@@ -6,3 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+maki-crypto.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+maki-test-support.workspace = true

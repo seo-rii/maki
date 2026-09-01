@@ -249,6 +249,15 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
             max_active_callbacks: config.limits.max_active_callbacks,
             max_plaintext_bytes: config.limits.max_plaintext_bytes.0,
         },
+        cache: match config.cache.mode {
+            maki_format::config::CacheMode::Off => None,
+            maki_format::config::CacheMode::Read => {
+                Some(maki_core::engine::EngineCacheConfig {
+                    max_bytes: config.cache.max_bytes.0,
+                    ttl: config.cache.ttl.0,
+                })
+            }
+        },
     }
 }
 

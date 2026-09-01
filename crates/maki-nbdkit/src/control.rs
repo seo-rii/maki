@@ -46,6 +46,10 @@ impl ControlBackend for EngineControlBackend {
             "maki_journal_bytes": stats.journal_pending_bytes,
             "maki_overlay_units": stats.overlay_units,
             "maki_overlay_bytes": stats.overlay_bytes,
+            "maki_cache_hits_total": stats.cache_hits,
+            "maki_cache_misses_total": stats.cache_misses,
+            "maki_cache_bytes": stats.cache_bytes,
+            "maki_cache_entries": stats.cache_entries,
         })
     }
 
@@ -53,11 +57,16 @@ impl ControlBackend for EngineControlBackend {
         self.engine.checkpoint().await.map_err(|e| e.to_string())
     }
 
-    async fn reload(&self, section: &str, _payload: &Value) -> Result<(), String> {
+    async fn reload(&self, section: &str, payload: &Value) -> Result<(), String> {
         match section {
-            // Hot-reloadable sections (SPEC §20). Cache resize lands with
-            // Phase 10; endpoint/credential reload with the remote providers.
-            "cache" | "retry" | "circuit-breaker" | "batch" | "limits" => Ok(()),
+            // Hot-reloadable sections (SPEC §20).
+            "cache" => {
+                if let Some(max_bytes) = payload.get("max_bytes").and_then(|v| v.as_u64()) {
+                    self.engine.resize_cache(max_bytes);
+                }
+                Ok(())
+            }
+            "retry" | "circuit-breaker" | "batch" | "limits" => Ok(()),
             "endpoints" | "credentials" => {
                 Err(format!("section {section:?} reload requires a remote provider"))
             }

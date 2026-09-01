@@ -12,6 +12,7 @@ failpoints = ["dep:maki-test-support"]
 maki-backing.workspace = true
 maki-format.workspace = true
 maki-crypto.workspace = true
+maki-cache.workspace = true
 maki-test-support = { workspace = true, optional = true }
 thiserror.workspace = true
 parking_lot.workspace = true

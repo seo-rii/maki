@@ -903,6 +903,11 @@ dependencies = [
 [[package]]
 name = "maki-cache"
 version = "0.1.0"
+dependencies = [
+ "maki-crypto",
+ "maki-test-support",
+ "parking_lot",
+]
 
 [[package]]
 name = "maki-check"
@@ -932,6 +937,7 @@ dependencies = [
  "async-trait",
  "crc32fast",
  "maki-backing",
+ "maki-cache",
  "maki-core",
  "maki-crypto",
  "maki-format",

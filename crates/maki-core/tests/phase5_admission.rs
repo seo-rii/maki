@@ -48,6 +48,7 @@ async fn engine_with(
         EngineOptions {
             volume: VolumeOptions::default(),
             limits,
+            cache: None,
         },
     )
     .await

@@ -56,10 +56,18 @@ impl Default for EngineLimits {
     }
 }
 
+/// Plaintext read-cache settings (SPEC §29). `None` = mode off.
+#[derive(Debug, Clone)]
+pub struct EngineCacheConfig {
+    pub max_bytes: u64,
+    pub ttl: std::time::Duration,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineOptions {
     pub volume: VolumeOptions,
     pub limits: EngineLimits,
+    pub cache: Option<EngineCacheConfig>,
 }
 
 struct UnitLocks {
@@ -103,6 +111,8 @@ struct EngineInner {
     batch_max_bytes: u64,
     /// Request-count + plaintext-byte admission (SPEC §30).
     admission: maki_crypto::flow::DualSemaphore,
+    /// Versioned plaintext read cache (SPEC §29). `None` = mode off.
+    cache: Option<maki_cache::VersionedLruCache>,
 }
 
 #[derive(Clone)]
@@ -170,6 +180,16 @@ impl Engine {
                     options.limits.max_active_callbacks,
                     options.limits.max_plaintext_bytes,
                 ),
+                cache: options.cache.map(|c| {
+                    maki_cache::VersionedLruCache::new(
+                        maki_cache::CacheConfig {
+                            max_bytes: c.max_bytes,
+                            ttl: c.ttl,
+                            zeroize_on_evict: true,
+                        },
+                        Arc::new(maki_crypto::SystemClock::new()),
+                    )
+                }),
             }),
         })
     }
@@ -256,12 +276,22 @@ impl Engine {
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
 
-        // Consistent per-unit ciphertext snapshot.
+        // Consistent per-unit ciphertext snapshot; cache hits (keyed by the
+        // unit's current write sequence, SPEC §29) skip decryption.
+        let mut cached: HashMap<u64, std::sync::Arc<SecretBuffer>> = HashMap::new();
         let mut cts = Vec::new();
+        let mut seqs: HashMap<u64, u64> = HashMap::new();
         {
             let volume = self.inner.volume.read().await;
             for unit in first..=last {
-                if let Some((_seq, data)) = volume.read_ct(unit)? {
+                if let Some((seq, data)) = volume.read_ct(unit)? {
+                    if let Some(cache) = &self.inner.cache {
+                        if let Some(buf) = cache.get(unit, seq) {
+                            cached.insert(unit, buf);
+                            continue;
+                        }
+                    }
+                    seqs.insert(unit, seq);
                     cts.push(CiphertextUnit {
                         unit_index: unit,
                         data,
@@ -271,14 +301,23 @@ impl Engine {
         }
         let mut plain = self.decrypt_units(cts).await?;
 
+        if let Some(cache) = &self.inner.cache {
+            for (unit, buf) in plain.iter() {
+                cache.put(*unit, seqs[unit], buf.duplicate());
+            }
+        }
+
         let mut out = Vec::with_capacity(len);
         for unit in first..=last {
             let unit_start = unit * unit_size;
             let from = offset.max(unit_start) - unit_start;
             let to = (offset + len as u64).min(unit_start + unit_size) - unit_start;
-            match plain.remove(&unit) {
-                Some(buf) => out.extend_from_slice(&buf.expose()[from as usize..to as usize]),
-                None => out.extend(std::iter::repeat(0u8).take((to - from) as usize)),
+            if let Some(buf) = plain.remove(&unit) {
+                out.extend_from_slice(&buf.expose()[from as usize..to as usize]);
+            } else if let Some(buf) = cached.remove(&unit) {
+                out.extend_from_slice(&buf.expose()[from as usize..to as usize]);
+            } else {
+                out.extend(std::iter::repeat(0u8).take((to - from) as usize));
             }
         }
         Ok(out)
@@ -356,12 +395,25 @@ impl Engine {
             let mut volume = self.inner.volume.write().await;
             for ct in &cts {
                 volume.write_ct(ct.unit_index, &ct.data, false)?;
+                // Any cached plaintext of an older version is now dead. The
+                // version key alone already prevents stale reads; this frees
+                // the space eagerly.
+                if let Some(cache) = &self.inner.cache {
+                    cache.invalidate(ct.unit_index);
+                }
             }
             if fua {
                 volume.flush()?;
             }
         }
         Ok(())
+    }
+
+    /// Hot-resize the plaintext read cache (SPEC §20; 0 disables).
+    pub fn resize_cache(&self, max_bytes: u64) {
+        if let Some(cache) = &self.inner.cache {
+            cache.set_max_bytes(max_bytes);
+        }
     }
 
     /// FLUSH barrier: everything acknowledged before this call is durable
@@ -376,8 +428,14 @@ impl Engine {
         volume.checkpoint()
     }
 
-    /// Journal/checkpoint observability (metrics inputs).
+    /// Journal/checkpoint/cache observability (metrics inputs, SPEC §40).
     pub async fn stats(&self) -> EngineStats {
+        let cache = self
+            .inner
+            .cache
+            .as_ref()
+            .map(|c| c.stats())
+            .unwrap_or_default();
         let volume = self.inner.volume.read().await;
         EngineStats {
             durable_sequence: volume.journal_durable_sequence(),
@@ -387,6 +445,10 @@ impl Engine {
             journal_pending_bytes: volume.journal_pending_bytes(),
             overlay_units: volume.overlay_len(),
             overlay_bytes: volume.overlay_bytes(),
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_bytes: cache.bytes,
+            cache_entries: cache.entries,
         }
     }
 }
@@ -400,4 +462,8 @@ pub struct EngineStats {
     pub journal_pending_bytes: u64,
     pub overlay_units: usize,
     pub overlay_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_bytes: u64,
+    pub cache_entries: usize,
 }

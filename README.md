@@ -21,7 +21,7 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 7 | Daemon and privilege model | ✅ host-verifiable complete |
 | 8 | HTTP remote provider | ✅ chaos+TLS suites passed |
 | 9 | WebSocket and gRPC | ✅ complete |
-| 10 | Cache and operations | ⏳ |
+| 10 | Cache and operations | ✅ complete |
 | 11 | Database qualification | ⏳ |
 | 12 | Power-loss qualification | ⏳ |
 
