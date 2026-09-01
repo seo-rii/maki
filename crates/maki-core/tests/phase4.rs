@@ -57,6 +57,7 @@ async fn attach(backing: &Arc<CrashableBacking>) -> Result<Engine, AttachError> 
             volume: VolumeOptions {
                 journal_segment_size: 1 << 20,
             },
+            ..Default::default()
         },
     )
     .await

@@ -4,10 +4,15 @@
 //! Phase 2: provider self-test and batch-result validation.
 //! Phase 5: batching, retry, retry budget, circuit breaker, endpoint set.
 
+pub mod batch;
+pub mod breaker;
 pub mod checked;
 pub mod clock;
+pub mod endpoint;
 pub mod error;
+pub mod flow;
 pub mod provider;
+pub mod retry;
 pub mod secret;
 pub mod selftest;
 pub mod types;

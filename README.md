@@ -16,7 +16,7 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 2 | CryptoProvider (local AES-GCM-SIV / AES-XTS) | ✅ complete |
 | 3 | Journal and recovery | ✅ gate passed |
 | 4 | Block core | ✅ gate passed |
-| 5 | Backpressure, retry, HA | ⏳ |
+| 5 | Backpressure, retry, HA | ✅ complete |
 | 6 | nbdkit adapter | ⏳ |
 | 7 | Daemon and privilege model | ⏳ |
 | 8 | HTTP remote provider | ⏳ |

@@ -39,9 +39,27 @@ pub enum AttachError {
     Config(String),
 }
 
+/// Admission limits at the block-core entry (SPEC §30): both request count
+/// and byte count are bounded.
+#[derive(Debug, Clone)]
+pub struct EngineLimits {
+    pub max_active_callbacks: u32,
+    pub max_plaintext_bytes: u64,
+}
+
+impl Default for EngineLimits {
+    fn default() -> Self {
+        Self {
+            max_active_callbacks: 64,
+            max_plaintext_bytes: 128 << 20,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineOptions {
     pub volume: VolumeOptions,
+    pub limits: EngineLimits,
 }
 
 struct UnitLocks {
@@ -83,6 +101,8 @@ struct EngineInner {
     /// Provider batch contract (SPEC §16): calls are chunked to fit.
     batch_max_items: usize,
     batch_max_bytes: u64,
+    /// Request-count + plaintext-byte admission (SPEC §30).
+    admission: maki_crypto::flow::DualSemaphore,
 }
 
 #[derive(Clone)]
@@ -146,6 +166,10 @@ impl Engine {
                 unit_locks: UnitLocks::new(),
                 batch_max_items,
                 batch_max_bytes,
+                admission: maki_crypto::flow::DualSemaphore::new(
+                    options.limits.max_active_callbacks,
+                    options.limits.max_plaintext_bytes,
+                ),
             }),
         })
     }
@@ -227,6 +251,7 @@ impl Engine {
     /// Read `len` bytes at `offset`.
     pub async fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, CoreError> {
         self.check_range(offset, len)?;
+        let _admission = self.inner.admission.acquire(len as u64).await;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
@@ -263,6 +288,7 @@ impl Engine {
     /// durable before returning.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
+        let _admission = self.inner.admission.acquire(data.len() as u64).await;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + data.len() as u64 - 1) / unit_size;

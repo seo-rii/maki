@@ -57,6 +57,29 @@ pub struct FakeCryptoProvider {
     misbehavior: Mutex<Option<Misbehavior>>,
     encrypt_calls: AtomicUsize,
     decrypt_calls: AtomicUsize,
+    current_calls: Arc<AtomicUsize>,
+    max_concurrent: Arc<AtomicUsize>,
+}
+
+/// RAII guard tracking concurrent provider calls.
+struct ConcurrencyGuard {
+    current: Arc<AtomicUsize>,
+}
+
+impl ConcurrencyGuard {
+    fn enter(current: &Arc<AtomicUsize>, max: &Arc<AtomicUsize>) -> Self {
+        let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(now, Ordering::SeqCst);
+        Self {
+            current: current.clone(),
+        }
+    }
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeCryptoProvider {
@@ -74,7 +97,14 @@ impl FakeCryptoProvider {
             misbehavior: Mutex::new(None),
             encrypt_calls: AtomicUsize::new(0),
             decrypt_calls: AtomicUsize::new(0),
+            current_calls: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Highest number of overlapping encrypt/decrypt calls observed.
+    pub fn max_concurrent_calls(&self) -> usize {
+        self.max_concurrent.load(Ordering::SeqCst)
     }
 
     pub fn with_key(mut self, key_seed: u64) -> Self {
@@ -234,6 +264,7 @@ impl CryptoProvider for FakeCryptoProvider {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        let _guard = ConcurrencyGuard::enter(&self.current_calls, &self.max_concurrent);
         self.encrypt_calls.fetch_add(1, Ordering::SeqCst);
         self.common(context, items.len()).await?;
         let mut out = Vec::with_capacity(items.len());
@@ -264,6 +295,7 @@ impl CryptoProvider for FakeCryptoProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        let _guard = ConcurrencyGuard::enter(&self.current_calls, &self.max_concurrent);
         self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
         self.common(context, items.len()).await?;
         let expected_len = (self.unit_size + self.overhead) as usize;
