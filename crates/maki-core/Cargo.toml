@@ -5,4 +5,25 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+failpoints = ["dep:maki-test-support"]
+
 [dependencies]
+maki-backing.workspace = true
+maki-format.workspace = true
+maki-crypto.workspace = true
+maki-test-support = { workspace = true, optional = true }
+thiserror.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
+crc32fast.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+maki-core = { path = ".", features = ["failpoints"] }
+maki-test-support.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

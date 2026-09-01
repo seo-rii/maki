@@ -8,6 +8,7 @@ pub mod ab;
 pub mod allocation;
 pub mod catalog;
 pub mod checker;
+pub mod checkpoint;
 pub mod codec;
 pub mod config;
 pub mod error;

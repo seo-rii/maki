@@ -14,7 +14,7 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 0 | Executable specification (reference model, crash backing, fakes) | ✅ gate passed |
 | 1 | Configuration and on-disk format | ✅ gate passed |
 | 2 | CryptoProvider (local AES-GCM-SIV / AES-XTS) | ✅ complete |
-| 3 | Journal and recovery | ⏳ |
+| 3 | Journal and recovery | ✅ gate passed |
 | 4 | Block core | ⏳ |
 | 5 | Backpressure, retry, HA | ⏳ |
 | 6 | nbdkit adapter | ⏳ |

@@ -310,6 +310,22 @@ version = "0.1.0"
 [[package]]
 name = "maki-core"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crc32fast",
+ "maki-backing",
+ "maki-core",
+ "maki-crypto",
+ "maki-format",
+ "maki-test-support",
+ "parking_lot",
+ "rand",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "maki-crypto"
