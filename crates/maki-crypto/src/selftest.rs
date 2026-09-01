@@ -109,9 +109,16 @@ pub async fn cross_endpoint_self_test(
         let items = patterns(unit_size);
         let cts = enc.encrypt_batch(context, &items).await?;
         let pts = dec.decrypt_batch(context, &cts).await.map_err(|e| {
-            CryptoError::ProviderFatal(format!(
-                "cross-endpoint decrypt {dir} failed: {e} — endpoints are not interchangeable"
-            ))
+            // A transport-level failure is not proof of incompatibility —
+            // preserve its class so the caller can distinguish "down" from
+            // "not interchangeable".
+            if e.is_retryable() || matches!(e.class(), crate::ErrorClass::EndpointFatal) {
+                e
+            } else {
+                CryptoError::ProviderFatal(format!(
+                    "cross-endpoint decrypt {dir} failed: {e} — endpoints are not interchangeable"
+                ))
+            }
         })?;
         validate_decrypt_result(&cts, &pts, &caps_b)?;
         for (orig, got) in items.iter().zip(pts.iter()) {

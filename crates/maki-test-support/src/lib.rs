@@ -16,6 +16,7 @@
 pub mod clock;
 pub mod crash_backing;
 pub mod failpoints;
+pub mod http_chaos;
 pub mod fake_provider;
 pub mod model;
 pub mod oracle;

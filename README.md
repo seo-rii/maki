@@ -19,7 +19,7 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 5 | Backpressure, retry, HA | ✅ complete |
 | 6 | nbdkit adapter | ✅ adapter tested; Linux ABI pending CI |
 | 7 | Daemon and privilege model | ✅ host-verifiable complete |
-| 8 | HTTP remote provider | ⏳ |
+| 8 | HTTP remote provider | ✅ chaos+TLS suites passed |
 | 9 | WebSocket and gRPC | ⏳ |
 | 10 | Cache and operations | ⏳ |
 | 11 | Database qualification | ⏳ |

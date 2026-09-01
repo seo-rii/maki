@@ -381,8 +381,16 @@ pub struct CredentialRef {
 pub struct BodyConfig {
     #[serde(rename = "type", default = "d_json")]
     pub body_type: String,
+    /// Top-level fields (JSON pointers → sources).
     #[serde(default)]
     pub fields: BTreeMap<String, FieldMapping>,
+    /// Batch layout: pointer to a JSON array receiving one object per item.
+    /// Absent = one HTTP request per item.
+    #[serde(default)]
+    pub items_path: Option<String>,
+    /// Per-item fields within `items_path` elements.
+    #[serde(default)]
+    pub item_fields: BTreeMap<String, FieldMapping>,
 }
 
 fn d_json() -> String {
@@ -403,10 +411,17 @@ pub struct FieldMapping {
 pub struct ResponseConfig {
     #[serde(rename = "type", default = "d_json")]
     pub response_type: String,
+    /// Pointer to the payload (single-item), or within each batch element.
     #[serde(default)]
     pub data_path: Option<String>,
     #[serde(default)]
     pub encoding: Option<String>,
+    /// Batch: pointer to the response array.
+    #[serde(default)]
+    pub items_path: Option<String>,
+    /// Optional per-element echo of the unit index, validated when present.
+    #[serde(default)]
+    pub item_index_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
