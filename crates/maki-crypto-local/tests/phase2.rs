@@ -1,6 +1,6 @@
 //! Phase 2 — local crypto providers (SPEC §17, §44).
 
-use maki_crypto::selftest::{cross_endpoint_self_test, provider_self_test};
+use maki_crypto::selftest::{cross_endpoint_self_test, provider_conformance, provider_self_test};
 use maki_crypto::{
     Capability, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer,
 };
@@ -233,4 +233,16 @@ async fn error_messages_never_contain_plaintext_or_key() {
     let msg = format!("{err}");
     assert!(!msg.contains("99, 99"), "error leaks plaintext: {msg}");
     assert!(!msg.contains("11, 11"), "error leaks key: {msg}");
+}
+
+/// Every transport must pass the same provider conformance suite (SPEC §51).
+#[tokio::test]
+async fn local_providers_pass_conformance() {
+    provider_conformance(&gcm("vol-key"), &ctx(), UNIT, "local-gcm-siv-v1")
+        .await
+        .unwrap();
+    let xts = AesXtsProvider::new(&keys(), "xts-key", UNIT as u32, "local-xts-v1").unwrap();
+    provider_conformance(&xts, &xts_ctx(), UNIT, "local-xts-v1")
+        .await
+        .unwrap();
 }

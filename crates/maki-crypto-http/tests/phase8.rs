@@ -9,7 +9,7 @@ use base64::Engine as _;
 use serde_json::json;
 
 use common::{Handler, RecordedRequest, ResponseSpec, TestServer};
-use maki_crypto::selftest::provider_self_test;
+use maki_crypto::selftest::{provider_conformance, provider_self_test};
 use maki_crypto::{
     Capability, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
     SecretBuffer,
@@ -399,6 +399,21 @@ async fn provider_passes_body_mapping_self_test() {
     ))
     .unwrap();
     provider_self_test(&provider, &ctx(), UNIT, "vendor-profile-v1")
+        .await
+        .unwrap();
+}
+
+/// Every transport must pass the same provider conformance suite (SPEC §51).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_passes_provider_conformance() {
+    let server = TestServer::start(xor_json_handler("data", "ciphertext")).await;
+    let provider = HttpCryptoProvider::new(spec(
+        &server.url(),
+        json_op("/encrypt", "data", "/ciphertext"),
+        json_op("/decrypt", "data", "/ciphertext"),
+    ))
+    .unwrap();
+    provider_conformance(&provider, &ctx(), UNIT, "vendor-profile-v1")
         .await
         .unwrap();
 }

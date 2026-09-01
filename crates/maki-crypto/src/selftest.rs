@@ -87,6 +87,58 @@ pub async fn provider_self_test(
     Ok(())
 }
 
+/// Transport-agnostic provider conformance suite (SPEC §51): every
+/// transport (local, HTTP, WebSocket, gRPC) must pass identically.
+pub async fn provider_conformance(
+    provider: &dyn CryptoProvider,
+    context: &CryptoContext,
+    unit_size: usize,
+    expected_compatibility_id: &str,
+) -> Result<(), CryptoError> {
+    // Core self-test: capabilities, round trips, order, size, tamper.
+    provider_self_test(provider, context, unit_size, expected_compatibility_id).await?;
+
+    // Wider batch with distinctive per-unit content.
+    let caps = provider.capabilities().await?;
+    let n = 32usize.min(caps.batch.max_items.max(1) as usize);
+    let items: Vec<PlaintextUnit> = (0..n)
+        .map(|i| PlaintextUnit {
+            unit_index: 1000 + i as u64,
+            data: SecretBuffer::from_vec(vec![i as u8 ^ 0x5A; unit_size]),
+        })
+        .collect();
+    let cts = provider.encrypt_batch(context, &items).await?;
+    validate_encrypt_result(&items, &cts, &caps)?;
+    let pts = provider.decrypt_batch(context, &cts).await?;
+    validate_decrypt_result(&cts, &pts, &caps)?;
+    for (orig, got) in items.iter().zip(pts.iter()) {
+        if orig.data != got.data {
+            return Err(CryptoError::ProviderFatal(
+                "conformance: wide-batch round trip mismatch".to_string(),
+            ));
+        }
+    }
+
+    // Statelessness sanity: encrypting the same unit twice must decrypt
+    // identically both times.
+    let again = provider
+        .encrypt_batch(
+            context,
+            &[PlaintextUnit {
+                unit_index: 1000,
+                data: items[0].data.duplicate(),
+            }],
+        )
+        .await?;
+    let back = provider.decrypt_batch(context, &again).await?;
+    if back[0].data != items[0].data {
+        return Err(CryptoError::ProviderFatal(
+            "conformance: repeated encryption round trip mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Cross-endpoint interchangeability (SPEC §34): ciphertext encrypted by A
 /// must decrypt on B and vice versa. Run for every endpoint pair before
 /// attach.

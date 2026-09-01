@@ -1,0 +1,30 @@
+// Reference contract for the Maki gRPC remote crypto transport (SPEC §18).
+//
+// A vendor service may live at any package/service name — the method paths
+// are configured per volume (`encrypt_path` / `decrypt_path`) — but the
+// message shapes must match these definitions. Responses MUST echo each
+// item's unit_index and preserve request order; Maki validates both.
+
+syntax = "proto3";
+
+package maki;
+
+service CryptoService {
+  rpc EncryptBatch(CryptoBatchRequest) returns (CryptoBatchResponse);
+  rpc DecryptBatch(CryptoBatchRequest) returns (CryptoBatchResponse);
+}
+
+message CryptoItem {
+  uint64 unit_index = 1;
+  bytes data = 2;
+}
+
+message CryptoBatchRequest {
+  string volume_id = 1;
+  string compatibility_id = 2;
+  repeated CryptoItem items = 3;
+}
+
+message CryptoBatchResponse {
+  repeated CryptoItem items = 1;
+}
