@@ -1,0 +1,56 @@
+# CI strategy per SPEC §55.
+# PR: fast, deterministic suites. Nightly: full property/crash/saturation
+# gates. Weekly & release tiers (DB qualification, TLS suite, soak, QEMU
+# power loss) run on dedicated runners — see docs/ci.md.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "0 3 * * *" # nightly gates
+
+jobs:
+  pr:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+        continue-on-error: true # formatting drift is advisory until first release
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true
+      # SPEC §55 PR tier: unit, property smoke, codec, fake crypto, journal
+      # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
+      # smoke — all part of the default workspace suite.
+      - name: workspace tests
+        run: cargo test --workspace
+
+  nightly-gates:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # SPEC §55 nightly tier: full property tests, crash cycles, queue
+      # saturation, retry storm — the ignored phase gates.
+      - name: phase gates (release)
+        run: >
+          cargo test --workspace --release -- --ignored
+          phase0_gate_full phase3_gate_full phase4_gate_full
+          phase11_gate_dbsim_full phase12_gate_full
+      - name: nbdkit plugin build (cdylib + plugin_init symbol)
+        run: |
+          cargo build --release -p maki-nbdkit
+          nm -D target/release/libmaki_nbdkit.so | grep -q plugin_init

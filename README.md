@@ -22,8 +22,8 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 8 | HTTP remote provider | ✅ chaos+TLS suites passed |
 | 9 | WebSocket and gRPC | ✅ complete |
 | 10 | Cache and operations | ✅ complete |
-| 11 | Database qualification | ⏳ |
-| 12 | Power-loss qualification | ⏳ |
+| 11 | Database qualification | ✅ simulation tier; DB runbook |
+| 12 | Power-loss qualification | ✅ simulation tier; QEMU/metal runbook |
 
 ## Workspace layout
 
