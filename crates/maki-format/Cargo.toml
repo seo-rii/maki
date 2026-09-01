@@ -6,3 +6,14 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+maki-backing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+crc32fast.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+maki-test-support.workspace = true
+rand.workspace = true
+tempfile.workspace = true
