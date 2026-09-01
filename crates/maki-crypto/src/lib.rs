@@ -4,10 +4,12 @@
 //! Phase 2: provider self-test and batch-result validation.
 //! Phase 5: batching, retry, retry budget, circuit breaker, endpoint set.
 
+pub mod checked;
 pub mod clock;
 pub mod error;
 pub mod provider;
 pub mod secret;
+pub mod selftest;
 pub mod types;
 
 pub use clock::{Clock, SystemClock};
