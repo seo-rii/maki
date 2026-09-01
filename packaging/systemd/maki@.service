@@ -1,0 +1,52 @@
+# Maki data-plane daemon: one instance per volume (SPEC §3, §10).
+# The daemon runs as the unprivileged `maki` user with an empty capability
+# set; every privileged operation goes through maki-attach@.service.
+
+[Unit]
+Description=Maki encrypted volume %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=maki
+Group=maki
+
+ExecStart=/usr/bin/nbdkit \
+    --foreground \
+    -U /run/maki/%i/nbd.sock \
+    /usr/lib/maki/maki-nbdkit.so \
+    config=/etc/maki/volumes/%i.toml
+
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# PRIV-015: never write core dumps (plaintext/key material may be mapped).
+LimitCORE=0
+LimitMEMLOCK=512M
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+RuntimeDirectory=maki/%i
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/lib/maki/%i
+ReadWritePaths=/run/maki/%i
+
+# SPEC §9: secrets arrive as systemd credentials, never in the TOML.
+# Uncomment and point at the real secret source for the volume:
+LoadCredential=crypto-token:/etc/maki/secrets/%i.token
+
+[Install]
+WantedBy=multi-user.target

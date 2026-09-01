@@ -18,7 +18,7 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 4 | Block core | ✅ gate passed |
 | 5 | Backpressure, retry, HA | ✅ complete |
 | 6 | nbdkit adapter | ✅ adapter tested; Linux ABI pending CI |
-| 7 | Daemon and privilege model | ⏳ |
+| 7 | Daemon and privilege model | ✅ host-verifiable complete |
 | 8 | HTTP remote provider | ⏳ |
 | 9 | WebSocket and gRPC | ⏳ |
 | 10 | Cache and operations | ⏳ |

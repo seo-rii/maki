@@ -10,3 +10,5 @@ name = "maki-check"
 path = "src/main.rs"
 
 [dependencies]
+maki-format.workspace = true
+maki-backing.workspace = true

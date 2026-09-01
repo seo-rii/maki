@@ -5,4 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# NOTE: this crate must never depend on maki-crypto / maki-crypto-local —
+# the privileged helper is a storage control-plane component with zero
+# access to key material (SPEC §6, PRIV-010).
+
 [dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

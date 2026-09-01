@@ -8,6 +8,7 @@
 //!   `plugin_init`.
 
 pub mod adapter;
+pub mod control;
 pub mod daemon;
 
 #[cfg(target_os = "linux")]

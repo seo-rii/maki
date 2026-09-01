@@ -19,6 +19,9 @@ maki-format.workspace = true
 maki-crypto.workspace = true
 maki-crypto-local.workspace = true
 maki-backing.workspace = true
+maki-control.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
 maki-test-support = { workspace = true, optional = true }
 thiserror.workspace = true
 parking_lot.workspace = true
@@ -28,4 +31,3 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-async-trait.workspace = true

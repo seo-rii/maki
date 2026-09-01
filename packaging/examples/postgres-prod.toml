@@ -1,0 +1,129 @@
+config_schema_version = 1
+
+[volume]
+name = "postgres-prod"
+
+max_virtual_size = "16TiB"
+
+device_block_size = 4096
+crypto_unit_size = 4096
+
+shard_logical_size = "64GiB"
+
+[crypto]
+provider = "remote-http"
+
+crypto_compatibility_id = "vendor-profile-prod-v1"
+
+availability_policy = "stall"
+
+[crypto.capabilities]
+mode = "hybrid"
+
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+
+stateless = true
+retry_safe = true
+
+integrity = "none"
+context_binding = "none"
+replay_protection = "none"
+
+[[crypto.http.endpoint]]
+name = "crypto-a"
+url = "https://crypto-a.internal"
+
+[[crypto.http.endpoint]]
+name = "crypto-b"
+url = "https://crypto-b.internal"
+
+[limits]
+max_active_callbacks = 64
+
+max_plaintext_bytes = "128MiB"
+max_ciphertext_bytes = "160MiB"
+
+max_pending_crypto_items = 4096
+max_pending_crypto_bytes = "128MiB"
+
+max_crypto_inflight_batches = 32
+max_crypto_inflight_bytes = "32MiB"
+
+max_inflight_per_endpoint = 8
+max_inflight_bytes_per_endpoint = "8MiB"
+
+max_journal_pending_bytes = "64MiB"
+
+[crypto.batch]
+target_items = 64
+target_bytes = "256KiB"
+
+max_items = 128
+max_bytes = "1MiB"
+
+max_wait = "150us"
+
+[crypto.retry]
+strategy = "exponential-full-jitter"
+
+initial_delay = "50ms"
+max_delay = "5s"
+
+[crypto.retry_budget]
+retry_ratio = 0.20
+burst = 16
+minimum_probe_rate = "1/s"
+
+[crypto.circuit_breaker]
+failure_threshold = 8
+
+open_initial = "1s"
+open_max = "30s"
+
+half_open_max_requests = 2
+success_threshold = 2
+
+[backing]
+root = "/var/lib/maki/postgres-prod"
+
+slot_alignment = 512
+
+journal_segment_size = "256MiB"
+journal_max_bytes = "4GiB"
+
+checkpoint_reserve_bytes = "4GiB"
+journal_emergency_reserve_bytes = "1GiB"
+
+[cache]
+mode = "off"
+
+max_bytes = "256MiB"
+ttl = "30s"
+
+lock_memory = true
+zeroize_on_evict = true
+
+[nbd]
+socket = "/run/maki/postgres-prod/nbd.sock"
+
+device_block_size = 4096
+
+minimum_io = 4096
+preferred_io = 4096
+maximum_io = "1MiB"
+
+threads = 64
+connections = 1
+
+[control]
+socket = "/run/maki/postgres-prod/control.sock"
+group = "maki-admin"
+
+[security]
+memory_lock_mode = "secure-buffers"
+
+disable_core_dump = true
+madv_dontdump = true
+
+require_secure_swap_policy = true

@@ -10,3 +10,4 @@ name = "maki-attach"
 path = "src/main.rs"
 
 [dependencies]
+maki-privileged.workspace = true

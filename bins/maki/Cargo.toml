@@ -10,3 +10,9 @@ name = "maki"
 path = "src/main.rs"
 
 [dependencies]
+maki-format.workspace = true
+maki-nbdkit.workspace = true
+maki-control.workspace = true
+maki-backing.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
