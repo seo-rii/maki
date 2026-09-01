@@ -389,6 +389,21 @@ dependencies = [
 [[package]]
 name = "maki-nbdkit"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "maki-backing",
+ "maki-core",
+ "maki-crypto",
+ "maki-crypto-local",
+ "maki-format",
+ "maki-test-support",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "maki-privileged"

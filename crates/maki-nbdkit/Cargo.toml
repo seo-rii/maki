@@ -5,4 +5,27 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = ["fake-provider"]
+# Development/benchmark provider selectable via `provider = "fake"`.
+fake-provider = ["dep:maki-test-support"]
+
 [dependencies]
+maki-core.workspace = true
+maki-format.workspace = true
+maki-crypto.workspace = true
+maki-crypto-local.workspace = true
+maki-backing.workspace = true
+maki-test-support = { workspace = true, optional = true }
+thiserror.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true
