@@ -1,0 +1,12 @@
+[package]
+name = "maki-attach"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "maki-attach"
+path = "src/main.rs"
+
+[dependencies]

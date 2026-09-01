@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/maki-core",
+    "crates/maki-format",
+    "crates/maki-crypto",
+    "crates/maki-crypto-local",
+    "crates/maki-crypto-http",
+    "crates/maki-crypto-websocket",
+    "crates/maki-crypto-grpc",
+    "crates/maki-backing",
+    "crates/maki-cache",
+    "crates/maki-nbdkit",
+    "crates/maki-control",
+    "crates/maki-privileged",
+    "crates/maki-test-support",
+    "bins/maki",
+    "bins/maki-attach",
+    "bins/maki-check",
+    "bins/maki-benchmark",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Maki Developers"]
+
+[workspace.dependencies]
+maki-core = { path = "crates/maki-core" }
+maki-format = { path = "crates/maki-format" }
+maki-crypto = { path = "crates/maki-crypto" }
+maki-crypto-local = { path = "crates/maki-crypto-local" }
+maki-crypto-http = { path = "crates/maki-crypto-http" }
+maki-crypto-websocket = { path = "crates/maki-crypto-websocket" }
+maki-crypto-grpc = { path = "crates/maki-crypto-grpc" }
+maki-backing = { path = "crates/maki-backing" }
+maki-cache = { path = "crates/maki-cache" }
+maki-nbdkit = { path = "crates/maki-nbdkit" }
+maki-control = { path = "crates/maki-control" }
+maki-privileged = { path = "crates/maki-privileged" }
+maki-test-support = { path = "crates/maki-test-support" }
+
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+crc32fast = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util", "net", "fs", "test-util"] }
+async-trait = "0.1"
+bytes = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+parking_lot = "0.12"
+tempfile = "3"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+
+[profile.release]
+debug = true
