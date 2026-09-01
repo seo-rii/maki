@@ -6,3 +6,16 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+maki-crypto.workspace = true
+maki-backing.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+crc32fast.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
