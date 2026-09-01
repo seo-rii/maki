@@ -8,6 +8,7 @@
 //! calls into `maki_test_support::failpoints` under a stable name (see
 //! `docs/phase-3.md` for the list).
 
+pub mod engine;
 pub mod error;
 pub mod journal;
 pub mod overlay;

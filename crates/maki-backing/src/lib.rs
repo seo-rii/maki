@@ -41,7 +41,7 @@ pub trait BackingFile: Send + Sync {
 }
 
 /// Held while a volume is attached; dropping releases the lock.
-pub trait VolumeLock: Send {}
+pub trait VolumeLock: Send + Sync {}
 
 /// A confined storage namespace for one volume.
 pub trait Backing: Send + Sync + 'static {

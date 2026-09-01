@@ -110,7 +110,7 @@ impl JournalWriter {
     }
 
     fn seal_active(&mut self) -> Result<(), CoreError> {
-        if let Some(mut active) = self.active.take() {
+        if let Some(active) = self.active.take() {
             if active.unsynced {
                 fp("journal.sync")?;
                 active.file.sync_data()?;

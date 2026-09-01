@@ -154,7 +154,7 @@ impl Volume {
 
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
-    pub fn read_ct(&mut self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+    pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
         if let Some(v) = self.overlay.get(unit) {
             return Ok(Some((v.sequence, v.ciphertext.clone())));
         }

@@ -42,8 +42,7 @@ impl From<crate::error::CoreError> for RecoveryError {
         match e {
             crate::error::CoreError::Io(io) => RecoveryError::Io(io),
             crate::error::CoreError::Format(f) => RecoveryError::Format(f),
-            crate::error::CoreError::Corrupt(c) => RecoveryError::Corrupt(c),
-            crate::error::CoreError::Durability(d) => RecoveryError::Corrupt(d),
+            other => RecoveryError::Corrupt(other.to_string()),
         }
     }
 }

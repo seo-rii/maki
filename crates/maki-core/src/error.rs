@@ -15,4 +15,9 @@ pub enum CoreError {
     /// A durability guarantee could not be established (e.g. FUA verify).
     #[error("durability violation: {0}")]
     Durability(String),
+    /// Malformed request (range, alignment) — EINVAL at the block layer.
+    #[error("invalid request: {0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Crypto(#[from] maki_crypto::CryptoError),
 }
