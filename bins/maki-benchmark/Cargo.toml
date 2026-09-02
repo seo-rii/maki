@@ -12,3 +12,6 @@ path = "src/main.rs"
 [dependencies]
 maki-nbdkit.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

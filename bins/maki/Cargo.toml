@@ -16,3 +16,6 @@ maki-control.workspace = true
 maki-backing.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

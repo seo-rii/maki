@@ -873,6 +873,7 @@ dependencies = [
  "maki-format",
  "maki-nbdkit",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -897,6 +898,7 @@ name = "maki-benchmark"
 version = "0.1.0"
 dependencies = [
  "maki-nbdkit",
+ "tempfile",
  "tokio",
 ]
 
@@ -915,6 +917,8 @@ version = "0.1.0"
 dependencies = [
  "maki-backing",
  "maki-format",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

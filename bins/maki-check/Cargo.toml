@@ -12,3 +12,7 @@ path = "src/main.rs"
 [dependencies]
 maki-format.workspace = true
 maki-backing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true

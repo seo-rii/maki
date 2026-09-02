@@ -30,7 +30,10 @@ currently implemented as GitHub Actions jobs.
 The workspace suite includes unit and integration tests, property and crash
 smokes, codec/parser mutation smokes, local and loopback transport tests,
 failpoint coverage, privilege-plan tests, NBD adapter tests, database
-simulation, and simulated power-loss scenarios.
+simulation, simulated power-loss scenarios, and binary E2E tests that run all
+four shipped executables as real processes. The E2E coverage includes the
+`maki` volume lifecycle and corruption exits, `maki-check` exit codes,
+`maki-benchmark` attach/I/O/journal recovery, and `maki-attach` plan output.
 
 ### Nightly schedule
 
