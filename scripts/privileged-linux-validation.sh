@@ -119,7 +119,7 @@ readonly nbd_index=$((10#${BASH_REMATCH[1]}))
 required_commands=(
     blockdev cargo df findmnt fio lsblk lvcreate lvremove mkfs.xfs modprobe
     nbd-client nbdinfo nbdkit nm pvcreate pvremove sqlite3 sync vgchange
-    vgcreate vgremove
+    vgcreate vgremove setpriv
 )
 
 missing_commands() {
@@ -543,8 +543,9 @@ EOF
 "$maki_bin" volume inspect "$config_path" | tee "$run_dir/volume-inspect.txt"
 pass "disposable Maki volume created and inspected"
 
-log "starting nbdkit as unprivileged user $(id -un)"
-nbdkit --foreground -U "$socket_path" "$plugin_path" \
+log "starting nbdkit as unprivileged user $(id -un) with no-new-privileges"
+nbdkit_launcher=(setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all)
+"${nbdkit_launcher[@]}" nbdkit --foreground -U "$socket_path" "$plugin_path" \
     config="$config_path" >"$run_dir/nbdkit.log" 2>&1 &
 nbdkit_pid=$!
 for _ in $(seq 1 200); do
@@ -559,9 +560,11 @@ pass "nbdkit/libnbd negotiation over Unix socket"
 
 effective_uid="$(awk '/^Uid:/ {print $3}' "/proc/$nbdkit_pid/status")"
 effective_caps="$(awk '/^CapEff:/ {print $2}' "/proc/$nbdkit_pid/status")"
+no_new_privileges="$(awk '/^NoNewPrivs:/ {print $2}' "/proc/$nbdkit_pid/status")"
 [[ "$effective_uid" == "$(id -u)" ]] || die "nbdkit effective UID is $effective_uid"
 [[ "$effective_caps" == "0000000000000000" ]] || die "nbdkit CapEff is $effective_caps"
-pass "nbdkit runs unprivileged with an empty effective capability set"
+[[ "$no_new_privileges" == "1" ]] || die "nbdkit NoNewPrivs is $no_new_privileges"
+pass "nbdkit runs unprivileged with no-new-privileges and empty effective capabilities"
 
 # The invoking user deliberately opens the log file so it is never root-owned.
 # shellcheck disable=SC2024
@@ -571,7 +574,7 @@ fi
 pass "unrelated user is denied by the runtime-directory boundary"
 
 duplicate_socket="$work_dir/duplicate.sock"
-nbdkit --foreground -U "$duplicate_socket" "$plugin_path" \
+"${nbdkit_launcher[@]}" nbdkit --foreground -U "$duplicate_socket" "$plugin_path" \
     config="$config_path" >"$run_dir/duplicate-nbdkit.log" 2>&1 &
 duplicate_pid=$!
 for _ in $(seq 1 100); do

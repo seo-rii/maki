@@ -16,7 +16,8 @@ The automated run checks:
 
 - release builds and the nbdkit `plugin_init` export;
 - nbdkit/libnbd negotiation and duplicate-attach exclusion;
-- the nbdkit process's unprivileged UID and empty effective capability set;
+- the nbdkit process's unprivileged UID, `NoNewPrivs`, and empty effective
+  capability set;
 - denial of the protected socket to an unrelated user;
 - kernel `/dev/nbdN` attachment and exported geometry;
 - denial of an NBD disconnect ioctl to the invoking unprivileged user;
