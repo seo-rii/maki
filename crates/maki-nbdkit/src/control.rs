@@ -4,8 +4,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use maki_core::engine::Engine;
 use maki_control::server::ControlBackend;
+use maki_core::engine::Engine;
 
 pub struct EngineControlBackend {
     engine: Engine,
@@ -67,10 +67,12 @@ impl ControlBackend for EngineControlBackend {
                 Ok(())
             }
             "retry" | "circuit-breaker" | "batch" | "limits" => Ok(()),
-            "endpoints" | "credentials" => {
-                Err(format!("section {section:?} reload requires a remote provider"))
-            }
-            other => Err(format!("section {other:?} is not hot-reloadable (SPEC §20)")),
+            "endpoints" | "credentials" => Err(format!(
+                "section {section:?} reload requires a remote provider"
+            )),
+            other => Err(format!(
+                "section {other:?} is not hot-reloadable (SPEC §20)"
+            )),
         }
     }
 }

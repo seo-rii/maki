@@ -79,7 +79,10 @@ fn append_assigns_sequences_and_tracks_durability() {
     let (seq, data) = vol.read_ct(1).unwrap().expect("unit 1 present");
     assert_eq!(seq, s2);
     assert_eq!(data, ct(2));
-    assert!(vol.read_ct(7).unwrap().is_none(), "unwritten unit reads zero");
+    assert!(
+        vol.read_ct(7).unwrap().is_none(),
+        "unwritten unit reads zero"
+    );
 }
 
 // ---------- barrier (FLUSH) ----------
@@ -96,10 +99,13 @@ fn barrier_makes_prior_writes_durable_across_crash() {
     drop(vol);
 
     backing.crash_all_lost();
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(0xA));
     assert_eq!(vol.read_ct(1).unwrap().unwrap().1, ct(0xB));
-    assert!(vol.read_ct(2).unwrap().is_none(), "unflushed write may be lost");
+    assert!(
+        vol.read_ct(2).unwrap().is_none(),
+        "unflushed write may be lost"
+    );
 }
 
 // ---------- FUA ----------
@@ -114,7 +120,7 @@ fn fua_write_is_durable_across_crash() {
     drop(vol);
 
     backing.crash_all_lost();
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert_eq!(vol.read_ct(3).unwrap().unwrap().1, ct(0xF));
 }
 
@@ -130,11 +136,14 @@ fn segments_roll_and_survive_crash() {
         vol.write_ct(i as u64 % 8, &ct(i), false).unwrap();
     }
     vol.flush().unwrap();
-    assert!(vol.journal_segment_count() >= 2, "expected multiple segments");
+    assert!(
+        vol.journal_segment_count() >= 2,
+        "expected multiple segments"
+    );
     drop(vol);
 
     backing.crash_all_lost();
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     for i in 32..40u8 {
         // last write per unit wins
         let unit = i as u64 % 8;
@@ -153,7 +162,10 @@ fn segment_dirsync_failure_fails_closed() {
     }
     let fp = failpoints::set(
         "journal.segment.dirsync",
-        failpoints::FailpointAction::IoError(io::ErrorKind::Other, "injected dirsync failure".to_string()),
+        failpoints::FailpointAction::IoError(
+            io::ErrorKind::Other,
+            "injected dirsync failure".to_string(),
+        ),
     );
     // Appends must eventually fail rather than acknowledge into a segment
     // whose dirent could vanish.
@@ -188,7 +200,11 @@ fn torn_journal_tail_is_truncated_on_recovery() {
     // Crash keeping only half of record 2's bytes.
     backing.crash_keep_torn_prefix(&seg, 100);
     let mut vol = recover(&backing).unwrap();
-    assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(0x1), "durable record kept");
+    assert_eq!(
+        vol.read_ct(0).unwrap().unwrap().1,
+        ct(0x1),
+        "durable record kept"
+    );
     assert!(vol.read_ct(1).unwrap().is_none(), "torn record dropped");
     let _ = seg_len_before_tear;
 
@@ -196,7 +212,7 @@ fn torn_journal_tail_is_truncated_on_recovery() {
     vol.write_ct(1, &ct(0x3), true).unwrap();
     drop(vol);
     backing.crash_all_lost();
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert_eq!(vol.read_ct(1).unwrap().unwrap().1, ct(0x3));
 }
 
@@ -253,7 +269,7 @@ fn checkpoint_moves_data_to_slots_and_deletes_segments() {
     // Data now served from slots (and survives a lose-all crash).
     drop(vol);
     backing.crash_all_lost();
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert_eq!(vol.checkpoint_sequence(), ck);
     for unit in 0..6u64 {
         let expect = (14..20u8).find(|i| *i as u64 % 6 == unit).unwrap();
@@ -308,8 +324,8 @@ fn crash_mid_checkpoint_at_every_boundary_recovers_consistently() {
         // all flushed data must still read correctly.
         let mut rng = StdRng::seed_from_u64(0xC0DE);
         backing.crash(&mut rng);
-        let mut vol = recover(&backing)
-            .unwrap_or_else(|e| panic!("recovery after {stage} failed: {e:?}"));
+        let mut vol =
+            recover(&backing).unwrap_or_else(|e| panic!("recovery after {stage} failed: {e:?}"));
         for unit in 0..4u64 {
             let expect = (8..12u8).find(|i| *i as u64 % 4 == unit).unwrap();
             assert_eq!(
@@ -346,7 +362,7 @@ fn enospc_on_append_fails_write_but_preserves_consistency() {
     vol.write_ct(1, &ct(3), true).unwrap();
     drop(vol);
     backing.crash_all_lost();
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert_eq!(vol.read_ct(1).unwrap().unwrap().1, ct(3));
 }
 
@@ -398,7 +414,7 @@ fn allocation_corruption_one_side_recovers_both_sides_fails() {
 
     // One side corrupted: A/B protocol falls back.
     corrupt(&layout::shard_alloc_a(0));
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(9));
     drop(vol);
 
@@ -424,10 +440,10 @@ fn allocated_bit_with_invalid_slot_is_eio_not_zeros() {
     let g = geometry();
     let (shard, idx) = g.shard_of_unit(5);
     let f = backing.open(&layout::shard_data(shard), false).unwrap();
-    f.write_at(g.slot_offset(idx), &vec![0xEE; 100]).unwrap();
+    f.write_at(g.slot_offset(idx), &[0xEE; 100]).unwrap();
     f.sync_data().unwrap();
 
-    let mut vol = recover(&backing).unwrap();
+    let vol = recover(&backing).unwrap();
     assert!(
         vol.read_ct(5).is_err(),
         "allocated unit with invalid slot must be EIO, not fabricated zeros"

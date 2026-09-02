@@ -59,7 +59,9 @@ mod tests {
 
     #[test]
     fn rejects_escapes() {
-        for bad in ["", "/abs", "a/../b", "..", "a//b", "a\\b", "c:evil", "a/./b"] {
+        for bad in [
+            "", "/abs", "a/../b", "..", "a//b", "a\\b", "c:evil", "a/./b",
+        ] {
             assert!(validate(bad, false).is_err(), "should reject {bad:?}");
         }
     }

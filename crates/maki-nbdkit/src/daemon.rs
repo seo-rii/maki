@@ -70,9 +70,7 @@ fn resolve_key_source(cred: &CredentialRef) -> Result<(Box<dyn KeySource>, Strin
 
 /// Build the configured crypto provider (SPEC §12: profile mismatch is
 /// caught later by the attach self-test).
-pub async fn build_provider(
-    config: &VolumeConfig,
-) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
     let unit = config.volume.crypto_unit_size;
     let compat = config.crypto.crypto_compatibility_id.as_str();
     match config.crypto.provider.as_str() {
@@ -206,8 +204,11 @@ async fn remote_http_provider(
                 .max_operation_time
                 .map(|d| d.0)
                 .unwrap_or(std::time::Duration::from_secs(30));
-            let initial = retry.initial_delay.0.max(std::time::Duration::from_millis(1));
-            Some(((op_time.as_millis() / initial.as_millis()).max(1)).min(1000) as u32)
+            let initial = retry
+                .initial_delay
+                .0
+                .max(std::time::Duration::from_millis(1));
+            Some((op_time.as_millis() / initial.as_millis()).clamp(1, 1000) as u32)
         }
     };
     let dispatch = DispatchConfig {
@@ -251,12 +252,10 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
         },
         cache: match config.cache.mode {
             maki_format::config::CacheMode::Off => None,
-            maki_format::config::CacheMode::Read => {
-                Some(maki_core::engine::EngineCacheConfig {
-                    max_bytes: config.cache.max_bytes.0,
-                    ttl: config.cache.ttl.0,
-                })
-            }
+            maki_format::config::CacheMode::Read => Some(maki_core::engine::EngineCacheConfig {
+                max_bytes: config.cache.max_bytes.0,
+                ttl: config.cache.ttl.0,
+            }),
         },
     }
 }

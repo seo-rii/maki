@@ -21,7 +21,11 @@ pub fn create_volume(
         ));
     }
 
-    for dir in [layout::DATA_DIR, layout::JOURNAL_DIR, layout::CHECKPOINT_DIR] {
+    for dir in [
+        layout::DATA_DIR,
+        layout::JOURNAL_DIR,
+        layout::CHECKPOINT_DIR,
+    ] {
         backing.create_dir_all(dir)?;
     }
 

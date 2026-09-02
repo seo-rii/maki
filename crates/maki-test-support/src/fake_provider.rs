@@ -220,7 +220,7 @@ impl FakeCryptoProvider {
                 if let Some(first) = out.first_mut() {
                     first
                         .data
-                        .extend(std::iter::repeat(0u8).take(self.overhead as usize + 64));
+                        .extend(std::iter::repeat_n(0u8, self.overhead as usize + 64));
                 }
                 out
             }

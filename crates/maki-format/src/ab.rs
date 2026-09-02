@@ -45,7 +45,11 @@ impl AbStore {
         let a = self.read_side::<T>(backing, &self.a);
         let b = self.read_side::<T>(backing, &self.b);
         Ok(match (a, b) {
-            (Some(a), Some(b)) => Some(if a.generation() >= b.generation() { a } else { b }),
+            (Some(a), Some(b)) => Some(if a.generation() >= b.generation() {
+                a
+            } else {
+                b
+            }),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
             (None, None) => None,

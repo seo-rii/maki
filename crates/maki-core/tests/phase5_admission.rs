@@ -114,12 +114,7 @@ async fn saturation_respects_callback_limit_and_flush_fua_complete() {
     drop(engine);
     backing.crash_all_lost();
     let provider2 = Arc::new(FakeCryptoProvider::new(UNIT));
-    let engine = engine_with(
-        &backing,
-        provider2,
-        EngineLimits::default(),
-    )
-    .await;
+    let engine = engine_with(&backing, provider2, EngineLimits::default()).await;
     assert_eq!(
         engine.read(100 * UNIT as u64, UNIT as usize).await.unwrap(),
         vec![0xFA; UNIT as usize]

@@ -18,7 +18,9 @@ pub struct RetryPolicy {
 /// `delay = random(0, min(max_delay, initial_delay × 2^attempt))` (SPEC §31).
 pub fn full_jitter_delay(policy: &RetryPolicy, attempt: u32, rng: &mut impl Rng) -> Duration {
     let factor = 2u32.saturating_pow(attempt.min(31));
-    let cap = policy.max_delay.min(policy.initial_delay.saturating_mul(factor));
+    let cap = policy
+        .max_delay
+        .min(policy.initial_delay.saturating_mul(factor));
     Duration::from_nanos(rng.random_range(0..=cap.as_nanos().min(u64::MAX as u128) as u64))
 }
 

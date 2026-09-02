@@ -38,9 +38,7 @@ impl KeySource for MapKeySource {
 }
 
 fn missing(name: &str) -> CryptoError {
-    CryptoError::ProviderFatal(format!(
-        "credential {name:?} unavailable — failing closed"
-    ))
+    CryptoError::ProviderFatal(format!("credential {name:?} unavailable — failing closed"))
 }
 
 /// Reads credentials from a directory of files: systemd `LoadCredential`

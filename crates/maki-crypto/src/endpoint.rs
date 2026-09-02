@@ -221,7 +221,10 @@ impl EndpointSet {
                 }
                 tried_any = true;
                 calls_made += 1;
-                match self.call_endpoint(&endpoint, context, &request, bytes).await {
+                match self
+                    .call_endpoint(&endpoint, context, &request, bytes)
+                    .await
+                {
                     Ok(response) => {
                         endpoint.breaker.on_success();
                         return Ok(response);

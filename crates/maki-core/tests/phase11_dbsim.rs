@@ -229,7 +229,10 @@ async fn recover_database(engine: &Engine) -> (Vec<u32>, u32) {
         for frame in frames {
             let (ftxn, page, image) = frame_to_image(frame);
             debug_assert_eq!(ftxn, *txn);
-            engine.write(off(page), &image, false).await.expect("replay");
+            engine
+                .write(off(page), &image, false)
+                .await
+                .expect("replay");
         }
         replayed.push(*txn);
     }
@@ -391,7 +394,11 @@ async fn db_qualification_run(seed: u64, txn_count: u32) {
     let engine = db.engine.clone();
     for (page, committed_txn) in &ledger {
         let got = engine.read(off(*page), UNIT as usize).await.unwrap();
-        assert_eq!(got, page_image(*committed_txn, *page), "seed {seed}: final check");
+        assert_eq!(
+            got,
+            page_image(*committed_txn, *page),
+            "seed {seed}: final check"
+        );
     }
 }
 
@@ -413,13 +420,19 @@ async fn provider_outage_aborts_transaction_without_corruption() {
     .unwrap();
 
     // Committed baseline.
-    engine.write(off(0), &page_image(1, 0), false).await.unwrap();
+    engine
+        .write(off(0), &page_image(1, 0), false)
+        .await
+        .unwrap();
     engine.flush().await.unwrap();
 
     // Outage: the next encrypt calls fail.
     provider.fail_next([maki_crypto::CryptoError::Retryable("outage".to_string())]);
     assert!(
-        engine.write(off(0), &page_image(2, 0), false).await.is_err(),
+        engine
+            .write(off(0), &page_image(2, 0), false)
+            .await
+            .is_err(),
         "write during outage fails (engine layer has no retry; the \
          dispatcher above it does)"
     );

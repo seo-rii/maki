@@ -70,18 +70,18 @@ impl SlotStore {
             let alloc = alloc_ab
                 .load::<AllocationMap>(backing.as_ref())?
                 .ok_or_else(|| {
-                    CoreError::Corrupt(format!(
-                        "shard {shard_idx}: no valid allocation map copy"
-                    ))
+                    CoreError::Corrupt(format!("shard {shard_idx}: no valid allocation map copy"))
                 })?;
             if alloc.units() != geometry.units_per_shard() {
                 return Err(CoreError::Corrupt(format!(
                     "shard {shard_idx}: allocation map size mismatch"
                 )));
             }
-            let data = backing.open(&layout::shard_data(shard_idx), false).map_err(|e| {
-                CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
-            })?;
+            let data = backing
+                .open(&layout::shard_data(shard_idx), false)
+                .map_err(|e| {
+                    CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                })?;
             shards.insert(
                 shard_idx,
                 Shard {
@@ -205,7 +205,9 @@ impl SlotStore {
         for shard in self.shards.values_mut() {
             if shard.dirty_alloc {
                 fp("checkpoint.alloc_store")?;
-                shard.alloc_ab.store(self.backing.as_ref(), &mut shard.alloc)?;
+                shard
+                    .alloc_ab
+                    .store(self.backing.as_ref(), &mut shard.alloc)?;
                 shard.dirty_alloc = false;
                 any = true;
             }
@@ -227,9 +229,10 @@ impl SlotStore {
         }
         let offset = self.geometry.slot_offset(in_shard);
         let mut header_bytes = [0u8; 64];
-        shard.data.read_at(offset, &mut header_bytes).map_err(|e| {
-            CoreError::Corrupt(format!("unit {unit}: slot read failed: {e}"))
-        })?;
+        shard
+            .data
+            .read_at(offset, &mut header_bytes)
+            .map_err(|e| CoreError::Corrupt(format!("unit {unit}: slot read failed: {e}")))?;
         let header = SlotHeader::decode(&header_bytes).map_err(|e| {
             CoreError::Corrupt(format!(
                 "unit {unit}: allocated but slot header invalid: {e}"
@@ -248,9 +251,10 @@ impl SlotStore {
             )));
         }
         let mut data = vec![0u8; header.ciphertext_len as usize];
-        shard.data.read_at(offset + 64, &mut data).map_err(|e| {
-            CoreError::Corrupt(format!("unit {unit}: ciphertext read failed: {e}"))
-        })?;
+        shard
+            .data
+            .read_at(offset + 64, &mut data)
+            .map_err(|e| CoreError::Corrupt(format!("unit {unit}: ciphertext read failed: {e}")))?;
         if crc32fast::hash(&data) != header.ciphertext_crc {
             return Err(CoreError::Corrupt(format!(
                 "unit {unit}: ciphertext CRC mismatch"
@@ -263,12 +267,7 @@ impl SlotStore {
     }
 
     /// Shards touched by the given unit list (for checkpoint fdatasync).
-    pub fn shards_of_units<'a>(
-        &self,
-        units: impl Iterator<Item = &'a u64>,
-    ) -> BTreeSet<u64> {
-        units
-            .map(|u| self.geometry.shard_of_unit(*u).0)
-            .collect()
+    pub fn shards_of_units<'a>(&self, units: impl Iterator<Item = &'a u64>) -> BTreeSet<u64> {
+        units.map(|u| self.geometry.shard_of_unit(*u).0).collect()
     }
 }

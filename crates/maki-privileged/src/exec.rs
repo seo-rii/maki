@@ -55,9 +55,7 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
                 // wiring is in the maki-attach binary.
             }
             PlannedStep::Umount { mountpoint } => run(step, "umount", &[mountpoint.as_str()])?,
-            PlannedStep::NbdDisconnect { device } => {
-                run(step, "nbd-client", &["-d", device])?
-            }
+            PlannedStep::NbdDisconnect { device } => run(step, "nbd-client", &["-d", device])?,
             PlannedStep::LvExtend {
                 vg_name,
                 lv_name,

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OverlayVersion {
     pub sequence: u64,
     pub ciphertext: Vec<u8>,
@@ -19,15 +19,6 @@ pub struct OverlayVersion {
 struct UnitOverlay {
     latest: OverlayVersion,
     durable: Option<OverlayVersion>,
-}
-
-impl Default for OverlayVersion {
-    fn default() -> Self {
-        Self {
-            sequence: 0,
-            ciphertext: Vec::new(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -61,7 +52,9 @@ impl Overlay {
         self.bytes += ciphertext.len() as u64;
         let entry = self.units.entry(unit).or_default();
         if entry.latest.sequence != 0 {
-            self.bytes = self.bytes.saturating_sub(entry.latest.ciphertext.len() as u64);
+            self.bytes = self
+                .bytes
+                .saturating_sub(entry.latest.ciphertext.len() as u64);
         }
         entry.latest = OverlayVersion {
             sequence,
@@ -92,20 +85,19 @@ impl Overlay {
                 // is gone, but its successor is either also <= durable (its
                 // own queue entry promotes it) or still volatile (the old
                 // durable copy, if any, stays).
-                if entry.latest.sequence == seq {
-                    if entry
+                if entry.latest.sequence == seq
+                    && entry
                         .durable
                         .as_ref()
                         .map(|d| d.sequence < seq)
                         .unwrap_or(true)
-                    {
-                        if entry.durable.is_none() {
-                            self.bytes += entry.latest.ciphertext.len() as u64;
-                        } else {
-                            // replacing durable: bytes stay ~same
-                        }
-                        entry.durable = Some(entry.latest.clone());
+                {
+                    if entry.durable.is_none() {
+                        self.bytes += entry.latest.ciphertext.len() as u64;
+                    } else {
+                        // replacing durable: bytes stay ~same
                     }
+                    entry.durable = Some(entry.latest.clone());
                 }
             }
         }

@@ -167,6 +167,7 @@ impl Backing for FileBacking {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&p)?;
         match file.try_lock() {
             Ok(()) => Ok(Box::new(FileLock { _file: file })),

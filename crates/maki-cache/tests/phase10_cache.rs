@@ -112,7 +112,11 @@ fn runtime_resize_shrinks_and_grows() {
     // Shrink: immediate eviction down to the new budget.
     cache.set_max_bytes(1024);
     let stats = cache.stats();
-    assert!(stats.bytes <= 1024, "resize must evict: {} bytes", stats.bytes);
+    assert!(
+        stats.bytes <= 1024,
+        "resize must evict: {} bytes",
+        stats.bytes
+    );
     assert!(stats.entries <= 2);
     // Grow: capacity available again.
     cache.set_max_bytes(4096);
@@ -162,5 +166,8 @@ fn eviction_drops_buffers() {
     assert!(cache.get(2, 1).is_none(), "TTL eviction");
     let stats = cache.stats();
     assert_eq!(stats.entries, 0);
-    assert_eq!(stats.bytes, 0, "all buffers released (and zeroized on drop)");
+    assert_eq!(
+        stats.bytes, 0,
+        "all buffers released (and zeroized on drop)"
+    );
 }

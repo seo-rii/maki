@@ -55,7 +55,9 @@ pub fn validate_encrypt_result(
             )));
         }
         if ct.data.is_empty() {
-            return Err(CryptoError::Contract(format!("encrypt result {i} is empty")));
+            return Err(CryptoError::Contract(format!(
+                "encrypt result {i} is empty"
+            )));
         }
         if ct.data.len() > caps.max_ciphertext_size as usize {
             return Err(CryptoError::Contract(format!(

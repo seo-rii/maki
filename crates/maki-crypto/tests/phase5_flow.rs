@@ -8,7 +8,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use maki_crypto::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
-use maki_crypto::clock::Clock;
 use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 use maki_crypto::flow::{BoundedQueue, DualSemaphore};
 use maki_crypto::retry::{full_jitter_delay, RetryBudget, RetryBudgetConfig, RetryPolicy};
@@ -208,7 +207,9 @@ fn full_jitter_is_bounded_and_spread() {
     let mut rng = StdRng::seed_from_u64(1);
     let mut seen_distinct = std::collections::HashSet::new();
     for attempt in 0..20u32 {
-        let cap = policy.max_delay.min(policy.initial_delay * 2u32.saturating_pow(attempt.min(16)));
+        let cap = policy
+            .max_delay
+            .min(policy.initial_delay * 2u32.saturating_pow(attempt.min(16)));
         for _ in 0..50 {
             let d = full_jitter_delay(&policy, attempt, &mut rng);
             assert!(d <= cap, "attempt {attempt}: {d:?} > cap {cap:?}");
@@ -402,7 +403,9 @@ async fn recovered_endpoint_warms_up_via_half_open() {
     }
     let a_state = set.endpoint_states();
     let calls_before = a.encrypt_calls();
-    assert!(a_state.iter().any(|(n, s)| n == "a" && *s == CircuitState::Open));
+    assert!(a_state
+        .iter()
+        .any(|(n, s)| n == "a" && *s == CircuitState::Open));
 
     // After the open interval, the endpoint is probed again (warm-up) and
     // returns to service.
@@ -415,7 +418,9 @@ async fn recovered_endpoint_warms_up_via_half_open() {
         "recovered endpoint must be warmed back into rotation"
     );
     let a_state = set.endpoint_states();
-    assert!(a_state.iter().any(|(n, s)| n == "a" && *s == CircuitState::Closed));
+    assert!(a_state
+        .iter()
+        .any(|(n, s)| n == "a" && *s == CircuitState::Closed));
 }
 
 // ---------- provider-fatal errors are never retried ----------

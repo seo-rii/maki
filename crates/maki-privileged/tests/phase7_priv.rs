@@ -7,7 +7,7 @@
 //! docs/phase-7.md.
 
 use maki_privileged::plan::{plan_attach, plan_detach, plan_grow, AttachRequest, GrowRequest};
-use maki_privileged::verify::{verify_mount_identity, MountObservation, MountExpectation};
+use maki_privileged::verify::{verify_mount_identity, MountExpectation, MountObservation};
 
 fn packaging(path: &str) -> String {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/");
@@ -21,14 +21,14 @@ fn packaging(path: &str) -> String {
 fn data_plane_unit_is_unprivileged_and_sandboxed() {
     let unit = packaging("systemd/maki@.service");
     for required in [
-        "User=maki",                 // PRIV-001: UID != 0
+        "User=maki", // PRIV-001: UID != 0
         "Group=maki",
-        "CapabilityBoundingSet=",    // PRIV-002: empty capability set
+        "CapabilityBoundingSet=", // PRIV-002: empty capability set
         "AmbientCapabilities=",
         "NoNewPrivileges=yes",
-        "LimitCORE=0",               // PRIV-015: no core dumps
-        "Restart=on-failure",        // PRIV-012: restart after failure
-        "ProtectSystem=strict",      // PRIV-004: /etc immutable
+        "LimitCORE=0",          // PRIV-015: no core dumps
+        "Restart=on-failure",   // PRIV-012: restart after failure
+        "ProtectSystem=strict", // PRIV-004: /etc immutable
         "ProtectHome=yes",
         "PrivateTmp=yes",
         "ReadWritePaths=/var/lib/maki/%i",
@@ -126,7 +126,14 @@ fn plans_contain_no_credential_material() {
         })
     );
     let lower = rendered.to_lowercase();
-    for forbidden in ["credential", "token", "secret", "key=", "tls", "authorization"] {
+    for forbidden in [
+        "credential",
+        "token",
+        "secret",
+        "key=",
+        "tls",
+        "authorization",
+    ] {
         assert!(
             !lower.contains(forbidden),
             "plan leaked credential-adjacent term {forbidden:?}:\n{rendered}"
@@ -185,15 +192,26 @@ fn mount_identity_accepts_matching_mount() {
 
 #[test]
 fn mount_identity_rejects_every_mismatch() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut MountObservation)>)> = vec![
-        ("missing mountpoint", Box::new(|o| o.mountpoint_exists = false)),
+    type ObservationMutation = Box<dyn Fn(&mut MountObservation)>;
+
+    let cases: Vec<(&str, ObservationMutation)> = vec![
+        (
+            "missing mountpoint",
+            Box::new(|o| o.mountpoint_exists = false),
+        ),
         ("wrong fstype", Box::new(|o| o.fstype = Some("ext4".into()))),
-        ("wrong fs uuid", Box::new(|o| o.fs_uuid = Some("XXXX".into()))),
+        (
+            "wrong fs uuid",
+            Box::new(|o| o.fs_uuid = Some("XXXX".into())),
+        ),
         (
             "wrong volume uuid",
             Box::new(|o| o.sentinel_volume_uuid = Some("9999".into())),
         ),
-        ("missing sentinel", Box::new(|o| o.sentinel_volume_uuid = None)),
+        (
+            "missing sentinel",
+            Box::new(|o| o.sentinel_volume_uuid = None),
+        ),
         ("nbd down", Box::new(|o| o.nbd_connected = false)),
         ("probe failed", Box::new(|o| o.rw_probe_ok = false)),
     ];

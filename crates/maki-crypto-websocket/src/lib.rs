@@ -27,8 +27,8 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use maki_crypto::{
-    CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
-    PlaintextUnit, SecretBuffer,
+    CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
+    SecretBuffer,
 };
 
 #[derive(Debug, Clone)]
@@ -42,9 +42,8 @@ pub struct WsProviderSpec {
 /// id → (connection generation the request was sent on, responder).
 /// The generation lets a dying connection's sweep fail only *its own*
 /// requests — never ones already in flight on a successor connection.
-type Pending = Arc<
-    parking_lot::Mutex<HashMap<u64, (u64, oneshot::Sender<Result<Value, CryptoError>>)>>,
->;
+type Pending =
+    Arc<parking_lot::Mutex<HashMap<u64, (u64, oneshot::Sender<Result<Value, CryptoError>>)>>>;
 
 struct Connection {
     sender: mpsc::Sender<Message>,
@@ -115,13 +114,10 @@ impl WsCryptoProvider {
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
-        let (ws, _response) = tokio_tungstenite::connect_async_with_config(
-            &self.spec.url,
-            Some(config),
-            false,
-        )
-        .await
-        .map_err(|e| retryable(format!("websocket connect failed: {e}")))?;
+        let (ws, _response) =
+            tokio_tungstenite::connect_async_with_config(&self.spec.url, Some(config), false)
+                .await
+                .map_err(|e| retryable(format!("websocket connect failed: {e}")))?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (mut sink, mut source) = ws.split();
@@ -254,9 +250,12 @@ impl WsCryptoProvider {
 
     /// One logical request with a single transparent reconnect attempt on
     /// transport failure.
-    async fn request(&self, op: &str, context: &CryptoContext, items: &[(u64, &[u8])])
-        -> Result<Vec<Vec<u8>>, CryptoError>
-    {
+    async fn request(
+        &self,
+        op: &str,
+        context: &CryptoContext,
+        items: &[(u64, &[u8])],
+    ) -> Result<Vec<Vec<u8>>, CryptoError> {
         let mut last_err = None;
         for _attempt in 0..2 {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -279,7 +278,11 @@ impl WsCryptoProvider {
         Err(last_err.unwrap())
     }
 
-    fn parse_response(&self, response: &Value, expected: usize) -> Result<Vec<Vec<u8>>, CryptoError> {
+    fn parse_response(
+        &self,
+        response: &Value,
+        expected: usize,
+    ) -> Result<Vec<Vec<u8>>, CryptoError> {
         if let Some(error) = response.get("error") {
             let class = error.get("class").and_then(|c| c.as_str()).unwrap_or("");
             let message = error

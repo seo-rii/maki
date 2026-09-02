@@ -162,7 +162,10 @@ impl Engine {
         .await?;
 
         let (batch_max_items, batch_max_bytes) = if caps.batch.supported {
-            (caps.batch.max_items.max(1) as usize, caps.batch.max_bytes.max(1))
+            (
+                caps.batch.max_items.max(1) as usize,
+                caps.batch.max_bytes.max(1),
+            )
         } else {
             (1, u64::MAX)
         };
@@ -233,8 +236,8 @@ impl Engine {
     fn check_range(&self, offset: u64, len: usize) -> Result<(), CoreError> {
         let block = self.inner.geometry.device_block_size as u64;
         if len == 0
-            || offset % block != 0
-            || len as u64 % block != 0
+            || !offset.is_multiple_of(block)
+            || !(len as u64).is_multiple_of(block)
             || offset.checked_add(len as u64).map(|end| end > self.size()) != Some(false)
         {
             return Err(CoreError::Invalid(format!(
@@ -317,7 +320,7 @@ impl Engine {
             } else if let Some(buf) = cached.remove(&unit) {
                 out.extend_from_slice(&buf.expose()[from as usize..to as usize]);
             } else {
-                out.extend(std::iter::repeat(0u8).take((to - from) as usize));
+                out.extend(std::iter::repeat_n(0u8, (to - from) as usize));
             }
         }
         Ok(out)

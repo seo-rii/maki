@@ -39,16 +39,14 @@ impl Geometry {
         max_virtual_size: u64,
         shard_logical_size: u64,
     ) -> Result<Self, FormatError> {
-        if !is_pow2(device_block_size as u64)
-            || !(512..=65536).contains(&device_block_size)
-        {
+        if !is_pow2(device_block_size as u64) || !(512..=65536).contains(&device_block_size) {
             return Err(FormatError::Invalid(format!(
                 "device_block_size {device_block_size} must be a power of two in [512, 65536]"
             )));
         }
         if crypto_unit_size == 0
             || crypto_unit_size < device_block_size
-            || crypto_unit_size % device_block_size != 0
+            || !crypto_unit_size.is_multiple_of(device_block_size)
         {
             return Err(FormatError::Invalid(format!(
                 "crypto_unit_size {crypto_unit_size} must be a positive multiple of device_block_size {device_block_size}"
@@ -64,12 +62,12 @@ impl Geometry {
                 "max_ciphertext_size {max_ciphertext_size} < crypto_unit_size {crypto_unit_size}"
             )));
         }
-        if max_virtual_size == 0 || max_virtual_size % crypto_unit_size as u64 != 0 {
+        if max_virtual_size == 0 || !max_virtual_size.is_multiple_of(crypto_unit_size as u64) {
             return Err(FormatError::Invalid(format!(
                 "max_virtual_size {max_virtual_size} must be a positive multiple of crypto_unit_size"
             )));
         }
-        if shard_logical_size == 0 || shard_logical_size % crypto_unit_size as u64 != 0 {
+        if shard_logical_size == 0 || !shard_logical_size.is_multiple_of(crypto_unit_size as u64) {
             return Err(FormatError::Invalid(format!(
                 "shard_logical_size {shard_logical_size} must be a positive multiple of crypto_unit_size"
             )));

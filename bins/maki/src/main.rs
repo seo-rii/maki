@@ -115,10 +115,7 @@ fn check(config: &str) -> Result<bool, String> {
     for error in &report.errors {
         println!("ERROR: {error}");
     }
-    println!(
-        "check {}",
-        if report.ok() { "passed" } else { "FAILED" }
-    );
+    println!("check {}", if report.ok() { "passed" } else { "FAILED" });
     Ok(report.ok())
 }
 

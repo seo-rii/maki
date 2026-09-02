@@ -125,7 +125,9 @@ impl TestServer {
             stream.write_all(head.as_bytes()).await?;
             match spec.drop_after {
                 Some(n) => {
-                    stream.write_all(&spec.body[..n.min(spec.body.len())]).await?;
+                    stream
+                        .write_all(&spec.body[..n.min(spec.body.len())])
+                        .await?;
                     return Ok(()); // close mid-body
                 }
                 None => stream.write_all(&spec.body).await?,

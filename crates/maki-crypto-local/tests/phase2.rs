@@ -50,7 +50,10 @@ fn pt(unit_index: u64, fill: u8) -> PlaintextUnit {
 async fn gcm_siv_round_trip() {
     let p = gcm("vol-key");
     let cts = p
-        .encrypt_batch(&ctx(), &[pt(0, 0x00), pt(9, 0xAB), pt(u64::MAX / 4096, 0xFF)])
+        .encrypt_batch(
+            &ctx(),
+            &[pt(0, 0x00), pt(9, 0xAB), pt(u64::MAX / 4096, 0xFF)],
+        )
         .await
         .unwrap();
     let caps = p.capabilities().await.unwrap();
@@ -157,11 +160,7 @@ fn wrong_key_length_fails_closed() {
 fn file_key_source_reads_raw_and_hex() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("raw-key"), vec![0xAA; 32]).unwrap();
-    std::fs::write(
-        dir.path().join("hex-key"),
-        format!("{}\n", "ab".repeat(32)),
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("hex-key"), format!("{}\n", "ab".repeat(32))).unwrap();
     let src = maki_crypto_local::keysource::FileKeySource::new(dir.path());
     assert_eq!(src.load("raw-key").unwrap().expose(), &vec![0xAA; 32][..]);
     assert_eq!(src.load("hex-key").unwrap().expose(), &vec![0xAB; 32][..]);
@@ -195,16 +194,20 @@ async fn local_providers_pass_self_test() {
 async fn cross_endpoint_same_key_passes_different_key_fails() {
     let a = gcm("vol-key");
     let b = gcm("vol-key");
-    cross_endpoint_self_test(&a, &b, &ctx(), UNIT).await.unwrap();
+    cross_endpoint_self_test(&a, &b, &ctx(), UNIT)
+        .await
+        .unwrap();
     let c = gcm("vol-key-2");
-    assert!(cross_endpoint_self_test(&a, &c, &ctx(), UNIT).await.is_err());
+    assert!(cross_endpoint_self_test(&a, &c, &ctx(), UNIT)
+        .await
+        .is_err());
 }
 
 // ---------- secret leakage ----------
 
 #[test]
 fn secrets_never_appear_in_debug_output() {
-    let key_material = vec![0x11; 32];
+    let key_material = [0x11; 32];
     let provider = gcm("vol-key");
     let rendered = format!("{provider:?}");
     let hexed = key_material
@@ -212,14 +215,20 @@ fn secrets_never_appear_in_debug_output() {
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     assert!(!rendered.contains(&hexed), "provider Debug leaks key");
-    assert!(!rendered.contains("17, 17, 17"), "provider Debug leaks key bytes");
+    assert!(
+        !rendered.contains("17, 17, 17"),
+        "provider Debug leaks key bytes"
+    );
 
     let unit = PlaintextUnit {
         unit_index: 1,
         data: SecretBuffer::from_slice(b"top-secret-plaintext"),
     };
     let rendered = format!("{unit:?}");
-    assert!(!rendered.contains("top-secret"), "plaintext leaked: {rendered}");
+    assert!(
+        !rendered.contains("top-secret"),
+        "plaintext leaked: {rendered}"
+    );
     assert!(rendered.contains("redacted"));
 }
 

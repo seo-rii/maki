@@ -95,7 +95,9 @@ fn fua_write_then_crash_is_durable() {
         let file = backing.open("data", false).unwrap();
         let mut actual = vec![0u8; UNIT];
         file.read_at(0, &mut actual).unwrap();
-        model.crash_adopt(0, &actual).expect("FUA durability violated");
+        model
+            .crash_adopt(0, &actual)
+            .expect("FUA durability violated");
         assert_eq!(actual, new, "FUA write lost at seed {seed}");
     }
 }
@@ -207,7 +209,7 @@ fn same_unit_concurrent_writes_serialize() {
                     }
                     yield_now().await;
                 }
-                if value.get() != 0 && busy.get() != true {
+                if value.get() != 0 && !busy.get() {
                     overlaps.set(overlaps.get() + 1);
                 }
                 // critical section with interleaving opportunities
@@ -223,7 +225,11 @@ fn same_unit_concurrent_writes_serialize() {
             });
         }
         sched.run();
-        assert_eq!(overlaps.get(), 0, "critical section overlapped, seed {seed}");
+        assert_eq!(
+            overlaps.get(),
+            0,
+            "critical section overlapped, seed {seed}"
+        );
         let v = value.get();
         assert!(v == 1 || v == 2, "final value must be one writer's");
     }

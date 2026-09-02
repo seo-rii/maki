@@ -62,7 +62,7 @@ impl PayloadEncoding {
                 .decode(s)
                 .map_err(|e| bad(e.to_string())),
             Self::HexLower | Self::HexUpper => {
-                if s.len() % 2 != 0 {
+                if !s.len().is_multiple_of(2) {
                     return Err(bad("odd hex length".to_string()));
                 }
                 (0..s.len())
@@ -264,9 +264,7 @@ impl HttpCryptoProvider {
             FieldSource::Payload(encoding) => Value::String(encoding.encode(payload)),
             FieldSource::UnitIndex => Value::from(unit_index),
             FieldSource::VolumeId => Value::String(context.volume_uuid.to_string()),
-            FieldSource::CompatibilityId => {
-                Value::String(context.crypto_compatibility_id.clone())
-            }
+            FieldSource::CompatibilityId => Value::String(context.crypto_compatibility_id.clone()),
             FieldSource::BatchIndex => Value::from(batch_index as u64),
         }
     }
@@ -536,7 +534,11 @@ impl HttpCryptoProvider {
                 method: op_cfg.method.clone(),
                 path: op_cfg.path.clone(),
                 headers,
-                query: op_cfg.query.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                query: op_cfg
+                    .query
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
                 body,
                 response,
             })
@@ -577,10 +579,7 @@ impl HttpCryptoProvider {
         };
 
         let tls = http.tls.as_ref().map(|t| {
-            let ca_pem = t
-                .ca_file
-                .as_ref()
-                .and_then(|path| std::fs::read(path).ok());
+            let ca_pem = t.ca_file.as_ref().and_then(|path| std::fs::read(path).ok());
             let identity_pem = t
                 .client_cert_file
                 .as_ref()
@@ -596,10 +595,7 @@ impl HttpCryptoProvider {
             encrypt,
             decrypt,
             capabilities,
-            timeout: http
-                .timeout
-                .map(|d| d.0)
-                .unwrap_or(Duration::from_secs(10)),
+            timeout: http.timeout.map(|d| d.0).unwrap_or(Duration::from_secs(10)),
             max_response_bytes: http
                 .max_response_bytes
                 .map(|b| b.0 as usize)

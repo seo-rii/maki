@@ -42,16 +42,12 @@ impl FromStr for ByteSize {
 
     fn from_str(s: &str) -> Result<Self, String> {
         let s = s.trim();
-        let split = s
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(s.len());
+        let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
         let (num, suffix) = s.split_at(split);
         if num.is_empty() {
             return Err(format!("byte size {s:?}: missing number"));
         }
-        let value: u64 = num
-            .parse()
-            .map_err(|e| format!("byte size {s:?}: {e}"))?;
+        let value: u64 = num.parse().map_err(|e| format!("byte size {s:?}: {e}"))?;
         let mult: u64 = match suffix.trim() {
             "" | "B" => 1,
             "KiB" => 1 << 10,
@@ -203,17 +199,12 @@ fn d_shard_logical() -> ByteSize {
     ByteSize(64 << 30)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AvailabilityPolicy {
+    #[default]
     Stall,
     BoundedError,
-}
-
-impl Default for AvailabilityPolicy {
-    fn default() -> Self {
-        AvailabilityPolicy::Stall
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

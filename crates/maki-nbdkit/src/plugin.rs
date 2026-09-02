@@ -248,6 +248,6 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
 };
 
 #[no_mangle]
-pub extern "C" fn plugin_init() -> *const nbdkit_plugin {
+extern "C" fn plugin_init() -> *const nbdkit_plugin {
     &PLUGIN
 }

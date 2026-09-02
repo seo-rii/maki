@@ -50,9 +50,6 @@ impl CryptoError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.class(),
-            ErrorClass::Retryable | ErrorClass::Throttled
-        )
+        matches!(self.class(), ErrorClass::Retryable | ErrorClass::Throttled)
     }
 }

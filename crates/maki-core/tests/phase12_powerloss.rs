@@ -83,7 +83,10 @@ async fn critical_sequence(seed: u64) {
 
     // Establish "old" content durably for A, B, C.
     for unit in [0u64, 1, 2] {
-        engine.write(off(unit), &old_img(unit), false).await.unwrap();
+        engine
+            .write(off(unit), &old_img(unit), false)
+            .await
+            .unwrap();
     }
     engine.flush().await.unwrap();
 
@@ -99,8 +102,16 @@ async fn critical_sequence(seed: u64) {
     let a = engine.read(off(0), UNIT as usize).await.unwrap();
     let b = engine.read(off(1), UNIT as usize).await.unwrap();
     let c = engine.read(off(2), UNIT as usize).await.unwrap();
-    assert_eq!(a, new_img(0), "seed {seed}: A must be new (FLUSH violation)");
-    assert_eq!(b, new_img(1), "seed {seed}: B must be new (FLUSH violation)");
+    assert_eq!(
+        a,
+        new_img(0),
+        "seed {seed}: A must be new (FLUSH violation)"
+    );
+    assert_eq!(
+        b,
+        new_img(1),
+        "seed {seed}: B must be new (FLUSH violation)"
+    );
     assert!(
         c == old_img(2) || c == new_img(2),
         "seed {seed}: C must be old or new, never torn or foreign"

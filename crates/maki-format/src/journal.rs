@@ -123,10 +123,7 @@ pub fn scan_segment(buf: &[u8], first_sequence: u64) -> (Vec<JournalRecord>, Sca
                 records,
                 ScanOutcome::Corrupt {
                     at: pos,
-                    reason: format!(
-                        "sequence {} where {} expected",
-                        header.sequence, expected
-                    ),
+                    reason: format!("sequence {} where {} expected", header.sequence, expected),
                 },
             );
         }

@@ -169,7 +169,10 @@ fn provider(url: &str) -> WsCryptoProvider {
 async fn roundtrip_with_correlation_ids() {
     let (url, _) = ws_server(Mode::Normal).await;
     let p = provider(&url);
-    let cts = p.encrypt_batch(&ctx(), &[pt(1, 0x10), pt(2, 0x20)]).await.unwrap();
+    let cts = p
+        .encrypt_batch(&ctx(), &[pt(1, 0x10), pt(2, 0x20)])
+        .await
+        .unwrap();
     assert_eq!(cts[0].data, vec![0x10 ^ XOR; UNIT]);
     let pts = p.decrypt_batch(&ctx(), &cts).await.unwrap();
     assert_eq!(pts[1].data.expose(), &vec![0x20; UNIT][..]);
@@ -219,7 +222,10 @@ async fn oversized_incoming_frame_is_an_error() {
     let (url, _) = ws_server(Mode::HugeResponse).await;
     let p = provider(&url); // max_frame_bytes = 512 KiB < huge response
     let err = p.encrypt_batch(&ctx(), &[pt(1, 0x01)]).await.unwrap_err();
-    assert!(err.is_retryable(), "oversized frame kills the connection: {err:?}");
+    assert!(
+        err.is_retryable(),
+        "oversized frame kills the connection: {err:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

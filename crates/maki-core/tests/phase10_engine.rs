@@ -69,7 +69,10 @@ async fn cached_reads_skip_the_provider() {
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider.clone(), read_cache()).await;
 
-    engine.write(0, &vec![0x42; UNIT as usize], false).await.unwrap();
+    engine
+        .write(0, &vec![0x42; UNIT as usize], false)
+        .await
+        .unwrap();
     let calls_after_write = provider.decrypt_calls();
     let first = engine.read(0, UNIT as usize).await.unwrap();
     let calls_after_first = provider.decrypt_calls();
@@ -93,10 +96,19 @@ async fn overwrite_invalidates_cached_plaintext() {
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider.clone(), read_cache()).await;
 
-    engine.write(0, &vec![0xA1; UNIT as usize], false).await.unwrap();
-    assert_eq!(engine.read(0, UNIT as usize).await.unwrap(), vec![0xA1; UNIT as usize]);
+    engine
+        .write(0, &vec![0xA1; UNIT as usize], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.read(0, UNIT as usize).await.unwrap(),
+        vec![0xA1; UNIT as usize]
+    );
     // Overwrite: any cached plaintext for the old version must be dead.
-    engine.write(0, &vec![0xB2; UNIT as usize], false).await.unwrap();
+    engine
+        .write(0, &vec![0xB2; UNIT as usize], false)
+        .await
+        .unwrap();
     assert_eq!(
         engine.read(0, UNIT as usize).await.unwrap(),
         vec![0xB2; UNIT as usize],
@@ -116,13 +128,19 @@ async fn concurrent_read_write_with_cache_never_stale() {
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, read_cache()).await;
     let off = 3 * UNIT as u64;
-    engine.write(off, &vec![0; UNIT as usize], false).await.unwrap();
+    engine
+        .write(off, &vec![0; UNIT as usize], false)
+        .await
+        .unwrap();
 
     let writer = {
         let engine = engine.clone();
         tokio::spawn(async move {
             for i in 1..=40u8 {
-                engine.write(off, &vec![i; UNIT as usize], false).await.unwrap();
+                engine
+                    .write(off, &vec![i; UNIT as usize], false)
+                    .await
+                    .unwrap();
             }
         })
     };
@@ -150,7 +168,10 @@ async fn cache_off_decrypts_every_read() {
     let backing = Arc::new(CrashableBacking::new());
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider.clone(), None).await;
-    engine.write(0, &vec![0x10; UNIT as usize], false).await.unwrap();
+    engine
+        .write(0, &vec![0x10; UNIT as usize], false)
+        .await
+        .unwrap();
     let base = provider.decrypt_calls();
     engine.read(0, UNIT as usize).await.unwrap();
     engine.read(0, UNIT as usize).await.unwrap();
@@ -177,7 +198,11 @@ async fn cache_resize_at_runtime() {
     assert_eq!(engine.stats().await.cache_bytes, 0);
     let base = provider.decrypt_calls();
     engine.read(0, UNIT as usize).await.unwrap();
-    assert_eq!(provider.decrypt_calls(), base + 1, "no cache after resize to 0");
+    assert_eq!(
+        provider.decrypt_calls(),
+        base + 1,
+        "no cache after resize to 0"
+    );
     engine.resize_cache(1 << 20);
     engine.read(0, UNIT as usize).await.unwrap(); // repopulates
     let base = provider.decrypt_calls();
@@ -201,7 +226,10 @@ async fn growth_during_workload_creates_shards_consistently() {
         let engine = engine.clone();
         tokio::spawn(async move {
             for i in 0..60u8 {
-                engine.write(0, &vec![i; UNIT as usize], false).await.unwrap();
+                engine
+                    .write(0, &vec![i; UNIT as usize], false)
+                    .await
+                    .unwrap();
             }
         })
     };
@@ -223,7 +251,10 @@ async fn growth_during_workload_creates_shards_consistently() {
 
     for unit in (8..248u64).step_by(8) {
         assert_eq!(
-            engine.read(unit * UNIT as u64, UNIT as usize).await.unwrap(),
+            engine
+                .read(unit * UNIT as u64, UNIT as usize)
+                .await
+                .unwrap(),
             vec![0x77; UNIT as usize],
             "unit {unit} lost during growth"
         );
@@ -233,6 +264,8 @@ async fn growth_during_workload_creates_shards_consistently() {
 /// Crash during growth: a failure mid shard-creation (data file created but
 /// catalog not yet committed) must recover to a consistent volume with no
 /// data loss for durable writes.
+// Failpoints are process-global, so this guard intentionally spans awaits.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn crash_during_shard_creation_recovers() {
     let _guard = failpoints::test_lock();
@@ -241,16 +274,25 @@ async fn crash_during_shard_creation_recovers() {
     let engine = engine_with_cache(&backing, provider, None).await;
 
     // Durable write in shard 0, checkpointed.
-    engine.write(0, &vec![0x01; UNIT as usize], true).await.unwrap();
+    engine
+        .write(0, &vec![0x01; UNIT as usize], true)
+        .await
+        .unwrap();
     engine.checkpoint().await.unwrap();
 
     // Write into a fresh shard, FUA (durable in journal), then make the
     // checkpoint fail at the catalog-commit boundary and crash.
     let far = 100 * UNIT as u64; // shard 12
-    engine.write(far, &vec![0x02; UNIT as usize], true).await.unwrap();
+    engine
+        .write(far, &vec![0x02; UNIT as usize], true)
+        .await
+        .unwrap();
     let fp = failpoints::set(
         "store.catalog_store",
-        failpoints::FailpointAction::IoError(io::ErrorKind::Other, "crash during growth".to_string()),
+        failpoints::FailpointAction::IoError(
+            io::ErrorKind::Other,
+            "crash during growth".to_string(),
+        ),
     );
     assert!(engine.checkpoint().await.is_err(), "checkpoint must fail");
     drop(fp);
@@ -259,7 +301,10 @@ async fn crash_during_shard_creation_recovers() {
 
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, None).await;
-    assert_eq!(engine.read(0, UNIT as usize).await.unwrap(), vec![0x01; UNIT as usize]);
+    assert_eq!(
+        engine.read(0, UNIT as usize).await.unwrap(),
+        vec![0x01; UNIT as usize]
+    );
     assert_eq!(
         engine.read(far, UNIT as usize).await.unwrap(),
         vec![0x02; UNIT as usize],
@@ -271,7 +316,10 @@ async fn crash_during_shard_creation_recovers() {
     backing.crash_all_lost();
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, None).await;
-    assert_eq!(engine.read(far, UNIT as usize).await.unwrap(), vec![0x02; UNIT as usize]);
+    assert_eq!(
+        engine.read(far, UNIT as usize).await.unwrap(),
+        vec![0x02; UNIT as usize]
+    );
 }
 
 // ---------- metrics ----------
@@ -281,7 +329,10 @@ async fn stats_expose_required_metrics_inputs() {
     let backing = Arc::new(CrashableBacking::new());
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, read_cache()).await;
-    engine.write(0, &vec![1; UNIT as usize], false).await.unwrap();
+    engine
+        .write(0, &vec![1; UNIT as usize], false)
+        .await
+        .unwrap();
     engine.read(0, UNIT as usize).await.unwrap();
     engine.read(0, UNIT as usize).await.unwrap();
     engine.flush().await.unwrap();

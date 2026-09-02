@@ -125,10 +125,7 @@ impl CryptoProvider for AesGcmSivProvider {
             let aad = self.aad(context, item.unit_index);
             let ct = self
                 .cipher
-                .encrypt(
-                    Nonce::from_slice(&nonce),
-                    Payload { msg: pt, aad: &aad },
-                )
+                .encrypt(Nonce::from_slice(&nonce), Payload { msg: pt, aad: &aad })
                 .map_err(|_| CryptoError::ProviderFatal("AEAD encryption failed".to_string()))?;
             let mut data = Vec::with_capacity(NONCE_LEN + ct.len());
             data.extend_from_slice(&nonce);
@@ -150,9 +147,7 @@ impl CryptoProvider for AesGcmSivProvider {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             if item.data.len() < NONCE_LEN + TAG_LEN {
-                return Err(CryptoError::Integrity(
-                    "ciphertext too short".to_string(),
-                ));
+                return Err(CryptoError::Integrity("ciphertext too short".to_string()));
             }
             let (nonce, body) = item.data.split_at(NONCE_LEN);
             let aad = self.aad(context, item.unit_index);
@@ -167,9 +162,7 @@ impl CryptoProvider for AesGcmSivProvider {
                 )
                 // Never include any data in the message: authentication
                 // failure yields no information.
-                .map_err(|_| {
-                    CryptoError::Integrity("AEAD authentication failed".to_string())
-                })?;
+                .map_err(|_| CryptoError::Integrity("AEAD authentication failed".to_string()))?;
             if pt.len() != self.unit_size as usize {
                 return Err(CryptoError::Integrity(
                     "decrypted length mismatch".to_string(),

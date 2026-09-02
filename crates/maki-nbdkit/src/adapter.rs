@@ -107,15 +107,11 @@ impl NbdAdapter {
     }
 
     /// Run a blocking engine operation with a panic boundary.
-    fn run<T>(
-        &self,
-        op: impl FnOnce(Engine) -> BoxCoreFuture<T>,
-    ) -> Result<T, AdapterError> {
+    fn run<T>(&self, op: impl FnOnce(Engine) -> BoxCoreFuture<T>) -> Result<T, AdapterError> {
         let state = self.state()?;
         let engine = state.engine.clone();
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            self.runtime.block_on(op(engine))
-        }));
+        let outcome =
+            std::panic::catch_unwind(AssertUnwindSafe(|| self.runtime.block_on(op(engine))));
         match outcome {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(map_core_error(&e)),
@@ -136,7 +132,9 @@ impl NbdAdapter {
     }
 
     pub fn block_sizes(&self) -> (u32, u32, u32) {
-        self.state().map(|s| s.block_sizes).unwrap_or((512, 4096, 1 << 20))
+        self.state()
+            .map(|s| s.block_sizes)
+            .unwrap_or((512, 4096, 1 << 20))
     }
 
     pub fn can_trim(&self) -> bool {
@@ -161,18 +159,15 @@ impl NbdAdapter {
 
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<(), AdapterError> {
         let len = buf.len();
-        let data = self.run(move |engine| {
-            Box::pin(async move { engine.read(offset, len).await })
-        })?;
+        let data =
+            self.run(move |engine| Box::pin(async move { engine.read(offset, len).await }))?;
         buf.copy_from_slice(&data);
         Ok(())
     }
 
     pub fn pwrite(&self, data: &[u8], offset: u64, fua: bool) -> Result<(), AdapterError> {
         let owned = data.to_vec();
-        self.run(move |engine| {
-            Box::pin(async move { engine.write(offset, &owned, fua).await })
-        })
+        self.run(move |engine| Box::pin(async move { engine.write(offset, &owned, fua).await }))
     }
 
     pub fn flush(&self) -> Result<(), AdapterError> {

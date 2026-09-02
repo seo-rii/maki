@@ -104,7 +104,10 @@ async fn self_test_detects_integrity_lies() {
     let err = provider_self_test(&p, &ctx(), UNIT, "test-profile-v1")
         .await
         .unwrap_err();
-    assert!(matches!(err.class(), maki_crypto::ErrorClass::ProviderFatal));
+    assert!(matches!(
+        err.class(),
+        maki_crypto::ErrorClass::ProviderFatal
+    ));
 }
 
 #[tokio::test]
@@ -112,12 +115,16 @@ async fn cross_endpoint_self_test_requires_interchangeable_ciphertext() {
     // Same key/profile: A→B and B→A must both decrypt (SPEC §34).
     let a = FakeCryptoProvider::new(UNIT as u32).with_key(1);
     let b = FakeCryptoProvider::new(UNIT as u32).with_key(1);
-    cross_endpoint_self_test(&a, &b, &ctx(), UNIT).await.unwrap();
+    cross_endpoint_self_test(&a, &b, &ctx(), UNIT)
+        .await
+        .unwrap();
 
     // Different keys: must fail even though compat ids match — the test
     // catches misconfigured "same profile" claims.
     let c = FakeCryptoProvider::new(UNIT as u32).with_key(2);
-    assert!(cross_endpoint_self_test(&a, &c, &ctx(), UNIT).await.is_err());
+    assert!(cross_endpoint_self_test(&a, &c, &ctx(), UNIT)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -129,7 +136,10 @@ async fn retry_classification_is_stable() {
         CryptoError::Integrity("x".into()).class(),
         NonRetryableRequest
     );
-    assert_eq!(CryptoError::EndpointFatal("x".into()).class(), EndpointFatal);
+    assert_eq!(
+        CryptoError::EndpointFatal("x".into()).class(),
+        EndpointFatal
+    );
     assert_eq!(CryptoError::Contract("x".into()).class(), ProviderFatal);
     assert!(CryptoError::Throttled("x".into()).is_retryable());
     assert!(!CryptoError::Integrity("x".into()).is_retryable());

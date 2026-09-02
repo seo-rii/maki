@@ -17,7 +17,9 @@ use std::sync::Arc;
 use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
-use maki_format::journal::{scan_segment, JournalRecord, ScanOutcome, SegmentHeader, SEGMENT_HEADER_SIZE};
+use maki_format::journal::{
+    scan_segment, JournalRecord, ScanOutcome, SegmentHeader, SEGMENT_HEADER_SIZE,
+};
 use maki_format::layout;
 use maki_format::superblock::Superblock;
 use maki_format::FormatError;

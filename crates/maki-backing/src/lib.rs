@@ -36,6 +36,10 @@ pub trait BackingFile: Send + Sync {
 
     fn len(&self) -> io::Result<u64>;
 
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Make all previously written data durable (fdatasync).
     fn sync_data(&self) -> io::Result<()>;
 }

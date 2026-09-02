@@ -81,15 +81,22 @@ struct CryptoServer {
 }
 
 impl CryptoServer {
-    fn handle(&self, request: Request<CryptoBatchRequest>) -> Result<CryptoBatchResponse, Status> {
+    fn handle(
+        &self,
+        request: Request<CryptoBatchRequest>,
+    ) -> Result<CryptoBatchResponse, Box<Status>> {
         if let Some(token) = &self.state.require_token {
-            match request.metadata().get("authorization").and_then(|v| v.to_str().ok()) {
+            match request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+            {
                 Some(got) if got == token => {}
-                _ => return Err(Status::new(Code::Unauthenticated, "bad token")),
+                _ => return Err(Box::new(Status::new(Code::Unauthenticated, "bad token"))),
             }
         }
         if let Some(code) = self.state.fail_with.lock().take() {
-            return Err(Status::new(code, "injected"));
+            return Err(Box::new(Status::new(code, "injected")));
         }
         let message = request.into_inner();
         assert_eq!(message.compatibility_id, "grpc-profile-v1");
@@ -141,14 +148,15 @@ where
                         fn call(&mut self, request: Request<CryptoBatchRequest>) -> Self::Future {
                             let server = self.0.clone();
                             Box::pin(async move {
-                                server.handle(request).map(Response::new)
+                                server
+                                    .handle(request)
+                                    .map(Response::new)
+                                    .map_err(|status| *status)
                             })
                         }
                     }
-                    let codec: tonic::codec::ProstCodec<
-                        CryptoBatchResponse,
-                        CryptoBatchRequest,
-                    > = tonic::codec::ProstCodec::default();
+                    let codec: tonic::codec::ProstCodec<CryptoBatchResponse, CryptoBatchRequest> =
+                        tonic::codec::ProstCodec::default();
                     let mut grpc = tonic::server::Grpc::new(codec);
                     Ok(grpc.unary(Svc(this), req).await)
                 }
@@ -230,7 +238,10 @@ fn pt(i: u64, fill: u8) -> PlaintextUnit {
 async fn native_protocol_roundtrip() {
     let url = grpc_server(Arc::new(ServerState::default())).await;
     let p = provider(&url, vec![]);
-    let cts = p.encrypt_batch(&ctx(), &[pt(1, 0x21), pt(2, 0x22)]).await.unwrap();
+    let cts = p
+        .encrypt_batch(&ctx(), &[pt(1, 0x21), pt(2, 0x22)])
+        .await
+        .unwrap();
     assert_eq!(cts[0].data, vec![0x21 ^ XOR; UNIT]);
     let pts = p.decrypt_batch(&ctx(), &cts).await.unwrap();
     assert_eq!(pts[1].data.expose(), &vec![0x22; UNIT][..]);
@@ -252,22 +263,34 @@ async fn metadata_is_sent_and_enforced() {
     // With the token: works.
     let p = provider(
         &url,
-        vec![("authorization".to_string(), "Bearer grpc-secret".to_string())],
+        vec![(
+            "authorization".to_string(),
+            "Bearer grpc-secret".to_string(),
+        )],
     );
     p.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_mapping_covers_grpc_codes() {
-    assert_eq!(class_of_code(Code::ResourceExhausted), ErrorClass::Throttled);
+    assert_eq!(
+        class_of_code(Code::ResourceExhausted),
+        ErrorClass::Throttled
+    );
     assert_eq!(class_of_code(Code::Unavailable), ErrorClass::Retryable);
     assert_eq!(class_of_code(Code::DeadlineExceeded), ErrorClass::Retryable);
-    assert_eq!(class_of_code(Code::Unauthenticated), ErrorClass::EndpointFatal);
+    assert_eq!(
+        class_of_code(Code::Unauthenticated),
+        ErrorClass::EndpointFatal
+    );
     assert_eq!(
         class_of_code(Code::InvalidArgument),
         ErrorClass::NonRetryableRequest
     );
-    assert_eq!(class_of_code(Code::Unimplemented), ErrorClass::ProviderFatal);
+    assert_eq!(
+        class_of_code(Code::Unimplemented),
+        ErrorClass::ProviderFatal
+    );
 
     // And over the wire:
     let state = Arc::new(ServerState::default());
@@ -281,14 +304,19 @@ async fn status_mapping_covers_grpc_codes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reordered_response_is_detected_via_index_echo() {
     let state = Arc::new(ServerState::default());
-    state.reorder.store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .reorder
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let url = grpc_server(state).await;
     let p = provider(&url, vec![]);
     let err = p
         .encrypt_batch(&ctx(), &[pt(10, 1), pt(20, 2)])
         .await
         .unwrap_err();
-    assert!(matches!(err, maki_crypto::CryptoError::Contract(_)), "{err:?}");
+    assert!(
+        matches!(err, maki_crypto::CryptoError::Contract(_)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

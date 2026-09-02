@@ -10,8 +10,8 @@ use tokio_rustls::rustls;
 
 use maki_crypto::{CryptoContext, CryptoProvider, ErrorClass, PlaintextUnit, SecretBuffer};
 use maki_crypto_http::{
-    BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding,
-    RespKind, RespSpec, TlsSpec,
+    BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding, RespKind,
+    RespSpec, TlsSpec,
 };
 
 const UNIT: usize = 128;
@@ -78,9 +78,7 @@ async fn tls_server(
     install_crypto_provider();
     let server_cert = rcgen::generate_simple_self_signed(vec![san.to_string()]).unwrap();
     let cert_der = server_cert.cert.der().clone();
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(
-        server_cert.key_pair.serialize_der(),
-    );
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(server_cert.key_pair.serialize_der());
 
     let builder = rustls::ServerConfig::builder();
     let config = match require_client_cert_from {
@@ -180,7 +178,7 @@ fn provider(url: &str, tls: TlsSpec) -> HttpCryptoProvider {
 fn pt() -> PlaintextUnit {
     PlaintextUnit {
         unit_index: 1,
-        data: SecretBuffer::from_slice(&vec![0x11; UNIT]),
+        data: SecretBuffer::from_slice(&[0x11; UNIT]),
     }
 }
 

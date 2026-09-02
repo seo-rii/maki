@@ -27,13 +27,32 @@ use maki_backing::{Backing, BackingFile, VolumeLock};
 /// Operation descriptor passed to the fault hook.
 #[derive(Debug)]
 pub enum FaultOp<'a> {
-    Open { path: &'a str, create: bool },
-    WriteAt { path: &'a str, offset: u64, len: usize },
-    SetLen { path: &'a str, len: u64 },
-    SyncData { path: &'a str },
-    SyncDir { dir: &'a str },
-    Remove { path: &'a str },
-    Rename { from: &'a str, to: &'a str },
+    Open {
+        path: &'a str,
+        create: bool,
+    },
+    WriteAt {
+        path: &'a str,
+        offset: u64,
+        len: usize,
+    },
+    SetLen {
+        path: &'a str,
+        len: u64,
+    },
+    SyncData {
+        path: &'a str,
+    },
+    SyncDir {
+        dir: &'a str,
+    },
+    Remove {
+        path: &'a str,
+    },
+    Rename {
+        from: &'a str,
+        to: &'a str,
+    },
 }
 
 pub type FaultHook = Arc<dyn Fn(&FaultOp<'_>) -> Option<io::Error> + Send + Sync>;
@@ -192,11 +211,13 @@ impl CrashableBacking {
                             Vec::new()
                         };
                         // Keep each pending op independently.
-                        let kept: Vec<&Pend> =
-                            vol.pending.iter().filter(|_| rng.random_bool(0.5)).collect();
-                        let last_write_idx = kept
+                        let kept: Vec<&Pend> = vol
+                            .pending
                             .iter()
-                            .rposition(|p| matches!(p, Pend::Write { .. }));
+                            .filter(|_| rng.random_bool(0.5))
+                            .collect();
+                        let last_write_idx =
+                            kept.iter().rposition(|p| matches!(p, Pend::Write { .. }));
                         for (i, p) in kept.iter().enumerate() {
                             if Some(i) == last_write_idx {
                                 if let (Some(gran), Pend::Write { offset, data: src }) =

@@ -179,7 +179,11 @@ fn ab_store_prefers_highest_valid_generation() {
     newest.sync_data().unwrap();
 
     let fallback = ab.load::<Superblock>(&backing).unwrap().unwrap();
-    assert_eq!(fallback.generation(), g2 - 1, "must fall back to older side");
+    assert_eq!(
+        fallback.generation(),
+        g2 - 1,
+        "must fall back to older side"
+    );
 }
 
 #[test]
@@ -558,7 +562,9 @@ fn binary_decoders_never_panic_on_garbage() {
                 }
             }
             _ => {
-                data = (0..rng.random_range(0..300)).map(|_| rng.random()).collect();
+                data = (0..rng.random_range(0..300))
+                    .map(|_| rng.random())
+                    .collect();
             }
         }
         // must not panic:
@@ -593,7 +599,9 @@ fn config_parser_never_panics_on_garbage() {
                 }
             }
             _ => {
-                data = (0..rng.random_range(0..500)).map(|_| rng.random()).collect();
+                data = (0..rng.random_range(0..500))
+                    .map(|_| rng.random())
+                    .collect();
             }
         }
         if let Ok(s) = String::from_utf8(data) {

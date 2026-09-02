@@ -11,12 +11,11 @@ use serde_json::json;
 use common::{Handler, RecordedRequest, ResponseSpec, TestServer};
 use maki_crypto::selftest::{provider_conformance, provider_self_test};
 use maki_crypto::{
-    Capability, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
-    SecretBuffer,
+    Capability, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit, SecretBuffer,
 };
 use maki_crypto_http::{
-    BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding,
-    RespKind, RespSpec,
+    BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding, RespKind,
+    RespSpec,
 };
 
 const UNIT: usize = 512;
@@ -76,7 +75,10 @@ fn json_op(path: &str, data_field: &str, result_path: &str) -> OpSpec {
         query: vec![("profile".to_string(), "v1".to_string())],
         body: BodySpec::Json {
             fields: vec![
-                (format!("/{data_field}"), FieldSource::Payload(PayloadEncoding::Base64)),
+                (
+                    format!("/{data_field}"),
+                    FieldSource::Payload(PayloadEncoding::Base64),
+                ),
                 ("/volume".to_string(), FieldSource::VolumeId),
                 ("/unit".to_string(), FieldSource::UnitIndex),
             ],
@@ -113,7 +115,10 @@ fn xor_json_handler(data_field: &'static str, result_path: &'static str) -> Hand
             Ok(v) => v,
             Err(_) => return ResponseSpec::status(400),
         };
-        let Some(data) = v.pointer(&format!("/{data_field}")).and_then(|d| d.as_str()) else {
+        let Some(data) = v
+            .pointer(&format!("/{data_field}"))
+            .and_then(|d| d.as_str())
+        else {
             return ResponseSpec::status(422);
         };
         let ct = xor(&b64d(data));
@@ -133,7 +138,10 @@ async fn json_base64_roundtrip_with_headers_and_query() {
     ))
     .unwrap();
 
-    let cts = provider.encrypt_batch(&ctx(), &[pt(7, 0xAB)]).await.unwrap();
+    let cts = provider
+        .encrypt_batch(&ctx(), &[pt(7, 0xAB)])
+        .await
+        .unwrap();
     assert_eq!(cts[0].data, xor(&vec![0xAB; UNIT]));
     let pts = provider.decrypt_batch(&ctx(), &cts).await.unwrap();
     assert_eq!(pts[0].data.expose(), &vec![0xAB; UNIT][..]);
@@ -161,7 +169,9 @@ async fn hex_payload_encoding_works() {
     let handler: Handler = Arc::new(|req: &RecordedRequest| {
         let v: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         let hex = v.pointer("/data").unwrap().as_str().unwrap();
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -174,14 +184,19 @@ async fn hex_payload_encoding_works() {
 
     let mut op = json_op("/op", "data", "/result");
     op.body = BodySpec::Json {
-        fields: vec![("/data".to_string(), FieldSource::Payload(PayloadEncoding::HexLower))],
+        fields: vec![(
+            "/data".to_string(),
+            FieldSource::Payload(PayloadEncoding::HexLower),
+        )],
         items_path: None,
         item_fields: vec![],
     };
     op.response.encoding = PayloadEncoding::HexLower;
-    let provider =
-        HttpCryptoProvider::new(spec(&server.url(), op.clone(), op)).unwrap();
-    let cts = provider.encrypt_batch(&ctx(), &[pt(1, 0x3C)]).await.unwrap();
+    let provider = HttpCryptoProvider::new(spec(&server.url(), op.clone(), op)).unwrap();
+    let cts = provider
+        .encrypt_batch(&ctx(), &[pt(1, 0x3C)])
+        .await
+        .unwrap();
     assert_eq!(cts[0].data, xor(&vec![0x3C; UNIT]));
 }
 
@@ -206,7 +221,10 @@ async fn raw_payload_roundtrip() {
         },
     };
     let provider = HttpCryptoProvider::new(spec(&server.url(), op.clone(), op)).unwrap();
-    let cts = provider.encrypt_batch(&ctx(), &[pt(3, 0x11)]).await.unwrap();
+    let cts = provider
+        .encrypt_batch(&ctx(), &[pt(3, 0x11)])
+        .await
+        .unwrap();
     assert_eq!(cts[0].data, xor(&vec![0x11; UNIT]));
     let pts = provider.decrypt_batch(&ctx(), &cts).await.unwrap();
     assert_eq!(pts[0].data.expose(), &vec![0x11; UNIT][..]);
@@ -224,7 +242,10 @@ fn batch_op() -> OpSpec {
             fields: vec![("/profile".to_string(), FieldSource::CompatibilityId)],
             items_path: Some("/items".to_string()),
             item_fields: vec![
-                ("/data".to_string(), FieldSource::Payload(PayloadEncoding::Base64)),
+                (
+                    "/data".to_string(),
+                    FieldSource::Payload(PayloadEncoding::Base64),
+                ),
                 ("/idx".to_string(), FieldSource::UnitIndex),
             ],
         },
@@ -266,11 +287,14 @@ fn batch_handler(reorder: bool, drop_last: bool) -> Handler {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_single_request_preserves_order() {
     let server = TestServer::start(batch_handler(false, false)).await;
-    let provider =
-        HttpCryptoProvider::new(spec(&server.url(), batch_op(), batch_op())).unwrap();
+    let provider = HttpCryptoProvider::new(spec(&server.url(), batch_op(), batch_op())).unwrap();
     let items = vec![pt(10, 1), pt(20, 2), pt(30, 3)];
     let cts = provider.encrypt_batch(&ctx(), &items).await.unwrap();
-    assert_eq!(server.requests.lock().len(), 1, "one HTTP request per batch");
+    assert_eq!(
+        server.requests.lock().len(),
+        1,
+        "one HTTP request per batch"
+    );
     assert_eq!(cts.len(), 3);
     for (i, ct) in cts.iter().enumerate() {
         assert_eq!(ct.unit_index, items[i].unit_index);
@@ -281,8 +305,7 @@ async fn batch_single_request_preserves_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_reorder_is_detected() {
     let server = TestServer::start(batch_handler(true, false)).await;
-    let provider =
-        HttpCryptoProvider::new(spec(&server.url(), batch_op(), batch_op())).unwrap();
+    let provider = HttpCryptoProvider::new(spec(&server.url(), batch_op(), batch_op())).unwrap();
     let err = provider
         .encrypt_batch(&ctx(), &[pt(10, 1), pt(20, 2)])
         .await
@@ -293,8 +316,7 @@ async fn batch_reorder_is_detected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_batch_response_is_detected() {
     let server = TestServer::start(batch_handler(false, true)).await;
-    let provider =
-        HttpCryptoProvider::new(spec(&server.url(), batch_op(), batch_op())).unwrap();
+    let provider = HttpCryptoProvider::new(spec(&server.url(), batch_op(), batch_op())).unwrap();
     let err = provider
         .encrypt_batch(&ctx(), &[pt(10, 1), pt(20, 2)])
         .await
@@ -306,9 +328,8 @@ async fn partial_batch_response_is_detected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_response_is_refused() {
-    let handler: Handler = Arc::new(|_req: &RecordedRequest| {
-        ResponseSpec::raw(vec![0u8; 256 * 1024])
-    });
+    let handler: Handler =
+        Arc::new(|_req: &RecordedRequest| ResponseSpec::raw(vec![0u8; 256 * 1024]));
     let server = TestServer::start(handler).await;
     let mut s = spec(
         &server.url(),
@@ -317,7 +338,10 @@ async fn oversized_response_is_refused() {
     );
     s.max_response_bytes = 4096;
     let provider = HttpCryptoProvider::new(s).unwrap();
-    let err = provider.encrypt_batch(&ctx(), &[pt(1, 5)]).await.unwrap_err();
+    let err = provider
+        .encrypt_batch(&ctx(), &[pt(1, 5)])
+        .await
+        .unwrap_err();
     assert_eq!(err.class(), ErrorClass::NonRetryableRequest, "{err:?}");
 }
 
@@ -333,20 +357,36 @@ async fn status_codes_classify_correctly() {
     ))
     .unwrap();
 
-    let err = provider.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap_err();
+    let err = provider
+        .encrypt_batch(&ctx(), &[pt(1, 1)])
+        .await
+        .unwrap_err();
     assert_eq!(err.class(), ErrorClass::Throttled, "429 → Throttled");
 
     server.set_handler(Arc::new(|_: &RecordedRequest| ResponseSpec::status(503)));
-    let err = provider.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap_err();
+    let err = provider
+        .encrypt_batch(&ctx(), &[pt(1, 1)])
+        .await
+        .unwrap_err();
     assert_eq!(err.class(), ErrorClass::Retryable, "503 → Retryable");
 
     server.set_handler(Arc::new(|_: &RecordedRequest| ResponseSpec::status(400)));
-    let err = provider.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap_err();
+    let err = provider
+        .encrypt_batch(&ctx(), &[pt(1, 1)])
+        .await
+        .unwrap_err();
     assert_eq!(err.class(), ErrorClass::NonRetryableRequest, "400");
 
     server.set_handler(Arc::new(|_: &RecordedRequest| ResponseSpec::status(401)));
-    let err = provider.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap_err();
-    assert_eq!(err.class(), ErrorClass::EndpointFatal, "401 → endpoint fatal");
+    let err = provider
+        .encrypt_batch(&ctx(), &[pt(1, 1)])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.class(),
+        ErrorClass::EndpointFatal,
+        "401 → endpoint fatal"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -364,8 +404,15 @@ async fn timeout_is_retryable() {
     );
     s.timeout = Duration::from_millis(200);
     let provider = HttpCryptoProvider::new(s).unwrap();
-    let err = provider.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap_err();
-    assert_eq!(err.class(), ErrorClass::Retryable, "timeout → Retryable: {err:?}");
+    let err = provider
+        .encrypt_batch(&ctx(), &[pt(1, 1)])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.class(),
+        ErrorClass::Retryable,
+        "timeout → Retryable: {err:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -480,7 +527,10 @@ root = "/tmp/unused"
         &maki_crypto_local::keysource::EnvKeySource,
     )
     .unwrap();
-    let cts = provider.encrypt_batch(&ctx(), &[pt(1, 0x42)]).await.unwrap();
+    let cts = provider
+        .encrypt_batch(&ctx(), &[pt(1, 0x42)])
+        .await
+        .unwrap();
     assert_eq!(cts[0].data, xor(&vec![0x42; UNIT]));
     let requests = server.requests.lock().clone();
     assert_eq!(
@@ -525,7 +575,10 @@ async fn payloads_never_appear_in_logs() {
     ))
     .unwrap();
     let secret = vec![0xABu8; UNIT];
-    let cts = provider.encrypt_batch(&ctx(), &[pt(7, 0xAB)]).await.unwrap();
+    let cts = provider
+        .encrypt_batch(&ctx(), &[pt(7, 0xAB)])
+        .await
+        .unwrap();
     let _ = provider.decrypt_batch(&ctx(), &cts).await.unwrap();
 
     let logs = capture.0.lock().clone();

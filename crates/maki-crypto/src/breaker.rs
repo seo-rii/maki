@@ -79,9 +79,7 @@ impl CircuitBreaker {
         match inner.state {
             CircuitState::Closed => true,
             CircuitState::Open => self.clock.now() >= inner.open_until,
-            CircuitState::HalfOpen => {
-                inner.half_open_started < self.config.half_open_max_requests
-            }
+            CircuitState::HalfOpen => inner.half_open_started < self.config.half_open_max_requests,
         }
     }
 
