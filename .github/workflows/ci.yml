@@ -47,6 +47,7 @@ jobs:
         run: >
           cargo test --workspace --release -- --ignored
           phase0_gate_full phase3_gate_full phase4_gate_full
+          phase5_gate_endpoint_cycles_full phase5_gate_breaker_cycles_full
           phase11_gate_dbsim_full phase12_gate_full
       - name: nbdkit plugin build (cdylib + plugin_init symbol)
         run: |

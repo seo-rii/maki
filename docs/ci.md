@@ -12,7 +12,7 @@ currently implemented as GitHub Actions jobs.
 
 | Tier | Trigger | Platform | Enforcement | Implementation |
 |---|---|---|---|---|
-| Baseline | Pull request, push to `main`/`master`, or scheduled run | Ubuntu and Windows | Workspace tests block; formatting and Clippy are advisory | Automated: `pr` job |
+| Baseline | Pull request, push to `main`/`master`, or scheduled run | Ubuntu and Windows | Formatting, Clippy, and workspace tests block | Automated: `pr` job |
 | Nightly | Daily schedule at 03:00 UTC | Ubuntu | Phase gates and plugin checks block the job | Automated: `nightly-gates` job |
 | Weekly Linux | Maintainer-run | Dedicated Linux host | Policy-defined qualification | Manual; runner automation pending |
 | Release | Before a release | Dedicated VM and physical hardware | All release gates required | Manual; runner automation pending |
@@ -23,8 +23,8 @@ currently implemented as GitHub Actions jobs.
 
 | Check | Command | Enforcement |
 |---|---|---|
-| Formatting | `cargo fmt --all --check` | Advisory (`continue-on-error`) |
-| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Advisory (`continue-on-error`) |
+| Formatting | `cargo fmt --all --check` | Blocking |
+| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Blocking |
 | Workspace suite | `cargo test --workspace` | Blocking |
 
 The workspace suite includes unit and integration tests, property and crash
@@ -41,6 +41,8 @@ The scheduled Linux job runs these ignored release-mode gates:
 | `phase0_gate_full` | 10,000 seeds x 60 model operations |
 | `phase3_gate_full` | 10,000 seeds x 60 mixed operations, including randomized crash/recovery |
 | `phase4_gate_full` | 110,000 randomized model operations |
+| `phase5_gate_endpoint_cycles_full` | 10,000 deterministic endpoint-failure cycles through the dispatcher |
+| `phase5_gate_breaker_cycles_full` | 10,000 complete circuit-breaker lifecycles |
 | `phase11_gate_dbsim_full` | 500 runs x 40 transactions |
 | `phase12_gate_full` | 500 critical-sequence + 500 FUA simulated power-loss cycles |
 
@@ -100,8 +102,8 @@ suite. It uses simulated backing stores; it does not perform a real power cut.
 |---|---:|---|---|---|
 | Randomized model operations | 100,000+ | **Pass** | 110,000-operation Phase 4 gate | 2026-09-02 |
 | Process crash/recovery | 10,000+ | **Partial** | In-process backing simulation: 10,000 seeds x 60 mixed operations; no process-level count | 2026-09-02 |
-| Endpoint failure cycles | 10,000+ | **Partial** | Failover suites pass; volume soak pending | 2026-09-02 |
-| Circuit-breaker cycles | 10,000+ | **Partial** | Transition suites pass; volume soak pending | 2026-09-02 |
+| Endpoint failure cycles | 10,000+ | **Pass (simulation)** | 10,000 deterministic dispatcher cycles; zero failed requests or permit leaks | 2026-09-02 |
+| Circuit-breaker cycles | 10,000+ | **Pass (simulation)** | 10,000 open/half-open/closed lifecycles, including failed-probe reopen | 2026-09-02 |
 | QEMU hard power loss | 300+ | **Pending** | Simulation: 500+500 cycles; no QEMU evidence | 2026-09-02 |
 | Parser fuzzing | 24 CPU-hours/target | **Partial** | 4,000 decoder + 1,500 config mutation inputs; cargo-fuzz pending | 2026-09-02 |
 | Mixed workload | 72 hours | **Pending** | Dedicated hardware run not recorded | — |
@@ -124,7 +126,4 @@ kernel-device, service, or hardware tiers.
 
 - Wire cargo-fuzz targets and a maintained corpus into an extended runner.
 - Add dedicated weekly Linux and release-hardware automation.
-- Add 10,000-cycle endpoint-failure and circuit-breaker volume gates.
-- Promote formatting and Clippy from advisory to blocking now that the current
-  warning baseline is clean.
 - Provide supported vendor-contract and duration-based soak invocations.

@@ -1,6 +1,6 @@
 # Phase 5 — Backpressure, Retry, and HA
 
-Status: **complete** · Gate criteria verified in-suite: queue bound violation = 0, permit leak = 0 (asserted via post-run `available_*` checks), retry storm = 0 (budget + jitter caps), bounded memory (100k requests through a 512-item queue)
+Status: **complete** · Gate criteria verified in-suite: queue bound violation = 0, permit leak = 0 (asserted via post-run `available_*` checks), retry storm = 0 (budget + jitter caps), bounded memory (100k requests through a 512-item queue) · SPEC §56 soak gates: `phase5_gate_endpoint_cycles_full` (10k deterministic endpoint-failure cycles through the dispatcher, manual clock, full breaker cycling, 0 failed requests, 0 permit leaks) and `phase5_gate_breaker_cycles_full` (10k breaker lifecycles incl. failed-probe reopens), with 300-cycle smokes in the PR suite
 
 ## What was built (`maki-crypto` + engine admission in `maki-core`)
 

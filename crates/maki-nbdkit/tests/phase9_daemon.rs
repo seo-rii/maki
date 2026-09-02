@@ -277,8 +277,10 @@ async fn grpc_without_token_is_refused_by_server() {
     let dir = tempfile::tempdir().unwrap();
     let transport = format!("[[crypto.grpc.endpoint]]\nname = \"ep0\"\nurl = \"{url}\"\n");
     // Bounded-error so the endpoint-fatal failure surfaces instead of the
-    // stall policy retrying the self-test forever.
-    let policy = "availability_policy = \"bounded-error\"\nmax_operation_time = \"200ms\"\n";
+    // stall policy retrying the self-test forever; a generous retry budget
+    // keeps the attempts backoff-paced rather than probe-rate-throttled.
+    let policy = "availability_policy = \"bounded-error\"\nmax_operation_time = \"200ms\"\n\
+                  [crypto.retry_budget]\nretry_ratio = 1.0\nburst = 64\nminimum_probe_rate = \"50/s\"\n";
     let config = base_config(&temp_root(&dir), "remote-grpc", policy, &transport);
     let err = attach(&config).await.unwrap_err();
     assert!(

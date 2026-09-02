@@ -331,19 +331,23 @@ async fn permits_are_released_during_backoff() {
         let set = set.clone();
         tokio::spawn(async move { set.encrypt_batch(&ctx(), &[pt(1)]).await })
     };
-    // Give t1 time to fail and enter backoff, then t2 must get the permit.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait until t1 is actually parked in backoff (its manual-clock sleep is
+    // registered) — no wall-clock guessing.
+    while clock.sleeper_count() == 0 {
+        tokio::task::yield_now().await;
+    }
     let t2 = {
         let set = set.clone();
         tokio::spawn(async move { set.encrypt_batch(&ctx(), &[pt(2)]).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        t2.is_finished(),
-        "t2 must proceed while t1 is parked in backoff (permit released)"
-    );
-    t2.await.unwrap().unwrap();
-    // Release t1 from backoff.
+    // t2 completing at all proves the permit was released: t1 stays parked
+    // until the clock advances, so a held permit would block t2 forever.
+    tokio::time::timeout(Duration::from_secs(10), t2)
+        .await
+        .expect("t2 must proceed while t1 is parked in backoff (permit released)")
+        .unwrap()
+        .unwrap();
+    // Release t1 from backoff (it is guaranteed parked: sleeper_count >= 1).
     clock.advance(Duration::from_secs(10));
     t1.await.unwrap().unwrap();
     assert_eq!(set.metrics().retries_total(), 1);
@@ -439,4 +443,146 @@ async fn non_retryable_errors_fail_fast() {
     assert!(matches!(err, CryptoError::NonRetryableRequest(_)));
     assert_eq!(fake.encrypt_calls(), 1, "no retry on non-retryable");
     assert_eq!(set.metrics().retries_total(), 0);
+}
+
+// ---------- SPEC §56 soak cycles (simulation tier) ----------
+
+/// Endpoint-failure storm: `a` flaps (20 failing cycles then 12 healthy per
+/// period of 32, error class rotating through the endpoint-scoped classes),
+/// `b` stays healthy, and the manual clock ticks (400ms) across `a`'s
+/// breaker windows so it cycles closed → open → half-open → closed
+/// continuously. `open_max` is capped at 2s (5 ticks) so every healthy
+/// stretch is long enough to absorb one stale-failure probe and still fit a
+/// successful probe + warm-up — the full breaker cycle is guaranteed by
+/// construction. Every request must succeed (in-pass failover), and permits
+/// must not leak. Fully deterministic — no randomness, no real time.
+async fn endpoint_failure_storm(cycles: u64) {
+    let clock = Arc::new(ManualClock::new());
+    let a = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let b = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let mut cfg = dispatch_cfg();
+    cfg.breaker.open_max = Duration::from_secs(2);
+    let set = EndpointSet::new(
+        vec![
+            ("a".to_string(), a.clone() as Arc<dyn CryptoProvider>),
+            ("b".to_string(), b.clone() as Arc<dyn CryptoProvider>),
+        ],
+        cfg,
+        clock.clone(),
+    );
+
+    // Keep `a`'s failure queue at depth <= 1: queue a new failure only once
+    // the previous one was consumed by an actual call on `a`, so breaker-open
+    // stretches (where `a` is skipped) can never pile up stale failures.
+    let mut pending_since: Option<usize> = None;
+    let (mut saw_closed, mut saw_open, mut saw_half_open) = (false, false, false);
+    for i in 0..cycles {
+        if let Some(at) = pending_since {
+            if a.encrypt_calls() > at {
+                pending_since = None;
+            }
+        }
+        if i % 32 < 20 && pending_since.is_none() {
+            let err = match i % 3 {
+                0 => CryptoError::Retryable("flap".to_string()),
+                1 => CryptoError::Throttled("flap".to_string()),
+                _ => CryptoError::EndpointFatal("flap".to_string()),
+            };
+            a.fail_next([err]);
+            pending_since = Some(a.encrypt_calls());
+        }
+        let out = set
+            .encrypt_batch(&ctx(), &[pt(i)])
+            .await
+            .unwrap_or_else(|e| panic!("cycle {i}: request must survive the flap: {e:?}"));
+        assert_eq!(out.len(), 1, "cycle {i}");
+        for (name, state) in set.endpoint_states() {
+            if name == "a" {
+                match state {
+                    CircuitState::Closed => saw_closed = true,
+                    CircuitState::Open => saw_open = true,
+                    CircuitState::HalfOpen => saw_half_open = true,
+                }
+            }
+        }
+        // Tick across the breaker's open windows so half-open probes happen.
+        clock.advance(Duration::from_millis(400));
+    }
+
+    assert!(
+        saw_closed && saw_open && saw_half_open,
+        "a's breaker must cycle through every state \
+         (closed={saw_closed} open={saw_open} half-open={saw_half_open})"
+    );
+    assert!(
+        set.metrics().failovers_total() >= cycles / 100,
+        "storm must actually exercise failover: {} failovers over {cycles} cycles",
+        set.metrics().failovers_total()
+    );
+    // No permit leak after the storm: a full complement of concurrent
+    // requests still fits through the global semaphore.
+    let set = Arc::new(set);
+    let mut tasks = Vec::new();
+    for i in 0..dispatch_cfg().global_max_inflight_batches as u64 {
+        let set = set.clone();
+        tasks.push(tokio::spawn(async move {
+            set.encrypt_batch(&ctx(), &[pt(i)]).await.unwrap()
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
+
+/// Full breaker lifecycle driven directly: trip → gate → half-open probe →
+/// (every 4th cycle: failed probe reopens first) → warm-up successes →
+/// closed. State-machine only, manual clock, deterministic.
+fn breaker_cycle_storm(cycles: u64) {
+    let clock = Arc::new(ManualClock::new());
+    let breaker = CircuitBreaker::new(breaker_cfg(), clock.clone());
+    for i in 0..cycles {
+        assert_eq!(breaker.state(), CircuitState::Closed, "cycle {i}: start");
+        for _ in 0..breaker_cfg().failure_threshold {
+            breaker.on_failure();
+        }
+        assert_eq!(breaker.state(), CircuitState::Open, "cycle {i}: trips");
+        assert!(!breaker.allow(), "cycle {i}: open must gate traffic");
+        clock.advance(breaker_cfg().open_max + Duration::from_secs(1));
+        assert!(breaker.allow(), "cycle {i}: half-open probe allowed");
+        if i % 4 == 3 {
+            breaker.on_failure();
+            assert_eq!(breaker.state(), CircuitState::Open, "cycle {i}: reopens");
+            assert!(!breaker.allow(), "cycle {i}: reopened gates again");
+            clock.advance(breaker_cfg().open_max + Duration::from_secs(1));
+            assert!(breaker.allow(), "cycle {i}: probe after reopen");
+        }
+        breaker.on_success();
+        assert!(breaker.allow(), "cycle {i}: second half-open slot");
+        breaker.on_success();
+        assert_eq!(breaker.state(), CircuitState::Closed, "cycle {i}: closes");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_failure_cycles_smoke() {
+    endpoint_failure_storm(300).await;
+}
+
+#[test]
+fn breaker_cycles_smoke() {
+    breaker_cycle_storm(300);
+}
+
+/// SPEC §56: endpoint failure cycles, 10,000+.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "phase gate: 10,000+ endpoint failure cycles"]
+async fn phase5_gate_endpoint_cycles_full() {
+    endpoint_failure_storm(10_000).await;
+}
+
+/// SPEC §56: circuit breaker cycles, 10,000+.
+#[test]
+#[ignore = "phase gate: 10,000+ circuit breaker cycles"]
+fn phase5_gate_breaker_cycles_full() {
+    breaker_cycle_storm(10_000);
 }
