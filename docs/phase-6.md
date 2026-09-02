@@ -1,8 +1,9 @@
 # nbdkit Adapter (Phase 6)
 
 The `maki-nbdkit` crate exposes Maki's asynchronous engine through nbdkit's
-synchronous plugin ABI. The adapter logic and Linux shared-library smoke tests
-pass; live nbdkit/libnbd and raw NBD qualification are still required.
+synchronous plugin ABI. The adapter, Linux cdylib, Debian header prefix, and
+rootless nbdkit/libnbd/fio path pass. Kernel NBD and filesystem qualification
+are still required.
 
 ## Status
 
@@ -11,10 +12,11 @@ pass; live nbdkit/libnbd and raw NBD qualification are still required.
 | Adapter behavior | **Pass** | [9 adapter integration tests](../crates/maki-nbdkit/tests/phase6.rs) |
 | Linux cdylib build | **Pass on Debian 12/KVM** | [2026-09-02 validation report](native-linux-validation-2026-09-02.md) |
 | `plugin_init` export | **Pass** | [2026-09-02 validation report](native-linux-validation-2026-09-02.md) |
-| ABI layout vs distro header | **Not run** | nbdkit development header unavailable; comparison test not implemented |
-| nbdkit/libnbd socket round trip | **Not run** | Tools unavailable on the validation host |
-| `/dev/nbd` + `fio` | **Not run** | Requires a privileged, disposable block-device target |
-| Kernel data-path gate | **Open** | ABI, live socket, and raw-device checks incomplete |
+| ABI layout vs distro header | **Pass on Debian 12/KVM** | API-v2 prefix checked against `nbdkit-plugin-dev 1.32.5-1` |
+| nbdkit/libnbd socket round trip | **Pass on Debian 12/KVM** | `nbdinfo` plus byte-identical 8 MiB `nbdcopy` round trip |
+| fio over userspace NBD | **Pass on Debian 12/KVM** | 2,048 CRC32C-verified 4 KiB writes and reads; 63 FLUSH operations |
+| Kernel `/dev/nbd` + filesystem | **Not run** | Requires a privileged, disposable block-device target |
+| Kernel data-path gate | **Open** | Kernel attachment, filesystem, and raw-device checks incomplete |
 
 ## Responsibilities and boundaries
 
@@ -57,6 +59,10 @@ callbacks so later optional callbacks use nbdkit's defaults.
 | TRIM | No | Callback is not advertised |
 | Write zeroes | No | nbdkit may fall back to ordinary zero-filled writes |
 | Multi-connection | No | Disabled by the API-prefix/default contract |
+
+In the rootless live probe, `nbdinfo` reported `can_zero: true` because nbdkit
+can emulate zero requests with ordinary writes. That negotiated capability
+does not mean Maki exports a native write-zeroes callback.
 
 The FUA behavior follows the
 [nbdkit `can_fua` contract](https://libguestfs.org/nbdkit-plugin.3.html): the
@@ -114,11 +120,15 @@ nm -D --defined-only target/release/libmaki_nbdkit.so |
   grep -Eq '[[:space:]]T[[:space:]]plugin_init$'
 ```
 
-After nbdkit and libnbd tools are installed, the Unix-socket portion can also
-run without `/dev/nbd` or root. Start with the report's
-[disposable fixture](native-linux-validation-2026-09-02.md#disposable-filebacking-smoke-test),
-and ensure its backing root is writable by the calling user. Then use two
-terminals:
+After nbdkit, libnbd tools, and fio are available, the userspace NBD path can
+run without `/dev/nbd` or root. Debian package names are `nbdkit`,
+`nbdkit-plugin-dev`, `libnbd-bin`, and `fio`; `nbd-client` is optional for the
+negotiation-only smoke. The validation report documents the rootless `.deb`
+extraction used when system installation was unavailable.
+
+Create a dedicated 8 MiB fake-provider volume with a writable backing root.
+The commands below overwrite the complete export, so do not reuse a real
+volume. Then use two terminals:
 
 ```bash
 # Terminal 1
@@ -135,11 +145,26 @@ nbdkit --foreground \
 
 ```bash
 # Terminal 2; substitute the socket path printed/selected in Terminal 1
-nbdinfo "nbd+unix:///?socket=/absolute/path/to/nbd.sock"
+uri="nbd+unix:///?socket=/absolute/path/to/nbd.sock"
+test_dir="$(mktemp -d)"
+
+nbdinfo "$uri"
+dd if=/dev/urandom of="$test_dir/source.bin" bs=1M count=8 status=none
+nbdcopy --flush --synchronous "$test_dir/source.bin" "$uri"
+nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"
+cmp "$test_dir/source.bin" "$test_dir/roundtrip.bin"
+
+fio --name=maki-nbd-verify \
+  --ioengine=nbd --uri="$uri" \
+  --rw=write --bs=4k --size=8M --iodepth=1 --fsync=32 \
+  --verify=crc32c --do_verify=1 --verify_fatal=1 \
+  --verify_state_save=0
 ```
 
-This socket-level smoke test is not a substitute for `/dev/nbd` and filesystem
-qualification.
+Stop nbdkit normally and run both offline checkers after it releases the volume
+lock. This userspace test exercises Maki through nbdkit and libnbd, including
+read, write, and FLUSH. It is not a substitute for kernel `/dev/nbd`,
+filesystem, raw-device durability, or hard-power-loss qualification.
 
 ## Linux qualification checklist
 
@@ -147,10 +172,11 @@ qualification.
 |---|---|---|
 | Build the release cdylib on the target distribution | Unprivileged | **Pass on Debian 12/KVM** |
 | Assert the global `plugin_init` export | Unprivileged | **Pass** |
-| Compare `nbdkit_plugin` size, offsets, and callbacks with the distro's `nbdkit-plugin.h` | Unprivileged after dev-package install | **Not run** |
-| Run nbdkit + `nbdinfo`/libnbd over a temporary Unix socket | Unprivileged | **Not run** |
+| Compare `nbdkit_plugin` size, offsets, and callbacks with the distro's `nbdkit-plugin.h` | Unprivileged after dev-package install | **Pass for Debian 12 header 1.32.5-1** |
+| Run nbdkit + `nbdinfo`/`nbdcopy` over a temporary Unix socket | Unprivileged | **Pass on Debian 12/KVM** |
+| Run fio CRC verification and periodic FLUSH over the Unix-socket export | Unprivileged; destructive only to the disposable export | **Pass on Debian 12/KVM** |
 | Attach a disposable `/dev/nbdN` and run aligned read/write verification | Root; destructive to selected target | **Not run** |
-| Run `fio --verify` with randwrite, FLUSH, and FUA workloads | Root; sustained raw-device writes | **Not run** |
+| Run `fio --verify` against the kernel device and filesystem | Root; sustained writes to selected target | **Not run** |
 | Compare acknowledged FLUSH/FUA operations after hard power loss | Disruptive; isolated VM/hardware only | **Not run** |
 
 The kernel data-path gate closes only when every row is complete on the target
@@ -159,10 +185,11 @@ violations.
 
 ## Known limitations
 
-- The Rust `nbdkit_plugin` mirror has not yet been checked against a real
-  distribution header. Do not treat a successful cdylib build as ABI proof.
-- Live block-size negotiation and I/O have not been observed through nbdkit or
-  the kernel NBD client.
+- The one-off ABI probe covers the Debian `nbdkit-plugin-dev 1.32.5-1` header's
+  API-v2 prefix. It is not yet an automated repository test and does not prove
+  compatibility with every distribution or future nbdkit release.
+- Userspace I/O has been observed through nbdkit and libnbd. Kernel NBD,
+  filesystem behavior, and configured block-size negotiation remain untested.
 - The C shim currently advertises emulated rather than native FUA, despite the
   direct Rust adapter accepting a `fua` argument.
 - TRIM, write-zeroes callbacks, and multi-connection are intentionally

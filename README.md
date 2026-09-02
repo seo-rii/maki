@@ -17,7 +17,7 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 3 | Journal and recovery | ✅ gate passed |
 | 4 | Block core | ✅ gate passed |
 | 5 | Backpressure, retry, HA | ✅ complete |
-| 6 | nbdkit adapter | ◑ adapter + Linux build/symbol pass; ABI/live NBD pending |
+| 6 | nbdkit adapter | ◑ adapter + ABI/userspace NBD pass; kernel NBD pending |
 | 7 | Daemon and privilege model | ◑ unit/packaging checks pass; live OS enforcement pending |
 | 8 | HTTP remote provider | ◑ loopback chaos/TLS pass; vendor contract/soak pending |
 | 9 | WebSocket and gRPC | ✅ complete |
@@ -40,11 +40,15 @@ Test-driven throughout (SPEC §41): every phase lands its failing tests first,
 then the implementation, then fault/property cases. Run the repository test
 suites with:
 
-```
-cargo test --workspace            # PR-level suite
-cargo test --workspace --release -- --ignored   # phase gates (long)
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo test --workspace --release --locked -- --ignored
 ```
 
 Development on Windows/macOS is supported for all pure-logic crates; the
 nbdkit data path, privilege separation, and qualification phases require
-Linux (see per-phase docs).
+Linux. The userspace nbdkit/libnbd path can be tested without root; kernel
+`/dev/nbd`, filesystems, and hardware qualification require isolated Linux
+targets (see the per-phase docs).

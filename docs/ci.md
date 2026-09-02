@@ -107,23 +107,24 @@ suite. It uses simulated backing stores; it does not perform a real power cut.
 | Mixed workload | 72 hours | **Pending** | Dedicated hardware run not recorded | — |
 
 At revision
-[`ea7448804f8f50bd00cf91ece8fe5f64fc5d7813`](https://github.com/seo-rii/maki/commit/ea7448804f8f50bd00cf91ece8fe5f64fc5d7813),
-the executed workspace and extended simulation suites reported zero silent
-corruption, FLUSH/FUA, plaintext-leak, queue-bound, semaphore, privilege, or
-secret-leakage violations. This statement does not cover unexecuted manual or
-hardware tiers.
+[`8f8b13d56539ae02ea29fcf6959a3f910f16acb4`](https://github.com/seo-rii/maki/commit/8f8b13d56539ae02ea29fcf6959a3f910f16acb4),
+the executed workspace, extended simulation, formatter, strict Clippy, ABI,
+and userspace nbdkit/libnbd/fio checks passed. They reported no silent
+corruption, FLUSH/FUA, plaintext-leak, queue-bound, semaphore, privilege,
+checksum, or lint violations. This statement does not cover unexecuted manual,
+kernel-device, service, or hardware tiers.
 
 ## Validation reports
 
 | Date | Revision | Environment | Outcome | Report |
 |---|---|---|---|---|
-| 2026-09-02 | `ea74488` | Debian 12, KVM guest | Partial; functional suites pass, quality and hardware gates open | [Linux validation report](native-linux-validation-2026-09-02.md) |
+| 2026-09-02 | `8f8b13d` | Debian 12, KVM guest | Partial; functional, quality, ABI, and userspace NBD checks pass; privileged and hardware gates open | [Linux validation report](native-linux-validation-2026-09-02.md) |
 
 ## Planned CI work
 
 - Wire cargo-fuzz targets and a maintained corpus into an extended runner.
 - Add dedicated weekly Linux and release-hardware automation.
 - Add 10,000-cycle endpoint-failure and circuit-breaker volume gates.
-- Make formatting and Clippy blocking after the current warning baseline is
-  resolved.
+- Promote formatting and Clippy from advisory to blocking now that the current
+  warning baseline is clean.
 - Provide supported vendor-contract and duration-based soak invocations.
