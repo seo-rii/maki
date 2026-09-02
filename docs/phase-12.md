@@ -19,7 +19,12 @@ The exact SPEC §54 scenarios against the full engine:
 - **FUA test**: `WRITE A + FUA success · power cut` ⇒ **A = new**.
 - **Nondeterminism check**: across seeds, C actually exhibits *both* old and new outcomes — proving the crash model isn't accidentally always-durable (a vacuous pass).
 
-`CrashableBacking`'s crash model — independent survival of every unsynced write, torn tail writes, vanished dirents, resurrected deletions — is a superset of single-power-cut behavior on a POSIX filesystem, so simulation passes are strictly conservative.
+These scenarios use `CrashableBacking::new()` to model independent survival or
+loss of pending, unsynchronized operations. `CrashableBacking` can also model
+torn writes when constructed with `with_tearing`, but that option is not
+enabled by the Phase 12 tests. The simulation is development evidence, not a
+proof that the model is a strict superset of real storage behavior; it does not
+replace the QEMU or bare-metal tiers below.
 
 ## QEMU/KVM runbook (hard VM power cut)
 

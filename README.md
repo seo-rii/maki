@@ -17,13 +17,16 @@ See [SPEC.md](SPEC.md) for the full technical specification and
 | 3 | Journal and recovery | ✅ gate passed |
 | 4 | Block core | ✅ gate passed |
 | 5 | Backpressure, retry, HA | ✅ complete |
-| 6 | nbdkit adapter | ✅ adapter tested; Linux ABI pending CI |
-| 7 | Daemon and privilege model | ✅ host-verifiable complete |
-| 8 | HTTP remote provider | ✅ chaos+TLS suites passed |
+| 6 | nbdkit adapter | ◑ adapter + Linux build/symbol pass; ABI/live NBD pending |
+| 7 | Daemon and privilege model | ◑ unit/packaging checks pass; live OS enforcement pending |
+| 8 | HTTP remote provider | ◑ loopback chaos/TLS pass; vendor contract/soak pending |
 | 9 | WebSocket and gRPC | ✅ complete |
 | 10 | Cache and operations | ✅ complete |
-| 11 | Database qualification | ✅ simulation tier; DB runbook |
-| 12 | Power-loss qualification | ✅ simulation tier; QEMU/metal runbook |
+| 11 | Database qualification | ◑ simulation tier passes; real DB pending |
+| 12 | Power-loss qualification | ◑ simulation tier passes; QEMU/metal pending |
+
+Validation evidence: [CI and release qualification](docs/ci.md) ·
+[2026-09-02 Linux VM validation report](docs/native-linux-validation-2026-09-02.md)
 
 ## Workspace layout
 
@@ -34,7 +37,8 @@ under `packaging/`.
 ## Development
 
 Test-driven throughout (SPEC §41): every phase lands its failing tests first,
-then the implementation, then fault/property cases. Run everything with:
+then the implementation, then fault/property cases. Run the repository test
+suites with:
 
 ```
 cargo test --workspace            # PR-level suite
