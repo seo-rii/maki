@@ -90,17 +90,14 @@ impl<T: Send + 'static> Batcher<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    type ObservedBatches = Arc<Mutex<Vec<Vec<u32>>>>;
-    type FlushFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-    type FlushFn = Box<dyn FnMut(Vec<u32>) -> FlushFuture + Send>;
+    type FlushFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    type Seen = Arc<Mutex<Vec<Vec<u32>>>>;
 
-    fn collector() -> (ObservedBatches, FlushFn) {
-        let seen: ObservedBatches = Arc::new(Mutex::new(Vec::new()));
+    fn collector() -> (Seen, impl FnMut(Vec<u32>) -> FlushFuture) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
         let flush = move |batch: Vec<u32>| {
             let seen = seen2.clone();
@@ -108,7 +105,7 @@ mod tests {
                 seen.lock().await.push(batch);
             }) as FlushFuture
         };
-        (seen, Box::new(flush))
+        (seen, flush)
     }
 
     #[tokio::test(start_paused = true)]

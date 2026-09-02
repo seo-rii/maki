@@ -71,10 +71,7 @@ impl Overlay {
     /// Advance the durable boundary: versions with sequence <=
     /// `durable_sequence` become checkpointable.
     pub fn promote(&mut self, durable_sequence: u64) {
-        loop {
-            let Some((&seq, &unit)) = self.pending_promotion.iter().next() else {
-                break;
-            };
+        while let Some((&seq, &unit)) = self.pending_promotion.first_key_value() {
             if seq > durable_sequence {
                 break;
             }
@@ -94,8 +91,6 @@ impl Overlay {
                 {
                     if entry.durable.is_none() {
                         self.bytes += entry.latest.ciphertext.len() as u64;
-                    } else {
-                        // replacing durable: bytes stay ~same
                     }
                     entry.durable = Some(entry.latest.clone());
                 }

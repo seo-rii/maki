@@ -26,10 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all --check
-        continue-on-error: true # formatting drift is advisory until first release
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true
       # SPEC §55 PR tier: unit, property smoke, codec, fake crypto, journal
       # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
       # smoke — all part of the default workspace suite.

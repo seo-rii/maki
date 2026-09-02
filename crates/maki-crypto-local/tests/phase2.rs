@@ -207,7 +207,7 @@ async fn cross_endpoint_same_key_passes_different_key_fails() {
 
 #[test]
 fn secrets_never_appear_in_debug_output() {
-    let key_material = [0x11; 32];
+    let key_material = [0x11u8; 32];
     let provider = gcm("vol-key");
     let rendered = format!("{provider:?}");
     let hexed = key_material

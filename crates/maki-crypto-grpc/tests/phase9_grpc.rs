@@ -81,10 +81,8 @@ struct CryptoServer {
 }
 
 impl CryptoServer {
-    fn handle(
-        &self,
-        request: Request<CryptoBatchRequest>,
-    ) -> Result<CryptoBatchResponse, Box<Status>> {
+    #[allow(clippy::result_large_err)] // tonic::Status is the natural error type for a gRPC handler
+    fn handle(&self, request: Request<CryptoBatchRequest>) -> Result<CryptoBatchResponse, Status> {
         if let Some(token) = &self.state.require_token {
             match request
                 .metadata()
@@ -92,11 +90,11 @@ impl CryptoServer {
                 .and_then(|v| v.to_str().ok())
             {
                 Some(got) if got == token => {}
-                _ => return Err(Box::new(Status::new(Code::Unauthenticated, "bad token"))),
+                _ => return Err(Status::new(Code::Unauthenticated, "bad token")),
             }
         }
         if let Some(code) = self.state.fail_with.lock().take() {
-            return Err(Box::new(Status::new(code, "injected")));
+            return Err(Status::new(code, "injected"));
         }
         let message = request.into_inner();
         assert_eq!(message.compatibility_id, "grpc-profile-v1");
@@ -147,12 +145,7 @@ where
                         type Future = BoxFuture<Response<Self::Response>, Status>;
                         fn call(&mut self, request: Request<CryptoBatchRequest>) -> Self::Future {
                             let server = self.0.clone();
-                            Box::pin(async move {
-                                server
-                                    .handle(request)
-                                    .map(Response::new)
-                                    .map_err(|status| *status)
-                            })
+                            Box::pin(async move { server.handle(request).map(Response::new) })
                         }
                     }
                     let codec: tonic::codec::ProstCodec<CryptoBatchResponse, CryptoBatchRequest> =

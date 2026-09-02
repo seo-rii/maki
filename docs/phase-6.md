@@ -41,8 +41,9 @@ mounting, or filesystem growth. Those operations belong to the separate
 The daemon opens `FileBacking` from `[backing].root`, resolves the configured
 provider, applies engine limits, runs recovery, and performs the provider
 self-test before serving I/O. Local AES-GCM-SIV and AES-XTS providers are
-supported; the fake provider is enabled for development, and the remote HTTP
-provider is implemented as part of [Phase 8](phase-8.md).
+supported; the fake provider is enabled for development, and remote HTTP,
+WebSocket, and gRPC providers are implemented in [Phase 8](phase-8.md) and
+[Phase 9](phase-9.md).
 
 The ABI shim exports an nbdkit API-v2 prefix with
 `THREAD_MODEL_PARALLEL` and `errno_is_preserved = 1`. Its Tokio runtime is

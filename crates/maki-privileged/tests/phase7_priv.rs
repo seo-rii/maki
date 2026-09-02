@@ -192,9 +192,8 @@ fn mount_identity_accepts_matching_mount() {
 
 #[test]
 fn mount_identity_rejects_every_mismatch() {
-    type ObservationMutation = Box<dyn Fn(&mut MountObservation)>;
-
-    let cases: Vec<(&str, ObservationMutation)> = vec![
+    type Mutation = Box<dyn Fn(&mut MountObservation)>;
+    let cases: Vec<(&str, Mutation)> = vec![
         (
             "missing mountpoint",
             Box::new(|o| o.mountpoint_exists = false),
