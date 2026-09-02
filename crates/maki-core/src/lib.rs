@@ -6,7 +6,7 @@
 //!
 //! Failpoints: with the `failpoints` feature, every persistence boundary
 //! calls into `maki_test_support::failpoints` under a stable name (see
-//! `docs/phase-3.md` for the list).
+//! `docs/architecture.md` for the persistence model).
 
 pub mod engine;
 pub mod error;

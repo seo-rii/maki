@@ -4,7 +4,7 @@
 //! files so a packaging regression fails CI. PRIV-010 is enforced by
 //! construction (the helper has no credential machinery) and pinned by plan
 //! inspection. OS-level enforcement is exercised by the Linux checklist in
-//! docs/phase-7.md.
+//! docs/operations.md.
 
 use maki_privileged::plan::{plan_attach, plan_detach, plan_grow, AttachRequest, GrowRequest};
 use maki_privileged::verify::{verify_mount_identity, MountExpectation, MountObservation};

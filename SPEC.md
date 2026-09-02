@@ -1378,542 +1378,169 @@ add reproducing regression test
 
 ---
 
-# 42. Phase 0 — Executable Specification
+# 42. Executable Durability Model
 
-Build first:
+Sections 42 through 54 define verification contracts for the implemented
+system. They are not an implementation sequence. Maintained test and
+qualification guidance lives in [docs/testing.md](docs/testing.md).
 
-```text
-ReferenceBlockModel
-CrashableBacking
-FakeCryptoProvider
-ManualClock
-DeterministicScheduler
-Failpoint framework
-```
+The repository MUST provide a deterministic reference block model, crashable
+backing store, fake crypto provider, manual clock, deterministic scheduler, and
+named persistence failpoints.
 
-Test-first cases:
+Acceptance criteria:
 
 ```text
-normal write followed by crash
-FUA followed by crash
-FLUSH followed by crash
-partial record
-same-unit concurrent write
-allocation mismatch
-retry semaphore release
-```
-
-Phase gate:
-
-```text
-10,000+ randomized model sequences
-durability oracle violations = 0
+normal writes recover to an allowed old or new value
+FUA and FLUSH acknowledgements recover to the new value
+torn records are detected
+same-unit writes serialize
+unsynchronized metadata loss is modeled
+retry sleeps do not retain scarce permits
 ```
 
 ---
 
-# 43. Phase 1 — Configuration and On-Disk Format
+# 43. Configuration and On-Disk Format Verification
 
-Test-first:
+Configuration and binary metadata decoders MUST reject malformed input without
+panicking. Geometry uses checked arithmetic. Superblocks, allocation maps,
+shard catalogs, slots, journal records, and checkpoint state use versioned,
+CRC-protected encodings with frozen golden vectors.
 
-```text
-geometry validation
-slot-size calculation
-integer overflow
-superblock A/B
-allocation metadata A/B
-catalog A/B
-malformed parser input
-```
-
-Implementation:
-
-```text
-config schema
-codec
-superblock
-slot format
-allocation metadata
-shard catalog
-format checker
-```
-
-Phase gate:
-
-```text
-parser panic = 0
-golden vectors frozen
-property/fuzz smoke tests pass
-```
+A/B metadata MUST fall back to the highest valid generation. Torn final journal
+tails may be truncated; corruption before a valid successor record MUST refuse
+recovery.
 
 ---
 
-# 44. Phase 2 — CryptoProvider
+# 44. CryptoProvider Verification
 
-Test-first:
+Every provider MUST pass the shared contract suite for round trips, supported
+sizes, response count and order, unit identity, ciphertext bounds, compatibility
+identity, and declared integrity behavior. Multi-endpoint sets MUST prove
+cross-endpoint decrypt compatibility before attach.
 
-```text
-round trip
-randomized ciphertext
-maximum-size violation
-batch reorder
-missing item
-duplicate item
-compatibility mismatch
-cross-endpoint decrypt
-local AEAD context binding
-secret logging leakage
-```
-
-Implementation:
-
-```text
-CryptoProvider
-Fake Provider
-AES-GCM-SIV
-AES-XTS
-key-source abstraction
-provider self-test
-```
+Keys and plaintext MUST remain absent from logs and error messages. Missing or
+invalid credentials fail closed.
 
 ---
 
-# 45. Phase 3 — Journal and Recovery
+# 45. Journal and Recovery Verification
 
-Test-first:
+Tests MUST cover append ordering, FUA, FLUSH, segment creation, directory
+synchronization, checkpoint boundaries, allocation corruption, ENOSPC, sequence
+gaps, torn tails, middle corruption, and duplicate attach. Failpoints MUST cover
+every persistence boundary.
 
-```text
-append
-barrier
-FUA
-segment creation
-directory fsync
-partial journal tail
-middle-record corruption
-checkpointing
-ENOSPC
-allocation corruption
-```
-
-Failpoints are inserted at every persistence boundary.
-
-Phase gate:
-
-```text
-10,000+ crash/recovery cycles
-silent corruption = 0
-```
+Randomized recovery compares observable data with the executable durability
+model and permits zero silent-corruption violations.
 
 ---
 
-# 46. Phase 4 — Block Core
+# 46. Block Engine Verification
 
-Test-first:
-
-```text
-zero read
-read/write
-multi-unit request
-partial-unit RMW
-concurrent writes
-concurrent read/write
-FUA
-FLUSH
-cache-disabled differential model test
-```
-
-The implementation is continuously compared against `ReferenceBlockModel`.
-
-Phase gate:
-
-```text
-100,000+ randomized I/O operations
-model mismatch = 0
-```
+The engine MUST be tested for zero reads, aligned and partial-unit I/O,
+read-modify-write, multi-unit requests, provider batch limits, concurrent reads
+and writes, FUA, FLUSH, and corrupted ciphertext. Randomized operations MUST be
+compared byte-for-byte with a plaintext reference model.
 
 ---
 
-# 47. Phase 5 — Backpressure, Retry, and HA
+# 47. Backpressure and Availability Verification
 
-Test-first:
+Tests MUST exercise request and byte semaphores, bounded queues, provider and
+endpoint concurrency, permit release during backoff, full-jitter retry, retry
+budgets, minimum probes, circuit transitions, endpoint failover, queue
+saturation, and large request counts.
 
-```text
-global semaphore
-endpoint semaphore
-byte semaphore
-
-bounded queues
-
-release permit during backoff
-
-full jitter
-retry budget
-minimum probe rate
-
-circuit transitions
-endpoint failover
-endpoint warm-up after recovery
-
-queue saturation + FLUSH
-queue saturation + FUA
-
-100,000 pending requests
-```
-
-Phase gate:
-
-```text
-queue bound violation = 0
-permit leak = 0
-retry storm = 0
-unbounded RSS growth = 0
-```
+Queue-bound violations, permit leaks, retry storms, and unbounded memory growth
+are release-blocking failures.
 
 ---
 
-# 48. Phase 6 — nbdkit Adapter
+# 48. nbdkit Adapter Verification
 
-Test-first:
+The adapter MUST verify device geometry, read and write callbacks, emulated FUA,
+FLUSH, parallel callbacks, panic containment, disabled native TRIM and
+write-zeroes, disabled multi-connection, disconnect, and clean detach.
 
-```text
-get_size
-block_size
-
-read/write
-FUA
-FLUSH
-
-parallel callbacks
-panic boundary
-
-zero fallback
-trim disabled
-multi-connection disabled
-
-disconnect
-clean detach
-```
-
-Implementation:
-
-```text
-maki-nbdkit cdylib
-after_fork runtime
-Unix Domain Socket
-NBD attach helper
-```
-
-Phase gate:
-
-```text
-libnbd tests pass
-/dev/nbd fio verify passes
-FLUSH/FUA behavior matches model
-```
-
-This phase produces the local-crypto Linux NBD MVP.
+Linux qualification additionally covers the exported API-v2 prefix, libnbd
+round trips, fio verification, and the kernel NBD path. See
+[docs/operations.md](docs/operations.md) and [docs/testing.md](docs/testing.md).
 
 ---
 
-# 49. Phase 7 — Daemon and Privilege Model
+# 49. Privilege Verification
 
-This phase is mandatory before production qualification.
+The long-running daemon MUST run with a non-root UID, no effective capabilities,
+restricted filesystem access, protected sockets, disabled core dumps, and no
+mount authority. Administrative control users MUST NOT gain privileged storage
+verbs. The privileged helper MUST NOT receive crypto credentials.
 
-## Test-first
-
-```text
-PRIV-001
-Maki daemon UID != 0
-
-PRIV-002
-effective capability set == 0
-
-PRIV-003
-daemon cannot write another volume's backing
-
-PRIV-004
-daemon cannot modify arbitrary /etc files
-
-PRIV-005
-daemon cannot perform mount syscall
-
-PRIV-006
-unauthorized user cannot access NBD UDS
-
-PRIV-007
-unauthorized user cannot access control socket
-
-PRIV-008
-maki-admin group can perform status/reload
-
-PRIV-009
-maki-admin cannot perform attach/mount
-
-PRIV-010
-privileged helper cannot access crypto credentials
-
-PRIV-011
-duplicate attach rejected by volume lock
-
-PRIV-012
-systemd restarts daemon after failure
-
-PRIV-013
-daemon cannot enter READY without backing
-
-PRIV-014
-missing credential fails closed
-
-PRIV-015
-core dump generation is blocked
-
-PRIV-016
-normal I/O works under systemd sandbox
-```
-
-## Implementation
-
-```text
-maki system user/group
-maki-admin group
-
-systemd units
-tmpfiles.d
-sysusers.d
-
-control socket ACL
-NBD socket ACL
-
-maki-attach helper
-
-credential loading
-
-volume locking
-
-systemd sandboxing
-```
-
-## Phase gate
-
-```text
-daemon running as root = 0
-unexpected capabilities = 0
-unauthorized access success = 0
-secret exposure = 0
-```
+Installed-system qualification verifies systemd sandboxing, ACLs, duplicate
+attach rejection, credential failure, restart behavior, mount identity, and I/O
+under the sandbox.
 
 ---
 
-# 50. Phase 8 — HTTP Remote Provider
+# 50. HTTP Provider Verification
 
-Test-first:
+The HTTP transport MUST test raw and mapped payloads, supported encodings,
+headers and credential references, batching, response order and completeness,
+hard response-size limits, status classification, timeouts, CA and SAN
+validation, mTLS, provider self-test, cross-endpoint compatibility, and absence
+of payload logging.
 
-```text
-raw payload
-JSON mapping
-base64
-hex
-
-headers
-query parameters
-credentials
-
-batch reorder
-partial response
-
-response-size limit
-
-TLS CA
-SAN
-mTLS
-
-HTTP 429
-HTTP 503
-timeout
-
-body mapping self-test
-
-absence of payload logging
-```
-
-Phase gate:
-
-```text
-fake HTTP chaos suite passes
-vendor contract suite passes
-cross-endpoint test passes
-24-hour hardware-provider soak passes
-```
+Vendor contract and duration testing require the production endpoint and remain
+external qualification.
 
 ---
 
-# 51. Phase 9 — WebSocket and gRPC
+# 51. WebSocket and gRPC Verification
 
-WebSocket tests:
+WebSocket tests cover correlation IDs, out-of-order and stale responses,
+connection generations, reconnect, error mapping, and frame-size limits. gRPC
+tests cover the reference message contract, configurable method paths, metadata,
+status mapping, response identity and order, and message-size limits.
 
-```text
-correlation IDs
-out-of-order responses
-reconnection
-stale responses
-frame-size limits
-```
-
-gRPC tests:
-
-```text
-native protocol
-dynamic descriptor
-metadata
-status mapping
-message-size limits
-```
-
-Every transport MUST pass the same provider conformance suite.
+Every remote transport MUST pass the same provider conformance suite. Unsupported
+TLS configurations MUST fail closed.
 
 ---
 
-# 52. Phase 10 — Cache and Operations
+# 52. Cache and Operational Verification
 
-Test-first:
-
-```text
-versioned cache behavior
-stale-read prevention
-TTL
-runtime resize
-zeroization
-
-metrics
-
-online growth
-growth during workload
-crash during growth
-
-mount guard
-
-wrong volume UUID
-missing mount
-```
-
-Phase gate:
-
-```text
-stale read = 0
-plaintext leak = 0
-growth corruption = 0
-```
+The read cache MUST be tested for write-sequence matching, stale-read prevention,
+TTL, LRU and byte bounds, runtime resizing, metrics, and zeroization on eviction.
+Growth tests cover lazy shard creation during workload and crash recovery at
+catalog boundaries. Mount validation rejects every identity or readiness
+mismatch independently.
 
 ---
 
-# 53. Phase 11 — Database Qualification
+# 53. Database Qualification
 
-## SQLite
+Automated testing MUST include a WAL-style database model with synchronous
+commit, epoch-gated replay, crash injection, provider outage, and an independent
+commit ledger. Real SQLite, PostgreSQL, ClickHouse, and MinIO qualification is
+performed on disposable Linux volumes as described in
+[docs/testing.md](docs/testing.md).
 
-```text
-WAL
-DELETE journal
-synchronous=FULL
-process crash
-provider outage
-PRAGMA integrity_check
-commit ledger
-```
-
-## PostgreSQL
-
-```text
-pgbench
-fsync=on
-synchronous_commit=on
-full_page_writes=on
-data_checksums=on
-
-checkpoint
-VACUUM
-CREATE INDEX
-
-WAL recovery
-pg_amcheck
-transaction ledger
-```
-
-## ClickHouse
-
-```text
-INSERT
-merge
-mutation
-partition operations
-CHECK TABLE
-hash oracle
-```
-
-## MinIO
-
-A dedicated Maki volume is recommended.
-
-```text
-multipart upload
-large object
-overwrite
-range GET
-restart
-provider outage
-SHA-256 oracle
-```
-
-Phase gate:
-
-```text
-DB corruption = 0
-durable transaction loss = 0
-silent corruption = 0
-```
+Database corruption, loss of acknowledged durable transactions, and silent data
+substitution are release-blocking failures.
 
 ---
 
-# 54. Phase 12 — Power-Loss Qualification
+# 54. Power-Loss Qualification
 
-Test hierarchy:
+Simulation MUST verify the FLUSH and FUA recovery contracts against the full
+engine. Simulation is development evidence and MUST NOT be represented as real
+power-loss qualification.
 
-```text
-WSL
-→ development and integration
-
-QEMU/KVM
-→ hard VM power cut
-
-Bare-metal Linux
-→ final durability qualification
-```
-
-Critical test:
-
-```text
-WRITE A
-WRITE B
-FLUSH success
-WRITE C
-power cut
-```
-
-Recovery requirement:
-
-```text
-A = new
-B = new
-C = old or new
-```
-
-FUA test:
-
-```text
-WRITE A + FUA success
-power cut
-
-A = new
-```
+Release qualification requires randomized QEMU hard cuts and bare-metal tests
+with an acknowledgement ledger stored outside the system under test. WSL is not
+valid power-loss evidence.
 
 ---
 
@@ -1963,7 +1590,7 @@ TLS suite
 ## Release
 
 ```text
-all phase gates
+all extended gates
 QEMU power-loss tests
 bare-metal tests
 72-hour mixed workload

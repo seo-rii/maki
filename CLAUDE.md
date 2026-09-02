@@ -1,20 +1,23 @@
-# Maki — development guide
+# Maki development guide
 
-Maki is a crash-consistent, bounded, privilege-separated encrypted block-storage layer (NBD via nbdkit). `SPEC.md` is the authoritative specification; `docs/phase-N.md` records what each phase built, its gate results, and any deferred Linux/hardware checklist.
+Maki is a crash-consistent, bounded, privilege-separated encrypted block-storage
+layer exposed through nbdkit. `SPEC.md` is normative. Start with
+`docs/architecture.md`, `docs/configuration.md`, `docs/operations.md`, and
+`docs/testing.md` for maintained project documentation.
 
 ## Ground rules
 
-- **TDD is mandatory** (SPEC §41): failing tests land before implementation; bug fixes start with a reproducing regression test. Phase gates live as `#[ignore]`d tests named `phase*_gate_full`.
+- **TDD is mandatory** (SPEC §41): failing tests land before implementation; bug fixes start with a reproducing regression test. Extended gates live as `#[ignore]`d tests; their historical `phase*_gate_full` names remain stable test identifiers.
 - **Durability invariants are non-negotiable** (SPEC §12): plaintext never persisted; FLUSH/FUA-acknowledged data survives any crash; `checkpoint_sequence ≤ durable_sequence`; corrupted ciphertext ⇒ EIO, never data; allocated-but-invalid slots ⇒ EIO, never zeros.
 - **Secrets**: plaintext and keys travel in `SecretBuffer` (zeroize-on-drop, no `Clone`, redacted Debug). Never log payloads; never put literals in configs (SPEC §9). `maki-privileged` must never gain a dependency on any crypto crate (PRIV-010 by construction).
 - **Providers are untrusted**: results go through `CheckedProvider`/validators; unprovable capabilities are `Absent` (SPEC §16).
 
 ## Commands
 
-```
-cargo test --workspace                                  # PR suite (~1 min)
-cargo test --workspace --release -- --ignored           # phase gates
-cargo test -p maki-core --test phase3 -- --nocapture    # one phase
+```bash
+cargo test --workspace --locked
+cargo test --workspace --release --locked -- --ignored
+cargo test -p maki-core --locked --test phase3 -- --nocapture
 ```
 
 Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are process-global). Timing-sensitive async code uses the injectable `Clock` (`ManualClock` in tests) — never real sleeps.
@@ -36,12 +39,15 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 
 ## Traps that already bit us (don't re-learn)
 
-- crc32 of a self-checksummed image is a constant — golden vectors hash the payload *excluding* the trailing CRC (`docs/phase-1.md`).
-- Checkpointing the newest overlay version loses a unit whose newest write is volatile — hence the dual latest/latest-durable overlay (`docs/phase-3.md`).
-- A dying websocket connection's failure sweep must be generation-scoped or it kills requests on the successor connection (`docs/phase-10.md`).
-- WAL-style replay needs a flushed header/salt gating epochs — validation alone lets older transactions replay over newer durably-applied data (`docs/phase-11.md`).
+- crc32 of a self-checksummed image is a constant; golden vectors hash the payload excluding the trailing CRC ([architecture](docs/architecture.md)).
+- Checkpointing the newest overlay version can lose a unit whose newest write is volatile; keep latest and latest-durable versions separately ([architecture](docs/architecture.md)).
+- A dying WebSocket connection must only fail requests from its own generation ([architecture](docs/architecture.md)).
+- WAL-style replay needs a flushed header or salt to gate epochs ([testing](docs/testing.md)).
 - On-disk format changes require a format-version bump + new golden vectors; `tests/golden/*.crc` failing means you broke compatibility.
 
-## What still needs a Linux/hardware host
+## External qualification
 
-Phase 6 nbdkit ABI + libnbd/fio verification, Phase 7 OS-enforced PRIV checks (`docs/phase-7.md` checklist), Phase 8 vendor-endpoint contract + 24 h soak, Phase 11 real-database qualification, Phase 12 QEMU/bare-metal power cuts. Each has a runbook in its phase doc.
+Kernel NBD/filesystem checks, OS-enforced privilege checks, vendor endpoint
+qualification, real databases, and disruptive power-loss testing require
+dedicated Linux or hardware environments. Follow `docs/testing.md`; operational
+commands and safety boundaries are in `docs/operations.md`.

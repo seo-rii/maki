@@ -1,0 +1,174 @@
+# Operations
+
+This guide covers volume lifecycle, nbdkit integration, privilege separation,
+control commands, and recovery. Commands that attach block devices, modify LVM,
+mount filesystems, or grow filesystems require an isolated Linux target and
+appropriate privileges.
+
+The repository includes a guarded, destructive-target-restricted procedure in
+[Privileged Linux validation](privileged-linux-validation.md).
+
+## Prerequisites
+
+Building the Rust workspace requires a Rust toolchain. The Linux data path also
+uses nbdkit. Rootless userspace validation requires `nbdkit`, `nbdinfo`,
+`nbdcopy`, and fio with its NBD engine. Kernel attachment additionally requires
+the Linux NBD module and a disposable `/dev/nbdN`.
+
+On Debian-family systems the relevant packages are `nbdkit`,
+`nbdkit-plugin-dev`, `libnbd-bin`, and `fio`. Package and service installation
+remain distribution-specific.
+
+## Build the plugin
+
+```bash
+cargo build --release --locked -p maki-nbdkit
+nm -D --defined-only target/release/libmaki_nbdkit.so |
+  grep -Eq '[[:space:]]T[[:space:]]plugin_init$'
+```
+
+The exported structure uses the validated nbdkit API-v2 prefix. FLUSH is
+available, FUA is emulated by nbdkit, and native TRIM, write-zeroes, block-size
+negotiation, and multi-connection callbacks are not exported.
+
+## Volume lifecycle
+
+Initialize, inspect, and check a volume with the administrative CLI:
+
+```bash
+maki volume create /etc/maki/volumes/example.toml
+maki volume inspect /etc/maki/volumes/example.toml
+maki check /etc/maki/volumes/example.toml
+```
+
+`volume create` writes the initial superblock, catalog, and backing directories.
+The command must target an empty, reviewed backing location. `maki-check` can
+also inspect a backing root directly:
+
+```bash
+maki-check /var/lib/maki/example
+```
+
+Run offline checks only after the daemon or nbdkit process has released the
+volume lock.
+
+## Run nbdkit
+
+Use a dedicated socket and one daemon per volume:
+
+```bash
+nbdkit --foreground \
+  -U /run/maki/example/nbd.sock \
+  /usr/lib/maki/libmaki_nbdkit.so \
+  config=/etc/maki/volumes/example.toml
+```
+
+The plugin creates its Tokio runtime after nbdkit forks. Clean shutdown flushes
+the engine, checkpoints durable state, and releases the volume lock.
+
+## Rootless userspace smoke test
+
+The following test overwrites the complete disposable export:
+
+```bash
+uri='nbd+unix:///?socket=/run/maki/example/nbd.sock'
+test_dir="$(mktemp -d)"
+
+nbdinfo "$uri"
+dd if=/dev/urandom of="$test_dir/source.bin" bs=1M count=8 status=none
+nbdcopy --flush --synchronous "$test_dir/source.bin" "$uri"
+nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"
+cmp "$test_dir/source.bin" "$test_dir/roundtrip.bin"
+
+fio --name=maki-nbd-verify \
+  --ioengine=nbd --uri="$uri" \
+  --rw=write --bs=4k --size=8M --iodepth=1 --fsync=32 \
+  --verify=crc32c --do_verify=1 --verify_fatal=1 \
+  --verify_state_save=0
+```
+
+This covers Maki through nbdkit and libnbd without a kernel device. It does not
+qualify `/dev/nbd`, LVM, XFS, or raw-device durability.
+
+## Control plane
+
+The unprivileged control socket accepts newline-delimited JSON with a 64 KiB
+line limit. The `maki` CLI exposes the supported operations:
+
+```bash
+maki status /etc/maki/volumes/example.toml
+maki metrics /etc/maki/volumes/example.toml
+maki checkpoint /etc/maki/volumes/example.toml
+maki reload /etc/maki/volumes/example.toml cache
+```
+
+Attach, detach, mount, unmount, NBD, and growth verbs are deliberately absent
+from the control socket.
+
+## Privileged helper
+
+`maki-attach` prints an auditable operation plan before execution. Always review
+plan mode first:
+
+```bash
+maki-attach attach --volume example --plan
+maki-attach detach --volume example --plan
+maki-attach grow --volume example --add-bytes 1073741824 --plan
+```
+
+> [!CAUTION]
+> Removing `--plan` executes NBD, LVM, mount, or filesystem-growth commands on
+> Linux. Specify the NBD device, volume group, logical volume, mountpoint, and
+> volume UUID explicitly in production automation.
+
+The helper has no crypto dependencies and must not receive provider credentials.
+
+## systemd deployment
+
+The repository provides templates under `packaging/systemd/`, users and groups
+under `packaging/sysusers.d/`, and runtime directory rules under
+`packaging/tmpfiles.d/`.
+
+The data-plane unit runs as `maki`, has an empty capability set, disables core
+dumps, uses `NoNewPrivileges`, and receives crypto credentials. The attach unit
+is a separate privileged oneshot service without credentials.
+
+Before production use, verify the installed units on the target distribution:
+
+```bash
+systemd-analyze security maki@example.service
+systemd-analyze verify maki@example.service maki-attach@example.service
+```
+
+Also verify socket ACLs, effective capabilities, core-dump policy, duplicate
+attach rejection, mount identity, and normal I/O under the service sandbox.
+
+## Growth and cache reload
+
+Maki allocates backing shards lazily within the configured virtual capacity.
+Growing the mounted filesystem is a privileged LVM and XFS operation exposed by
+`maki-attach grow`. The configured maximum virtual size does not change.
+
+The read-cache size and TTL are runtime settings. Reload the `cache` section
+through the control socket after changing them. Reducing the byte limit evicts
+entries immediately; setting it to zero disables caching.
+
+## Metrics and health
+
+Monitor request and byte admission, endpoint inflight work, crypto latency and
+retries, retry-budget tokens, circuit state, failover count, journal size and
+durable sequence, checkpoint lag, FLUSH/FUA latency, cache hits and misses,
+backing free space, and volume state. Do not add unit indexes, LBAs, request IDs,
+or other high-cardinality values as metric labels.
+
+## Failure handling
+
+- Provider contract or compatibility failures refuse attach.
+- Corrupt metadata, sequence gaps, and non-tail journal corruption fail loudly.
+- A torn final journal tail is truncated during recovery.
+- An allocated slot that cannot be validated returns EIO, never fabricated zeros.
+- A second process cannot attach while the volume lock is held.
+- Clean detach requires FLUSH, checkpoint, engine drop, and lock release.
+
+Use [Testing and qualification](testing.md) before interpreting a successful
+userspace smoke test as production readiness.

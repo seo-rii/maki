@@ -1,7 +1,7 @@
 //! End-to-end test of `maki-attach` as a real process: `--plan` prints the
 //! audited step sequence and executes nothing; missing arguments are usage
 //! errors; on non-Linux hosts execution is refused (exit 3) after printing
-//! the plan. The execution path itself is Linux-only (docs/phase-7.md).
+//! the plan. The execution path itself is Linux-only (docs/operations.md).
 
 use std::process::{Command, Output};
 

@@ -5,7 +5,7 @@
 //! only needs to speak the documented contract at any package/service name.
 //! Responses echo `unit_index`, giving native reorder detection. Message
 //! sizes are bounded in both directions. Dynamic descriptor loading
-//! (arbitrary message shapes) is milestone M7 — see docs/phase-9.md.
+//! (arbitrary message shapes) is not supported; see docs/configuration.md.
 
 use std::time::Duration;
 

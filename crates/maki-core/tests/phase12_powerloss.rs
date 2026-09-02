@@ -6,7 +6,7 @@
 //! over `CrashableBacking`, whose crash model (independent survival of every
 //! unsynced write, torn tails, orphaned dirents) is a superset of what a
 //! power cut can do to a POSIX filesystem. The QEMU/bare-metal runbook is
-//! in docs/phase-12.md.
+//! in docs/testing.md.
 
 use std::sync::Arc;
 

@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the cross-platform blocking adapter — the exact
 //! surface the nbdkit C ABI shim calls. Kernel-level verification (libnbd,
-//! /dev/nbd fio) runs on Linux; see docs/phase-6.md.
+//! /dev/nbd fio) runs on Linux; see docs/testing.md.
 
 use std::sync::Arc;
 

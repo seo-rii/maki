@@ -11,7 +11,7 @@
 //!   after nbdkit forks — equivalent to the `after_fork` hook without
 //!   depending on newer struct fields.
 //! - MUST be layout-verified against the distribution's nbdkit-plugin.h in
-//!   Linux CI before production use (see docs/phase-6.md).
+//!   Linux qualification before production use (see docs/testing.md).
 
 #![allow(non_camel_case_types)]
 

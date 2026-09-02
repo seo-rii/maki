@@ -14,17 +14,16 @@ header ABI probe, and live Maki nbdkit/libnbd/fio path all passed. Kernel NBD,
 installed-service, vendor, real-database, and physical power-loss
 qualifications remain open.
 
-Related documentation: [CI and release qualification](ci.md) ·
-[Phase 6: nbdkit adapter](phase-6.md) ·
-[Phase 11: database qualification](phase-11.md) ·
-[Phase 12: power-loss qualification](phase-12.md)
+Related documentation: [Architecture](architecture.md) ·
+[Operations](operations.md) ·
+[Testing and qualification](testing.md)
 
 ## Summary
 
 | Area | Outcome | Evidence |
 |---|---|---|
 | Default workspace tests | **Pass** | 200 passed, 0 failed, 5 ignored |
-| Extended simulation gates | **Pass** | All 5 release-mode phase gates passed |
+| Extended simulation gates | **Pass** | All 5 release-mode extended gates passed |
 | Code quality | **Pass** | Formatter clean; strict Clippy clean across the workspace, all targets, and all features |
 | Plugin build and ABI | **Pass** | ELF/symbol checks and Debian 12 nbdkit API-v2 prefix comparison passed |
 | Rootless Maki NBD path | **Pass** | `nbdinfo`, 8 MiB `nbdcopy` round trip, fio CRC32C verification, and post-I/O offline checks passed |
@@ -111,7 +110,7 @@ use the target distribution's package manager.
 Run these commands from the repository root at the tested revision. `--locked`
 keeps dependency resolution pinned to `Cargo.lock`.
 
-### Workspace, phase gates, plugin, and quality checks
+### Workspace, extended gates, plugin, and quality checks
 
 ```bash
 cargo fmt --all --check
@@ -249,13 +248,13 @@ does not replace validation after package installation.
 
 | Check | Result | Observation |
 |---|---|---|
-| Default workspace suite | **Pass** | 200 passed, 0 failed, 5 ignored phase gates |
-| Extended phase gates | **Pass** | 5/5 release-mode gates passed |
-| Phase 0 full gate | **Pass** | 10,000 seeds x 60 randomized model operations |
-| Phase 3 full gate | **Pass** | 10,000 seeds x 60 mixed operations, including randomized crash/recovery |
-| Phase 4 full gate | **Pass** | 110,000 randomized model operations |
-| Phase 11 full gate | **Pass** | 500 database-simulation runs, 40 transactions per run |
-| Phase 12 full gate | **Pass** | 500 critical-sequence and 500 FUA simulated power-loss cycles |
+| Default workspace suite | **Pass** | 200 passed, 0 failed, 5 ignored extended gates |
+| Extended simulation gates | **Pass** | 5/5 release-mode gates passed |
+| Durability-model gate | **Pass** | 10,000 seeds x 60 randomized model operations |
+| Crash/recovery gate | **Pass** | 10,000 seeds x 60 mixed operations, including randomized crash/recovery |
+| Block-model gate | **Pass** | 110,000 randomized model operations |
+| Database-simulation gate | **Pass** | 500 database-simulation runs, 40 transactions per run |
+| Power-loss simulation gate | **Pass** | 500 critical-sequence and 500 FUA simulated power-loss cycles |
 | `cargo fmt --all --check` | **Pass** | The previous 44-file formatting drift is resolved |
 | Strict Clippy | **Pass** | Workspace, all targets, all features, `-D warnings` |
 | FileBacking CLI flow | **Pass** | Create, inspect, and both offline checkers passed before and after the workload |
@@ -298,25 +297,24 @@ raw-device durability, or hard-power-loss recovery.
 
 | Qualification | Why it was not run | Prerequisite to close it | Runbook |
 |---|---|---|---|
-| Kernel `/dev/nbd`, filesystem, and raw-device fio | Root-only attachment and destructive writes to the selected device | Dedicated disposable NBD target and authorized root environment | [Phase 6](phase-6.md) |
-| Live privilege, ACL, capability, and service-crash checks | Packaging and dedicated service identities absent; includes intentional crash | Installed package on an isolated Linux host | [Phase 7](phase-7.md) |
-| Vendor contract and soak | No endpoint or credential supplied | Vendor test environment and a supported invocation; current docs mention CLI modes not implemented by the binaries | [Phase 8](phase-8.md) |
-| Real SQLite/PostgreSQL qualification | Requires the privileged NBD/XFS path first | Completed Phase 6 kernel path and disposable database instance | [Phase 11](phase-11.md) |
-| QEMU hard cuts and bare-metal cuts | Intentionally disruptive | Dedicated VM/hardware, independent ledger, and authorized power control | [Phase 12](phase-12.md) |
-| 24/72-hour soak and 24 CPU-hour parser fuzzing | Long, resource-intensive qualification; fuzz wiring is pending | Dedicated runner, bounded monitoring, and cargo-fuzz targets/corpus | [CI strategy](ci.md) |
+| Kernel `/dev/nbd`, filesystem, and raw-device fio | Root-only attachment and destructive writes to the selected device | Dedicated disposable NBD target and authorized root environment | [Operations](operations.md) |
+| Live privilege, ACL, capability, and service-crash checks | Packaging and dedicated service identities absent; includes intentional crash | Installed package on an isolated Linux host | [Operations](operations.md) |
+| Vendor contract and soak | No endpoint or credential supplied | Vendor test environment with production mapping and credentials | [Configuration](configuration.md) |
+| Real SQLite/PostgreSQL qualification | Requires the privileged NBD/XFS path first | Completed kernel path and disposable database instance | [Testing](testing.md) |
+| QEMU hard cuts and bare-metal cuts | Intentionally disruptive | Dedicated VM/hardware, independent ledger, and authorized power control | [Testing](testing.md) |
+| 24/72-hour soak and 24 CPU-hour parser fuzzing | Long, resource-intensive qualification; fuzz wiring is pending | Dedicated runner, bounded monitoring, and cargo-fuzz targets/corpus | [Testing](testing.md) |
 
 ## Impact on release qualification
 
 - Executed functional, simulation, quality, ABI, and userspace NBD checks
   passed without reported corruption, durability, secrecy, queue-bound,
   semaphore, privilege, checksum, or lint violations.
-- Phase 6 now has distro-header and userspace nbdkit/libnbd/fio evidence, but
-  its kernel `/dev/nbd`, filesystem, and raw-device gate remains open.
-- The Phase 3 in-process crash simulation passed, but it did not record 10,000
+- The nbdkit adapter now has distro-header and userspace libnbd/fio evidence,
+  but its kernel `/dev/nbd`, filesystem, and raw-device gate remains open.
+- The in-process crash simulation passed, but it did not record 10,000
   operating-system process crashes; that release requirement remains partial.
-- Phase 7 OS-enforced checks, Phase 8 vendor qualification, Phase 11 real
-  database qualification, and Phase 12 QEMU/bare-metal qualification remain
-  open.
+- OS-enforced privilege checks, vendor qualification, real database
+  qualification, and QEMU/bare-metal qualification remain open.
 - Formatting and strict Clippy are clean at the tested revision. They remain
   advisory in the current GitHub Actions workflow.
 
