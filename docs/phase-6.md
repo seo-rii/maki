@@ -28,3 +28,12 @@ get_size/block_size · trim/zero/multi-conn disabled flags · read/write roundtr
 4. FLUSH/FUA behavior vs the model: `fio --fsync=1` + power-cut simulation (Phase 12 harness).
 
 The plugin shim is intentionally thin; all engine behavior it exposes is covered by the adapter tests on every platform.
+
+## Native Linux validation record
+
+The [2026-09-02 native Linux run](native-linux-validation-2026-09-02.md)
+passed the release plugin build, exported-symbol check, adapter suite, and a
+temporary FileBacking CLI/benchmark flow on Debian 12. The host did not have
+nbdkit/libnbd/fio tooling installed, and raw NBD attachment was excluded as a
+privileged, destructive operation. The kernel-level checklist therefore
+remains open.

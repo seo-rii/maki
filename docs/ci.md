@@ -22,3 +22,10 @@
 | mixed workload | 72 h | ⏳ hardware tier |
 
 Allowed-failure counters (silent corruption, FLUSH/FUA violation, plaintext leak, queue bound, semaphore, privilege, secret leakage) are all **0** across every suite in this repository.
+
+## Recorded native-host runs
+
+- [2026-09-02 native Linux validation](native-linux-validation-2026-09-02.md):
+  Debian 12 on a KVM guest, all unprivileged repository tests and extended
+  simulation gates. The report records passing results, tool-dependent skips,
+  and the still-open kernel/bare-metal gates.
