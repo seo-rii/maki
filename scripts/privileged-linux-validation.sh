@@ -352,11 +352,24 @@ cleanup() {
     fi
     nbdkit_pid=""
 
-    if [[ -n "$runtime_dir" && "$runtime_dir" == /run/maki/privval-* ]]; then
-        sudo -n rmdir "$runtime_dir" 2>/dev/null || true
+    if [[ "$cleanup_safe" == true && -n "$runtime_dir" && "$runtime_dir" == /run/maki/privval-* ]]; then
+        if [[ -S "$socket_path" && "$socket_path" == "$runtime_dir/nbd.sock" ]]; then
+            log "cleanup: deleting stale test socket $socket_path"
+            unlink "$socket_path" || cleanup_rc=1
+        elif [[ -e "$socket_path" ]]; then
+            log "cleanup warning: refusing unexpected runtime entry $socket_path"
+            cleanup_rc=1
+        fi
+        if ! sudo -n rmdir "$runtime_dir"; then
+            log "cleanup warning: could not remove test runtime directory $runtime_dir"
+            cleanup_rc=1
+        fi
     fi
-    if [[ "$runtime_parent_created" == true ]]; then
-        sudo -n rmdir /run/maki 2>/dev/null || true
+    if [[ "$runtime_parent_created" == true && ! -e "$runtime_dir" ]]; then
+        if ! sudo -n rmdir /run/maki; then
+            log "cleanup warning: could not remove test-created /run/maki"
+            cleanup_rc=1
+        fi
     fi
 
     if [[ -n "$work_dir" && "$cleanup_safe" == true ]]; then
