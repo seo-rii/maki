@@ -431,11 +431,24 @@ if [[ "$install_missing" == true ]]; then
     source /etc/os-release
     [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* ]] ||
         die "--install-missing currently supports Debian-family systems only"
+
+    apt_source_args=()
+    if [[ "${ID:-}" == "debian" && -r /etc/apt/sources.list.d/debian.sources ]]; then
+        # Ignore unrelated third-party repositories for this test-only install.
+        # This avoids changing host configuration and keeps every package on
+        # the distribution's signed Debian sources.
+        apt_source_args=(
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/debian.sources
+            -o Dir::Etc::sourceparts=-
+        )
+        log "using only /etc/apt/sources.list.d/debian.sources"
+    fi
+
     log "installing native validation dependencies with apt"
-    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
-    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        binutils fio kmod libnbd-bin lvm2 nbd-client nbdkit nbdkit-plugin-dev \
-        sqlite3 util-linux xfsprogs
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" update
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" \
+        install -y --no-install-recommends binutils fio kmod libnbd-bin lvm2 \
+        nbd-client nbdkit nbdkit-plugin-dev sqlite3 util-linux xfsprogs
     pass "native validation dependencies installed"
 fi
 
