@@ -29,4 +29,11 @@ Native tonic/prost implementation with hand-written message types (no protoc bui
 ## Notes
 
 - Both transports are `CryptoProvider`s, so they compose with `CheckedProvider`, the Phase-5 `EndpointSet` (retry/budget/breaker/failover), and the attach self-test unchanged.
-- Daemon wiring for `remote-websocket` / `remote-grpc` follows the `remote-http` pattern in `maki-nbdkit::daemon` when these transports get production config schemas (the `[crypto.websocket]`/`[crypto.grpc]` sections exist and validate today).
+
+## Daemon wiring (follow-up, `maki-nbdkit/tests/phase9_daemon.rs`)
+
+`provider = "remote-websocket"` / `"remote-grpc"` assemble through the same dispatcher as `remote-http` (shared `dispatch_endpoint_set`: cross-endpoint self-test, retry/budget/breaker/failover):
+
+- `[crypto.websocket]`: `[[endpoint]]` (ws:// URLs), `timeout`, `max_frame_bytes`.
+- `[crypto.grpc]`: `[[endpoint]]` (http:// URLs), `timeout`, `max_message_bytes`, `encrypt_path`/`decrypt_path` (default: the reference contract `/maki.CryptoService/{Encrypt,Decrypt}Batch`), and `[crypto.grpc.metadata]` — ascii metadata where sensitive keys (authorization etc.) must be credential references (SPEC §9, validated in `maki-format`), resolved through the daemon's key router.
+- **TLS gap, fail closed**: neither transport build compiles in TLS yet, so `wss://`/`https://` endpoints or a `[crypto.*.tls]` section refuse attach with an explicit error — never a silent downgrade. Use `remote-http` (full rustls, mTLS, custom CA) where TLS is required; wiring TLS into ws/grpc is a follow-up (tungstenite `rustls-tls` / tonic `tls` features).

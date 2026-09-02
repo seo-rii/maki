@@ -486,6 +486,70 @@ root = "/x"
 }
 
 #[test]
+fn grpc_section_parses_with_paths_and_credential_metadata() {
+    let good = r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[crypto.grpc]
+encrypt_path = "/vendor.Kms/Encrypt"
+decrypt_path = "/vendor.Kms/Decrypt"
+max_message_bytes = "4MiB"
+[[crypto.grpc.endpoint]]
+name = "primary"
+url = "http://crypto.internal:7000"
+[crypto.grpc.metadata]
+authorization = { source = "credential", name = "crypto-token" }
+[backing]
+root = "/x"
+"#;
+    let cfg = parse_config(good).unwrap();
+    cfg.validate().unwrap();
+    let grpc = cfg.crypto.grpc.as_ref().unwrap();
+    assert_eq!(grpc.encrypt_path.as_deref(), Some("/vendor.Kms/Encrypt"));
+    assert_eq!(grpc.endpoint.len(), 1);
+    assert_eq!(grpc.max_message_bytes.unwrap(), ByteSize(4 << 20));
+}
+
+#[test]
+fn grpc_metadata_rejects_literal_secrets() {
+    // SPEC §9 applies to gRPC metadata exactly as to HTTP headers.
+    let bad = r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[[crypto.grpc.endpoint]]
+name = "primary"
+url = "http://crypto.internal:7000"
+[crypto.grpc.metadata]
+authorization = "Bearer sk-actual-secret"
+[backing]
+root = "/x"
+"#;
+    match parse_config(bad) {
+        Err(_) => {}
+        Ok(cfg) => assert!(
+            cfg.validate().is_err(),
+            "sensitive gRPC metadata with literal value must be rejected"
+        ),
+    }
+}
+
+#[test]
 fn byte_size_and_duration_parsing() {
     use maki_format::config::{ByteSize, MakiDuration};
     assert_eq!("128MiB".parse::<ByteSize>().unwrap().0, 128 << 20);

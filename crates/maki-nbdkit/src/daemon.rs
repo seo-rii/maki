@@ -100,6 +100,8 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
             }
         }
         "remote-http" => remote_http_provider(config).await,
+        "remote-websocket" => remote_websocket_provider(config).await,
+        "remote-grpc" => remote_grpc_provider(config).await,
         other => Err(DaemonError::Unsupported(format!("provider {other:?}"))),
     }
 }
@@ -125,9 +127,6 @@ impl KeySource for RoutedKeySource {
 async fn remote_http_provider(
     config: &VolumeConfig,
 ) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
-    use maki_crypto::clock::SystemClock;
-    use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
-
     let http = config
         .crypto
         .http
@@ -147,6 +146,175 @@ async fn remote_http_provider(
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
+    dispatch_endpoint_set(config, endpoints).await
+}
+
+/// `remote-websocket`: per-endpoint WS transports through the shared
+/// dispatcher. The transport build has no TLS support yet, so `wss://` or a
+/// `[crypto.websocket.tls]` section refuses attach — fail closed, never a
+/// silent downgrade.
+async fn remote_websocket_provider(
+    config: &VolumeConfig,
+) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+    let ws = config
+        .crypto
+        .websocket
+        .as_ref()
+        .ok_or_else(|| DaemonError::Unsupported("missing [crypto.websocket]".to_string()))?;
+    if ws.endpoint.is_empty() {
+        return Err(DaemonError::Unsupported(
+            "remote-websocket requires at least one [[crypto.websocket.endpoint]]".to_string(),
+        ));
+    }
+    if ws.tls.is_some() {
+        return Err(DaemonError::Unsupported(
+            "TLS for the websocket transport is not compiled in; \
+             remove [crypto.websocket.tls] or use remote-http"
+                .to_string(),
+        ));
+    }
+    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    for endpoint in &ws.endpoint {
+        if !endpoint.url.starts_with("ws://") {
+            return Err(DaemonError::Unsupported(format!(
+                "websocket endpoint {:?} must be ws:// (TLS/wss is not compiled in)",
+                endpoint.url
+            )));
+        }
+        let provider =
+            maki_crypto_websocket::WsCryptoProvider::new(maki_crypto_websocket::WsProviderSpec {
+                url: endpoint.url.clone(),
+                capabilities: capabilities_from_config(config, "remote-websocket"),
+                timeout: ws
+                    .timeout
+                    .map(|d| d.0)
+                    .unwrap_or(std::time::Duration::from_secs(10)),
+                max_frame_bytes: ws.max_frame_bytes.map(|b| b.0 as usize).unwrap_or(8 << 20),
+            });
+        endpoints.push((endpoint.name.clone(), Arc::new(provider)));
+    }
+    dispatch_endpoint_set(config, endpoints).await
+}
+
+/// `remote-grpc`: fixed reference contract
+/// (`packaging/examples/maki-crypto.proto`) at configurable method paths,
+/// with credential-resolved ascii metadata. Same TLS fail-closed rule as the
+/// websocket transport.
+async fn remote_grpc_provider(
+    config: &VolumeConfig,
+) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+    let grpc = config
+        .crypto
+        .grpc
+        .as_ref()
+        .ok_or_else(|| DaemonError::Unsupported("missing [crypto.grpc]".to_string()))?;
+    if grpc.endpoint.is_empty() {
+        return Err(DaemonError::Unsupported(
+            "remote-grpc requires at least one [[crypto.grpc.endpoint]]".to_string(),
+        ));
+    }
+    if grpc.tls.is_some() {
+        return Err(DaemonError::Unsupported(
+            "TLS for the grpc transport is not compiled in; \
+             remove [crypto.grpc.tls] or use remote-http"
+                .to_string(),
+        ));
+    }
+    let mut metadata = Vec::new();
+    for (name, value) in &grpc.metadata {
+        metadata.push((name.clone(), resolve_metadata_value(value)?));
+    }
+    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    for endpoint in &grpc.endpoint {
+        if !endpoint.url.starts_with("http://") {
+            return Err(DaemonError::Unsupported(format!(
+                "grpc endpoint {:?} must be http:// (TLS/https is not compiled in)",
+                endpoint.url
+            )));
+        }
+        let provider =
+            maki_crypto_grpc::GrpcCryptoProvider::new(maki_crypto_grpc::GrpcProviderSpec {
+                url: endpoint.url.clone(),
+                encrypt_path: grpc
+                    .encrypt_path
+                    .clone()
+                    .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
+                decrypt_path: grpc
+                    .decrypt_path
+                    .clone()
+                    .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
+                metadata: metadata.clone(),
+                capabilities: capabilities_from_config(config, "remote-grpc"),
+                timeout: grpc
+                    .timeout
+                    .map(|d| d.0)
+                    .unwrap_or(std::time::Duration::from_secs(10)),
+                max_message_bytes: grpc
+                    .max_message_bytes
+                    .map(|b| b.0 as usize)
+                    .unwrap_or(4 << 20),
+            })?;
+        endpoints.push((endpoint.name.clone(), Arc::new(provider)));
+    }
+    dispatch_endpoint_set(config, endpoints).await
+}
+
+/// Declared `[crypto.capabilities]` as `CryptoCapabilities` (the same
+/// mapping the HTTP provider applies inside `from_config`).
+fn capabilities_from_config(
+    config: &VolumeConfig,
+    provider_id: &str,
+) -> maki_crypto::CryptoCapabilities {
+    let caps_cfg = &config.crypto.capabilities;
+    let capability = |s: &str| match s {
+        "verified" => maki_crypto::Capability::Verified,
+        "contractual" => maki_crypto::Capability::Contractual,
+        _ => maki_crypto::Capability::Absent,
+    };
+    maki_crypto::CryptoCapabilities {
+        provider_id: provider_id.to_string(),
+        crypto_compatibility_id: config.crypto.crypto_compatibility_id.clone(),
+        supported_plaintext_sizes: caps_cfg.supported_plaintext_sizes.clone(),
+        max_ciphertext_size: caps_cfg.max_ciphertext_size,
+        stateless: caps_cfg.stateless,
+        retry_safe: caps_cfg.retry_safe,
+        batch: maki_crypto::BatchCapability {
+            supported: true,
+            max_items: config.crypto.batch.max_items,
+            max_bytes: config.crypto.batch.max_bytes.0,
+        },
+        integrity: capability(&caps_cfg.integrity),
+        context_binding: capability(&caps_cfg.context_binding),
+        replay_protection: capability(&caps_cfg.replay_protection),
+    }
+}
+
+/// Resolve a metadata value: literal as-is (validation already rejected
+/// literals for sensitive keys, SPEC §9), credential via the key router.
+fn resolve_metadata_value(value: &maki_format::config::HeaderValue) -> Result<String, DaemonError> {
+    match value {
+        maki_format::config::HeaderValue::Literal(v) => Ok(v.clone()),
+        maki_format::config::HeaderValue::Credential(cred) => {
+            let secret = RoutedKeySource.load(&cred.name)?;
+            let text = String::from_utf8(secret.expose().to_vec()).map_err(|_| {
+                DaemonError::Unsupported("credential is not valid UTF-8".to_string())
+            })?;
+            Ok(match &cred.format {
+                Some(template) => template.replace("{}", text.trim()),
+                None => text.trim().to_string(),
+            })
+        }
+    }
+}
+
+/// Cross-endpoint interchangeability check (SPEC §34) plus the dispatcher
+/// (retry/budget/breaker/failover) shared by every remote transport.
+async fn dispatch_endpoint_set(
+    config: &VolumeConfig,
+    endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
+) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+    use maki_crypto::clock::SystemClock;
+    use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 
     // Cross-endpoint encrypt/decrypt self-tests before attach (SPEC §34).
     // The synthetic context uses the configured profile; the volume UUID is

@@ -223,7 +223,7 @@ pub struct CryptoSection {
     #[serde(default)]
     pub websocket: Option<TransportSection>,
     #[serde(default)]
-    pub grpc: Option<TransportSection>,
+    pub grpc: Option<GrpcSection>,
     #[serde(default)]
     pub batch: BatchSection,
     #[serde(default)]
@@ -294,7 +294,7 @@ pub struct HttpSection {
     pub max_response_bytes: Option<ByteSize>,
 }
 
-/// Endpoint list shared by websocket/grpc transports.
+/// WebSocket transport (SPEC §18).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransportSection {
@@ -306,6 +306,29 @@ pub struct TransportSection {
     pub timeout: Option<MakiDuration>,
     #[serde(default)]
     pub max_frame_bytes: Option<ByteSize>,
+}
+
+/// gRPC transport (SPEC §18). Method paths default to the reference contract
+/// (`packaging/examples/maki-crypto.proto`); metadata values follow the same
+/// SPEC §9 rules as HTTP headers (sensitive keys must be credential refs).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcSection {
+    #[serde(default)]
+    pub endpoint: Vec<EndpointConfig>,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub timeout: Option<MakiDuration>,
+    #[serde(default)]
+    pub max_message_bytes: Option<ByteSize>,
+    /// e.g. `/maki.CryptoService/EncryptBatch`.
+    #[serde(default)]
+    pub encrypt_path: Option<String>,
+    #[serde(default)]
+    pub decrypt_path: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, HeaderValue>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -754,6 +777,21 @@ impl VolumeConfig {
                                 HeaderValue::Credential(c) => validate_credential(c)?,
                             }
                         }
+                    }
+                }
+            }
+        }
+        if let Some(grpc) = &self.crypto.grpc {
+            for (name, value) in &grpc.metadata {
+                if SENSITIVE_HEADERS.contains(&name.to_lowercase().as_str()) {
+                    match value {
+                        HeaderValue::Literal(_) => {
+                            return Err(ConfigError::Invalid(format!(
+                                "gRPC metadata {name:?} must use a credential reference, \
+                                 not a literal secret (SPEC §9)"
+                            )));
+                        }
+                        HeaderValue::Credential(c) => validate_credential(c)?,
                     }
                 }
             }
