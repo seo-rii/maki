@@ -15,7 +15,9 @@ use crate::geometry::Geometry;
 pub const SUPERBLOCK_SIZE: usize = 4096;
 pub const SUPERBLOCK_MAGIC: &[u8; 8] = b"MAKISB01";
 pub const SUPERBLOCK_VERSION: u32 = 1;
-const MAX_STR: usize = 128;
+/// On-disk length cap for the superblock's string fields; config validation
+/// enforces it so `encode` can never be handed an over-long value.
+pub const MAX_STR: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {

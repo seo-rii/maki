@@ -486,6 +486,44 @@ root = "/x"
 }
 
 #[test]
+fn overlong_superblock_strings_are_rejected_at_validation() {
+    // The superblock stores these strings in 128-byte fields; an over-long
+    // value must fail config validation, never panic Superblock::encode.
+    let with = |compat: &str, key_name: &str| {
+        format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "{compat}"
+key = {{ source = "env", name = "{key_name}" }}
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[backing]
+root = "/x"
+"#
+        )
+    };
+    let long = "x".repeat(200);
+    let cfg = parse_config(&with(&long, "k")).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "200-char compat id must be rejected"
+    );
+    let cfg = parse_config(&with("v1", &long)).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "200-char key name must be rejected"
+    );
+    let cfg = parse_config(&with(&"c".repeat(128), &"k".repeat(128))).unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn grpc_section_parses_with_paths_and_credential_metadata() {
     let good = r#"
 config_schema_version = 1

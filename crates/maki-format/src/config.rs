@@ -725,6 +725,20 @@ impl VolumeConfig {
                 self.crypto.provider
             )));
         }
+        // These strings are stored in fixed superblock fields.
+        let max = crate::superblock::MAX_STR;
+        if self.crypto.crypto_compatibility_id.len() > max {
+            return Err(ConfigError::Invalid(format!(
+                "crypto_compatibility_id exceeds {max} bytes"
+            )));
+        }
+        if let Some(key) = &self.crypto.key {
+            if key.name.len() > max {
+                return Err(ConfigError::Invalid(format!(
+                    "crypto key name exceeds {max} bytes"
+                )));
+            }
+        }
         self.geometry()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         if !self
