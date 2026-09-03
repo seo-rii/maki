@@ -552,6 +552,8 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
 
 /// Recovery + provider verification + ready engine (SPEC §27).
 pub async fn attach_from_config(config: &VolumeConfig) -> Result<Engine, DaemonError> {
+    // Process hardening first (SPEC 36-37): nothing secret exists yet.
+    crate::security::apply(config)?;
     let backing = build_backing(config)?;
     let provider = build_provider(config).await?;
     Ok(Engine::attach(backing, provider, engine_options(config)).await?)

@@ -659,7 +659,7 @@ impl Default for SecuritySection {
             memory_lock_mode: "secure-buffers".to_string(),
             disable_core_dump: true,
             madv_dontdump: true,
-            require_secure_swap_policy: true,
+            require_secure_swap_policy: false,
         }
     }
 }
@@ -1241,6 +1241,16 @@ impl VolumeConfig {
             return Err(invalid(format!(
                 "security.memory_lock_mode {lock:?} must be secure-buffers|all|off (SPEC 36)"
             )));
+        }
+        if self.security.madv_dontdump && !self.security.disable_core_dump {
+            return Err(invalid(
+                "security.madv_dontdump is honoured through disable_core_dump (a non-dumpable \n                 process writes no core); enable disable_core_dump or set madv_dontdump = false",
+            ));
+        }
+        if self.cache.lock_memory && lock == "off" {
+            return Err(invalid(
+                "cache.lock_memory requires security.memory_lock_mode = secure-buffers or all \n                 (cache plaintext lives in secret buffers)",
+            ));
         }
         Ok(())
     }

@@ -162,6 +162,24 @@ match that contract and responses must preserve unit identity and order.
 Free space is read with `statvfs` on Unix hosts. Where it cannot be read, the
 free-space rules do not apply and `maki_backing_free_bytes` is null.
 
+## Security settings
+
+The `[security]` section is applied by the daemon before the volume is
+attached, fails closed on Linux, and is reported under `security` in
+`maki status` so nothing in it is a placebo.
+
+| Setting | Effect on Linux |
+|---|---|
+| `disable_core_dump` (default true) | `prctl(PR_SET_DUMPABLE, 0)` and `RLIMIT_CORE = 0`, verified after the call |
+| `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
+| `memory_lock_mode = "secure-buffers"` (default) | Every secret buffer (plaintext, keys, cache entries) is `mlock`ed for its lifetime; failures are counted and reported |
+| `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
+| `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
+| `require_secure_swap_policy` (default false) | When true, attach is refused unless `/proc/swaps` is empty or lists only zram or dm-crypt devices. Set it in production (the shipped example does) |
+
+On non-Linux hosts nothing is enforced; the status document reports
+`platform = "unsupported-platform"` and a warning is logged.
+
 ## Capacity and limits
 
 `volume.max_virtual_size`, `crypto_unit_size`, provider ciphertext bounds, slot

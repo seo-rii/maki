@@ -78,16 +78,3 @@ pub fn choose_free_nbd(devices: &[(String, bool)]) -> Option<String> {
     free.sort_unstable();
     free.first().map(|n| format!("/dev/nbd{n}"))
 }
-
-/// Whether a `/proc/swaps` listing is acceptable under the secure swap
-/// policy (SPEC §37): no swap, zram, or devices the caller proved encrypted.
-/// Returns the names of swap entries that are not provably safe.
-pub fn unsafe_swaps(proc_swaps: &str, is_encrypted: impl Fn(&str) -> bool) -> Vec<String> {
-    proc_swaps
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| !name.contains("zram") && !is_encrypted(name))
-        .map(|s| s.to_string())
-        .collect()
-}

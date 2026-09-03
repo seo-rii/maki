@@ -50,6 +50,7 @@ impl ControlBackend for EngineControlBackend {
             "backing_free_bytes": stats.backing_free_bytes,
             "checkpoints_total": stats.checkpoints_total,
             "checkpoint_failures_total": stats.checkpoint_failures_total,
+            "security": crate::security::posture_json(),
         })
     }
 

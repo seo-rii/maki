@@ -38,6 +38,7 @@ Maki is designed around four constraints:
 | Kernel `/dev/nbd`, LVM, XFS, and fio path | Validated on Debian 12/KVM; broader destructive qualification open |
 | Real database and vendor-provider workloads | SQLite smoke passed; broader qualification open |
 | QEMU and bare-metal power-loss testing | Not qualified |
+| 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
 
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.

@@ -8,7 +8,7 @@ use maki_privileged::config::{
 use maki_privileged::plan::{
     plan_attach, plan_detach, rollback_steps, PlannedStep, AUTO_NBD_DEVICE,
 };
-use maki_privileged::probe::{choose_free_nbd, nbd_index, parse_mountinfo, unsafe_swaps};
+use maki_privileged::probe::{choose_free_nbd, nbd_index, parse_mountinfo};
 use maki_privileged::verify::{verify_mount_identity, MountExpectation, MountObservation};
 
 const UUID: &str = "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
@@ -243,18 +243,6 @@ fn free_nbd_allocation_picks_the_lowest_unconnected_device() {
     assert!(choose_free_nbd(&[]).is_none());
     assert_eq!(nbd_index("/dev/nbd12"), Some(12));
     assert_eq!(nbd_index("/dev/sda"), None);
-}
-
-#[test]
-fn swap_policy_flags_unencrypted_devices_only() {
-    let swaps = "Filename\t\t\t\tType\t\tSize\tUsed\tPriority
-/dev/zram0                              partition\t8388604\t0\t100
-/dev/dm-3                               partition\t4194300\t0\t-2
-/swapfile                               file\t\t1048572\t0\t-3
-";
-    let flagged = unsafe_swaps(swaps, |name| name == "/dev/dm-3");
-    assert_eq!(flagged, vec!["/swapfile".to_string()]);
-    assert!(unsafe_swaps("Filename Type Size Used Priority\n", |_| false).is_empty());
 }
 
 // ---------- verifier stays strict ----------

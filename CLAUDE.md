@@ -20,6 +20,12 @@ cargo test --workspace --release --locked -- --ignored
 cargo test -p maki-core --locked --test phase3 -- --nocapture
 ```
 
+Unix-only suites (control socket, `statvfs`, privileged executor, process
+hardening) are skipped on Windows; run them on Linux (CI, or WSL from this
+machine) before claiming a change is verified. `review_*.rs` test files are
+the regression suites for the 2026-09-02 external review; their scope and the
+status of every finding live in `docs/review-remediation.md`.
+
 Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are process-global). Timing-sensitive async code uses the injectable `Clock` (`ManualClock` in tests) — never real sleeps.
 
 ## Map
@@ -34,7 +40,7 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 | `maki-core` | `JournalWriter`, `Overlay` (latest + latest-durable per unit), `SlotStore`, checkpoint, recovery, `Engine` (RMW, per-unit locks, cache, admission) |
 | `maki-cache` | versioned plaintext LRU, key `(unit, write_sequence)` |
 | `maki-nbdkit` | blocking `NbdAdapter` (panic boundary), daemon assembly from config, Linux `plugin.rs` C shim |
-| `maki-control` / `maki-privileged` | control socket (no privileged verbs); attach/detach/grow plans + mount guard (no crypto deps) |
+| `maki-control` / `maki-privileged` | control socket (bound by the daemon, chgrp'd, no privileged verbs); attach/detach/grow plans with rollback, root-owned attach config + argument hygiene, pure mount/sysfs probes, Linux executor (no crypto deps) |
 | `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark` |
 
 ## Traps that already bit us (don't re-learn)

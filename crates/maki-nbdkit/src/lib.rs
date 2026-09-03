@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod control;
 pub mod daemon;
+pub mod security;
 
 #[cfg(target_os = "linux")]
 pub mod plugin;
