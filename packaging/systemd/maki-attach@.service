@@ -2,11 +2,18 @@
 # XFS mount and identity verification. Runs as root, but by construction
 # has zero access to crypto secrets (PRIV-010): no credential directives in
 # this unit, and the maki-attach binary contains no crypto code.
+#
+# Attach parameters (volume UUID, mountpoint, VG/LV, optional fixed NBD
+# device, optional expected XFS UUID) come from the root-owned
+# /etc/maki/attach/%i.toml (see packaging/examples/attach.toml). The unit
+# stays active only while the mount identity check has passed: services
+# that need the secure mount must Requires= and After= this unit.
 
 [Unit]
 Description=Maki attach helper for volume %i
 Requires=maki@%i.service
 After=maki@%i.service
+ConditionPathExists=/etc/maki/attach/%i.toml
 
 [Service]
 Type=oneshot

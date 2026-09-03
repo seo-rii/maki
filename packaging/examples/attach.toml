@@ -1,0 +1,29 @@
+# Root-owned attach configuration for one volume:
+#   /etc/maki/attach/<volume>.toml   (mode 0600, owner root)
+# Read by `maki-attach attach --volume <volume>` (maki-attach@.service).
+# Contains no secrets; the helper never receives crypto credentials.
+
+# The Maki volume UUID (`maki volume inspect`). Required for execution: the
+# mount identity check compares it with <mountpoint>/.maki-sentinel.
+volume_uuid = "00000000-0000-0000-0000-000000000000"
+
+# Omit to allocate the lowest free /dev/nbdN at attach time (the helper
+# serializes allocation through /run/maki/attach.lock). Set to pin one.
+# nbd_device = "/dev/nbd0"
+
+# Defaults: /run/maki/<volume>/nbd.sock, vg_maki_<volume>, data, /srv/<volume>.
+# nbd_socket = "/run/maki/postgres-prod/nbd.sock"
+# vg_name = "vg_maki_postgres-prod"
+# lv_name = "data"
+# mountpoint = "/srv/postgres-prod"
+
+# Block size handed to nbd-client -b and blockdev --setbsz.
+device_block_size = 4096
+
+# Pin the XFS filesystem UUID once the filesystem exists (`blkid`). Any
+# other filesystem at the mountpoint then refuses attach.
+# fs_uuid = "11111111-2222-3333-4444-555555555555"
+
+# First boot only: create the sentinel on an empty filesystem. Remove after
+# the first successful attach; an existing sentinel is never overwritten.
+init_sentinel = false

@@ -883,6 +883,7 @@ name = "maki-attach"
 version = "0.1.0"
 dependencies = [
  "maki-privileged",
+ "tempfile",
 ]
 
 [[package]]
@@ -1100,6 +1101,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
  "tracing",
 ]
 

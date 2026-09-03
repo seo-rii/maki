@@ -1,18 +1,36 @@
 //! Deterministic operation plans for the privileged helper (SPEC §6).
 //! Plans are pure data: auditable, testable, and rendered before execution.
+//!
+//! Review M-016: an attach may leave the NBD device unassigned
+//! ([`AUTO_NBD_DEVICE`]); the executor allocates a free device under the
+//! attach lock and binds it into the plan before running it. Every plan can
+//! be rolled back: [`rollback_steps`] derives the compensating steps for the
+//! prefix that already ran, in reverse order.
 
 use std::fmt;
+
+/// Placeholder for "allocate a free `/dev/nbdN` at execution time".
+pub const AUTO_NBD_DEVICE: &str = "/dev/nbd<auto>";
+
+/// Name of the sentinel file the mount guard reads (SPEC §39).
+pub const SENTINEL_FILE: &str = ".maki-sentinel";
 
 #[derive(Debug, Clone)]
 pub struct AttachRequest {
     pub volume: String,
     pub nbd_socket: String,
+    /// A concrete `/dev/nbdN`, or [`AUTO_NBD_DEVICE`].
     pub nbd_device: String,
     pub device_block_size: u32,
     pub vg_name: String,
     pub lv_name: String,
     pub mountpoint: String,
+    /// The Maki volume UUID the mounted filesystem's sentinel must carry.
     pub volume_uuid: String,
+    /// Expected XFS filesystem UUID (`None` = not pinned).
+    pub fs_uuid: Option<String>,
+    /// Write the sentinel if the filesystem has none yet (first boot).
+    pub init_sentinel: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -24,12 +42,13 @@ pub struct GrowRequest {
     pub mountpoint: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedStep {
     ModprobeNbd,
     NbdConnect {
         socket: String,
         device: String,
+        block_size: u32,
     },
     SetBlockSize {
         device: String,
@@ -45,9 +64,17 @@ pub enum PlannedStep {
         device: String,
         mountpoint: String,
     },
+    /// Create `<mountpoint>/.maki-sentinel` holding the volume UUID if it
+    /// does not exist yet; never overwrite a different value.
+    WriteSentinel {
+        mountpoint: String,
+        volume_uuid: String,
+    },
     VerifyMountIdentity {
         mountpoint: String,
         volume_uuid: String,
+        fs_uuid: Option<String>,
+        nbd_device: String,
     },
     Umount {
         mountpoint: String,
@@ -74,11 +101,28 @@ impl PlannedStep {
             PlannedStep::LvmActivate { .. } => "lvm-activate",
             PlannedStep::LvmDeactivate { .. } => "lvm-deactivate",
             PlannedStep::MountXfs { .. } => "mount-xfs",
+            PlannedStep::WriteSentinel { .. } => "write-sentinel",
             PlannedStep::VerifyMountIdentity { .. } => "verify-mount-identity",
             PlannedStep::Umount { .. } => "umount",
             PlannedStep::NbdDisconnect { .. } => "nbd-disconnect",
             PlannedStep::LvExtend { .. } => "lvextend",
             PlannedStep::XfsGrowfs { .. } => "xfs-growfs",
+        }
+    }
+
+    /// Replace the auto-allocation placeholder with a concrete device.
+    fn bind_device(&mut self, device: &str) {
+        let fields: [&mut String; 1] = match self {
+            PlannedStep::NbdConnect { device: d, .. }
+            | PlannedStep::SetBlockSize { device: d, .. }
+            | PlannedStep::NbdDisconnect { device: d }
+            | PlannedStep::VerifyMountIdentity { nbd_device: d, .. } => [d],
+            _ => return,
+        };
+        for field in fields {
+            if field == AUTO_NBD_DEVICE {
+                *field = device.to_string();
+            }
         }
     }
 }
@@ -87,9 +131,11 @@ impl fmt::Display for PlannedStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlannedStep::ModprobeNbd => write!(f, "modprobe nbd"),
-            PlannedStep::NbdConnect { socket, device } => {
-                write!(f, "nbd-client -unix {socket} {device}")
-            }
+            PlannedStep::NbdConnect {
+                socket,
+                device,
+                block_size,
+            } => write!(f, "nbd-client -unix {socket} {device} -b {block_size}"),
             PlannedStep::SetBlockSize { device, block_size } => {
                 write!(f, "blockdev --setbsz {block_size} {device}")
             }
@@ -98,12 +144,22 @@ impl fmt::Display for PlannedStep {
             PlannedStep::MountXfs { device, mountpoint } => {
                 write!(f, "mount -t xfs -o noatime {device} {mountpoint}")
             }
-            PlannedStep::VerifyMountIdentity {
+            PlannedStep::WriteSentinel {
                 mountpoint,
                 volume_uuid,
             } => write!(
                 f,
-                "verify mount identity at {mountpoint} (volume {volume_uuid})"
+                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (only if absent)"
+            ),
+            PlannedStep::VerifyMountIdentity {
+                mountpoint,
+                volume_uuid,
+                fs_uuid,
+                nbd_device,
+            } => write!(
+                f,
+                "verify mount identity at {mountpoint} (volume {volume_uuid}, fs uuid {}, nbd {nbd_device})",
+                fs_uuid.as_deref().unwrap_or("unpinned")
             ),
             PlannedStep::Umount { mountpoint } => write!(f, "umount {mountpoint}"),
             PlannedStep::NbdDisconnect { device } => write!(f, "nbd-client -d {device}"),
@@ -123,6 +179,29 @@ pub struct Plan {
     pub steps: Vec<PlannedStep>,
 }
 
+impl Plan {
+    /// True if any step still refers to [`AUTO_NBD_DEVICE`].
+    pub fn needs_device_allocation(&self) -> bool {
+        self.steps.iter().any(|s| {
+            matches!(
+                s,
+                PlannedStep::NbdConnect { device, .. }
+                | PlannedStep::SetBlockSize { device, .. }
+                | PlannedStep::NbdDisconnect { device }
+                | PlannedStep::VerifyMountIdentity { nbd_device: device, .. }
+                if device == AUTO_NBD_DEVICE
+            )
+        })
+    }
+
+    /// Bind an allocated device into every placeholder.
+    pub fn bind_device(&mut self, device: &str) {
+        for step in &mut self.steps {
+            step.bind_device(device);
+        }
+    }
+}
+
 impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "# {}", self.description)?;
@@ -134,30 +213,40 @@ impl fmt::Display for Plan {
 }
 
 pub fn plan_attach(request: &AttachRequest) -> Plan {
+    let mut steps = vec![
+        PlannedStep::ModprobeNbd,
+        PlannedStep::NbdConnect {
+            socket: request.nbd_socket.clone(),
+            device: request.nbd_device.clone(),
+            block_size: request.device_block_size,
+        },
+        PlannedStep::SetBlockSize {
+            device: request.nbd_device.clone(),
+            block_size: request.device_block_size,
+        },
+        PlannedStep::LvmActivate {
+            vg_name: request.vg_name.clone(),
+        },
+        PlannedStep::MountXfs {
+            device: format!("/dev/{}/{}", request.vg_name, request.lv_name),
+            mountpoint: request.mountpoint.clone(),
+        },
+    ];
+    if request.init_sentinel {
+        steps.push(PlannedStep::WriteSentinel {
+            mountpoint: request.mountpoint.clone(),
+            volume_uuid: request.volume_uuid.clone(),
+        });
+    }
+    steps.push(PlannedStep::VerifyMountIdentity {
+        mountpoint: request.mountpoint.clone(),
+        volume_uuid: request.volume_uuid.clone(),
+        fs_uuid: request.fs_uuid.clone(),
+        nbd_device: request.nbd_device.clone(),
+    });
     Plan {
         description: format!("attach volume {}", request.volume),
-        steps: vec![
-            PlannedStep::ModprobeNbd,
-            PlannedStep::NbdConnect {
-                socket: request.nbd_socket.clone(),
-                device: request.nbd_device.clone(),
-            },
-            PlannedStep::SetBlockSize {
-                device: request.nbd_device.clone(),
-                block_size: request.device_block_size,
-            },
-            PlannedStep::LvmActivate {
-                vg_name: request.vg_name.clone(),
-            },
-            PlannedStep::MountXfs {
-                device: format!("/dev/{}/{}", request.vg_name, request.lv_name),
-                mountpoint: request.mountpoint.clone(),
-            },
-            PlannedStep::VerifyMountIdentity {
-                mountpoint: request.mountpoint.clone(),
-                volume_uuid: request.volume_uuid.clone(),
-            },
-        ],
+        steps,
     }
 }
 
@@ -193,4 +282,27 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
             },
         ],
     }
+}
+
+/// Compensating steps for an already-executed prefix, newest first: a
+/// mount is unmounted, an activated VG deactivated, a connected NBD device
+/// disconnected. Steps without side effects that outlive a failure (module
+/// load, block-size hint, sentinel, verification, growth) have none.
+pub fn rollback_steps(executed: &[PlannedStep]) -> Vec<PlannedStep> {
+    executed
+        .iter()
+        .rev()
+        .filter_map(|step| match step {
+            PlannedStep::MountXfs { mountpoint, .. } => Some(PlannedStep::Umount {
+                mountpoint: mountpoint.clone(),
+            }),
+            PlannedStep::LvmActivate { vg_name } => Some(PlannedStep::LvmDeactivate {
+                vg_name: vg_name.clone(),
+            }),
+            PlannedStep::NbdConnect { device, .. } => Some(PlannedStep::NbdDisconnect {
+                device: device.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }

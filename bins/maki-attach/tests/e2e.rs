@@ -20,7 +20,7 @@ fn attach_plan_prints_ordered_steps_without_executing() {
     assert!(text.contains("# attach volume v1"), "{text}");
     assert!(text.contains("modprobe nbd"), "{text}");
     assert!(
-        text.contains("nbd-client -unix /run/maki/v1/nbd.sock /dev/nbd0"),
+        text.contains("nbd-client -unix /run/maki/v1/nbd.sock /dev/nbd<auto>"),
         "{text}"
     );
     assert!(text.contains("/srv/v1"), "{text}");
@@ -60,7 +60,13 @@ fn missing_volume_flag_is_a_usage_error() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn execution_is_refused_off_linux() {
-    let out = run(&["attach", "--volume", "v9"]);
+    let out = run(&[
+        "attach",
+        "--volume",
+        "v9",
+        "--uuid",
+        "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c",
+    ]);
     assert_eq!(out.status.code(), Some(3), "non-Linux execution -> exit 3");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("# attach volume v9"),

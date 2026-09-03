@@ -149,7 +149,16 @@ from the control socket.
 
 ## Privileged helper
 
-`maki-attach` prints an auditable operation plan before execution. Always review
+`maki-attach` reads its parameters from the root-owned
+`/etc/maki/attach/<volume>.toml` (template:
+[`packaging/examples/attach.toml`](../packaging/examples/attach.toml)): the Maki
+volume UUID, the mountpoint, VG and LV names, an optional pinned NBD device and
+an optional expected XFS UUID. Command-line flags override individual values.
+Every value is checked before it reaches a system utility: option-like values,
+relative or non-canonical paths, and malformed UUIDs are rejected with exit
+code 2 and no plan is printed.
+
+The helper prints an auditable operation plan before execution. Always review
 plan mode first:
 
 ```bash
@@ -158,10 +167,30 @@ maki-attach detach --volume example --plan
 maki-attach grow --volume example --add-bytes 1073741824 --plan
 ```
 
+Execution (Linux, root) then:
+
+1. takes `/run/maki/attach.lock` and, unless a device is pinned, allocates the
+   lowest free `/dev/nbdN` from sysfs;
+2. connects NBD with the configured block size and waits until the device
+   reports a size;
+3. activates the VG, mounts XFS, and on `--init-sentinel` (or
+   `init_sentinel = true`, first boot only) creates `<mountpoint>/.maki-sentinel`
+   holding the volume UUID, never overwriting a different value;
+4. verifies the mount identity from `/proc/self/mountinfo`, `blkid`, sysfs NBD
+   state, the sentinel, and a read/write probe;
+5. on any failure rolls back the executed steps in reverse (umount, VG
+   deactivate, NBD disconnect) and exits non-zero, reporting rollback steps
+   that themselves failed.
+
+`maki-attach@<volume>.service` therefore stays active only after the identity
+check passed. Services that need the secure mount must declare
+`Requires=maki-attach@<volume>.service` and `After=` it; the unit is skipped
+when no attach configuration exists. Execution without a volume UUID is
+refused.
+
 > [!CAUTION]
 > Removing `--plan` executes NBD, LVM, mount, or filesystem-growth commands on
-> Linux. Specify the NBD device, volume group, logical volume, mountpoint, and
-> volume UUID explicitly in production automation.
+> Linux.
 
 The helper has no crypto dependencies and must not receive provider credentials.
 

@@ -89,6 +89,8 @@ fn request() -> AttachRequest {
         lv_name: "data".to_string(),
         mountpoint: "/srv/postgres".to_string(),
         volume_uuid: "0123-4567".to_string(),
+        fs_uuid: None,
+        init_sentinel: false,
     }
 }
 
