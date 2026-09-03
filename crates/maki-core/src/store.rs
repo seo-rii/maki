@@ -117,6 +117,22 @@ impl SlotStore {
         self.shards.len()
     }
 
+    /// Lowest allocated unit, if any slot has ever been checkpointed.
+    pub fn first_allocated_unit(&self) -> Option<u64> {
+        let mut shards: Vec<u64> = self.shards.keys().copied().collect();
+        shards.sort_unstable();
+        for shard_idx in shards {
+            let shard = &self.shards[&shard_idx];
+            if shard.alloc.set_count() == 0 {
+                continue;
+            }
+            if let Some(in_shard) = (0..shard.alloc.units()).find(|u| shard.alloc.get(*u)) {
+                return Some(shard_idx * self.geometry.units_per_shard() + in_shard);
+            }
+        }
+        None
+    }
+
     fn ensure_shard(&mut self, shard_idx: u64) -> Result<(), CoreError> {
         if self.shards.contains_key(&shard_idx) {
             return Ok(());

@@ -46,6 +46,7 @@ async fn engine_with(
         backing.clone() as Arc<dyn Backing>,
         provider,
         EngineOptions {
+            identity: None,
             volume: VolumeOptions::default(),
             limits,
             cache: None,

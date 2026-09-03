@@ -160,6 +160,18 @@ impl Volume {
             && self.store.shard_count() == 0
     }
 
+    /// Some unit that currently holds ciphertext (overlay first, then the
+    /// slots), for key probing on volumes without a canary.
+    pub fn first_ciphertext_unit(&self) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        if let Some(unit) = self.overlay.first_unit() {
+            return Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)));
+        }
+        let Some(unit) = self.store.first_allocated_unit() else {
+            return Ok(None);
+        };
+        Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)))
+    }
+
     /// Journal a ciphertext write; publish to the overlay on success.
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).

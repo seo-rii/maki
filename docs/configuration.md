@@ -36,7 +36,11 @@ Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
 | `remote-http` | HTTP | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
 | `remote-websocket` | WebSocket | Declared by provider contract | `wss://` currently rejected |
 | `remote-grpc` | gRPC | Declared by provider contract | TLS endpoints currently rejected |
-| `fake` | In-process test provider | Test-only | Not for production |
+| `fake` | In-process test provider | Test-only | Refused unless built with `--features fake-provider` |
+
+The `fake` provider is not compiled into a default build; `maki volume create`
+and attach reject it at validation time. Enable the `fake-provider` feature of
+`maki-nbdkit` only for development and benchmark builds.
 
 WebSocket and gRPC fail closed when TLS is configured. Use `remote-http` when a
 remote production deployment requires TLS until those transports gain rustls
@@ -50,9 +54,12 @@ every other endpoint. Changing keys, algorithms, nonce layout, context binding,
 or payload encoding without a compatible migration requires a new identity and
 must not attach to an existing volume.
 
-Maki stores the provider type and compatibility identity in the superblock and
-checks them during attach. The provider self-test also verifies supported unit
-sizes, ciphertext bounds, response ordering, round trips, and integrity claims.
+Maki stores the provider type, compatibility identity, and key name in the
+superblock and refuses attach when the configuration disagrees. The provider
+self-test verifies supported unit sizes, ciphertext bounds, response ordering,
+round trips, and integrity claims; the key canary (see
+[Operations](operations.md#key-binding-at-first-attach)) then proves that the
+key material itself matches, which the self-test alone cannot.
 
 ## Credentials and secrets
 

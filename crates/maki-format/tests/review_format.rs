@@ -287,3 +287,77 @@ fn create_volume_writes_checkpoint_state_and_durable_mark() {
         "no durable information yet"
     );
 }
+
+// ---------- key canary (M-001) ----------
+
+#[test]
+fn canary_plaintext_is_deterministic_and_volume_bound() {
+    let a = Uuid::from_u128(1);
+    let b = Uuid::from_u128(2);
+    let pa = maki_format::canary::canary_plaintext(&a, 4096);
+    assert_eq!(pa.len(), 4096);
+    assert_eq!(pa, maki_format::canary::canary_plaintext(&a, 4096));
+    assert_ne!(pa, maki_format::canary::canary_plaintext(&b, 4096));
+    assert!(pa.starts_with(b"MAKI-KEY-CANARY-V1"));
+    assert!(pa[32..].iter().any(|b| *b != 0), "pattern, not zeros");
+    // Tiny units still work (tag truncated).
+    assert_eq!(maki_format::canary::canary_plaintext(&a, 8).len(), 8);
+}
+
+#[test]
+fn key_canary_roundtrip_and_corruption() {
+    use maki_format::canary::KeyCanary;
+    let c = KeyCanary {
+        generation: 3,
+        volume_uuid: Uuid::from_u128(0xC0DE),
+        unit_index: maki_format::canary::CANARY_UNIT_INDEX,
+        ciphertext: (0..300u32).map(|i| i as u8).collect(),
+    };
+    let bytes = c.encode();
+    assert_eq!(KeyCanary::decode(&bytes).unwrap(), c);
+    let mut bad = bytes.clone();
+    bad[60] ^= 0x01;
+    assert!(matches!(
+        KeyCanary::decode(&bad),
+        Err(FormatError::BadChecksum(_))
+    ));
+    assert!(KeyCanary::decode(&bytes[..40]).is_err());
+    assert!(KeyCanary::decode(b"nonsense").is_err());
+}
+
+#[test]
+fn canary_unit_index_is_json_safe_and_out_of_range() {
+    let idx = maki_format::canary::CANARY_UNIT_INDEX;
+    assert!(idx < (1u64 << 53));
+    // 16 TiB of 512-byte units is far below the reserved index.
+    let g = Geometry::compute(512, 512, 512, 512, 16 << 40, 1 << 30).unwrap();
+    assert!(g.num_units() < idx);
+}
+
+/// Golden vector: the v1 canary record and plaintext are frozen (an old
+/// canary must verify forever).
+#[test]
+fn key_canary_golden_vectors_frozen() {
+    use maki_format::canary::{canary_plaintext, KeyCanary};
+    let uuid = Uuid::from_u128(0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF);
+    let plain_crc = crc32fast::hash(&canary_plaintext(&uuid, 4096));
+    let expected_plain: u32 = include!("golden/canary_plaintext_v1.crc");
+    assert_eq!(
+        plain_crc, expected_plain,
+        "canary plaintext changed! crc={plain_crc:#010x}"
+    );
+    let bytes = KeyCanary {
+        generation: 1,
+        volume_uuid: uuid,
+        unit_index: maki_format::canary::CANARY_UNIT_INDEX,
+        ciphertext: vec![0xAB; 64],
+    }
+    .encode();
+    assert_eq!(&bytes[0..8], b"MAKICNY1");
+    let crc = crc32fast::hash(&bytes[..bytes.len() - 4]);
+    let expected: u32 = include!("golden/canary_record_v1.crc");
+    assert_eq!(
+        crc, expected,
+        "canary record encoding changed! crc={crc:#010x}"
+    );
+}

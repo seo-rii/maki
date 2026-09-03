@@ -50,6 +50,7 @@ pub struct FakeCryptoProvider {
     context_binding: bool,
     key_seed: u64,
     compat_id: String,
+    integrity_check: bool,
     max_batch_items: u32,
     max_batch_bytes: u64,
     fail_queue: Mutex<VecDeque<CryptoError>>,
@@ -90,6 +91,7 @@ impl FakeCryptoProvider {
             context_binding: true,
             key_seed: 0x6d616b69,
             compat_id: "test-profile-v1".to_string(),
+            integrity_check: true,
             max_batch_items: 128,
             max_batch_bytes: 1 << 20,
             fail_queue: Mutex::new(VecDeque::new()),
@@ -120,6 +122,14 @@ impl FakeCryptoProvider {
     pub fn with_overhead(mut self, overhead: u32) -> Self {
         assert!(overhead >= 8);
         self.overhead = overhead;
+        self
+    }
+
+    /// Disable the decrypt-side CRC check: like an unauthenticated cipher
+    /// (XTS), a wrong key then yields garbage plaintext without an error,
+    /// and `integrity` is reported `Absent`.
+    pub fn with_integrity_check(mut self, on: bool) -> Self {
+        self.integrity_check = on;
         self
     }
 
@@ -249,7 +259,11 @@ impl CryptoProvider for FakeCryptoProvider {
                 max_items: self.max_batch_items,
                 max_bytes: self.max_batch_bytes,
             },
-            integrity: Capability::Contractual,
+            integrity: if self.integrity_check {
+                Capability::Contractual
+            } else {
+                Capability::Absent
+            },
             context_binding: if self.context_binding {
                 Capability::Contractual
             } else {
@@ -316,7 +330,7 @@ impl CryptoProvider for FakeCryptoProvider {
             let body = &ct[8..8 + self.unit_size as usize];
             let ks = self.keystream(context, item.unit_index, body.len());
             let pt: Vec<u8> = body.iter().zip(ks.iter()).map(|(c, k)| c ^ k).collect();
-            if crc32fast::hash(&pt) != crc {
+            if self.integrity_check && crc32fast::hash(&pt) != crc {
                 return Err(CryptoError::Integrity(
                     "ciphertext failed integrity verification".to_string(),
                 ));

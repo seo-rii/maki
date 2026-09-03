@@ -782,6 +782,8 @@ LRU cache size
 ├── superblock.b
 ├── shard-catalog.a
 ├── shard-catalog.b
+├── canary.a
+├── canary.b
 ├── data/
 ├── journal/
 │   ├── seg-<index>
@@ -970,8 +972,21 @@ run provider self-test
  ↓
 verify crypto compatibility
  ↓
+verify provider type and key identity against the superblock
+ ↓
+verify key canary
+ ↓
 READY
 ```
+
+Key canary: on the first attach of a pristine volume, Maki encrypts a fixed,
+volume-bound plaintext at a reserved unit index and stores it A/B-replicated
+(`canary.a`, `canary.b`). Every later attach MUST decrypt the canary back to
+that plaintext before the volume is exposed. A different key or provider under
+the same compatibility ID therefore refuses attach; for unauthenticated
+ciphers this comparison is the only wrong-key detection. A volume that holds
+data but no canary is probed by decrypting one existing unit with an
+integrity-capable provider; without integrity it MUST refuse attach.
 
 ---
 

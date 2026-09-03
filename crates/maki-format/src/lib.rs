@@ -6,6 +6,7 @@
 
 pub mod ab;
 pub mod allocation;
+pub mod canary;
 pub mod catalog;
 pub mod checker;
 pub mod checkpoint;
@@ -27,6 +28,9 @@ pub mod layout {
     pub const SUPERBLOCK_B: &str = "superblock.b";
     pub const SHARD_CATALOG_A: &str = "shard-catalog.a";
     pub const SHARD_CATALOG_B: &str = "shard-catalog.b";
+    /// Provider/key-bound canary (see `canary`), established at first attach.
+    pub const KEY_CANARY_A: &str = "canary.a";
+    pub const KEY_CANARY_B: &str = "canary.b";
     pub const DATA_DIR: &str = "data";
     pub const JOURNAL_DIR: &str = "journal";
     pub const CHECKPOINT_DIR: &str = "checkpoint";

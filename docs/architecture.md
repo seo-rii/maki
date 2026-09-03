@@ -62,7 +62,8 @@ writes.
 
 | Structure | Protection | Role |
 |---|---|---|
-| Superblock | Two generations plus CRC | Volume identity, geometry, provider type, and compatibility ID |
+| Superblock | Two generations plus CRC | Volume identity, geometry, provider type, key name, and compatibility ID |
+| Key canary | Two generations plus CRC, written at first attach | Provider/key-bound ciphertext of a fixed plaintext; must decrypt on every attach |
 | Shard catalog | Two generations plus CRC | Durable set of allocated shard files |
 | Allocation map | Per-shard A/B copies | Distinguishes unwritten units from allocated slots |
 | Slot | Header CRC and ciphertext CRC | Stores one encrypted unit and write sequence |
@@ -114,6 +115,14 @@ retry safety, integrity, context binding, and a compatibility identity. Maki
 validates response count, order, unit index, and size on every call. A provider
 self-test runs before attach, and multi-endpoint configurations verify
 cross-endpoint ciphertext compatibility.
+
+The self-test proves only that the provider is coherent with itself. The key
+canary proves that it is the provider and key the volume was written with: a
+fixed, volume-bound plaintext encrypted at a reserved unit index on the first
+attach and decrypted back on every later one. The configured provider type and
+key name are also compared with the superblock. The non-cryptographic `fake`
+provider is compiled in only with the `fake-provider` feature and refused at
+configuration validation otherwise.
 
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-

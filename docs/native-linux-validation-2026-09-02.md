@@ -118,7 +118,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --workspace --release --locked -- --ignored
 
-cargo build --release --locked -p maki-nbdkit
+cargo build --release --locked -p maki-nbdkit --features fake-provider
+# (since 2026-09-03 the fake provider is opt-in; a default build refuses it)
 nm -D --defined-only target/release/libmaki_nbdkit.so |
   grep -Eq '[[:space:]]T[[:space:]]plugin_init$'
 readelf -h target/release/libmaki_nbdkit.so
@@ -158,7 +159,7 @@ root = "$validation_dir/backing"
 EOF
 
 cargo build --release --locked \
-  -p maki -p maki-check -p maki-benchmark
+  -p maki -p maki-check -p maki-benchmark --features maki-nbdkit/fake-provider
 
 target/release/maki volume create "$config_path"
 target/release/maki volume inspect "$config_path"

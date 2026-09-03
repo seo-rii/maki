@@ -33,7 +33,25 @@ pub enum DaemonError {
 pub fn parse_and_validate(raw: &str) -> Result<VolumeConfig, ConfigError> {
     let config = parse_config(raw)?;
     config.validate()?;
+    check_provider_available(&config, cfg!(feature = "fake-provider"))?;
     Ok(config)
+}
+
+/// Providers a build can actually construct. The non-cryptographic `fake`
+/// provider exists only behind the `fake-provider` feature (review M-008);
+/// a release build must refuse it at validation time, not at attach.
+pub fn check_provider_available(
+    config: &VolumeConfig,
+    fake_enabled: bool,
+) -> Result<(), ConfigError> {
+    if config.crypto.provider == "fake" && !fake_enabled {
+        return Err(ConfigError::Invalid(
+            "provider \"fake\" is not compiled into this build (feature `fake-provider`); \
+             it is a test-only, non-cryptographic provider"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
@@ -411,6 +429,15 @@ async fn dispatch_endpoint_set(
 
 pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
     EngineOptions {
+        identity: Some(maki_core::engine::AttachIdentity {
+            provider_type: config.crypto.provider.clone(),
+            key_identity: config
+                .crypto
+                .key
+                .as_ref()
+                .map(|k| k.name.clone())
+                .unwrap_or_default(),
+        }),
         volume: VolumeOptions {
             journal_segment_size: config.backing.journal_segment_size.0,
         },

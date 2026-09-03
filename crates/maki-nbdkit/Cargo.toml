@@ -9,7 +9,7 @@ authors.workspace = true
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["fake-provider"]
+default = []
 # Development/benchmark provider selectable via `provider = "fake"`.
 fake-provider = ["dep:maki-test-support"]
 
@@ -33,6 +33,7 @@ uuid.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+maki-nbdkit = { path = ".", features = ["fake-provider"] }
 tempfile.workspace = true
 base64.workspace = true
 tokio-tungstenite = "0.26"

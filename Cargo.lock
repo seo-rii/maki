@@ -1074,6 +1074,7 @@ dependencies = [
  "maki-crypto-local",
  "maki-crypto-websocket",
  "maki-format",
+ "maki-nbdkit",
  "maki-test-support",
  "parking_lot",
  "prost",

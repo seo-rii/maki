@@ -10,7 +10,9 @@
 //! - FUA syncs after all of the request's records are appended (SPEC §24);
 //!   FLUSH is the journal barrier (SPEC §25).
 //! - Attach refuses crypto-profile mismatches and providers whose contract
-//!   does not fit the volume geometry (SPEC §12, §27).
+//!   does not fit the volume geometry (SPEC §12, §27), and — through the key
+//!   canary — a provider or key other than the one the volume was written
+//!   with.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,9 +23,13 @@ use maki_backing::Backing;
 use maki_crypto::checked::CheckedProvider;
 use maki_crypto::selftest::provider_self_test;
 use maki_crypto::{
-    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer,
+    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    SecretBuffer,
 };
+use maki_format::ab::AbStore;
+use maki_format::canary::{canary_plaintext, KeyCanary, CANARY_UNIT_INDEX};
 use maki_format::geometry::Geometry;
+use maki_format::{layout, FormatError};
 
 use crate::error::CoreError;
 use crate::recovery::RecoveryError;
@@ -35,8 +41,26 @@ pub enum AttachError {
     Recovery(#[from] RecoveryError),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Core(#[from] CoreError),
     #[error("configuration: {0}")]
     Config(String),
+    /// The configured provider type or key identity differs from what the
+    /// superblock records (SPEC §20: immutable after creation).
+    #[error("crypto identity mismatch: {0}")]
+    IdentityMismatch(String),
+    /// The provider could not decrypt the volume's key canary back to its
+    /// known plaintext: wrong key, wrong provider, or damaged canary.
+    #[error("key canary verification failed: {0} — attach refused")]
+    KeyMismatch(String),
+    /// The volume holds data but no canary, and the provider offers no
+    /// integrity with which to probe existing ciphertext instead.
+    #[error("volume has data but no key canary: {0}")]
+    MissingCanary(String),
 }
 
 /// Admission limits at the block-core entry (SPEC §30): both request count
@@ -63,11 +87,22 @@ pub struct EngineCacheConfig {
     pub ttl: std::time::Duration,
 }
 
+/// What the configuration says the volume's crypto identity is; compared
+/// against the superblock at attach (SPEC §20 immutable fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachIdentity {
+    pub provider_type: String,
+    pub key_identity: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineOptions {
     pub volume: VolumeOptions,
     pub limits: EngineLimits,
     pub cache: Option<EngineCacheConfig>,
+    /// `None` skips the identity string comparison (the canary still
+    /// applies); the daemon always sets it from configuration.
+    pub identity: Option<AttachIdentity>,
 }
 
 struct UnitLocks {
@@ -130,7 +165,8 @@ impl std::fmt::Debug for Engine {
 
 impl Engine {
     /// Recover the volume, verify the provider (self-test + compatibility +
-    /// geometry contract), and return a ready engine.
+    /// geometry contract + identity + key canary), and return a ready
+    /// engine.
     pub async fn attach(
         backing: Arc<dyn Backing>,
         provider: Arc<dyn CryptoProvider>,
@@ -139,6 +175,27 @@ impl Engine {
         let volume = Volume::recover(backing, options.volume)?;
         let superblock = volume.superblock().clone();
         let geometry = superblock.geometry.clone();
+
+        if let Some(identity) = &options.identity {
+            if identity.provider_type != superblock.provider_type {
+                return Err(AttachError::IdentityMismatch(format!(
+                    "volume was created with provider {:?}, configuration says {:?}",
+                    superblock.provider_type, identity.provider_type
+                )));
+            }
+            if identity.key_identity != superblock.key_identity {
+                return Err(AttachError::IdentityMismatch(format!(
+                    "volume was created with key identity {:?}, configuration says {:?}",
+                    superblock.key_identity, identity.key_identity
+                )));
+            }
+        }
+        if geometry.num_units() > CANARY_UNIT_INDEX {
+            return Err(AttachError::Config(format!(
+                "volume addresses {} units, which reaches the reserved canary unit index",
+                geometry.num_units()
+            )));
+        }
 
         let context = CryptoContext {
             volume_uuid: superblock.volume_uuid,
@@ -161,6 +218,9 @@ impl Engine {
         )
         .await?;
 
+        let provider = CheckedProvider::new(provider);
+        verify_key_canary(&volume, &provider, &context, caps.integrity.present()).await?;
+
         let (batch_max_items, batch_max_bytes) = if caps.batch.supported {
             (
                 caps.batch.max_items.max(1) as usize,
@@ -173,7 +233,7 @@ impl Engine {
         Ok(Self {
             inner: Arc::new(EngineInner {
                 volume: RwLock::new(volume),
-                provider: CheckedProvider::new(provider),
+                provider,
                 context,
                 geometry,
                 unit_locks: UnitLocks::new(),
@@ -453,6 +513,128 @@ impl Engine {
             cache_bytes: cache.bytes,
             cache_entries: cache.entries,
         }
+    }
+}
+
+/// Key-canary check (SPEC §12, review M-001).
+///
+/// - Canary present: decrypt it and compare with the known plaintext; any
+///   mismatch or integrity failure refuses attach. Transport-class errors
+///   are surfaced as such rather than as a key mismatch.
+/// - Canary absent on a pristine volume: establish it now. The first attach
+///   binds the provider and key to the volume.
+/// - Canary absent on a volume with data (written before canaries existed):
+///   with an integrity-capable provider, decrypt one existing unit as the
+///   proof instead, then establish the canary; without integrity there is
+///   no proof, so attach is refused.
+async fn verify_key_canary(
+    volume: &Volume,
+    provider: &CheckedProvider,
+    context: &CryptoContext,
+    provider_has_integrity: bool,
+) -> Result<(), AttachError> {
+    let backing = volume.backing().clone();
+    let superblock = volume.superblock();
+    let unit_size = superblock.geometry.crypto_unit_size as usize;
+    let expected = canary_plaintext(&superblock.volume_uuid, unit_size);
+    let ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+
+    if let Some(canary) = ab.load::<KeyCanary>(backing.as_ref())? {
+        if canary.volume_uuid != superblock.volume_uuid {
+            return Err(AttachError::KeyMismatch(
+                "canary belongs to a different volume".to_string(),
+            ));
+        }
+        let plain = decrypt_probe(
+            provider,
+            context,
+            CiphertextUnit {
+                unit_index: canary.unit_index,
+                data: canary.ciphertext,
+            },
+        )
+        .await?;
+        if plain.expose() != expected.as_slice() {
+            return Err(AttachError::KeyMismatch(
+                "canary decrypted to unexpected plaintext (wrong key or provider)".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if !volume.is_pristine() {
+        if !provider_has_integrity {
+            return Err(AttachError::MissingCanary(
+                "the provider offers no integrity, so existing ciphertext cannot prove the key; \
+                 attach with the integrity-capable provider the volume was written with"
+                    .to_string(),
+            ));
+        }
+        let Some((unit, data)) = volume.first_ciphertext_unit()? else {
+            return Err(AttachError::MissingCanary(
+                "volume has history but no readable ciphertext to probe".to_string(),
+            ));
+        };
+        // Authenticated decrypt of real data is the proof; the plaintext is
+        // discarded (dropped as a SecretBuffer).
+        let _ = decrypt_probe(
+            provider,
+            context,
+            CiphertextUnit {
+                unit_index: unit,
+                data,
+            },
+        )
+        .await?;
+    }
+
+    // Establish: encrypt the fixed plaintext at the reserved index and make
+    // both copies plus their dirents durable before the volume is exposed.
+    let cts = provider
+        .encrypt_batch(
+            context,
+            &[PlaintextUnit {
+                unit_index: CANARY_UNIT_INDEX,
+                data: SecretBuffer::from_vec(expected),
+            }],
+        )
+        .await?;
+    let ct = cts.into_iter().next().ok_or_else(|| {
+        AttachError::Crypto(CryptoError::Contract(
+            "canary encrypt returned no item".to_string(),
+        ))
+    })?;
+    let mut record = KeyCanary {
+        generation: 0,
+        volume_uuid: superblock.volume_uuid,
+        unit_index: CANARY_UNIT_INDEX,
+        ciphertext: ct.data,
+    };
+    ab.store(backing.as_ref(), &mut record)?;
+    ab.store(backing.as_ref(), &mut record)?;
+    backing.sync_dir("")?;
+    Ok(())
+}
+
+/// Decrypt one unit for verification, classifying failures: integrity,
+/// request, provider-fatal and contract errors mean the key/provider does
+/// not match; transport-class errors are reported as themselves.
+async fn decrypt_probe(
+    provider: &CheckedProvider,
+    context: &CryptoContext,
+    unit: CiphertextUnit,
+) -> Result<SecretBuffer, AttachError> {
+    match provider.decrypt_batch(context, &[unit]).await {
+        Ok(mut pts) => Ok(pts.remove(0).data),
+        Err(e)
+            if matches!(
+                e.class(),
+                ErrorClass::Retryable | ErrorClass::Throttled | ErrorClass::EndpointFatal
+            ) =>
+        {
+            Err(AttachError::Crypto(e))
+        }
+        Err(e) => Err(AttachError::KeyMismatch(e.to_string())),
     }
 }
 

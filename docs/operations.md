@@ -52,6 +52,28 @@ maki-check /var/lib/maki/example
 Run offline checks only after the daemon or nbdkit process has released the
 volume lock.
 
+## Key binding at first attach
+
+The first attach of a freshly created volume binds the configured provider and
+key to it: Maki encrypts a fixed canary and stores it as `canary.a`/`canary.b`
+in the backing root. Every later attach decrypts the canary before the volume
+is exposed, so a rotated key file, a different key name, or a different
+provider type under the same compatibility identity refuses attach with
+`key canary verification failed` or `crypto identity mismatch`. This is the
+only wrong-key detection for `local-aes-xts`, which otherwise decrypts to
+garbage without an error.
+
+Consequences for operations:
+
+- Attach a new volume once with the intended production key before handing it
+  to a workload. If the wrong key was used on an empty volume, delete and
+  recreate the volume rather than trying to re-bind it.
+- Key rotation is a migration (new volume, copy data), not a config change.
+- A volume written before canaries existed is bound on its next attach after
+  one existing unit is decrypted with an integrity-capable provider
+  (`local-aes-gcm-siv`, or a remote provider declaring integrity). Such a
+  volume cannot be attached with `local-aes-xts` until it has a canary.
+
 ## Run nbdkit
 
 Use a dedicated socket and one daemon per volume:
@@ -164,8 +186,10 @@ or other high-cardinality values as metric labels.
 ## Failure handling
 
 - Provider contract or compatibility failures refuse attach.
-- Corrupt metadata, sequence gaps, and non-tail journal corruption fail loudly.
-- A torn final journal tail is truncated during recovery.
+- A wrong key, key name, or provider type refuses attach (key canary).
+- Corrupt metadata, sequence gaps, missing journal segments, and journal
+  corruption before the durable mark fail loudly.
+- A torn final journal tail after the durable mark is truncated during recovery.
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.

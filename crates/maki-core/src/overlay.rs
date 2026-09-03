@@ -47,6 +47,11 @@ impl Overlay {
         self.bytes
     }
 
+    /// Lowest unit currently held in the overlay.
+    pub fn first_unit(&self) -> Option<u64> {
+        self.units.keys().next().copied()
+    }
+
     /// Publish a freshly journaled version (after successful append).
     pub fn publish(&mut self, unit: u64, sequence: u64, ciphertext: Vec<u8>) {
         self.bytes += ciphertext.len() as u64;
