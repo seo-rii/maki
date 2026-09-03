@@ -7,7 +7,8 @@
 #[cfg(target_os = "linux")]
 #[test]
 fn dropping_locked_buffers_releases_their_pages() {
-    use maki_crypto::{page_lock_failures, set_page_locking, SecretBuffer};
+    use maki_crypto::secret::{page_lock_failures, set_page_locking};
+    use maki_crypto::SecretBuffer;
 
     // A small lock limit for this process only (the test has its own
     // binary). 1 MiB: sixteen 64 KiB buffers alive at once would exceed it.

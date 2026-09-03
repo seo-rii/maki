@@ -116,6 +116,8 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
     Ok(bound)
 }
 
+use std::time::Duration;
+
 /// Process umask override, restored on drop.
 struct UmaskGuard(libc::mode_t);
 

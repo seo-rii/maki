@@ -229,6 +229,7 @@ async fn unverified_endpoint_never_enters_serving_pool() {
     for i in 0..5 {
         set.encrypt_batch(&ctx(), &[pt(i)]).await.unwrap();
     }
+    settle().await; // validation runs off the request path (C-03)
     assert_eq!(b.encrypt_calls(), 0, "quarantined endpoint served traffic");
     assert_eq!(
         gate.attempts.load(Ordering::SeqCst),
@@ -242,11 +243,13 @@ async fn unverified_endpoint_never_enters_serving_pool() {
     set.encrypt_batch(&ctx(), &[pt(5)]).await.unwrap();
     assert_eq!(gate.attempts.load(Ordering::SeqCst), 2);
     assert_eq!(b.encrypt_calls(), 0);
+    settle().await; // let the deferred verdict land before the next attempt
 
     gate.open.store(true, Ordering::SeqCst);
     clock.advance(Duration::from_secs(2));
     set.encrypt_batch(&ctx(), &[pt(6)]).await.unwrap();
     assert_eq!(gate.attempts.load(Ordering::SeqCst), 3);
+    settle().await;
     assert!(
         set.endpoint_status()[1].validated,
         "promoted after validation"
@@ -279,6 +282,7 @@ async fn proven_incompatible_endpoint_is_excluded_permanently() {
     );
     set.encrypt_batch(&ctx(), &[pt(1)]).await.unwrap();
     assert_eq!(gate.attempts.load(Ordering::SeqCst), 1);
+    settle().await; // the verdict lands off the request path (C-03)
     assert!(set.endpoint_status()[1].rejected);
     for _ in 0..3 {
         clock.advance(Duration::from_secs(5));

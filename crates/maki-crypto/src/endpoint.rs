@@ -336,12 +336,16 @@ impl EndpointSet {
             if endpoint.validating.swap(true, Ordering::SeqCst) {
                 continue;
             }
-            let validator = validator.clone();
-            let reference_provider = reference.provider.clone();
-            let context = context.clone();
+            // The validator is *invoked* here (its attempt is accounted
+            // synchronously); only the resulting future runs in the
+            // background.
+            let attempt = validator(
+                reference.provider.clone(),
+                endpoint.provider.clone(),
+                context.clone(),
+            );
             tokio::spawn(async move {
-                let result =
-                    validator(reference_provider, endpoint.provider.clone(), context).await;
+                let result = attempt.await;
                 match result {
                     Ok(()) => {
                         endpoint.validated.store(true, Ordering::SeqCst);

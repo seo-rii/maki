@@ -15,3 +15,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+# Open-flag constants (O_NOFOLLOW, O_NONBLOCK) for the mount-root hygiene
+# of the executor; no crypto dependency (PRIV-010).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
