@@ -53,6 +53,8 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - An automatic journal roll advances `durable_sequence` *inside* `append`; always promote the overlay before publishing a newer version of the same unit, or a checkpoint can delete the only copy of a durable write ([remediation log](docs/review-remediation.md), M-002).
 - Clear a persistence dirty flag only after the directory fsync that makes the new file durable; clearing earlier lets a retry skip the step (M-003).
 - Unsynced journal records persist in any order: a valid record after damaged bytes does not prove the damage is durable. Classify with the durable mark, never by what follows (M-007).
+- An A/B record falling back to its older generation is *normal* (torn write, later damage), and the older allocation map / shard catalog does not list the newest slots or shard. Slot headers are authoritative: probe them instead of reading "bit 0" as zeros ([remediation log](docs/review-remediation.md), S-01).
+- Debug builds run `check_invariants()` on the overlay, journal, and volume after every mutation; a sanitizer panic in a test is a real accounting bug, not a flaky test. Keep the checks O(1)-ish on large structures (they sample).
 
 ## External qualification
 

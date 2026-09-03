@@ -175,6 +175,18 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             report
                 .info
                 .push(format!("slots: {checked} allocated, {bad} invalid"));
+            // Slots the loaded allocation copy did not list but that hold
+            // a header for their unit: the store repaired them at open and
+            // the next checkpoint persists the map, but it means a copy of
+            // the allocation metadata was lost.
+            let repaired = store.repaired_allocations();
+            if !repaired.is_empty() {
+                report.warnings.push(format!(
+                    "slots: {} unit(s) hold data their newest valid allocation map copy does \
+                     not list (repaired from slot headers; the next checkpoint persists the map)",
+                    repaired.len()
+                ));
+            }
         }
         Err(CoreError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("slot store: {e}")),

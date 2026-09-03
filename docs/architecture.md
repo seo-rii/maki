@@ -108,6 +108,19 @@ fsyncs the data directory before clearing any dirty flag, commits checkpoint
 state, and only then deletes covered journal segments. A checkpoint that fails
 part-way leaves every incomplete step marked for the retry.
 
+Slot headers are authoritative; the shard catalog and the allocation maps are
+accelerators that an A/B fallback can leave one generation behind. Opening the
+store adopts data files the catalog copy does not list and, for a shard with an
+invalid or absent allocation copy, audits its slot headers and repairs the map
+in memory (the next checkpoint persists it; the deep check reports it). Reading
+a cleared slot probes its header before answering zeros. A cataloged shard with
+no valid allocation copy at all refuses attach.
+
+In debug builds the overlay, journal, and volume verify their invariants after
+every mutation (`check_invariants`), so the randomized suites described in
+[testing](testing.md) fail at the first accounting slip rather than at a later
+symptom.
+
 Checkpoints are not only a shutdown step. A background worker checkpoints when
 the journal crosses a size watermark, when backing free space drops below the
 checkpoint reserve, and on a time interval (syncing unsynced records first). The

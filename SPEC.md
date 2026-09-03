@@ -842,7 +842,13 @@ shard absent from catalog
 
 shard exists
 allocation bit = 0
+slot holds no valid header for this unit
 → unwritten zero
+
+allocation bit = 0
+slot holds a valid header for this unit
+→ allocation copy is behind the slot: treat as bit = 1
+  (served; bit repaired in memory, persisted by the next checkpoint)
 
 allocation bit = 1
 slot invalid or missing
@@ -852,6 +858,20 @@ allocation bit = 1
 slot valid
 → decrypt
 ```
+
+Slot headers are authoritative; the shard catalog and the allocation maps
+are accelerators. An A/B record legitimately falls back to its older
+generation (a torn write during a crash, or later damage to the newer
+copy), and the older generation does not list the newest shard or the
+slots the last checkpoint filled. Therefore:
+
+- a shard data file the loaded catalog copy does not list is adopted at
+  open and re-cataloged by the next checkpoint;
+- a shard whose allocation map has one invalid or absent copy is audited
+  slot by slot at open and every slot with a valid header for its unit is
+  marked allocated;
+- a cataloged shard with *no* valid allocation copy refuses attach
+  (offline repair territory), as does a missing data file.
 
 ---
 
@@ -985,9 +1005,9 @@ acquire volume lock
  ↓
 select valid superblock
  ↓
-validate shard catalog
+validate shard catalog (adopt unlisted shard data files)
  ↓
-validate allocation metadata
+validate allocation metadata (repair from slot headers when a copy is invalid)
  ↓
 scan journal
  ↓

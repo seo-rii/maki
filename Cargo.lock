@@ -912,6 +912,7 @@ dependencies = [
  "maki-crypto",
  "maki-test-support",
  "parking_lot",
+ "rand 0.9.5",
 ]
 
 [[package]]

@@ -10,4 +10,5 @@ maki-crypto.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
+rand.workspace = true
 maki-test-support.workspace = true

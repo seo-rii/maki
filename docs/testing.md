@@ -22,6 +22,11 @@ The ignored release-mode suite is substantially more expensive than the default
 workspace suite. It uses simulated backing stores and does not perform real
 power cuts or privileged device operations.
 
+The default (debug) suite also runs the core sanitizers: `Overlay`,
+`JournalWriter`, and `Volume` check their invariants after every mutation and
+panic on the first violation. Release builds compile the checks out, so run the
+default suite, not only the release gates, after touching those structures.
+
 ## Automated CI
 
 The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
@@ -80,6 +85,7 @@ has a constant residue.
 | Cache and growth | Version matching, stale-read prevention, eviction, zeroization, shard creation, and crash recovery |
 | NBD adapter | Geometry, capability advertisement, read/write, panic boundary, parallel callbacks, and clean detach |
 | Review regressions | `review_storage.rs`, `review_attach.rs`, `review_bounded.rs`, `review_check.rs` (maki-core), `review_deep.rs` (maki-check binary), `review_format.rs` and `review_config.rs` (maki-format), `review_daemon.rs`, `review_control.rs`, `review_sample.rs` and `review_security.rs` (maki-nbdkit), `review_uds.rs` (maki-control), `review_dispatch.rs` and `review_scheduler.rs` (maki-crypto), `review_ws.rs` (maki-crypto-websocket), `review_priv.rs` (maki-privileged), `review_attach.rs` (maki-attach binary): roll-vs-promotion ordering, allocation dirty-flag ordering, fail-closed recovery, durable mark, A/B error classification, key canary and identity checks, bounded journal and degraded state, control-socket lifecycle and ownership (Unix-only suites run under Linux CI and WSL), configuration validation matrix, plaintext-transport policy, TLS fail-closed, the production sample building its provider, retry-safety and absolute deadlines in the dispatcher, endpoint quarantine, and WebSocket unit echo; see the [remediation log](review-remediation.md) |
+| Sanitizers and randomized suites | Debug-build `check_invariants` on `Overlay`, `JournalWriter`, and `Volume` after every mutation; `review_fuzz.rs` (maki-format: single-bit-flip and random-mutation fuzz of every decoder, the journal scanner, URL parsing, and `validate()` on a mutated production sample), `review_stress.rs` and `review_corruption.rs` (maki-core: concurrent engine stress with a per-unit oracle, provider chaos, background checkpoints and a crash; engine-level sweep of all persistence failpoints; random single-file corruption with deep check and re-attach), `review_stress_crypto.rs` (maki-crypto: scheduler and dispatcher under random faults), `review_cache_model.rs` (maki-cache: model-based LRU check); findings S-01 and S-02 in the [remediation log](review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
 
 ## Current qualification status
 

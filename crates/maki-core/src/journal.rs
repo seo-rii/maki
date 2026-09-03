@@ -166,6 +166,7 @@ impl JournalWriter {
             durable_size: active.write_offset,
         };
         self.write_mark(mark);
+        self.sanitize();
         Ok(())
     }
 
@@ -196,6 +197,7 @@ impl JournalWriter {
         if let Some(active) = self.active.take() {
             self.sealed.push(active.info);
         }
+        self.sanitize();
         Ok(())
     }
 
@@ -237,11 +239,13 @@ impl JournalWriter {
                     synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
                 });
+                self.sanitize();
                 Ok(())
             }
             Err(e) => {
                 // Best-effort cleanup; the retry recreates the same index.
                 let _ = self.backing.remove(&path);
+                self.sanitize();
                 Err(e)
             }
         }
@@ -276,6 +280,7 @@ impl JournalWriter {
         active.unsynced = true;
         self.next_sequence += 1;
         self.appended_sequence = sequence;
+        self.sanitize();
         Ok(sequence)
     }
 
@@ -286,8 +291,127 @@ impl JournalWriter {
         // seal keeps the segment active), so the active segment is the only
         // possible holder of pending records.
         self.durable_sequence = self.appended_sequence;
+        self.sanitize();
         Ok(self.durable_sequence)
     }
+
+    /// Structural invariants of the writer (SPEC §23–§25). Panics on
+    /// violation; debug builds run it after every mutation.
+    ///
+    /// * `durable_sequence <= appended_sequence < next_sequence` and the
+    ///   two differ by exactly one.
+    /// * Sealed segments carry strictly increasing indexes and contiguous
+    ///   base sequences; the active segment (if any) follows them and its
+    ///   records end exactly at `appended_sequence`.
+    /// * The active segment's synced prefix never exceeds its size, an
+    ///   unsynced segment has bytes past the synced prefix, and a synced one
+    ///   has none.
+    /// * Every sealed segment is fully durable: its last record is at or
+    ///   below `durable_sequence`.
+    /// * `next_segment_index` is above every segment index in use.
+    pub fn check_invariants(&self) {
+        assert!(
+            self.durable_sequence <= self.appended_sequence,
+            "journal sanitizer: durable {} > appended {}",
+            self.durable_sequence,
+            self.appended_sequence
+        );
+        assert_eq!(
+            self.next_sequence,
+            self.appended_sequence + 1,
+            "journal sanitizer: next sequence not appended + 1"
+        );
+        let mut prev_index: Option<u64> = None;
+        let mut expected_base: Option<u64> = None;
+        let all = self
+            .sealed
+            .iter()
+            .map(|s| (s, false))
+            .chain(self.active.as_ref().map(|a| (&a.info, true)));
+        for (seg, is_active) in all {
+            if let Some(p) = prev_index {
+                assert!(
+                    seg.index > p,
+                    "journal sanitizer: segment {} after {}",
+                    seg.index,
+                    p
+                );
+            }
+            prev_index = Some(seg.index);
+            assert!(
+                seg.index < self.next_segment_index,
+                "journal sanitizer: segment {} >= next index {}",
+                seg.index,
+                self.next_segment_index
+            );
+            if let Some(base) = expected_base {
+                assert_eq!(
+                    seg.base_sequence, base,
+                    "journal sanitizer: segment {} base not contiguous",
+                    seg.index
+                );
+            }
+            expected_base = Some(seg.base_sequence + seg.record_count);
+            assert!(
+                seg.size >= SEGMENT_HEADER_SIZE as u64,
+                "journal sanitizer: segment {} smaller than its header",
+                seg.index
+            );
+            if !is_active && seg.record_count > 0 {
+                assert!(
+                    seg.last_sequence() <= self.durable_sequence,
+                    "journal sanitizer: sealed segment {} ends at {} past durable {}",
+                    seg.index,
+                    seg.last_sequence(),
+                    self.durable_sequence
+                );
+            }
+        }
+        if let Some(a) = &self.active {
+            assert_eq!(
+                a.info.base_sequence + a.info.record_count,
+                self.next_sequence,
+                "journal sanitizer: active segment does not end at next sequence"
+            );
+            assert_eq!(
+                a.write_offset, a.info.size,
+                "journal sanitizer: size != offset"
+            );
+            assert!(
+                a.synced_offset <= a.write_offset,
+                "journal sanitizer: synced past written"
+            );
+            if a.unsynced {
+                assert!(
+                    a.synced_offset < a.write_offset,
+                    "journal sanitizer: unsynced segment with nothing pending"
+                );
+            } else {
+                assert_eq!(
+                    a.synced_offset, a.write_offset,
+                    "journal sanitizer: synced segment with pending bytes"
+                );
+                assert_eq!(
+                    self.durable_sequence, self.appended_sequence,
+                    "journal sanitizer: fully synced but durable lags appended"
+                );
+            }
+        } else {
+            assert_eq!(
+                self.durable_sequence, self.appended_sequence,
+                "journal sanitizer: no active segment but durable lags appended"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn sanitize(&self) {
+        self.check_invariants();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn sanitize(&self) {}
 
     /// Delete sealed segments fully covered by `checkpoint_sequence`.
     /// Returns how many were deleted. The caller fsyncs the journal dir.
@@ -315,6 +439,7 @@ impl JournalWriter {
             }
         }
         self.sealed = kept;
+        self.sanitize();
         match error {
             Some(e) => Err(e),
             None => Ok(deleted),

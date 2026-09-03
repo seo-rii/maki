@@ -83,7 +83,7 @@ impl Volume {
         }
         overlay.promote(durable_sequence);
 
-        Ok(Self {
+        let volume = Self {
             backing,
             _lock: lock,
             superblock,
@@ -92,7 +92,9 @@ impl Volume {
             overlay,
             ck_ab: AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B),
             ck_state: checkpoint_state,
-        })
+        };
+        volume.sanitize();
+        Ok(volume)
     }
 
     pub fn backing(&self) -> &Arc<dyn Backing> {
@@ -199,6 +201,7 @@ impl Volume {
                 )));
             }
         }
+        self.sanitize();
         Ok(sequence)
     }
 
@@ -206,6 +209,7 @@ impl Volume {
     pub fn flush(&mut self) -> Result<(), CoreError> {
         let durable = self.journal.sync()?;
         self.overlay.promote(durable);
+        self.sanitize();
         Ok(())
     }
 
@@ -234,8 +238,14 @@ impl Volume {
         self.overlay.promote(durable);
         if durable <= self.ck_state.checkpoint_sequence {
             // Nothing new is durable; still retire anything a previously
-            // interrupted checkpoint applied but could not clean up.
+            // interrupted checkpoint applied but could not clean up, and
+            // persist metadata the store repaired at open (an adopted shard
+            // or an allocation map rebuilt from slot headers).
             self.overlay.retire(self.ck_state.checkpoint_sequence);
+            if self.store.has_pending_repairs() {
+                self.store.persist_allocations()?;
+            }
+            self.sanitize();
             return Ok(self.ck_state.checkpoint_sequence);
         }
         let items = self.overlay.collect_durable(durable);
@@ -271,6 +281,46 @@ impl Volume {
         self.backing.sync_dir(layout::JOURNAL_DIR)?;
 
         self.overlay.retire(durable);
+        self.sanitize();
         Ok(durable)
     }
+
+    /// Cross-component invariants (SPEC §12, §26): the checkpoint never
+    /// leads the durable boundary, the overlay holds nothing at or below
+    /// the checkpoint, and both sub-structures pass their own audits.
+    /// Panics on violation; debug builds run it after every volume
+    /// mutation.
+    pub fn check_invariants(&self) {
+        let checkpoint = self.ck_state.checkpoint_sequence;
+        let durable = self.journal.durable_sequence();
+        assert!(
+            checkpoint <= durable,
+            "volume sanitizer: checkpoint {checkpoint} > durable {durable}"
+        );
+        self.journal.check_invariants();
+        // The overlay audit is O(units); skip it on very large overlays so
+        // debug stress tests stay linear (the overlay samples on its own).
+        if self.overlay.len() <= 4096 {
+            self.overlay.check_invariants();
+            if let Some((_, newest)) = self.overlay.sequence_bounds() {
+                // Versions at or below the checkpoint may linger after an
+                // interrupted checkpoint (retired by the next one); versions
+                // above the journal's appended sequence never exist.
+                assert!(
+                    newest <= self.journal.appended_sequence(),
+                    "volume sanitizer: overlay version {newest} beyond appended {}",
+                    self.journal.appended_sequence()
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn sanitize(&self) {
+        self.check_invariants();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn sanitize(&self) {}
 }
