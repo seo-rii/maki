@@ -249,7 +249,9 @@ impl WsCryptoProvider {
     }
 
     /// One logical request with a single transparent reconnect attempt on
-    /// transport failure.
+    /// transport failure. A provider that is not `retry_safe` is never sent
+    /// the same request twice (review M-010): the transport failure is
+    /// surfaced as-is.
     async fn request(
         &self,
         op: &str,
@@ -257,7 +259,12 @@ impl WsCryptoProvider {
         items: &[(u64, &[u8])],
     ) -> Result<Vec<Vec<u8>>, CryptoError> {
         let mut last_err = None;
-        for _attempt in 0..2 {
+        let attempts = if self.spec.capabilities.retry_safe {
+            2
+        } else {
+            1
+        };
+        for _attempt in 0..attempts {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             let body = json!({
                 "id": id,
@@ -270,7 +277,7 @@ impl WsCryptoProvider {
                     .collect::<Vec<_>>(),
             });
             match self.request_once(&body).await {
-                Ok(response) => return self.parse_response(&response, items.len()),
+                Ok(response) => return self.parse_response(&response, items),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),
             }
@@ -278,11 +285,15 @@ impl WsCryptoProvider {
         Err(last_err.unwrap())
     }
 
+    /// Every response item must echo its request unit, in request order
+    /// (review M-012): a reordered, duplicated, dropped, or foreign item is
+    /// a contract violation, never silently re-labelled by position.
     fn parse_response(
         &self,
         response: &Value,
-        expected: usize,
+        requested: &[(u64, &[u8])],
     ) -> Result<Vec<Vec<u8>>, CryptoError> {
+        let expected = requested.len();
         if let Some(error) = response.get("error") {
             let class = error.get("class").and_then(|c| c.as_str()).unwrap_or("");
             let message = error
@@ -309,7 +320,15 @@ impl WsCryptoProvider {
         }
         items
             .iter()
-            .map(|item| {
+            .zip(requested.iter())
+            .enumerate()
+            .map(|(position, (item, (unit, _)))| {
+                let echoed = item.get("unit").and_then(|u| u.as_u64());
+                if echoed != Some(*unit) {
+                    return Err(CryptoError::Contract(format!(
+                        "response item {position} echoes unit {echoed:?}, expected {unit}"
+                    )));
+                }
                 let data = item
                     .get("data")
                     .and_then(|d| d.as_str())

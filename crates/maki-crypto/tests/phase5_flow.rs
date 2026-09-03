@@ -59,6 +59,9 @@ fn dispatch_cfg() -> DispatchConfig {
         per_endpoint_max_inflight: 8,
         per_endpoint_max_bytes: 8 << 20,
         max_attempts: None,
+        max_operation_time: None,
+        retry_safe: true,
+        validation_interval: Duration::from_secs(1),
     }
 }
 

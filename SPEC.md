@@ -700,6 +700,18 @@ integer
 uuid
 ```
 
+Batch result identity: every batch element a remote provider returns MUST
+carry the unit index of the request item it answers, in request order. Maki
+rejects a response whose elements are missing, duplicated, reordered, or
+mislabelled as a contract violation; it never re-labels results by position.
+For HTTP this is the `item_index_path` response mapping (required for batch
+layouts), for WebSocket the `unit` field of each response item, and for gRPC
+the `unit_index` field of `CryptoItem`.
+
+Retry safety: a provider whose capabilities do not declare `retry_safe` is
+sent each request at most once. No retry, failover, or transport-level resend
+happens after the request has been sent.
+
 ---
 
 # 19. HTTP Configuration Example

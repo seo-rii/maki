@@ -131,7 +131,18 @@ provider contract errors. Response bodies are read under a hard size limit.
 
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
 stale response IDs are discarded, pending requests are scoped to a connection
-generation, and both inbound and outbound frame sizes are bounded.
+generation, and both inbound and outbound frame sizes are bounded. Each
+response item must carry the `unit` of the request item it answers, in request
+order; a missing, reordered, or mislabelled item is a contract error.
+
+Providers that do not declare `retry_safe` are sent every request at most
+once: the dispatcher performs no retry or failover after a request has been
+sent, and the WebSocket transport does not resend over a fresh connection. With
+`availability_policy = "bounded-error"`, `max_operation_time` is an absolute
+wall-clock deadline: backoff never sleeps past it and an in-flight request is
+abandoned when it expires. Endpoints that could not be cross-validated at attach
+(unreachable at the time) are quarantined and start serving only after the
+cross-endpoint check succeeds against a validated endpoint.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).

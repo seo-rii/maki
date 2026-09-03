@@ -341,66 +341,129 @@ fn resolve_metadata_value(value: &maki_format::config::HeaderValue) -> Result<St
     }
 }
 
-/// Cross-endpoint interchangeability check (SPEC §34) plus the dispatcher
+/// Cross-endpoint interchangeability check (SPEC 34) plus the dispatcher
 /// (retry/budget/breaker/failover) shared by every remote transport.
+///
+/// Each endpoint is first probed on its own (a single-endpoint self-test):
+/// endpoints that are unreachable right now are *quarantined* (review
+/// M-011) and enter the set unvalidated; they only start serving once the
+/// cross-endpoint check succeeds against a validated endpoint under the real
+/// volume context. Reachable endpoints are cross-checked against the first
+/// reachable one; proven non-interchangeability (or a misconfigured
+/// endpoint) refuses attach. At least one endpoint must be reachable.
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
 ) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
     use maki_crypto::clock::SystemClock;
-    use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
+    use maki_crypto::endpoint::{DispatchConfig, EndpointSet, EndpointValidator};
+    use maki_crypto::selftest::{cross_endpoint_self_test, provider_self_test};
 
-    // Cross-endpoint encrypt/decrypt self-tests before attach (SPEC §34).
-    // The synthetic context uses the configured profile; the volume UUID is
-    // bound later by the attach-time self-test.
-    if endpoints.len() > 1 {
-        let context = maki_crypto::CryptoContext {
-            volume_uuid: uuid::Uuid::nil(),
-            format_version: 1,
-            crypto_compatibility_id: config.crypto.crypto_compatibility_id.clone(),
-        };
-        let unit = config.volume.crypto_unit_size as usize;
-        for other in &endpoints[1..] {
-            match maki_crypto::selftest::cross_endpoint_self_test(
-                endpoints[0].1.as_ref(),
-                other.1.as_ref(),
-                &context,
-                unit,
-            )
-            .await
-            {
-                Ok(()) => {}
-                // A transport failure only proves the endpoint is down right
-                // now — its circuit breaker will gate it. Proven
-                // non-interchangeability (ProviderFatal / contract) refuses
-                // attach (SPEC §12, §34).
-                Err(e)
-                    if matches!(
-                        e.class(),
-                        maki_crypto::ErrorClass::Retryable
-                            | maki_crypto::ErrorClass::Throttled
-                            | maki_crypto::ErrorClass::EndpointFatal
-                    ) =>
-                {
-                    tracing::warn!(
-                        "cross-endpoint self-test vs {:?} skipped (endpoint unavailable): {e}",
-                        other.0
-                    );
+    let unit = config.volume.crypto_unit_size as usize;
+    let compat = config.crypto.crypto_compatibility_id.clone();
+    let transport_failure = |e: &maki_crypto::CryptoError| {
+        matches!(
+            e.class(),
+            maki_crypto::ErrorClass::Retryable
+                | maki_crypto::ErrorClass::Throttled
+                | maki_crypto::ErrorClass::EndpointFatal
+        )
+    };
+    // Synthetic context with the configured profile; the volume UUID is
+    // bound by the attach-time self-test and by later revalidation.
+    let context = maki_crypto::CryptoContext {
+        volume_uuid: uuid::Uuid::nil(),
+        format_version: 1,
+        crypto_compatibility_id: compat.clone(),
+    };
+
+    // 1. Reachability: every endpoint on its own, tolerating a few transient
+    //    failures. A single endpoint has nothing to cross-validate against:
+    //    the engine self-test (through the retrying dispatcher) covers it.
+    let mut reachable: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let single = endpoints.len() == 1;
+    let probe_delay = config.crypto.retry.initial_delay.0;
+    for (name, provider) in endpoints {
+        if single {
+            reachable.push((name, provider));
+            break;
+        }
+        let mut last: Option<maki_crypto::CryptoError> = None;
+        for attempt in 0..3 {
+            match provider_self_test(provider.as_ref(), &context, unit, &compat).await {
+                Ok(()) => {
+                    last = None;
+                    break;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) if transport_failure(&e) => {
+                    last = Some(e);
+                    if attempt < 2 {
+                        tokio::time::sleep(probe_delay).await;
+                    }
+                }
+                Err(e) => {
+                    return Err(DaemonError::Unsupported(format!(
+                        "endpoint {name:?} failed its self-test: {e}"
+                    )))
+                }
+            }
+        }
+        match last {
+            None => reachable.push((name, provider)),
+            Some(e) => {
+                tracing::warn!("endpoint {name:?} quarantined: unreachable at attach ({e})");
+                quarantined.push((name, provider));
             }
         }
     }
+    if reachable.is_empty() {
+        return Err(DaemonError::Unsupported(
+            "no remote endpoint is reachable; attach refused".to_string(),
+        ));
+    }
+
+    // 2. Interchangeability among the reachable ones (SPEC 34).
+    let mut flagged: Vec<(String, Arc<dyn CryptoProvider>, bool)> = Vec::new();
+    let reference = reachable[0].1.clone();
+    for (index, (name, provider)) in reachable.into_iter().enumerate() {
+        if index == 0 {
+            flagged.push((name, provider, true));
+            continue;
+        }
+        match cross_endpoint_self_test(reference.as_ref(), provider.as_ref(), &context, unit).await
+        {
+            Ok(()) => flagged.push((name, provider, true)),
+            Err(e) if transport_failure(&e) => {
+                tracing::warn!(
+                    "endpoint {name:?} quarantined: cross-endpoint self-test could not run ({e})"
+                );
+                flagged.push((name, provider, false));
+            }
+            // Proven non-interchangeability (ProviderFatal / contract)
+            // refuses attach (SPEC 12, 34).
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for (name, provider) in quarantined {
+        flagged.push((name, provider, false));
+    }
+
+    let validator: EndpointValidator = Arc::new(move |reference, candidate, context| {
+        Box::pin(async move {
+            cross_endpoint_self_test(reference.as_ref(), candidate.as_ref(), &context, unit).await
+        })
+    });
 
     let retry = &config.crypto.retry;
     let budget = &config.crypto.retry_budget;
     let breaker = &config.crypto.circuit_breaker;
     let limits = &config.limits;
-    let max_attempts = match config.crypto.availability_policy {
-        maki_format::config::AvailabilityPolicy::Stall => None,
+    let (max_attempts, max_operation_time) = match config.crypto.availability_policy {
+        maki_format::config::AvailabilityPolicy::Stall => (None, None),
         maki_format::config::AvailabilityPolicy::BoundedError => {
-            // Rough bound: enough passes to span max_operation_time at the
-            // initial delay (jitter shortens real delays).
+            // The absolute deadline is the contract (SPEC 35); the pass
+            // bound is a belt-and-braces cap derived from it.
             let op_time = config
                 .crypto
                 .max_operation_time
@@ -410,7 +473,10 @@ async fn dispatch_endpoint_set(
                 .initial_delay
                 .0
                 .max(std::time::Duration::from_millis(1));
-            Some((op_time.as_millis() / initial.as_millis()).clamp(1, 1000) as u32)
+            (
+                Some((op_time.as_millis() / initial.as_millis()).clamp(1, 1000) as u32),
+                Some(op_time),
+            )
         }
     };
     let dispatch = DispatchConfig {
@@ -435,9 +501,13 @@ async fn dispatch_endpoint_set(
         per_endpoint_max_inflight: limits.max_inflight_per_endpoint,
         per_endpoint_max_bytes: limits.max_inflight_bytes_per_endpoint.0,
         max_attempts,
+        max_operation_time,
+        retry_safe: config.crypto.capabilities.retry_safe,
+        validation_interval: breaker.open_initial.0,
     };
-    Ok(Arc::new(EndpointSet::new(
-        endpoints,
+    Ok(Arc::new(EndpointSet::with_quarantine(
+        flagged,
+        Some(validator),
         dispatch,
         Arc::new(SystemClock::new()),
     )))

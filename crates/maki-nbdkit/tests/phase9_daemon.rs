@@ -48,7 +48,7 @@ async fn ws_server() -> String {
                         .map(|item| {
                             let data = b64d(item["data"].as_str().unwrap());
                             let out: Vec<u8> = data.iter().map(|b| b ^ XOR).collect();
-                            json!({"data": b64(&out)})
+                            json!({"unit": item["unit"], "data": b64(&out)})
                         })
                         .collect();
                     let response = json!({"id": request["id"], "items": items});
