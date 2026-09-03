@@ -300,6 +300,7 @@ fn crash_mid_checkpoint_at_every_boundary_recovers_consistently() {
         "checkpoint.slot_write",
         "checkpoint.shard_sync",
         "checkpoint.alloc_store",
+        "checkpoint.alloc_dirsync",
         "checkpoint.state_store",
         "checkpoint.segment_delete",
         "checkpoint.dirsync",

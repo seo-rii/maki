@@ -44,6 +44,9 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - A dying WebSocket connection must only fail requests from its own generation ([architecture](docs/architecture.md)).
 - WAL-style replay needs a flushed header or salt to gate epochs ([testing](docs/testing.md)).
 - On-disk format changes require a format-version bump + new golden vectors; `tests/golden/*.crc` failing means you broke compatibility.
+- An automatic journal roll advances `durable_sequence` *inside* `append`; always promote the overlay before publishing a newer version of the same unit, or a checkpoint can delete the only copy of a durable write ([remediation log](docs/review-remediation.md), M-002).
+- Clear a persistence dirty flag only after the directory fsync that makes the new file durable; clearing earlier lets a retry skip the step (M-003).
+- Unsynced journal records persist in any order: a valid record after damaged bytes does not prove the damage is durable. Classify with the durable mark, never by what follows (M-007).
 
 ## External qualification
 

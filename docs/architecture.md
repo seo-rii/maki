@@ -67,23 +67,45 @@ writes.
 | Allocation map | Per-shard A/B copies | Distinguishes unwritten units from allocated slots |
 | Slot | Header CRC and ciphertext CRC | Stores one encrypted unit and write sequence |
 | Journal segment | Header and record CRCs | Ordered ciphertext writes pending checkpoint |
-| Checkpoint state | Two generations plus CRC | Highest durably applied journal sequence |
+| Journal durable mark | CRC, single copy, never fsync'd | Lower bound on the fdatasync'd prefix of the active segment |
+| Checkpoint state | Two generations plus CRC, written at creation | Highest durably applied journal sequence |
 
 Metadata updates overwrite the stale A/B side and then advance generation. A
-torn new copy therefore falls back to the older valid generation. Journal tails
-may be truncated after a crash; corruption before a valid successor record is a
-hard error and attachment fails.
+torn new copy therefore falls back to the older valid generation. A side that
+is absent, empty, short, or fails its CRC is an invalid copy; any other read
+error is an I/O error and refuses attach rather than silently selecting the
+other side.
 
 ## Recovery and checkpointing
 
 Recovery acquires the volume lock, validates superblock and allocation state,
-scans journal segments, rejects sequence gaps or foreign records, and rebuilds
-the in-memory overlay from records newer than the checkpoint.
+loads the checkpoint state (required on every volume), scans journal segments,
+and rebuilds the in-memory overlay from records newer than the checkpoint. It
+fails closed: the oldest surviving segment must bridge from the checkpoint
+boundary, segments must be contiguous and carry the volume's UUID, a segment
+larger than the writer can produce is rejected before it is read, and a
+complete-but-invalid final segment header is treated as damage rather than as
+a creation crash.
+
+Journal tails may be truncated after a crash, but only after the point the
+durable mark proves was fdatasync'd. Damage inside that prefix is corruption
+even at the very end of the segment; damage after it is a torn tail even when
+an intact record follows, because unsynced records may persist in any order.
+The [review remediation log](review-remediation.md) describes these rules in
+detail.
 
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at
-checkpoint time. Checkpointing writes slots, synchronizes data and metadata,
-commits checkpoint state, and only then deletes covered journal segments.
+checkpoint time. The durable boundary can move inside `append` itself (an
+automatic segment roll fdatasyncs the sealed segment), so the volume promotes
+the overlay after every journal operation and *before* publishing a newer
+version of the same unit; checkpointing re-derives the checkpointable set from
+the journal's own boundary rather than trusting earlier promotions.
+
+Checkpointing writes slots, synchronizes data, writes allocation metadata and
+fsyncs the data directory before clearing any dirty flag, commits checkpoint
+state, and only then deletes covered journal segments. A checkpoint that fails
+part-way leaves every incomplete step marked for the retry.
 
 ## Provider boundary
 

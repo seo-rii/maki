@@ -4,6 +4,7 @@ use maki_backing::Backing;
 
 use crate::ab::AbStore;
 use crate::catalog::ShardCatalog;
+use crate::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use crate::error::FormatError;
 use crate::layout;
 use crate::superblock::Superblock;
@@ -45,6 +46,21 @@ pub fn create_volume(
     let cat_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B);
     let mut catalog = ShardCatalog::new();
     cat_ab.store(backing, &mut catalog)?;
+
+    // Initial checkpoint state (sequence 0), both copies: recovery requires
+    // a valid copy on every initialized volume, so that losing the state
+    // can never be mistaken for "never checkpointed".
+    let ck_ab = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
+    let mut state = CheckpointState::default();
+    ck_ab.store(backing, &mut state)?;
+    ck_ab.store(backing, &mut state)?;
+
+    // The journal writer's durable mark (empty = no information yet); its
+    // dirent is made durable here so the first mark write never depends on
+    // a later directory fsync.
+    let mark = backing.open(layout::JOURNAL_DURABLE_MARK, true)?;
+    mark.set_len(0)?;
+    mark.sync_data()?;
 
     // Make all dirents durable.
     backing.sync_dir(layout::DATA_DIR)?;

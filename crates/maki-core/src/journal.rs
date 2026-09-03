@@ -5,13 +5,28 @@
 //! (create → header → fdatasync → dir fsync) completes before any record in
 //! the segment can be acknowledged, so a durable record can never live in a
 //! file whose dirent might vanish.
+//!
+//! Durability boundary contract: `durable_sequence` only advances after a
+//! successful `sync_data`, and a failed seal keeps the active segment (its
+//! records stay pending) so a later barrier still syncs them. Callers must
+//! treat *every* return from [`JournalWriter::append`] — including errors —
+//! as a point where `durable_sequence` may have moved (an automatic roll
+//! seals the previous segment).
+//!
+//! After every successful segment fdatasync the writer records the synced
+//! prefix in the durable mark (`journal/durable-mark`, see
+//! `maki_format::journal::DurableMark`) with a plain, un-synced write. The
+//! mark lets recovery tell durable-body corruption from a torn tail; it is
+//! only ever a lower bound, so a failed mark write is logged, not fatal.
 
 use std::sync::Arc;
 
 use uuid::Uuid;
 
 use maki_backing::{Backing, BackingFile};
-use maki_format::journal::{encode_record, JournalRecord, SegmentHeader, SEGMENT_HEADER_SIZE};
+use maki_format::journal::{
+    encode_record, DurableMark, JournalRecord, SegmentHeader, SEGMENT_HEADER_SIZE,
+};
 use maki_format::layout;
 
 use crate::error::CoreError;
@@ -54,6 +69,8 @@ pub struct JournalWriter {
     sealed: Vec<SegmentInfo>,
     active: Option<ActiveSegment>,
     next_segment_index: u64,
+    /// `journal/durable-mark`, opened lazily on the first successful sync.
+    mark: Option<Arc<dyn BackingFile>>,
 }
 
 impl JournalWriter {
@@ -70,13 +87,14 @@ impl JournalWriter {
         Self {
             backing,
             volume_uuid,
-            segment_size: segment_size.max(SEGMENT_HEADER_SIZE as u64 + 64),
+            segment_size: effective_segment_size(segment_size),
             next_sequence: durable_sequence + 1,
             appended_sequence: durable_sequence,
             durable_sequence,
             sealed,
             active: None,
             next_segment_index,
+            mark: None,
         }
     }
 
@@ -100,6 +118,16 @@ impl JournalWriter {
         self.active.as_ref().map(|a| a.info.index)
     }
 
+    /// Index of the first segment holding a record newer than
+    /// `checkpoint_sequence` (sealed first, then the active one).
+    pub fn first_uncovered_segment_index(&self, checkpoint_sequence: u64) -> Option<u64> {
+        self.sealed
+            .iter()
+            .chain(self.active.as_ref().map(|a| &a.info))
+            .find(|s| s.record_count > 0 && s.last_sequence() > checkpoint_sequence)
+            .map(|s| s.index)
+    }
+
     /// Bytes appended but not yet durable (admission control input).
     pub fn pending_bytes(&self) -> u64 {
         self.active
@@ -109,13 +137,60 @@ impl JournalWriter {
             .unwrap_or(0)
     }
 
-    fn seal_active(&mut self) -> Result<(), CoreError> {
-        if let Some(active) = self.active.take() {
-            if active.unsynced {
-                fp("journal.sync")?;
-                active.file.sync_data()?;
-                self.durable_sequence = self.appended_sequence;
+    /// Total bytes of every journal segment on disk (sealed + active): the
+    /// quantity a journal size limit bounds.
+    pub fn total_bytes(&self) -> u64 {
+        self.sealed.iter().map(|s| s.size).sum::<u64>()
+            + self.active.as_ref().map(|a| a.info.size).unwrap_or(0)
+    }
+
+    /// fdatasync the active segment's pending records and publish the
+    /// durable mark. On success `durable_sequence` covers every appended
+    /// record.
+    fn sync_active(&mut self) -> Result<(), CoreError> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(());
+        };
+        if !active.unsynced {
+            return Ok(());
+        }
+        fp("journal.sync")?;
+        active.file.sync_data()?;
+        active.unsynced = false;
+        self.durable_sequence = self.appended_sequence;
+        let mark = DurableMark {
+            segment_index: active.info.index,
+            durable_size: active.write_offset,
+        };
+        self.write_mark(mark);
+        Ok(())
+    }
+
+    /// Best-effort, never fsync'd (see module docs): a mark can only make
+    /// recovery *stricter* about bytes that are provably durable.
+    fn write_mark(&mut self, mark: DurableMark) {
+        if self.mark.is_none() {
+            match self.backing.open(layout::JOURNAL_DURABLE_MARK, true) {
+                Ok(file) => self.mark = Some(file),
+                Err(e) => {
+                    tracing::warn!("journal durable mark unavailable: {e}");
+                    return;
+                }
             }
+        }
+        if let Some(file) = &self.mark {
+            if let Err(e) = file.write_at(0, &mark.encode()) {
+                tracing::warn!("journal durable mark write failed: {e}");
+            }
+        }
+    }
+
+    /// Sync the active segment (if it has pending records) and retire it to
+    /// the sealed list. On a sync failure the segment stays active and
+    /// unsynced so a later barrier still covers its records.
+    fn seal_active(&mut self) -> Result<(), CoreError> {
+        self.sync_active()?;
+        if let Some(active) = self.active.take() {
             self.sealed.push(active.info);
         }
         Ok(())
@@ -169,7 +244,9 @@ impl JournalWriter {
     }
 
     /// Append one ciphertext record. Returns its sequence. On error, no
-    /// sequence is consumed and the journal remains consistent.
+    /// sequence is consumed and the journal remains consistent — but
+    /// `durable_sequence` may still have advanced (an automatic roll seals
+    /// the previous segment before the failure).
     pub fn append(&mut self, unit_index: u64, payload: &[u8]) -> Result<u64, CoreError> {
         let record_len = 32 + payload.len() as u64;
         let needs_roll = match &self.active {
@@ -200,13 +277,10 @@ impl JournalWriter {
 
     /// Make all appended records durable (FLUSH barrier / FUA tail).
     pub fn sync(&mut self) -> Result<u64, CoreError> {
-        if let Some(active) = self.active.as_mut() {
-            if active.unsynced {
-                fp("journal.sync")?;
-                active.file.sync_data()?;
-                active.unsynced = false;
-            }
-        }
+        self.sync_active()?;
+        // Every sealed segment was synced before it was sealed (a failed
+        // seal keeps the segment active), so the active segment is the only
+        // possible holder of pending records.
         self.durable_sequence = self.appended_sequence;
         Ok(self.durable_sequence)
     }
@@ -242,4 +316,10 @@ impl JournalWriter {
             None => Ok(deleted),
         }
     }
+}
+
+/// The segment size the writer actually rolls at for a configured value
+/// (a floor keeps the header plus one small record possible).
+pub fn effective_segment_size(configured: u64) -> u64 {
+    configured.max(SEGMENT_HEADER_SIZE as u64 + 64)
 }

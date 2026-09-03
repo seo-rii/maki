@@ -10,6 +10,12 @@
 //! and their dirents made durable *before* the catalog commits the shard —
 //! a crash in between leaves harmless orphans, never a cataloged shard with
 //! missing metadata.
+//!
+//! Allocation persistence: a shard's dirty flag is cleared only after the
+//! data-directory fsync that makes the fresh A/B copy's dirent durable has
+//! succeeded. Clearing it earlier lets a retried checkpoint skip the step,
+//! after which a crash can drop the never-dir-synced copy and reclassify
+//! written slots as unwritten zeros.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -106,6 +112,11 @@ impl SlotStore {
         &self.geometry
     }
 
+    /// Number of cataloged shards.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     fn ensure_shard(&mut self, shard_idx: u64) -> Result<(), CoreError> {
         if self.shards.contains_key(&shard_idx) {
             return Ok(());
@@ -198,22 +209,31 @@ impl SlotStore {
         Ok(())
     }
 
-    /// Persist all dirty allocation maps (A/B), then make any new metadata
-    /// file dirents durable.
+    /// Persist all dirty allocation maps (A/B), make any new metadata file
+    /// dirents durable, and only then clear the dirty flags. A failure at
+    /// any step leaves every affected shard dirty so a retry redoes the
+    /// whole step.
     pub fn persist_allocations(&mut self) -> Result<(), CoreError> {
-        let mut any = false;
-        for shard in self.shards.values_mut() {
-            if shard.dirty_alloc {
-                fp("checkpoint.alloc_store")?;
-                shard
-                    .alloc_ab
-                    .store(self.backing.as_ref(), &mut shard.alloc)?;
-                shard.dirty_alloc = false;
-                any = true;
-            }
+        let dirty: Vec<u64> = self
+            .shards
+            .iter()
+            .filter(|(_, s)| s.dirty_alloc)
+            .map(|(idx, _)| *idx)
+            .collect();
+        if dirty.is_empty() {
+            return Ok(());
         }
-        if any {
-            self.backing.sync_dir(layout::DATA_DIR)?;
+        for idx in &dirty {
+            fp("checkpoint.alloc_store")?;
+            let shard = self.shards.get_mut(idx).unwrap();
+            shard
+                .alloc_ab
+                .store(self.backing.as_ref(), &mut shard.alloc)?;
+        }
+        fp("checkpoint.alloc_dirsync")?;
+        self.backing.sync_dir(layout::DATA_DIR)?;
+        for idx in &dirty {
+            self.shards.get_mut(idx).unwrap().dirty_alloc = false;
         }
         Ok(())
     }

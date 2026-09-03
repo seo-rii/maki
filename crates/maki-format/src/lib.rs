@@ -30,6 +30,8 @@ pub mod layout {
     pub const DATA_DIR: &str = "data";
     pub const JOURNAL_DIR: &str = "journal";
     pub const CHECKPOINT_DIR: &str = "checkpoint";
+    /// The journal writer's fdatasync high-water mark (see `journal::DurableMark`).
+    pub const JOURNAL_DURABLE_MARK: &str = "journal/durable-mark";
 
     pub fn shard_data(shard: u64) -> String {
         format!("{DATA_DIR}/shard-{shard:08x}.dat")

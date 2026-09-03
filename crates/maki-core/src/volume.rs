@@ -1,6 +1,14 @@
 //! The ciphertext-level volume: journal + overlay + slot store + checkpoint
 //! (SPEC §23–§27). Phase 4's engine layers crypto, RMW, and per-unit
 //! concurrency on top of this.
+//!
+//! Overlay/journal ordering rule: the overlay's durable boundary is advanced
+//! (`promote`) after *every* journal operation that can move
+//! `durable_sequence` — including an automatic segment roll inside `append`
+//! — and always *before* a newer version of a unit is published. Publishing
+//! first would supersede a version that just became durable, and a
+//! checkpoint at that boundary would then delete its journal segment without
+//! ever copying it into a slot.
 
 use std::sync::Arc;
 
@@ -12,7 +20,7 @@ use maki_format::superblock::Superblock;
 
 use crate::error::CoreError;
 use crate::fp;
-use crate::journal::JournalWriter;
+use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
 use crate::recovery::{recover, Recovered, RecoveryError};
 use crate::store::{SlotRead, SlotStore};
@@ -47,21 +55,22 @@ impl Volume {
         backing: Arc<dyn Backing>,
         options: VolumeOptions,
     ) -> Result<Self, RecoveryError> {
+        let segment_size = effective_segment_size(options.journal_segment_size);
         let Recovered {
             lock,
             superblock,
             store,
-            checkpoint_sequence,
+            checkpoint_state,
             durable_sequence,
             next_segment_index,
             segments,
             replay,
-        } = recover(&backing)?;
+        } = recover(&backing, segment_size)?;
 
         let journal = JournalWriter::resume(
             backing.clone(),
             superblock.volume_uuid,
-            options.journal_segment_size,
+            segment_size,
             durable_sequence,
             next_segment_index,
             segments,
@@ -74,9 +83,6 @@ impl Volume {
         }
         overlay.promote(durable_sequence);
 
-        let mut ck_state = CheckpointState::default();
-        ck_state.checkpoint_sequence = checkpoint_sequence;
-
         Ok(Self {
             backing,
             _lock: lock,
@@ -85,8 +91,12 @@ impl Volume {
             store,
             overlay,
             ck_ab: AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B),
-            ck_state,
+            ck_state: checkpoint_state,
         })
+    }
+
+    pub fn backing(&self) -> &Arc<dyn Backing> {
+        &self.backing
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -109,6 +119,11 @@ impl Volume {
         self.journal.pending_bytes()
     }
 
+    /// Bytes of journal on disk (all segments).
+    pub fn journal_total_bytes(&self) -> u64 {
+        self.journal.total_bytes()
+    }
+
     pub fn journal_segment_count(&self) -> usize {
         self.journal.segment_count()
     }
@@ -116,6 +131,13 @@ impl Volume {
     pub fn journal_active_segment_path(&self) -> Option<String> {
         self.journal
             .active_segment_index()
+            .map(layout::journal_segment)
+    }
+
+    /// Path of the first segment holding records newer than the checkpoint.
+    pub fn journal_first_uncheckpointed_segment_path(&self) -> Option<String> {
+        self.journal
+            .first_uncovered_segment_index(self.ck_state.checkpoint_sequence)
             .map(layout::journal_segment)
     }
 
@@ -127,11 +149,28 @@ impl Volume {
         self.overlay.bytes()
     }
 
+    /// True when no write has ever been acknowledged or applied: no
+    /// checkpoint, no journal records, no shard. Used by the attach layer to
+    /// decide whether binding a crypto identity to the volume is safe.
+    pub fn is_pristine(&self) -> bool {
+        self.ck_state.checkpoint_sequence == 0
+            && self.journal.durable_sequence() == 0
+            && self.journal.appended_sequence() == 0
+            && self.overlay.is_empty()
+            && self.store.shard_count() == 0
+    }
+
     /// Journal a ciphertext write; publish to the overlay on success.
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
-        let sequence = self.journal.append(unit, ciphertext)?;
+        let appended = self.journal.append(unit, ciphertext);
+        // An automatic roll inside `append` may have advanced the durable
+        // boundary (even when the append itself failed). Promote *before*
+        // publishing, so a just-durable previous version of this unit is
+        // captured rather than superseded.
+        self.overlay.promote(self.journal.durable_sequence());
+        let sequence = appended?;
         if fua {
             let durable = self.journal.sync()?;
             if durable < sequence {
@@ -171,6 +210,10 @@ impl Volume {
     /// `checkpoint_sequence <= durable_sequence` always.
     pub fn checkpoint(&mut self) -> Result<u64, CoreError> {
         let durable = self.journal.durable_sequence();
+        // Never rely on callers having promoted after the last boundary
+        // move: the checkpointable set is derived here, from the journal's
+        // own durable boundary.
+        self.overlay.promote(durable);
         if durable <= self.ck_state.checkpoint_sequence {
             // Nothing new is durable; still retire anything a previously
             // interrupted checkpoint applied but could not clean up.
@@ -178,10 +221,6 @@ impl Volume {
             return Ok(self.ck_state.checkpoint_sequence);
         }
         let items = self.overlay.collect_durable(durable);
-        if items.is_empty() {
-            // Nothing to apply, but the boundary may still advance so
-            // covered segments can be reclaimed.
-        }
 
         // 1. write main slots
         for (unit, version) in &items {

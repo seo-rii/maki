@@ -4,10 +4,19 @@
 //! `store` always overwrites the *stale* side, so a torn write can only
 //! destroy the copy being replaced; `load` selects the valid copy with the
 //! highest generation.
+//!
+//! Read classification: a side that is absent, empty, short, or fails its
+//! CRC/decode is an *invalid copy* (the other side is authoritative). Any
+//! other I/O failure — permissions, EIO, a device error — is reported as an
+//! error: it says nothing about the copy's validity, and treating it as
+//! "invalid" could silently select an older generation.
 
 use maki_backing::Backing;
 
 use crate::error::FormatError;
+
+/// Sanity cap on a metadata record file; larger is an invalid copy.
+const MAX_RECORD_SIZE: u64 = 1 << 30;
 
 pub trait AbRecord: Sized {
     fn generation(&self) -> u64;
@@ -29,21 +38,37 @@ impl AbStore {
         }
     }
 
-    fn read_side<T: AbRecord>(&self, backing: &dyn Backing, path: &str) -> Option<T> {
-        let file = backing.open(path, false).ok()?;
-        let len = file.len().ok()?;
-        if len == 0 || len > 1 << 30 {
-            return None;
+    /// One side: `Ok(None)` for an absent or invalid copy, `Err` for a hard
+    /// I/O failure.
+    fn read_side<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+        path: &str,
+    ) -> Result<Option<T>, FormatError> {
+        let file = match backing.open(path, false) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(FormatError::Io(e)),
+        };
+        let len = file.len()?;
+        if len == 0 || len > MAX_RECORD_SIZE {
+            return Ok(None);
         }
         let mut buf = vec![0u8; len as usize];
-        file.read_at(0, &mut buf).ok()?;
-        T::decode(&buf).ok()
+        match file.read_at(0, &mut buf) {
+            Ok(()) => {}
+            // The file shrank under us or is shorter than its size claims:
+            // a torn copy, not an I/O fault.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(FormatError::Io(e)),
+        }
+        Ok(T::decode(&buf).ok())
     }
 
-    /// Best valid copy, if any.
+    /// Best valid copy, if any. `Err` only for hard I/O failures.
     pub fn load<T: AbRecord>(&self, backing: &dyn Backing) -> Result<Option<T>, FormatError> {
-        let a = self.read_side::<T>(backing, &self.a);
-        let b = self.read_side::<T>(backing, &self.b);
+        let a = self.read_side::<T>(backing, &self.a)?;
+        let b = self.read_side::<T>(backing, &self.b)?;
         Ok(match (a, b) {
             (Some(a), Some(b)) => Some(if a.generation() >= b.generation() {
                 a
@@ -56,15 +81,21 @@ impl AbStore {
         })
     }
 
-    /// The side the *next* store will overwrite (the invalid or older one).
-    pub fn next_target_path(&self, backing: &dyn Backing) -> Result<&str, FormatError> {
+    fn generations(
+        &self,
+        backing: &dyn Backing,
+    ) -> Result<(Option<u64>, Option<u64>), FormatError> {
         let ga = self
-            .read_side::<RawGeneration>(backing, &self.a)
+            .read_side::<RawGeneration>(backing, &self.a)?
             .map(|r| r.generation);
         let gb = self
-            .read_side::<RawGeneration>(backing, &self.b)
+            .read_side::<RawGeneration>(backing, &self.b)?
             .map(|r| r.generation);
-        Ok(match (ga, gb) {
+        Ok((ga, gb))
+    }
+
+    fn target_for(&self, ga: Option<u64>, gb: Option<u64>) -> &str {
+        match (ga, gb) {
             (None, _) => &self.a,
             (_, None) => &self.b,
             (Some(ga), Some(gb)) => {
@@ -74,7 +105,13 @@ impl AbStore {
                     &self.b
                 }
             }
-        })
+        }
+    }
+
+    /// The side the *next* store will overwrite (the invalid or older one).
+    pub fn next_target_path(&self, backing: &dyn Backing) -> Result<&str, FormatError> {
+        let (ga, gb) = self.generations(backing)?;
+        Ok(self.target_for(ga, gb))
     }
 
     /// Bump the record's generation past both sides, write it to the stale
@@ -85,26 +122,11 @@ impl AbStore {
         backing: &dyn Backing,
         record: &mut T,
     ) -> Result<(), FormatError> {
-        let ga = self
-            .read_side::<RawGeneration>(backing, &self.a)
-            .map(|r| r.generation);
-        let gb = self
-            .read_side::<RawGeneration>(backing, &self.b)
-            .map(|r| r.generation);
+        let (ga, gb) = self.generations(backing)?;
         let max_existing = ga.into_iter().chain(gb).max().unwrap_or(0);
         record.set_generation(max_existing.max(record.generation()) + 1);
 
-        let target = match (ga, gb) {
-            (None, _) => &self.a,
-            (_, None) => &self.b,
-            (Some(ga), Some(gb)) => {
-                if ga <= gb {
-                    &self.a
-                } else {
-                    &self.b
-                }
-            }
-        };
+        let target = self.target_for(ga, gb);
         let bytes = record.encode();
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;

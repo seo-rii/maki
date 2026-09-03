@@ -784,8 +784,17 @@ LRU cache size
 ├── shard-catalog.b
 ├── data/
 ├── journal/
+│   ├── seg-<index>
+│   └── durable-mark
 └── checkpoint/
+    ├── state.a
+    └── state.b
 ```
+
+`checkpoint/state.{a,b}` are written at creation (sequence 0) and recovery
+requires a valid copy. `journal/durable-mark` records the fdatasync'd prefix of
+the active segment after every sync, as a never-fsync'd lower bound; recovery
+uses it to distinguish durable-body corruption from a torn tail.
 
 Maki MUST acquire an exclusive volume lock.
 

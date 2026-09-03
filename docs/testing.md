@@ -79,6 +79,7 @@ has a constant residue.
 | Transports | HTTP mapping/TLS/chaos, WebSocket reconnect/order/size, and gRPC status/metadata/size |
 | Cache and growth | Version matching, stale-read prevention, eviction, zeroization, shard creation, and crash recovery |
 | NBD adapter | Geometry, capability advertisement, read/write, panic boundary, parallel callbacks, and clean detach |
+| Review regressions | `review_storage.rs` (maki-core) and `review_format.rs` (maki-format): roll-vs-promotion ordering, allocation dirty-flag ordering, fail-closed recovery, durable mark, and A/B error classification; see the [remediation log](review-remediation.md) |
 
 ## Current qualification status
 

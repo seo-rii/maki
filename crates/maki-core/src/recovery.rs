@@ -2,15 +2,26 @@
 //!
 //! ```text
 //! acquire volume lock → select valid superblock → validate shard catalog
-//! → validate allocation metadata → scan journal → discard/truncate partial
-//! tail → rebuild overlay → READY
+//! → validate allocation metadata → load checkpoint state → scan journal
+//! → discard/truncate partial tail → rebuild overlay → READY
 //! ```
-//! (The provider self-test and crypto-compatibility verification are the
-//! attach layer's final step, on top of this.)
+//! (The provider self-test, crypto-compatibility verification and the key
+//! canary check are the attach layer's final steps, on top of this.)
 //!
-//! Scan policy: a torn tail is legal only in the *last* segment (older
-//! segments were fdatasync'd before their successor was created). Any other
-//! damage is `Corrupt` — attach is refused rather than risk silent loss.
+//! Scan policy — fail closed on anything that is not provably a crash
+//! artifact:
+//! - a torn tail is legal only in the *last* segment (older segments were
+//!   fdatasync'd before their successor was created), and only *after* the
+//!   prefix the writer's durable mark proves was fdatasync'd;
+//! - a final segment shorter than a header, or entirely zero-filled, is a
+//!   creation crash and is discarded; a *complete* but invalid header is
+//!   durable damage;
+//! - the surviving journal must bridge from `checkpoint_sequence + 1` and
+//!   be contiguous — a missing segment is never silently skipped;
+//! - a segment larger than the writer can ever produce is rejected before
+//!   it is read into memory;
+//! - metadata read errors other than "not found" are I/O errors, never
+//!   "invalid copy" (an initialized volume must have checkpoint state).
 
 use std::sync::Arc;
 
@@ -18,7 +29,8 @@ use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use maki_format::journal::{
-    scan_segment, JournalRecord, ScanOutcome, SegmentHeader, SEGMENT_HEADER_SIZE,
+    max_segment_file_size, scan_segment_bounded, DurableMark, JournalRecord, ScanOutcome,
+    SegmentHeader, DURABLE_MARK_SIZE, SEGMENT_HEADER_SIZE,
 };
 use maki_format::layout;
 use maki_format::superblock::Superblock;
@@ -53,7 +65,7 @@ pub struct Recovered {
     pub lock: Box<dyn VolumeLock>,
     pub superblock: Superblock,
     pub store: SlotStore,
-    pub checkpoint_sequence: u64,
+    pub checkpoint_state: CheckpointState,
     pub durable_sequence: u64,
     pub next_segment_index: u64,
     pub segments: Vec<SegmentInfo>,
@@ -61,7 +73,9 @@ pub struct Recovered {
     pub replay: Vec<JournalRecord>,
 }
 
-pub fn recover(backing: &Arc<dyn Backing>) -> Result<Recovered, RecoveryError> {
+/// Recover a volume. `segment_size` is the writer's effective segment size;
+/// it bounds how large any segment file may legitimately be.
+pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovered, RecoveryError> {
     // 1. exclusive volume lock
     let lock = backing.try_lock(layout::VOLUME_LOCK).map_err(|e| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -79,11 +93,18 @@ pub fn recover(backing: &Arc<dyn Backing>) -> Result<Recovered, RecoveryError> {
     // 3./4. catalog + allocation metadata
     let store = SlotStore::open(backing.clone(), superblock.geometry.clone())?;
 
-    // checkpoint state
-    let ck_state = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B)
+    // checkpoint state: written at volume creation, so an initialized
+    // volume always has at least one valid copy. Losing both is damage —
+    // restarting at sequence 0 would replay stale journal history over
+    // newer slots.
+    let checkpoint_state = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B)
         .load::<CheckpointState>(backing.as_ref())?
-        .unwrap_or_default();
-    let checkpoint_sequence = ck_state.checkpoint_sequence;
+        .ok_or_else(|| RecoveryError::Corrupt("no valid checkpoint state copy".to_string()))?;
+    let checkpoint_sequence = checkpoint_state.checkpoint_sequence;
+
+    // The writer's fdatasync high-water mark (absent or invalid = no
+    // information; recovery then falls back to the heuristic scan).
+    let mark = load_durable_mark(backing)?;
 
     // 5./6. scan journal, truncate torn tail, verify continuity
     let mut names: Vec<(u64, String)> = backing
@@ -93,6 +114,7 @@ pub fn recover(backing: &Arc<dyn Backing>) -> Result<Recovered, RecoveryError> {
         .collect();
     names.sort();
 
+    let max_file_size = max_segment_file_size(segment_size);
     let mut segments: Vec<SegmentInfo> = Vec::new();
     let mut replay: Vec<JournalRecord> = Vec::new();
     let mut prev_last_seq: Option<u64> = None;
@@ -105,23 +127,51 @@ pub fn recover(backing: &Arc<dyn Backing>) -> Result<Recovered, RecoveryError> {
         let file = backing.open(&path, false)?;
         let len = file.len()?;
 
-        let header = if len < SEGMENT_HEADER_SIZE as u64 {
-            None
-        } else {
-            let mut hdr = vec![0u8; SEGMENT_HEADER_SIZE];
-            file.read_at(0, &mut hdr)?;
-            SegmentHeader::decode(&hdr).ok()
-        };
-        let Some(header) = header else {
-            if is_last {
-                // Crash during segment creation: discard.
-                backing.remove(&path)?;
-                backing.sync_dir(layout::JOURNAL_DIR)?;
+        if len > max_file_size {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment {name}: size {len} exceeds maximum {max_file_size}"
+            )));
+        }
+
+        // What the durable mark proves about *this* segment, if anything.
+        let marked_durable: Option<u64> = mark
+            .filter(|m| m.segment_index == index)
+            .map(|m| m.durable_size);
+        if let Some(durable) = marked_durable {
+            if durable > len {
+                return Err(RecoveryError::Corrupt(format!(
+                    "journal segment {name}: durable mark covers {durable} bytes but file has {len}"
+                )));
+            }
+        }
+
+        // Shorter than a header: the creation protocol never reached its
+        // fdatasync, so no record can have been acknowledged from it.
+        if len < SEGMENT_HEADER_SIZE as u64 {
+            if is_last && marked_durable.is_none() {
+                discard_segment(backing, &path)?;
                 continue;
             }
             return Err(RecoveryError::Corrupt(format!(
-                "journal segment {name}: invalid header in non-final segment"
+                "journal segment {name}: truncated header in non-final or synced segment"
             )));
+        }
+
+        let mut image = vec![0u8; len as usize];
+        file.read_at(0, &mut image)?;
+        let header = match SegmentHeader::decode(&image[..SEGMENT_HEADER_SIZE]) {
+            Ok(h) => h,
+            Err(e) => {
+                // A never-written (zero-filled) final segment is a creation
+                // crash; anything else with a full-sized header is damage.
+                if is_last && marked_durable.is_none() && image.iter().all(|b| *b == 0) {
+                    discard_segment(backing, &path)?;
+                    continue;
+                }
+                return Err(RecoveryError::Corrupt(format!(
+                    "journal segment {name}: invalid header ({e})"
+                )));
+            }
         };
         if header.volume_uuid != superblock.volume_uuid {
             return Err(RecoveryError::Corrupt(format!(
@@ -135,9 +185,24 @@ pub fn recover(backing: &Arc<dyn Backing>) -> Result<Recovered, RecoveryError> {
             )));
         }
 
-        let mut body = vec![0u8; (len - SEGMENT_HEADER_SIZE as u64) as usize];
-        file.read_at(SEGMENT_HEADER_SIZE as u64, &mut body)?;
-        let (records, outcome) = scan_segment(&body, header.base_sequence);
+        // The oldest surviving segment must connect to the checkpoint
+        // boundary; a later base means an uncheckpointed segment is gone.
+        if prev_last_seq.is_none() && header.base_sequence > checkpoint_sequence + 1 {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment {name}: base sequence {} does not bridge from checkpoint {}",
+                header.base_sequence, checkpoint_sequence
+            )));
+        }
+
+        let body = &image[SEGMENT_HEADER_SIZE..];
+        // Non-final segments were fdatasync'd in full before their
+        // successor was created; the final one is durable up to the mark.
+        let durable_len = if is_last {
+            marked_durable.map(|d| (d as usize).saturating_sub(SEGMENT_HEADER_SIZE))
+        } else {
+            Some(body.len())
+        };
+        let (records, outcome) = scan_segment_bounded(body, header.base_sequence, durable_len);
 
         match outcome {
             ScanOutcome::Clean => {}
@@ -197,10 +262,38 @@ pub fn recover(backing: &Arc<dyn Backing>) -> Result<Recovered, RecoveryError> {
         lock,
         superblock,
         store,
-        checkpoint_sequence,
+        checkpoint_state,
         durable_sequence,
         next_segment_index,
         segments,
         replay,
     })
+}
+
+/// The durable mark, if present and intact. Absent, empty, short, or
+/// CRC-invalid all mean "no information" (the mark is written without
+/// fsync and may be torn); only hard I/O errors are reported.
+fn load_durable_mark(backing: &Arc<dyn Backing>) -> Result<Option<DurableMark>, RecoveryError> {
+    let file = match backing.open(layout::JOURNAL_DURABLE_MARK, false) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(RecoveryError::Io(e)),
+    };
+    if file.len()? < DURABLE_MARK_SIZE as u64 {
+        return Ok(None);
+    }
+    let mut buf = [0u8; DURABLE_MARK_SIZE];
+    match file.read_at(0, &mut buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(RecoveryError::Io(e)),
+    }
+    Ok(DurableMark::decode(&buf).ok())
+}
+
+/// Remove a segment that never completed its creation protocol.
+fn discard_segment(backing: &Arc<dyn Backing>, path: &str) -> Result<(), RecoveryError> {
+    backing.remove(path)?;
+    backing.sync_dir(layout::JOURNAL_DIR)?;
+    Ok(())
 }
