@@ -73,7 +73,7 @@ pub fn class_of_code(code: tonic::Code) -> ErrorClass {
 
 // ---------------------------------------------------------------- provider
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GrpcProviderSpec {
     /// e.g. `http://crypto.internal:7000` (or https with TLS config).
     pub url: String,
@@ -85,6 +85,26 @@ pub struct GrpcProviderSpec {
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_message_bytes: usize,
+}
+
+/// Metadata values are resolved credentials: never printed (C-11).
+impl std::fmt::Debug for GrpcProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = self
+            .metadata
+            .iter()
+            .map(|(k, _)| format!("{k}: <redacted>"))
+            .collect();
+        f.debug_struct("GrpcProviderSpec")
+            .field("url", &self.url)
+            .field("encrypt_path", &self.encrypt_path)
+            .field("decrypt_path", &self.decrypt_path)
+            .field("metadata", &keys)
+            .field("capabilities", &self.capabilities)
+            .field("timeout", &self.timeout)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .finish()
+    }
 }
 
 pub struct GrpcCryptoProvider {

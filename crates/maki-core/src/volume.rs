@@ -67,7 +67,7 @@ impl Volume {
             replay,
         } = recover(&backing, segment_size)?;
 
-        let journal = JournalWriter::resume(
+        let mut journal = JournalWriter::resume(
             backing.clone(),
             superblock.volume_uuid,
             segment_size,
@@ -75,6 +75,7 @@ impl Volume {
             next_segment_index,
             segments,
         );
+        journal.allow_covered_holes_below(checkpoint_state.checkpoint_sequence);
 
         // Rebuild overlay: everything in the surviving journal is durable.
         let mut overlay = Overlay::new();
@@ -128,6 +129,13 @@ impl Volume {
 
     pub fn journal_segment_count(&self) -> usize {
         self.journal.segment_count()
+    }
+
+    /// Sealed segments the checkpoint already covers but that are still on
+    /// disk (reclaimable by any checkpoint, even one with nothing new).
+    pub fn journal_covered_segment_count(&self) -> usize {
+        self.journal
+            .covered_segment_count(self.ck_state.checkpoint_sequence)
     }
 
     pub fn journal_active_segment_path(&self) -> Option<String> {
@@ -244,6 +252,18 @@ impl Volume {
             self.overlay.retire(self.ck_state.checkpoint_sequence);
             if self.store.has_pending_repairs() {
                 self.store.persist_allocations()?;
+            }
+            // Segments the checkpoint already covers can still be on disk:
+            // their deletion failed (state was stored first) or was lost in
+            // a crash. Reclaim them, or the journal stays at its limit and
+            // every write fails with ENOSPC while nothing is "new" (K-02).
+            if self
+                .journal
+                .delete_covered(self.ck_state.checkpoint_sequence)?
+                > 0
+            {
+                fp("checkpoint.dirsync")?;
+                self.backing.sync_dir(layout::JOURNAL_DIR)?;
             }
             self.sanitize();
             return Ok(self.ck_state.checkpoint_sequence);

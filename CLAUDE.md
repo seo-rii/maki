@@ -56,6 +56,9 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - An A/B record falling back to its older generation is *normal* (torn write, later damage), and the older allocation map / shard catalog does not list the newest slots or shard. Slot headers are authoritative: probe them instead of reading "bit 0" as zeros ([remediation log](docs/review-remediation.md), S-01).
 - Debug builds run `check_invariants()` on the overlay, journal, and volume after every mutation; a sanitizer panic in a test is a real accounting bug, not a flaky test. Keep the checks O(1)-ish on large structures (they sample).
 - Journal segment indexes are never reused: the durable mark outlives the segment it names, so numbering continues above the mark even when a checkpoint has deleted every segment (S-03). Run the release gates (`-- --ignored`) after touching recovery; the default suite did not catch this.
+- A process restart is not a power loss: recovery reads back page-cache bytes that were never fdatasync'd. Everything recovery accepts must be fsync'd before the writer resumes, or a later FLUSH acknowledges data the next power loss removes (K-01). `CrashableBacking` models this: `drop` + `recover` is a restart, only `crash*` drops pending writes.
+- An A/B side that passes its CRC but does not decode as the record type is *invalid*, not "newest": choose the side to overwrite from the typed view (O-10).
+- Anything an HTTP endpoint can steer must not re-send plaintext: redirects are refused, never followed (C-01).
 
 ## External qualification
 

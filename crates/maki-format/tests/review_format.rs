@@ -215,7 +215,7 @@ fn ab_load_reports_hard_io_errors_instead_of_masking_them() {
         Err(FormatError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
         other => panic!("expected an I/O error, got {:?}", other.map(|_| ())),
     }
-    assert!(ab.next_target_path(&backing).is_err());
+    assert!(ab.next_target_path::<CheckpointState>(&backing).is_err());
     assert!(ab.store(&backing, &mut s).is_err());
     backing.set_fault_hook(None);
     assert_eq!(
@@ -360,4 +360,66 @@ fn key_canary_golden_vectors_frozen() {
         crc, expected,
         "canary record encoding changed! crc={crc:#010x}"
     );
+}
+
+// ---------- audit: geometry bounds the journal and allocation map impose ----------
+
+#[test]
+fn geometry_rejects_units_the_journal_or_allocation_map_cannot_hold() {
+    // One unit's ciphertext must fit a journal record (MAX_PAYLOAD).
+    let err =
+        Geometry::compute(4096, 32 << 20, 512, (32 << 20) + 288, 1 << 30, 64 << 30).unwrap_err();
+    assert!(err.to_string().contains("max_ciphertext_size"), "{err}");
+    // Exactly at the bound is fine.
+    Geometry::compute(4096, 4096, 512, MAX_PAYLOAD, 1 << 30, 64 << 30).unwrap();
+
+    // A shard's unit count must fit the allocation map's u32 index space.
+    let err = Geometry::compute(4096, 4096, 512, 4384, 1 << 30, 32 << 40).unwrap_err();
+    assert!(err.to_string().contains("units_per_shard"), "{err}");
+    Geometry::compute(4096, 4096, 512, 4384, 1 << 30, (u32::MAX as u64) * 4096).unwrap();
+}
+
+// ---------- audit: A/B store target chosen from the typed view ----------
+
+#[test]
+fn ab_store_overwrites_the_side_that_does_not_decode_as_the_record_type() {
+    use maki_format::ab::AbRecord;
+    use maki_format::catalog::ShardCatalog;
+
+    let backing = CrashableBacking::new();
+    let ab = AbStore::new("m.a", "m.b");
+    let mut s = CheckpointState::default();
+    s.checkpoint_sequence = 4;
+    ab.store(&backing, &mut s).unwrap(); // side A, generation 1
+    ab.store(&backing, &mut s).unwrap(); // side B, generation 2
+
+    // Side A now holds a CRC-valid record of *another* type with a higher
+    // raw generation: it passes the raw generation probe but is not a
+    // loadable CheckpointState.
+    let mut foreign = ShardCatalog::new();
+    foreign.set_generation(10);
+    let bytes = foreign.encode();
+    let file = backing.open("m.a", true).unwrap();
+    file.set_len(bytes.len() as u64).unwrap();
+    file.write_at(0, &bytes).unwrap();
+    file.sync_data().unwrap();
+    assert_eq!(
+        ab.side_generations::<CheckpointState>(&backing).unwrap(),
+        (None, Some(2))
+    );
+    assert_eq!(
+        ab.next_target_path::<CheckpointState>(&backing).unwrap(),
+        "m.a",
+        "the undecodable side is the one to overwrite"
+    );
+
+    // The store must overwrite A (invalid for this type), never B (the
+    // only loadable copy), and still move past every raw generation.
+    ab.store(&backing, &mut s).unwrap();
+    assert_eq!(
+        ab.side_generations::<CheckpointState>(&backing).unwrap(),
+        (Some(11), Some(2))
+    );
+    let loaded = ab.load::<CheckpointState>(&backing).unwrap().unwrap();
+    assert_eq!((loaded.generation(), loaded.checkpoint_sequence), (11, 4));
 }

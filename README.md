@@ -39,7 +39,8 @@ Maki is designed around four constraints:
 | Real database and vendor-provider workloads | SQLite smoke passed; broader qualification open |
 | QEMU and bare-metal power-loss testing | Not qualified |
 | 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
-| 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; three findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark refusing attach) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
+| 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; five findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark, S-04/S-05 recovery under out-of-order sector persistence) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
+| 2026-09-03 second audit (core, crypto, operations) | 27 confirmed findings fixed with regression tests, among them recovery accepting never-synced page-cache bytes after a process restart, HTTP redirects re-sending plaintext, the root helper following symlinks in the mount root, and detach disconnecting the wrong NBD device; see the [remediation log](docs/review-remediation.md#second-audit-2026-09-03-core-crypto-layer-operational-layers) |
 
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.

@@ -156,7 +156,15 @@ Remote providers sit behind a batch scheduler: concurrent requests are
 coalesced into bounded provider calls (targets, maxima, and a maximum wait from
 configuration), whole requests are never split, and each lane's pending work is
 bounded by count and bytes so a slow provider applies backpressure instead of
-growing memory. Local providers are called directly.
+growing memory. Each lane keeps several batches in flight (bounded by
+`limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
+requests behind it. Local providers are called directly.
+
+The dispatcher validates quarantined endpoints in background tasks, never on
+the request path; an RPC abandoned at the operation deadline releases its
+inflight slot and is not charged to the endpoint's circuit breaker; and the
+HTTP transport never follows a redirect (a 3xx fails the endpoint over rather
+than re-sending plaintext to a server-chosen URL).
 
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-

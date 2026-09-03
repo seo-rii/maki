@@ -275,8 +275,7 @@ impl CrashableBacking {
                             .filter(|_| rng.random_bool(0.5))
                             .collect();
                         for p in kept {
-                            if let (Some(gran), Pend::Write { offset, data: src }) = (tearing, p)
-                            {
+                            if let (Some(gran), Pend::Write { offset, data: src }) = (tearing, p) {
                                 if rng.random_bool(0.3) {
                                     apply_torn(&mut data, *offset, src, gran, rng);
                                     continue;

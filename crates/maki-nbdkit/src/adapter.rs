@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use maki_core::engine::Engine;
 use maki_core::CoreError;
+use maki_crypto::SecretBuffer;
 
 use crate::daemon;
 
@@ -215,15 +216,19 @@ impl NbdAdapter {
 
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<(), AdapterError> {
         let len = buf.len();
+        // Plaintext stays in zeroizing buffers until it is copied into the
+        // caller's (nbdkit's) buffer (SPEC §36).
         let data =
-            self.run(move |engine| Box::pin(async move { engine.read(offset, len).await }))?;
-        buf.copy_from_slice(&data);
+            self.run(move |engine| Box::pin(async move { engine.read_secret(offset, len).await }))?;
+        buf.copy_from_slice(data.expose());
         Ok(())
     }
 
     pub fn pwrite(&self, data: &[u8], offset: u64, fua: bool) -> Result<(), AdapterError> {
-        let owned = data.to_vec();
-        self.run(move |engine| Box::pin(async move { engine.write(offset, &owned, fua).await }))
+        let owned = SecretBuffer::from_slice(data);
+        self.run(move |engine| {
+            Box::pin(async move { engine.write(offset, owned.expose(), fua).await })
+        })
     }
 
     pub fn flush(&self) -> Result<(), AdapterError> {

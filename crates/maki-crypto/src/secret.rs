@@ -137,10 +137,15 @@ impl SecretBuffer {
 
 impl Drop for SecretBuffer {
     fn drop(&mut self) {
-        self.data.zeroize();
+        // Unlock *before* zeroizing: `Vec::zeroize` clears the vector, so
+        // an unlock afterwards would see an empty range and every dropped
+        // buffer would stay pinned until `RLIMIT_MEMLOCK` made all later
+        // locks fail (C-02).
         if self.locked {
             unlock_pages(&self.data);
+            self.locked = false;
         }
+        self.data.zeroize();
     }
 }
 

@@ -124,34 +124,59 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
     }
 }
 
-/// Credential router for header, metadata and TLS-key secrets (SPEC 9): a
-/// path-like name is read as a file (the `file` source), otherwise the systemd
-/// credentials directory is tried first and environment variables are the
-/// development fallback.
-struct RoutedKeySource;
+/// Credential router for header, metadata and TLS-key secrets (SPEC 9).
+/// Every credential is loaded from exactly the source its reference
+/// declares — `credential` (systemd credentials directory, failing closed
+/// when it is unset), `file`, or `env` — never from a fallback (O-06: a
+/// production daemon must not attach on a stray environment variable).
+struct RoutedKeySource {
+    /// credential name -> declared source
+    sources: std::collections::HashMap<String, String>,
+}
+
+impl RoutedKeySource {
+    fn from_config(config: &VolumeConfig) -> Self {
+        Self {
+            sources: config
+                .credential_refs()
+                .into_iter()
+                .map(|c| (c.name.clone(), c.source.clone()))
+                .collect(),
+        }
+    }
+}
 
 impl KeySource for RoutedKeySource {
     fn load(&self, name: &str) -> Result<maki_crypto::SecretBuffer, maki_crypto::CryptoError> {
-        if name.contains(['/', '\\']) {
-            let path = std::path::Path::new(name);
-            let dir = path.parent().unwrap_or(std::path::Path::new("."));
-            let file = path
-                .file_name()
+        let fatal = |m: String| maki_crypto::CryptoError::ProviderFatal(m);
+        let Some(source) = self.sources.get(name) else {
+            return Err(fatal(format!(
+                "credential {name:?} is not declared in the configuration"
+            )));
+        };
+        match source.as_str() {
+            "env" => EnvKeySource.load(name),
+            "file" => {
+                let path = std::path::Path::new(name);
+                let dir = path.parent().unwrap_or(std::path::Path::new("."));
+                let file = path
+                    .file_name()
+                    .ok_or_else(|| fatal(format!("credential path {name:?} has no file name")))?
+                    .to_string_lossy()
+                    .into_owned();
+                FileKeySource::new(dir).load(&file)
+            }
+            "credential" => systemd_credential_source()
                 .ok_or_else(|| {
-                    maki_crypto::CryptoError::ProviderFatal(format!(
-                        "credential path {name:?} has no file name"
+                    fatal(format!(
+                        "credential {name:?}: CREDENTIALS_DIRECTORY not set, failing closed"
                     ))
                 })?
-                .to_string_lossy()
-                .into_owned();
-            return FileKeySource::new(dir).load(&file);
+                .load(name),
+            other => Err(fatal(format!(
+                "credential {name:?}: unsupported source {other:?}"
+            ))),
         }
-        if let Some(source) = systemd_credential_source() {
-            if let Ok(secret) = source.load(name) {
-                return Ok(secret);
-            }
-        }
-        EnvKeySource.load(name)
     }
 }
 
@@ -176,7 +201,7 @@ async fn remote_http_provider(
         let provider = maki_crypto_http::HttpCryptoProvider::from_config(
             config,
             &endpoint.url,
-            &RoutedKeySource,
+            &RoutedKeySource::from_config(config),
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
@@ -256,7 +281,10 @@ async fn remote_grpc_provider(
     }
     let mut metadata = Vec::new();
     for (name, value) in &grpc.metadata {
-        metadata.push((name.clone(), resolve_metadata_value(value)?));
+        metadata.push((
+            name.clone(),
+            resolve_metadata_value(&RoutedKeySource::from_config(config), value)?,
+        ));
     }
     let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     for endpoint in &grpc.endpoint {
@@ -325,11 +353,14 @@ fn capabilities_from_config(
 
 /// Resolve a metadata value: literal as-is (validation already rejected
 /// literals for sensitive keys, SPEC §9), credential via the key router.
-fn resolve_metadata_value(value: &maki_format::config::HeaderValue) -> Result<String, DaemonError> {
+fn resolve_metadata_value(
+    keys: &RoutedKeySource,
+    value: &maki_format::config::HeaderValue,
+) -> Result<String, DaemonError> {
     match value {
         maki_format::config::HeaderValue::Literal(v) => Ok(v.clone()),
         maki_format::config::HeaderValue::Credential(cred) => {
-            let secret = RoutedKeySource.load(&cred.name)?;
+            let secret = keys.load(&cred.name)?;
             let text = String::from_utf8(secret.expose().to_vec()).map_err(|_| {
                 DaemonError::Unsupported("credential is not valid UTF-8".to_string())
             })?;
@@ -595,6 +626,7 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
         max_pending_items: limits.max_pending_crypto_items,
         max_pending_plaintext_bytes: limits.max_pending_crypto_bytes.0,
         max_pending_ciphertext_bytes: limits.max_ciphertext_bytes.0,
+        max_inflight_batches: limits.max_crypto_inflight_batches,
     }
 }
 

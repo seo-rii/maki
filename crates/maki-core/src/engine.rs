@@ -23,7 +23,7 @@
 //!   successful checkpoint clears.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -180,23 +180,38 @@ impl std::fmt::Debug for EngineOptions {
 
 struct UnitLocks {
     locks: parking_lot::Mutex<HashMap<u64, Arc<AsyncMutex<()>>>>,
+    /// Table size above which the next idle-entry sweep runs.
+    sweep_threshold: AtomicUsize,
+    /// Sweeps performed (observability for the amortization test).
+    sweeps: AtomicU64,
 }
 
 impl UnitLocks {
     fn new() -> Self {
         Self {
             locks: parking_lot::Mutex::new(HashMap::new()),
+            sweep_threshold: AtomicUsize::new(8192),
+            sweeps: AtomicU64::new(0),
         }
     }
 
     /// Lock a unit range in ascending order.
+    ///
+    /// Idle entries are swept out amortized: a sweep runs only once the
+    /// table has doubled since the last one (never below 8192 entries), so
+    /// a workload that *holds* many locks (large requests on small units,
+    /// many parallel callbacks) does not pay a full-table scan per unit
+    /// (K-04).
     async fn lock_range(&self, first: u64, last: u64) -> Vec<OwnedMutexGuard<()>> {
         let mut guards = Vec::with_capacity((last - first + 1) as usize);
         for unit in first..=last {
             let mutex = {
                 let mut map = self.locks.lock();
-                if map.len() > 8192 {
+                if map.len() > self.sweep_threshold.load(Ordering::Relaxed) {
                     map.retain(|_, m| Arc::strong_count(m) > 1);
+                    self.sweeps.fetch_add(1, Ordering::Relaxed);
+                    self.sweep_threshold
+                        .store(map.len().saturating_mul(2).max(8192), Ordering::Relaxed);
                 }
                 map.entry(unit)
                     .or_insert_with(|| Arc::new(AsyncMutex::new(())))
@@ -205,6 +220,28 @@ impl UnitLocks {
             guards.push(mutex.lock_owned().await);
         }
         guards
+    }
+}
+
+#[cfg(test)]
+mod unit_lock_tests {
+    use super::*;
+
+    /// Holding many locks must not turn every further acquisition into a
+    /// full-table sweep: sweeps stay logarithmic in the table size.
+    #[tokio::test]
+    async fn sweeps_are_amortized_while_many_locks_are_held() {
+        let locks = UnitLocks::new();
+        let _held = locks.lock_range(0, 8_999).await;
+        let before = locks.sweeps.load(Ordering::Relaxed);
+        let _more = locks.lock_range(9_000, 13_095).await;
+        let sweeps = locks.sweeps.load(Ordering::Relaxed) - before;
+        assert!(sweeps <= 2, "{sweeps} sweeps for 4096 acquisitions");
+        // Released entries are eventually reclaimed.
+        drop(_more);
+        drop(_held);
+        let _again = locks.lock_range(50_000, 60_000).await;
+        assert!(locks.locks.lock().len() <= 10_001 + 8192);
     }
 }
 
@@ -319,7 +356,8 @@ impl Engine {
         )
         .await?;
 
-        let provider = CheckedProvider::new(provider);
+        let provider =
+            CheckedProvider::pinned(provider, volume.superblock().geometry.crypto_unit_size);
         verify_key_canary(&volume, &provider, &context, caps.integrity.present()).await?;
 
         let (batch_max_items, batch_max_bytes) = if caps.batch.supported {
@@ -439,19 +477,34 @@ impl Engine {
             return Ok(HashMap::new());
         }
         let mut out = HashMap::with_capacity(cts.len());
+        let unit_size = self.inner.geometry.crypto_unit_size as usize;
         for range in self.batch_chunks(cts.len(), |i| cts[i].data.len()) {
             let pts = self
                 .inner
                 .provider
                 .decrypt_batch(&self.inner.context, &cts[range])
                 .await?;
-            out.extend(pts.into_iter().map(|pt| (pt.unit_index, pt.data)));
+            for pt in pts {
+                // The provider contract pins plaintext to *this volume's*
+                // unit size, not merely to a size the provider supports:
+                // anything else would be sliced out of range or silently
+                // re-encrypted at the wrong length (K-08).
+                if pt.data.len() != unit_size {
+                    return Err(CoreError::Crypto(CryptoError::Contract(format!(
+                        "decrypt of unit {} returned {} bytes, volume unit size is {unit_size}",
+                        pt.unit_index,
+                        pt.data.len()
+                    ))));
+                }
+                out.insert(pt.unit_index, pt.data);
+            }
         }
         Ok(out)
     }
 
-    /// Read `len` bytes at `offset`.
-    pub async fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, CoreError> {
+    /// Read `len` bytes at `offset` into a zeroizing buffer (the data
+    /// path; SPEC §36).
+    pub async fn read_secret(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
         let _admission = self.inner.admission.acquire(len as u64).await;
         let unit_size = self.unit_size();
@@ -489,20 +542,30 @@ impl Engine {
             }
         }
 
-        let mut out = Vec::with_capacity(len);
+        let mut out = SecretBuffer::zeroed(len);
+        let mut cursor = 0usize;
         for unit in first..=last {
             let unit_start = unit * unit_size;
-            let from = offset.max(unit_start) - unit_start;
-            let to = (offset + len as u64).min(unit_start + unit_size) - unit_start;
+            let from = (offset.max(unit_start) - unit_start) as usize;
+            let to = ((offset + len as u64).min(unit_start + unit_size) - unit_start) as usize;
+            let dst = &mut out.expose_mut()[cursor..cursor + (to - from)];
             if let Some(buf) = plain.remove(&unit) {
-                out.extend_from_slice(&buf.expose()[from as usize..to as usize]);
+                dst.copy_from_slice(&buf.expose()[from..to]);
             } else if let Some(buf) = cached.remove(&unit) {
-                out.extend_from_slice(&buf.expose()[from as usize..to as usize]);
-            } else {
-                out.extend(std::iter::repeat_n(0u8, (to - from) as usize));
+                dst.copy_from_slice(&buf.expose()[from..to]);
             }
+            cursor += to - from;
         }
         Ok(out)
+    }
+
+    /// Read `len` bytes at `offset`. Convenience for tests and tools: the
+    /// returned vector is not zeroized on drop; the daemon uses
+    /// [`Engine::read_secret`].
+    pub async fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, CoreError> {
+        self.read_secret(offset, len)
+            .await
+            .map(SecretBuffer::into_vec)
     }
 
     /// Write `data` at `offset`; with `fua`, all of the request's records are
@@ -570,6 +633,20 @@ impl Engine {
                     .encrypt_batch(&self.inner.context, &items[range])
                     .await?,
             );
+        }
+        // A ciphertext the volume cannot hold must never reach the journal:
+        // the slot store would refuse it at every checkpoint and recovery
+        // classifies an oversized record as corruption (K-06/K-08).
+        let max_ct = self.inner.geometry.max_ciphertext_size as usize;
+        if let Some(bad) = cts
+            .iter()
+            .find(|c| c.data.is_empty() || c.data.len() > max_ct)
+        {
+            return Err(CoreError::Crypto(CryptoError::Contract(format!(
+                "encrypt of unit {} returned {} bytes, volume maximum is {max_ct}",
+                bad.unit_index,
+                bad.data.len()
+            ))));
         }
         let incoming: u64 = cts.iter().map(|c| 32 + c.data.len() as u64).sum();
 
@@ -650,9 +727,16 @@ impl Engine {
     }
 
     /// Hot-resize the plaintext read cache (SPEC §20; 0 disables).
-    pub fn resize_cache(&self, max_bytes: u64) {
-        if let Some(cache) = &self.inner.cache {
-            cache.set_max_bytes(max_bytes);
+    /// Resize the plaintext read cache. Returns `false` when the engine runs
+    /// without a cache (`cache.mode = off`): there is nothing to apply, and
+    /// a caller must not report the change as applied (O-09).
+    pub fn resize_cache(&self, max_bytes: u64) -> bool {
+        match &self.inner.cache {
+            Some(cache) => {
+                cache.set_max_bytes(max_bytes);
+                true
+            }
+            None => false,
         }
     }
 
@@ -725,17 +809,18 @@ impl EngineInner {
     /// the backing is low on space, or the interval elapsed with work
     /// pending (unsynced records are synced first so they can be applied).
     async fn worker_pass(&self) {
-        let (total, appended, checkpointed, durable) = {
+        let (total, appended, checkpointed, durable, covered) = {
             let v = self.volume.read().await;
             (
                 v.journal_total_bytes(),
                 v.journal_appended_sequence(),
                 v.checkpoint_sequence(),
                 v.journal_durable_sequence(),
+                v.journal_covered_segment_count(),
             )
         };
-        if appended <= checkpointed {
-            return; // nothing to apply
+        if appended <= checkpointed && covered == 0 {
+            return; // nothing to apply and nothing to reclaim
         }
         let by_size = total >= self.policy.journal_high_watermark_bytes;
         let by_space = self.policy.low_space_checkpoint_bytes > 0

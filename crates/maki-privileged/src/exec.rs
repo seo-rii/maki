@@ -144,10 +144,28 @@ fn blkid_uuid(device: &str) -> Option<String> {
     }
 }
 
-fn read_sentinel(mountpoint: &str) -> Option<String> {
+/// Longest sentinel the helper reads: a UUID plus slack. Anything larger
+/// is not a sentinel (and must not be read into memory as root).
+pub const SENTINEL_MAX_BYTES: u64 = 4096;
+
+/// Read the sentinel under `mountpoint`. The mount root belongs to the
+/// workload, so as root we never follow a symlink there (`O_NOFOLLOW`),
+/// never open anything but a regular file, and never read more than
+/// [`SENTINEL_MAX_BYTES`] (O-01).
+pub fn read_sentinel(mountpoint: &str) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = Path::new(mountpoint).join(SENTINEL_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > SENTINEL_MAX_BYTES {
+        return None;
+    }
     let mut text = String::new();
-    File::open(Path::new(mountpoint).join(SENTINEL_FILE))
-        .ok()?
+    file.take(SENTINEL_MAX_BYTES)
         .read_to_string(&mut text)
         .ok()?;
     let value = text.trim().to_string();
@@ -188,19 +206,36 @@ fn write_sentinel(
 }
 
 /// Write, fsync, read back and remove a probe file under the mountpoint.
-fn rw_probe(mountpoint: &str) -> bool {
-    let path = Path::new(mountpoint).join(".maki-rw-probe");
+///
+/// The mount root is the workload's: the probe is created with
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` under an unpredictable name and read back
+/// through the same descriptor, so a planted symlink, FIFO or file of that
+/// name can neither be followed, truncated as root, nor block the helper
+/// (O-01).
+pub fn rw_probe(mountpoint: &str) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let nonce = {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}{:x}", std::process::id(), t)
+    };
+    let path = Path::new(mountpoint).join(format!(".maki-rw-probe.{nonce}"));
     let result = (|| -> io::Result<bool> {
         let payload = format!("maki-rw-probe {}", std::process::id());
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)?;
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
-        drop(file);
-        let back = std::fs::read_to_string(&path)?;
+        let mut back = String::new();
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.take(SENTINEL_MAX_BYTES).read_to_string(&mut back)?;
         Ok(back == payload)
     })();
     let _ = std::fs::remove_file(&path);
@@ -295,10 +330,24 @@ fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
 /// returned with the rollback outcome.
 pub fn execute(plan: &Plan) -> Result<(), ExecError> {
     let mut plan = plan.clone();
-    let needs_lock = plan
-        .steps
-        .iter()
-        .any(|s| matches!(s, PlannedStep::NbdConnect { .. }));
+    if plan.unresolved_disconnect() {
+        return Err(ExecError::Step {
+            step: "nbd-disconnect".to_string(),
+            message: format!(
+                "the NBD device is on auto and no device was recorded at attach ({}); \
+                 refusing to guess which device to disconnect (pass --nbd-device)",
+                crate::plan::bound_device_record_path(&plan.volume).display()
+            ),
+        });
+    }
+    // Connecting *and* disconnecting serialize under the attach lock: a
+    // detach racing another volume's attach must not touch its device.
+    let needs_lock = plan.steps.iter().any(|s| {
+        matches!(
+            s,
+            PlannedStep::NbdConnect { .. } | PlannedStep::NbdDisconnect { .. }
+        )
+    });
     let _lock = if needs_lock {
         Some(lock_attach()?)
     } else {
@@ -312,10 +361,48 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
         plan.bind_device(&device);
         println!("# bound NBD device: {device}");
     }
+    // Remember the device an attach binds, for the detach that follows
+    // (O-02). Written before connecting so a crash between the two leaves
+    // at worst a stale record naming an unconnected device.
+    let connects = plan.steps.iter().find_map(|s| match s {
+        PlannedStep::NbdConnect { device, .. } => Some(device.clone()),
+        _ => None,
+    });
+    if let Some(device) = &connects {
+        let record = crate::plan::bound_device_record_path(&plan.volume);
+        if let Some(dir) = record.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&record, format!("{device}\n"))?;
+    }
 
     let mut executed: Vec<PlannedStep> = Vec::new();
     for step in &plan.steps {
-        if let Err(error) = run_step(step) {
+        // `nbd-client` connecting and the device becoming ready are two
+        // outcomes: once the connect succeeded the step counts as executed
+        // even if readiness times out, so the rollback disconnects it
+        // instead of leaking a connected device (O-07).
+        let result = match step {
+            PlannedStep::NbdConnect {
+                socket,
+                device,
+                block_size,
+            } => {
+                let bs = block_size.to_string();
+                match run(step, "nbd-client", &["-unix", socket, device, "-b", &bs]) {
+                    Ok(()) => {
+                        executed.push(step.clone());
+                        match wait_nbd_ready(step, device) {
+                            Ok(()) => continue,
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            other => run_step(other),
+        };
+        if let Err(error) = result {
             let rollback = rollback_steps(&executed);
             let mut failed = 0usize;
             for compensating in &rollback {
@@ -331,6 +418,16 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
             });
         }
         executed.push(step.clone());
+    }
+    // A completed detach retires the record; a failed one keeps it so the
+    // next attempt still knows the device.
+    if plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, PlannedStep::NbdDisconnect { .. }))
+        && connects.is_none()
+    {
+        let _ = std::fs::remove_file(crate::plan::bound_device_record_path(&plan.volume));
     }
     Ok(())
 }

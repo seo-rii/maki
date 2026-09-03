@@ -113,6 +113,12 @@ intended for development.
 
 The data-plane service receives credentials through `LoadCredential`. The
 privileged attach helper has no crypto dependency and no credential directive.
+
+Every credential reference is loaded from exactly the `source` it declares:
+`credential` reads `$CREDENTIALS_DIRECTORY/<name>` and fails closed when the
+directory is unset, `file` reads the named file, `env` reads
+`MAKI_CREDENTIAL_<NAME>`. There is no fallback between sources, so a production
+daemon cannot attach on a stray environment variable.
 Do not place plaintext keys or bearer tokens in TOML, command lines, logs, or
 operation plans.
 
@@ -169,7 +175,11 @@ requests are coalesced into one provider call when their items fit
 `crypto.batch.max_items` / `max_bytes`; a batch is dispatched as soon as
 `target_items` or `target_bytes` is reached, and at the latest `max_wait`
 after its first item arrived. A request's items are never split and keep
-their order. `limits.max_pending_crypto_items` bounds queued items per lane,
+their order. Each lane keeps up to `limits.max_crypto_inflight_batches`
+batches in flight at once (the dispatcher's own limits bound what reaches the
+endpoints), so one slow batch does not serialize the requests behind it.
+`limits.max_pending_crypto_items` bounds queued items per lane (one permit per
+item, so a request of eight items counts as eight),
 `limits.max_pending_crypto_bytes` bounds queued plaintext (encrypt lane) and
 `limits.max_ciphertext_bytes` bounds queued ciphertext (decrypt lane); a full
 queue applies backpressure. Local providers are called directly, since

@@ -123,15 +123,24 @@ impl AbStore {
         Ok((a, b))
     }
 
-    /// The side the *next* store will overwrite (the invalid or older one).
-    pub fn next_target_path(&self, backing: &dyn Backing) -> Result<&str, FormatError> {
-        let (ga, gb) = self.generations(backing)?;
+    /// The side the *next* store will overwrite: a side that does not hold
+    /// a valid record *of type `T`* first (whatever its raw generation says),
+    /// otherwise the older one. Choosing by raw generation alone would let a
+    /// CRC-valid but undecodable side (wrong type, newer version, damaged
+    /// payload) count as "newest" and the only loadable copy be overwritten.
+    pub fn next_target_path<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+    ) -> Result<&str, FormatError> {
+        let (ga, gb) = self.side_generations::<T>(backing)?;
         Ok(self.target_for(ga, gb))
     }
 
-    /// Bump the record's generation past both sides, write it to the stale
-    /// side, and fdatasync it. (Directory durability of freshly created
-    /// files is the caller's responsibility — see `init::create_volume`.)
+    /// Bump the record's generation past both sides (raw generations, so a
+    /// foreign or newer-version record never outranks the new one), write it
+    /// to the side `next_target_path` names, and fdatasync it. (Directory
+    /// durability of freshly created files is the caller's responsibility —
+    /// see `init::create_volume`.)
     pub fn store<T: AbRecord>(
         &self,
         backing: &dyn Backing,
@@ -141,7 +150,8 @@ impl AbStore {
         let max_existing = ga.into_iter().chain(gb).max().unwrap_or(0);
         record.set_generation(max_existing.max(record.generation()) + 1);
 
-        let target = self.target_for(ga, gb);
+        let (ta, tb) = self.side_generations::<T>(backing)?;
+        let target = self.target_for(ta, tb);
         let bytes = record.encode();
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;

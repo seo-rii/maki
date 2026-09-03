@@ -60,6 +60,28 @@ impl DualSemaphore {
         }
     }
 
+    /// Acquire `items` item slots plus `bytes` of byte budget. An oversized
+    /// request is capped to the whole budget, like bytes.
+    pub async fn acquire_n(&self, items: u32, bytes: u64) -> DualPermit {
+        let count = (items as usize).clamp(1, self.max_items) as u32;
+        let items = self
+            .items
+            .clone()
+            .acquire_many_owned(count)
+            .await
+            .expect("semaphore closed");
+        let bytes = self
+            .bytes
+            .clone()
+            .acquire_many_owned(self.byte_permits(bytes))
+            .await
+            .expect("semaphore closed");
+        DualPermit {
+            _items: items,
+            _bytes: bytes,
+        }
+    }
+
     /// Non-blocking acquire. Returns `None` when capacity is unavailable or
     /// the request exceeds the total byte budget.
     pub fn try_acquire(&self, bytes: u64) -> Option<DualPermit> {

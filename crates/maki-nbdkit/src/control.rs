@@ -117,9 +117,17 @@ impl ControlBackend for EngineControlBackend {
             // Hot-reloadable and actually applied (SPEC §20).
             "cache" => {
                 let Some(max_bytes) = payload.get("max_bytes").and_then(|v| v.as_u64()) else {
-                    return Err("reload cache: payload.max_bytes (integer) is required".to_string());
+                    return Err("reload cache: payload.max_bytes (integer) is required \
+                                (`maki reload <config> cache --max-bytes N`)"
+                        .to_string());
                 };
-                self.engine.resize_cache(max_bytes);
+                if !self.engine.resize_cache(max_bytes) {
+                    return Err(
+                        "reload cache: this daemon runs with cache.mode = off, so there is no \
+                         cache to resize; the change was NOT applied (restart with cache.mode = read)"
+                            .to_string(),
+                    );
+                }
                 Ok(())
             }
             // Listed as hot-reloadable by SPEC §20 but not applied by this

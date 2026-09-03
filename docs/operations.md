@@ -141,8 +141,11 @@ line limit. The `maki` CLI exposes the supported operations:
 maki status /etc/maki/volumes/example.toml
 maki metrics /etc/maki/volumes/example.toml
 maki checkpoint /etc/maki/volumes/example.toml
-maki reload /etc/maki/volumes/example.toml cache
+maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 ```
+
+`reload cache` needs the new size; it is refused (not silently accepted) on a
+daemon running with `cache.mode = "off"`.
 
 Attach, detach, mount, unmount, NBD, and growth verbs are deliberately absent
 from the control socket.
@@ -177,10 +180,19 @@ Execution (Linux, root) then:
    `init_sentinel = true`, first boot only) creates `<mountpoint>/.maki-sentinel`
    holding the volume UUID, never overwriting a different value;
 4. verifies the mount identity from `/proc/self/mountinfo`, `blkid`, sysfs NBD
-   state, the sentinel, and a read/write probe;
+   state, the sentinel, and a read/write probe (the mount root belongs to the
+   workload: the sentinel is opened without following symlinks and read to a
+   4 KiB bound, the probe file is created exclusively under an unpredictable
+   name, so nothing planted there can make root overwrite or block);
 5. on any failure rolls back the executed steps in reverse (umount, VG
-   deactivate, NBD disconnect) and exits non-zero, reporting rollback steps
+   deactivate, NBD disconnect — a device that connected but never became
+   ready is disconnected too) and exits non-zero, reporting rollback steps
    that themselves failed.
+
+The device bound at attach is recorded in `/run/maki/attach/<volume>.nbd`.
+`maki-attach detach` uses that record when the attach configuration leaves
+`nbd_device` on auto, takes the same attach lock, and refuses to run when no
+device is recorded rather than guess (pass `--nbd-device` explicitly then).
 
 `maki-attach@<volume>.service` therefore stays active only after the identity
 check passed. Services that need the secure mount must declare

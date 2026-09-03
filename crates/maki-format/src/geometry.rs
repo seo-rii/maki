@@ -62,6 +62,16 @@ impl Geometry {
                 "max_ciphertext_size {max_ciphertext_size} < crypto_unit_size {crypto_unit_size}"
             )));
         }
+        // One unit's ciphertext is one journal record; the scanner refuses
+        // records above its payload bound, so such a volume would accept
+        // writes and then be unattachable.
+        if max_ciphertext_size > crate::journal::MAX_PAYLOAD {
+            return Err(FormatError::Invalid(format!(
+                "max_ciphertext_size {max_ciphertext_size} exceeds the journal record bound {} \
+                 (crypto_unit_size too large)",
+                crate::journal::MAX_PAYLOAD
+            )));
+        }
         if max_virtual_size == 0 || !max_virtual_size.is_multiple_of(crypto_unit_size as u64) {
             return Err(FormatError::Invalid(format!(
                 "max_virtual_size {max_virtual_size} must be a positive multiple of crypto_unit_size"
@@ -89,11 +99,20 @@ impl Geometry {
             shard_logical_size,
         };
 
-        // A full shard's physical byte size must be representable.
+        // A full shard's physical byte size must be representable, and its
+        // unit count must fit the allocation map's index space.
         geometry
             .units_per_shard()
             .checked_mul(slot_size)
             .ok_or_else(|| FormatError::Overflow("shard physical size".to_string()))?;
+        if geometry.units_per_shard() > u32::MAX as u64 {
+            return Err(FormatError::Invalid(format!(
+                "units_per_shard {} exceeds the allocation map limit {} (shard_logical_size too \
+                 large for crypto_unit_size {crypto_unit_size})",
+                geometry.units_per_shard(),
+                u32::MAX
+            )));
+        }
 
         Ok(geometry)
     }

@@ -133,7 +133,7 @@ pub struct RespSpec {
     pub item_index_path: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpSpec {
     pub method: String,
     pub path: String,
@@ -144,12 +144,49 @@ pub struct OpSpec {
     pub response: RespSpec,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Header and query *values* are resolved credentials: never printed
+/// (C-11). Names stay visible for diagnostics.
+impl std::fmt::Debug for OpSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |pairs: &[(String, String)]| -> Vec<String> {
+            pairs
+                .iter()
+                .map(|(k, _)| format!("{k}: <redacted>"))
+                .collect()
+        };
+        f.debug_struct("OpSpec")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("headers", &redact(&self.headers))
+            .field("query", &redact(&self.query))
+            .field("body", &self.body)
+            .field("response", &self.response)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct TlsSpec {
     /// PEM CA bundle to trust (replaces nothing; added as a root).
     pub ca_pem: Option<Vec<u8>>,
     /// PEM client certificate + key for mTLS.
     pub identity_pem: Option<Vec<u8>>,
+}
+
+/// The identity PEM carries the client's private key: never printed.
+impl std::fmt::Debug for TlsSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsSpec")
+            .field(
+                "ca_pem",
+                &self.ca_pem.as_ref().map(|c| format!("{} bytes", c.len())),
+            )
+            .field(
+                "identity_pem",
+                &self.identity_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +267,12 @@ fn classify_status(status: reqwest::StatusCode) -> Option<CryptoError> {
     }
     let code = status.as_u16();
     Some(match code {
+        // A redirect is never followed (see `new`): the endpoint is
+        // misconfigured or hijacked, and a request must not be re-sent to
+        // a server-chosen URL. Fail over to another endpoint instead.
+        300..=399 => CryptoError::EndpointFatal(format!(
+            "HTTP {code}: redirects are refused (the request is never re-sent elsewhere)"
+        )),
         429 => CryptoError::Throttled(format!("HTTP {code}")),
         401 | 403 | 407 => CryptoError::EndpointFatal(format!("HTTP {code}")),
         408 => CryptoError::Retryable(format!("HTTP {code}")),
@@ -240,8 +283,13 @@ fn classify_status(status: reqwest::StatusCode) -> Option<CryptoError> {
 
 impl HttpCryptoProvider {
     pub fn new(spec: HttpProviderSpec) -> Result<Self, CryptoError> {
+        // Never follow redirects: reqwest would replay the body (plaintext
+        // on encrypt) to whatever `Location` the server names — possibly a
+        // different host, possibly over plaintext HTTP — and turn a POST
+        // into a GET on 301/302/303 (C-01, SPEC §18 no transport resend).
         let mut builder = reqwest::Client::builder()
             .timeout(spec.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .use_rustls_tls();
         if let Some(tls) = &spec.tls {
             if let Some(ca) = &tls.ca_pem {

@@ -598,13 +598,16 @@ fn lost_or_stale_mark_never_turns_a_torn_middle_record_into_corruption() {
         // Record 3 persisted intact, record 2 only partially.
         let f = backing.open(&seg, false).unwrap();
         let off = 48 + (32 + CT_LEN) as u64 + 100;
-        f.write_at(off, &vec![0xAA; 200]).unwrap();
+        f.write_at(off, &[0xAA; 200]).unwrap();
         f.sync_data().unwrap();
 
         let vol = recover(&backing)
             .unwrap_or_else(|e| panic!("{mark_fate}: healthy crash state refused: {e:?}"));
         assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(1), "{mark_fate}");
-        assert!(vol.read_ct(1).unwrap().is_none(), "{mark_fate}: torn record must not be served");
+        assert!(
+            vol.read_ct(1).unwrap().is_none(),
+            "{mark_fate}: torn record must not be served"
+        );
         assert!(
             vol.read_ct(2).unwrap().is_none(),
             "{mark_fate}: an unsynced record after the tear goes with the tail"
@@ -630,7 +633,7 @@ fn zero_tail_of_final_segment_is_truncated_before_it_can_be_sealed() {
     drop(vol);
     // The crash persisted the file growth but none of record 2's sectors.
     let f = backing.open(&seg, false).unwrap();
-    f.write_at(48 + (32 + CT_LEN) as u64, &vec![0u8; 32 + CT_LEN])
+    f.write_at(48 + (32 + CT_LEN) as u64, &[0u8; 32 + CT_LEN])
         .unwrap();
     f.sync_data().unwrap();
 

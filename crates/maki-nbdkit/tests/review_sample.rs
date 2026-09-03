@@ -114,3 +114,26 @@ fn client_key_credential_is_appended_to_the_identity() {
         ),
     }
 }
+
+/// O-06: a credential declared with `source = "credential"` is loaded from
+/// the systemd credentials directory and nowhere else. With that directory
+/// unset, a stray `MAKI_CREDENTIAL_*` environment variable must not let the
+/// daemon attach.
+#[tokio::test]
+async fn credential_source_never_falls_back_to_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("vol").to_string_lossy().replace('\\', "/");
+    let config = parse_and_validate(&sample_with_root(&root)).unwrap();
+    std::env::remove_var("CREDENTIALS_DIRECTORY");
+    std::env::set_var("MAKI_CREDENTIAL_CRYPTO_TOKEN", "stray-development-token");
+    let err = maki_nbdkit::daemon::build_provider(&config)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .expect("attach must not proceed on an environment variable");
+    std::env::remove_var("MAKI_CREDENTIAL_CRYPTO_TOKEN");
+    assert!(
+        err.contains("CREDENTIALS_DIRECTORY") || err.contains("crypto-token"),
+        "{err}"
+    );
+}

@@ -136,6 +136,29 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
         }
     }
 
+    // 7. Everything the scan accepted is durable *from now on*. A process
+    //    restart (no power loss) hands recovery page-cache bytes that were
+    //    never fdatasync'd; the writer resumes with every segment sealed and
+    //    no active one, so no later barrier would ever sync them, a FLUSH
+    //    would acknowledge them anyway, and a successor segment would turn
+    //    their torn tail into "corruption" after a real power loss (S-06).
+    //    fsync every surviving segment and publish the mark for the last.
+    for seg in &scan.segments {
+        backing
+            .open(&layout::journal_segment(seg.index), false)?
+            .sync_data()?;
+    }
+    if let Some(last) = scan.segments.last() {
+        backing.sync_dir(layout::JOURNAL_DIR)?;
+        let mark = DurableMark {
+            segment_index: last.index,
+            durable_size: last.size,
+        };
+        let file = backing.open(layout::JOURNAL_DURABLE_MARK, true)?;
+        file.write_at(0, &mark.encode())?;
+        file.sync_data()?;
+    }
+
     Ok(Recovered {
         lock,
         superblock,
@@ -337,13 +360,22 @@ pub fn scan_journal(
             }
         }
 
-        // Cross-segment sequence continuity.
+        // Cross-segment sequence continuity. Segments fully covered by the
+        // checkpoint are deleted by it; a crash can lose some of those
+        // unlinks and not others, so a *covered* prefix may have holes.
+        // Only records above the checkpoint must be contiguous, and the
+        // first uncovered segment must bridge the checkpoint (checked
+        // below).
         if let Some(prev) = prev_last_seq {
             if header.base_sequence != prev + 1 {
-                return Err(RecoveryError::Corrupt(format!(
-                    "journal segment {name}: base sequence {} does not follow {}",
-                    header.base_sequence, prev
-                )));
+                let hole_is_covered =
+                    prev <= checkpoint_sequence && header.base_sequence <= checkpoint_sequence + 1;
+                if !hole_is_covered {
+                    return Err(RecoveryError::Corrupt(format!(
+                        "journal segment {name}: base sequence {} does not follow {}",
+                        header.base_sequence, prev
+                    )));
+                }
             }
         }
         let record_count = records.len() as u64;
@@ -356,6 +388,27 @@ pub fn scan_journal(
         max_seq = max_seq.max(last);
 
         for record in records {
+            // A CRC-valid record can still be nonsense for *this* volume
+            // (forged, or a journal from another geometry): replaying it
+            // would create an out-of-range shard or an oversized slot that
+            // the next open rejects. Refuse it here instead.
+            if record.unit_index >= superblock.geometry.num_units() {
+                return Err(RecoveryError::Corrupt(format!(
+                    "journal segment {name}: record {} names unit {} beyond the device ({} units)",
+                    record.sequence,
+                    record.unit_index,
+                    superblock.geometry.num_units()
+                )));
+            }
+            if record.payload.len() > superblock.geometry.max_ciphertext_size as usize {
+                return Err(RecoveryError::Corrupt(format!(
+                    "journal segment {name}: record {} payload of {} bytes exceeds the volume's \
+                     maximum ciphertext size {}",
+                    record.sequence,
+                    record.payload.len(),
+                    superblock.geometry.max_ciphertext_size
+                )));
+            }
             if record.sequence > checkpoint_sequence {
                 replay.push(record);
             }

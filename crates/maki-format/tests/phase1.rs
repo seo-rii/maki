@@ -72,6 +72,8 @@ fn geometry_integer_overflow_is_an_error_not_a_panic() {
     match r {
         Ok(g) => assert!(g.slot_size >= u32::MAX as u64),
         Err(FormatError::Overflow(_)) => {}
+        // Rejected before the arithmetic: larger than a journal record.
+        Err(FormatError::Invalid(msg)) => assert!(msg.contains("max_ciphertext_size"), "{msg}"),
         Err(e) => panic!("unexpected error {e}"),
     }
     // total slot bytes per shard must be checked
@@ -197,7 +199,7 @@ fn ab_store_survives_torn_write_of_new_side() {
 
     // Second store, but the write is torn mid-superblock by a crash.
     // Perform the update without sync by writing directly to the target side.
-    let target = ab.next_target_path(&backing).unwrap();
+    let target = ab.next_target_path::<Superblock>(&backing).unwrap();
     s.set_generation(g1 + 1);
     let f = backing.open(target, true).unwrap();
     f.write_at(0, &s.encode()).unwrap();

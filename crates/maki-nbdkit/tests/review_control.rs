@@ -147,3 +147,33 @@ fn missing_control_socket_directory_fails_attach() {
         .expect("attach must fail without a control socket");
     assert!(err.message.contains("control socket"), "{err}");
 }
+
+/// O-09: `reload cache` on a daemon running without a cache used to
+/// answer `ok` although nothing was applied; the CLI could not even send
+/// the size. It must refuse explicitly.
+#[test]
+fn reload_cache_without_a_cache_is_refused_not_silently_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("vol").to_string_lossy().into_owned();
+    let socket = dir
+        .path()
+        .join("control.sock")
+        .to_string_lossy()
+        .into_owned();
+    let raw = format!(
+        "{}
+[cache]
+mode = \"off\"
+",
+        config(&root, &socket)
+    );
+    let config_path = dir.path().join("vol.toml");
+    std::fs::write(&config_path, &raw).unwrap();
+    maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+    let adapter = NbdAdapter::open_config(config_path.to_str().unwrap()).unwrap();
+    let client = Client::new(&socket);
+    let r = client.call("reload", Some("cache"), json!({ "max_bytes": 4096 }));
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert!(r["error"].as_str().unwrap().contains("NOT applied"), "{r}");
+    adapter.shutdown().unwrap();
+}

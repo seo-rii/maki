@@ -89,7 +89,13 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
         }
     }
     let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
+    // Bind under a restrictive umask so the socket never exists world- or
+    // group-connectable before chgrp/chmod run (O-11); connections made in
+    // that window would sit in the backlog and be served.
+    let listener = {
+        let _umask = UmaskGuard::set(0o117);
+        UnixListener::bind(path)?
+    };
     let bound = ControlListener {
         listener,
         path: path.to_path_buf(),
@@ -110,10 +116,41 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
     Ok(bound)
 }
 
+/// Process umask override, restored on drop.
+struct UmaskGuard(libc::mode_t);
+
+impl UmaskGuard {
+    fn set(mask: libc::mode_t) -> Self {
+        // SAFETY: umask is a plain process-wide syscall wrapper.
+        Self(unsafe { libc::umask(mask) })
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the value returned by the earlier call.
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
 /// Serve connections on a bound socket until the future is dropped.
+///
+/// An `accept` error is never fatal: EMFILE/ENFILE/ENOBUFS during a client
+/// burst or a transiently short descriptor table used to end this loop,
+/// unlink the socket, and leave the daemon without a control plane for the
+/// rest of its life (O-04). Log, pause briefly, and keep accepting.
 pub async fn serve(listener: ControlListener, backend: Arc<dyn ControlBackend>) -> io::Result<()> {
     loop {
-        let (stream, _addr) = listener.listener.accept().await?;
+        let stream = match listener.listener.accept().await {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                tracing::warn!("control socket accept failed (retrying): {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let backend = backend.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_connection(stream, backend).await {

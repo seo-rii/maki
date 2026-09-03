@@ -1013,6 +1013,10 @@ scan journal
  ↓
 discard/truncate partial tail
  ↓
+fdatasync every surviving segment, publish the durable mark
+(a process restart hands recovery page-cache bytes: nothing it
+accepts may stay unsynced once the writer resumes)
+ ↓
 rebuild overlay
  ↓
 run provider self-test

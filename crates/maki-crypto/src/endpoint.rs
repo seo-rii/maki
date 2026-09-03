@@ -113,7 +113,19 @@ struct Endpoint {
     validated: AtomicBool,
     /// Validation proved the endpoint *not* interchangeable: never retried.
     rejected: AtomicBool,
+    /// A background validation of this endpoint is running.
+    validating: AtomicBool,
     last_validation_attempt: parking_lot::Mutex<Option<Duration>>,
+}
+
+/// Decrements the endpoint's inflight count when dropped, so an RPC future
+/// abandoned at the deadline still returns its slot (C-06).
+struct InflightGuard<'a>(&'a AtomicU32);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Snapshot of one endpoint's admission state.
@@ -155,8 +167,16 @@ impl Request<'_> {
     }
 }
 
+const DEADLINE_MESSAGE: &str = "operation deadline exceeded";
+
 fn deadline_error() -> CryptoError {
-    CryptoError::Retryable("operation deadline exceeded".to_string())
+    CryptoError::Retryable(DEADLINE_MESSAGE.to_string())
+}
+
+/// The *operation's* wall-clock budget ran out; says nothing about the
+/// health of whichever endpoint happened to be in flight.
+fn is_deadline_error(err: &CryptoError) -> bool {
+    matches!(err, CryptoError::Retryable(m) if m == DEADLINE_MESSAGE)
 }
 
 impl EndpointSet {
@@ -207,6 +227,7 @@ impl EndpointSet {
                     inflight: AtomicU32::new(0),
                     validated: AtomicBool::new(validated),
                     rejected: AtomicBool::new(false),
+                    validating: AtomicBool::new(false),
                     last_validation_attempt: parking_lot::Mutex::new(None),
                 })
             })
@@ -269,9 +290,13 @@ impl EndpointSet {
         out
     }
 
-    /// Try to promote quarantined endpoints (bounded by
-    /// `validation_interval`) using a validated, admitting reference.
-    async fn promote_quarantined(&self, context: &CryptoContext) {
+    /// Start validating quarantined endpoints (bounded by
+    /// `validation_interval`, one run per endpoint at a time) against a
+    /// validated, admitting reference. The validator makes real RPCs to an
+    /// endpoint that was unreachable at attach and may be so still, so it
+    /// runs in a background task: awaiting it on the request path stalled
+    /// every request behind that endpoint's transport timeout (C-03).
+    fn promote_quarantined(&self, context: &CryptoContext) {
         let Some(validator) = &self.validator else {
             return;
         };
@@ -281,6 +306,7 @@ impl EndpointSet {
             .filter(|e| {
                 !e.validated.load(Ordering::SeqCst)
                     && !e.rejected.load(Ordering::SeqCst)
+                    && !e.validating.load(Ordering::SeqCst)
                     && e.breaker.would_allow()
             })
             .cloned()
@@ -307,33 +333,38 @@ impl EndpointSet {
                 }
                 *last = Some(now);
             }
-            match validator(
-                reference.provider.clone(),
-                endpoint.provider.clone(),
-                context.clone(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    endpoint.validated.store(true, Ordering::SeqCst);
-                    tracing::info!("endpoint {:?} validated and admitted", endpoint.name);
-                }
-                Err(e) if matches!(e.class(), ErrorClass::ProviderFatal) => {
-                    endpoint.rejected.store(true, Ordering::SeqCst);
-                    tracing::error!(
-                        "endpoint {:?} is not interchangeable and stays excluded: {e}",
-                        endpoint.name
-                    );
-                }
-                Err(e) => {
-                    // Which side was unreachable is unknown here; leave the
-                    // breakers to real traffic and simply try again later.
-                    tracing::warn!(
-                        "endpoint {:?} validation deferred (endpoint unavailable): {e}",
-                        endpoint.name
-                    );
-                }
+            if endpoint.validating.swap(true, Ordering::SeqCst) {
+                continue;
             }
+            let validator = validator.clone();
+            let reference_provider = reference.provider.clone();
+            let context = context.clone();
+            tokio::spawn(async move {
+                let result =
+                    validator(reference_provider, endpoint.provider.clone(), context).await;
+                match result {
+                    Ok(()) => {
+                        endpoint.validated.store(true, Ordering::SeqCst);
+                        tracing::info!("endpoint {:?} validated and admitted", endpoint.name);
+                    }
+                    Err(e) if matches!(e.class(), ErrorClass::ProviderFatal) => {
+                        endpoint.rejected.store(true, Ordering::SeqCst);
+                        tracing::error!(
+                            "endpoint {:?} is not interchangeable and stays excluded: {e}",
+                            endpoint.name
+                        );
+                    }
+                    Err(e) => {
+                        // Which side was unreachable is unknown here; leave
+                        // the breakers to real traffic and try again later.
+                        tracing::warn!(
+                            "endpoint {:?} validation deferred (endpoint unavailable): {e}",
+                            endpoint.name
+                        );
+                    }
+                }
+                endpoint.validating.store(false, Ordering::SeqCst);
+            });
         }
     }
 
@@ -348,7 +379,8 @@ impl EndpointSet {
         let _global = self.global.acquire(bytes).await;
         let _local = endpoint.semaphore.acquire(bytes).await;
         endpoint.inflight.fetch_add(1, Ordering::SeqCst);
-        let result = match request {
+        let _inflight = InflightGuard(&endpoint.inflight);
+        match request {
             Request::Encrypt(items) => endpoint
                 .provider
                 .encrypt_batch(context, items)
@@ -359,9 +391,7 @@ impl EndpointSet {
                 .decrypt_batch(context, items)
                 .await
                 .map(Response::Decrypted),
-        };
-        endpoint.inflight.fetch_sub(1, Ordering::SeqCst);
-        result
+        }
     }
 
     /// The RPC, abandoned at the deadline (the dropped future cancels the
@@ -430,7 +460,7 @@ impl EndpointSet {
                 }
             }
 
-            self.promote_quarantined(context).await;
+            self.promote_quarantined(context);
 
             // One pass: try each admissible endpoint once, failing over
             // between them.
@@ -480,6 +510,12 @@ impl EndpointSet {
                         return Ok(response);
                     }
                     Err(err) => {
+                        if is_deadline_error(&err) {
+                            // The operation's budget ran out mid-RPC: not
+                            // an endpoint failure, so no breaker or budget
+                            // charge (C-06).
+                            return Err(err);
+                        }
                         match err.class() {
                             ErrorClass::Retryable
                             | ErrorClass::Throttled

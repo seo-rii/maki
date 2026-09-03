@@ -73,6 +73,11 @@ pub struct JournalWriter {
     next_segment_index: u64,
     /// `journal/durable-mark`, opened lazily on the first successful sync.
     mark: Option<Arc<dyn BackingFile>>,
+    /// Sealed segments whose records are all at or below this sequence may
+    /// be non-contiguous: they are checkpoint-covered survivors whose
+    /// neighbours' deletion persisted (recovery accepts such holes, K-07)
+    /// and the next checkpoint deletes them.
+    holes_allowed_below: u64,
 }
 
 impl JournalWriter {
@@ -97,7 +102,15 @@ impl JournalWriter {
             active: None,
             next_segment_index,
             mark: None,
+            holes_allowed_below: 0,
         }
+    }
+
+    /// Declare that sealed segments covered by `checkpoint_sequence` need
+    /// not be contiguous (see `holes_allowed_below`).
+    pub fn allow_covered_holes_below(&mut self, checkpoint_sequence: u64) {
+        self.holes_allowed_below = checkpoint_sequence;
+        self.sanitize();
     }
 
     pub fn next_sequence(&self) -> u64 {
@@ -128,6 +141,15 @@ impl JournalWriter {
             .chain(self.active.as_ref().map(|a| &a.info))
             .find(|s| s.record_count > 0 && s.last_sequence() > checkpoint_sequence)
             .map(|s| s.index)
+    }
+
+    /// Sealed segments whose every record is at or below
+    /// `checkpoint_sequence` (deletable).
+    pub fn covered_segment_count(&self, checkpoint_sequence: u64) -> usize {
+        self.sealed
+            .iter()
+            .filter(|s| s.last_sequence() <= checkpoint_sequence)
+            .count()
     }
 
     /// Bytes appended but not yet durable (admission control input).
@@ -352,10 +374,13 @@ impl JournalWriter {
                 self.next_segment_index
             );
             if let Some(base) = expected_base {
-                assert_eq!(
-                    seg.base_sequence, base,
-                    "journal sanitizer: segment {} base not contiguous",
-                    seg.index
+                let hole_is_covered = base <= self.holes_allowed_below + 1
+                    && seg.base_sequence <= self.holes_allowed_below + 1;
+                assert!(
+                    seg.base_sequence == base || hole_is_covered,
+                    "journal sanitizer: segment {} base {} not contiguous (expected {base})",
+                    seg.index,
+                    seg.base_sequence
                 );
             }
             expected_base = Some(seg.base_sequence + seg.record_count);

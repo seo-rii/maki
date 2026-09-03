@@ -176,10 +176,27 @@ impl fmt::Display for PlannedStep {
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub description: String,
+    /// The volume the plan is for (names the bound-device record).
+    pub volume: String,
     pub steps: Vec<PlannedStep>,
 }
 
 impl Plan {
+    /// True when the plan would disconnect a device it never connected and
+    /// does not know: a detach with the device still on `auto` and no
+    /// record from the attach. Allocating "a free device" here would
+    /// disconnect the wrong one (O-02); the executor refuses such a plan.
+    pub fn unresolved_disconnect(&self) -> bool {
+        let connects = self
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlannedStep::NbdConnect { .. }));
+        !connects
+            && self.steps.iter().any(
+                |s| matches!(s, PlannedStep::NbdDisconnect { device } if device == AUTO_NBD_DEVICE),
+            )
+    }
+
     /// True if any step still refers to [`AUTO_NBD_DEVICE`].
     pub fn needs_device_allocation(&self) -> bool {
         self.steps.iter().any(|s| {
@@ -246,13 +263,42 @@ pub fn plan_attach(request: &AttachRequest) -> Plan {
     });
     Plan {
         description: format!("attach volume {}", request.volume),
+        volume: request.volume.clone(),
         steps,
     }
 }
 
+/// Where the executor records the NBD device it bound for `volume` at
+/// attach, so a later detach (whose config normally leaves the device on
+/// `auto`) disconnects *that* device and not a freshly allocated free one
+/// (O-02).
+pub fn bound_device_record_path(volume: &str) -> std::path::PathBuf {
+    std::path::Path::new(BOUND_DEVICE_RECORD_DIR).join(format!("{volume}.nbd"))
+}
+
+/// Directory of the per-volume bound-device records.
+pub const BOUND_DEVICE_RECORD_DIR: &str = "/run/maki/attach";
+
+/// The device recorded at attach for `volume`, if any and well-formed.
+pub fn recorded_bound_device(volume: &str) -> Option<String> {
+    let text = std::fs::read_to_string(bound_device_record_path(volume)).ok()?;
+    let device = text.trim().to_string();
+    let index = device.strip_prefix("/dev/nbd")?;
+    (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(device)
+}
+
+/// A detach never allocates a device: with the device on `auto` it uses
+/// the one recorded at attach, and stays unresolved (refused by the
+/// executor, see [`Plan::unresolved_disconnect`]) when there is no record.
 pub fn plan_detach(request: &AttachRequest) -> Plan {
+    let device = if request.nbd_device == AUTO_NBD_DEVICE {
+        recorded_bound_device(&request.volume).unwrap_or_else(|| AUTO_NBD_DEVICE.to_string())
+    } else {
+        request.nbd_device.clone()
+    };
     Plan {
         description: format!("detach volume {}", request.volume),
+        volume: request.volume.clone(),
         steps: vec![
             PlannedStep::Umount {
                 mountpoint: request.mountpoint.clone(),
@@ -260,9 +306,7 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
             PlannedStep::LvmDeactivate {
                 vg_name: request.vg_name.clone(),
             },
-            PlannedStep::NbdDisconnect {
-                device: request.nbd_device.clone(),
-            },
+            PlannedStep::NbdDisconnect { device },
         ],
     }
 }
@@ -271,6 +315,7 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
 pub fn plan_grow(request: &GrowRequest) -> Plan {
     Plan {
         description: format!("grow volume {}", request.volume),
+        volume: request.volume.clone(),
         steps: vec![
             PlannedStep::LvExtend {
                 vg_name: request.vg_name.clone(),

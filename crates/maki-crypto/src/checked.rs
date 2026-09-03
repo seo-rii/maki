@@ -17,6 +17,9 @@ use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextU
 pub struct CheckedProvider {
     inner: Arc<dyn CryptoProvider>,
     caps: OnceCell<CryptoCapabilities>,
+    /// The volume's unit size when known: every decrypted plaintext must
+    /// be exactly this long, not merely a size the provider supports.
+    unit_size: Option<u32>,
 }
 
 impl CheckedProvider {
@@ -24,6 +27,19 @@ impl CheckedProvider {
         Self {
             inner,
             caps: OnceCell::new(),
+            unit_size: None,
+        }
+    }
+
+    /// A checked provider that also pins decrypt results to `unit_size`
+    /// (C-08): a provider declaring several plaintext sizes could otherwise
+    /// return a shorter or longer unit that the engine would slice out of
+    /// range or silently re-encrypt at the wrong length.
+    pub fn pinned(inner: Arc<dyn CryptoProvider>, unit_size: u32) -> Self {
+        Self {
+            inner,
+            caps: OnceCell::new(),
+            unit_size: Some(unit_size),
         }
     }
 
@@ -125,6 +141,15 @@ impl CryptoProvider for CheckedProvider {
         let caps = self.caps().await?.clone();
         let out = self.inner.decrypt_batch(context, items).await?;
         validate_decrypt_result(items, &out, &caps)?;
+        if let Some(unit_size) = self.unit_size {
+            if let Some(pt) = out.iter().find(|pt| pt.data.len() != unit_size as usize) {
+                return Err(CryptoError::Contract(format!(
+                    "decrypt of unit {} returned {} bytes, volume unit size is {unit_size}",
+                    pt.unit_index,
+                    pt.data.len()
+                )));
+            }
+        }
         Ok(out)
     }
 }

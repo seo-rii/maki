@@ -615,7 +615,9 @@ impl Default for CacheSection {
 #[serde(deny_unknown_fields, default)]
 pub struct NbdSection {
     pub socket: Option<String>,
-    pub device_block_size: u32,
+    /// Block size the NBD export advertises. Unset = the volume's
+    /// `device_block_size`; when set it must equal it.
+    pub device_block_size: Option<u32>,
     pub minimum_io: u32,
     pub preferred_io: u32,
     pub maximum_io: ByteSize,
@@ -627,7 +629,7 @@ impl Default for NbdSection {
     fn default() -> Self {
         Self {
             socket: None,
-            device_block_size: 4096,
+            device_block_size: None,
             minimum_io: 4096,
             preferred_io: 4096,
             maximum_io: ByteSize(1 << 20),
@@ -689,6 +691,48 @@ const SENSITIVE_HEADERS: &[&str] = &[
 ];
 
 impl VolumeConfig {
+    /// Every credential reference the configuration declares, with the
+    /// source each one must be loaded from (the daemon's credential router
+    /// dispatches on it, O-06).
+    pub fn credential_refs(&self) -> Vec<&CredentialRef> {
+        let mut refs = Vec::new();
+        if let Some(key) = &self.crypto.key {
+            refs.push(key);
+        }
+        if let Some(http) = &self.crypto.http {
+            for op in [&http.encrypt, &http.decrypt].into_iter().flatten() {
+                for value in op.headers.values() {
+                    if let HeaderValue::Credential(c) = value {
+                        refs.push(c);
+                    }
+                }
+            }
+            if let Some(key) = http.tls.as_ref().and_then(|t| t.client_key.as_ref()) {
+                refs.push(key);
+            }
+        }
+        if let Some(grpc) = &self.crypto.grpc {
+            for value in grpc.metadata.values() {
+                if let HeaderValue::Credential(c) = value {
+                    refs.push(c);
+                }
+            }
+            if let Some(key) = grpc.tls.as_ref().and_then(|t| t.client_key.as_ref()) {
+                refs.push(key);
+            }
+        }
+        refs
+    }
+
+    /// The block size the NBD export advertises: `nbd.device_block_size`
+    /// when set (validation requires it to equal the volume's), otherwise
+    /// the volume's `device_block_size`.
+    pub fn nbd_device_block_size(&self) -> u32 {
+        self.nbd
+            .device_block_size
+            .unwrap_or(self.volume.device_block_size)
+    }
+
     pub fn geometry(&self) -> Result<Geometry, FormatError> {
         Geometry::compute(
             self.volume.device_block_size,
@@ -1225,6 +1269,15 @@ impl VolumeConfig {
         let n = &self.nbd;
         if n.threads == 0 {
             return Err(invalid("nbd.threads must be positive"));
+        }
+        if let Some(advertised) = n.device_block_size {
+            if advertised != self.volume.device_block_size {
+                return Err(invalid(format!(
+                    "nbd.device_block_size {advertised} must equal volume.device_block_size {} \
+                     (the export cannot advertise a block size the volume does not serve)",
+                    self.volume.device_block_size
+                )));
+            }
         }
         for (name, v) in [
             ("nbd.minimum_io", n.minimum_io as u64),

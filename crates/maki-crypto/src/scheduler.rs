@@ -43,6 +43,10 @@ pub struct SchedulerConfig {
     pub max_pending_plaintext_bytes: u64,
     /// Bound on queued ciphertext bytes (decrypt lane).
     pub max_pending_ciphertext_bytes: u64,
+    /// Batches a lane keeps in flight at once. One would serialize every
+    /// request behind a single provider round trip (C-04); the dispatcher's
+    /// own inflight limits bound what actually reaches the endpoints.
+    pub max_inflight_batches: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -56,6 +60,7 @@ impl Default for SchedulerConfig {
             max_pending_items: 4096,
             max_pending_plaintext_bytes: 128 << 20,
             max_pending_ciphertext_bytes: 160 << 20,
+            max_inflight_batches: 8,
         }
     }
 }
@@ -123,7 +128,10 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
     ) -> Self {
         let max_pending_items = config.max_pending_items.max(1);
         let (tx, rx) = mpsc::channel::<Group<I, O>>(max_pending_items as usize);
-        tokio::spawn(run_lane(rx, config, clock, stats, call));
+        let inflight = Arc::new(tokio::sync::Semaphore::new(
+            config.max_inflight_batches.max(1) as usize,
+        ));
+        tokio::spawn(run_lane(rx, config, clock, stats, call, inflight));
         Self {
             tx,
             admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
@@ -140,7 +148,12 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let permit = self.admission.acquire(bytes).await;
+        // One item permit per *item* (C-10): the pending bound is stated in
+        // items, and a request of many items must count as many.
+        let permit = self
+            .admission
+            .acquire_n(u32::try_from(items.len()).unwrap_or(u32::MAX), bytes)
+            .await;
         let (reply_tx, reply_rx) = oneshot::channel();
         let count = items.len() as u64;
         stats.pending_items.fetch_add(count, Ordering::SeqCst);
@@ -175,6 +188,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
     clock: Arc<dyn Clock>,
     stats: Arc<SchedulerStats>,
     call: LaneCall<I, O>,
+    inflight: Arc<tokio::sync::Semaphore>,
 ) {
     let mut carry: Option<Group<I, O>> = None;
     loop {
@@ -238,26 +252,48 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             all_items.extend(g.items);
             // `_permit` drops here: the group left the queue.
         }
-        match call(context, all_items).await {
-            Ok(mut out) if out.len() == items => {
-                for (len, reply) in lengths.into_iter().zip(replies) {
-                    let part: Vec<O> = out.drain(..len).collect();
-                    let _ = reply.send(Ok(part));
-                }
+        // Dispatch off the lane task so the next batch forms while this one
+        // is in flight (C-04); the inflight semaphore bounds the overlap.
+        let slot = inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
+        let call = call.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            deliver(call(context, all_items).await, items, lengths, replies);
+        });
+    }
+}
+
+/// Split one provider result back into the groups that formed the batch;
+/// a provider error (or a wrong result count) reaches every waiter.
+fn deliver<O>(
+    result: Result<Vec<O>, CryptoError>,
+    items: usize,
+    lengths: Vec<usize>,
+    replies: Vec<oneshot::Sender<Result<Vec<O>, CryptoError>>>,
+) {
+    match result {
+        Ok(mut out) if out.len() == items => {
+            for (len, reply) in lengths.into_iter().zip(replies) {
+                let part: Vec<O> = out.drain(..len).collect();
+                let _ = reply.send(Ok(part));
             }
-            Ok(out) => {
-                let err = CryptoError::Contract(format!(
-                    "provider returned {} results for {items} items",
-                    out.len()
-                ));
-                for reply in replies {
-                    let _ = reply.send(Err(err.duplicate()));
-                }
+        }
+        Ok(out) => {
+            let err = CryptoError::Contract(format!(
+                "provider returned {} results for {items} items",
+                out.len()
+            ));
+            for reply in replies {
+                let _ = reply.send(Err(err.duplicate()));
             }
-            Err(err) => {
-                for reply in replies {
-                    let _ = reply.send(Err(err.duplicate()));
-                }
+        }
+        Err(err) => {
+            for reply in replies {
+                let _ = reply.send(Err(err.duplicate()));
             }
         }
     }

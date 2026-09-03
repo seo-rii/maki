@@ -27,6 +27,8 @@ pub struct ResponseSpec {
     pub delay: Duration,
     /// Close the socket mid-response (truncated body).
     pub drop_after: Option<usize>,
+    /// Extra response headers (e.g. `Location` for a redirect).
+    pub headers: Vec<(String, String)>,
 }
 
 impl ResponseSpec {
@@ -37,6 +39,7 @@ impl ResponseSpec {
             content_type: "application/json".to_string(),
             delay: Duration::ZERO,
             drop_after: None,
+            headers: Vec::new(),
         }
     }
 
@@ -47,6 +50,7 @@ impl ResponseSpec {
             content_type: "application/octet-stream".to_string(),
             delay: Duration::ZERO,
             drop_after: None,
+            headers: Vec::new(),
         }
     }
 
@@ -57,6 +61,7 @@ impl ResponseSpec {
             content_type: "application/json".to_string(),
             delay: Duration::ZERO,
             drop_after: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -116,12 +121,16 @@ impl TestServer {
             if spec.delay > Duration::ZERO {
                 tokio::time::sleep(spec.delay).await;
             }
-            let head = format!(
-                "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n\r\n",
+            let mut head = format!(
+                "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n",
                 spec.status,
                 spec.content_type,
                 spec.body.len()
             );
+            for (name, value) in &spec.headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("\r\n");
             stream.write_all(head.as_bytes()).await?;
             match spec.drop_after {
                 Some(n) => {

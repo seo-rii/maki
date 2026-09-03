@@ -388,3 +388,58 @@ fn journal_hard_limit_must_leave_room_for_a_reclaim_and_the_largest_request() {
     );
     ok(&enough);
 }
+
+// ---------- audit: geometries the format layer cannot serve ----------
+
+#[test]
+fn units_whose_ciphertext_exceeds_a_journal_record_are_rejected() {
+    // 32 MiB crypto units: one unit's ciphertext is larger than the journal
+    // scanner's per-record bound, so no write could ever be journaled.
+    let raw = base()
+        .replace(
+            "max_virtual_size = \"1GiB\"\n",
+            "max_virtual_size = \"1GiB\"\ncrypto_unit_size = 33554432\n",
+        )
+        .replace(
+            "supported_plaintext_sizes = [4096]\nmax_ciphertext_size = 4384",
+            "supported_plaintext_sizes = [33554432]\nmax_ciphertext_size = 33554720",
+        );
+    let msg = err(&raw);
+    assert!(
+        msg.contains("max_ciphertext_size") && msg.contains("journal"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn shards_with_more_units_than_the_allocation_map_indexes_are_rejected() {
+    // 32 TiB shards of 4 KiB units = 2^33 units per shard.
+    let raw = base().replace(
+        "max_virtual_size = \"1GiB\"\n",
+        "max_virtual_size = \"1GiB\"\nshard_logical_size = \"32TiB\"\n",
+    );
+    let msg = err(&raw);
+    assert!(msg.contains("units_per_shard"), "{msg}");
+    // The documented default (64 GiB shards) stays valid.
+    ok(&base());
+}
+
+// ---------- audit: documented nbd.device_block_size cross-check ----------
+
+#[test]
+fn nbd_device_block_size_must_match_the_volume() {
+    let msg = err(&with("[nbd]\ndevice_block_size = 512"));
+    assert!(msg.contains("nbd.device_block_size"), "{msg}");
+    ok(&with("[nbd]\ndevice_block_size = 4096"));
+
+    // Unset: the NBD export inherits the volume's block size.
+    let small = base().replace(
+        "max_virtual_size = \"1GiB\"\n",
+        "max_virtual_size = \"1GiB\"\ndevice_block_size = 512\n",
+    );
+    ok(&small);
+    assert_eq!(parse(&small).nbd_device_block_size(), 512);
+    ok(&format!("{small}\n[nbd]\ndevice_block_size = 512\n"));
+    let msg = err(&format!("{small}\n[nbd]\ndevice_block_size = 4096\n"));
+    assert!(msg.contains("nbd.device_block_size"), "{msg}");
+}

@@ -44,6 +44,8 @@ struct Inner {
     open_duration: Duration,
     half_open_started: u32,
     half_open_successes: u32,
+    /// Probes that finished (either way) since the circuit went half-open.
+    half_open_completed: u32,
 }
 
 pub struct CircuitBreaker {
@@ -65,6 +67,7 @@ impl CircuitBreaker {
                 open_duration,
                 half_open_started: 0,
                 half_open_successes: 0,
+                half_open_completed: 0,
             }),
         }
     }
@@ -74,17 +77,23 @@ impl CircuitBreaker {
     }
 
     /// Would a request be admitted, without consuming a half-open slot?
+    /// `half_open_max_requests` bounds probes *in flight*; a completed
+    /// probe returns its slot (C-07: `success_threshold` above the slot
+    /// count used to wedge the circuit half-open forever).
     pub fn would_allow(&self) -> bool {
         let inner = self.inner.lock();
         match inner.state {
             CircuitState::Closed => true,
             CircuitState::Open => self.clock.now() >= inner.open_until,
-            CircuitState::HalfOpen => inner.half_open_started < self.config.half_open_max_requests,
+            CircuitState::HalfOpen => {
+                inner.half_open_started - inner.half_open_completed
+                    < self.config.half_open_max_requests
+            }
         }
     }
 
     /// Admit a request. In HALF_OPEN this consumes one of the limited probe
-    /// slots.
+    /// slots until the probe completes.
     pub fn allow(&self) -> bool {
         let mut inner = self.inner.lock();
         match inner.state {
@@ -93,6 +102,7 @@ impl CircuitBreaker {
                 if self.clock.now() >= inner.open_until {
                     inner.state = CircuitState::HalfOpen;
                     inner.half_open_started = 1;
+                    inner.half_open_completed = 0;
                     inner.half_open_successes = 0;
                     true
                 } else {
@@ -100,7 +110,9 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                if inner.half_open_started < self.config.half_open_max_requests {
+                if inner.half_open_started - inner.half_open_completed
+                    < self.config.half_open_max_requests
+                {
                     inner.half_open_started += 1;
                     true
                 } else {
@@ -116,6 +128,7 @@ impl CircuitBreaker {
             CircuitState::Closed => inner.consecutive_failures = 0,
             CircuitState::HalfOpen => {
                 inner.half_open_successes += 1;
+                inner.half_open_completed += 1;
                 if inner.half_open_successes >= self.config.success_threshold {
                     inner.state = CircuitState::Closed;
                     inner.consecutive_failures = 0;
@@ -142,6 +155,7 @@ impl CircuitBreaker {
                 inner.state = CircuitState::Open;
                 inner.open_until = now + inner.open_duration;
                 inner.half_open_started = 0;
+                inner.half_open_completed = 0;
             }
             CircuitState::Open => {}
         }

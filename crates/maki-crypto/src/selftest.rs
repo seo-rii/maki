@@ -73,6 +73,40 @@ pub async fn provider_self_test(
         }
     }
 
+    // A provider in pass-through mode (debug/no-op endpoint, a response
+    // mapping that echoes the request) round-trips perfectly; attaching it
+    // would persist plaintext. Ciphertext must never equal its plaintext
+    // (C-09).
+    if cts
+        .iter()
+        .zip(items.iter())
+        .any(|(ct, pt)| ct.data == pt.data.expose())
+    {
+        return Err(CryptoError::ProviderFatal(
+            "ciphertext equals plaintext: the provider is not encrypting".to_string(),
+        ));
+    }
+
+    // A claimed context binding is exercised, not trusted: the same
+    // ciphertext presented under another unit index must not decrypt to
+    // the same plaintext (an error or different bytes are both fine).
+    if caps.context_binding.present() {
+        let mut moved = cts[0].clone();
+        moved.unit_index = cts[0].unit_index.wrapping_add(1);
+        if let Ok(pts) = provider.decrypt_batch(context, &[moved]).await {
+            if pts
+                .first()
+                .map(|p| p.data == items[0].data)
+                .unwrap_or(false)
+            {
+                return Err(CryptoError::ProviderFatal(
+                    "provider claims context binding but decrypts under a different unit index"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     if caps.integrity.present() {
         let mut tampered: Vec<CiphertextUnit> = vec![cts[2].clone()];
         let mid = tampered[0].data.len() / 2;

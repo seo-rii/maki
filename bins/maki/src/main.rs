@@ -76,10 +76,27 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(e),
         },
-        ["status", config] => control(config, "status", None),
-        ["metrics", config] => control(config, "metrics", None),
-        ["checkpoint", config] => control(config, "checkpoint", None),
-        ["reload", config, section] => control(config, "reload", Some(section)),
+        ["status", config] => control(config, "status", None, serde_json::Value::Null),
+        ["metrics", config] => control(config, "metrics", None, serde_json::Value::Null),
+        ["checkpoint", config] => control(config, "checkpoint", None, serde_json::Value::Null),
+        // The cache is the one section the daemon applies at runtime; it
+        // needs the new size (O-09: without it the verb could never succeed).
+        ["reload", config, "cache", "--max-bytes", max_bytes] => match max_bytes.parse::<u64>() {
+            Ok(max_bytes) => control(
+                config,
+                "reload",
+                Some("cache"),
+                serde_json::json!({ "max_bytes": max_bytes }),
+            ),
+            Err(_) => fail(format!("--max-bytes: {max_bytes:?} is not an integer")),
+        },
+        ["reload", _config, "cache"] => fail(
+            "reload cache needs the new size: maki reload <config> cache --max-bytes <bytes>"
+                .to_string(),
+        ),
+        ["reload", config, section] => {
+            control(config, "reload", Some(section), serde_json::Value::Null)
+        }
         ["attach", ..] | ["detach", ..] | ["grow", ..] => {
             eprintln!(
                 "this operation requires the privileged helper: run `maki-attach {}` \
@@ -135,7 +152,12 @@ fn check(config: &str, deep: bool) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn control(config: &str, command: &str, section: Option<&str>) -> ExitCode {
+fn control(
+    config: &str,
+    command: &str,
+    section: Option<&str>,
+    payload: serde_json::Value,
+) -> ExitCode {
     let cfg = match read_config(config) {
         Ok(c) => c,
         Err(e) => return fail(e),
@@ -152,6 +174,7 @@ fn control(config: &str, command: &str, section: Option<&str>) -> ExitCode {
         let (mut rd, mut wr) = tokio::io::split(stream);
         let mut request = maki_control::protocol::Request::new(command);
         request.section = section.map(|s| s.to_string());
+        request.payload = payload;
         maki_control::protocol::send_command(&mut wr, &request)
             .await
             .map_err(|e| e.to_string())?;
@@ -173,6 +196,11 @@ fn control(config: &str, command: &str, section: Option<&str>) -> ExitCode {
 }
 
 #[cfg(not(unix))]
-fn control(_config: &str, _command: &str, _section: Option<&str>) -> ExitCode {
+fn control(
+    _config: &str,
+    _command: &str,
+    _section: Option<&str>,
+    _payload: serde_json::Value,
+) -> ExitCode {
     fail("control socket commands require a Unix host".to_string())
 }

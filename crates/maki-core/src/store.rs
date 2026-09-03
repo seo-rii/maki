@@ -380,33 +380,36 @@ impl SlotStore {
     /// any step leaves every affected shard dirty so a retry redoes the
     /// whole step.
     pub fn persist_allocations(&mut self) -> Result<(), CoreError> {
-        if self.catalog_dirty {
-            fp("store.catalog_store")?;
-            self.catalog_ab
-                .store(self.backing.as_ref(), &mut self.catalog)?;
-            self.backing.sync_dir("")?;
-            self.catalog_dirty = false;
-        }
         let dirty: Vec<u64> = self
             .shards
             .iter()
             .filter(|(_, s)| s.dirty_alloc)
             .map(|(idx, _)| *idx)
             .collect();
-        if dirty.is_empty() {
-            return Ok(());
+        if !dirty.is_empty() {
+            for idx in &dirty {
+                fp("checkpoint.alloc_store")?;
+                let shard = self.shards.get_mut(idx).unwrap();
+                shard
+                    .alloc_ab
+                    .store(self.backing.as_ref(), &mut shard.alloc)?;
+            }
+            fp("checkpoint.alloc_dirsync")?;
+            self.backing.sync_dir(layout::DATA_DIR)?;
+            for idx in &dirty {
+                self.shards.get_mut(idx).unwrap().dirty_alloc = false;
+            }
         }
-        for idx in &dirty {
-            fp("checkpoint.alloc_store")?;
-            let shard = self.shards.get_mut(idx).unwrap();
-            shard
-                .alloc_ab
-                .store(self.backing.as_ref(), &mut shard.alloc)?;
-        }
-        fp("checkpoint.alloc_dirsync")?;
-        self.backing.sync_dir(layout::DATA_DIR)?;
-        for idx in &dirty {
-            self.shards.get_mut(idx).unwrap().dirty_alloc = false;
+        // The catalog commits an adopted shard only *after* its allocation
+        // map exists on disk (same order as `ensure_shard`): a failure or
+        // crash in between must leave an orphan, never a cataloged shard
+        // with no allocation copy, which no later attach could open (K-03).
+        if self.catalog_dirty {
+            fp("store.catalog_store")?;
+            self.catalog_ab
+                .store(self.backing.as_ref(), &mut self.catalog)?;
+            self.backing.sync_dir("")?;
+            self.catalog_dirty = false;
         }
         Ok(())
     }

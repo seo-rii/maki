@@ -31,12 +31,37 @@ use maki_crypto::{
     SecretBuffer,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WsProviderSpec {
     pub url: String,
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_frame_bytes: usize,
+}
+
+/// A URL may carry userinfo or a token query: print scheme and host only
+/// (C-11).
+pub fn redacted_url(url: &str) -> String {
+    let no_query = url.split(['?', '#']).next().unwrap_or("");
+    match no_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split('/').next().unwrap_or("");
+            let host = authority.rsplit('@').next().unwrap_or("");
+            format!("{scheme}://{host}/<redacted>")
+        }
+        None => "<redacted>".to_string(),
+    }
+}
+
+impl std::fmt::Debug for WsProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsProviderSpec")
+            .field("url", &redacted_url(&self.url))
+            .field("capabilities", &self.capabilities)
+            .field("timeout", &self.timeout)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .finish()
+    }
 }
 
 /// id → (connection generation the request was sent on, responder).
@@ -114,10 +139,16 @@ impl WsCryptoProvider {
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
-        let (ws, _response) =
-            tokio_tungstenite::connect_async_with_config(&self.spec.url, Some(config), false)
-                .await
-                .map_err(|e| retryable(format!("websocket connect failed: {e}")))?;
+        // TCP connect and the HTTP upgrade have no timeout of their own: a
+        // peer that accepts and never answers would hold the connection
+        // mutex forever, and with it every request on this provider (C-05).
+        let (ws, _response) = tokio::time::timeout(
+            self.spec.timeout,
+            tokio_tungstenite::connect_async_with_config(&self.spec.url, Some(config), false),
+        )
+        .await
+        .map_err(|_| retryable("websocket connect timeout"))?
+        .map_err(|e| retryable(format!("websocket connect failed: {e}")))?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (mut sink, mut source) = ws.split();
@@ -216,9 +247,12 @@ impl WsCryptoProvider {
             // a fast response cannot be "stale" and a dying connection's
             // sweep can target exactly its own requests.
             self.pending.lock().insert(id, (generation, tx));
-            if conn.sender.send(Message::text(encoded)).await.is_err() {
-                // Writer gone: drop this connection if it's still the
-                // registered one.
+            let sent =
+                tokio::time::timeout(self.spec.timeout, conn.sender.send(Message::text(encoded)))
+                    .await;
+            if !matches!(sent, Ok(Ok(()))) {
+                // Writer gone or wedged: drop this connection if it's still
+                // the registered one.
                 if guard.as_ref().map(|c| c.generation) == Some(generation) {
                     *guard = None;
                 }
@@ -233,18 +267,29 @@ impl WsCryptoProvider {
                 // On a connection-loss error, clear the dead connection (if
                 // it is still this one) so the next call reconnects.
                 if result.is_err() {
-                    let mut guard = self.connection.lock().await;
-                    if guard.as_ref().map(|c| c.generation) == Some(sent_generation) {
-                        *guard = None;
-                    }
+                    self.retire(sent_generation).await;
                 }
                 result
             }
             Ok(Err(_)) => Err(retryable("websocket response channel closed")),
             Err(_) => {
+                // A peer that stopped answering (half-open TCP session,
+                // hung service) must not be reused: every later request
+                // would burn the full timeout on the same corpse (C-05).
                 self.pending.lock().remove(&id);
+                self.retire(sent_generation).await;
                 Err(retryable("websocket request timeout"))
             }
+        }
+    }
+
+    /// Forget the connection of `generation` if it is still the registered
+    /// one, so the next request reconnects. In-flight requests on it keep
+    /// their own timeouts; the reader task ends when the sink drops.
+    async fn retire(&self, generation: u64) {
+        let mut guard = self.connection.lock().await;
+        if guard.as_ref().map(|c| c.generation) == Some(generation) {
+            *guard = None;
         }
     }
 

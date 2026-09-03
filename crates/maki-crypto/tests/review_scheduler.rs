@@ -40,6 +40,7 @@ fn cfg() -> SchedulerConfig {
         max_pending_items: 64,
         max_pending_plaintext_bytes: 1 << 20,
         max_pending_ciphertext_bytes: 1 << 20,
+        max_inflight_batches: 4,
     }
 }
 

@@ -268,3 +268,129 @@ fn verifier_rejects_wrong_device_and_missing_sentinel() {
     observed.fs_uuid = Some("other".into());
     assert!(verify_mount_identity(&expected, &observed).is_err());
 }
+
+// ---------- O-02: a detach never guesses its device ----------
+
+/// With the packaged default (`nbd_device` unset) the detach plan carried
+/// the auto placeholder, and the executor "allocated" the lowest free
+/// device for it: `nbd-client -d` on an unrelated device, the real one
+/// left connected. A detach must use the device recorded at attach or
+/// refuse.
+#[test]
+fn detach_with_an_unrecorded_auto_device_is_unresolved_and_never_allocates() {
+    let mut request = request();
+    request.nbd_device = AUTO_NBD_DEVICE.to_string();
+    request.volume = "no-such-volume-for-this-test".to_string();
+    let detach = plan_detach(&request);
+    assert!(
+        detach.unresolved_disconnect(),
+        "detach with no recorded device must be refused, not allocated"
+    );
+    // Binding the device recorded at attach resolves it.
+    let mut bound = detach.clone();
+    bound.bind_device("/dev/nbd3");
+    assert!(!bound.unresolved_disconnect());
+    assert!(bound.steps.iter().any(|s| matches!(
+        s,
+        PlannedStep::NbdDisconnect { device } if device == "/dev/nbd3"
+    )));
+    // An attach plan connects the device it later refers to: never unresolved.
+    let attach = plan_attach(&request);
+    assert!(!attach.unresolved_disconnect());
+    assert!(attach.needs_device_allocation());
+    // The record lives under the run directory, keyed by volume.
+    let record = maki_privileged::plan::bound_device_record_path("pgdata");
+    assert!(record.starts_with(maki_privileged::plan::BOUND_DEVICE_RECORD_DIR));
+    assert_eq!(record.file_name().unwrap().to_string_lossy(), "pgdata.nbd");
+}
+
+// ---------- O-01: root never follows a tenant's symlink under the mount root ----------
+
+#[cfg(target_os = "linux")]
+mod mount_root_hygiene {
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    use maki_privileged::exec::{read_sentinel, rw_probe, SENTINEL_MAX_BYTES};
+    use maki_privileged::plan::SENTINEL_FILE;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "maki-priv-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A symlink planted at the sentinel name must not be followed, and an
+    /// oversized "sentinel" must not be read.
+    #[test]
+    fn sentinel_symlink_and_oversized_file_are_ignored() {
+        let dir = scratch("sentinel");
+        let target = dir.join("target");
+        std::fs::write(
+            &target,
+            "11111111-2222-3333-4444-555555555555
+",
+        )
+        .unwrap();
+        symlink(&target, dir.join(SENTINEL_FILE)).unwrap();
+        assert_eq!(
+            read_sentinel(dir.to_str().unwrap()),
+            None,
+            "sentinel read through a symlink"
+        );
+        std::fs::remove_file(dir.join(SENTINEL_FILE)).unwrap();
+
+        std::fs::write(
+            dir.join(SENTINEL_FILE),
+            vec![b'a'; SENTINEL_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            read_sentinel(dir.to_str().unwrap()),
+            None,
+            "oversized sentinel read"
+        );
+
+        std::fs::write(
+            dir.join(SENTINEL_FILE),
+            "uuid-value
+",
+        )
+        .unwrap();
+        assert_eq!(
+            read_sentinel(dir.to_str().unwrap()).as_deref(),
+            Some("uuid-value")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rw probe never truncates a planted file: it creates its own,
+    /// unpredictably named file and fails closed on any collision.
+    #[test]
+    fn rw_probe_never_overwrites_a_planted_target() {
+        let dir = scratch("probe");
+        let planted = dir.join("victim");
+        std::fs::write(&planted, "precious").unwrap();
+        // The legacy fixed name, and every name the probe could pick, point
+        // at the victim: only an O_EXCL create with our own name is safe.
+        symlink(&planted, dir.join(".maki-rw-probe")).unwrap();
+        assert!(rw_probe(dir.to_str().unwrap()), "healthy writable dir");
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "precious");
+        // Nothing of ours is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".maki-rw-probe."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
