@@ -742,6 +742,8 @@ impl VolumeConfig {
         self.geometry()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         self.validate_journal_bounds()?;
+        self.validate_settings()?;
+        self.validate_provider_sections()?;
         if !self
             .crypto
             .capabilities
@@ -819,9 +821,16 @@ impl VolumeConfig {
 }
 
 fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
-    if !["credential", "file", "keyring", "env"].contains(&c.source.as_str()) {
+    if c.source == "keyring" {
+        return Err(ConfigError::Invalid(
+            "credential source \"keyring\" is not implemented by this build; \
+             use credential (systemd), file, or env"
+                .to_string(),
+        ));
+    }
+    if !["credential", "file", "env"].contains(&c.source.as_str()) {
         return Err(ConfigError::Invalid(format!(
-            "credential source {:?} must be credential|file|keyring|env",
+            "credential source {:?} must be credential|file|env",
             c.source
         )));
     }
@@ -853,6 +862,498 @@ impl VolumeConfig {
             return Err(ConfigError::Invalid(
                 "limits.max_journal_pending_bytes must be positive".to_string(),
             ));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- settings validation (review M-013/M-015)
+
+fn invalid(message: impl Into<String>) -> ConfigError {
+    ConfigError::Invalid(message.into())
+}
+
+/// Scheme and host of an endpoint URL. Rejects userinfo (credentials in a
+/// URL) and anything that does not look like `scheme://host[:port][/...]`.
+pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| invalid(format!("endpoint url {url:?} has no scheme")))?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+')
+    {
+        return Err(invalid(format!(
+            "endpoint url {url:?} has an invalid scheme"
+        )));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(invalid(format!(
+            "endpoint url {url:?} carries userinfo; credentials belong in credential references"
+        )));
+    }
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or("").to_string()
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+            .to_string()
+    };
+    if host.is_empty() {
+        return Err(invalid(format!("endpoint url {url:?} has no host")));
+    }
+    Ok((scheme.to_ascii_lowercase(), host))
+}
+
+/// Hosts a plaintext transport may talk to without crossing the network.
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn validate_endpoints(
+    transport: &str,
+    endpoints: &[EndpointConfig],
+    plaintext_scheme: &str,
+    tls_scheme: &str,
+    tls_available: bool,
+) -> Result<(), ConfigError> {
+    if endpoints.is_empty() {
+        return Err(invalid(format!(
+            "[crypto.{transport}] needs at least one [[crypto.{transport}.endpoint]]"
+        )));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for endpoint in endpoints {
+        if endpoint.name.is_empty() {
+            return Err(invalid(format!(
+                "[crypto.{transport}] endpoint with empty name"
+            )));
+        }
+        if !names.insert(endpoint.name.as_str()) {
+            return Err(invalid(format!(
+                "[crypto.{transport}] endpoint name {:?} is duplicated",
+                endpoint.name
+            )));
+        }
+        let (scheme, host) = parse_endpoint_url(&endpoint.url)?;
+        if scheme == tls_scheme {
+            if !tls_available {
+                return Err(invalid(format!(
+                    "endpoint {:?}: TLS ({tls_scheme}://) for the {transport} transport is not \
+                     compiled into this build; use remote-http for TLS",
+                    endpoint.url
+                )));
+            }
+        } else if scheme == plaintext_scheme {
+            if !is_loopback_host(&host) {
+                return Err(invalid(format!(
+                    "endpoint {:?}: plaintext {plaintext_scheme}:// is only allowed to loopback \
+                     hosts; block data would cross the network unencrypted (use {tls_scheme}:// \
+                     or a local tunnel)",
+                    endpoint.url
+                )));
+            }
+        } else {
+            return Err(invalid(format!(
+                "endpoint {:?}: scheme must be {plaintext_scheme} or {tls_scheme}",
+                endpoint.url
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
+    if tls.server_name.is_some() {
+        return Err(invalid(format!(
+            "[crypto.{section}.tls] server_name is not supported; put the certificate's name \
+             in the endpoint url instead"
+        )));
+    }
+    for (field, path) in [
+        ("ca_file", &tls.ca_file),
+        ("client_cert_file", &tls.client_cert_file),
+    ] {
+        if let Some(path) = path {
+            std::fs::File::open(path).map_err(|e| {
+                invalid(format!(
+                    "[crypto.{section}.tls] {field} {path:?} is not readable: {e}"
+                ))
+            })?;
+        }
+    }
+    if let Some(key) = &tls.client_key {
+        validate_credential(key)?;
+        if tls.client_cert_file.is_none() {
+            return Err(invalid(format!(
+                "[crypto.{section}.tls] client_key requires client_cert_file"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
+    if !["POST", "PUT"].contains(&op.method.to_ascii_uppercase().as_str()) {
+        return Err(invalid(format!(
+            "[crypto.http.{name}] method {:?} must be POST or PUT",
+            op.method
+        )));
+    }
+    if !op.path.starts_with('/') {
+        return Err(invalid(format!(
+            "[crypto.http.{name}] path {:?} must start with a slash",
+            op.path
+        )));
+    }
+    for (header, value) in &op.headers {
+        if header.trim().is_empty() {
+            return Err(invalid(format!("[crypto.http.{name}] empty header name")));
+        }
+        if let HeaderValue::Credential(c) = value {
+            validate_credential(c)?;
+        }
+    }
+    let body_is_batch = op
+        .body
+        .as_ref()
+        .map(|b| b.body_type == "json" && b.items_path.is_some())
+        .unwrap_or(false);
+    if let Some(body) = &op.body {
+        if !["json", "raw"].contains(&body.body_type.as_str()) {
+            return Err(invalid(format!(
+                "[crypto.http.{name}.body] type {:?} must be json or raw",
+                body.body_type
+            )));
+        }
+    }
+    if let Some(response) = &op.response {
+        if !["json", "raw"].contains(&response.response_type.as_str()) {
+            return Err(invalid(format!(
+                "[crypto.http.{name}.response] type {:?} must be json or raw",
+                response.response_type
+            )));
+        }
+        if body_is_batch {
+            if response.items_path.is_none() {
+                return Err(invalid(format!(
+                    "[crypto.http.{name}.response] batch layout requires items_path"
+                )));
+            }
+            if response.item_index_path.is_none() {
+                return Err(invalid(format!(
+                    "[crypto.http.{name}.response] batch layout requires item_index_path: \
+                     every batch element must echo its unit index so reordered, duplicated \
+                     or dropped items are detected"
+                )));
+            }
+        }
+    } else if body_is_batch {
+        return Err(invalid(format!(
+            "[crypto.http.{name}] batch layout requires a [crypto.http.{name}.response] mapping"
+        )));
+    }
+    Ok(())
+}
+
+impl VolumeConfig {
+    /// Cross-field checks for every numeric, duration, and enumerated
+    /// setting the runtime consumes (review M-013): a zero count would park
+    /// a semaphore forever, a NaN rate would panic in `Duration::from_secs_f64`,
+    /// and an inverted range would silently disable a bound.
+    fn validate_settings(&self) -> Result<(), ConfigError> {
+        let l = &self.limits;
+        for (name, value) in [
+            ("limits.max_active_callbacks", l.max_active_callbacks as u64),
+            (
+                "limits.max_pending_crypto_items",
+                l.max_pending_crypto_items as u64,
+            ),
+            (
+                "limits.max_crypto_inflight_batches",
+                l.max_crypto_inflight_batches as u64,
+            ),
+            (
+                "limits.max_inflight_per_endpoint",
+                l.max_inflight_per_endpoint as u64,
+            ),
+            ("limits.max_plaintext_bytes", l.max_plaintext_bytes.0),
+            ("limits.max_ciphertext_bytes", l.max_ciphertext_bytes.0),
+            (
+                "limits.max_pending_crypto_bytes",
+                l.max_pending_crypto_bytes.0,
+            ),
+            (
+                "limits.max_crypto_inflight_bytes",
+                l.max_crypto_inflight_bytes.0,
+            ),
+            (
+                "limits.max_inflight_bytes_per_endpoint",
+                l.max_inflight_bytes_per_endpoint.0,
+            ),
+        ] {
+            if value == 0 {
+                return Err(invalid(format!("{name} must be positive")));
+            }
+        }
+        if l.max_ciphertext_bytes.0 < l.max_plaintext_bytes.0 {
+            return Err(invalid(
+                "limits.max_ciphertext_bytes must be at least limits.max_plaintext_bytes",
+            ));
+        }
+
+        let r = &self.crypto.retry;
+        if r.strategy != "exponential-full-jitter" {
+            return Err(invalid(format!(
+                "crypto.retry.strategy {:?} is not supported (exponential-full-jitter)",
+                r.strategy
+            )));
+        }
+        if r.initial_delay.0.is_zero() {
+            return Err(invalid("crypto.retry.initial_delay must be positive"));
+        }
+        if r.max_delay.0 < r.initial_delay.0 {
+            return Err(invalid(
+                "crypto.retry.max_delay must be at least initial_delay",
+            ));
+        }
+
+        let b = &self.crypto.retry_budget;
+        if !b.retry_ratio.is_finite() || b.retry_ratio < 0.0 {
+            return Err(invalid(
+                "crypto.retry_budget.retry_ratio must be a finite, non-negative number",
+            ));
+        }
+        if b.burst == 0 {
+            return Err(invalid("crypto.retry_budget.burst must be positive"));
+        }
+        let probe = b.minimum_probe_rate.0;
+        if !probe.is_finite() || probe <= 0.0 || probe > 1000.0 {
+            return Err(invalid(
+                "crypto.retry_budget.minimum_probe_rate must be finite and within (0, 1000]/s",
+            ));
+        }
+
+        let c = &self.crypto.circuit_breaker;
+        if c.failure_threshold == 0 || c.half_open_max_requests == 0 || c.success_threshold == 0 {
+            return Err(invalid(
+                "crypto.circuit_breaker thresholds and half_open_max_requests must be positive",
+            ));
+        }
+        if c.open_initial.0.is_zero() {
+            return Err(invalid(
+                "crypto.circuit_breaker.open_initial must be positive",
+            ));
+        }
+        if c.open_max.0 < c.open_initial.0 {
+            return Err(invalid(
+                "crypto.circuit_breaker.open_max must be at least open_initial",
+            ));
+        }
+
+        let bt = &self.crypto.batch;
+        let unit = self.volume.crypto_unit_size as u64;
+        if bt.max_items == 0 {
+            return Err(invalid("crypto.batch.max_items must be positive"));
+        }
+        if bt.max_bytes.0 < unit {
+            return Err(invalid(format!(
+                "crypto.batch.max_bytes must hold at least one crypto unit ({unit} bytes)"
+            )));
+        }
+        if bt.target_items == 0 || bt.target_items > bt.max_items {
+            return Err(invalid(
+                "crypto.batch.target_items must be within 1..=max_items",
+            ));
+        }
+        if bt.target_bytes.0 == 0 || bt.target_bytes.0 > bt.max_bytes.0 {
+            return Err(invalid(
+                "crypto.batch.target_bytes must be within 1..=max_bytes",
+            ));
+        }
+
+        let mode = self.crypto.capabilities.mode.as_str();
+        if !["declared", "hybrid", "probed"].contains(&mode) {
+            return Err(invalid(format!(
+                "crypto.capabilities.mode {mode:?} must be declared|hybrid|probed"
+            )));
+        }
+        if let Some(t) = &self.crypto.max_operation_time {
+            if t.0.is_zero() {
+                return Err(invalid("crypto.max_operation_time must be positive"));
+            }
+        }
+
+        if self.cache.mode == CacheMode::Read {
+            if self.cache.max_bytes.0 == 0 {
+                return Err(invalid(
+                    "cache.max_bytes must be positive when cache.mode = read",
+                ));
+            }
+            if self.cache.ttl.0.is_zero() {
+                return Err(invalid("cache.ttl must be positive when cache.mode = read"));
+            }
+        }
+
+        let n = &self.nbd;
+        if n.threads == 0 {
+            return Err(invalid("nbd.threads must be positive"));
+        }
+        for (name, v) in [
+            ("nbd.minimum_io", n.minimum_io as u64),
+            ("nbd.preferred_io", n.preferred_io as u64),
+            ("nbd.maximum_io", n.maximum_io.0),
+        ] {
+            if v == 0 || !v.is_power_of_two() {
+                return Err(invalid(format!("{name} must be a positive power of two")));
+            }
+        }
+        if (n.minimum_io as u64) < self.volume.device_block_size as u64
+            || n.preferred_io < n.minimum_io
+            || n.maximum_io.0 < n.preferred_io as u64
+        {
+            return Err(invalid(
+                "nbd I/O sizes must satisfy device_block_size <= minimum_io <= preferred_io <= maximum_io",
+            ));
+        }
+
+        if let Some(socket) = &self.control.socket {
+            if socket.trim().is_empty() {
+                return Err(invalid("control.socket must not be empty"));
+            }
+        }
+        if let Some(group) = &self.control.group {
+            if group.trim().is_empty() {
+                return Err(invalid("control.group must not be empty"));
+            }
+        }
+
+        let lock = self.security.memory_lock_mode.as_str();
+        if !["secure-buffers", "all", "off"].contains(&lock) {
+            return Err(invalid(format!(
+                "security.memory_lock_mode {lock:?} must be secure-buffers|all|off (SPEC 36)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Provider-specific requirements (review M-013/M-014/M-015): every
+    /// section the selected provider needs must be present and complete,
+    /// sections it cannot use must be absent, endpoints must parse, and a
+    /// plaintext transport may only talk to loopback.
+    fn validate_provider_sections(&self) -> Result<(), ConfigError> {
+        let provider = self.crypto.provider.as_str();
+        let crypto = &self.crypto;
+        let unused = |section: &str, present: bool| -> Result<(), ConfigError> {
+            if present {
+                Err(invalid(format!(
+                    "[crypto.{section}] is not used by provider {provider:?}; remove it"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        match provider {
+            "local-aes-gcm-siv" | "local-aes-xts" => {
+                if crypto.key.is_none() {
+                    return Err(invalid(format!(
+                        "provider {provider:?} requires [crypto].key = {{ source, name }}"
+                    )));
+                }
+                unused("http", crypto.http.is_some())?;
+                unused("websocket", crypto.websocket.is_some())?;
+                unused("grpc", crypto.grpc.is_some())?;
+            }
+            "fake" => {
+                unused("http", crypto.http.is_some())?;
+                unused("websocket", crypto.websocket.is_some())?;
+                unused("grpc", crypto.grpc.is_some())?;
+            }
+            "remote-http" => {
+                if crypto.key.is_some() {
+                    return Err(invalid("[crypto].key is only used by local providers"));
+                }
+                unused("websocket", crypto.websocket.is_some())?;
+                unused("grpc", crypto.grpc.is_some())?;
+                let http = crypto
+                    .http
+                    .as_ref()
+                    .ok_or_else(|| invalid("provider \"remote-http\" requires [crypto.http]"))?;
+                validate_endpoints("http", &http.endpoint, "http", "https", true)?;
+                let encrypt = http.encrypt.as_ref().ok_or_else(|| {
+                    invalid("provider \"remote-http\" requires [crypto.http.encrypt]")
+                })?;
+                let decrypt = http.decrypt.as_ref().ok_or_else(|| {
+                    invalid("provider \"remote-http\" requires [crypto.http.decrypt]")
+                })?;
+                validate_http_op("encrypt", encrypt)?;
+                validate_http_op("decrypt", decrypt)?;
+                if let Some(tls) = &http.tls {
+                    validate_tls("http", tls)?;
+                }
+                if let Some(t) = &http.timeout {
+                    if t.0.is_zero() {
+                        return Err(invalid("[crypto.http] timeout must be positive"));
+                    }
+                }
+                if let Some(b) = &http.max_response_bytes {
+                    if b.0 == 0 {
+                        return Err(invalid("[crypto.http] max_response_bytes must be positive"));
+                    }
+                }
+            }
+            "remote-websocket" => {
+                if crypto.key.is_some() {
+                    return Err(invalid("[crypto].key is only used by local providers"));
+                }
+                unused("http", crypto.http.is_some())?;
+                unused("grpc", crypto.grpc.is_some())?;
+                let ws = crypto.websocket.as_ref().ok_or_else(|| {
+                    invalid("provider \"remote-websocket\" requires [crypto.websocket]")
+                })?;
+                if ws.tls.is_some() {
+                    return Err(invalid(
+                        "[crypto.websocket.tls]: TLS for the websocket transport is not compiled \
+                         into this build; use remote-http for TLS",
+                    ));
+                }
+                validate_endpoints("websocket", &ws.endpoint, "ws", "wss", false)?;
+            }
+            "remote-grpc" => {
+                if crypto.key.is_some() {
+                    return Err(invalid("[crypto].key is only used by local providers"));
+                }
+                unused("http", crypto.http.is_some())?;
+                unused("websocket", crypto.websocket.is_some())?;
+                let grpc = crypto
+                    .grpc
+                    .as_ref()
+                    .ok_or_else(|| invalid("provider \"remote-grpc\" requires [crypto.grpc]"))?;
+                if grpc.tls.is_some() {
+                    return Err(invalid(
+                        "[crypto.grpc.tls]: TLS for the grpc transport is not compiled into this \
+                         build; use remote-http for TLS",
+                    ));
+                }
+                validate_endpoints("grpc", &grpc.endpoint, "http", "https", false)?;
+                for (name, value) in &grpc.metadata {
+                    if name.trim().is_empty() {
+                        return Err(invalid("[crypto.grpc.metadata] empty key"));
+                    }
+                    if let HeaderValue::Credential(c) = value {
+                        validate_credential(c)?;
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

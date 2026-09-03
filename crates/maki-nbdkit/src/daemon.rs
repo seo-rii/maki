@@ -124,12 +124,28 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
     }
 }
 
-/// Credential router for header secrets: systemd credentials directory when
-/// available, environment variables as the development fallback (SPEC §9).
+/// Credential router for header, metadata and TLS-key secrets (SPEC 9): a
+/// path-like name is read as a file (the `file` source), otherwise the systemd
+/// credentials directory is tried first and environment variables are the
+/// development fallback.
 struct RoutedKeySource;
 
 impl KeySource for RoutedKeySource {
     fn load(&self, name: &str) -> Result<maki_crypto::SecretBuffer, maki_crypto::CryptoError> {
+        if name.contains(['/', '\\']) {
+            let path = std::path::Path::new(name);
+            let dir = path.parent().unwrap_or(std::path::Path::new("."));
+            let file = path
+                .file_name()
+                .ok_or_else(|| {
+                    maki_crypto::CryptoError::ProviderFatal(format!(
+                        "credential path {name:?} has no file name"
+                    ))
+                })?
+                .to_string_lossy()
+                .into_owned();
+            return FileKeySource::new(dir).load(&file);
+        }
         if let Some(source) = systemd_credential_source() {
             if let Ok(secret) = source.load(name) {
                 return Ok(secret);

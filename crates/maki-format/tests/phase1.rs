@@ -397,6 +397,7 @@ max_virtual_size = "1GiB"
 [crypto]
 provider = "local-aes-gcm-siv"
 crypto_compatibility_id = "local-v1"
+key = { source = "env", name = "k" }
 [crypto.capabilities]
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
@@ -473,11 +474,23 @@ crypto_compatibility_id = "v1"
 [crypto.capabilities]
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
+[[crypto.http.endpoint]]
+name = "primary"
+url = "https://crypto.internal"
 [crypto.http.encrypt]
 method = "POST"
 path = "/encrypt"
 [crypto.http.encrypt.headers]
 Authorization = { source = "credential", name = "crypto-token" }
+[crypto.http.encrypt.response]
+data_path = "/ciphertext"
+encoding = "base64"
+[crypto.http.decrypt]
+method = "POST"
+path = "/decrypt"
+[crypto.http.decrypt.response]
+data_path = "/plaintext"
+encoding = "base64"
 [backing]
 root = "/x"
 "#;
@@ -542,7 +555,7 @@ decrypt_path = "/vendor.Kms/Decrypt"
 max_message_bytes = "4MiB"
 [[crypto.grpc.endpoint]]
 name = "primary"
-url = "http://crypto.internal:7000"
+url = "http://127.0.0.1:7000"
 [crypto.grpc.metadata]
 authorization = { source = "credential", name = "crypto-token" }
 [backing]
@@ -572,7 +585,7 @@ supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
 [[crypto.grpc.endpoint]]
 name = "primary"
-url = "http://crypto.internal:7000"
+url = "http://127.0.0.1:7000"
 [crypto.grpc.metadata]
 authorization = "Bearer sk-actual-secret"
 [backing]

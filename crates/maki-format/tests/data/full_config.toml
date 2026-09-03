@@ -38,6 +38,63 @@ url = "https://crypto-a.internal"
 name = "crypto-b"
 url = "https://crypto-b.internal"
 
+# Request/response mapping for the vendor batch API (SPEC 19). Every batch
+# element must echo its unit index (item_index_path) so reordered, dropped
+# or duplicated results are detected; the bearer token is a credential
+# reference, never a literal (SPEC 9).
+
+[crypto.http.encrypt]
+method = "POST"
+path = "/v1/encrypt"
+
+[crypto.http.encrypt.headers]
+Authorization = { source = "credential", name = "crypto-token", format = "Bearer {}" }
+
+[crypto.http.encrypt.body]
+type = "json"
+items_path = "/items"
+
+[crypto.http.encrypt.body.fields]
+"/volume" = { source = "volume_id" }
+"/profile" = { source = "compatibility_id" }
+
+[crypto.http.encrypt.body.item_fields]
+"/unit" = { source = "unit_index" }
+"/data" = { source = "payload", encoding = "base64" }
+
+[crypto.http.encrypt.response]
+type = "json"
+items_path = "/items"
+item_index_path = "/unit"
+data_path = "/data"
+encoding = "base64"
+
+[crypto.http.decrypt]
+method = "POST"
+path = "/v1/decrypt"
+
+[crypto.http.decrypt.headers]
+Authorization = { source = "credential", name = "crypto-token", format = "Bearer {}" }
+
+[crypto.http.decrypt.body]
+type = "json"
+items_path = "/items"
+
+[crypto.http.decrypt.body.fields]
+"/volume" = { source = "volume_id" }
+"/profile" = { source = "compatibility_id" }
+
+[crypto.http.decrypt.body.item_fields]
+"/unit" = { source = "unit_index" }
+"/data" = { source = "payload", encoding = "base64" }
+
+[crypto.http.decrypt.response]
+type = "json"
+items_path = "/items"
+item_index_path = "/unit"
+data_path = "/data"
+encoding = "base64"
+
 [limits]
 max_active_callbacks = 64
 

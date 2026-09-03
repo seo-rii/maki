@@ -46,6 +46,49 @@ WebSocket and gRPC fail closed when TLS is configured. Use `remote-http` when a
 remote production deployment requires TLS until those transports gain rustls
 support.
 
+## Validation rules
+
+`validate()` runs before a volume is created and before every attach. Beyond
+schema, geometry, and secret-literal checks it rejects:
+
+- any zero count or byte limit under `[limits]`, `[crypto.batch]`,
+  `[crypto.circuit_breaker]`, and `[crypto.retry_budget]`, a non-finite or
+  negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s`, an
+  `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
+  targets above their maxima, or a batch byte limit smaller than one crypto
+  unit;
+- a retry strategy other than `exponential-full-jitter`, an unknown
+  `capabilities.mode`, `availability_policy = "bounded-error"` without a
+  positive `max_operation_time`, and a `security.memory_lock_mode` outside
+  `secure-buffers | all | off`;
+- NBD I/O sizes that are not powers of two or not ordered
+  `device_block_size <= minimum_io <= preferred_io <= maximum_io`, or an
+  `nbd.device_block_size` that differs from the volume's;
+- a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
+- missing or foreign provider sections: local providers need `[crypto].key` and
+  must not carry transport sections; `remote-http` needs `[crypto.http]` with at
+  least one endpoint and both `encrypt` and `decrypt` mappings; `remote-websocket`
+  and `remote-grpc` need their section with at least one endpoint;
+- endpoint URLs without a scheme or host, with userinfo, with duplicate or empty
+  names, or with a scheme the transport does not speak;
+- **plaintext transports to non-loopback hosts**: `http://`, `ws://`, and gRPC
+  `http://` endpoints are accepted only for `localhost`, `127.0.0.0/8`, and
+  `::1`. Block data must not cross the network unencrypted; use `https://` or a
+  local tunnel. `wss://`, gRPC `https://`, and `[crypto.websocket.tls]` /
+  `[crypto.grpc.tls]` are refused because those transports have no TLS support
+  in this build;
+- HTTP batch layouts (`body.items_path`) whose response mapping lacks
+  `items_path` or `item_index_path`: every batch element must echo its unit
+  index so reordered, dropped, or duplicated results are detected;
+- TLS material that does not exist or cannot be read, `client_key` without
+  `client_cert_file`, and `server_name` (unsupported: put the certificate's name
+  in the endpoint URL);
+- the `keyring` credential source, which this build does not implement.
+
+The HTTP provider additionally refuses to start when a CA or client certificate
+file cannot be read or parsed, and reads `client_key` from its credential source
+to complete the client identity.
+
 ## Compatibility identity
 
 `crypto_compatibility_id` identifies the cryptographic profile rather than a

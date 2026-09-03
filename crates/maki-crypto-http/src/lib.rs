@@ -170,6 +170,14 @@ pub struct HttpCryptoProvider {
     spec: HttpProviderSpec,
 }
 
+impl std::fmt::Debug for HttpCryptoProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpCryptoProvider")
+            .field("base_url", &self.spec.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
 fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
@@ -578,17 +586,55 @@ impl HttpCryptoProvider {
             replay_protection: capability(&caps_cfg.replay_protection),
         };
 
-        let tls = http.tls.as_ref().map(|t| {
-            let ca_pem = t.ca_file.as_ref().and_then(|path| std::fs::read(path).ok());
-            let identity_pem = t
-                .client_cert_file
-                .as_ref()
-                .and_then(|path| std::fs::read(path).ok());
-            TlsSpec {
-                ca_pem,
-                identity_pem,
+        // TLS material is fail-closed (review M-015): an unreadable CA or
+        // client certificate refuses attach instead of silently falling
+        // back to default trust or no client identity.
+        let tls = match http.tls.as_ref() {
+            None => None,
+            Some(t) => {
+                if let Some(name) = &t.server_name {
+                    return Err(fatal(format!(
+                        "[crypto.http.tls] server_name {name:?} is not supported; \
+                         put the certificate's name in the endpoint url"
+                    )));
+                }
+                let read = |what: &str, path: &str| -> Result<Vec<u8>, CryptoError> {
+                    std::fs::read(path)
+                        .map_err(|e| fatal(format!("[crypto.http.tls] {what} {path:?}: {e}")))
+                };
+                let ca_pem = match &t.ca_file {
+                    Some(path) => Some(read("ca_file", path)?),
+                    None => None,
+                };
+                let identity_pem = match &t.client_cert_file {
+                    Some(path) => {
+                        let mut pem = read("client_cert_file", path)?;
+                        if let Some(key) = &t.client_key {
+                            // Private key from its credential source, appended
+                            // to the certificate PEM for the client identity.
+                            let secret = keys.load(&key.name)?;
+                            if !pem.ends_with(b"\n") {
+                                pem.push(b'\n');
+                            }
+                            pem.extend_from_slice(secret.expose());
+                        }
+                        Some(pem)
+                    }
+                    None => {
+                        if t.client_key.is_some() {
+                            return Err(fatal(
+                                "[crypto.http.tls] client_key requires client_cert_file",
+                            ));
+                        }
+                        None
+                    }
+                };
+                Some(TlsSpec {
+                    ca_pem,
+                    identity_pem,
+                })
             }
-        });
+        };
 
         Self::new(HttpProviderSpec {
             base_url: endpoint_url.trim_end_matches('/').to_string(),
