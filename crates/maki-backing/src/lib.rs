@@ -70,4 +70,11 @@ pub trait Backing: Send + Sync + 'static {
     /// Acquire the exclusive volume lock file. Fails with `WouldBlock` if
     /// another process/daemon holds it (`VOLUME_ALREADY_ATTACHED`).
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>>;
+
+    /// Free space available to this namespace, if the backing can tell
+    /// (`None` = unknown). Feeds the journal emergency reserve and the
+    /// `maki_backing_free_bytes` metric.
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
 }

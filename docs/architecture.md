@@ -108,6 +108,15 @@ fsyncs the data directory before clearing any dirty flag, commits checkpoint
 state, and only then deletes covered journal segments. A checkpoint that fails
 part-way leaves every incomplete step marked for the retry.
 
+Checkpoints are not only a shutdown step. A background worker checkpoints when
+the journal crosses a size watermark, when backing free space drops below the
+checkpoint reserve, and on a time interval (syncing unsynced records first). The
+write path forces a journal sync once unsynced bytes reach their limit, reclaims
+inline at the hard journal limit, and refuses writes with ENOSPC when the
+backing is below its emergency reserve or the journal cannot be reclaimed. A
+failed reclaim marks the engine degraded until a later checkpoint succeeds; the
+[remediation log](review-remediation.md#bounded-journal) lists the exact rules.
+
 ## Provider boundary
 
 Every provider declares plaintext sizes, maximum ciphertext size, batching,

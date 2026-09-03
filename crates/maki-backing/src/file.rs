@@ -178,6 +178,28 @@ impl Backing for FileBacking {
             Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
     }
+
+    #[cfg(unix)]
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(self.root.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "root path contains NUL"))?;
+        // SAFETY: statvfs writes into the zeroed struct we pass; the path is a
+        // valid NUL-terminated C string for the duration of the call.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(
+            (st.f_bavail as u64).saturating_mul(st.f_frsize as u64),
+        ))
+    }
+
+    /// Free-space queries are not wired on non-Unix development hosts.
+    #[cfg(not(unix))]
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]

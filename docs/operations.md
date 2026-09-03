@@ -193,6 +193,15 @@ or other high-cardinality values as metric labels.
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.
+- Writes fail with ENOSPC when backing free space is below
+  `backing.journal_emergency_reserve_bytes`, or when the journal has reached
+  `backing.journal_max_bytes` and an inline checkpoint could not reclaim it.
+  Reads keep working. `maki status` then shows `state: degraded` with the
+  checkpoint error; the state returns to `ready` once a checkpoint succeeds
+  (the worker retries on its interval, and every write retries the reclaim).
+- `maki reload` returns an error naming the section for any change the running
+  daemon cannot apply; only `cache` is applied at runtime today. An error means
+  the change was not applied: restart the daemon.
 
 Use [Testing and qualification](testing.md) before interpreting a successful
 userspace smoke test as production readiness.

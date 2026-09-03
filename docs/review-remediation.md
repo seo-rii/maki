@@ -23,8 +23,8 @@ Status values: **Fixed** (regression test landed and passes), **Partial**
 
 | Finding | Status | Change | Regression tests |
 |---|---|---|---|
-| M-004 no automatic checkpointing; journal / free-space bounds unenforced | Open | — | — |
-| M-005 control socket not started by the daemon; no-op reloads | Open | — | — |
+| M-004 no automatic checkpointing; journal / free-space bounds unenforced | Fixed | See [Bounded journal](#bounded-journal): a background checkpoint worker (watermark, low free space, interval), a forced journal sync at `limits.max_journal_pending_bytes`, inline reclaim and ENOSPC at `backing.journal_max_bytes`, ENOSPC below `backing.journal_emergency_reserve_bytes`, eager checkpoints below `backing.checkpoint_reserve_bytes`, a `Degraded` state, and the `maki_backing_free_bytes` / `maki_journal_bytes` / `maki_checkpoint_lag_bytes` metrics. `Backing::free_bytes` (statvfs on Unix) feeds the reserves. Config validation now requires `journal_max_bytes >= 2 * journal_segment_size`. | `review_bounded.rs` (maki-core): `sustained_writes_keep_journal_and_overlay_within_hard_limits`, `worker_checkpoints_when_watermark_is_crossed`, `worker_checkpoints_on_interval_and_syncs_pending_records`, `worker_stops_when_engine_is_dropped`, `pending_bytes_limit_forces_journal_sync`, `emergency_reserve_refuses_writes_until_space_returns`, `failed_reclaim_at_hard_limit_degrades_then_recovers` |
+| M-005 control socket not started by the daemon; no-op reloads | Partial | `reload` now returns an explicit "NOT applied" error for every section the engine cannot apply at runtime (`retry`, `circuit-breaker`, `batch`, `limits`, `timeouts`, `semaphores`, `endpoints`, `credentials`); only `cache` is applied, and it requires `max_bytes`. `status` reports the engine state, journal size, free space, and checkpoint counters. Spawning the UDS server from the daemon path remains open. | control backend tests (to be added with the UDS wiring) |
 | M-006 mount-identity verification is a no-op | Open | — | — |
 | M-009 A/B reader collapses I/O errors into "invalid copy" | Fixed | `AbStore` reports any I/O failure other than not-found as an error; empty, short, and CRC-invalid copies remain "invalid". `create_volume` writes both checkpoint-state copies (sequence 0) and recovery requires a valid copy on every volume instead of defaulting to 0. | `recovery_requires_valid_checkpoint_state`, `recovery_surfaces_hard_io_error_on_checkpoint_state`, `ab_load_reports_hard_io_errors_instead_of_masking_them`, `ab_load_treats_missing_empty_and_corrupt_sides_as_invalid_copies`, `create_volume_writes_checkpoint_state_and_durable_mark` |
 | M-010 retry ignores `retry_safe`; no absolute deadline | Open | — | — |
@@ -95,6 +95,30 @@ self-test:
   prove anything about an old key.
 
 Operational consequences are in [Operations](operations.md#key-binding-at-first-attach).
+
+## Bounded journal
+
+`Engine` (`maki-core/src/engine.rs`) enforces `CheckpointPolicy`, which the
+daemon derives from configuration:
+
+| Policy field | Source | Effect |
+|---|---|---|
+| `journal_high_watermark_bytes` | `backing.journal_max_bytes / 2` | Write path wakes the worker once journal bytes on disk reach it; the worker checkpoints. |
+| `journal_max_bytes` | `backing.journal_max_bytes` | Hard limit. A write that would cross it first syncs the journal and checkpoints inline (under the volume lock); if the journal still cannot fit the write, it fails with ENOSPC. |
+| `max_pending_bytes` | `limits.max_journal_pending_bytes` | Appended-but-unsynced bytes; the write path forces a journal sync before exceeding it. |
+| `emergency_reserve_bytes` | `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC while backing free space is below it. Reads continue. |
+| `low_space_checkpoint_bytes` | `backing.checkpoint_reserve_bytes` | The worker checkpoints eagerly while free space is below it. |
+| `interval` | 30 s (engine default) | The worker syncs pending records and checkpoints at least this often while anything is unapplied. |
+
+The worker holds only a weak reference to the engine and exits when the
+engine is dropped. Free space is queried through `Backing::free_bytes`
+(`statvfs` on Unix; unknown elsewhere and in the in-memory backings unless a
+test sets it) and cached for one second of the engine's clock.
+
+A checkpoint failure on any path increments `checkpoint_failures_total` and
+sets `EngineState::Degraded { reason }`; the next successful checkpoint
+returns the engine to `Ready`. The control socket reports the state in
+`status` and as `maki_volume_state` (1 ready, 2 degraded).
 
 ## On-disk additions
 

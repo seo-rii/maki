@@ -741,6 +741,7 @@ impl VolumeConfig {
         }
         self.geometry()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        self.validate_journal_bounds()?;
         if !self
             .crypto
             .capabilities
@@ -828,4 +829,31 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid("credential name is empty".to_string()));
     }
     Ok(())
+}
+
+impl VolumeConfig {
+    /// Cross-field checks for the journal bound settings the engine enforces
+    /// (review M-004/M-013): every bound must be positive, and the hard
+    /// journal limit must leave room for at least one sealed segment plus
+    /// the active one, or the limit could never be honoured.
+    fn validate_journal_bounds(&self) -> Result<(), ConfigError> {
+        let seg = self.backing.journal_segment_size.0;
+        let max = self.backing.journal_max_bytes.0;
+        if seg < 4096 {
+            return Err(ConfigError::Invalid(format!(
+                "backing.journal_segment_size {seg} must be at least 4096 bytes"
+            )));
+        }
+        if max < seg.saturating_mul(2) {
+            return Err(ConfigError::Invalid(format!(
+                "backing.journal_max_bytes {max} must be at least twice journal_segment_size {seg}"
+            )));
+        }
+        if self.limits.max_journal_pending_bytes.0 == 0 {
+            return Err(ConfigError::Invalid(
+                "limits.max_journal_pending_bytes must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }

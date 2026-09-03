@@ -56,6 +56,8 @@ struct ActiveSegment {
     info: SegmentInfo,
     file: Arc<dyn BackingFile>,
     write_offset: u64,
+    /// File offset up to which this segment has been fdatasync'd.
+    synced_offset: u64,
     unsynced: bool,
 }
 
@@ -133,7 +135,7 @@ impl JournalWriter {
         self.active
             .as_ref()
             .filter(|a| a.unsynced)
-            .map(|a| a.write_offset)
+            .map(|a| a.write_offset.saturating_sub(a.synced_offset))
             .unwrap_or(0)
     }
 
@@ -157,6 +159,7 @@ impl JournalWriter {
         fp("journal.sync")?;
         active.file.sync_data()?;
         active.unsynced = false;
+        active.synced_offset = active.write_offset;
         self.durable_sequence = self.appended_sequence;
         let mark = DurableMark {
             segment_index: active.info.index,
@@ -231,6 +234,7 @@ impl JournalWriter {
                     },
                     file,
                     write_offset: SEGMENT_HEADER_SIZE as u64,
+                    synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
                 });
                 Ok(())

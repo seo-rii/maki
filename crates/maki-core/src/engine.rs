@@ -13,18 +13,28 @@
 //!   does not fit the volume geometry (SPEC §12, §27), and — through the key
 //!   canary — a provider or key other than the one the volume was written
 //!   with.
+//! - The journal is bounded (SPEC §12 "all internal queues are bounded",
+//!   review M-004): a background worker checkpoints on a size watermark, on
+//!   low backing free space, and on a time interval; the write path forces a
+//!   journal sync when unsynced bytes exceed their limit, checkpoints inline
+//!   at the hard journal limit, and refuses writes (ENOSPC) when the backing
+//!   is below its emergency reserve or the journal cannot be reclaimed. A
+//!   failed reclaim puts the engine in a `Degraded` state that the next
+//!   successful checkpoint clears.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock};
 
 use maki_backing::Backing;
 use maki_crypto::checked::CheckedProvider;
 use maki_crypto::selftest::provider_self_test;
 use maki_crypto::{
-    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
-    SecretBuffer,
+    CiphertextUnit, Clock, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    SecretBuffer, SystemClock,
 };
 use maki_format::ab::AbStore;
 use maki_format::canary::{canary_plaintext, KeyCanary, CANARY_UNIT_INDEX};
@@ -95,7 +105,53 @@ pub struct AttachIdentity {
     pub key_identity: String,
 }
 
-#[derive(Debug, Clone, Default)]
+/// How the journal is kept bounded (SPEC §26, §30; review M-004).
+#[derive(Debug, Clone)]
+pub struct CheckpointPolicy {
+    /// Journal bytes on disk at which the background worker checkpoints.
+    pub journal_high_watermark_bytes: u64,
+    /// Hard limit on journal bytes on disk. A write that would exceed it
+    /// first syncs and checkpoints inline; if that cannot reclaim enough
+    /// space the write fails with ENOSPC and the engine is degraded.
+    pub journal_max_bytes: u64,
+    /// Appended-but-unsynced journal bytes at which the write path forces a
+    /// journal sync before appending more.
+    pub max_pending_bytes: u64,
+    /// Backing free space below which writes are refused with ENOSPC
+    /// (0 disables). Reads always continue.
+    pub emergency_reserve_bytes: u64,
+    /// Backing free space below which the worker checkpoints eagerly to
+    /// reclaim journal segments (0 disables).
+    pub low_space_checkpoint_bytes: u64,
+    /// The worker checkpoints at least this often while anything is
+    /// pending; unsynced records are synced first so they can be applied.
+    pub interval: Duration,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            journal_high_watermark_bytes: 2 << 30,
+            journal_max_bytes: 4 << 30,
+            max_pending_bytes: 64 << 20,
+            emergency_reserve_bytes: 1 << 30,
+            low_space_checkpoint_bytes: 4 << 30,
+            interval: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Operational state (SPEC §40 `maki_volume_state`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EngineState {
+    #[default]
+    Ready,
+    /// A journal reclaim (checkpoint) failed; writes may be refused until a
+    /// later checkpoint succeeds. Reads are unaffected.
+    Degraded { reason: String },
+}
+
+#[derive(Clone, Default)]
 pub struct EngineOptions {
     pub volume: VolumeOptions,
     pub limits: EngineLimits,
@@ -103,6 +159,23 @@ pub struct EngineOptions {
     /// `None` skips the identity string comparison (the canary still
     /// applies); the daemon always sets it from configuration.
     pub identity: Option<AttachIdentity>,
+    pub checkpoint: CheckpointPolicy,
+    /// Time source for the checkpoint worker and free-space cache
+    /// (`None` = system clock; tests inject `ManualClock`).
+    pub clock: Option<Arc<dyn Clock>>,
+}
+
+impl std::fmt::Debug for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineOptions")
+            .field("volume", &self.volume)
+            .field("limits", &self.limits)
+            .field("cache", &self.cache)
+            .field("identity", &self.identity)
+            .field("checkpoint", &self.checkpoint)
+            .field("clock", &self.clock.as_ref().map(|_| "custom"))
+            .finish()
+    }
 }
 
 struct UnitLocks {
@@ -135,8 +208,13 @@ impl UnitLocks {
     }
 }
 
+/// How long a free-space reading is reused before the backing is asked
+/// again.
+const FREE_SPACE_CACHE_TTL: Duration = Duration::from_secs(1);
+
 struct EngineInner {
     volume: RwLock<Volume>,
+    backing: Arc<dyn Backing>,
     provider: CheckedProvider,
     context: CryptoContext,
     geometry: Geometry,
@@ -148,6 +226,22 @@ struct EngineInner {
     admission: maki_crypto::flow::DualSemaphore,
     /// Versioned plaintext read cache (SPEC §29). `None` = mode off.
     cache: Option<maki_cache::VersionedLruCache>,
+    policy: CheckpointPolicy,
+    clock: Arc<dyn Clock>,
+    /// Wakes the checkpoint worker early (watermark crossed, shutdown).
+    checkpoint_notify: Arc<Notify>,
+    state: parking_lot::Mutex<EngineState>,
+    checkpoints_total: AtomicU64,
+    checkpoint_failures_total: AtomicU64,
+    last_checkpoint_at: parking_lot::Mutex<Duration>,
+    free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
+}
+
+impl Drop for EngineInner {
+    fn drop(&mut self) {
+        // Let a sleeping worker observe that the engine is gone.
+        self.checkpoint_notify.notify_one();
+    }
 }
 
 #[derive(Clone)]
@@ -163,16 +257,23 @@ impl std::fmt::Debug for Engine {
     }
 }
 
+fn enospc(msg: impl Into<String>) -> CoreError {
+    CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::StorageFull,
+        msg.into(),
+    ))
+}
+
 impl Engine {
     /// Recover the volume, verify the provider (self-test + compatibility +
-    /// geometry contract + identity + key canary), and return a ready
-    /// engine.
+    /// geometry contract + identity + key canary), start the checkpoint
+    /// worker, and return a ready engine.
     pub async fn attach(
         backing: Arc<dyn Backing>,
         provider: Arc<dyn CryptoProvider>,
         options: EngineOptions,
     ) -> Result<Self, AttachError> {
-        let volume = Volume::recover(backing, options.volume)?;
+        let volume = Volume::recover(backing.clone(), options.volume)?;
         let superblock = volume.superblock().clone();
         let geometry = superblock.geometry.clone();
 
@@ -230,31 +331,44 @@ impl Engine {
             (1, u64::MAX)
         };
 
-        Ok(Self {
-            inner: Arc::new(EngineInner {
-                volume: RwLock::new(volume),
-                provider,
-                context,
-                geometry,
-                unit_locks: UnitLocks::new(),
-                batch_max_items,
-                batch_max_bytes,
-                admission: maki_crypto::flow::DualSemaphore::new(
-                    options.limits.max_active_callbacks,
-                    options.limits.max_plaintext_bytes,
-                ),
-                cache: options.cache.map(|c| {
-                    maki_cache::VersionedLruCache::new(
-                        maki_cache::CacheConfig {
-                            max_bytes: c.max_bytes,
-                            ttl: c.ttl,
-                            zeroize_on_evict: true,
-                        },
-                        Arc::new(maki_crypto::SystemClock::new()),
-                    )
-                }),
+        let clock: Arc<dyn Clock> = options
+            .clock
+            .unwrap_or_else(|| Arc::new(SystemClock::new()));
+        let notify = Arc::new(Notify::new());
+        let inner = Arc::new(EngineInner {
+            volume: RwLock::new(volume),
+            backing,
+            provider,
+            context,
+            geometry,
+            unit_locks: UnitLocks::new(),
+            batch_max_items,
+            batch_max_bytes,
+            admission: maki_crypto::flow::DualSemaphore::new(
+                options.limits.max_active_callbacks,
+                options.limits.max_plaintext_bytes,
+            ),
+            cache: options.cache.map(|c| {
+                maki_cache::VersionedLruCache::new(
+                    maki_cache::CacheConfig {
+                        max_bytes: c.max_bytes,
+                        ttl: c.ttl,
+                        zeroize_on_evict: true,
+                    },
+                    Arc::new(maki_crypto::SystemClock::new()),
+                )
             }),
-        })
+            policy: options.checkpoint,
+            last_checkpoint_at: parking_lot::Mutex::new(clock.now()),
+            clock,
+            checkpoint_notify: notify.clone(),
+            state: parking_lot::Mutex::new(EngineState::Ready),
+            checkpoints_total: AtomicU64::new(0),
+            checkpoint_failures_total: AtomicU64::new(0),
+            free_space: parking_lot::Mutex::new(None),
+        });
+        spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
+        Ok(Self { inner })
     }
 
     /// Split `count` items with `size_of(i)` bytes each into chunk ranges
@@ -291,6 +405,11 @@ impl Engine {
 
     pub fn geometry(&self) -> &Geometry {
         &self.inner.geometry
+    }
+
+    /// Current operational state.
+    pub fn state(&self) -> EngineState {
+        self.inner.state.lock().clone()
     }
 
     fn check_range(&self, offset: u64, len: usize) -> Result<(), CoreError> {
@@ -452,10 +571,12 @@ impl Engine {
                     .await?,
             );
         }
+        let incoming: u64 = cts.iter().map(|c| 32 + c.data.len() as u64).sum();
 
         // Journal + publish under the exclusive volume lock.
         {
             let mut volume = self.inner.volume.write().await;
+            self.admit_journal(&mut volume, incoming)?;
             for ct in &cts {
                 volume.write_ct(ct.unit_index, &ct.data, false)?;
                 // Any cached plaintext of an older version is now dead. The
@@ -468,8 +589,64 @@ impl Engine {
             if fua {
                 volume.flush()?;
             }
+            if volume.journal_total_bytes() >= self.inner.policy.journal_high_watermark_bytes {
+                self.inner.checkpoint_notify.notify_one();
+            }
         }
         Ok(())
+    }
+
+    /// Journal admission for `incoming` bytes of records (SPEC §30 "journal
+    /// queue"; review M-004): emergency free-space reserve, unsynced-bytes
+    /// barrier, and the hard journal limit with inline reclaim.
+    fn admit_journal(&self, volume: &mut Volume, incoming: u64) -> Result<(), CoreError> {
+        let policy = &self.inner.policy;
+        if policy.emergency_reserve_bytes > 0 {
+            if let Some(free) = self.backing_free_bytes() {
+                if free < policy.emergency_reserve_bytes {
+                    return Err(enospc(format!(
+                        "backing free space {free} below emergency reserve {}",
+                        policy.emergency_reserve_bytes
+                    )));
+                }
+            }
+        }
+        let pending = volume.journal_pending_bytes();
+        if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
+            volume.flush()?;
+        }
+        if volume.journal_total_bytes().saturating_add(incoming) > policy.journal_max_bytes {
+            // Everything sealed becomes reclaimable once it is durable.
+            volume.flush()?;
+            self.inner.checkpoint_locked(volume)?;
+            if volume.journal_total_bytes().saturating_add(incoming) > policy.journal_max_bytes {
+                return Err(enospc(format!(
+                    "journal at hard limit {} bytes and cannot be reclaimed",
+                    policy.journal_max_bytes
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Cached backing free space (`None` = unknown).
+    fn backing_free_bytes(&self) -> Option<u64> {
+        let now = self.inner.clock.now();
+        let mut cache = self.inner.free_space.lock();
+        if let Some((value, at)) = *cache {
+            if now.saturating_sub(at) < FREE_SPACE_CACHE_TTL {
+                return value;
+            }
+        }
+        let value = match self.inner.backing.free_bytes() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("backing free-space query failed: {e}");
+                None
+            }
+        };
+        *cache = Some((value, now));
+        value
     }
 
     /// Hot-resize the plaintext read cache (SPEC §20; 0 disables).
@@ -488,7 +665,7 @@ impl Engine {
 
     pub async fn checkpoint(&self) -> Result<u64, CoreError> {
         let mut volume = self.inner.volume.write().await;
-        volume.checkpoint()
+        self.inner.checkpoint_locked(&mut volume)
     }
 
     /// Journal/checkpoint/cache observability (metrics inputs, SPEC §40).
@@ -499,6 +676,7 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
+        let backing_free_bytes = self.backing_free_bytes();
         let volume = self.inner.volume.read().await;
         EngineStats {
             durable_sequence: volume.journal_durable_sequence(),
@@ -506,14 +684,109 @@ impl Engine {
             checkpoint_sequence: volume.checkpoint_sequence(),
             journal_segments: volume.journal_segment_count(),
             journal_pending_bytes: volume.journal_pending_bytes(),
+            journal_total_bytes: volume.journal_total_bytes(),
             overlay_units: volume.overlay_len(),
             overlay_bytes: volume.overlay_bytes(),
             cache_hits: cache.hits,
             cache_misses: cache.misses,
             cache_bytes: cache.bytes,
             cache_entries: cache.entries,
+            backing_free_bytes,
+            checkpoints_total: self.inner.checkpoints_total.load(Ordering::Relaxed),
+            checkpoint_failures_total: self.inner.checkpoint_failures_total.load(Ordering::Relaxed),
+            state: self.inner.state.lock().clone(),
         }
     }
+}
+
+impl EngineInner {
+    /// Run a checkpoint under the (already held) volume lock and record the
+    /// outcome in counters and state.
+    fn checkpoint_locked(&self, volume: &mut Volume) -> Result<u64, CoreError> {
+        match volume.checkpoint() {
+            Ok(seq) => {
+                self.checkpoints_total.fetch_add(1, Ordering::Relaxed);
+                *self.last_checkpoint_at.lock() = self.clock.now();
+                *self.state.lock() = EngineState::Ready;
+                Ok(seq)
+            }
+            Err(e) => {
+                self.checkpoint_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                *self.state.lock() = EngineState::Degraded {
+                    reason: format!("checkpoint failed: {e}"),
+                };
+                Err(e)
+            }
+        }
+    }
+
+    /// One worker pass: checkpoint if the journal crossed its watermark,
+    /// the backing is low on space, or the interval elapsed with work
+    /// pending (unsynced records are synced first so they can be applied).
+    async fn worker_pass(&self) {
+        let (total, appended, checkpointed, durable) = {
+            let v = self.volume.read().await;
+            (
+                v.journal_total_bytes(),
+                v.journal_appended_sequence(),
+                v.checkpoint_sequence(),
+                v.journal_durable_sequence(),
+            )
+        };
+        if appended <= checkpointed {
+            return; // nothing to apply
+        }
+        let by_size = total >= self.policy.journal_high_watermark_bytes;
+        let by_space = self.policy.low_space_checkpoint_bytes > 0
+            && self
+                .backing
+                .free_bytes()
+                .ok()
+                .flatten()
+                .map(|free| free < self.policy.low_space_checkpoint_bytes)
+                .unwrap_or(false);
+        let elapsed = self
+            .clock
+            .now()
+            .saturating_sub(*self.last_checkpoint_at.lock());
+        let by_time = elapsed >= self.policy.interval;
+        if !(by_size || by_space || by_time) {
+            return;
+        }
+        let mut volume = self.volume.write().await;
+        if by_time && durable < appended {
+            if let Err(e) = volume.flush() {
+                tracing::warn!("checkpoint worker: journal sync failed: {e}");
+                return;
+            }
+        }
+        if let Err(e) = self.checkpoint_locked(&mut volume) {
+            tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+        }
+    }
+}
+
+/// The background checkpoint worker. Holds only a weak reference so it
+/// exits once the engine is dropped (the engine's drop wakes it).
+fn spawn_checkpoint_worker(weak: Weak<EngineInner>, notify: Arc<Notify>, clock: Arc<dyn Clock>) {
+    let interval = weak
+        .upgrade()
+        .map(|i| i.policy.interval)
+        .unwrap_or(Duration::from_secs(30));
+    tokio::spawn(async move {
+        loop {
+            let sleep = clock.sleep(interval);
+            tokio::select! {
+                _ = sleep => {}
+                _ = notify.notified() => {}
+            }
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            inner.worker_pass().await;
+        }
+    });
 }
 
 /// Key-canary check (SPEC §12, review M-001).
@@ -644,11 +917,19 @@ pub struct EngineStats {
     pub appended_sequence: u64,
     pub checkpoint_sequence: u64,
     pub journal_segments: usize,
+    /// Appended but not yet fdatasync'd bytes.
     pub journal_pending_bytes: u64,
+    /// Every journal segment on disk.
+    pub journal_total_bytes: u64,
     pub overlay_units: usize,
     pub overlay_bytes: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_bytes: u64,
     pub cache_entries: usize,
+    /// `None` when the backing cannot report free space.
+    pub backing_free_bytes: Option<u64>,
+    pub checkpoints_total: u64,
+    pub checkpoint_failures_total: u64,
+    pub state: EngineState,
 }

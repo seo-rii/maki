@@ -89,6 +89,8 @@ struct Inner {
     locks: std::collections::HashSet<String>,
     hook: Option<FaultHook>,
     stats_pending_writes: usize,
+    /// Simulated free space reported by `Backing::free_bytes`.
+    free_bytes: Option<u64>,
 }
 
 impl Inner {
@@ -151,6 +153,12 @@ impl CrashableBacking {
 
     pub fn set_fault_hook(&self, hook: Option<FaultHook>) {
         self.inner.lock().hook = hook;
+    }
+
+    /// Simulate the free space the backing filesystem reports (`None` =
+    /// unknown, the default).
+    pub fn set_free_bytes(&self, free: Option<u64>) {
+        self.inner.lock().free_bytes = free;
     }
 
     pub fn pending_write_count(&self) -> usize {
@@ -663,6 +671,10 @@ impl Backing for CrashableBacking {
             }
         }
         Ok(())
+    }
+
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        Ok(self.inner.lock().free_bytes)
     }
 
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {

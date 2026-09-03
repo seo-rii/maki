@@ -95,6 +95,19 @@ The gRPC transport uses the message shape in
 Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
 
+## Journal bounds
+
+| Setting | Enforced as |
+|---|---|
+| `backing.journal_segment_size` | Size at which the journal writer starts a new segment (at least 4096 bytes) |
+| `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
+| `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC while backing free space is below it |
+| `backing.checkpoint_reserve_bytes` | The worker checkpoints eagerly while backing free space is below it |
+| `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; the write path forces a journal sync before exceeding it |
+
+Free space is read with `statvfs` on Unix hosts. Where it cannot be read, the
+free-space rules do not apply and `maki_backing_free_bytes` is null.
+
 ## Capacity and limits
 
 `volume.max_virtual_size`, `crypto_unit_size`, provider ciphertext bounds, slot

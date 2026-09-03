@@ -429,6 +429,15 @@ async fn dispatch_endpoint_set(
 
 pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
     EngineOptions {
+        checkpoint: maki_core::engine::CheckpointPolicy {
+            journal_high_watermark_bytes: config.backing.journal_max_bytes.0 / 2,
+            journal_max_bytes: config.backing.journal_max_bytes.0,
+            max_pending_bytes: config.limits.max_journal_pending_bytes.0,
+            emergency_reserve_bytes: config.backing.journal_emergency_reserve_bytes.0,
+            low_space_checkpoint_bytes: config.backing.checkpoint_reserve_bytes.0,
+            interval: std::time::Duration::from_secs(30),
+        },
+        clock: None,
         identity: Some(maki_core::engine::AttachIdentity {
             provider_type: config.crypto.provider.clone(),
             key_identity: config

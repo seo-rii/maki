@@ -947,6 +947,21 @@ delete completed journal segment
 fsync journal directory
 ```
 
+Checkpoints MUST run automatically, not only at detach. Triggers:
+
+```text
+journal bytes on disk >= journal_max_bytes / 2       (background worker)
+backing free space   <  checkpoint_reserve_bytes     (background worker)
+interval elapsed with unapplied records              (background worker, syncs first)
+write would exceed journal_max_bytes                 (inline, before the append)
+```
+
+A write that would exceed `journal_max_bytes` after an inline checkpoint, or
+that arrives while backing free space is below
+`journal_emergency_reserve_bytes`, MUST fail with ENOSPC; reads continue. A
+failed checkpoint MUST be visible as a degraded volume state until a later
+checkpoint succeeds.
+
 ---
 
 # 27. Recovery

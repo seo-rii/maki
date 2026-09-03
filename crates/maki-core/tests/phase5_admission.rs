@@ -50,6 +50,8 @@ async fn engine_with(
             volume: VolumeOptions::default(),
             limits,
             cache: None,
+            checkpoint: Default::default(),
+            clock: None,
         },
     )
     .await
