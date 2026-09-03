@@ -114,6 +114,14 @@ qualify `/dev/nbd`, LVM, XFS, or raw-device durability.
 
 ## Control plane
 
+The data plane binds the per-volume control socket while attaching, at
+`control.socket` or by default `/run/maki/<volume>/control.sock`, with mode
+0660 and the group named by `control.group` (`maki-admin` in the packaged
+units; `sysusers.d` makes `maki` a member so the unprivileged daemon can apply
+it). A socket that cannot be bound fails attach: a daemon without its control
+socket is not operable. Rootless runs must therefore set `control.socket` to a
+writable path. The socket is removed on clean detach.
+
 The unprivileged control socket accepts newline-delimited JSON with a 64 KiB
 line limit. The `maki` CLI exposes the supported operations:
 

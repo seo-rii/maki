@@ -79,7 +79,7 @@ has a constant residue.
 | Transports | HTTP mapping/TLS/chaos, WebSocket reconnect/order/size, and gRPC status/metadata/size |
 | Cache and growth | Version matching, stale-read prevention, eviction, zeroization, shard creation, and crash recovery |
 | NBD adapter | Geometry, capability advertisement, read/write, panic boundary, parallel callbacks, and clean detach |
-| Review regressions | `review_storage.rs`, `review_attach.rs`, `review_bounded.rs` (maki-core), `review_format.rs` (maki-format), `review_daemon.rs` (maki-nbdkit): roll-vs-promotion ordering, allocation dirty-flag ordering, fail-closed recovery, durable mark, A/B error classification, key canary and identity checks, bounded journal and degraded state; see the [remediation log](review-remediation.md) |
+| Review regressions | `review_storage.rs`, `review_attach.rs`, `review_bounded.rs` (maki-core), `review_format.rs` (maki-format), `review_daemon.rs` and `review_control.rs` (maki-nbdkit), `review_uds.rs` (maki-control): roll-vs-promotion ordering, allocation dirty-flag ordering, fail-closed recovery, durable mark, A/B error classification, key canary and identity checks, bounded journal and degraded state, control-socket lifecycle and ownership (Unix-only suites run under Linux CI and WSL); see the [remediation log](review-remediation.md) |
 
 ## Current qualification status
 

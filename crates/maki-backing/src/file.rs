@@ -256,4 +256,13 @@ mod tests {
         assert!(backing.open("../evil", true).is_err());
         assert!(backing.open("/abs", true).is_err());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_bytes_reports_space_on_a_real_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = FileBacking::new(dir.path()).unwrap();
+        let free = backing.free_bytes().unwrap().expect("statvfs available");
+        assert!(free > 0);
+    }
 }

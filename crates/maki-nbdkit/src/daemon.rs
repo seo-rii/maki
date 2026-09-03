@@ -497,3 +497,13 @@ pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonErro
     };
     Ok(init::create_volume(backing.as_ref(), superblock)?)
 }
+
+/// The per-volume control socket path (SPEC §7): `control.socket`, or
+/// `/run/maki/<volume>/control.sock`.
+pub fn control_socket_path(config: &VolumeConfig) -> String {
+    config
+        .control
+        .socket
+        .clone()
+        .unwrap_or_else(|| format!("/run/maki/{}/control.sock", config.volume.name))
+}

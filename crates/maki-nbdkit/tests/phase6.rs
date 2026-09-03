@@ -254,6 +254,11 @@ fn clean_detach_flushes_checkpoints_and_releases_lock() {
 #[test]
 fn adapter_opens_from_config_file() {
     let dir = tempfile::tempdir().unwrap();
+    let control_sock = dir
+        .path()
+        .join("control.sock")
+        .to_string_lossy()
+        .replace('\\', "/");
     let root = dir.path().join("vol");
     let root_str = root.to_string_lossy().replace('\\', "/");
     let config = format!(
@@ -273,6 +278,8 @@ supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4104
 [backing]
 root = "{root_str}"
+[control]
+socket = "{control_sock}"
 "#
     );
     let config_path = dir.path().join("vol.toml");

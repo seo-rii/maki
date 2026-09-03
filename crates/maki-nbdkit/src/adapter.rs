@@ -5,8 +5,11 @@
 //! - Capability surface per SPEC §48: FLUSH + FUA supported; trim, write-
 //!   zeroes, and multi-connection disabled (nbdkit emulates zeroes via
 //!   pwrite).
-//! - `shutdown` is the clean-detach path: FLUSH barrier, checkpoint, then
-//!   release of the volume lock.
+//! - `open_config` also binds and serves the per-volume control socket
+//!   (SPEC §7, review M-005) on the adapter's runtime; a socket that cannot
+//!   be bound fails attach. `shutdown` is the clean-detach path: FLUSH
+//!   barrier, checkpoint, control socket removal, then release of the
+//!   volume lock.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -52,9 +55,18 @@ struct AdapterState {
     block_sizes: (u32, u32, u32),
 }
 
+/// The running control-socket server (Unix only).
+#[cfg(unix)]
+struct ControlServer {
+    task: tokio::task::JoinHandle<()>,
+    path: std::path::PathBuf,
+}
+
 pub struct NbdAdapter {
     runtime: tokio::runtime::Runtime,
     state: parking_lot::RwLock<Option<Arc<AdapterState>>>,
+    #[cfg(unix)]
+    control: parking_lot::Mutex<Option<ControlServer>>,
 }
 
 impl NbdAdapter {
@@ -67,11 +79,14 @@ impl NbdAdapter {
                 engine,
                 block_sizes,
             }))),
+            #[cfg(unix)]
+            control: parking_lot::Mutex::new(None),
         }
     }
 
     /// Full daemon path: parse + validate config, build backing/provider,
-    /// run recovery + self-test, return a serving adapter.
+    /// run recovery + self-test, start the control socket, return a serving
+    /// adapter.
     pub fn open_config(path: &str) -> Result<Self, AdapterError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| AdapterError::new(EINVAL, format!("config {path}: {e}")))?;
@@ -90,13 +105,50 @@ impl NbdAdapter {
             config.nbd.preferred_io,
             config.nbd.maximum_io.0.min(u32::MAX as u64) as u32,
         );
+
+        #[cfg(unix)]
+        let control = {
+            let socket = daemon::control_socket_path(&config);
+            let backend: Arc<dyn maki_control::server::ControlBackend> =
+                Arc::new(crate::control::EngineControlBackend::new(
+                    engine.clone(),
+                    config.volume.name.clone(),
+                ));
+            let group = config.control.group.clone();
+            let listener = runtime
+                .block_on(async {
+                    maki_control::uds::bind_control_socket(
+                        std::path::Path::new(&socket),
+                        group.as_deref(),
+                    )
+                })
+                .map_err(|e| AdapterError::new(EIO, format!("control socket {socket}: {e}")))?;
+            let task = runtime.spawn(async move {
+                if let Err(e) = maki_control::uds::serve(listener, backend).await {
+                    tracing::error!("control socket server stopped: {e}");
+                }
+            });
+            Some(ControlServer {
+                task,
+                path: std::path::PathBuf::from(socket),
+            })
+        };
+
         Ok(Self {
             runtime,
             state: parking_lot::RwLock::new(Some(Arc::new(AdapterState {
                 engine,
                 block_sizes,
             }))),
+            #[cfg(unix)]
+            control: parking_lot::Mutex::new(control),
         })
+    }
+
+    /// Path of the served control socket, if one is running.
+    #[cfg(unix)]
+    pub fn control_socket_path(&self) -> Option<std::path::PathBuf> {
+        self.control.lock().as_ref().map(|c| c.path.clone())
     }
 
     fn state(&self) -> Result<Arc<AdapterState>, AdapterError> {
@@ -178,10 +230,21 @@ impl NbdAdapter {
         self.run(move |engine| Box::pin(async move { engine.checkpoint().await }))
     }
 
-    /// Clean detach: FLUSH, checkpoint, release the volume lock.
+    /// Stop serving the control socket and remove its path.
+    fn stop_control(&self) {
+        #[cfg(unix)]
+        if let Some(control) = self.control.lock().take() {
+            control.task.abort();
+            let _ = std::fs::remove_file(&control.path);
+        }
+    }
+
+    /// Clean detach: FLUSH, checkpoint, stop the control socket, release
+    /// the volume lock.
     pub fn shutdown(&self) -> Result<(), AdapterError> {
         self.flush()?;
         self.checkpoint()?;
+        self.stop_control();
         *self.state.write() = None; // drops Engine → volume lock released
         Ok(())
     }

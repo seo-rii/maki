@@ -125,10 +125,7 @@ fn control(config: &str, command: &str, section: Option<&str>) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
-    let socket = match cfg.control.socket.clone() {
-        Some(s) => s,
-        None => format!("/run/maki/{}/control.sock", cfg.volume.name),
-    };
+    let socket = maki_nbdkit::daemon::control_socket_path(&cfg);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
