@@ -108,6 +108,21 @@ impl AbStore {
         }
     }
 
+    /// Generation of each side when it holds a valid record of type `T`
+    /// (`None` = absent or invalid); hard I/O errors are reported.
+    pub fn side_generations<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+    ) -> Result<(Option<u64>, Option<u64>), FormatError> {
+        let a = self
+            .read_side::<T>(backing, &self.a)?
+            .map(|r| r.generation());
+        let b = self
+            .read_side::<T>(backing, &self.b)?
+            .map(|r| r.generation());
+        Ok((a, b))
+    }
+
     /// The side the *next* store will overwrite (the invalid or older one).
     pub fn next_target_path(&self, backing: &dyn Backing) -> Result<&str, FormatError> {
         let (ga, gb) = self.generations(backing)?;

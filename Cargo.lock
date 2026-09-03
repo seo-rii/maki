@@ -870,6 +870,7 @@ version = "0.1.0"
 dependencies = [
  "maki-backing",
  "maki-control",
+ "maki-core",
  "maki-format",
  "maki-nbdkit",
  "serde_json",
@@ -917,6 +918,7 @@ name = "maki-check"
 version = "0.1.0"
 dependencies = [
  "maki-backing",
+ "maki-core",
  "maki-format",
  "tempfile",
  "uuid",

@@ -117,6 +117,23 @@ impl SlotStore {
         self.shards.len()
     }
 
+    /// Every allocated unit, in ascending order (offline check input).
+    pub fn allocated_units(&self) -> Vec<u64> {
+        let mut shards: Vec<u64> = self.shards.keys().copied().collect();
+        shards.sort_unstable();
+        let per_shard = self.geometry.units_per_shard();
+        let mut out = Vec::new();
+        for shard_idx in shards {
+            let shard = &self.shards[&shard_idx];
+            for in_shard in 0..shard.alloc.units() {
+                if shard.alloc.get(in_shard) {
+                    out.push(shard_idx * per_shard + in_shard);
+                }
+            }
+        }
+        out
+    }
+
     /// Lowest allocated unit, if any slot has ever been checkpointed.
     pub fn first_allocated_unit(&self) -> Option<u64> {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();

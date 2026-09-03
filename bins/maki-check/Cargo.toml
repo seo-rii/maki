@@ -10,9 +10,11 @@ name = "maki-check"
 path = "src/main.rs"
 
 [dependencies]
+maki-core.workspace = true
 maki-format.workspace = true
 maki-backing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 uuid.workspace = true
+maki-core.workspace = true

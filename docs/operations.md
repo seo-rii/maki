@@ -47,7 +47,19 @@ also inspect a backing root directly:
 
 ```bash
 maki-check /var/lib/maki/example
+maki-check /var/lib/maki/example --deep
+maki check /etc/maki/volumes/example.toml --deep
 ```
+
+Without `--deep` the check covers the superblock, shard catalog, allocation-map
+sizes, and file presence only. `--deep` additionally verifies both checkpoint
+state copies, the key canary, the durable mark, every journal segment exactly
+as recovery would scan it (reporting the repairs recovery would make), and
+every allocated slot exactly as the engine would read it. A volume that holds
+data is only known good after a deep check passes. `--deep` takes the volume
+lock and refuses to run while a daemon is attached; when checking a backing
+root directly, pass `--journal-segment-size` if the volume uses a non-default
+size.
 
 Run offline checks only after the daemon or nbdkit process has released the
 volume lock.

@@ -22,6 +22,12 @@
 //!   it is read into memory;
 //! - metadata read errors other than "not found" are I/O errors, never
 //!   "invalid copy" (an initialized volume must have checkpoint state).
+//!
+//! [`scan_journal`] is the read-only core of the scan: it returns the
+//! records to replay together with the repairs recovery *would* apply
+//! (discarding an unwritten final segment, truncating a torn tail). The
+//! offline deep checker reuses it verbatim, so "what recovery would do" and
+//! "what the checker reports" can never drift apart.
 
 use std::sync::Arc;
 
@@ -73,40 +79,113 @@ pub struct Recovered {
     pub replay: Vec<JournalRecord>,
 }
 
+/// A change recovery applies to the journal after a crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalRepair {
+    /// A final segment that never completed its creation protocol.
+    Discard { path: String },
+    /// Truncate a torn tail; `len` is the resulting file length.
+    Truncate { path: String, len: u64 },
+}
+
+/// Result of a read-only journal scan.
+pub struct JournalScan {
+    pub durable_sequence: u64,
+    pub next_segment_index: u64,
+    pub segments: Vec<SegmentInfo>,
+    /// Records with sequence > checkpoint_sequence, in sequence order.
+    pub replay: Vec<JournalRecord>,
+    pub repairs: Vec<JournalRepair>,
+    /// Whether a durable mark was found for the final segment.
+    pub mark: Option<DurableMark>,
+}
+
 /// Recover a volume. `segment_size` is the writer's effective segment size;
 /// it bounds how large any segment file may legitimately be.
 pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovered, RecoveryError> {
     // 1. exclusive volume lock
-    let lock = backing.try_lock(layout::VOLUME_LOCK).map_err(|e| {
+    let lock = acquire_lock(backing)?;
+
+    // 2. superblock
+    let superblock = load_superblock(backing)?;
+
+    // 3./4. catalog + allocation metadata
+    let store = SlotStore::open(backing.clone(), superblock.geometry.clone())?;
+
+    // checkpoint state
+    let checkpoint_state = load_checkpoint_state(backing)?;
+
+    // 5./6. scan journal, then apply the repairs the scan decided on
+    let scan = scan_journal(
+        backing,
+        &superblock,
+        checkpoint_state.checkpoint_sequence,
+        segment_size,
+    )?;
+    for repair in &scan.repairs {
+        match repair {
+            JournalRepair::Discard { path } => {
+                backing.remove(path)?;
+                backing.sync_dir(layout::JOURNAL_DIR)?;
+            }
+            JournalRepair::Truncate { path, len } => {
+                let file = backing.open(path, false)?;
+                file.set_len(*len)?;
+                file.sync_data()?;
+            }
+        }
+    }
+
+    Ok(Recovered {
+        lock,
+        superblock,
+        store,
+        checkpoint_state,
+        durable_sequence: scan.durable_sequence,
+        next_segment_index: scan.next_segment_index,
+        segments: scan.segments,
+        replay: scan.replay,
+    })
+}
+
+/// The exclusive volume lock (`VOLUME_ALREADY_ATTACHED` when held).
+pub fn acquire_lock(backing: &Arc<dyn Backing>) -> Result<Box<dyn VolumeLock>, RecoveryError> {
+    backing.try_lock(layout::VOLUME_LOCK).map_err(|e| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             RecoveryError::AlreadyAttached
         } else {
             RecoveryError::Io(e)
         }
-    })?;
+    })
+}
 
-    // 2. superblock
-    let superblock = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)
+pub fn load_superblock(backing: &Arc<dyn Backing>) -> Result<Superblock, RecoveryError> {
+    AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)
         .load::<Superblock>(backing.as_ref())?
-        .ok_or_else(|| RecoveryError::Corrupt("no valid superblock copy".to_string()))?;
+        .ok_or_else(|| RecoveryError::Corrupt("no valid superblock copy".to_string()))
+}
 
-    // 3./4. catalog + allocation metadata
-    let store = SlotStore::open(backing.clone(), superblock.geometry.clone())?;
-
-    // checkpoint state: written at volume creation, so an initialized
-    // volume always has at least one valid copy. Losing both is damage —
-    // restarting at sequence 0 would replay stale journal history over
-    // newer slots.
-    let checkpoint_state = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B)
+/// Checkpoint state is written at volume creation, so an initialized volume
+/// always has at least one valid copy. Losing both is damage — restarting
+/// at sequence 0 would replay stale journal history over newer slots.
+pub fn load_checkpoint_state(backing: &Arc<dyn Backing>) -> Result<CheckpointState, RecoveryError> {
+    AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B)
         .load::<CheckpointState>(backing.as_ref())?
-        .ok_or_else(|| RecoveryError::Corrupt("no valid checkpoint state copy".to_string()))?;
-    let checkpoint_sequence = checkpoint_state.checkpoint_sequence;
+        .ok_or_else(|| RecoveryError::Corrupt("no valid checkpoint state copy".to_string()))
+}
 
+/// Read-only journal scan: verifies every segment, decides the repairs a
+/// recovery would apply, and collects the records newer than the checkpoint.
+pub fn scan_journal(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+    checkpoint_sequence: u64,
+    segment_size: u64,
+) -> Result<JournalScan, RecoveryError> {
     // The writer's fdatasync high-water mark (absent or invalid = no
-    // information; recovery then falls back to the heuristic scan).
+    // information; the scan then falls back to the heuristic).
     let mark = load_durable_mark(backing)?;
 
-    // 5./6. scan journal, truncate torn tail, verify continuity
     let mut names: Vec<(u64, String)> = backing
         .list(layout::JOURNAL_DIR)?
         .into_iter()
@@ -117,8 +196,10 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
     let max_file_size = max_segment_file_size(segment_size);
     let mut segments: Vec<SegmentInfo> = Vec::new();
     let mut replay: Vec<JournalRecord> = Vec::new();
+    let mut repairs: Vec<JournalRepair> = Vec::new();
     let mut prev_last_seq: Option<u64> = None;
     let mut max_seq: u64 = 0;
+    let mut final_mark: Option<DurableMark> = None;
 
     let count = names.len();
     for (pos, (index, name)) in names.into_iter().enumerate() {
@@ -144,12 +225,15 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
                 )));
             }
         }
+        if is_last {
+            final_mark = mark.filter(|m| m.segment_index == index);
+        }
 
         // Shorter than a header: the creation protocol never reached its
         // fdatasync, so no record can have been acknowledged from it.
         if len < SEGMENT_HEADER_SIZE as u64 {
             if is_last && marked_durable.is_none() {
-                discard_segment(backing, &path)?;
+                repairs.push(JournalRepair::Discard { path });
                 continue;
             }
             return Err(RecoveryError::Corrupt(format!(
@@ -165,7 +249,7 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
                 // A never-written (zero-filled) final segment is a creation
                 // crash; anything else with a full-sized header is damage.
                 if is_last && marked_durable.is_none() && image.iter().all(|b| *b == 0) {
-                    discard_segment(backing, &path)?;
+                    repairs.push(JournalRepair::Discard { path });
                     continue;
                 }
                 return Err(RecoveryError::Corrupt(format!(
@@ -204,6 +288,7 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
         };
         let (records, outcome) = scan_segment_bounded(body, header.base_sequence, durable_len);
 
+        let mut size = len;
         match outcome {
             ScanOutcome::Clean => {}
             ScanOutcome::TornTail { at } => {
@@ -213,8 +298,11 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
                     )));
                 }
                 // discard/truncate partial tail (SPEC §27)
-                file.set_len(SEGMENT_HEADER_SIZE as u64 + at as u64)?;
-                file.sync_data()?;
+                size = SEGMENT_HEADER_SIZE as u64 + at as u64;
+                repairs.push(JournalRepair::Truncate {
+                    path: path.clone(),
+                    len: size,
+                });
             }
             ScanOutcome::Corrupt { at, reason } => {
                 return Err(RecoveryError::Corrupt(format!(
@@ -251,29 +339,27 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
             index,
             base_sequence: header.base_sequence,
             record_count,
-            size: file.len()?,
+            size,
         });
     }
 
     let durable_sequence = checkpoint_sequence.max(max_seq);
     let next_segment_index = segments.iter().map(|s| s.index + 1).max().unwrap_or(0);
 
-    Ok(Recovered {
-        lock,
-        superblock,
-        store,
-        checkpoint_state,
+    Ok(JournalScan {
         durable_sequence,
         next_segment_index,
         segments,
         replay,
+        repairs,
+        mark: final_mark,
     })
 }
 
 /// The durable mark, if present and intact. Absent, empty, short, or
 /// CRC-invalid all mean "no information" (the mark is written without
 /// fsync and may be torn); only hard I/O errors are reported.
-fn load_durable_mark(backing: &Arc<dyn Backing>) -> Result<Option<DurableMark>, RecoveryError> {
+pub fn load_durable_mark(backing: &Arc<dyn Backing>) -> Result<Option<DurableMark>, RecoveryError> {
     let file = match backing.open(layout::JOURNAL_DURABLE_MARK, false) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -289,11 +375,4 @@ fn load_durable_mark(backing: &Arc<dyn Backing>) -> Result<Option<DurableMark>, 
         Err(e) => return Err(RecoveryError::Io(e)),
     }
     Ok(DurableMark::decode(&buf).ok())
-}
-
-/// Remove a segment that never completed its creation protocol.
-fn discard_segment(backing: &Arc<dyn Backing>, path: &str) -> Result<(), RecoveryError> {
-    backing.remove(path)?;
-    backing.sync_dir(layout::JOURNAL_DIR)?;
-    Ok(())
 }

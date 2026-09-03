@@ -8,6 +8,7 @@
 //! calls into `maki_test_support::failpoints` under a stable name (see
 //! `docs/architecture.md` for the persistence model).
 
+pub mod check;
 pub mod engine;
 pub mod error;
 pub mod journal;

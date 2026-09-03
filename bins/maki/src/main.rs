@@ -12,7 +12,7 @@ fn usage() -> ExitCode {
         "usage:
   maki volume create <config.toml>     initialize a volume's backing layout
   maki volume inspect <config.toml>    print volume metadata
-  maki check <config.toml>             offline format check
+  maki check <config.toml> [--deep]    offline format check (--deep: journal, checkpoint, slots)
   maki status <config.toml>            daemon status (control socket)
   maki metrics <config.toml>           metrics snapshot (control socket)
   maki checkpoint <config.toml>        graceful checkpoint (control socket)
@@ -56,7 +56,17 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(e),
         },
-        ["check", config] => match check(config) {
+        ["check", config] => match check(config, false) {
+            Ok(clean) => {
+                if clean {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(e) => fail(e),
+        },
+        ["check", config, "--deep"] => match check(config, true) {
             Ok(clean) => {
                 if clean {
                     ExitCode::SUCCESS
@@ -102,10 +112,15 @@ fn inspect(config: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check(config: &str) -> Result<bool, String> {
+fn check(config: &str, deep: bool) -> Result<bool, String> {
     let cfg = read_config(config)?;
     let backing = maki_nbdkit::daemon::build_backing(&cfg).map_err(|e| e.to_string())?;
-    let report = maki_format::checker::check_volume(backing.as_ref()).map_err(|e| e.to_string())?;
+    let report = if deep {
+        maki_core::check::deep_check(backing, cfg.backing.journal_segment_size.0)
+            .map_err(|e| e.to_string())?
+    } else {
+        maki_format::checker::check_volume(backing.as_ref()).map_err(|e| e.to_string())?
+    };
     for info in &report.info {
         println!("info: {info}");
     }
