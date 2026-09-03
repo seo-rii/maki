@@ -27,9 +27,20 @@ and re-ran the extended release gates, which had not been exercised after the
 review changes. That pass found and fixed three more defects: S-01
 (checkpointed data read as zeros after an allocation-map or catalog A/B
 fallback), S-02 (overlay byte accounting), and S-03 (a healthy volume refused
-after segment numbering restarted under a stale durable mark). The final state
-passes strict Clippy, the full debug workspace suite, and all seven
-`phase*_gate_full` release gates on both Windows and WSL Ubuntu.
+after segment numbering restarted under a stale durable mark). Widening the
+crash model to out-of-order sector persistence then found S-04 and S-05 in
+recovery's torn-tail classification.
+
+A second audit of the core, the crypto layer and the operational layers
+followed (see [Second audit](#second-audit-2026-09-03-core-crypto-layer-operational-layers)):
+27 confirmed findings, each reproduced by a failing test before the fix, among
+them recovery accepting never-fsync'd page-cache bytes after a process restart
+(K-01), HTTP redirects re-sending plaintext (C-01), the root helper following
+symlinks in the mount root (O-01), credentials falling back to environment
+variables (O-06), and detach disconnecting the wrong NBD device (O-02). The
+final state passes strict Clippy, the full debug workspace suite (every
+Unix-only suite included), and all seven `phase*_gate_full` release gates
+under WSL Ubuntu, and strict Clippy plus the per-crate suites on Windows.
 
 What still needs an environment this repository cannot provide:
 

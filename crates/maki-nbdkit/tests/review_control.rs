@@ -75,7 +75,12 @@ fn control_socket_is_created_served_and_removed() {
         .join("control.sock")
         .to_string_lossy()
         .into_owned();
-    let raw = config(&root, &socket);
+    // A read cache is on so that `reload cache` has something to apply
+    // (O-09: with the cache off the verb is refused, see below).
+    let raw = format!("{}
+[cache]
+mode = \"read\"
+", config(&root, &socket));
     let config_path = dir.path().join("vol.toml");
     std::fs::write(&config_path, &raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
