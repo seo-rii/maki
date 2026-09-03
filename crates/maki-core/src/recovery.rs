@@ -281,8 +281,18 @@ pub fn scan_journal(
         let body = &image[SEGMENT_HEADER_SIZE..];
         // Non-final segments were fdatasync'd in full before their
         // successor was created; the final one is durable up to the mark.
+        // Without a mark for it (the mark's plain write was lost in the
+        // crash, or it names an older segment) nothing beyond the header
+        // is *proven* durable, so every damage there is a torn tail. Never
+        // fall back to classifying by what follows the damage: unsynced
+        // records persist in any order, and an intact record after a torn
+        // one is a normal crash state (M-007, S-04).
         let durable_len = if is_last {
-            marked_durable.map(|d| (d as usize).saturating_sub(SEGMENT_HEADER_SIZE))
+            Some(
+                marked_durable
+                    .map(|d| (d as usize).saturating_sub(SEGMENT_HEADER_SIZE))
+                    .unwrap_or(0),
+            )
         } else {
             Some(body.len())
         };
@@ -290,7 +300,23 @@ pub fn scan_journal(
 
         let mut size = len;
         match outcome {
-            ScanOutcome::Clean => {}
+            ScanOutcome::Clean => {
+                // A clean scan may still end in a zero-filled tail (a torn
+                // unsynced record whose sectors never arrived). It is
+                // harmless in the final segment, but the writer seals that
+                // segment as-is when it opens a successor, and a non-final
+                // segment is durable in full — the same zeros would then be
+                // corruption. Normalize the final segment to exactly its
+                // records so no sealed segment ever carries a zero tail.
+                let records_end: usize = records.iter().map(|r| 32 + r.payload.len()).sum();
+                if is_last && records_end < body.len() {
+                    size = SEGMENT_HEADER_SIZE as u64 + records_end as u64;
+                    repairs.push(JournalRepair::Truncate {
+                        path: path.clone(),
+                        len: size,
+                    });
+                }
+            }
             ScanOutcome::TornTail { at } => {
                 if !is_last {
                     return Err(RecoveryError::Corrupt(format!(

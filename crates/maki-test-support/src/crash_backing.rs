@@ -131,6 +131,51 @@ fn apply(data: &mut Vec<u8>, p: &Pend) {
     }
 }
 
+/// Persist a write partially at sector granularity `gran`: either only a
+/// prefix of its sectors reached the disk (the file did not grow past it),
+/// or every sector but one random one did (a hole of stale bytes inside an
+/// otherwise complete write).
+fn apply_torn(data: &mut Vec<u8>, offset: u64, src: &[u8], gran: usize, rng: &mut impl Rng) {
+    let sectors = src.len().div_ceil(gran);
+    if sectors == 0 {
+        return;
+    }
+    if rng.random_bool(0.5) {
+        let keep = (rng.random_range(0..sectors) * gran).min(src.len());
+        apply(
+            data,
+            &Pend::Write {
+                offset,
+                data: src[..keep].to_vec(),
+            },
+        );
+    } else {
+        let hole = rng.random_range(0..sectors);
+        let hole_start = hole * gran;
+        let hole_end = (hole_start + gran).min(src.len());
+        apply(
+            data,
+            &Pend::Write {
+                offset,
+                data: src[..hole_start].to_vec(),
+            },
+        );
+        if hole_end < src.len() {
+            apply(
+                data,
+                &Pend::Write {
+                    offset: offset + hole_end as u64,
+                    data: src[hole_end..].to_vec(),
+                },
+            );
+        } else if data.len() < offset as usize + src.len() {
+            // The hole is the final sector: the file still grew to cover
+            // it (sectors persist in any order), holding stale bytes.
+            data.resize(offset as usize + src.len(), 0);
+        }
+    }
+}
+
 /// In-memory crash-simulating backing.
 #[derive(Clone, Default)]
 pub struct CrashableBacking {
@@ -218,30 +263,23 @@ impl CrashableBacking {
                         } else {
                             Vec::new()
                         };
-                        // Keep each pending op independently.
+                        // Keep each pending op independently. With tearing
+                        // enabled *any* kept write may persist partially at
+                        // sector granularity — not only the last one: sectors
+                        // of unsynced writes reach the platter in any order,
+                        // so an earlier record can be torn while a later one
+                        // is intact (SPEC §27 torn-tail classification).
                         let kept: Vec<&Pend> = vol
                             .pending
                             .iter()
                             .filter(|_| rng.random_bool(0.5))
                             .collect();
-                        let last_write_idx =
-                            kept.iter().rposition(|p| matches!(p, Pend::Write { .. }));
-                        for (i, p) in kept.iter().enumerate() {
-                            if Some(i) == last_write_idx {
-                                if let (Some(gran), Pend::Write { offset, data: src }) =
-                                    (tearing, p)
-                                {
-                                    if rng.random_bool(0.5) {
-                                        let keep = (rng.random_range(0..=src.len()) / gran) * gran;
-                                        apply(
-                                            &mut data,
-                                            &Pend::Write {
-                                                offset: *offset,
-                                                data: src[..keep].to_vec(),
-                                            },
-                                        );
-                                        continue;
-                                    }
+                        for p in kept {
+                            if let (Some(gran), Pend::Write { offset, data: src }) = (tearing, p)
+                            {
+                                if rng.random_bool(0.3) {
+                                    apply_torn(&mut data, *offset, src, gran, rng);
+                                    continue;
                                 }
                             }
                             apply(&mut data, p);

@@ -322,7 +322,7 @@ impl MiniDb {
 /// crash/recover cycles, ledger verification after every recovery.
 async fn db_qualification_run(seed: u64, txn_count: u32) {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37).wrapping_add(3));
-    let backing = Arc::new(CrashableBacking::new());
+    let backing = Arc::new(CrashableBacking::new().with_tearing(512));
     let engine = attach(&backing).await;
     write_wal_header(&engine, 1).await;
     let mut db = MiniDb {

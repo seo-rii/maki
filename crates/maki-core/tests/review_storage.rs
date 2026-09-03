@@ -560,6 +560,96 @@ fn segment_indexes_never_fall_below_the_durable_mark() {
     assert_eq!(vol.read_ct(2).unwrap().unwrap().1, ct(3));
 }
 
+/// S-04 (found by widening the crash model to tear *any* unsynced write):
+/// the mark is a plain write and is often lost in the very crash it should
+/// describe. With no mark for the final segment, nothing beyond its header
+/// is proven durable, so a torn unsynced record followed by an intact one is
+/// a torn tail — the normal out-of-order persistence of unsynced records —
+/// and recovery must truncate, not refuse. The pre-M-007 "valid record
+/// after damage means corruption" heuristic must never come back.
+#[test]
+fn lost_or_stale_mark_never_turns_a_torn_middle_record_into_corruption() {
+    let _guard = failpoints::test_lock();
+    for mark_fate in ["removed", "stale"] {
+        let backing = Arc::new(CrashableBacking::new());
+        let mut vol = new_volume(&backing);
+        vol.write_ct(0, &ct(1), true).unwrap(); // durable
+        vol.write_ct(1, &ct(2), false).unwrap(); // unsynced
+        vol.write_ct(2, &ct(3), false).unwrap(); // unsynced
+        let seg = vol.journal_active_segment_path().unwrap();
+        drop(vol);
+
+        match mark_fate {
+            "removed" => backing.remove(layout::JOURNAL_DURABLE_MARK).unwrap(),
+            _ => {
+                // The crash kept an older mark naming a segment that no
+                // longer exists (a plain write torn back to old content).
+                let stale = maki_format::journal::DurableMark {
+                    segment_index: 7,
+                    durable_size: 4096,
+                };
+                backing
+                    .open(layout::JOURNAL_DURABLE_MARK, false)
+                    .unwrap()
+                    .write_at(0, &stale.encode())
+                    .unwrap();
+            }
+        }
+        // Record 3 persisted intact, record 2 only partially.
+        let f = backing.open(&seg, false).unwrap();
+        let off = 48 + (32 + CT_LEN) as u64 + 100;
+        f.write_at(off, &vec![0xAA; 200]).unwrap();
+        f.sync_data().unwrap();
+
+        let vol = recover(&backing)
+            .unwrap_or_else(|e| panic!("{mark_fate}: healthy crash state refused: {e:?}"));
+        assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(1), "{mark_fate}");
+        assert!(vol.read_ct(1).unwrap().is_none(), "{mark_fate}: torn record must not be served");
+        assert!(
+            vol.read_ct(2).unwrap().is_none(),
+            "{mark_fate}: an unsynced record after the tear goes with the tail"
+        );
+    }
+}
+
+/// S-05 (found by the widened crash model): a torn unsynced record can
+/// survive as an all-zero tail of the final segment. Recovery accepted
+/// that as a clean preallocated end without truncating it; the writer
+/// then sealed the segment when it opened a successor, and the *next*
+/// recovery, for which the segment was non-final and therefore durable in
+/// full, refused the volume with "zeroed record inside durable prefix".
+/// Recovery must normalize the final segment to exactly its records.
+#[test]
+fn zero_tail_of_final_segment_is_truncated_before_it_can_be_sealed() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    vol.write_ct(0, &ct(1), true).unwrap(); // durable
+    vol.write_ct(1, &ct(2), false).unwrap(); // unsynced
+    let seg = vol.journal_active_segment_path().unwrap();
+    drop(vol);
+    // The crash persisted the file growth but none of record 2's sectors.
+    let f = backing.open(&seg, false).unwrap();
+    f.write_at(48 + (32 + CT_LEN) as u64, &vec![0u8; 32 + CT_LEN])
+        .unwrap();
+    f.sync_data().unwrap();
+
+    let mut vol = recover(&backing).unwrap();
+    assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(1));
+    assert!(vol.read_ct(1).unwrap().is_none());
+    let len = backing.open(&seg, false).unwrap().len().unwrap();
+    assert_eq!(len, 48 + (32 + CT_LEN) as u64, "zero tail not truncated");
+
+    // A new record opens a successor segment and seals the old one.
+    vol.write_ct(2, &ct(3), true).unwrap();
+    assert_ne!(vol.journal_active_segment_path().unwrap(), seg);
+    drop(vol);
+    let vol = recover(&backing).unwrap_or_else(|e| panic!("sealed zero tail refused: {e:?}"));
+    assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(1));
+    assert!(vol.read_ct(1).unwrap().is_none());
+    assert_eq!(vol.read_ct(2).unwrap().unwrap().1, ct(3));
+}
+
 /// Without a mark (lost, or a volume written before marks existed) the
 /// scanner degrades to the heuristic: a clean journal still recovers.
 #[test]

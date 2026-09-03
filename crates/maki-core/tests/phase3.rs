@@ -472,7 +472,7 @@ fn volume_lock_rejects_second_attach() {
 
 fn crash_cycle(seed: u64, ops: usize) {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9).wrapping_add(7));
-    let backing = Arc::new(CrashableBacking::new());
+    let backing = Arc::new(CrashableBacking::new().with_tearing(512));
     let mut vol = new_volume(&backing);
     let num_units = 8u64;
     let mut model = ReferenceBlockModel::new(CT_LEN, num_units);

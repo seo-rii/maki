@@ -78,7 +78,7 @@ fn new_img(unit: u64) -> Vec<u8> {
 /// ```
 async fn critical_sequence(seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(97).wrapping_add(11));
-    let backing = Arc::new(CrashableBacking::new());
+    let backing = Arc::new(CrashableBacking::new().with_tearing(512));
     let engine = attach(&backing).await;
 
     // Establish "old" content durably for A, B, C.
@@ -124,7 +124,7 @@ async fn critical_sequence(seed: u64) {
 /// ```
 async fn fua_sequence(seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(193).wrapping_add(7));
-    let backing = Arc::new(CrashableBacking::new());
+    let backing = Arc::new(CrashableBacking::new().with_tearing(512));
     let engine = attach(&backing).await;
     engine.write(off(5), &old_img(5), false).await.unwrap();
     engine.flush().await.unwrap();
@@ -160,7 +160,7 @@ async fn spec54_c_exhibits_both_outcomes() {
     let mut saw_new = false;
     for seed in 0..300u64 {
         let mut rng = StdRng::seed_from_u64(seed);
-        let backing = Arc::new(CrashableBacking::new());
+        let backing = Arc::new(CrashableBacking::new().with_tearing(512));
         let engine = attach(&backing).await;
         engine.write(off(2), &old_img(2), false).await.unwrap();
         engine.flush().await.unwrap();
