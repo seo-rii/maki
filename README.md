@@ -39,6 +39,7 @@ Maki is designed around four constraints:
 | Real database and vendor-provider workloads | SQLite smoke passed; broader qualification open |
 | QEMU and bare-metal power-loss testing | Not qualified |
 | 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
+| 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; three findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark refusing attach) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
 
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.

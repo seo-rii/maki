@@ -344,7 +344,18 @@ pub fn scan_journal(
     }
 
     let durable_sequence = checkpoint_sequence.max(max_seq);
-    let next_segment_index = segments.iter().map(|s| s.index + 1).max().unwrap_or(0);
+    // Segment indexes must never be reused: the durable mark is a plain,
+    // never-cleaned file naming the newest segment it saw, so a fresh
+    // segment under an old index would be judged against a stale mark
+    // (a checkpoint right after recovery can delete every segment, which
+    // used to restart numbering at zero). Continue above both the surviving
+    // segments and the mark.
+    let next_segment_index = segments
+        .iter()
+        .map(|s| s.index + 1)
+        .max()
+        .unwrap_or(0)
+        .max(mark.map(|m| m.segment_index + 1).unwrap_or(0));
 
     Ok(JournalScan {
         durable_sequence,

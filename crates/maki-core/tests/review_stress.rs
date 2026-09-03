@@ -93,7 +93,7 @@ fn options() -> EngineOptions {
 }
 
 fn fresh() -> Arc<CrashableBacking> {
-    let backing = Arc::new(CrashableBacking::new());
+    let backing = Arc::new(CrashableBacking::new().with_tearing(512));
     init::create_volume(backing.as_ref(), superblock()).unwrap();
     backing
 }

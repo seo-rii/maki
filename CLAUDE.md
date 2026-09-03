@@ -55,6 +55,7 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - Unsynced journal records persist in any order: a valid record after damaged bytes does not prove the damage is durable. Classify with the durable mark, never by what follows (M-007).
 - An A/B record falling back to its older generation is *normal* (torn write, later damage), and the older allocation map / shard catalog does not list the newest slots or shard. Slot headers are authoritative: probe them instead of reading "bit 0" as zeros ([remediation log](docs/review-remediation.md), S-01).
 - Debug builds run `check_invariants()` on the overlay, journal, and volume after every mutation; a sanitizer panic in a test is a real accounting bug, not a flaky test. Keep the checks O(1)-ish on large structures (they sample).
+- Journal segment indexes are never reused: the durable mark outlives the segment it names, so numbering continues above the mark even when a checkpoint has deleted every segment (S-03). Run the release gates (`-- --ignored`) after touching recovery; the default suite did not catch this.
 
 ## External qualification
 

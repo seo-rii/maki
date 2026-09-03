@@ -92,8 +92,10 @@ Journal tails may be truncated after a crash, but only after the point the
 durable mark proves was fdatasync'd. Damage inside that prefix is corruption
 even at the very end of the segment; damage after it is a torn tail even when
 an intact record follows, because unsynced records may persist in any order.
-The [review remediation log](review-remediation.md) describes these rules in
-detail.
+Because the mark outlives the segment it names, segment indexes are never
+reused: recovery continues numbering above both the surviving segments and the
+mark. The [review remediation log](review-remediation.md) describes these rules
+in detail.
 
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at

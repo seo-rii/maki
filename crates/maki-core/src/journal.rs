@@ -239,6 +239,13 @@ impl JournalWriter {
                     synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
                 });
+                // Point the mark at the new segment (header only) so it
+                // names the newest segment index even before the first
+                // sync; recovery continues numbering above it.
+                self.write_mark(DurableMark {
+                    segment_index: index,
+                    durable_size: SEGMENT_HEADER_SIZE as u64,
+                });
                 self.sanitize();
                 Ok(())
             }

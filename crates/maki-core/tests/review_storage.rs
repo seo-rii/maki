@@ -512,6 +512,54 @@ fn recovery_rejects_segment_shorter_than_durable_mark() {
     assert!(msg.contains("durable mark"), "{msg}");
 }
 
+/// Found by the phase 3 release gate (seed 172) after M-007: a checkpoint
+/// right after recovery can delete *every* segment (all survivors are
+/// sealed, none is active), and recovery then restarted numbering at
+/// segment 0. The durable mark is a plain, never-cleaned file, so the stale
+/// mark for the old segment 0 refused the next recovery as "file shorter
+/// than the mark". Indexes must continue above the mark's segment.
+#[test]
+fn segment_indexes_never_fall_below_the_durable_mark() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    vol.write_ct(0, &ct(1), true).unwrap(); // seg-0; mark = seg-0, one record
+    drop(vol);
+    // Make the mark durable as a real disk would have (it is only ever
+    // written without fsync).
+    backing
+        .open(layout::JOURNAL_DURABLE_MARK, false)
+        .unwrap()
+        .sync_data()
+        .unwrap();
+
+    let mut vol = recover(&backing).unwrap(); // seg-0 sealed, record 1 replayed
+    vol.checkpoint().unwrap(); // applies record 1 and deletes seg-0: journal empty
+    assert_eq!(vol.journal_segment_count(), 0);
+    drop(vol);
+
+    let mut vol = recover(&backing).unwrap();
+    vol.write_ct(1, &ct(2), false).unwrap();
+    let seg = vol.journal_active_segment_path().unwrap();
+    assert_ne!(
+        seg,
+        layout::journal_segment(0),
+        "segment index reused under a stale durable mark"
+    );
+    drop(vol);
+
+    // Crash: the unsynced record and the writer's newer mark are lost; the
+    // old, durable mark still names seg-0 with a full record.
+    backing.crash_all_lost();
+    let mut vol = recover(&backing).unwrap_or_else(|e| panic!("refused by a stale mark: {e:?}"));
+    assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(1));
+    assert!(vol.read_ct(1).unwrap().is_none());
+    vol.write_ct(2, &ct(3), true).unwrap();
+    drop(vol);
+    let vol = recover(&backing).unwrap();
+    assert_eq!(vol.read_ct(2).unwrap().unwrap().1, ct(3));
+}
+
 /// Without a mark (lost, or a volume written before marks existed) the
 /// scanner degrades to the heuristic: a clean journal still recovers.
 #[test]
