@@ -21,6 +21,16 @@ M-016). Every batch was verified with `cargo fmt`, strict Clippy, and the
 full workspace suite on Windows, and the Linux-only paths (Unix sockets,
 `statvfs`, the privileged executor, process hardening) under WSL Ubuntu.
 
+A follow-up pass added debug-build sanitizers and randomized suites (see
+[Sanitizers and randomized suites](#sanitizers-and-randomized-suites-2026-09-03))
+and re-ran the extended release gates, which had not been exercised after the
+review changes. That pass found and fixed three more defects: S-01
+(checkpointed data read as zeros after an allocation-map or catalog A/B
+fallback), S-02 (overlay byte accounting), and S-03 (a healthy volume refused
+after segment numbering restarted under a stale durable mark). The final state
+passes strict Clippy, the full debug workspace suite, and all seven
+`phase*_gate_full` release gates on both Windows and WSL Ubuntu.
+
 What still needs an environment this repository cannot provide:
 
 - Real NBD/LVM/XFS attach, mount-identity verification, rollback, and device
@@ -99,7 +109,7 @@ debug assertions that release builds compile out.
 | `review_corruption.rs` (maki-core) | 80 rounds of random single-file damage (bit flips, truncation, zeroed ranges) to any volume file after a checkpointed workload: the deep checker never panics; attach either refuses (journal or checkpoint-state damage only) or serves every unit exactly; data-shard damage yields EIO, never zeros or another version | found S-01 |
 | `review_stress_crypto.rs` (maki-crypto) | scheduler and dispatcher under 48 concurrent tasks with random request shapes and random retryable / throttled / endpoint-fatal faults: request order and unit identity kept, every failure classified transient, no hangs, pending counters and permits return to zero, service resumes once faults stop | clean |
 | `review_cache_model.rs` (maki-cache) | 12 seeds x 4000 random put/get/invalidate/resize/TTL steps against an independent LRU model: exact hit/miss, eviction order, byte accounting, budget after every step | clean |
-| Extended gates (`cargo test --workspace --release -- --ignored`, Linux) | the historical `phase*_gate_full` randomized crash/recovery, endpoint, breaker, database-simulation and integration gates, re-run against the review changes | found S-03 |
+| Extended gates (`cargo test --workspace --release -- --ignored`, Linux) | the historical `phase*_gate_full` randomized crash/recovery, endpoint, breaker, database-simulation and integration gates, re-run against the review changes | found S-03; all seven pass after the fix |
 
 ### Findings
 
