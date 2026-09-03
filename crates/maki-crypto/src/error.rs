@@ -52,4 +52,18 @@ impl CryptoError {
     pub fn is_retryable(&self) -> bool {
         matches!(self.class(), ErrorClass::Retryable | ErrorClass::Throttled)
     }
+
+    /// A copy with the same class and message (errors are not `Clone` so
+    /// that fan-out to several waiters stays explicit).
+    pub fn duplicate(&self) -> Self {
+        match self {
+            CryptoError::Retryable(m) => CryptoError::Retryable(m.clone()),
+            CryptoError::Throttled(m) => CryptoError::Throttled(m.clone()),
+            CryptoError::NonRetryableRequest(m) => CryptoError::NonRetryableRequest(m.clone()),
+            CryptoError::EndpointFatal(m) => CryptoError::EndpointFatal(m.clone()),
+            CryptoError::ProviderFatal(m) => CryptoError::ProviderFatal(m.clone()),
+            CryptoError::Integrity(m) => CryptoError::Integrity(m.clone()),
+            CryptoError::Contract(m) => CryptoError::Contract(m.clone()),
+        }
+    }
 }

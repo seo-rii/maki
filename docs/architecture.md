@@ -133,6 +133,12 @@ key name are also compared with the superblock. The non-cryptographic `fake`
 provider is compiled in only with the `fake-provider` feature and refused at
 configuration validation otherwise.
 
+Remote providers sit behind a batch scheduler: concurrent requests are
+coalesced into bounded provider calls (targets, maxima, and a maximum wait from
+configuration), whole requests are never split, and each lane's pending work is
+bounded by count and bytes so a slow provider applies backpressure instead of
+growing memory. Local providers are called directly.
+
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
 jitter retry. Retry budgets, circuit breakers, endpoint limits, and global byte

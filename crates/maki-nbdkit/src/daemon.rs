@@ -552,11 +552,50 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
 
 /// Recovery + provider verification + ready engine (SPEC §27).
 pub async fn attach_from_config(config: &VolumeConfig) -> Result<Engine, DaemonError> {
+    Ok(attach_from_config_with_stats(config).await?.0)
+}
+
+/// Like [`attach_from_config`], also returning the batch scheduler's stats
+/// handle when the provider is remote (SPEC 30: remote calls are coalesced
+/// through a bounded batch scheduler; local providers are called directly).
+pub async fn attach_from_config_with_stats(
+    config: &VolumeConfig,
+) -> Result<(Engine, Option<Arc<maki_crypto::scheduler::SchedulerStats>>), DaemonError> {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
     let backing = build_backing(config)?;
     let provider = build_provider(config).await?;
-    Ok(Engine::attach(backing, provider, engine_options(config)).await?)
+    let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
+        let scheduler = maki_crypto::scheduler::BatchScheduler::new(
+            provider,
+            scheduler_config(config),
+            Arc::new(maki_crypto::SystemClock::new()),
+        );
+        let stats = scheduler.stats();
+        (Arc::new(scheduler) as Arc<dyn CryptoProvider>, Some(stats))
+    } else {
+        (provider, None)
+    };
+    let engine = Engine::attach(backing, provider, engine_options(config)).await?;
+    Ok((engine, stats))
+}
+
+/// `[crypto.batch]` targets and maxima plus the `[limits]` pending bounds
+/// (`max_pending_crypto_items`, `max_pending_crypto_bytes` for plaintext,
+/// `max_ciphertext_bytes` for ciphertext).
+pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::SchedulerConfig {
+    let batch = &config.crypto.batch;
+    let limits = &config.limits;
+    maki_crypto::scheduler::SchedulerConfig {
+        target_items: batch.target_items as usize,
+        target_bytes: batch.target_bytes.0,
+        max_items: batch.max_items as usize,
+        max_bytes: batch.max_bytes.0,
+        max_wait: batch.max_wait.0,
+        max_pending_items: limits.max_pending_crypto_items,
+        max_pending_plaintext_bytes: limits.max_pending_crypto_bytes.0,
+        max_pending_ciphertext_bytes: limits.max_ciphertext_bytes.0,
+    }
 }
 
 /// `maki volume create`: initialize the on-disk layout for a configured

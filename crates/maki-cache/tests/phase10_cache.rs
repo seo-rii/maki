@@ -171,3 +171,26 @@ fn eviction_drops_buffers() {
         "all buffers released (and zeroized on drop)"
     );
 }
+
+/// Follow-up audit: eviction used to scan every entry; a full cache must
+/// keep evicting in strict LRU order under many inserts and touches.
+#[test]
+fn eviction_order_survives_many_entries_and_touches() {
+    let (cache, _clock) = cache(64 * 100, Duration::from_secs(3600));
+    for unit in 0..100u64 {
+        cache.put(unit, 1, buf(unit as u8, 100));
+    }
+    assert_eq!(cache.stats().entries, 64);
+    // Units 0..36 were evicted (oldest); touch unit 40 so it survives.
+    assert!(cache.get(40, 1).is_some());
+    for unit in 100..163u64 {
+        cache.put(unit, 1, buf(0, 100));
+    }
+    assert_eq!(cache.stats().entries, 64);
+    assert!(
+        cache.get(40, 1).is_some(),
+        "touched entry outlives untouched ones"
+    );
+    assert!(cache.get(41, 1).is_none(), "untouched sibling was evicted");
+    assert_eq!(cache.stats().bytes, 64 * 100);
+}

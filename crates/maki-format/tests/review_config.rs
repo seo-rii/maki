@@ -369,3 +369,22 @@ fn defaults_still_validate() {
     ok(&base());
     ok(&local());
 }
+
+// ---------- follow-up audit: journal limit progress guarantee ----------
+
+#[test]
+fn journal_hard_limit_must_leave_room_for_a_reclaim_and_the_largest_request() {
+    // 4 KiB units, 1 MiB requests: a request journals 257 records of
+    // 32 + 4384 bytes; two 1 MiB segments alone are not enough.
+    let too_small = base().replace(
+        "[backing]\nroot = \"/x\"\n",
+        "[backing]\nroot = \"/x\"\njournal_segment_size = \"1MiB\"\njournal_max_bytes = \"2MiB\"\n",
+    );
+    let msg = err(&too_small);
+    assert!(msg.contains("largest request"), "{msg}");
+    let enough = base().replace(
+        "[backing]\nroot = \"/x\"\n",
+        "[backing]\nroot = \"/x\"\njournal_segment_size = \"1MiB\"\njournal_max_bytes = \"4MiB\"\n",
+    );
+    ok(&enough);
+}

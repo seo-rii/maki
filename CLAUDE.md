@@ -35,7 +35,7 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 | `maki-test-support` | executable spec: `ReferenceBlockModel` (durability oracle), `CrashableBacking` (POSIX-faithful crash sim + fault hook), `FakeCryptoProvider`, `ManualClock`, `DeterministicScheduler`, failpoints, HTTP chaos server |
 | `maki-backing` | escape-proof `Backing` trait; `FileBacking` (real FS), `MemBacking` |
 | `maki-format` | geometry, superblock, A/B protocol, slot/allocation/catalog/journal codecs (all CRC, panic-free, golden-frozen), TOML config schema |
-| `maki-crypto` | `CryptoProvider` trait, `SecretBuffer`, error classes, `CheckedProvider`, self-tests + conformance suite, flow control (`DualSemaphore`, `BoundedQueue`), retry/budget/breaker, `EndpointSet` dispatcher, `Batcher` |
+| `maki-crypto` | `CryptoProvider` trait, `SecretBuffer`, error classes, `CheckedProvider`, self-tests + conformance suite, flow control (`DualSemaphore`, `BoundedQueue`), retry/budget/breaker, `EndpointSet` dispatcher (retry-safe aware, deadlines, quarantine), `BatchScheduler` (cross-request coalescing, bounded lanes) |
 | `maki-crypto-local` / `-http` / `-websocket` / `-grpc` | providers; all pass `provider_conformance` |
 | `maki-core` | `JournalWriter`, `Overlay` (latest + latest-durable per unit), `SlotStore`, checkpoint, recovery, `Engine` (RMW, per-unit locks, cache, admission) |
 | `maki-cache` | versioned plaintext LRU, key `(unit, write_sequence)` |

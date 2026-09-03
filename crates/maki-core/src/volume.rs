@@ -183,16 +183,22 @@ impl Volume {
         // captured rather than superseded.
         self.overlay.promote(self.journal.durable_sequence());
         let sequence = appended?;
+        // The record is in the journal now, so it must be visible: a later
+        // barrier (or recovery) would surface it anyway. Publish before the
+        // FUA sync so a sync failure never leaves the live view behind the
+        // on-disk journal.
+        self.overlay.publish(unit, sequence, ciphertext.to_vec());
+        self.overlay.promote(self.journal.durable_sequence());
         if fua {
-            let durable = self.journal.sync()?;
+            let sync = self.journal.sync();
+            self.overlay.promote(self.journal.durable_sequence());
+            let durable = sync?;
             if durable < sequence {
                 return Err(CoreError::Durability(format!(
                     "FUA verify failed: durable {durable} < sequence {sequence}"
                 )));
             }
         }
-        self.overlay.publish(unit, sequence, ciphertext.to_vec());
-        self.overlay.promote(self.journal.durable_sequence());
         Ok(sequence)
     }
 

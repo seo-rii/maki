@@ -8,8 +8,13 @@
 //! Bounded by bytes with LRU eviction, TTL expiry, runtime resize, and
 //! zeroize-on-evict (plaintext lives in `SecretBuffer`, which zeroizes on
 //! drop; eviction drops the buffer immediately).
+//!
+//! Recency is tracked in an ordered index keyed by a monotonic tick, so an
+//! eviction is O(log n) rather than a scan of every entry: a full cache of
+//! tens of thousands of units evicts on every insert, and a linear scan
+//! there would turn the hot read path quadratic.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,12 +45,14 @@ struct Entry {
     write_sequence: u64,
     data: Arc<SecretBuffer>,
     inserted_at: Duration,
-    /// Monotonic recency stamp for LRU.
+    /// Monotonic recency stamp for LRU; also the key in `recency`.
     last_used: u64,
 }
 
 struct Inner {
     map: HashMap<u64, Entry>,
+    /// last_used tick -> unit, oldest first. Ticks are unique.
+    recency: BTreeMap<u64, u64>,
     bytes: u64,
     max_bytes: u64,
     tick: u64,
@@ -54,18 +61,40 @@ struct Inner {
 impl Inner {
     fn remove(&mut self, unit: u64) {
         if let Some(entry) = self.map.remove(&unit) {
+            self.recency.remove(&entry.last_used);
             self.bytes -= entry.data.len() as u64;
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    /// Mark `unit` most recently used.
+    fn touch(&mut self, unit: u64) {
+        let tick = self.next_tick();
+        if let Some(entry) = self.map.get_mut(&unit) {
+            self.recency.remove(&entry.last_used);
+            entry.last_used = tick;
+            self.recency.insert(tick, unit);
         }
     }
 
     /// Evict LRU entries until `need` bytes fit within the budget.
     fn make_room(&mut self, need: u64) {
         while self.bytes + need > self.max_bytes {
-            let Some((&unit, _)) = self.map.iter().min_by_key(|(_, e)| e.last_used) else {
+            let Some((&_, &unit)) = self.recency.iter().next() else {
                 return;
             };
             self.remove(unit);
         }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.recency.clear();
+        self.bytes = 0;
     }
 }
 
@@ -84,6 +113,7 @@ impl VersionedLruCache {
             clock,
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
+                recency: BTreeMap::new(),
                 bytes: 0,
                 max_bytes: config.max_bytes,
                 tick: 0,
@@ -104,8 +134,7 @@ impl VersionedLruCache {
             return; // dropped => zeroized
         }
         inner.make_room(len);
-        inner.tick += 1;
-        let tick = inner.tick;
+        let tick = inner.next_tick();
         inner.map.insert(
             unit,
             Entry {
@@ -115,6 +144,7 @@ impl VersionedLruCache {
                 last_used: tick,
             },
         );
+        inner.recency.insert(tick, unit);
         inner.bytes += len;
     }
 
@@ -125,7 +155,7 @@ impl VersionedLruCache {
         let now = self.clock.now();
         let ttl = *self.ttl.lock();
         let mut inner = self.inner.lock();
-        let result = match inner.map.get_mut(&unit) {
+        let result = match inner.map.get(&unit) {
             Some(entry)
                 if entry.write_sequence == write_sequence
                     && now.saturating_sub(entry.inserted_at) < ttl =>
@@ -140,11 +170,7 @@ impl VersionedLruCache {
             None => None,
         };
         if let Some(data) = result {
-            inner.tick += 1;
-            let tick = inner.tick;
-            if let Some(entry) = inner.map.get_mut(&unit) {
-                entry.last_used = tick;
-            }
+            inner.touch(unit);
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(data)
         } else {
@@ -159,9 +185,7 @@ impl VersionedLruCache {
     }
 
     pub fn clear(&self) {
-        let mut inner = self.inner.lock();
-        inner.map.clear();
-        inner.bytes = 0;
+        self.inner.lock().clear();
     }
 
     /// Runtime resize (hot-reloadable, SPEC §20). Shrinking evicts
@@ -170,8 +194,7 @@ impl VersionedLruCache {
         let mut inner = self.inner.lock();
         inner.max_bytes = max_bytes;
         if max_bytes == 0 {
-            inner.map.clear();
-            inner.bytes = 0;
+            inner.clear();
         } else {
             inner.make_room(0);
         }

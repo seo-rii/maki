@@ -2,8 +2,19 @@
 //! enforced or reported as not enforced, never silently accepted. Linux
 //! enforces; the posture document says what happened.
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
 use maki_nbdkit::daemon::parse_and_validate;
 use maki_nbdkit::security::{apply, posture, posture_json, unsafe_swaps};
+
+/// `apply` records a process-global posture: tests that call it must not
+/// interleave.
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn config(security: &str, cache: &str) -> String {
     format!(
@@ -61,6 +72,7 @@ fn swap_parser_is_strict() {
 
 #[test]
 fn posture_is_recorded_and_reported() {
+    let _serial = serial();
     let cfg = parse_and_validate(&config(
         "disable_core_dump = true\nmemory_lock_mode = \"secure-buffers\"\nrequire_secure_swap_policy = false",
         "",
@@ -90,6 +102,7 @@ fn posture_is_recorded_and_reported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_disables_core_dumps_for_real() {
+    let _serial = serial();
     let cfg = parse_and_validate(&config(
         "disable_core_dump = true\nmemory_lock_mode = \"off\"\nmadv_dontdump = false\nrequire_secure_swap_policy = false",
         "lock_memory = false",

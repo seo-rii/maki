@@ -97,9 +97,11 @@ impl NbdAdapter {
             .enable_all()
             .build()
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
-        let engine = runtime
-            .block_on(daemon::attach_from_config(&config))
+        let (engine, crypto_stats) = runtime
+            .block_on(daemon::attach_from_config_with_stats(&config))
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
+        #[cfg(not(unix))]
+        let _ = &crypto_stats; // only the Unix control socket reports them
         let block_sizes = (
             config.nbd.minimum_io,
             config.nbd.preferred_io,
@@ -109,11 +111,13 @@ impl NbdAdapter {
         #[cfg(unix)]
         let control = {
             let socket = daemon::control_socket_path(&config);
-            let backend: Arc<dyn maki_control::server::ControlBackend> =
-                Arc::new(crate::control::EngineControlBackend::new(
+            let backend: Arc<dyn maki_control::server::ControlBackend> = Arc::new(
+                crate::control::EngineControlBackend::new(
                     engine.clone(),
                     config.volume.name.clone(),
-                ));
+                )
+                .with_crypto_stats(crypto_stats.clone()),
+            );
             let group = config.control.group.clone();
             let listener = runtime
                 .block_on(async {

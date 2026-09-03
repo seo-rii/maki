@@ -858,6 +858,25 @@ impl VolumeConfig {
                 "backing.journal_max_bytes {max} must be at least twice journal_segment_size {seg}"
             )));
         }
+        // Progress guarantee: after an inline reclaim only the active segment
+        // remains, and the largest single request must still fit under the
+        // hard limit, or the journal could refuse writes forever.
+        let record = 32u64 + self.crypto.capabilities.max_ciphertext_size as u64;
+        let units_per_request = self
+            .nbd
+            .maximum_io
+            .0
+            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
+            + 1;
+        let largest_request = units_per_request.saturating_mul(record);
+        let needed = seg.saturating_mul(2).saturating_add(largest_request);
+        if max < needed {
+            return Err(ConfigError::Invalid(format!(
+                "backing.journal_max_bytes {max} must be at least {needed}: two segments plus \
+                 the largest request ({units_per_request} records of {record} bytes) so a \
+                 reclaim can always make room"
+            )));
+        }
         if self.limits.max_journal_pending_bytes.0 == 0 {
             return Err(ConfigError::Invalid(
                 "limits.max_journal_pending_bytes must be positive".to_string(),

@@ -162,6 +162,21 @@ match that contract and responses must preserve unit identity and order.
 Free space is read with `statvfs` on Unix hosts. Where it cannot be read, the
 free-space rules do not apply and `maki_backing_free_bytes` is null.
 
+## Batching and pending bounds
+
+Remote providers are called through a batch scheduler (SPEC §30). Concurrent
+requests are coalesced into one provider call when their items fit
+`crypto.batch.max_items` / `max_bytes`; a batch is dispatched as soon as
+`target_items` or `target_bytes` is reached, and at the latest `max_wait`
+after its first item arrived. A request's items are never split and keep
+their order. `limits.max_pending_crypto_items` bounds queued items per lane,
+`limits.max_pending_crypto_bytes` bounds queued plaintext (encrypt lane) and
+`limits.max_ciphertext_bytes` bounds queued ciphertext (decrypt lane); a full
+queue applies backpressure. Local providers are called directly, since
+coalescing an in-process cipher only adds latency. `maki status` reports the
+scheduler under `crypto`, and metrics expose `maki_crypto_pending_items`,
+`maki_crypto_pending_bytes`, and batch counters.
+
 ## Security settings
 
 The `[security]` section is applied by the daemon before the volume is

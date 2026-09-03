@@ -401,7 +401,10 @@ impl EndpointSet {
     ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
         let started = self.clock.now();
-        let deadline = self.config.max_operation_time.map(|d| started + d);
+        let deadline = self
+            .config
+            .max_operation_time
+            .map(|d| started.saturating_add(d));
         let mut calls_made = 0u32;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;

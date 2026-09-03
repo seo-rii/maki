@@ -8,12 +8,16 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use std::sync::Arc;
+
 use maki_control::server::ControlBackend;
 use maki_core::engine::{Engine, EngineState};
+use maki_crypto::scheduler::SchedulerStats;
 
 pub struct EngineControlBackend {
     engine: Engine,
     volume_name: String,
+    crypto_stats: Option<Arc<SchedulerStats>>,
 }
 
 impl EngineControlBackend {
@@ -21,6 +25,27 @@ impl EngineControlBackend {
         Self {
             engine,
             volume_name: volume_name.into(),
+            crypto_stats: None,
+        }
+    }
+
+    /// Attach the batch scheduler's counters (remote providers).
+    pub fn with_crypto_stats(mut self, stats: Option<Arc<SchedulerStats>>) -> Self {
+        self.crypto_stats = stats;
+        self
+    }
+
+    fn crypto_json(&self) -> Value {
+        match &self.crypto_stats {
+            None => json!({ "batched": false }),
+            Some(s) => json!({
+                "batched": true,
+                "pending_items": s.pending_items(),
+                "pending_bytes": s.pending_bytes(),
+                "batches_total": s.batches_total(),
+                "batched_items_total": s.batched_items_total(),
+                "coalesced_batches_total": s.coalesced_batches_total(),
+            }),
         }
     }
 }
@@ -51,6 +76,7 @@ impl ControlBackend for EngineControlBackend {
             "checkpoints_total": stats.checkpoints_total,
             "checkpoint_failures_total": stats.checkpoint_failures_total,
             "security": crate::security::posture_json(),
+            "crypto": self.crypto_json(),
         })
     }
 
@@ -75,6 +101,10 @@ impl ControlBackend for EngineControlBackend {
             "maki_cache_misses_total": stats.cache_misses,
             "maki_cache_bytes": stats.cache_bytes,
             "maki_cache_entries": stats.cache_entries,
+            "maki_crypto_pending_items": self.crypto_stats.as_ref().map(|s| s.pending_items()).unwrap_or(0),
+            "maki_crypto_pending_bytes": self.crypto_stats.as_ref().map(|s| s.pending_bytes()).unwrap_or(0),
+            "maki_crypto_batches_total": self.crypto_stats.as_ref().map(|s| s.batches_total()).unwrap_or(0),
+            "maki_crypto_coalesced_batches_total": self.crypto_stats.as_ref().map(|s| s.coalesced_batches_total()).unwrap_or(0),
         })
     }
 

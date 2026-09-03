@@ -531,3 +531,39 @@ fn recovery_without_durable_mark_still_recovers_clean_journal() {
     vol.write_ct(2, &ct(3), true).unwrap();
     assert!(backing.exists(layout::JOURNAL_DURABLE_MARK).unwrap());
 }
+
+// ---------- follow-up audit: FUA sync failure keeps live view == journal ----------
+
+/// A FUA write whose fdatasync fails has still been appended to the journal.
+/// It must be visible to reads immediately (a later barrier or recovery
+/// would surface it anyway); otherwise the live view diverges from what a
+/// restart will replay.
+#[test]
+fn failed_fua_sync_still_publishes_the_journaled_record() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    vol.write_ct(0, &ct(1), true).unwrap();
+
+    let fp = failpoints::fail_n_times("journal.sync", 1, io::ErrorKind::Other, "injected");
+    let err = vol.write_ct(0, &ct(2), true).unwrap_err();
+    drop(fp);
+    assert!(matches!(err, maki_core::CoreError::Io(_)), "{err}");
+    assert_eq!(
+        vol.read_ct(0).unwrap().unwrap().1,
+        ct(2),
+        "the appended record is the live version even though FUA failed"
+    );
+    assert_eq!(
+        vol.journal_durable_sequence(),
+        1,
+        "and it is not claimed durable"
+    );
+
+    // A later barrier makes it durable and a crash keeps it.
+    vol.flush().unwrap();
+    drop(vol);
+    backing.crash_all_lost();
+    let vol = recover(&backing).unwrap();
+    assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(2));
+}
