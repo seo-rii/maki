@@ -59,6 +59,9 @@ struct ActiveSegment {
     /// File offset up to which this segment has been fdatasync'd.
     synced_offset: u64,
     unsynced: bool,
+    /// A failed write may have extended the physical file beyond the last
+    /// accepted record. Keep cleanup pending until its truncation is synced.
+    needs_tail_cleanup: bool,
 }
 
 pub struct JournalWriter {
@@ -175,12 +178,19 @@ impl JournalWriter {
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
-        if !active.unsynced {
+        if !active.unsynced && !active.needs_tail_cleanup {
             return Ok(());
+        }
+        if active.needs_tail_cleanup {
+            // Even a segment with no new accepted records can have a torn
+            // append. Its removal must be durable before a roll makes this
+            // segment non-final, where recovery rejects every damaged byte.
+            active.file.set_len(active.write_offset)?;
         }
         fp("journal.sync")?;
         active.file.sync_data()?;
         active.unsynced = false;
+        active.needs_tail_cleanup = false;
         active.synced_offset = active.write_offset;
         self.durable_sequence = self.appended_sequence;
         let mark = DurableMark {
@@ -260,6 +270,7 @@ impl JournalWriter {
                     write_offset: SEGMENT_HEADER_SIZE as u64,
                     synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
+                    needs_tail_cleanup: false,
                 });
                 // Point the mark at the new segment (header only) so it
                 // names the newest segment index even before the first
@@ -301,8 +312,16 @@ impl JournalWriter {
         };
         let bytes = encode_record(&record);
         let active = self.active.as_mut().expect("active segment after roll");
+        if active.needs_tail_cleanup {
+            // A shorter retry cannot overwrite the whole failed prefix.
+            // Retain the flag until fdatasync also persists this truncation.
+            active.file.set_len(active.write_offset)?;
+        }
         fp("journal.append.write")?;
-        active.file.write_at(active.write_offset, &bytes)?;
+        if let Err(error) = active.file.write_at(active.write_offset, &bytes) {
+            active.needs_tail_cleanup = true;
+            return Err(error.into());
+        }
         active.write_offset += bytes.len() as u64;
         active.info.record_count += 1;
         active.info.size = active.write_offset;
