@@ -127,12 +127,21 @@ qualify `/dev/nbd`, LVM, XFS, or raw-device durability.
 ## Control plane
 
 The data plane binds the per-volume control socket while attaching, at
-`control.socket` or by default `/run/maki/<volume>/control.sock`, with mode
+`control.socket` or by default `/run/maki-control/<volume>/control.sock`, with mode
 0660 and the group named by `control.group` (`maki-admin` in the packaged
-units; `sysusers.d` makes `maki` a member so the unprivileged daemon can apply
+example configuration; `sysusers.d` makes `maki` a member so the unprivileged daemon can apply
 it). A socket that cannot be bound fails attach: a daemon without its control
 socket is not operable. Rootless runs must therefore set `control.socket` to a
 writable path. The socket is removed on clean detach.
+
+The packaged `/run/maki-control` directory is `root:maki-admin` 0750; its
+per-volume children are `maki:maki` 0711. This lets administrators traverse
+the control path while `/run/maki` (`root:maki` 0750) restricts access to NBD.
+The daemon keeps `Group=maki`. Set `control.group = "maki-admin"` to apply the
+administrative socket group; omitting it retains the daemon's socket group.
+NBD isolation relies on the restricted ancestor: nbdkit resets its own umask,
+so a service `UMask` is not a socket-mode guarantee.
+[nbdkit plugin manual](https://libguestfs.org/nbdkit-plugin.3.html#UMASK)
 
 The unprivileged control socket accepts newline-delimited JSON with a 64 KiB
 line limit. The `maki` CLI exposes the supported operations:
@@ -172,10 +181,12 @@ maki-attach grow --volume example --add-bytes 1073741824 --plan
 
 Execution (Linux, root) then:
 
-1. takes `/run/maki/attach.lock` and, unless a device is pinned, allocates the
-   lowest free `/dev/nbdN` from sysfs;
-2. connects NBD with the configured block size and waits until the device
-   reports a size;
+1. opens `/run/maki-attach` through verified root-owned directory descriptors,
+   takes its private `attach.lock`, and, unless a device is pinned, allocates
+   the lowest free `/dev/nbdN` from sysfs;
+2. records the requested attachment and a random connection identifier before
+   connecting NBD, then connects with the configured block size, waits until
+   the device reports a size, and verifies its kernel backend identifier;
 3. activates the VG, mounts XFS, and on `--init-sentinel` (or
    `init_sentinel = true`, first boot only) creates `<mountpoint>/.maki-sentinel`
    holding the volume UUID, never overwriting a different value;
@@ -186,18 +197,34 @@ Execution (Linux, root) then:
    name, so nothing planted there can make root overwrite or block);
 5. on any failure rolls back the executed steps in reverse (umount, VG
    deactivate, NBD disconnect — a device that connected but never became
-   ready is disconnected too) and exits non-zero, reporting rollback steps
-   that themselves failed.
+   ready is disconnected too, only if its recorded backend identity still
+   matches) and exits non-zero, reporting rollback steps that themselves failed.
 
-The device bound at attach is recorded in `/run/maki/attach/<volume>.nbd`.
-`maki-attach detach` uses that record when the attach configuration leaves
-`nbd_device` on auto, takes the same attach lock, and refuses to run when no
-device is recorded rather than guess (pass `--nbd-device` explicitly then).
+Attachment records live in `/run/maki-attach/<volume>.nbd`, under a
+`root:root` 0700 directory. Records are bounded, private, single-link regular
+files containing versioned JSON. The helper refuses symlinks, writable
+ancestors, unexpected ownership, and malformed or legacy device-only records.
+An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV, device,
+and random connection identifier.
+
+`maki-attach detach` takes the same lock and compares the requested attachment
+with that record and the live `/sys/block/nbdN/backend` before unmounting or
+deactivating a VG. It verifies the backend again immediately before disconnect,
+including rollback. Missing records or mismatched identities refuse execution;
+an explicit `--nbd-device` cannot bypass this check.
+
+This requires **nbd-client 3.27.0 or later built with netlink support**, and a
+kernel exposing the NBD backend identifier. The identifier option was added
+in [NBD 3.27.0](https://github.com/NetworkBlockDevice/nbd/releases/tag/nbd-3.27.0).
+An unsupported client or unverifiable connection fails closed. Qualify the
+updated helper on the intended Linux target before deployment; older privileged
+validation reports do not cover this connection-identity protocol.
 
 `maki-attach@<volume>.service` therefore stays active only after the identity
 check passed. Services that need the secure mount must declare
-`Requires=maki-attach@<volume>.service` and `After=` it; the unit is skipped
-when no attach configuration exists. Execution without a volume UUID is
+`Requires=maki-attach@<volume>.service` and `After=` it. `AssertPathExists`
+makes a missing attach configuration fail startup, so the dependent service's
+start job also fails. Execution without a volume UUID is
 refused.
 
 > [!CAUTION]
@@ -225,6 +252,26 @@ systemd-analyze verify maki@example.service maki-attach@example.service
 
 Also verify socket ACLs, effective capabilities, core-dump policy, duplicate
 attach rejection, mount identity, and normal I/O under the service sandbox.
+
+### Upgrading the runtime layout
+
+The September 2026 fixes change helper records and the default control socket
+path. Apply the package changes during a planned maintenance window:
+
+1. Stop dependent workloads and detach existing volumes **using the old
+   helper before replacing it**. Do not copy legacy
+   `/run/maki/attach/<volume>.nbd` files into the new helper directory.
+2. Install the updated helper, units, and tmpfiles rules, and ensure the
+   nbd-client and kernel requirements above are satisfied.
+3. Update explicit `control.socket` values to
+   `/run/maki-control/<volume>/control.sock`, or provision an equivalent custom
+   path whose ancestors permit the configured control group to traverse it.
+4. Reattach and verify the trusted record, mount identity, administrator control
+   access, and NBD socket isolation before starting workloads.
+
+If the helper has already been upgraded while a legacy attachment is live,
+missing trusted state requires independently verified manual cleanup. Pinning
+the NBD device is not a migration shortcut.
 
 ## Growth and cache reload
 

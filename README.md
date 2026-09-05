@@ -42,6 +42,13 @@ Maki is designed around four constraints:
 | 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; five findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark, S-04/S-05 recovery under out-of-order sector persistence) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
 | 2026-09-03 second audit (core, crypto, operations) | 27 confirmed findings fixed with regression tests, among them recovery accepting never-synced page-cache bytes after a process restart, HTTP redirects re-sending plaintext, the root helper following symlinks in the mount root, and detach disconnecting the wrong NBD device; see the [remediation log](docs/review-remediation.md#second-audit-2026-09-03-core-crypto-layer-operational-layers) |
 
+The [2026-09-05 review](docs/project-review-2026-09-05.md) identified nine further
+issues in A/B retries, request lifetimes, credentials, and deployment boundaries.
+All nine have TDD fixes; the [remediation log](docs/review-remediation.md#follow-up-review-2026-09-05)
+records the evidence. The updated helper requires a new runtime layout and NBD
+backend identity support; follow the [upgrade procedure](docs/operations.md#upgrading-the-runtime-layout)
+and qualify it on the target host before deployment.
+
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.
 

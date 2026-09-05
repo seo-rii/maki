@@ -88,7 +88,32 @@ has a constant residue.
 | Sanitizers and randomized suites | Debug-build `check_invariants` on `Overlay`, `JournalWriter`, and `Volume` after every mutation; `review_fuzz.rs` (maki-format: single-bit-flip and random-mutation fuzz of every decoder, the journal scanner, URL parsing, and `validate()` on a mutated production sample), `review_stress.rs` and `review_corruption.rs` (maki-core: concurrent engine stress with a per-unit oracle, provider chaos, background checkpoints and a crash; engine-level sweep of all persistence failpoints; random single-file corruption with deep check and re-attach), `review_stress_crypto.rs` (maki-crypto: scheduler and dispatcher under random faults), `review_cache_model.rs` (maki-cache: model-based LRU check); findings S-01 to S-05 in the [remediation log](review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
 | Second audit regressions | `review_audit.rs` (maki-core: process-restart durability, covered-segment reclaim, adoption ordering, scanner bounds, covered-prefix resurrection, decrypt length), `review_audit2.rs`, `review_secret.rs` (maki-crypto: breaker probes, deadline accounting, background validation, lane concurrency, self-test strictness, pending items, page unlocking), `review_redirect.rs` (maki-crypto-http), `review_hang.rs` (maki-crypto-websocket), and the O-series additions to `review_priv.rs`, `review_uds.rs`, `review_control.rs`, `review_sample.rs`, `review_config.rs`, `review_format.rs`; findings K/C/O in the [remediation log](review-remediation.md#second-audit-2026-09-03-core-crypto-layer-operational-layers) |
 
+## September 2026 review regressions
+
+These suites cover the repaired storage, resource-lifetime, and configuration
+boundaries. They are part of the default workspace suite; Linux-specific checks
+exercise kernel page-lock state, and the runtime permission check models the
+packaged configuration without installing services or creating users.
+
+| Boundary | Regression coverage |
+|---|---|
+| A/B retry durability (BUG-001) | `review_ab_retry.rs` in `maki-format` and `maki-core`: failed data/directory sync, repeated retries and restart, sector tearing, writeback that loses dirty bits, preservation across metadata types, and recovery of durable volume data |
+| Required attach configuration (BUG-002) | `maki-privileged/tests/regression_missing_attach_config.rs`: required assertion in the unit and actual offline systemd assertion evaluation for missing/present temporary configuration |
+| Trusted helper state (BUG-003) | `maki-privileged/src/state_tests.rs`, `exec_tests.rs`, and `tests/regression_attach_state.rs`: protected state ancestors/files, configuration and live backend identity, stale records, fail-before-side-effects ordering, rollback, and cleanup failure; device operations are simulated |
+| HalfOpen probe lifetime (BUG-004) | `maki-crypto/tests/review_probe_lifetime.rs`: request/provider errors, operation deadline, future cancellation, and exhausted retry budget all leave a slot for a healthy recovery request |
+| WebSocket connection lifetime (BUG-005) | `maki-crypto-websocket/tests/review_connection_lifetime.rs`: server-observed socket closure after timeout, outer cancellation, and idle provider drop; a healthy successor remains reusable |
+| Secret-buffer page ownership (BUG-006) | `maki-crypto/tests/review_secret_page_lifetime.rs`: shared-page drop, `into_vec`, and duplicate lifetimes; last-owner unlock, lock failures, and full-capacity zeroization before deallocation, with process-wide settings isolated in child processes |
+| Credential source identity (BUG-007) | `maki-nbdkit/tests/review_credential_sources.rs`: conflicting sources for one name rejected before loading credentials; repeated same-source references and distinct names remain valid |
+| HTTP error redaction (BUG-008) | `maki-crypto-http/tests/review_redirect.rs`: connection failure, timeout, and truncated response errors omit request URLs and synthetic query secrets from both Display and Debug |
+| Administrative socket access (BUG-009) | `maki-nbdkit/tests/regression_control_packaging.rs`: default/example/custom paths, admin traversal, daemon access, and isolation from NBD and helper state under the packaged directory modes |
+
 ## Current qualification status
+
+The September helper changes require new target-host qualification with
+nbd-client netlink/backend identity support. The historical privileged Linux
+reports below cover earlier code. The current regression suite does not start
+systemd workloads or attach real devices; follow the
+[runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
 
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|

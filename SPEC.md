@@ -266,7 +266,7 @@ maki grow
 Normal status and runtime configuration operations are performed over the daemon control socket:
 
 ```text
-/run/maki/<volume>/control.sock
+/run/maki-control/<volume>/control.sock
 ```
 
 Recommended ownership:
@@ -321,6 +321,15 @@ Recommended layout:
 /run/maki/
 ├── postgres/
 └── minio/
+
+/run/maki-control/
+├── postgres/
+└── minio/
+
+/run/maki-attach/
+├── attach.lock
+├── postgres.nbd
+└── minio.nbd
 ```
 
 Recommended permissions:
@@ -341,8 +350,20 @@ maki:maki                 0700
 data/journal/metadata files
 maki:maki                 0600
 
-/run/maki/<volume>
-maki:maki                 0700
+/run/maki
+root:maki                 0750
+
+/run/maki-control
+root:maki-admin           0750
+
+/run/maki/<volume> and /run/maki-control/<volume>
+maki:maki                 0711
+
+/run/maki-attach
+root:root                 0700
+
+/run/maki-attach/*
+root:root                 0600
 ```
 
 The NBD Unix Domain Socket:
@@ -351,7 +372,16 @@ The NBD Unix Domain Socket:
 /run/maki/<volume>/nbd.sock
 ```
 
-MUST be created inside a restrictive runtime directory.
+MUST be created behind a restrictive runtime ancestor.
+Administrative control access MUST NOT grant access to the NBD socket.
+
+Privileged attachment state MUST be opened through root-controlled directory
+descriptors without following symlinks. Detach MUST verify its requested
+volume UUID, socket, mountpoint, VG, LV, and device against a trusted record
+before executing any step. The record's unique connection identifier MUST
+match the live NBD backend before detach and immediately before disconnect,
+including rollback. A missing or invalid record MUST fail closed, even when
+the caller supplies an explicit NBD device.
 
 ---
 
@@ -430,8 +460,11 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 
+RuntimeDirectory=maki/%i maki-control/%i
+RuntimeDirectoryMode=0711
 ReadWritePaths=/var/lib/maki/%i
 ReadWritePaths=/run/maki/%i
+ReadWritePaths=/run/maki-control/%i
 ```
 
 The exact sandbox options MUST be finalized after compatibility testing with nbdkit and all required shared libraries.
@@ -1882,7 +1915,7 @@ threads = 64
 connections = 1
 
 [control]
-socket = "/run/maki/postgres-prod/control.sock"
+socket = "/run/maki-control/postgres-prod/control.sock"
 group = "maki-admin"
 
 [security]

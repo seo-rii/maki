@@ -71,11 +71,20 @@ writes.
 | Journal durable mark | CRC, single copy, never fsync'd | Lower bound on the fdatasync'd prefix of the active segment |
 | Checkpoint state | Two generations plus CRC, written at creation | Highest durably applied journal sequence |
 
-Metadata updates overwrite the stale A/B side and then advance generation. A
-torn new copy therefore falls back to the older valid generation. A side that
-is absent, empty, short, or fails its CRC is an invalid copy; any other read
-error is an I/O error and refuses attach rather than silently selecting the
-other side.
+Metadata updates select an absent, invalid, or older A/B side for replacement.
+Before touching it, the store rewrites the preserved, typed-valid copy's exact
+bytes without truncation, synchronizes that file, and synchronizes its parent
+directory. Only then does it advance the generation, write the replacement,
+and synchronize the new contents. The caller must synchronize the replacement's
+directory entry when it creates a file.
+
+This preservation step also runs after a failed store or a process restart:
+readable, CRC-valid bytes may still be volatile, and writeback errors can clear
+dirty page-cache bits without persisting them. If preservation fails, the
+replacement side is untouched. A torn replacement can therefore fall back to
+the preserved generation. A side that is absent, empty, short, or fails its
+CRC or typed decode is an invalid copy; any other read error is an I/O error
+and refuses attach rather than silently selecting the other side.
 
 ## Recovery and checkpointing
 
@@ -161,10 +170,21 @@ growing memory. Each lane keeps several batches in flight (bounded by
 requests behind it. Local providers are called directly.
 
 The dispatcher validates quarantined endpoints in background tasks, never on
-the request path; an RPC abandoned at the operation deadline releases its
-inflight slot and is not charged to the endpoint's circuit breaker; and the
-HTTP transport never follows a redirect (a 3xx fails the endpoint over rather
-than re-sending plaintext to a server-chosen URL).
+the request path. Each admitted call owns a circuit-breaker permit for its
+generation. Completion, operation deadline, cancellation, request/provider
+errors, and retry-budget refusal all release a HalfOpen probe slot; outcomes
+that are not endpoint failures do not advance the failure count. A stale
+permit cannot affect a later breaker generation. Abandoning an RPC also
+releases its transport inflight slot.
+
+The HTTP transport never follows a redirect (a 3xx fails the endpoint over
+rather than re-sending plaintext to a server-chosen URL). It removes request
+URLs from transport errors before classification and formatting, keeping query
+credentials out of those error messages. Each WebSocket connection generation
+owns both reader and writer futures in one task. Timeout, request cancellation,
+connection replacement, and provider drop retire that generation, cancel its
+task, release its socket, and fail its pending requests without disturbing a
+successor connection.
 
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
@@ -185,9 +205,18 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 
 - The nbdkit data plane runs as the `maki` user with no Linux capabilities.
 - The control socket exposes status, metrics, checkpoint, and reload only.
+- Its default path is `/run/maki-control/<volume>/control.sock`; the packaged
+  runtime layout lets `maki-admin` reach it through a separate directory tree
+  while keeping the NBD runtime tree restricted to the daemon's group.
 - Privileged storage operations are isolated in `maki-attach`.
 - Keys and plaintext use redacted, zeroizing buffers and must not be logged.
+- Optional buffer page locks have shared ownership: buffers on the same page
+  keep it locked until the final owner releases it. Drop zeroizes before
+  releasing ownership; `into_vec` transfers zeroization to the caller and
+  releases only that buffer's lock ownership.
 - Configuration rejects literal values for sensitive headers.
+- Repeated credential names must declare the same source throughout a volume
+  configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.
 
 See [Configuration](configuration.md), [Operations](operations.md), and the
