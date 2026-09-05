@@ -41,9 +41,19 @@ maki volume inspect /etc/maki/volumes/example.toml
 maki check /etc/maki/volumes/example.toml
 ```
 
-`volume create` writes the initial superblock, catalog, and backing directories.
-The command must target an empty, reviewed backing location. `maki-check` can
-also inspect a backing root directly:
+`volume create` writes the initial superblock, catalog, and backing directories,
+all owner-only (`0700` directories, `0600` files). The command must target an
+empty, reviewed backing location, and the tree must end up owned by the daemon
+user: `/var/lib/maki` is `root:maki 0750`, so create the volume directory for
+the daemon and run the command as that user rather than as root (a root-owned
+`0700` tree is unreadable to the daemon, which then fails to attach):
+
+```bash
+install -d -o maki -g maki -m 0700 /var/lib/maki/example
+sudo -u maki maki volume create /etc/maki/volumes/example.toml
+```
+
+`maki-check` can also inspect a backing root directly:
 
 ```bash
 maki-check /var/lib/maki/example
@@ -307,6 +317,11 @@ high-cardinality values as metric labels.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with mode `0600` or `0400`, or attach is
   refused.
+- The daemon runs under `UMask=0077`, so the NBD socket nbdkit creates is
+  connectable only by the daemon user and root (the attach helper). The
+  control socket is `0660` with `control.group`, and the daemon gives that
+  group search access to its runtime directory so `maki status` works for
+  administrators; `/run/maki` itself is `maki:maki-admin 0750`.
 
 Use [Testing and qualification](testing.md) before interpreting a successful
 userspace smoke test as production readiness.

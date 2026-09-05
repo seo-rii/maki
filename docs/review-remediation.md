@@ -301,6 +301,26 @@ non-dumpable flag; FLUSH takes the volume's exclusive lock rather than an
 append-ordered barrier (§25 describes the ordering, which the lock also
 provides, at a concurrency cost the benchmark must quantify).
 
+## Fifth pass (2026-09-05): A/B retry, breaker probes, packaging
+
+A further pass over the A/B metadata store, the circuit breaker, the
+dispatcher, the journal scanner, the deep checker, and the packaging
+(systemd units, tmpfiles, sysusers) against SPEC §5, §7, §8 and §10.
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| N-09 | **The A/B store retried a failed sync on the wrong side.** After a failed `fdatasync` the new record stays visible in the page cache (F01), so the retry read that side as the newer generation and overwrote the *other* side, the only copy proven durable; a crash tearing that retry left one torn side and one side two generations old, losing metadata acknowledged as durable (checkpoint state, allocation maps, catalog, canary). | On a sync failure the written side is emptied before the error is returned, so the retry targets it again and the durable side is never touched until a newer copy has been synced elsewhere. | `a_failed_sync_never_makes_the_last_durable_copy_the_next_target`, `stores_alternate_sides_and_a_torn_write_costs_only_the_stale_side` (maki-format `review_ab.rs`; the first fails on the previous code with "loaded 1") |
+| N-10 | A half-open probe abandoned at the operation deadline (its RPC future dropped, C-06) never reported back, so its slot was never returned: `half_open_max_requests` abandoned probes wedged the circuit half-open forever, and a single-endpoint `bounded-error` volume with a slow provider stopped probing for good. | `CircuitBreaker::on_abandoned` returns the slot without a verdict; the dispatcher calls it for every deadline error. | `abandoned_half_open_probes_return_their_slots` (maki-crypto) |
+| N-11 | **Administrators could not reach the control socket.** systemd creates `/run/maki/<volume>` as `maki:maki`, and `/run/maki` was `maki:maki`, so a `maki-admin` member could not traverse to the `0660` socket (SPEC §7 group access); SPEC §8 even asked for `0700`, contradicting §7. | The daemon gives `control.group` search access to the socket's directory (`0750`, chgrp) when it owns it; `/run/maki` is `maki:maki-admin 0750`; SPEC §8 now says so. The unit runs under `UMask=0077`, so the NBD socket nbdkit creates in the same directory stays connectable only by the daemon and root. | `socket_directory_becomes_searchable_by_the_control_group` (maki-control, Linux) |
+| N-12 | The documented `maki volume create` flow produced a tree the daemon cannot open: run as root it created `/var/lib/maki/<volume>` owned by root (now `0700` after N-01), while `/var/lib/maki` (`root:maki 0750`) does not let the daemon user create it either. | The operations guide creates the directory for the daemon user and runs the command as that user; `maki volume create` warns when run as root. `/etc/maki/attach` and `/etc/maki/secrets` joined the tmpfiles layout. | documentation; the warning has no root-only test |
+| N-13 | `control.socket` and `nbd.socket` accepted relative paths, which nbdkit and the helper resolve against their own working directories. | Validation requires absolute paths. | two cases in `zero_and_inverted_bounds_are_rejected` (maki-format) |
+
+Read and found consistent: the retry budget (token bucket with the minimum
+probe rate), the dispatcher's retry-safety and failover accounting, the
+journal scanner's durable-prefix classification, the deep checker's use of
+the real scanner and slot reader, and the attach helper unit's ordering
+(`Requires=`/`After=` the daemon, `ConditionPathExists` on the attach config).
+
 ## Recovery fail-closed rules
 
 Recovery (`maki-core/src/recovery.rs`) now refuses to attach on anything that

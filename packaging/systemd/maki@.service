@@ -39,7 +39,16 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 
+# Everything the daemon creates is private to it: backing files (the
+# backing layer forces 0600/0700 anyway) and, above all, the NBD socket
+# nbdkit creates under this umask, so only the maki user and root (the
+# attach helper) can connect to the block device. The control socket is
+# chmod'd 0660 explicitly by the daemon (SPEC 7).
+UMask=0077
 RuntimeDirectory=maki/%i
+# 0750 with the group the daemon sets to `control.group` (maki-admin): an
+# administrator must be able to traverse the directory to reach
+# control.sock, and cannot open nbd.sock (0700 under the umask above).
 RuntimeDirectoryMode=0750
 ReadWritePaths=/var/lib/maki/%i
 ReadWritePaths=/run/maki/%i

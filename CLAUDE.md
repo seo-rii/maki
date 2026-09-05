@@ -62,6 +62,8 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - A failed `fdatasync` is never retried by calling it again: Linux marks the dirty pages clean and the retry "succeeds" without writing them. The journal keeps its own copy of unsynced records and rewrites them before the next sync; recovery rewrites the unproven tail of the final segment before syncing it (F01). `CrashableBacking` models this by default (a failed sync loses its dirty writes).
 - `write_at` can persist a prefix and then fail: the file is then longer than the writer's logical end, and sealing it makes that tail "corruption". Truncate back to the logical end before appending or sealing; the debug sanitizer checks the file length (F03).
 - `mlock`/`munlock` work on whole pages with no reference count: locked secrets must live in page-isolated allocations, never in shared heap pages (F04).
+- The rewrite rule applies to A/B records too: after a failed sync the written side must be emptied so the retry targets it again; otherwise the retry overwrites the only durable copy (N-09).
+- A circuit-breaker probe that ends without a verdict (deadline) must return its half-open slot (`on_abandoned`), or the circuit wedges (N-10).
 - Per-crate builds on Windows cover the cross-platform code; the Linux-only suites (`review_abi.rs`, `review_secret.rs` smaps check, the control backlog test, the backing symlink test) need WSL, where `nbdkit-plugin-dev` is installed for the ABI probe.
 
 ## External qualification

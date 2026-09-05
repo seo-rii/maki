@@ -156,7 +156,17 @@ impl AbStore {
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;
         file.write_at(0, &bytes)?;
-        file.sync_data()?;
+        if let Err(e) = file.sync_data() {
+            // A failed sync leaves the new record visible in the page cache
+            // but unpersisted (F01). Left as is, the retry would read it as
+            // this side's generation and overwrite the *other* side — the
+            // only copy proven durable — so a crash tearing that retry
+            // would lose the last acknowledged generation. Empty this side
+            // instead: the retry targets it again and the durable side is
+            // never touched until a newer copy has been synced elsewhere.
+            let _ = file.set_len(0);
+            return Err(e.into());
+        }
         Ok(())
     }
 }

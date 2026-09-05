@@ -139,6 +139,21 @@ impl CircuitBreaker {
         }
     }
 
+    /// A probe that ended without a verdict: abandoned at the operation
+    /// deadline (its RPC future dropped, C-06). It returns its half-open
+    /// slot without counting as a success or a failure; otherwise every
+    /// abandoned probe would leak a slot and `half_open_max_requests`
+    /// abandoned probes would wedge the circuit half-open forever (fifth
+    /// pass, N-10).
+    pub fn on_abandoned(&self) {
+        let mut inner = self.inner.lock();
+        if inner.state == CircuitState::HalfOpen
+            && inner.half_open_completed < inner.half_open_started
+        {
+            inner.half_open_completed += 1;
+        }
+    }
+
     pub fn on_failure(&self) {
         let mut inner = self.inner.lock();
         let now = self.clock.now();

@@ -96,6 +96,8 @@ has a constant residue.
 
 | Fourth pass (specification) | `review_state.rs` (maki-core: degraded state on journal sync failure, admission and barrier-latency counters), `review_metrics.rs` (maki-nbdkit: every SPEC §40 metric present with and without a dispatcher), `dispatcher_reports_latency_budget_and_inflight` (maki-crypto), `preferred_io_defaults_to_the_crypto_unit` and the absolute-root cases (maki-format), `created_directories_and_files_are_owner_only` (maki-backing, Unix), `review_keysource.rs` (maki-crypto-local, Unix), `control_commands_time_out_against_a_silent_daemon` (maki binary, Unix); findings N-01 to N-08 in the [remediation log](review-remediation.md#fourth-pass-2026-09-05-specification-contradictions-and-boundaries) |
 
+| Fifth pass | `review_ab.rs` (maki-format: A/B retry after a failed sync, torn retries), `abandoned_half_open_probes_return_their_slots` (maki-crypto), `socket_directory_becomes_searchable_by_the_control_group` (maki-control, Linux), socket-path cases (maki-format); findings N-09 to N-13 in the [remediation log](review-remediation.md#fifth-pass-2026-09-05-ab-retry-breaker-probes-packaging) |
+
 ## Current qualification status
 
 | Requirement | Target | Status | Evidence |

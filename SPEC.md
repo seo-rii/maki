@@ -341,8 +341,14 @@ maki:maki                 0700
 data/journal/metadata files
 maki:maki                 0600
 
+/run/maki
+maki:maki-admin           0750
+
 /run/maki/<volume>
-maki:maki                 0700
+maki:maki-admin           0750
+(the daemon sets the group to `control.group`; administrators must be able
+to traverse the directory to reach control.sock, while nbd.sock is created
+0700 under the daemon's umask)
 ```
 
 The NBD Unix Domain Socket:

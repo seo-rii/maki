@@ -1336,9 +1336,20 @@ impl VolumeConfig {
             )));
         }
 
-        if let Some(socket) = &self.control.socket {
-            if socket.trim().is_empty() {
-                return Err(invalid("control.socket must not be empty"));
+        // Socket paths are resolved by nbdkit and the helper against *their*
+        // working directories: only an absolute path names one place.
+        for (name, socket) in [
+            ("control.socket", &self.control.socket),
+            ("nbd.socket", &self.nbd.socket),
+        ] {
+            if let Some(socket) = socket {
+                if socket.trim().is_empty()
+                    || !(socket.starts_with('/') || std::path::Path::new(socket).is_absolute())
+                {
+                    return Err(invalid(format!(
+                        "{name} {socket:?} must be an absolute path"
+                    )));
+                }
             }
         }
         if let Some(group) = &self.control.group {

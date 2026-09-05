@@ -82,3 +82,46 @@ async fn unknown_group_is_an_error() {
 fn root_group_resolves_to_gid_zero() {
     assert_eq!(resolve_gid("root").unwrap(), 0);
 }
+
+/// N-11 (fifth pass): a 0660 socket is unreachable when its directory cannot
+/// be traversed. systemd creates the runtime directory owner-only for the
+/// daemon user, so an administrator in `control.group` could never connect.
+/// The daemon gives that group search access to the socket's directory.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn socket_directory_becomes_searchable_by_the_control_group() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn group_name(gid: u32) -> String {
+        // SAFETY: getgrgid returns a static buffer; read immediately.
+        unsafe {
+            let entry = libc::getgrgid(gid);
+            assert!(!entry.is_null(), "gid {gid} has no group entry");
+            std::ffi::CStr::from_ptr((*entry).gr_name)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // The systemd shape: an owner-only runtime directory.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The caller's own primary group stands in for maki-admin.
+    // SAFETY: plain getgid.
+    let gid = unsafe { libc::getgid() };
+    let group = group_name(gid);
+    let path = dir.path().join("control.sock");
+    let _listener = bind_control_socket(&path, Some(&group)).unwrap();
+
+    let meta = std::fs::metadata(dir.path()).unwrap();
+    assert_eq!(meta.gid(), gid, "directory chgrp'd to the control group");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o750,
+        "group can traverse the directory, others still cannot"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o660
+    );
+}

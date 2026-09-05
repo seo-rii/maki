@@ -45,7 +45,8 @@ fn main() -> ExitCode {
     // The engine refuses requests above nbd.maximum_io and misaligned ones
     // (F07); say so instead of panicking on the first I/O.
     let block = engine.geometry().device_block_size as usize;
-    if io_size == 0 || io_size as u64 > engine.max_request_bytes() || io_size % block != 0 {
+    if io_size == 0 || io_size as u64 > engine.max_request_bytes() || !io_size.is_multiple_of(block)
+    {
         eprintln!(
             "io-size {io_size} must be a positive multiple of {block} no larger than \
              nbd.maximum_io ({})",

@@ -77,6 +77,9 @@ fn main() -> ExitCode {
                         sb.geometry.max_virtual_size,
                         sb.geometry.slot_size
                     );
+                    if let Some(hint) = ownership_hint(running_as_root()) {
+                        eprintln!("warning: {hint}");
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e.to_string()),
@@ -160,6 +163,27 @@ fn main() -> ExitCode {
         }
         _ => usage(),
     }
+}
+
+/// The backing tree is created owner-only; a root-created volume is
+/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`).
+fn ownership_hint(as_root: bool) -> Option<&'static str> {
+    as_root.then_some(
+        "the volume tree was created owner-only by root; the daemon runs as the maki user \
+         and cannot open it. Run `maki volume create` as that user (sudo -u maki ...) or \
+         chown the tree to maki:maki before starting the service",
+    )
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: plain geteuid.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 fn fail(message: String) -> ExitCode {

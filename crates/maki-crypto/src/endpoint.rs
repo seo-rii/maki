@@ -558,7 +558,10 @@ impl EndpointSet {
                         if is_deadline_error(&err) {
                             // The operation's budget ran out mid-RPC: not
                             // an endpoint failure, so no breaker or budget
-                            // charge (C-06).
+                            // charge (C-06) — but a half-open probe slot
+                            // must come back, or abandoned probes wedge
+                            // the circuit (N-10).
+                            endpoint.breaker.on_abandoned();
                             return Err(err);
                         }
                         match err.class() {

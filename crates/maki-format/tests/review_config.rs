@@ -380,6 +380,9 @@ fn zero_and_inverted_bounds_are_rejected() {
         ("[backing]\nroot = \"\"", "backing.root"),
         ("[backing]\nroot = \"/x\"\njournal_segment_size = \"1MiB\"\njournal_max_bytes = \"1MiB\"", "journal_max_bytes"),
         ("[control]\ngroup = \" \"", "control.group"),
+        // Fifth pass: socket paths name one place only when absolute.
+        ("[control]\nsocket = \"control.sock\"", "control.socket"),
+        ("[nbd]\nsocket = \"run/nbd.sock\"", "nbd.socket"),
         ("[security]\nmemory_lock_mode = \"maybe\"", "memory_lock_mode"),
     ];
     for (section, needle) in cases {

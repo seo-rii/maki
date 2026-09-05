@@ -109,6 +109,14 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
                 format!("chgrp {group:?} on {}: {e}", path.display()),
             )
         })?;
+        // A 0660 socket is unreachable when its directory cannot be
+        // traversed: systemd creates the runtime directory maki:maki, so an
+        // administrator in `control.group` could not connect at all (fifth
+        // pass, N-11). Give the group search access to the socket's own
+        // directory when we own it; anything else is the operator's layout.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            grant_group_search(parent, gid, group);
+        }
     }
     {
         use std::os::unix::fs::PermissionsExt;
@@ -120,6 +128,39 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
 use std::time::Duration;
 
 use crate::protocol::ProtocolError;
+
+/// chgrp `dir` to `gid` and add group read+search, when the directory is
+/// ours to change. Failures are logged, not fatal: the socket itself is
+/// correct, only its reachability for the group depends on the directory.
+fn grant_group_search(dir: &Path, gid: u32, group: &str) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    // SAFETY: plain getuid.
+    let ours = meta.uid() == unsafe { libc::getuid() };
+    if !ours {
+        tracing::warn!(
+            "control socket directory {} is not owned by the daemon; make sure group \
+             {group:?} can traverse it",
+            dir.display()
+        );
+        return;
+    }
+    if meta.gid() != gid {
+        if let Err(e) = std::os::unix::fs::chown(dir, None, Some(gid)) {
+            tracing::warn!("chgrp {group:?} on {}: {e}", dir.display());
+            return;
+        }
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o050 != 0o050 {
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o050))
+        {
+            tracing::warn!("chmod g+rx on {}: {e}", dir.display());
+        }
+    }
+}
 
 /// Process umask override, restored on drop.
 struct UmaskGuard(libc::mode_t);
