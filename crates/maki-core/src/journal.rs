@@ -19,6 +19,9 @@
 //! mark lets recovery tell durable-body corruption from a torn tail; it is
 //! only ever a lower bound, so a failed mark write is logged, not fatal.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+use std::ops::Range;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -62,6 +65,13 @@ struct ActiveSegment {
     /// A failed write may have extended the physical file beyond the last
     /// accepted record. Keep cleanup pending until its truncation is synced.
     needs_tail_cleanup: bool,
+    /// Linux may clear dirty page-cache bits after writeback EIO. Retrying
+    /// sync alone cannot make those bytes durable; rewrite them first.
+    needs_redirty: bool,
+    /// Fingerprint of exactly the records accepted after synced_offset.
+    /// Ephemeral state only: CRC32 cannot fingerprint self-checksummed
+    /// record headers, which all have the same CRC residue.
+    pending_fingerprint: DefaultHasher,
 }
 
 pub struct JournalWriter {
@@ -187,10 +197,22 @@ impl JournalWriter {
             // segment non-final, where recovery rejects every damaged byte.
             active.file.set_len(active.write_offset)?;
         }
+        if active.needs_redirty {
+            rewrite_verified_range(
+                active.file.as_ref(),
+                active.synced_offset..active.write_offset,
+                active.pending_fingerprint.finish(),
+            )?;
+        }
         fp("journal.sync")?;
-        active.file.sync_data()?;
+        if let Err(error) = active.file.sync_data() {
+            active.needs_redirty = true;
+            return Err(error.into());
+        }
         active.unsynced = false;
         active.needs_tail_cleanup = false;
+        active.needs_redirty = false;
+        active.pending_fingerprint = DefaultHasher::new();
         active.synced_offset = active.write_offset;
         self.durable_sequence = self.appended_sequence;
         let mark = DurableMark {
@@ -271,6 +293,8 @@ impl JournalWriter {
                     synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
                     needs_tail_cleanup: false,
+                    needs_redirty: false,
+                    pending_fingerprint: DefaultHasher::new(),
                 });
                 // Point the mark at the new segment (header only) so it
                 // names the newest segment index even before the first
@@ -322,6 +346,7 @@ impl JournalWriter {
             active.needs_tail_cleanup = true;
             return Err(error.into());
         }
+        active.pending_fingerprint.write(&bytes);
         active.write_offset += bytes.len() as u64;
         active.info.record_count += 1;
         active.info.size = active.write_offset;
@@ -496,6 +521,34 @@ impl JournalWriter {
             None => Ok(deleted),
         }
     }
+}
+
+/// Redirty the accepted journal image using bounded scratch space, and
+/// verify that re-read bytes still match the original in-memory fingerprint.
+/// No successful durability boundary may follow a changed or lost cache
+/// image. Callers fdatasync only after this verification succeeds.
+pub(crate) fn rewrite_verified_range(
+    file: &dyn BackingFile,
+    range: Range<u64>,
+    expected_fingerprint: u64,
+) -> Result<(), CoreError> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut fingerprint = DefaultHasher::new();
+    let mut offset = range.start;
+    while offset < range.end {
+        let len = (range.end - offset).min(buffer.len() as u64) as usize;
+        let chunk = &mut buffer[..len];
+        file.read_at(offset, chunk)?;
+        fingerprint.write(chunk);
+        file.write_at(offset, chunk)?;
+        offset += len as u64;
+    }
+    if fingerprint.finish() != expected_fingerprint {
+        return Err(CoreError::Corrupt(
+            "journal bytes changed after validation; refusing a durability acknowledgement".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The segment size the writer actually rolls at for a configured value

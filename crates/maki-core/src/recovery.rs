@@ -29,6 +29,8 @@
 //! offline deep checker reuses it verbatim, so "what recovery would do" and
 //! "what the checker reports" can never drift apart.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
@@ -42,7 +44,7 @@ use maki_format::layout;
 use maki_format::superblock::Superblock;
 use maki_format::FormatError;
 
-use crate::journal::SegmentInfo;
+use crate::journal::{rewrite_verified_range, SegmentInfo};
 use crate::store::SlotStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +100,15 @@ pub struct JournalScan {
     pub repairs: Vec<JournalRepair>,
     /// Whether a durable mark was found for the final segment.
     pub mark: Option<DurableMark>,
+    /// Fingerprints bind recovery's later rewrite to the exact bytes this
+    /// read-only scan accepted, with constant metadata per segment.
+    verified_prefixes: Vec<VerifiedPrefix>,
+}
+
+struct VerifiedPrefix {
+    path: String,
+    len: u64,
+    fingerprint: u64,
 }
 
 /// Recover a volume. `segment_size` is the writer's effective segment size;
@@ -142,11 +153,13 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
     //    no active one, so no later barrier would ever sync them, a FLUSH
     //    would acknowledge them anyway, and a successor segment would turn
     //    their torn tail into "corruption" after a real power loss (S-06).
-    //    fsync every surviving segment and publish the mark for the last.
-    for seg in &scan.segments {
-        backing
-            .open(&layout::journal_segment(seg.index), false)?
-            .sync_data()?;
+    //    A writeback EIO may also have cleared the cached pages' dirty bits:
+    //    plain fsync can then succeed without writing them. Rewrite each
+    //    accepted prefix, verify it against the scan, and only then sync it.
+    for prefix in &scan.verified_prefixes {
+        let file = backing.open(&prefix.path, false)?;
+        rewrite_verified_range(file.as_ref(), 0..prefix.len, prefix.fingerprint)?;
+        file.sync_data()?;
     }
     if let Some(last) = scan.segments.last() {
         backing.sync_dir(layout::JOURNAL_DIR)?;
@@ -223,6 +236,7 @@ pub fn scan_journal(
     let mut prev_last_seq: Option<u64> = None;
     let mut max_seq: u64 = 0;
     let mut final_mark: Option<DurableMark> = None;
+    let mut verified_prefixes = Vec::new();
 
     let count = names.len();
     for (pos, (index, name)) in names.into_iter().enumerate() {
@@ -420,6 +434,16 @@ pub fn scan_journal(
             record_count,
             size,
         });
+        // This fingerprint is ephemeral, never written to the disk format.
+        // CRC32 over CRC-protected headers would have a constant residue
+        // and fail to bind their contents, so use a different hash here.
+        let mut fingerprint = DefaultHasher::new();
+        fingerprint.write(&image[..size as usize]);
+        verified_prefixes.push(VerifiedPrefix {
+            path,
+            len: size,
+            fingerprint: fingerprint.finish(),
+        });
     }
 
     let durable_sequence = checkpoint_sequence.max(max_seq);
@@ -443,6 +467,7 @@ pub fn scan_journal(
         replay,
         repairs,
         mark: final_mark,
+        verified_prefixes,
     })
 }
 
