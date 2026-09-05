@@ -1306,6 +1306,12 @@ impl VolumeConfig {
                 return Err(invalid(format!("{name} must be a positive power of two")));
             }
         }
+        if n.minimum_io > 65536 {
+            return Err(invalid("nbd.minimum_io must not exceed 65536 bytes"));
+        }
+        if n.maximum_io.0 > u32::MAX as u64 {
+            return Err(invalid("nbd.maximum_io must fit in the NBD u32 wire field"));
+        }
         if (n.minimum_io as u64) < self.volume.device_block_size as u64
             || n.preferred_io < n.minimum_io
             || n.maximum_io.0 < n.preferred_io as u64

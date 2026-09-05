@@ -106,7 +106,7 @@ impl NbdAdapter {
         let block_sizes = (
             config.nbd.minimum_io,
             config.nbd.preferred_io,
-            config.nbd.maximum_io.0.min(u32::MAX as u64) as u32,
+            config.nbd.maximum_io.0 as u32, // validated as a wire-sized value
         );
 
         #[cfg(unix)]
@@ -214,7 +214,30 @@ impl NbdAdapter {
         true
     }
 
+    /// Negotiation is advisory: clients may still send requests outside
+    /// these limits. Refuse them before copying plaintext or entering the
+    /// engine, whose journal headroom is sized for the configured maximum.
+    fn validate_request(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
+        let state = self.state()?;
+        let (minimum, _, maximum) = state.block_sizes;
+        if length == 0
+            || length as u64 > maximum as u64
+            || !(length as u64).is_multiple_of(minimum as u64)
+            || !offset.is_multiple_of(minimum as u64)
+            || offset
+                .checked_add(length as u64)
+                .is_none_or(|end| end > state.engine.size())
+        {
+            return Err(AdapterError::new(
+                EINVAL,
+                "request exceeds NBD size or alignment constraints",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<(), AdapterError> {
+        self.validate_request(offset, buf.len())?;
         let len = buf.len();
         // Plaintext stays in zeroizing buffers until it is copied into the
         // caller's (nbdkit's) buffer (SPEC §36).
@@ -225,6 +248,7 @@ impl NbdAdapter {
     }
 
     pub fn pwrite(&self, data: &[u8], offset: u64, fua: bool) -> Result<(), AdapterError> {
+        self.validate_request(offset, data.len())?;
         let owned = SecretBuffer::from_slice(data);
         self.run(move |engine| {
             Box::pin(async move { engine.write(offset, owned.expose(), fua).await })

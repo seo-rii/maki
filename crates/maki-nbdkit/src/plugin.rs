@@ -3,10 +3,9 @@
 //!
 //! Layout notes:
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
-//!   populate; `_struct_size` stops after the v2 rpc callbacks, so later
-//!   optional fields (`can_multi_conn`, `block_size`, …) read as NULL in
-//!   nbdkit — their defaults match our requirements (multi-conn OFF, zero
-//!   emulated via pwrite, trim absent).
+//!   populate; `_struct_size` includes the block_size callback so clients
+//!   can negotiate the configured limits. Other optional callbacks stay
+//!   NULL (multi-conn OFF, zero emulated via pwrite, trim absent).
 //! - The tokio runtime is created lazily at first `open`, which happens
 //!   after nbdkit forks — equivalent to the `after_fork` hook without
 //!   depending on newer struct fields.
@@ -77,6 +76,23 @@ unsafe extern "C" fn close(_handle: *mut c_void) {}
 unsafe extern "C" fn get_size(handle: *mut c_void) -> i64 {
     let a = unsafe { &*(handle as *const NbdAdapter) };
     a.get_size() as i64
+}
+
+unsafe extern "C" fn block_size(
+    handle: *mut c_void,
+    minimum: *mut u32,
+    preferred: *mut u32,
+    maximum: *mut u32,
+) -> c_int {
+    let a = unsafe { &*(handle as *const NbdAdapter) };
+    let sizes = a.block_sizes();
+    // nbdkit supplies valid output pointers for the negotiation callback.
+    unsafe {
+        *minimum = sizes.0;
+        *preferred = sizes.1;
+        *maximum = sizes.2;
+    }
+    0
 }
 
 unsafe extern "C" fn can_write(_h: *mut c_void) -> c_int {
@@ -207,6 +223,22 @@ struct nbdkit_plugin {
     flush: Option<unsafe extern "C" fn(*mut c_void, u32) -> c_int>,
     trim: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32) -> c_int>,
     zero: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32) -> c_int>,
+    magic_config_key: *const c_char,
+    can_multi_conn: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    can_extents: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    extents: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32, *mut c_void) -> c_int>,
+    can_cache: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    cache: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32) -> c_int>,
+    thread_model: Option<unsafe extern "C" fn() -> c_int>,
+    can_fast_zero: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    preconnect: Option<unsafe extern "C" fn(c_int) -> c_int>,
+    get_ready: Option<unsafe extern "C" fn() -> c_int>,
+    after_fork: Option<unsafe extern "C" fn() -> c_int>,
+    list_exports: Option<unsafe extern "C" fn(c_int, c_int, *mut c_void) -> c_int>,
+    default_export: Option<unsafe extern "C" fn(c_int, c_int) -> *const c_char>,
+    export_description: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
+    cleanup: Option<unsafe extern "C" fn()>,
+    block_size: Option<unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32) -> c_int>,
 }
 
 unsafe impl Sync for nbdkit_plugin {}
@@ -245,6 +277,22 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     flush: Some(flush_v2),
     trim: None,
     zero: None,
+    magic_config_key: std::ptr::null(),
+    can_multi_conn: None,
+    can_extents: None,
+    extents: None,
+    can_cache: None,
+    cache: None,
+    thread_model: None,
+    can_fast_zero: None,
+    preconnect: None,
+    get_ready: None,
+    after_fork: None,
+    list_exports: None,
+    default_export: None,
+    export_description: None,
+    cleanup: None,
+    block_size: Some(block_size),
 };
 
 #[no_mangle]
