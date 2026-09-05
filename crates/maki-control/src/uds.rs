@@ -9,6 +9,7 @@
 //! member of — `packaging/sysusers.d` adds `maki` to `maki-admin`).
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -74,68 +75,72 @@ pub fn resolve_gid(name: &str) -> io::Result<u32> {
 }
 
 /// Bind the control socket (replacing a stale file), apply `group` if
-/// given, and restrict the mode to 0660 — all before returning, so no
-/// client can observe a wider mode. Must be called inside a tokio runtime.
+/// given, and restrict the mode to 0660 before publishing its path. Must
+/// be called inside a tokio runtime.
 pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<ControlListener> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "control socket directory {} does not exist",
-                    parent.display()
-                ),
-            ));
-        }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "control socket directory {} does not exist",
+                parent.display()
+            ),
+        ));
     }
-    let _ = std::fs::remove_file(path);
-    // Bind under a restrictive umask so the socket never exists world- or
-    // group-connectable before chgrp/chmod run (O-11); connections made in
-    // that window would sit in the backlog and be served.
-    let listener = {
-        let _umask = UmaskGuard::set(0o117);
-        UnixListener::bind(path)?
+    // Validate the public address even when the private bind uses a shorter
+    // path: clients still need to connect through the requested address.
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
+    let gid = group.map(resolve_gid).transpose()?;
+
+    // BUG-014: umask is shared by every thread (and inherited by children).
+    // A temporary override could strip directory traversal from unrelated
+    // file creation. Hide the socket in a private directory instead, then
+    // publish it atomically only after its group and permissions are ready.
+    let staging = tempfile::Builder::new()
+        .prefix(".maki-control-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    // Creation honors the inherited umask; restore owner traversal without
+    // ever allowing another user to enter the private directory.
+    std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
+    let staged_path = staging.path().join("socket");
+    let listener = UnixListener::bind(&staged_path);
+    #[cfg(target_os = "linux")]
+    let listener = listener.or_else(|error| {
+        use std::os::fd::AsRawFd;
+
+        if std::os::unix::net::SocketAddr::from_pathname(&staged_path).is_ok() {
+            return Err(error);
+        }
+        // Staging must not reduce Linux's valid public socket path length.
+        // An open directory supplies a short address for the same inode;
+        // the ordinary path above keeps short binds independent of procfs.
+        let directory = std::fs::File::open(staging.path())?;
+        UnixListener::bind(format!("/proc/self/fd/{}/socket", directory.as_raw_fd()))
+    });
+    let mut bound = ControlListener {
+        listener: listener?,
+        path: staged_path.clone(),
     };
-    let bound = ControlListener {
-        listener,
-        path: path.to_path_buf(),
-    };
-    if let Some(group) = group {
-        let gid = resolve_gid(group)?;
-        std::os::unix::fs::chown(path, None, Some(gid)).map_err(|e| {
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(&staged_path, None, Some(gid)).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!("chgrp {group:?} on {}: {e}", path.display()),
             )
         })?;
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    }
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::rename(&staged_path, path)?;
+    bound.path = path.to_path_buf();
     Ok(bound)
 }
 
 use std::time::Duration;
-
-/// Process umask override, restored on drop.
-struct UmaskGuard(libc::mode_t);
-
-impl UmaskGuard {
-    fn set(mask: libc::mode_t) -> Self {
-        // SAFETY: umask is a plain process-wide syscall wrapper.
-        Self(unsafe { libc::umask(mask) })
-    }
-}
-
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        // SAFETY: restores the value returned by the earlier call.
-        unsafe {
-            libc::umask(self.0);
-        }
-    }
-}
 
 /// Serve connections on a bound socket until the future is dropped.
 ///

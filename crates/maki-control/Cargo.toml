@@ -20,3 +20,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] 
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+tempfile.workspace = true
