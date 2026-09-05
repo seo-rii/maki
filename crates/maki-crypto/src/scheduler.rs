@@ -73,11 +73,18 @@ pub struct SchedulerStats {
     batches: AtomicU64,
     batched_items: AtomicU64,
     coalesced_batches: AtomicU64,
+    inflight_batches: AtomicU64,
 }
 
 impl SchedulerStats {
     pub fn pending_items(&self) -> u64 {
         self.pending_items.load(Ordering::SeqCst)
+    }
+
+    /// Provider calls dispatched and not yet answered (SPEC §40
+    /// `maki_crypto_inflight_batches`).
+    pub fn inflight_batches(&self) -> u64 {
+        self.inflight_batches.load(Ordering::SeqCst)
     }
 
     pub fn pending_bytes(&self) -> u64 {
@@ -260,9 +267,13 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             .await
             .expect("semaphore closed");
         let call = call.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            deliver(call(context, all_items).await, items, lengths, replies);
+            stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
+            let result = call(context, all_items).await;
+            stats.inflight_batches.fetch_sub(1, Ordering::SeqCst);
+            deliver(result, items, lengths, replies);
         });
     }
 }

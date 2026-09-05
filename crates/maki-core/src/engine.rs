@@ -23,7 +23,7 @@
 //!   successful checkpoint clears.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -283,6 +283,47 @@ struct EngineInner {
     checkpoint_failures_total: AtomicU64,
     last_checkpoint_at: parking_lot::Mutex<Duration>,
     free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
+    /// Mirrors `Volume::journal_writeback_uncertain` after every journal
+    /// operation, so [`Engine::state`] can report it without the volume
+    /// lock: a journal that cannot be synced is a degraded volume.
+    journal_uncertain: AtomicBool,
+    /// FLUSH and FUA latency (SPEC §40 `maki_flush_seconds`,
+    /// `maki_fua_seconds`), measured on the engine clock.
+    flush_latency: LatencyStats,
+    fua_latency: LatencyStats,
+}
+
+/// Sum, count and maximum of a latency series, in nanoseconds.
+#[derive(Default)]
+struct LatencyStats {
+    nanos_sum: AtomicU64,
+    count: AtomicU64,
+    nanos_max: AtomicU64,
+}
+
+impl LatencyStats {
+    fn record(&self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.nanos_sum.fetch_add(nanos, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.nanos_max.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LatencySnapshot {
+        LatencySnapshot {
+            seconds_sum: self.nanos_sum.load(Ordering::Relaxed) as f64 / 1e9,
+            count: self.count.load(Ordering::Relaxed),
+            seconds_max: self.nanos_max.load(Ordering::Relaxed) as f64 / 1e9,
+        }
+    }
+}
+
+/// A latency series as reported in [`EngineStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LatencySnapshot {
+    pub seconds_sum: f64,
+    pub count: u64,
+    pub seconds_max: f64,
 }
 
 impl Drop for EngineInner {
@@ -343,6 +384,18 @@ impl Engine {
             return Err(AttachError::Config(format!(
                 "volume addresses {} units, which reaches the reserved canary unit index",
                 geometry.num_units()
+            )));
+        }
+        // The NBD adapter splits requests at this size, so a bound that is
+        // not a block multiple would make every large request fail as
+        // misaligned instead of being served.
+        let block = geometry.device_block_size as u64;
+        if options.limits.max_request_bytes == 0
+            || !options.limits.max_request_bytes.is_multiple_of(block)
+        {
+            return Err(AttachError::Config(format!(
+                "max_request_bytes {} must be a positive multiple of the device block size {block}",
+                options.limits.max_request_bytes
             )));
         }
 
@@ -416,6 +469,9 @@ impl Engine {
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
             free_space: parking_lot::Mutex::new(None),
+            journal_uncertain: AtomicBool::new(false),
+            flush_latency: LatencyStats::default(),
+            fua_latency: LatencyStats::default(),
         });
         spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
         Ok(Self { inner })
@@ -457,9 +513,13 @@ impl Engine {
         &self.inner.geometry
     }
 
-    /// Current operational state.
+    /// Current operational state. A journal whose last sync failed and has
+    /// not been rewritten and synced since counts as degraded (SPEC §26:
+    /// a persistence failure must be visible), whatever the checkpoint
+    /// state says.
     pub fn state(&self) -> EngineState {
-        self.inner.state.lock().clone()
+        let state = self.inner.state.lock().clone();
+        self.inner.effective_state(state)
     }
 
     fn check_range(&self, offset: u64, len: usize) -> Result<(), CoreError> {
@@ -700,22 +760,43 @@ impl Engine {
         // Journal + publish under the exclusive volume lock.
         {
             let mut volume = self.inner.volume.write().await;
-            self.admit_journal(&mut volume, incoming)?;
-            for ct in &cts {
-                volume.write_ct(ct.unit_index, &ct.data, false)?;
-                // Any cached plaintext of an older version is now dead. The
-                // version key alone already prevents stale reads; this frees
-                // the space eagerly.
-                if let Some(cache) = &self.inner.cache {
-                    cache.invalidate(ct.unit_index);
-                }
-            }
-            if fua {
-                volume.flush()?;
-            }
+            let outcome = self.journal_request(&mut volume, incoming, &cts, fua);
+            // Whatever happened, the state report must know whether the
+            // journal can still be synced.
+            self.inner.note_journal(&volume);
+            outcome?;
             if volume.journal_total_bytes() >= self.inner.policy.journal_high_watermark_bytes {
                 self.inner.checkpoint_notify.notify_one();
             }
+        }
+        Ok(())
+    }
+
+    /// Admit, append and publish one request's records; with `fua`, sync
+    /// them (SPEC §24) and account the FUA latency.
+    fn journal_request(
+        &self,
+        volume: &mut Volume,
+        incoming: u64,
+        cts: &[CiphertextUnit],
+        fua: bool,
+    ) -> Result<(), CoreError> {
+        self.admit_journal(volume, incoming)?;
+        for ct in cts {
+            volume.write_ct(ct.unit_index, &ct.data, false)?;
+            // Any cached plaintext of an older version is now dead. The
+            // version key alone already prevents stale reads; this frees
+            // the space eagerly.
+            if let Some(cache) = &self.inner.cache {
+                cache.invalidate(ct.unit_index);
+            }
+        }
+        if fua {
+            let started = self.inner.clock.now();
+            volume.flush()?;
+            self.inner
+                .fua_latency
+                .record(self.inner.clock.now().saturating_sub(started));
         }
         Ok(())
     }
@@ -791,12 +872,21 @@ impl Engine {
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
         let mut volume = self.inner.volume.write().await;
-        volume.flush()
+        let started = self.inner.clock.now();
+        let outcome = volume.flush();
+        self.inner.note_journal(&volume);
+        outcome?;
+        self.inner
+            .flush_latency
+            .record(self.inner.clock.now().saturating_sub(started));
+        Ok(())
     }
 
     pub async fn checkpoint(&self) -> Result<u64, CoreError> {
         let mut volume = self.inner.volume.write().await;
-        self.inner.checkpoint_locked(&mut volume)
+        let outcome = self.inner.checkpoint_locked(&mut volume);
+        self.inner.note_journal(&volume);
+        outcome
     }
 
     /// Journal/checkpoint/cache observability (metrics inputs, SPEC §40).
@@ -808,8 +898,15 @@ impl Engine {
             .map(|c| c.stats())
             .unwrap_or_default();
         let backing_free_bytes = self.backing_free_bytes();
+        let admission = &self.inner.admission;
+        let active_callbacks = (admission.max_items() - admission.available_items()) as u64;
+        let plaintext_bytes_in_flight = admission.max_bytes() - admission.available_bytes();
         let volume = self.inner.volume.read().await;
         EngineStats {
+            active_callbacks,
+            plaintext_bytes_in_flight,
+            flush_latency: self.inner.flush_latency.snapshot(),
+            fua_latency: self.inner.fua_latency.snapshot(),
             durable_sequence: volume.journal_durable_sequence(),
             appended_sequence: volume.journal_appended_sequence(),
             checkpoint_sequence: volume.checkpoint_sequence(),
@@ -827,12 +924,34 @@ impl Engine {
             backing_free_bytes,
             checkpoints_total: self.inner.checkpoints_total.load(Ordering::Relaxed),
             checkpoint_failures_total: self.inner.checkpoint_failures_total.load(Ordering::Relaxed),
-            state: self.inner.state.lock().clone(),
+            state: self.inner.effective_state(self.inner.state.lock().clone()),
         }
     }
 }
 
 impl EngineInner {
+    /// Remember whether the journal has unsynced bytes a failed sync left
+    /// in an unknown state (read under the volume lock the caller holds).
+    fn note_journal(&self, volume: &Volume) {
+        self.journal_uncertain
+            .store(volume.journal_writeback_uncertain(), Ordering::SeqCst);
+    }
+
+    /// The reported state: a checkpoint-degraded volume stays degraded; a
+    /// ready one is degraded while its journal cannot be synced.
+    fn effective_state(&self, state: EngineState) -> EngineState {
+        match state {
+            EngineState::Ready if self.journal_uncertain.load(Ordering::SeqCst) => {
+                EngineState::Degraded {
+                    reason: "journal sync failed; FLUSH and FUA fail until the unsynced records \
+                             are rewritten and synced"
+                        .to_string(),
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Run a checkpoint under the (already held) volume lock and record the
     /// outcome in counters and state.
     fn checkpoint_locked(&self, volume: &mut Volume) -> Result<u64, CoreError> {
@@ -890,7 +1009,9 @@ impl EngineInner {
         }
         let mut volume = self.volume.write().await;
         if by_time && durable < appended {
-            if let Err(e) = volume.flush() {
+            let flushed = volume.flush();
+            self.note_journal(&volume);
+            if let Err(e) = flushed {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
                 return;
             }
@@ -898,6 +1019,7 @@ impl EngineInner {
         if let Err(e) = self.checkpoint_locked(&mut volume) {
             tracing::warn!("checkpoint worker: checkpoint failed: {e}");
         }
+        self.note_journal(&volume);
     }
 }
 
@@ -1047,6 +1169,15 @@ async fn decrypt_probe(
 
 #[derive(Debug, Clone, Default)]
 pub struct EngineStats {
+    /// Requests currently admitted (SPEC §40 `maki_active_callbacks`).
+    pub active_callbacks: u64,
+    /// Plaintext bytes currently charged against the admission budget
+    /// (`maki_plaintext_bytes`).
+    pub plaintext_bytes_in_flight: u64,
+    /// Successful FLUSH barriers (`maki_flush_seconds`).
+    pub flush_latency: LatencySnapshot,
+    /// Successful FUA syncs (`maki_fua_seconds`).
+    pub fua_latency: LatencySnapshot,
     pub durable_sequence: u64,
     pub appended_sequence: u64,
     pub checkpoint_sequence: u64,

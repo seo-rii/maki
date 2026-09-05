@@ -12,12 +12,15 @@ use std::sync::Arc;
 
 use maki_control::server::ControlBackend;
 use maki_core::engine::{Engine, EngineState};
+use maki_crypto::breaker::CircuitState;
+use maki_crypto::endpoint::EndpointSet;
 use maki_crypto::scheduler::SchedulerStats;
 
 pub struct EngineControlBackend {
     engine: Engine,
     volume_name: String,
     crypto_stats: Option<Arc<SchedulerStats>>,
+    endpoints: Option<Arc<EndpointSet>>,
 }
 
 impl EngineControlBackend {
@@ -26,6 +29,7 @@ impl EngineControlBackend {
             engine,
             volume_name: volume_name.into(),
             crypto_stats: None,
+            endpoints: None,
         }
     }
 
@@ -35,18 +39,76 @@ impl EngineControlBackend {
         self
     }
 
+    /// Attach the endpoint dispatcher (remote providers) for the per-endpoint
+    /// and retry metrics SPEC §40 requires.
+    pub fn with_endpoints(mut self, endpoints: Option<Arc<EndpointSet>>) -> Self {
+        self.endpoints = endpoints;
+        self
+    }
+
     fn crypto_json(&self) -> Value {
         match &self.crypto_stats {
-            None => json!({ "batched": false }),
+            None => json!({ "batched": false, "endpoints": self.endpoints_json() }),
             Some(s) => json!({
                 "batched": true,
                 "pending_items": s.pending_items(),
                 "pending_bytes": s.pending_bytes(),
+                "inflight_batches": s.inflight_batches(),
                 "batches_total": s.batches_total(),
                 "batched_items_total": s.batched_items_total(),
                 "coalesced_batches_total": s.coalesced_batches_total(),
+                "endpoints": self.endpoints_json(),
             }),
         }
+    }
+
+    /// One entry per endpoint: circuit, validation, inflight, budget.
+    fn endpoints_json(&self) -> Value {
+        let Some(set) = &self.endpoints else {
+            return json!([]);
+        };
+        let tokens: std::collections::HashMap<String, f64> =
+            set.endpoint_budget_tokens().into_iter().collect();
+        Value::Array(
+            set.endpoint_status()
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "name": e.name,
+                        "circuit": circuit_label(e.circuit),
+                        "validated": e.validated,
+                        "rejected": e.rejected,
+                        "inflight": e.inflight,
+                        "retry_budget_tokens": tokens.get(&e.name).copied().unwrap_or(0.0),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Per-endpoint gauges keyed by endpoint name (a bounded label set).
+    fn per_endpoint(&self, f: impl Fn(&EndpointSet) -> Vec<(String, Value)>) -> Value {
+        match &self.endpoints {
+            None => json!({}),
+            Some(set) => Value::Object(f(set).into_iter().collect()),
+        }
+    }
+}
+
+fn circuit_label(state: CircuitState) -> &'static str {
+    match state {
+        CircuitState::Closed => "closed",
+        CircuitState::Open => "open",
+        CircuitState::HalfOpen => "half-open",
+    }
+}
+
+/// `maki_circuit_state` code: 0 closed, 1 open, 2 half-open.
+fn circuit_code(state: CircuitState) -> u64 {
+    match state {
+        CircuitState::Closed => 0,
+        CircuitState::Open => 1,
+        CircuitState::HalfOpen => 2,
     }
 }
 
@@ -85,7 +147,55 @@ impl ControlBackend for EngineControlBackend {
     async fn metrics(&self) -> Value {
         let stats = self.engine.stats().await;
         let (_, state_code, _) = state_label(&stats.state);
-        json!({
+        let dispatch = self.endpoints.as_ref().map(|set| set.metrics());
+        let (inflight_rpcs, inflight_bytes) = self
+            .endpoints
+            .as_ref()
+            .map(|set| set.global_inflight())
+            .unwrap_or((0, 0));
+        // SPEC §40 required gauges and counters (built as its own document:
+        // one `json!` with every key exceeds the macro recursion limit).
+        let spec = json!({
+            "maki_active_callbacks": stats.active_callbacks,
+            "maki_plaintext_bytes": stats.plaintext_bytes_in_flight,
+            // Ciphertext held in memory: journal records not yet checkpointed.
+            "maki_ciphertext_bytes": stats.overlay_bytes,
+            "maki_submission_queue_items": self.crypto_stats.as_ref().map(|s| s.pending_items()).unwrap_or(0),
+            "maki_submission_queue_bytes": self.crypto_stats.as_ref().map(|s| s.pending_bytes()).unwrap_or(0),
+            "maki_crypto_inflight_batches": self.crypto_stats.as_ref().map(|s| s.inflight_batches()).unwrap_or(inflight_rpcs),
+            "maki_crypto_inflight_bytes": inflight_bytes,
+            "maki_endpoint_inflight": self.per_endpoint(|set| {
+                set.endpoint_inflight()
+                    .into_iter()
+                    .map(|(name, n)| (name, json!(n)))
+                    .collect()
+            }),
+            "maki_crypto_latency_seconds_sum": dispatch.map(|m| m.rpc_seconds_sum()).unwrap_or(0.0),
+            "maki_crypto_latency_seconds_count": dispatch.map(|m| m.rpc_count()).unwrap_or(0),
+            "maki_crypto_retries_total": dispatch.map(|m| m.retries_total()).unwrap_or(0),
+            "maki_crypto_retries_refused_unsafe_total": dispatch.map(|m| m.retries_refused_unsafe_total()).unwrap_or(0),
+            "maki_crypto_deadline_exceeded_total": dispatch.map(|m| m.deadline_exceeded_total()).unwrap_or(0),
+            "maki_retry_budget_tokens": self.per_endpoint(|set| {
+                set.endpoint_budget_tokens()
+                    .into_iter()
+                    .map(|(name, tokens)| (name, json!(tokens)))
+                    .collect()
+            }),
+            "maki_circuit_state": self.per_endpoint(|set| {
+                set.endpoint_states()
+                    .into_iter()
+                    .map(|(name, state)| (name, json!(circuit_code(state))))
+                    .collect()
+            }),
+            "maki_endpoint_failover_total": dispatch.map(|m| m.failovers_total()).unwrap_or(0),
+            "maki_flush_seconds_sum": stats.flush_latency.seconds_sum,
+            "maki_flush_seconds_count": stats.flush_latency.count,
+            "maki_flush_seconds_max": stats.flush_latency.seconds_max,
+            "maki_fua_seconds_sum": stats.fua_latency.seconds_sum,
+            "maki_fua_seconds_count": stats.fua_latency.count,
+            "maki_fua_seconds_max": stats.fua_latency.seconds_max,
+        });
+        let mut doc = json!({
             "maki_volume_state": state_code,
             "maki_journal_appended_sequence": stats.appended_sequence,
             "maki_journal_durable_sequence": stats.durable_sequence,
@@ -109,7 +219,11 @@ impl ControlBackend for EngineControlBackend {
             "maki_crypto_pending_bytes": self.crypto_stats.as_ref().map(|s| s.pending_bytes()).unwrap_or(0),
             "maki_crypto_batches_total": self.crypto_stats.as_ref().map(|s| s.batches_total()).unwrap_or(0),
             "maki_crypto_coalesced_batches_total": self.crypto_stats.as_ref().map(|s| s.coalesced_batches_total()).unwrap_or(0),
-        })
+        });
+        if let (Some(into), Value::Object(from)) = (doc.as_object_mut(), spec) {
+            into.extend(from);
+        }
+        doc
     }
 
     async fn checkpoint(&self) -> Result<u64, String> {

@@ -70,11 +70,26 @@ pub struct DispatchMetrics {
     failovers: AtomicU64,
     deadline_exceeded: AtomicU64,
     retries_refused_unsafe: AtomicU64,
+    /// Completed RPC attempts and their total latency in nanoseconds
+    /// (SPEC §40 `maki_crypto_latency_seconds`); an attempt abandoned at
+    /// the deadline is not a sample.
+    rpc_count: AtomicU64,
+    rpc_nanos: AtomicU64,
 }
 
 impl DispatchMetrics {
     pub fn retries_total(&self) -> u64 {
         self.retries.load(Ordering::SeqCst)
+    }
+
+    /// Completed RPC attempts (successful or failed).
+    pub fn rpc_count(&self) -> u64 {
+        self.rpc_count.load(Ordering::SeqCst)
+    }
+
+    /// Total latency of completed RPC attempts, in seconds.
+    pub fn rpc_seconds_sum(&self) -> f64 {
+        self.rpc_nanos.load(Ordering::SeqCst) as f64 / 1e9
     }
 
     pub fn failovers_total(&self) -> u64 {
@@ -264,6 +279,24 @@ impl EndpointSet {
             .collect()
     }
 
+    /// Retry-budget tokens available per endpoint (SPEC §40
+    /// `maki_retry_budget_tokens`).
+    pub fn endpoint_budget_tokens(&self) -> Vec<(String, f64)> {
+        self.endpoints
+            .iter()
+            .map(|e| (e.name.clone(), e.budget.tokens()))
+            .collect()
+    }
+
+    /// RPCs and bytes currently holding the set's global permits
+    /// (`maki_crypto_inflight_batches`, `maki_crypto_inflight_bytes`).
+    pub fn global_inflight(&self) -> (u64, u64) {
+        (
+            (self.global.max_items() - self.global.available_items()) as u64,
+            self.global.max_bytes() - self.global.available_bytes(),
+        )
+    }
+
     pub fn endpoint_status(&self) -> Vec<EndpointStatus> {
         self.endpoints
             .iter()
@@ -384,7 +417,8 @@ impl EndpointSet {
         let _local = endpoint.semaphore.acquire(bytes).await;
         endpoint.inflight.fetch_add(1, Ordering::SeqCst);
         let _inflight = InflightGuard(&endpoint.inflight);
-        match request {
+        let started = self.clock.now();
+        let result = match request {
             Request::Encrypt(items) => endpoint
                 .provider
                 .encrypt_batch(context, items)
@@ -395,7 +429,14 @@ impl EndpointSet {
                 .decrypt_batch(context, items)
                 .await
                 .map(Response::Decrypted),
-        }
+        };
+        let elapsed = self.clock.now().saturating_sub(started);
+        self.metrics.rpc_count.fetch_add(1, Ordering::SeqCst);
+        self.metrics.rpc_nanos.fetch_add(
+            elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::SeqCst,
+        );
+        result
     }
 
     /// The RPC, abandoned at the deadline (the dropped future cancels the

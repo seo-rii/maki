@@ -149,3 +149,41 @@ fn usage_and_bad_inputs_fail_closed() {
     assert!(!out.status.success(), "unknown provider must fail");
     assert!(stderr(&out).contains("error"), "{}", stderr(&out));
 }
+
+/// Fourth pass: a control command against a daemon that accepts but never
+/// answers must not hang the operator's shell; `--timeout` bounds the
+/// round trip and the failure names the socket and the bound.
+#[cfg(unix)]
+#[test]
+fn control_commands_time_out_against_a_silent_daemon() {
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let vol = setup("silentvol", "MAKI_CREDENTIAL_SILENT");
+    let socket = vol._dir.path().join("control.sock");
+    let socket_str = socket.to_string_lossy().into_owned();
+    let mut cfg = std::fs::read_to_string(&vol.config_path).unwrap();
+    cfg.push_str(&format!("\n[control]\nsocket = \"{socket_str}\"\n"));
+    std::fs::write(&vol.config_path, cfg).unwrap();
+    // Bound but never served: connects land in the backlog and get no reply.
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    let started = Instant::now();
+    let out = maki(&["status", &vol.config_path, "--timeout", "1"], None);
+    assert!(!out.status.success(), "a silent daemon must be an error");
+    let err = stderr(&out);
+    assert!(
+        err.contains("within 1s") && err.contains(&socket_str),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the command must return around the timeout, took {:?}",
+        started.elapsed()
+    );
+
+    let out = maki(&["status", &vol.config_path, "--timeout", "0"], None);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--timeout"), "{}", stderr(&out));
+    drop(listener);
+}

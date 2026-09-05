@@ -17,7 +17,7 @@ pub struct FileBacking {
 impl FileBacking {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
+        create_private_dir_all(&root)?;
         Ok(Self { root })
     }
 
@@ -43,7 +43,9 @@ impl FileBacking {
     }
 }
 
-/// `OpenOptions` that never follow a symlink at the final component.
+/// `OpenOptions` that never follow a symlink at the final component and
+/// create files owner-only (SPEC §8: data, journal and metadata files are
+/// `maki:maki 0600`).
 fn open_options() -> OpenOptions {
     #[allow(unused_mut)] // only Unix adds flags
     let mut options = OpenOptions::new();
@@ -51,8 +53,24 @@ fn open_options() -> OpenOptions {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600);
     }
     options
+}
+
+/// `create_dir_all` with owner-only directories (SPEC §8: the volume
+/// directory and everything under it are `maki:maki 0700`). Existing
+/// directories keep their mode.
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[allow(unused_mut)] // only Unix sets a mode
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 pub struct RealFile {
@@ -167,7 +185,7 @@ impl Backing for FileBacking {
     }
 
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
-        fs::create_dir_all(self.resolve(path, false)?)
+        create_private_dir_all(&self.resolve(path, false)?)
     }
 
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
@@ -279,6 +297,27 @@ mod tests {
         let backing = FileBacking::new(dir.path()).unwrap();
         assert!(backing.open("../evil", true).is_err());
         assert!(backing.open("/abs", true).is_err());
+    }
+
+    /// SPEC §8: the volume directory tree is `0700` and its files `0600`,
+    /// whatever the process umask says. Ciphertext, metadata, the journal
+    /// and the key canary must not be readable by other users.
+    #[cfg(unix)]
+    #[test]
+    fn created_directories_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vol");
+        let backing = FileBacking::new(&root).unwrap();
+        assert_eq!(mode(&root), 0o700);
+        backing.create_dir_all("data/sub").unwrap();
+        assert_eq!(mode(&root.join("data")), 0o700);
+        assert_eq!(mode(&root.join("data/sub")), 0o700);
+        backing.open("data/sub/shard", true).unwrap();
+        assert_eq!(mode(&root.join("data/sub/shard")), 0o600);
+        backing.try_lock("volume.lock").unwrap();
+        assert_eq!(mode(&root.join("volume.lock")), 0o600);
     }
 
     /// Lexical validation stops `..` and absolute paths; a symlink planted

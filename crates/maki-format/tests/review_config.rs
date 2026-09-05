@@ -302,6 +302,49 @@ fn http_batch_layout_requires_unit_echo() {
 
 // ---------- numeric and duration settings (M-013) ----------
 
+/// SPEC §13: the default preferred I/O size is the crypto unit, not a fixed
+/// 4096. A unit below `minimum_io` is raised to it so the size ordering
+/// still holds; an explicit value wins; an explicit value below the
+/// minimum is refused.
+#[test]
+fn preferred_io_defaults_to_the_crypto_unit() {
+    let with_unit = |unit: u32, nbd: &str| {
+        format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+crypto_unit_size = {unit}
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "v1"
+key = {{ source = "env", name = "k" }}
+[crypto.capabilities]
+supported_plaintext_sizes = [{unit}]
+max_ciphertext_size = {}
+[backing]
+root = "/x"
+{nbd}
+"#,
+            unit + 288
+        )
+    };
+    let cfg = parse_config(&with_unit(8192, "")).unwrap();
+    assert_eq!(cfg.nbd_preferred_io(), 8192);
+    let cfg = parse_config(&with_unit(4096, "")).unwrap();
+    assert_eq!(cfg.nbd_preferred_io(), 4096);
+    let cfg = parse_config(&with_unit(512, "")).unwrap();
+    assert_eq!(cfg.nbd_preferred_io(), 4096, "raised to minimum_io");
+    let cfg = parse_config(&with_unit(8192, "[nbd]\npreferred_io = 16384")).unwrap();
+    assert_eq!(cfg.nbd_preferred_io(), 16384, "explicit value wins");
+    let err = parse_config(&with_unit(8192, "[nbd]\npreferred_io = 2048"))
+        .unwrap()
+        .validate()
+        .unwrap_err();
+    assert!(err.to_string().contains("nbd I/O sizes"), "{err}");
+}
+
 #[test]
 fn zero_and_inverted_bounds_are_rejected() {
     let cases: &[(&str, &str)] = &[
@@ -332,6 +375,9 @@ fn zero_and_inverted_bounds_are_rejected() {
         ("[nbd]\nminimum_io = 3000", "power of two"),
         // F07: the admission budget must hold one maximal request.
         ("[limits]\nmax_plaintext_bytes = \"1MiB\"\nmax_ciphertext_bytes = \"2MiB\"", "max_plaintext_bytes"),
+        // Fourth pass: the backing root is never relative to the daemon's cwd.
+        ("[backing]\nroot = \"relative/vol\"", "backing.root"),
+        ("[backing]\nroot = \"\"", "backing.root"),
         ("[backing]\nroot = \"/x\"\njournal_segment_size = \"1MiB\"\njournal_max_bytes = \"1MiB\"", "journal_max_bytes"),
         ("[control]\ngroup = \" \"", "control.group"),
         ("[security]\nmemory_lock_mode = \"maybe\"", "memory_lock_mode"),

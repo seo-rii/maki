@@ -238,12 +238,17 @@ entries immediately; setting it to zero disables caching.
 
 ## Metrics and health
 
-Monitor request and byte admission, endpoint inflight work, crypto latency and
-retries, retry-budget tokens, circuit state, failover count, journal size and
-durable sequence, journal sync failures (`maki_journal_sync_failures_total`,
-`maki_journal_writeback_uncertain`), checkpoint lag, FLUSH/FUA latency, cache
-hits and misses, backing free space, and volume state. Do not add unit indexes,
-LBAs, request IDs, or other high-cardinality values as metric labels.
+`maki metrics` carries every metric SPEC §40 names: request and byte admission
+(`maki_active_callbacks`, `maki_plaintext_bytes`), ciphertext held in memory,
+the crypto submission queue and inflight batches and bytes, per-endpoint
+inflight work, crypto latency (`_sum`/`_count`), retries, retry-budget tokens,
+circuit state (0 closed, 1 open, 2 half-open), failover count, journal size and
+sequences, journal sync failures (`maki_journal_sync_failures_total`,
+`maki_journal_writeback_uncertain`), checkpoint lag, FLUSH and FUA latency
+(`_sum`/`_count`/`_max`), cache hits and misses, backing free space, and volume
+state. Per-endpoint values are objects keyed by endpoint name (empty for local
+providers). Do not add unit indexes, LBAs, request IDs, or other
+high-cardinality values as metric labels.
 
 ## Failure handling
 
@@ -291,6 +296,17 @@ LBAs, request IDs, or other high-cardinality values as metric labels.
 - `maki reload` returns an error naming the section for any change the running
   daemon cannot apply; only `cache` is applied at runtime today. An error means
   the change was not applied: restart the daemon.
+- `maki status`, `metrics`, `checkpoint` and `reload` give up when the daemon
+  does not answer within 60 s (600 s for `checkpoint`); pass
+  `--timeout <seconds>` to wait longer. A timeout means the daemon is stalled
+  or busy, not that the command was rejected.
+- While the journal cannot be synced (see the writeback item above) `maki
+  status` reports `state: degraded` with the reason, and `maki_volume_state`
+  is 2, until a barrier succeeds; a successful checkpoint alone does not clear
+  it.
+- Volume directories are created `0700` and their files `0600`; a `file`
+  credential must be a regular file with mode `0600` or `0400`, or attach is
+  refused.
 
 Use [Testing and qualification](testing.md) before interpreting a successful
 userspace smoke test as production readiness.

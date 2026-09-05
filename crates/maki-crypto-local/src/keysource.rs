@@ -86,6 +86,27 @@ impl KeySource for FileKeySource {
             )));
         }
         let path = self.dir.join(name);
+        // SPEC §9: a file credential is a *root-only secret file*. A key
+        // readable by the group or by others, or anything but a regular
+        // file (a symlink to somewhere else, a FIFO), is refused rather
+        // than loaded. systemd's LoadCredential files are 0400.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::symlink_metadata(&path).map_err(|_| missing(name))?;
+            if !meta.file_type().is_file() {
+                return Err(CryptoError::ProviderFatal(format!(
+                    "credential {name:?} is not a regular file"
+                )));
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(CryptoError::ProviderFatal(format!(
+                    "credential file {name:?} has mode {mode:04o}: it is readable by the group \
+                     or by others; a secret file must be 0600 or 0400 (SPEC 9)"
+                )));
+            }
+        }
         let mut raw = std::fs::read(&path).map_err(|_| missing(name))?;
         let result = match try_hex_decode(&raw) {
             Some(decoded) => SecretBuffer::from_vec(decoded),

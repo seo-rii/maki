@@ -108,17 +108,17 @@ impl NbdAdapter {
             .enable_all()
             .build()
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
-        let (engine, crypto_stats) = runtime
+        let (engine, crypto_stats, endpoints) = runtime
             .block_on(daemon::attach_from_config_with_stats(&config))
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
         #[cfg(not(unix))]
-        let _ = &crypto_stats; // only the Unix control socket reports them
+        let _ = (&crypto_stats, &endpoints); // only the Unix control socket reports them
 
         // The engine's request bound is `nbd.maximum_io` (see
         // `daemon::engine_options`); advertise and split at the same value.
         let block_sizes = (
             config.nbd.minimum_io,
-            config.nbd.preferred_io,
+            config.nbd_preferred_io(),
             engine.max_request_bytes().min(u32::MAX as u64) as u32,
         );
 
@@ -130,7 +130,8 @@ impl NbdAdapter {
                     engine.clone(),
                     config.volume.name.clone(),
                 )
-                .with_crypto_stats(crypto_stats.clone()),
+                .with_crypto_stats(crypto_stats.clone())
+                .with_endpoints(endpoints.clone()),
             );
             let group = config.control.group.clone();
             let listener = runtime

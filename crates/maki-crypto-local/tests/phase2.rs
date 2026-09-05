@@ -161,6 +161,16 @@ fn file_key_source_reads_raw_and_hex() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("raw-key"), vec![0xAA; 32]).unwrap();
     std::fs::write(dir.path().join("hex-key"), format!("{}\n", "ab".repeat(32))).unwrap();
+    // A secret file must be owner-only (SPEC 9; see review_keysource.rs).
+    #[cfg(unix)]
+    for name in ["raw-key", "hex-key"] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join(name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     let src = maki_crypto_local::keysource::FileKeySource::new(dir.path());
     assert_eq!(src.load("raw-key").unwrap().expose(), &vec![0xAA; 32][..]);
     assert_eq!(src.load("hex-key").unwrap().expose(), &vec![0xAB; 32][..]);

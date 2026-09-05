@@ -68,6 +68,39 @@ async fn requests_above_the_configured_maximum_are_refused() {
     assert_eq!(engine.read(0, 8192).await.unwrap(), vec![1u8; 8192]);
 }
 
+/// The adapter splits requests at `max_request_bytes`; a bound that is not
+/// a block multiple would turn every split request into an alignment
+/// error. Attach refuses it instead (fourth pass).
+#[tokio::test]
+async fn attach_refuses_a_request_bound_that_is_not_a_block_multiple() {
+    for bad in [0u64, 1000, 4095] {
+        let backing = Arc::new(CrashableBacking::new());
+        init::create_volume(backing.as_ref(), superblock()).unwrap();
+        let err = Engine::attach(
+            backing as Arc<dyn Backing>,
+            Arc::new(FakeCryptoProvider::new(UNIT)),
+            EngineOptions {
+                identity: None,
+                volume: VolumeOptions::default(),
+                limits: EngineLimits {
+                    max_request_bytes: bad,
+                    ..EngineLimits::default()
+                },
+                cache: None,
+                checkpoint: Default::default(),
+                clock: None,
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("max_request_bytes {bad} must be refused"));
+        assert!(
+            matches!(err, maki_core::engine::AttachError::Config(_)),
+            "{bad}: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn admission_charges_every_touched_unit_in_full() {
     let engine = engine(1 << 20).await;

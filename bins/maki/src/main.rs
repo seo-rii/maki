@@ -6,6 +6,7 @@
 //! the privileged helper.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn usage() -> ExitCode {
     eprintln!(
@@ -29,8 +30,37 @@ fn read_config(path: &str) -> Result<maki_format::config::VolumeConfig, String> 
     Ok(cfg)
 }
 
+/// Default bound on a control-socket round trip. A stalled daemon (a
+/// checkpoint holding the volume lock, a provider that never answers) must
+/// not hang the operator's shell forever; `--timeout <seconds>` overrides.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A checkpoint legitimately takes a while on a large journal.
+const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Remove `--timeout <seconds>` from the arguments, if present.
+fn take_timeout(args: &mut Vec<String>) -> Result<Option<Duration>, String> {
+    let Some(i) = args.iter().position(|a| a == "--timeout") else {
+        return Ok(None);
+    };
+    let value = args
+        .get(i + 1)
+        .cloned()
+        .ok_or_else(|| "--timeout needs a value in seconds".to_string())?;
+    let secs: u64 = value
+        .parse()
+        .ok()
+        .filter(|s| *s > 0)
+        .ok_or_else(|| format!("--timeout: {value:?} is not a positive number of seconds"))?;
+    args.drain(i..i + 2);
+    Ok(Some(Duration::from_secs(secs)))
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let timeout = match take_timeout(&mut args) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match argv.as_slice() {
         ["volume", "create", config] => {
@@ -76,9 +106,27 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(e),
         },
-        ["status", config] => control(config, "status", None, serde_json::Value::Null),
-        ["metrics", config] => control(config, "metrics", None, serde_json::Value::Null),
-        ["checkpoint", config] => control(config, "checkpoint", None, serde_json::Value::Null),
+        ["status", config] => control(
+            config,
+            "status",
+            None,
+            serde_json::Value::Null,
+            timeout.unwrap_or(CONTROL_TIMEOUT),
+        ),
+        ["metrics", config] => control(
+            config,
+            "metrics",
+            None,
+            serde_json::Value::Null,
+            timeout.unwrap_or(CONTROL_TIMEOUT),
+        ),
+        ["checkpoint", config] => control(
+            config,
+            "checkpoint",
+            None,
+            serde_json::Value::Null,
+            timeout.unwrap_or(CHECKPOINT_TIMEOUT),
+        ),
         // The cache is the one section the daemon applies at runtime; it
         // needs the new size (O-09: without it the verb could never succeed).
         ["reload", config, "cache", "--max-bytes", max_bytes] => match max_bytes.parse::<u64>() {
@@ -87,6 +135,7 @@ fn main() -> ExitCode {
                 "reload",
                 Some("cache"),
                 serde_json::json!({ "max_bytes": max_bytes }),
+                timeout.unwrap_or(CONTROL_TIMEOUT),
             ),
             Err(_) => fail(format!("--max-bytes: {max_bytes:?} is not an integer")),
         },
@@ -94,9 +143,13 @@ fn main() -> ExitCode {
             "reload cache needs the new size: maki reload <config> cache --max-bytes <bytes>"
                 .to_string(),
         ),
-        ["reload", config, section] => {
-            control(config, "reload", Some(section), serde_json::Value::Null)
-        }
+        ["reload", config, section] => control(
+            config,
+            "reload",
+            Some(section),
+            serde_json::Value::Null,
+            timeout.unwrap_or(CONTROL_TIMEOUT),
+        ),
         ["attach", ..] | ["detach", ..] | ["grow", ..] => {
             eprintln!(
                 "this operation requires the privileged helper: run `maki-attach {}` \
@@ -157,6 +210,7 @@ fn control(
     command: &str,
     section: Option<&str>,
     payload: serde_json::Value,
+    timeout: Duration,
 ) -> ExitCode {
     let cfg = match read_config(config) {
         Ok(c) => c,
@@ -167,7 +221,7 @@ fn control(
         .enable_all()
         .build()
         .unwrap();
-    let result: Result<serde_json::Value, String> = runtime.block_on(async {
+    let round_trip = async {
         let stream = tokio::net::UnixStream::connect(&socket)
             .await
             .map_err(|e| format!("{socket}: {e}"))?;
@@ -181,6 +235,16 @@ fn control(
         maki_control::protocol::read_response(&mut rd)
             .await
             .map_err(|e| e.to_string())
+    };
+    let result: Result<serde_json::Value, String> = runtime.block_on(async {
+        match tokio::time::timeout(timeout, round_trip).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(format!(
+                "{command}: no response from {socket} within {}s; the daemon may be stalled \
+                 (pass --timeout <seconds> to wait longer)",
+                timeout.as_secs()
+            )),
+        }
     });
     match result {
         Ok(v) => {
@@ -201,6 +265,7 @@ fn control(
     _command: &str,
     _section: Option<&str>,
     _payload: serde_json::Value,
+    _timeout: Duration,
 ) -> ExitCode {
     fail("control socket commands require a Unix host".to_string())
 }

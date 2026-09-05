@@ -42,6 +42,17 @@ fn main() -> ExitCode {
         }
     };
 
+    // The engine refuses requests above nbd.maximum_io and misaligned ones
+    // (F07); say so instead of panicking on the first I/O.
+    let block = engine.geometry().device_block_size as usize;
+    if io_size == 0 || io_size as u64 > engine.max_request_bytes() || io_size % block != 0 {
+        eprintln!(
+            "io-size {io_size} must be a positive multiple of {block} no larger than \
+             nbd.maximum_io ({})",
+            engine.max_request_bytes()
+        );
+        return ExitCode::from(2);
+    }
     let size = engine.size();
     let slots = size / io_size as u64;
     let data = vec![0xA5u8; io_size];

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use maki_backing::{Backing, FileBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
 use maki_core::volume::VolumeOptions;
+use maki_crypto::endpoint::EndpointSet;
 use maki_crypto::CryptoProvider;
 use maki_crypto_local::keysource::{
     systemd_credential_source, EnvKeySource, FileKeySource, KeySource,
@@ -89,39 +90,49 @@ fn resolve_key_source(cred: &CredentialRef) -> Result<(Box<dyn KeySource>, Strin
 /// Build the configured crypto provider (SPEC §12: profile mismatch is
 /// caught later by the attach self-test).
 pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+    Ok(build_provider_with_endpoints(config).await?.0)
+}
+
+/// Build the configured provider; for remote providers also return the
+/// endpoint dispatcher itself, whose per-endpoint state and retry counters
+/// the control plane reports (SPEC §40).
+pub async fn build_provider_with_endpoints(
+    config: &VolumeConfig,
+) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
     let unit = config.volume.crypto_unit_size;
     let compat = config.crypto.crypto_compatibility_id.as_str();
-    match config.crypto.provider.as_str() {
+    let set = match config.crypto.provider.as_str() {
         #[cfg(feature = "fake-provider")]
-        "fake" => Ok(Arc::new(
-            maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat),
-        )),
+        "fake" => {
+            return Ok((
+                Arc::new(maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat)),
+                None,
+            ))
+        }
         "local-aes-gcm-siv" | "local-aes-xts" => {
             let cred = config.crypto.key.as_ref().ok_or_else(|| {
                 DaemonError::Unsupported("local provider requires [crypto].key".to_string())
             })?;
             let (source, name) = resolve_key_source(cred)?;
-            if config.crypto.provider == "local-aes-gcm-siv" {
-                Ok(Arc::new(AesGcmSivProvider::new(
+            let provider: Arc<dyn CryptoProvider> = if config.crypto.provider == "local-aes-gcm-siv"
+            {
+                Arc::new(AesGcmSivProvider::new(
                     source.as_ref(),
                     &name,
                     unit,
                     compat,
-                )?))
+                )?)
             } else {
-                Ok(Arc::new(AesXtsProvider::new(
-                    source.as_ref(),
-                    &name,
-                    unit,
-                    compat,
-                )?))
-            }
+                Arc::new(AesXtsProvider::new(source.as_ref(), &name, unit, compat)?)
+            };
+            return Ok((provider, None));
         }
-        "remote-http" => remote_http_provider(config).await,
-        "remote-websocket" => remote_websocket_provider(config).await,
-        "remote-grpc" => remote_grpc_provider(config).await,
-        other => Err(DaemonError::Unsupported(format!("provider {other:?}"))),
-    }
+        "remote-http" => remote_http_provider(config).await?,
+        "remote-websocket" => remote_websocket_provider(config).await?,
+        "remote-grpc" => remote_grpc_provider(config).await?,
+        other => return Err(DaemonError::Unsupported(format!("provider {other:?}"))),
+    };
+    Ok((set.clone() as Arc<dyn CryptoProvider>, Some(set)))
 }
 
 /// Credential router for header, metadata and TLS-key secrets (SPEC 9).
@@ -183,9 +194,7 @@ impl KeySource for RoutedKeySource {
 /// Assemble the multi-endpoint HTTP provider: per-endpoint transports,
 /// cross-endpoint interchangeability check (SPEC §34), and the dispatcher
 /// (retry/budget/breaker/failover) from configuration.
-async fn remote_http_provider(
-    config: &VolumeConfig,
-) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+async fn remote_http_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>, DaemonError> {
     let http = config
         .crypto
         .http
@@ -212,9 +221,7 @@ async fn remote_http_provider(
 /// dispatcher. The transport build has no TLS support yet, so `wss://` or a
 /// `[crypto.websocket.tls]` section refuses attach — fail closed, never a
 /// silent downgrade.
-async fn remote_websocket_provider(
-    config: &VolumeConfig,
-) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+async fn remote_websocket_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>, DaemonError> {
     let ws = config
         .crypto
         .websocket
@@ -259,9 +266,7 @@ async fn remote_websocket_provider(
 /// (`packaging/examples/maki-crypto.proto`) at configurable method paths,
 /// with credential-resolved ascii metadata. Same TLS fail-closed rule as the
 /// websocket transport.
-async fn remote_grpc_provider(
-    config: &VolumeConfig,
-) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+async fn remote_grpc_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>, DaemonError> {
     let grpc = config
         .crypto
         .grpc
@@ -385,9 +390,9 @@ fn resolve_metadata_value(
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
-) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+) -> Result<Arc<EndpointSet>, DaemonError> {
     use maki_crypto::clock::SystemClock;
-    use maki_crypto::endpoint::{DispatchConfig, EndpointSet, EndpointValidator};
+    use maki_crypto::endpoint::{DispatchConfig, EndpointValidator};
     use maki_crypto::selftest::{cross_endpoint_self_test, provider_self_test};
 
     let unit = config.volume.crypto_unit_size as usize;
@@ -588,15 +593,23 @@ pub async fn attach_from_config(config: &VolumeConfig) -> Result<Engine, DaemonE
 }
 
 /// Like [`attach_from_config`], also returning the batch scheduler's stats
-/// handle when the provider is remote (SPEC 30: remote calls are coalesced
-/// through a bounded batch scheduler; local providers are called directly).
+/// handle and the endpoint dispatcher when the provider is remote (SPEC
+/// 30: remote calls are coalesced through a bounded batch scheduler; local
+/// providers are called directly). Both feed the control plane's metrics.
 pub async fn attach_from_config_with_stats(
     config: &VolumeConfig,
-) -> Result<(Engine, Option<Arc<maki_crypto::scheduler::SchedulerStats>>), DaemonError> {
+) -> Result<
+    (
+        Engine,
+        Option<Arc<maki_crypto::scheduler::SchedulerStats>>,
+        Option<Arc<EndpointSet>>,
+    ),
+    DaemonError,
+> {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
     let backing = build_backing(config)?;
-    let provider = build_provider(config).await?;
+    let (provider, endpoints) = build_provider_with_endpoints(config).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::new(
             provider,
@@ -609,7 +622,7 @@ pub async fn attach_from_config_with_stats(
         (provider, None)
     };
     let engine = Engine::attach(backing, provider, engine_options(config)).await?;
-    Ok((engine, stats))
+    Ok((engine, stats, endpoints))
 }
 
 /// `[crypto.batch]` targets and maxima plus the `[limits]` pending bounds

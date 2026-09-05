@@ -619,7 +619,10 @@ pub struct NbdSection {
     /// `device_block_size`; when set it must equal it.
     pub device_block_size: Option<u32>,
     pub minimum_io: u32,
-    pub preferred_io: u32,
+    /// Preferred I/O size advertised to NBD. Unset = the crypto unit size
+    /// (SPEC §13), raised to `minimum_io` when the unit is smaller; see
+    /// [`VolumeConfig::nbd_preferred_io`].
+    pub preferred_io: Option<u32>,
     pub maximum_io: ByteSize,
     pub threads: u32,
     pub connections: u32,
@@ -631,7 +634,7 @@ impl Default for NbdSection {
             socket: None,
             device_block_size: None,
             minimum_io: 4096,
-            preferred_io: 4096,
+            preferred_io: None,
             maximum_io: ByteSize(1 << 20),
             threads: 64,
             connections: 1,
@@ -769,6 +772,17 @@ impl VolumeConfig {
                 self.crypto.provider
             )));
         }
+        // The backing root is resolved by whoever starts the daemon: a
+        // relative path would land wherever nbdkit's working directory is
+        // (SPEC §8 places volumes under /var/lib/maki/<volume>).
+        let root = self.backing.root.as_str();
+        if root.trim().is_empty()
+            || !(root.starts_with('/') || std::path::Path::new(root).is_absolute())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "backing.root {root:?} must be an absolute path"
+            )));
+        }
         // These strings are stored in fixed superblock fields.
         let max = crate::superblock::MAX_STR;
         if self.crypto.crypto_compatibility_id.len() > max {
@@ -889,6 +903,15 @@ impl VolumeConfig {
     /// (review M-004/M-013): every bound must be positive, and the hard
     /// journal limit must leave room for at least one sealed segment plus
     /// the active one, or the limit could never be honoured.
+    /// The preferred I/O size advertised to NBD: `nbd.preferred_io` when
+    /// set, otherwise the crypto unit (SPEC §13), never below
+    /// `nbd.minimum_io`.
+    pub fn nbd_preferred_io(&self) -> u32 {
+        self.nbd
+            .preferred_io
+            .unwrap_or_else(|| self.volume.crypto_unit_size.max(self.nbd.minimum_io))
+    }
+
     fn validate_journal_bounds(&self) -> Result<(), ConfigError> {
         let seg = self.backing.journal_segment_size.0;
         let max = self.backing.journal_max_bytes.0;
@@ -1279,9 +1302,10 @@ impl VolumeConfig {
                 )));
             }
         }
+        let preferred = self.nbd_preferred_io();
         for (name, v) in [
             ("nbd.minimum_io", n.minimum_io as u64),
-            ("nbd.preferred_io", n.preferred_io as u64),
+            ("nbd.preferred_io", preferred as u64),
             ("nbd.maximum_io", n.maximum_io.0),
         ] {
             if v == 0 || !v.is_power_of_two() {
@@ -1289,8 +1313,8 @@ impl VolumeConfig {
             }
         }
         if (n.minimum_io as u64) < self.volume.device_block_size as u64
-            || n.preferred_io < n.minimum_io
-            || n.maximum_io.0 < n.preferred_io as u64
+            || preferred < n.minimum_io
+            || n.maximum_io.0 < preferred as u64
         {
             return Err(invalid(
                 "nbd I/O sizes must satisfy device_block_size <= minimum_io <= preferred_io <= maximum_io",

@@ -311,3 +311,30 @@ async fn capabilities_come_from_a_validated_endpoint() {
         "test-profile-v1"
     );
 }
+
+// ---------- SPEC 40 (fourth pass): dispatcher accounting ----------
+
+/// The dispatcher reports RPC latency samples, per-endpoint retry-budget
+/// tokens and the global permits in use, so the control plane can serve
+/// `maki_crypto_latency_seconds`, `maki_retry_budget_tokens` and
+/// `maki_crypto_inflight_*`.
+#[tokio::test]
+async fn dispatcher_reports_latency_budget_and_inflight() {
+    use maki_crypto::CryptoProvider;
+    let set = EndpointSet::new(
+        vec![("a".to_string(), fake() as Arc<dyn CryptoProvider>)],
+        cfg(true, None),
+        Arc::new(maki_crypto::SystemClock::new()),
+    );
+    assert_eq!(set.metrics().rpc_count(), 0);
+    assert_eq!(set.global_inflight(), (0, 0));
+    set.encrypt_batch(&ctx(), &[pt(0)]).await.unwrap();
+    set.encrypt_batch(&ctx(), &[pt(1)]).await.unwrap();
+    assert_eq!(set.metrics().rpc_count(), 2);
+    assert!(set.metrics().rpc_seconds_sum() >= 0.0);
+    assert_eq!(set.global_inflight(), (0, 0), "permits are returned");
+    let tokens = set.endpoint_budget_tokens();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].0, "a");
+    assert!(tokens[0].1 >= 0.0);
+}

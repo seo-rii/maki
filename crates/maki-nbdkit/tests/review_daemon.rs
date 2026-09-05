@@ -30,6 +30,12 @@ impl Fixture {
     fn key_file(&self, name: &str, hex: &str) -> String {
         let path = self.dir.path().join(name);
         std::fs::write(&path, hex).unwrap();
+        // A file credential must be owner-only (SPEC 9).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         path.to_string_lossy().replace('\\', "/")
     }
 

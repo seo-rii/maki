@@ -54,6 +54,14 @@ own copy before the next sync, never by a bare retry (F01), and a partial
 `write_at` is truncated back to the logical end before anything is appended
 or sealed (F03). `CrashableBacking` now models both failure modes by default.
 
+A fourth, self-directed pass then read the normative sections of `SPEC.md`
+against the code (see
+[Fourth pass](#fourth-pass-2026-09-05-specification-contradictions-and-boundaries)):
+eight findings N-01 to N-08, among them backing files created world-readable
+against SPEC §8, most of the SPEC §40 required metrics missing, the
+`preferred_io` default, key files loaded regardless of their permissions, and
+control commands that could hang forever.
+
 What still needs an environment this repository cannot provide:
 
 - Real NBD/LVM/XFS attach, mount-identity verification, rollback, and device
@@ -262,6 +270,36 @@ written only once the device is held), memory accounting for callbacks waiting
 in admission (the per-piece copy bounds it to one `maximum_io` per callback),
 lock-wait latency measurement, and the narrow production profile (one geometry,
 one provider) that needs the Linux qualification environment.
+
+## Fourth pass (2026-09-05): specification contradictions and boundaries
+
+A self-directed pass after the third review read the normative sections of
+`SPEC.md` against the code and re-read the modules no review had covered
+(overlay, slot store, cache, initialization, binaries). Every finding has a
+failing test before its fix. IDs: N (new).
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| N-01 | **SPEC §8 contradiction: backing files and directories were created with the process umask** (`0644` / `0755` under the usual `022`), while the specification places the volume tree at `maki:maki 0700` and its files at `0600`. Ciphertext, metadata, the journal and the key canary were readable by every local user. | `FileBacking` creates directories with mode `0700` and files with `0600` regardless of the umask (existing entries keep their mode). | `created_directories_and_files_are_owner_only` (maki-backing, Unix) |
+| N-02 | **SPEC §40 contradiction: most of the "required metrics" were absent** — active callbacks, plaintext bytes in flight, submission queue, inflight batches and bytes, per-endpoint inflight, crypto latency, retries, retry-budget tokens, circuit state, failover count, FLUSH and FUA latency. | The engine accounts admission usage and FLUSH/FUA latency (sum, count, max); the dispatcher accounts RPC latency and exposes per-endpoint budget tokens and global inflight; the scheduler counts inflight batches; the daemon hands the endpoint dispatcher to the control backend, whose `metrics` document now carries every name the specification lists (per-endpoint gauges as objects keyed by endpoint name, empty for local providers) and whose `status` lists each endpoint's circuit, validation, inflight and budget. | `every_spec_required_metric_is_reported_with_a_dispatcher`, `every_spec_required_metric_is_reported_without_a_dispatcher` (maki-nbdkit `review_metrics.rs`); `dispatcher_reports_latency_budget_and_inflight` (maki-crypto); `admission_usage_and_barrier_latencies_are_reported` (maki-core `review_state.rs`) |
+| N-03 | **SPEC §13 contradiction: `nbd.preferred_io` defaulted to a fixed 4096**, not to the crypto unit; a volume with 8 KiB units advertised a 4 KiB preferred size. | `nbd.preferred_io` is optional and defaults to the crypto unit (raised to `nbd.minimum_io` when the unit is smaller, so the size ordering holds). | `preferred_io_defaults_to_the_crypto_unit` (maki-format) |
+| N-04 | A journal whose sync had failed reported the volume `ready`: `maki_volume_state` said 1 while every FLUSH and FUA failed (SPEC §26 wants a persistence failure visible until it is resolved; the third review asked for a sticky, observable state). | The engine mirrors the journal's writeback-uncertain flag after every journal operation and reports `degraded` (with the reason) while it is set; a successful checkpoint does not clear it, only the barrier that rewrites and syncs does. | `a_failed_journal_sync_degrades_the_volume_until_a_barrier_succeeds` (maki-core) |
+| N-05 | An engine request bound that is not a multiple of the device block size would make the adapter's split pieces misaligned, failing every large request as invalid. | `Engine::attach` refuses a zero or non-block-multiple `max_request_bytes`. | `attach_refuses_a_request_bound_that_is_not_a_block_multiple` (maki-core) |
+| N-06 | `maki status`, `metrics`, `checkpoint` and `reload` waited forever on a daemon that accepts but never answers (a stalled provider, a long checkpoint holding the volume lock). | Every control round trip is bounded: 60 s by default, 600 s for `checkpoint`, `--timeout <seconds>` to override; the failure names the socket and the bound. | `control_commands_time_out_against_a_silent_daemon` (maki binary, Unix) |
+| N-07 | **SPEC §9 contradiction: a `file` credential was loaded whatever its permissions** — a world-readable key file, or a symlink to any file, was accepted as the "root-only secret file". | `FileKeySource` refuses a credential that is not a regular file or whose mode grants group or other access (`0600`/`0400` only; systemd's `LoadCredential` files are `0400`). | `group_or_world_readable_key_files_are_refused`, `a_symlink_or_special_file_is_not_a_credential` (maki-crypto-local, Unix) |
+| N-08 | `backing.root` accepted a relative path, which resolves against nbdkit's working directory rather than the SPEC §8 layout. | Validation requires an absolute path. | two cases in `zero_and_inverted_bounds_are_rejected` (maki-format) |
+
+Read and found consistent with the specification in this pass: the overlay's
+latest/durable bookkeeping and byte accounting, the slot store's shard
+creation protocol and read classification, the cache's version key and
+eviction, volume initialization, the checkpoint triggers and inline ENOSPC
+rules (SPEC §26), the per-unit concurrency and FUA/FLUSH sequences (§24, §25,
+§28), the control socket's verb split (§7), and the secure-mount checklist
+(§39). Known and documented deviations that remain: only the cache section is
+hot-reloadable (§20 lists more); `madv_dontdump` is honoured through the
+non-dumpable flag; FLUSH takes the volume's exclusive lock rather than an
+append-ordered barrier (§25 describes the ordering, which the lock also
+provides, at a concurrency cost the benchmark must quantify).
 
 ## Recovery fail-closed rules
 

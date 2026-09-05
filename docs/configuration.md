@@ -61,8 +61,10 @@ schema, geometry, and secret-literal checks it rejects:
   `capabilities.mode`, `availability_policy = "bounded-error"` without a
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
   `secure-buffers | all | off`;
+- a `backing.root` that is not an absolute path;
 - NBD I/O sizes that are not powers of two or not ordered
-  `device_block_size <= minimum_io <= preferred_io <= maximum_io`, an
+  `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
+  `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
   `nbd.device_block_size` that differs from the volume's, or a
   `limits.max_plaintext_bytes` smaller than `nbd.maximum_io` plus one crypto
   unit (the admission budget must hold one maximal request; a request is
