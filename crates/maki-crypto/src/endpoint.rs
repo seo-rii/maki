@@ -471,9 +471,9 @@ impl EndpointSet {
             let candidates = self.candidates();
             let mut tried_any = false;
             for endpoint in candidates {
-                if !endpoint.breaker.allow() {
+                let Some(probe) = endpoint.breaker.acquire() else {
                     continue;
-                }
+                };
                 if calls_made > 0 {
                     // A re-send of a request that already reached a provider.
                     if !self.config.retry_safe {
@@ -510,7 +510,7 @@ impl EndpointSet {
                     .await
                 {
                     Ok(response) => {
-                        endpoint.breaker.on_success();
+                        probe.on_success();
                         return Ok(response);
                     }
                     Err(err) => {
@@ -524,7 +524,7 @@ impl EndpointSet {
                             ErrorClass::Retryable
                             | ErrorClass::Throttled
                             | ErrorClass::EndpointFatal => {
-                                endpoint.breaker.on_failure();
+                                probe.on_failure();
                                 last_error = Some(err);
                                 if let Some(dl) = deadline {
                                     if self.clock.now() >= dl {

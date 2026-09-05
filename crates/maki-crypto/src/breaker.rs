@@ -42,16 +42,39 @@ struct Inner {
     consecutive_failures: u32,
     open_until: Duration,
     open_duration: Duration,
-    half_open_started: u32,
+    generation: u64,
+    half_open_inflight: u32,
     half_open_successes: u32,
-    /// Probes that finished (either way) since the circuit went half-open.
-    half_open_completed: u32,
 }
 
 pub struct CircuitBreaker {
     config: BreakerConfig,
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
+}
+
+/// Owns an admission until its outcome is known or its operation is dropped.
+/// A stale admission must never release a newer half-open window's slot.
+pub(crate) struct BreakerPermit<'a> {
+    breaker: &'a CircuitBreaker,
+    generation: u64,
+    outcome: Option<bool>,
+}
+
+impl BreakerPermit<'_> {
+    pub(crate) fn on_success(mut self) {
+        self.outcome = Some(true);
+    }
+
+    pub(crate) fn on_failure(mut self) {
+        self.outcome = Some(false);
+    }
+}
+
+impl Drop for BreakerPermit<'_> {
+    fn drop(&mut self) {
+        self.breaker.finish(Some(self.generation), self.outcome);
+    }
 }
 
 impl CircuitBreaker {
@@ -65,9 +88,9 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 open_until: Duration::ZERO,
                 open_duration,
-                half_open_started: 0,
+                generation: 0,
+                half_open_inflight: 0,
                 half_open_successes: 0,
-                half_open_completed: 0,
             }),
         }
     }
@@ -85,10 +108,7 @@ impl CircuitBreaker {
         match inner.state {
             CircuitState::Closed => true,
             CircuitState::Open => self.clock.now() >= inner.open_until,
-            CircuitState::HalfOpen => {
-                inner.half_open_started - inner.half_open_completed
-                    < self.config.half_open_max_requests
-            }
+            CircuitState::HalfOpen => inner.half_open_inflight < self.config.half_open_max_requests,
         }
     }
 
@@ -96,13 +116,30 @@ impl CircuitBreaker {
     /// slots until the probe completes.
     pub fn allow(&self) -> bool {
         let mut inner = self.inner.lock();
+        self.admit(&mut inner)
+    }
+
+    pub(crate) fn acquire(&self) -> Option<BreakerPermit<'_>> {
+        let mut inner = self.inner.lock();
+        if self.admit(&mut inner) {
+            Some(BreakerPermit {
+                breaker: self,
+                generation: inner.generation,
+                outcome: None,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn admit(&self, inner: &mut Inner) -> bool {
         match inner.state {
             CircuitState::Closed => true,
             CircuitState::Open => {
                 if self.clock.now() >= inner.open_until {
                     inner.state = CircuitState::HalfOpen;
-                    inner.half_open_started = 1;
-                    inner.half_open_completed = 0;
+                    inner.generation += 1;
+                    inner.half_open_inflight = 1;
                     inner.half_open_successes = 0;
                     true
                 } else {
@@ -110,10 +147,8 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                if inner.half_open_started - inner.half_open_completed
-                    < self.config.half_open_max_requests
-                {
-                    inner.half_open_started += 1;
+                if inner.half_open_inflight < self.config.half_open_max_requests {
+                    inner.half_open_inflight += 1;
                     true
                 } else {
                     false
@@ -123,41 +158,49 @@ impl CircuitBreaker {
     }
 
     pub fn on_success(&self) {
+        self.finish(None, Some(true));
+    }
+
+    pub fn on_failure(&self) {
+        self.finish(None, Some(false));
+    }
+
+    fn finish(&self, generation: Option<u64>, outcome: Option<bool>) {
         let mut inner = self.inner.lock();
-        match inner.state {
-            CircuitState::Closed => inner.consecutive_failures = 0,
-            CircuitState::HalfOpen => {
+        if generation.is_some_and(|generation| generation != inner.generation) {
+            return;
+        }
+        if inner.state == CircuitState::HalfOpen {
+            inner.half_open_inflight = inner.half_open_inflight.saturating_sub(1);
+        }
+        let now = self.clock.now();
+        match (inner.state, outcome) {
+            (CircuitState::Closed, Some(true)) => inner.consecutive_failures = 0,
+            (CircuitState::HalfOpen, Some(true)) => {
                 inner.half_open_successes += 1;
-                inner.half_open_completed += 1;
                 if inner.half_open_successes >= self.config.success_threshold {
                     inner.state = CircuitState::Closed;
+                    inner.generation += 1;
                     inner.consecutive_failures = 0;
                     inner.open_duration = self.config.open_initial;
                 }
             }
-            CircuitState::Open => {}
-        }
-    }
-
-    pub fn on_failure(&self) {
-        let mut inner = self.inner.lock();
-        let now = self.clock.now();
-        match inner.state {
-            CircuitState::Closed => {
+            (CircuitState::Closed, Some(false)) => {
                 inner.consecutive_failures += 1;
                 if inner.consecutive_failures >= self.config.failure_threshold {
                     inner.state = CircuitState::Open;
+                    inner.generation += 1;
                     inner.open_until = now + inner.open_duration;
                 }
             }
-            CircuitState::HalfOpen => {
+            (CircuitState::HalfOpen, Some(false)) => {
                 inner.open_duration = (inner.open_duration * 2).min(self.config.open_max);
                 inner.state = CircuitState::Open;
+                inner.generation += 1;
                 inner.open_until = now + inner.open_duration;
-                inner.half_open_started = 0;
-                inner.half_open_completed = 0;
+                inner.half_open_inflight = 0;
             }
-            CircuitState::Open => {}
+            (_, None) | (CircuitState::Open, _) => {}
         }
     }
 }
