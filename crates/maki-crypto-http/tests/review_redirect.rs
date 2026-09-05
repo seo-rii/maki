@@ -155,3 +155,76 @@ fn spec_debug_output_redacts_credentials() {
         "header names stay visible: {text}"
     );
 }
+
+fn assert_transport_error_is_redacted(error: &CryptoError) {
+    assert!(matches!(error, CryptoError::Retryable(_)));
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        for secret in ["SECRET-TOKEN", "SECRET-QUERY"] {
+            assert!(
+                !rendered.contains(secret),
+                "transport error must not expose credential values"
+            );
+        }
+        assert!(
+            !rendered.contains("http://"),
+            "transport errors must not retain request URLs"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connection_errors_do_not_expose_query_credentials() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        // End the connection without an HTTP response, while keeping the
+        // listener bound until this request arrives (no port-reuse race).
+        drop(stream);
+    });
+    let mut config = spec(&format!("http://{address}"));
+    config.tls = None;
+    let provider = HttpCryptoProvider::new(config).unwrap();
+    let error = provider.encrypt_batch(&ctx(), &[pt(0)]).await.unwrap_err();
+    server.await.unwrap();
+    assert_transport_error_is_redacted(&error);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeouts_do_not_expose_query_credentials() {
+    let server = TestServer::start(Arc::new(|_| {
+        let mut response = ResponseSpec::raw(vec![0; UNIT]);
+        response.delay = Duration::from_secs(3600);
+        response
+    }))
+    .await;
+    let mut config = spec(&server.url());
+    config.tls = None;
+    config.timeout = Duration::from_secs(1);
+    let provider = HttpCryptoProvider::new(config).unwrap();
+    let error = provider.encrypt_batch(&ctx(), &[pt(0)]).await.unwrap_err();
+    assert!(error.to_string().contains("timeout"));
+    assert_transport_error_is_redacted(&error);
+}
+
+#[tokio::test]
+async fn response_body_errors_do_not_expose_query_credentials() {
+    let server = TestServer::start(Arc::new(|_| {
+        let mut response = ResponseSpec::raw(vec![0; UNIT]);
+        response.drop_after = Some(1);
+        response
+    }))
+    .await;
+    let mut config = spec(&server.url());
+    config.tls = None;
+    let provider = HttpCryptoProvider::new(config).unwrap();
+    let ciphertext = maki_crypto::CiphertextUnit {
+        unit_index: 0,
+        data: vec![0; UNIT],
+    };
+    let error = provider
+        .decrypt_batch(&ctx(), &[ciphertext])
+        .await
+        .unwrap_err();
+    assert_transport_error_is_redacted(&error);
+}

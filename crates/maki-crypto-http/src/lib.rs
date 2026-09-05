@@ -244,7 +244,10 @@ fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), Cryp
 }
 
 /// Classify a transport error (SPEC §31).
-fn classify_transport(e: &reqwest::Error) -> CryptoError {
+fn classify_transport(e: reqwest::Error) -> CryptoError {
+    // Transport errors include the request URL in Display and Debug. Drop
+    // it before either classification or logging can expose query secrets.
+    let e = e.without_url();
     if e.is_timeout() {
         return CryptoError::Retryable(format!("request timeout: {e}"));
     }
@@ -345,7 +348,7 @@ impl HttpCryptoProvider {
             .body(body)
             .send()
             .await
-            .map_err(|e| classify_transport(&e))?;
+            .map_err(classify_transport)?;
 
         if let Some(err) = classify_status(response.status()) {
             return Err(err);
@@ -361,7 +364,7 @@ impl HttpCryptoProvider {
         // Stream with a hard cap regardless of the declared length.
         let mut out = Vec::new();
         let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(|e| classify_transport(&e))? {
+        while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
             out.extend_from_slice(&chunk);
             if out.len() > self.spec.max_response_bytes {
                 return Err(CryptoError::NonRetryableRequest(format!(
