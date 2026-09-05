@@ -23,6 +23,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -73,9 +74,51 @@ type Pending =
 struct Connection {
     sender: mpsc::Sender<Message>,
     generation: u64,
+    cancellation: ConnectionCancellation,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.cancellation.retire();
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionCancellation {
+    task: AbortHandle,
+    pending: Pending,
+    dead_generation: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl ConnectionCancellation {
+    fn retire(&self) {
+        // Mark before sweeping, so a racing request never registers on a
+        // generation whose response reader can no longer deliver it.
+        self.dead_generation
+            .fetch_max(self.generation, Ordering::SeqCst);
+        self.task.abort();
+        WsCryptoProvider::fail_pending_generation(&self.pending, self.generation, "retired");
+    }
+}
+
+struct PendingRequest {
+    id: u64,
+    pending: Pending,
+    cancellation: Option<ConnectionCancellation>,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.id);
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.retire();
+        }
+    }
 }
 
 struct MarkDeadOnDrop {
+    pending: Pending,
     dead_generation: Arc<AtomicU64>,
     generation: u64,
 }
@@ -84,6 +127,7 @@ impl Drop for MarkDeadOnDrop {
     fn drop(&mut self) {
         self.dead_generation
             .fetch_max(self.generation, Ordering::SeqCst);
+        WsCryptoProvider::fail_pending_generation(&self.pending, self.generation, "closed");
     }
 }
 
@@ -119,13 +163,12 @@ impl WsCryptoProvider {
         }
     }
 
-    /// Fail every pending request sent on `generation` or older (that
-    /// connection died); requests on newer connections are untouched.
-    fn fail_pending_up_to(pending: &Pending, generation: u64, why: &str) {
+    /// Fail only the requests owned by the retiring connection generation.
+    fn fail_pending_generation(pending: &Pending, generation: u64, why: &str) {
         let mut map = pending.lock();
         let ids: Vec<u64> = map
             .iter()
-            .filter(|(_, (g, _))| *g <= generation)
+            .filter(|(_, (g, _))| *g == generation)
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
@@ -154,25 +197,21 @@ impl WsCryptoProvider {
         let (mut sink, mut source) = ws.split();
         let (tx, mut rx) = mpsc::channel::<Message>(64);
 
-        // Writer task.
-        tokio::spawn(async move {
+        // One task owns both halves. Completion of either future drops the
+        // other, and aborting the owner always releases the whole socket.
+        let writer = async move {
             while let Some(msg) = rx.recv().await {
                 if sink.send(msg).await.is_err() {
                     return;
                 }
             }
-        });
+        };
 
-        // Reader task: correlate responses; drop stale ids. On exit, mark
-        // this generation dead so later requests reconnect instead of
-        // sending into a corpse.
+        // Correlate responses only with requests on this generation.
         let pending = self.pending.clone();
         let dead_generation = self.dead_generation.clone();
-        tokio::spawn(async move {
-            let _mark_dead = MarkDeadOnDrop {
-                dead_generation: dead_generation.clone(),
-                generation,
-            };
+        let reader_pending = self.pending.clone();
+        let reader = async move {
             loop {
                 match source.next().await {
                     Some(Ok(msg)) => {
@@ -184,8 +223,16 @@ impl WsCryptoProvider {
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
                             continue;
                         };
-                        match pending.lock().remove(&id) {
-                            Some((_generation, tx)) => {
+                        let response = {
+                            let mut pending = reader_pending.lock();
+                            if pending.get(&id).is_some_and(|(g, _)| *g == generation) {
+                                pending.remove(&id)
+                            } else {
+                                None
+                            }
+                        };
+                        match response {
+                            Some((_, tx)) => {
                                 let _ = tx.send(Ok(value));
                             }
                             None => {
@@ -196,25 +243,38 @@ impl WsCryptoProvider {
                         }
                     }
                     Some(Err(e)) => {
-                        // Mark dead BEFORE the sweep: a request registering
-                        // after the sweep then sees the marker and
-                        // reconnects — no interleaving can strand a waiter.
-                        dead_generation.fetch_max(generation, Ordering::SeqCst);
-                        Self::fail_pending_up_to(&pending, generation, &e.to_string());
+                        tracing::debug!("websocket: reader exited: {e}");
                         return;
                     }
                     None => {
-                        dead_generation.fetch_max(generation, Ordering::SeqCst);
-                        Self::fail_pending_up_to(&pending, generation, "closed");
                         return;
                     }
                 }
+            }
+        };
+        let task = tokio::spawn(async move {
+            // Natural exit and abort share the same generation-scoped
+            // cleanup, including failure of the writer before a response.
+            let _mark_dead = MarkDeadOnDrop {
+                pending,
+                dead_generation,
+                generation,
+            };
+            tokio::select! {
+                _ = writer => {},
+                _ = reader => {},
             }
         });
 
         Ok(Connection {
             sender: tx,
             generation,
+            cancellation: ConnectionCancellation {
+                task: task.abort_handle(),
+                pending: self.pending.clone(),
+                dead_generation: self.dead_generation.clone(),
+                generation,
+            },
         })
     }
 
@@ -230,7 +290,7 @@ impl WsCryptoProvider {
         }
 
         let (tx, rx) = oneshot::channel();
-        let sent_generation = {
+        let mut pending_request = {
             let mut guard = self.connection.lock().await;
             // Discard a connection whose reader has already exited.
             if let Some(conn) = guard.as_ref() {
@@ -247,6 +307,11 @@ impl WsCryptoProvider {
             // a fast response cannot be "stale" and a dying connection's
             // sweep can target exactly its own requests.
             self.pending.lock().insert(id, (generation, tx));
+            let pending_request = PendingRequest {
+                id,
+                pending: self.pending.clone(),
+                cancellation: Some(conn.cancellation.clone()),
+            };
             let sent =
                 tokio::time::timeout(self.spec.timeout, conn.sender.send(Message::text(encoded)))
                     .await;
@@ -256,18 +321,18 @@ impl WsCryptoProvider {
                 if guard.as_ref().map(|c| c.generation) == Some(generation) {
                     *guard = None;
                 }
-                self.pending.lock().remove(&id);
                 return Err(retryable("websocket send failed"));
             }
-            generation
+            pending_request
         };
 
         match tokio::time::timeout(self.spec.timeout, rx).await {
             Ok(Ok(result)) => {
-                // On a connection-loss error, clear the dead connection (if
-                // it is still this one) so the next call reconnects.
-                if result.is_err() {
-                    self.retire(sent_generation).await;
+                if result.is_ok() {
+                    // A completed exchange leaves the connection reusable.
+                    // Any error or future cancellation instead retires only
+                    // this request's generation via the guard.
+                    pending_request.cancellation = None;
                 }
                 result
             }
@@ -276,20 +341,8 @@ impl WsCryptoProvider {
                 // A peer that stopped answering (half-open TCP session,
                 // hung service) must not be reused: every later request
                 // would burn the full timeout on the same corpse (C-05).
-                self.pending.lock().remove(&id);
-                self.retire(sent_generation).await;
                 Err(retryable("websocket request timeout"))
             }
-        }
-    }
-
-    /// Forget the connection of `generation` if it is still the registered
-    /// one, so the next request reconnects. In-flight requests on it keep
-    /// their own timeouts; the reader task ends when the sink drops.
-    async fn retire(&self, generation: u64) {
-        let mut guard = self.connection.lock().await;
-        if guard.as_ref().map(|c| c.generation) == Some(generation) {
-            *guard = None;
         }
     }
 
