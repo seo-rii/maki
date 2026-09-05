@@ -169,7 +169,7 @@ impl Request<'_> {
 
 const DEADLINE_MESSAGE: &str = "operation deadline exceeded";
 
-fn deadline_error() -> CryptoError {
+pub(crate) fn deadline_error() -> CryptoError {
     CryptoError::Retryable(DEADLINE_MESSAGE.to_string())
 }
 
@@ -569,6 +569,10 @@ impl EndpointSet {
 
 #[async_trait]
 impl CryptoProvider for EndpointSet {
+    fn max_operation_time(&self) -> Option<Duration> {
+        self.config.max_operation_time
+    }
+
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
         // Endpoints are interchangeable (verified by the cross-endpoint
         // self-test); report a validated one's contract.

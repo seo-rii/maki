@@ -389,6 +389,7 @@ fn deliver<O>(
 /// inner provider.
 pub struct BatchScheduler {
     inner: Arc<dyn CryptoProvider>,
+    clock: Arc<dyn Clock>,
     encrypt: Lane<PlaintextUnit, CiphertextUnit>,
     decrypt: Lane<CiphertextUnit, PlaintextUnit>,
     stats: Arc<SchedulerStats>,
@@ -417,7 +418,7 @@ impl BatchScheduler {
         let decrypt = Lane::spawn(
             config.clone(),
             config.max_pending_ciphertext_bytes,
-            clock,
+            clock.clone(),
             stats.clone(),
             Arc::new(move |context, items: Vec<CiphertextUnit>| {
                 let inner = dec_inner.clone();
@@ -426,6 +427,7 @@ impl BatchScheduler {
         );
         Self {
             inner,
+            clock,
             encrypt,
             decrypt,
             stats,
@@ -435,10 +437,31 @@ impl BatchScheduler {
     pub fn stats(&self) -> Arc<SchedulerStats> {
         self.stats.clone()
     }
+
+    /// Start the caller's budget before its first queue-admission wait.
+    /// Expiry drops the submit future; the lane then removes that group or
+    /// abandons an RPC whose final caller has expired (BUG-012 / BUG-013).
+    async fn with_deadline<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, CryptoError>>,
+    ) -> Result<T, CryptoError> {
+        let Some(limit) = self.max_operation_time() else {
+            return operation.await;
+        };
+        tokio::select! {
+            biased;
+            _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
+            result = operation => result,
+        }
+    }
 }
 
 #[async_trait]
 impl CryptoProvider for BatchScheduler {
+    fn max_operation_time(&self) -> Option<Duration> {
+        self.inner.max_operation_time()
+    }
+
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
         self.inner.capabilities().await
     }
@@ -448,17 +471,20 @@ impl CryptoProvider for BatchScheduler {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
-        let owned: Vec<PlaintextUnit> = items
-            .iter()
-            .map(|i| PlaintextUnit {
-                unit_index: i.unit_index,
-                data: i.data.duplicate(),
-            })
-            .collect();
-        self.encrypt
-            .submit(context, owned, bytes, &self.stats)
-            .await
+        self.with_deadline(async {
+            let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+            let owned: Vec<PlaintextUnit> = items
+                .iter()
+                .map(|i| PlaintextUnit {
+                    unit_index: i.unit_index,
+                    data: i.data.duplicate(),
+                })
+                .collect();
+            self.encrypt
+                .submit(context, owned, bytes, &self.stats)
+                .await
+        })
+        .await
     }
 
     async fn decrypt_batch(
@@ -466,9 +492,12 @@ impl CryptoProvider for BatchScheduler {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
-        self.decrypt
-            .submit(context, items.to_vec(), bytes, &self.stats)
-            .await
+        self.with_deadline(async {
+            let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+            self.decrypt
+                .submit(context, items.to_vec(), bytes, &self.stats)
+                .await
+        })
+        .await
     }
 }

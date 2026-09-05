@@ -118,6 +118,10 @@ pub fn validate_decrypt_result(
 
 #[async_trait]
 impl CryptoProvider for CheckedProvider {
+    fn max_operation_time(&self) -> Option<std::time::Duration> {
+        self.inner.max_operation_time()
+    }
+
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
         Ok(self.caps().await?.clone())
     }
