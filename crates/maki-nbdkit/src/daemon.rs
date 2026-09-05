@@ -89,6 +89,9 @@ fn resolve_key_source(cred: &CredentialRef) -> Result<(Box<dyn KeySource>, Strin
 /// Build the configured crypto provider (SPEC §12: profile mismatch is
 /// caught later by the attach self-test).
 pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
+    // Public callers can supply an unvalidated configuration. Refuse name
+    // collisions before the name-only credential router loads any secret.
+    config.validate_credential_sources()?;
     let unit = config.volume.crypto_unit_size;
     let compat = config.crypto.crypto_compatibility_id.as_str();
     match config.crypto.provider.as_str() {

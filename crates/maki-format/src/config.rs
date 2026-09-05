@@ -724,6 +724,23 @@ impl VolumeConfig {
         refs
     }
 
+    /// Credential consumers resolve by name. Repeated references may share
+    /// that name only when they also declare the same source (BUG-007).
+    pub fn validate_credential_sources(&self) -> Result<(), ConfigError> {
+        let mut sources = BTreeMap::new();
+        for credential in self.credential_refs() {
+            if let Some(previous) = sources.insert(&credential.name, &credential.source) {
+                if previous != &credential.source {
+                    return Err(invalid(format!(
+                        "credential {:?} has conflicting sources {:?} and {:?}; use distinct names",
+                        credential.name, previous, credential.source
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The block size the NBD export advertises: `nbd.device_block_size`
     /// when set (validation requires it to equal the volume's), otherwise
     /// the volume's `device_block_size`.
@@ -788,6 +805,7 @@ impl VolumeConfig {
         self.validate_journal_bounds()?;
         self.validate_settings()?;
         self.validate_provider_sections()?;
+        self.validate_credential_sources()?;
         if !self
             .crypto
             .capabilities
