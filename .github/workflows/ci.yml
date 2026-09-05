@@ -27,12 +27,13 @@ jobs:
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # SPEC §55 PR tier: unit, property smoke, codec, fake crypto, journal
       # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
-      # smoke — all part of the default workspace suite.
+      # smoke — all part of the default workspace suite. `--locked` keeps
+      # the build reproducible against Cargo.lock (third review).
       - name: workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   nightly-gates:
     if: github.event_name == 'schedule'
@@ -45,20 +46,29 @@ jobs:
       # saturation, retry storm — the ignored phase gates.
       - name: phase gates (release)
         run: >
-          cargo test --workspace --release -- --ignored
+          cargo test --workspace --release --locked -- --ignored
           phase0_gate_full phase3_gate_full phase4_gate_full
           phase5_gate_endpoint_cycles_full phase5_gate_breaker_cycles_full
           phase11_gate_dbsim_full phase12_gate_full
       - name: nbdkit plugin build (cdylib + plugin_init symbol)
         run: |
-          cargo build --release -p maki-nbdkit
+          cargo build --release --locked -p maki-nbdkit
           nm -D target/release/libmaki_nbdkit.so | grep -q plugin_init
+      # Third review F08: the hand-mirrored nbdkit_plugin struct and the
+      # NBDKIT_* constants are checked against the distribution's header by
+      # a C probe (tests/review_abi.rs), not by comments.
+      - name: nbdkit ABI check against the installed header
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nbdkit-plugin-dev
+          test -f /usr/include/nbdkit-plugin.h
+          cargo test --locked -p maki-nbdkit --test review_abi -- --nocapture
       # Review M-008: a release build must not accept the non-cryptographic
       # fake provider. (In `cargo test --workspace` feature unification turns
       # it on for the nbdkit crate's own tests, so this is checked here.)
       - name: release build refuses provider = "fake"
         run: |
-          cargo build --release -p maki
+          cargo build --release --locked -p maki
           cat > /tmp/fake.toml <<'EOF'
           config_schema_version = 1
           [volume]

@@ -6,10 +6,14 @@ use maki_privileged::config::{
     check_abs_path, check_argument, check_uuid, parse, AttachConfig, AttachOverrides,
 };
 use maki_privileged::plan::{
-    plan_attach, plan_detach, rollback_steps, PlannedStep, AUTO_NBD_DEVICE,
+    plan_attach, plan_detach, reconcile_detach_device, rollback_steps, PlannedStep, AUTO_NBD_DEVICE,
 };
-use maki_privileged::probe::{choose_free_nbd, nbd_index, parse_mountinfo};
-use maki_privileged::verify::{verify_mount_identity, MountExpectation, MountObservation};
+use maki_privileged::probe::{
+    choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
+};
+use maki_privileged::verify::{
+    verify_mount_device, verify_mount_identity, MountExpectation, MountObservation,
+};
 
 const UUID: &str = "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
 
@@ -178,6 +182,9 @@ fn init_sentinel_adds_a_write_step_before_verification() {
             "set-block-size",
             "lvm-activate",
             "mount-xfs",
+            // F02: the device check runs before anything touches the
+            // filesystem, sentinel included.
+            "verify-mount-device",
             "write-sentinel",
             "verify-mount-identity"
         ]
@@ -252,6 +259,7 @@ fn verifier_rejects_wrong_device_and_missing_sentinel() {
     let expected = MountExpectation {
         fs_uuid: Some("f".repeat(8)),
         volume_uuid: UUID.to_string(),
+        nbd_device: "/dev/nbd0".to_string(),
     };
     let mut observed = MountObservation {
         mountpoint_exists: true,
@@ -260,6 +268,7 @@ fn verifier_rejects_wrong_device_and_missing_sentinel() {
         sentinel_volume_uuid: Some(UUID.into()),
         nbd_connected: true,
         rw_probe_ok: true,
+        backing_devices: vec!["/dev/nbd0".into()],
     };
     verify_mount_identity(&expected, &observed).unwrap();
     observed.sentinel_volume_uuid = None;
@@ -267,6 +276,148 @@ fn verifier_rejects_wrong_device_and_missing_sentinel() {
     observed.sentinel_volume_uuid = Some(UUID.into());
     observed.fs_uuid = Some("other".into());
     assert!(verify_mount_identity(&expected, &observed).is_err());
+    observed.fs_uuid = Some("f".repeat(8));
+    observed.backing_devices = vec!["/dev/nbd1".into()];
+    assert!(
+        verify_mount_identity(&expected, &observed).is_err(),
+        "a matching sentinel on the wrong device must not pass"
+    );
+}
+
+// ---------- F02 (third review): the mount must be on the bound NBD device ----------
+
+/// The mounted filesystem's UUID, sentinel and probe used to be checked
+/// without ever asking which block device the filesystem is on. With
+/// `init_sentinel`, the helper wrote the expected sentinel onto whatever
+/// XFS it had mounted (a local LV named like the Maki one), then verified
+/// its own sentinel: application data landed outside Maki in plaintext.
+#[test]
+fn a_filesystem_not_stored_only_on_the_bound_nbd_device_is_refused_before_it_is_touched() {
+    let observed = |backing: Vec<&str>| MountObservation {
+        mountpoint_exists: true,
+        fstype: Some("xfs".into()),
+        fs_uuid: None,
+        sentinel_volume_uuid: None,
+        nbd_connected: true,
+        rw_probe_ok: false,
+        backing_devices: backing.into_iter().map(String::from).collect(),
+    };
+    verify_mount_device("/dev/nbd0", &observed(vec!["/dev/nbd0"])).unwrap();
+    // A local disk, a volume group spanning the NBD device and a local
+    // disk, an unresolved topology: all refused.
+    for backing in [vec!["/dev/sda2"], vec!["/dev/nbd0", "/dev/sda2"], vec![]] {
+        let err = verify_mount_device("/dev/nbd0", &observed(backing.clone())).unwrap_err();
+        assert!(
+            err.to_string().contains("backing") || err.to_string().contains("resolve"),
+            "{backing:?}: {err}"
+        );
+    }
+    // Another NBD device is another volume.
+    assert!(verify_mount_device("/dev/nbd0", &observed(vec!["/dev/nbd1"])).is_err());
+    let mut nothing_mounted = observed(vec!["/dev/nbd0"]);
+    nothing_mounted.fstype = None;
+    assert!(verify_mount_device("/dev/nbd0", &nothing_mounted).is_err());
+}
+
+#[test]
+fn leaf_devices_are_resolved_through_the_device_mapper_stack() {
+    let tree: std::collections::HashMap<&str, Vec<&str>> = [
+        ("dm-2", vec!["dm-1"]),
+        ("dm-1", vec!["nbd0"]),
+        ("dm-3", vec!["nbd0", "sda2"]),
+        ("dm-4", vec!["dm-5"]),
+        ("dm-5", vec!["dm-4"]),
+    ]
+    .into_iter()
+    .collect();
+    let mut slaves_of = |name: &str| -> Vec<String> {
+        tree.get(name)
+            .map(|s| s.iter().map(|x| x.to_string()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(resolve_leaf_devices("dm-2", &mut slaves_of), ["nbd0"]);
+    assert_eq!(
+        resolve_leaf_devices("dm-3", &mut slaves_of),
+        ["nbd0", "sda2"]
+    );
+    assert_eq!(resolve_leaf_devices("nbd0", &mut slaves_of), ["nbd0"]);
+    assert!(
+        resolve_leaf_devices("dm-4", &mut slaves_of).is_empty(),
+        "a cyclic tree terminates with no leaves"
+    );
+    assert_eq!(nbd_device_of("nbd0").as_deref(), Some("/dev/nbd0"));
+    assert_eq!(nbd_device_of("nbd12p3").as_deref(), Some("/dev/nbd12"));
+    assert_eq!(nbd_device_of("nbd"), None);
+    assert_eq!(nbd_device_of("nbd0x"), None);
+    assert_eq!(nbd_device_of("nbd0p"), None);
+    assert_eq!(nbd_device_of("sda"), None);
+}
+
+#[test]
+fn mountinfo_parsing_exposes_the_device_number() {
+    let first_two: String = MOUNTINFO.lines().take(2).collect::<Vec<_>>().join("\n");
+    let entry = parse_mountinfo(&first_two, "/srv/pg").unwrap();
+    assert_eq!(entry.major_minor, "253:2");
+    assert_eq!(parse_mountinfo(MOUNTINFO, "/").unwrap().major_minor, "8:1");
+}
+
+// ---------- F06 (third review): a detach decides its device under the lock ----------
+
+/// `plan_detach` read the attach record before the executor took the
+/// attach lock. Between the two the volume could be detached and
+/// re-attached to another device, with another volume now on the planned
+/// one: the stale plan would unmount the current mount and disconnect the
+/// other volume's device. The executor re-reads the record under the lock
+/// and refuses a plan the record no longer backs.
+#[test]
+fn a_detach_plan_is_reconciled_with_the_attach_record_under_the_lock() {
+    let mut request = request();
+    request.nbd_device = AUTO_NBD_DEVICE.to_string();
+    request.volume = "no-such-volume-for-this-test".to_string();
+    let unresolved = plan_detach(&request);
+    assert!(unresolved.recorded_device.is_none());
+
+    // Placeholder: bound to the record read under the lock, refused without one.
+    let mut plan = unresolved.clone();
+    reconcile_detach_device(&mut plan, Some("/dev/nbd2")).unwrap();
+    assert!(plan.steps.iter().any(|s| matches!(
+        s,
+        PlannedStep::NbdDisconnect { device } if device == "/dev/nbd2"
+    )));
+    let mut plan = unresolved.clone();
+    let err = reconcile_detach_device(&mut plan, None).unwrap_err();
+    assert!(err.contains("refusing to guess"), "{err}");
+
+    // Planned from a record naming nbd0: still nbd0 under the lock = fine;
+    // anything else is a stale plan.
+    let mut from_record = unresolved.clone();
+    from_record.bind_device("/dev/nbd0");
+    from_record.recorded_device = Some("/dev/nbd0".to_string());
+    reconcile_detach_device(&mut from_record.clone(), Some("/dev/nbd0")).unwrap();
+    let err = reconcile_detach_device(&mut from_record.clone(), Some("/dev/nbd1")).unwrap_err();
+    assert!(
+        err.contains("stale plan") && err.contains("/dev/nbd1"),
+        "{err}"
+    );
+    let err = reconcile_detach_device(&mut from_record.clone(), None).unwrap_err();
+    assert!(err.contains("stale plan"), "{err}");
+
+    // An operator-named device is the operator's decision.
+    let mut explicit = unresolved.clone();
+    explicit.bind_device("/dev/nbd7");
+    assert!(explicit.recorded_device.is_none());
+    reconcile_detach_device(&mut explicit, Some("/dev/nbd1")).unwrap();
+    reconcile_detach_device(&mut explicit, None).unwrap();
+    assert!(explicit.steps.iter().any(|s| matches!(
+        s,
+        PlannedStep::NbdDisconnect { device } if device == "/dev/nbd7"
+    )));
+
+    // Attach plans are untouched (their disconnect is only ever a rollback).
+    let attach = plan_attach(&request);
+    let mut reconciled = attach.clone();
+    reconcile_detach_device(&mut reconciled, Some("/dev/nbd3")).unwrap();
+    assert_eq!(reconciled.steps, attach.steps);
 }
 
 // ---------- O-02: a detach never guesses its device ----------

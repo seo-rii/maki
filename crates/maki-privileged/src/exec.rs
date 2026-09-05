@@ -12,9 +12,16 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::plan::{rollback_steps, Plan, PlannedStep, SENTINEL_FILE};
-use crate::probe::{choose_free_nbd, nbd_index, parse_mountinfo};
-use crate::verify::{verify_mount_identity, MountExpectation, MountObservation};
+use crate::plan::{
+    bound_device_record_path, reconcile_detach_device, recorded_bound_device, rollback_steps, Plan,
+    PlannedStep, SENTINEL_FILE,
+};
+use crate::probe::{
+    choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
+};
+use crate::verify::{
+    verify_mount_device, verify_mount_identity, MountExpectation, MountObservation,
+};
 
 /// Serializes attach helpers system-wide (device allocation + connect).
 pub const ATTACH_LOCK_PATH: &str = "/run/maki/attach.lock";
@@ -242,22 +249,81 @@ pub fn rw_probe(mountpoint: &str) -> bool {
     result.unwrap_or(false)
 }
 
-/// Gather every fact the verifier needs about a mounted volume.
-pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> MountObservation {
+/// The block devices a mounted device (`major:minor`) ultimately lives
+/// on: the sysfs name behind `/sys/dev/block/M:m`, then the `slaves`
+/// relation down to devices with none (device-mapper and MD stack that
+/// way). Partitions fold into their NBD device. Empty when sysfs cannot
+/// answer, which the verifier treats as "not proven".
+fn sysfs_leaf_devices(major_minor: &str) -> Vec<String> {
+    let start = std::fs::read_link(format!("/sys/dev/block/{major_minor}"))
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    let Some(start) = start else {
+        return Vec::new();
+    };
+    let mut slaves_of = |name: &str| -> Vec<String> {
+        std::fs::read_dir(format!("/sys/class/block/{name}/slaves"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    resolve_leaf_devices(&start, &mut slaves_of)
+        .into_iter()
+        .map(|leaf| nbd_device_of(&leaf).unwrap_or_else(|| format!("/dev/{leaf}")))
+        .collect()
+}
+
+/// Gather every fact the verifier needs about a mounted volume. Only the
+/// topology facts are collected when `touch` is false: nothing is written
+/// to a filesystem whose device has not been verified yet (F02).
+fn observe(mountpoint: &str, nbd_device: &str, touch: bool) -> MountObservation {
     let mountpoint_exists = Path::new(mountpoint).is_dir();
     let entry = std::fs::read_to_string("/proc/self/mountinfo")
         .ok()
         .and_then(|text| parse_mountinfo(&text, mountpoint));
     let fstype = entry.as_ref().map(|e| e.fstype.clone());
     let fs_uuid = entry.as_ref().and_then(|e| blkid_uuid(&e.source));
+    let backing_devices = entry
+        .as_ref()
+        .map(|e| sysfs_leaf_devices(&e.major_minor))
+        .unwrap_or_default();
     MountObservation {
         mountpoint_exists,
         fstype,
         fs_uuid,
-        sentinel_volume_uuid: read_sentinel(mountpoint),
+        sentinel_volume_uuid: if touch {
+            read_sentinel(mountpoint)
+        } else {
+            None
+        },
         nbd_connected: nbd_connected(nbd_device),
-        rw_probe_ok: entry.is_some() && rw_probe(mountpoint),
+        rw_probe_ok: touch && entry.is_some() && rw_probe(mountpoint),
+        backing_devices,
     }
+}
+
+/// Gather every fact the verifier needs about a mounted volume.
+pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> MountObservation {
+    observe(mountpoint, nbd_device, true)
+}
+
+/// Write the bound-device record for `volume` (after `nbd-client`
+/// connected, so a crash never leaves a record naming a device this
+/// volume does not hold — another volume could take it later, F06).
+fn record_bound_device(volume: &str, device: &str) -> io::Result<()> {
+    let record = bound_device_record_path(volume);
+    if let Some(dir) = record.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&record, format!("{device}\n"))
+}
+
+fn forget_bound_device(volume: &str) {
+    let _ = std::fs::remove_file(bound_device_record_path(volume));
 }
 
 fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
@@ -284,6 +350,15 @@ fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
             "mount",
             &["-t", "xfs", "-o", "noatime", device, mountpoint],
         ),
+        PlannedStep::VerifyMountDevice {
+            mountpoint,
+            nbd_device,
+        } => {
+            tracing::info!("maki-attach: {step}");
+            let observed = observe(mountpoint, nbd_device, false);
+            verify_mount_device(nbd_device, &observed)?;
+            Ok(())
+        }
         PlannedStep::WriteSentinel {
             mountpoint,
             volume_uuid,
@@ -300,6 +375,7 @@ fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
                 &MountExpectation {
                     fs_uuid: fs_uuid.clone(),
                     volume_uuid: volume_uuid.clone(),
+                    nbd_device: nbd_device.clone(),
                 },
                 &observed,
             )?;
@@ -330,16 +406,6 @@ fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
 /// returned with the rollback outcome.
 pub fn execute(plan: &Plan) -> Result<(), ExecError> {
     let mut plan = plan.clone();
-    if plan.unresolved_disconnect() {
-        return Err(ExecError::Step {
-            step: "nbd-disconnect".to_string(),
-            message: format!(
-                "the NBD device is on auto and no device was recorded at attach ({}); \
-                 refusing to guess which device to disconnect (pass --nbd-device)",
-                crate::plan::bound_device_record_path(&plan.volume).display()
-            ),
-        });
-    }
     // Connecting *and* disconnecting serialize under the attach lock: a
     // detach racing another volume's attach must not touch its device.
     let needs_lock = plan.steps.iter().any(|s| {
@@ -353,6 +419,17 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
     } else {
         None
     };
+    // A detach decides its device *here*, under the lock, from the attach
+    // record as it is now — not from what the planner saw earlier (F06).
+    // Every destructive step below (umount, vgchange, disconnect) runs
+    // after this check.
+    let current_record = recorded_bound_device(&plan.volume);
+    reconcile_detach_device(&mut plan, current_record.as_deref()).map_err(|message| {
+        ExecError::Step {
+            step: "nbd-disconnect".to_string(),
+            message,
+        }
+    })?;
     if plan.needs_device_allocation() {
         // The module must be loaded before sysfs lists any nbd device.
         run(&PlannedStep::ModprobeNbd, "modprobe", &["nbd"])?;
@@ -361,20 +438,10 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
         plan.bind_device(&device);
         println!("# bound NBD device: {device}");
     }
-    // Remember the device an attach binds, for the detach that follows
-    // (O-02). Written before connecting so a crash between the two leaves
-    // at worst a stale record naming an unconnected device.
-    let connects = plan.steps.iter().find_map(|s| match s {
-        PlannedStep::NbdConnect { device, .. } => Some(device.clone()),
-        _ => None,
-    });
-    if let Some(device) = &connects {
-        let record = crate::plan::bound_device_record_path(&plan.volume);
-        if let Some(dir) = record.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&record, format!("{device}\n"))?;
-    }
+    let connects = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, PlannedStep::NbdConnect { .. }));
 
     let mut executed: Vec<PlannedStep> = Vec::new();
     for step in &plan.steps {
@@ -392,9 +459,21 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
                 match run(step, "nbd-client", &["-unix", socket, device, "-b", &bs]) {
                     Ok(()) => {
                         executed.push(step.clone());
-                        match wait_nbd_ready(step, device) {
-                            Ok(()) => continue,
-                            Err(e) => Err(e),
+                        // Remember the device this attach holds, for the
+                        // detach that follows (O-02); written only once
+                        // the device really is ours (F06).
+                        match record_bound_device(&plan.volume, device) {
+                            Ok(()) => match wait_nbd_ready(step, device) {
+                                Ok(()) => continue,
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(ExecError::Step {
+                                step: step.to_string(),
+                                message: format!(
+                                    "cannot record the bound device at {}: {e}",
+                                    bound_device_record_path(&plan.volume).display()
+                                ),
+                            }),
                         }
                     }
                     Err(e) => Err(e),
@@ -406,9 +485,18 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
             let rollback = rollback_steps(&executed);
             let mut failed = 0usize;
             for compensating in &rollback {
-                if let Err(e) = run_step(compensating) {
-                    failed += 1;
-                    tracing::error!("maki-attach: rollback step {compensating} failed: {e}");
+                match run_step(compensating) {
+                    Ok(()) => {
+                        // The device is no longer ours: a record naming it
+                        // would point a later detach at whoever gets it next.
+                        if matches!(compensating, PlannedStep::NbdDisconnect { .. }) {
+                            forget_bound_device(&plan.volume);
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        tracing::error!("maki-attach: rollback step {compensating} failed: {e}");
+                    }
                 }
             }
             return Err(ExecError::RolledBack {
@@ -425,9 +513,9 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
         .steps
         .iter()
         .any(|s| matches!(s, PlannedStep::NbdDisconnect { .. }))
-        && connects.is_none()
+        && !connects
     {
-        let _ = std::fs::remove_file(crate::plan::bound_device_record_path(&plan.volume));
+        forget_bound_device(&plan.volume);
     }
     Ok(())
 }

@@ -13,6 +13,14 @@
 //!
 //! Fault injection: a hook may fail any operation (e.g. ENOSPC on append,
 //! EIO on fsync) — used by journal/checkpoint failpoint tests.
+//!
+//! Failure semantics are Linux-faithful, not "the syscall never happened":
+//! - a failed `sync_data` marks every dirty write *clean without persisting
+//!   it* (the page cache keeps showing the bytes, a later `sync_data` has
+//!   nothing left to write, a crash drops them) — the writeback-error
+//!   behaviour PostgreSQL's `data_sync_retry` documents (F01);
+//! - a `write_at` may persist a prefix and then fail (the partial-write
+//!   hook), leaving the file longer than the caller's logical end (F03).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -57,6 +65,12 @@ pub enum FaultOp<'a> {
 
 pub type FaultHook = Arc<dyn Fn(&FaultOp<'_>) -> Option<io::Error> + Send + Sync>;
 
+/// A hook that turns a `write_at` into a *partial* write: `Some((n, err))`
+/// persists the first `n` bytes of the write (as a normal dirty write) and
+/// returns `err` to the caller, exactly like `write_all_at` failing on its
+/// second `pwrite`.
+pub type PartialWriteHook = Arc<dyn Fn(&FaultOp<'_>) -> Option<(usize, io::Error)> + Send + Sync>;
+
 #[derive(Clone, Debug)]
 enum Pend {
     Write { offset: u64, data: Vec<u8> },
@@ -75,10 +89,29 @@ struct FileState {
 
 #[derive(Clone, Debug, Default)]
 struct Volatile {
-    /// If false, the volatile view starts from an empty file (fresh inode
-    /// after re-create), not from the durable content.
+    /// If false, the durable image of the next successful sync starts from
+    /// an empty file (fresh inode after re-create), not from the durable
+    /// content.
     base_durable: bool,
+    /// Dirty operations: what the next successful `sync_data` persists.
     pending: Vec<Pend>,
+    /// The page-cache view: every operation ever applied, including writes
+    /// a failed `sync_data` marked clean without persisting.
+    image: Vec<u8>,
+}
+
+impl Volatile {
+    fn fresh() -> Self {
+        Self::default()
+    }
+
+    fn from_durable(durable: &[u8]) -> Self {
+        Self {
+            base_durable: true,
+            pending: Vec::new(),
+            image: durable.to_vec(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -88,6 +121,11 @@ struct Inner {
     dirs: BTreeMap<String, bool>,
     locks: std::collections::HashSet<String>,
     hook: Option<FaultHook>,
+    partial_hook: Option<PartialWriteHook>,
+    /// When set, a failed `sync_data` leaves its dirty writes dirty (the
+    /// "syscall never happened" model). The default is the Linux model:
+    /// the writes are marked clean and lost.
+    lenient_sync_failures: bool,
     stats_pending_writes: usize,
     /// Simulated free space reported by `Backing::free_bytes`.
     free_bytes: Option<u64>,
@@ -104,17 +142,23 @@ impl Inner {
     }
 
     fn compose(&self, state: &FileState) -> Option<Vec<u8>> {
-        let vol = state.volatile.as_ref()?;
-        let mut data = if vol.base_durable {
-            state.durable.clone().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for p in &vol.pending {
-            apply(&mut data, p);
-        }
-        Some(data)
+        state.volatile.as_ref().map(|vol| vol.image.clone())
     }
+}
+
+/// The content a successful `sync_data` makes durable: the durable base
+/// (or an empty fresh inode) plus every *dirty* operation, in order. Writes
+/// an earlier failed sync marked clean are not part of it.
+fn durable_after_sync(state: &FileState, vol: &Volatile) -> Vec<u8> {
+    let mut data = if vol.base_durable {
+        state.durable.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for p in &vol.pending {
+        apply(&mut data, p);
+    }
+    data
 }
 
 fn apply(data: &mut Vec<u8>, p: &Pend) {
@@ -200,6 +244,19 @@ impl CrashableBacking {
         self.inner.lock().hook = hook;
     }
 
+    /// Install a partial-write hook (see [`PartialWriteHook`]).
+    pub fn set_partial_write_hook(&self, hook: Option<PartialWriteHook>) {
+        self.inner.lock().partial_hook = hook;
+    }
+
+    /// Choose what a failed `sync_data` does to the dirty writes it could
+    /// not persist. `false` (the default) is the Linux model: they are
+    /// marked clean and lost, a retry of the sync has nothing to write.
+    /// `true` keeps them dirty, as if the syscall had never run.
+    pub fn set_lenient_sync_failures(&self, lenient: bool) {
+        self.inner.lock().lenient_sync_failures = lenient;
+    }
+
     /// Simulate the free space the backing filesystem reports (`None` =
     /// unknown, the default).
     pub fn set_free_bytes(&self, free: Option<u64>) {
@@ -246,10 +303,7 @@ impl CrashableBacking {
                         state.durable.as_ref().map(|d| FileState {
                             durable: Some(d.clone()),
                             dirent_durable: true,
-                            volatile: Some(Volatile {
-                                base_durable: true,
-                                pending: Vec::new(),
-                            }),
+                            volatile: Some(Volatile::from_durable(d)),
                         })
                     }
                 }
@@ -284,12 +338,9 @@ impl CrashableBacking {
                             apply(&mut data, p);
                         }
                         Some(FileState {
+                            volatile: Some(Volatile::from_durable(&data)),
                             durable: Some(data),
                             dirent_durable: true,
-                            volatile: Some(Volatile {
-                                base_durable: true,
-                                pending: Vec::new(),
-                            }),
                         })
                     }
                 }
@@ -315,15 +366,13 @@ impl CrashableBacking {
             let state = inner.files.get(&name).unwrap().clone();
             let survives = state.dirent_durable && state.durable.is_some();
             if survives {
+                let durable = state.durable.clone().unwrap_or_default();
                 inner.files.insert(
                     name,
                     FileState {
-                        durable: state.durable.clone(),
+                        volatile: Some(Volatile::from_durable(&durable)),
+                        durable: Some(durable),
                         dirent_durable: true,
-                        volatile: Some(Volatile {
-                            base_durable: true,
-                            pending: Vec::new(),
-                        }),
                     },
                 );
             } else {
@@ -382,12 +431,9 @@ impl CrashableBacking {
             inner.files.insert(
                 path.to_string(),
                 FileState {
+                    volatile: Some(Volatile::from_durable(&data)),
                     durable: Some(data),
                     dirent_durable: true,
-                    volatile: Some(Volatile {
-                        base_durable: true,
-                        pending: Vec::new(),
-                    }),
                 },
             );
         }
@@ -405,15 +451,13 @@ impl CrashableBacking {
             let state = inner.files.get(&name).unwrap().clone();
             let survives = state.dirent_durable && state.durable.is_some();
             if survives {
+                let durable = state.durable.clone().unwrap_or_default();
                 inner.files.insert(
                     name,
                     FileState {
-                        durable: state.durable.clone(),
+                        volatile: Some(Volatile::from_durable(&durable)),
+                        durable: Some(durable),
                         dirent_durable: true,
-                        volatile: Some(Volatile {
-                            base_durable: true,
-                            pending: Vec::new(),
-                        }),
                     },
                 );
             } else {
@@ -445,9 +489,12 @@ impl CrashFile {
                 format!("{} (removed)", self.path),
             ));
         }
-        let r = f(&mut inner, &mut state)?;
+        // A failing operation can still have changed the file (a partial
+        // write persisted its prefix, a failed sync marked pages clean):
+        // keep the state whatever the outcome.
+        let r = f(&mut inner, &mut state);
         inner.files.insert(self.path.clone(), state);
-        Ok(r)
+        r
     }
 }
 
@@ -470,17 +517,28 @@ impl BackingFile for CrashFile {
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
         self.with_state(|inner, state| {
-            inner.check(&FaultOp::WriteAt {
+            let op = FaultOp::WriteAt {
                 path: &self.path,
                 offset,
                 len: data.len(),
-            })?;
-            state.volatile.as_mut().unwrap().pending.push(Pend::Write {
-                offset,
-                data: data.to_vec(),
-            });
-            inner.stats_pending_writes += 1;
-            Ok(())
+            };
+            inner.check(&op)?;
+            let partial = inner.partial_hook.as_ref().and_then(|hook| hook(&op));
+            let (written, outcome) = match partial {
+                Some((n, err)) => (&data[..n.min(data.len())], Err(err)),
+                None => (data, Ok(())),
+            };
+            if !written.is_empty() {
+                let pend = Pend::Write {
+                    offset,
+                    data: written.to_vec(),
+                };
+                let vol = state.volatile.as_mut().unwrap();
+                apply(&mut vol.image, &pend);
+                vol.pending.push(pend);
+                inner.stats_pending_writes += 1;
+            }
+            outcome
         })
     }
 
@@ -490,12 +548,9 @@ impl BackingFile for CrashFile {
                 path: &self.path,
                 len,
             })?;
-            state
-                .volatile
-                .as_mut()
-                .unwrap()
-                .pending
-                .push(Pend::SetLen(len));
+            let vol = state.volatile.as_mut().unwrap();
+            apply(&mut vol.image, &Pend::SetLen(len));
+            vol.pending.push(Pend::SetLen(len));
             Ok(())
         })
     }
@@ -506,8 +561,18 @@ impl BackingFile for CrashFile {
 
     fn sync_data(&self) -> io::Result<()> {
         self.with_state(|inner, state| {
-            inner.check(&FaultOp::SyncData { path: &self.path })?;
-            let data = inner.compose(state).unwrap();
+            if let Err(e) = inner.check(&FaultOp::SyncData { path: &self.path }) {
+                if !inner.lenient_sync_failures {
+                    // Writeback failed: the kernel marks the pages clean and
+                    // keeps their (unpersisted) content in the page cache. A
+                    // retry of fsync has nothing dirty to write and succeeds
+                    // without touching the disk.
+                    state.volatile.as_mut().unwrap().pending.clear();
+                }
+                return Err(e);
+            }
+            let vol = state.volatile.as_ref().unwrap();
+            let data = durable_after_sync(state, vol);
             state.durable = Some(data);
             let vol = state.volatile.as_mut().unwrap();
             vol.base_durable = true;
@@ -550,10 +615,7 @@ impl Backing for CrashableBacking {
                 FileState {
                     durable: prev.durable,
                     dirent_durable: false,
-                    volatile: Some(Volatile {
-                        base_durable: false,
-                        pending: Vec::new(),
-                    }),
+                    volatile: Some(Volatile::fresh()),
                 },
             );
         }
@@ -610,8 +672,9 @@ impl Backing for CrashableBacking {
                     base_durable: false,
                     pending: vec![Pend::Write {
                         offset: 0,
-                        data: content,
+                        data: content.clone(),
                     }],
+                    image: content,
                 }),
             },
         );
@@ -727,5 +790,96 @@ impl Backing for CrashableBacking {
             inner: self.inner.clone(),
             path: path.to_string(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eio() -> io::Error {
+        io::Error::other("injected EIO")
+    }
+
+    /// The Linux writeback-error model: a failed fsync leaves the bytes
+    /// visible but unpersisted, a retried fsync succeeds without writing
+    /// them, and only a rewrite makes them durable.
+    #[test]
+    fn failed_sync_marks_dirty_writes_clean_and_lost() {
+        let backing = CrashableBacking::new();
+        let file = backing.open("f", true).unwrap();
+        backing.sync_dir("").unwrap();
+        file.write_at(0, b"hello").unwrap();
+        let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = fail_next.clone();
+        backing.set_fault_hook(Some(Arc::new(move |op| match op {
+            FaultOp::SyncData { .. } if flag.swap(false, std::sync::atomic::Ordering::SeqCst) => {
+                Some(eio())
+            }
+            _ => None,
+        })));
+        assert!(file.sync_data().is_err());
+        let mut buf = [0u8; 5];
+        file.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello", "the page cache still shows the bytes");
+        file.sync_data().unwrap(); // nothing dirty: succeeds, writes nothing
+        backing.crash_all_lost();
+        let file = backing.open("f", false).unwrap();
+        assert_eq!(
+            file.len().unwrap(),
+            0,
+            "lost writeback must not survive a crash"
+        );
+
+        // Rewriting the same bytes dirties them again; the next sync persists them.
+        file.write_at(0, b"hello").unwrap();
+        file.sync_data().unwrap();
+        backing.crash_all_lost();
+        let file = backing.open("f", false).unwrap();
+        file.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn lenient_mode_keeps_failed_sync_writes_dirty() {
+        let backing = CrashableBacking::new();
+        backing.set_lenient_sync_failures(true);
+        let file = backing.open("f", true).unwrap();
+        backing.sync_dir("").unwrap();
+        file.write_at(0, b"hello").unwrap();
+        let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = once.clone();
+        backing.set_fault_hook(Some(Arc::new(move |op| match op {
+            FaultOp::SyncData { .. } if flag.swap(false, std::sync::atomic::Ordering::SeqCst) => {
+                Some(eio())
+            }
+            _ => None,
+        })));
+        assert!(file.sync_data().is_err());
+        file.sync_data().unwrap();
+        backing.crash_all_lost();
+        assert_eq!(backing.open("f", false).unwrap().len().unwrap(), 5);
+    }
+
+    /// A partial write persists its prefix (the file grows past the
+    /// caller's logical end) and reports the error.
+    #[test]
+    fn partial_write_hook_persists_a_prefix_and_fails() {
+        let backing = CrashableBacking::new();
+        let file = backing.open("f", true).unwrap();
+        backing.sync_dir("").unwrap();
+        backing.set_partial_write_hook(Some(Arc::new(|op| match op {
+            FaultOp::WriteAt { len, .. } if *len == 8 => Some((3, eio())),
+            _ => None,
+        })));
+        assert!(file.write_at(0, b"abcdefgh").is_err());
+        assert_eq!(file.len().unwrap(), 3);
+        file.write_at(0, b"xy").unwrap();
+        let mut buf = [0u8; 3];
+        file.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"xyc", "the torn prefix outlives a shorter overwrite");
+        file.sync_data().unwrap();
+        backing.crash_all_lost();
+        assert_eq!(backing.open("f", false).unwrap().len().unwrap(), 3);
     }
 }

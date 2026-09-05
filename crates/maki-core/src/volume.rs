@@ -122,6 +122,17 @@ impl Volume {
         self.journal.pending_bytes()
     }
 
+    /// A journal sync failed and its bytes have not been rewritten and
+    /// synced since: no barrier can succeed until they are (F01).
+    pub fn journal_writeback_uncertain(&self) -> bool {
+        self.journal.writeback_uncertain()
+    }
+
+    /// Journal segment syncs that failed since attach.
+    pub fn journal_sync_failures(&self) -> u64 {
+        self.journal.sync_failures()
+    }
+
     /// Bytes of journal on disk (all segments).
     pub fn journal_total_bytes(&self) -> u64 {
         self.journal.total_bytes()

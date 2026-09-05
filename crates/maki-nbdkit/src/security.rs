@@ -8,7 +8,7 @@
 //! | `madv_dontdump` | Honoured through `disable_core_dump` (a non-dumpable process writes no core); validation refuses it without that flag |
 //! | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; failure refuses attach |
 //! | `memory_lock_mode = "secure-buffers"` | Every `SecretBuffer` is `mlock`ed for its lifetime (best effort, failures counted) |
-//! | `require_secure_swap_policy` | `/proc/swaps` must be empty or list only zram / dm-crypt devices; otherwise attach is refused |
+//! | `require_secure_swap_policy` | `/proc/swaps` must be readable and list only RAM-only zram devices (`/dev/zramN` with no `backing_dev`) or dm-crypt devices (a zram whose writeback target is dm-crypt counts); anything else, an unreadable file, or an unparseable one refuses attach |
 //! | `cache.lock_memory` | Cache plaintext lives in `SecretBuffer`s, so it follows `memory_lock_mode` (validation refuses it with `off`) |
 //!
 //! On non-Linux hosts nothing is enforced; the posture says so and a
@@ -62,16 +62,90 @@ pub fn posture_json() -> Value {
     }
 }
 
-/// Swap entries from `/proc/swaps` that are neither zram nor proven
-/// encrypted by `is_encrypted`.
-pub fn unsafe_swaps(proc_swaps: &str, is_encrypted: impl Fn(&str) -> bool) -> Vec<String> {
-    proc_swaps
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| !name.contains("zram") && !is_encrypted(name))
-        .map(|s| s.to_string())
-        .collect()
+/// How one swap device was classified for the secure-swap policy (F05:
+/// the classification is by device identity, never by its name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapSafety {
+    /// A zram device with no writeback backing device: RAM only.
+    RamOnly,
+    /// A dm-crypt mapping, or a zram whose writeback target is one.
+    Encrypted,
+    /// Everything else, including devices that could not be classified.
+    Unsafe,
+}
+
+/// One line of `/proc/swaps`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapEntry {
+    pub name: String,
+    pub kind: String,
+}
+
+/// Parse `/proc/swaps`. The file always starts with a `Filename` header
+/// line, even with no swap; anything else is not the file's format and is
+/// an error, never "no swap" (a read failure must not pass the policy).
+pub fn parse_proc_swaps(text: &str) -> Result<Vec<SwapEntry>, String> {
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(header) if header.trim_start().starts_with("Filename") => {}
+        other => {
+            return Err(format!(
+                "/proc/swaps does not start with the Filename header (got {:?})",
+                other.unwrap_or("")
+            ))
+        }
+    }
+    let mut entries = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(kind)) = (fields.next(), fields.next()) else {
+            return Err(format!("unparseable /proc/swaps line {line:?}"));
+        };
+        entries.push(SwapEntry {
+            name: name.to_string(),
+            kind: kind.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Swap entries `classify` does not prove RAM-only or encrypted. An
+/// unparseable file is an error.
+pub fn unsafe_swaps(
+    proc_swaps: &str,
+    classify: impl Fn(&str) -> SwapSafety,
+) -> Result<Vec<String>, String> {
+    Ok(parse_proc_swaps(proc_swaps)?
+        .into_iter()
+        .filter(|entry| classify(&entry.name) == SwapSafety::Unsafe)
+        .map(|entry| entry.name)
+        .collect())
+}
+
+/// The index of a `/dev/zramN` device — exactly that path, so a swap file
+/// or partition merely *named* like zram never matches.
+pub fn zram_index(device: &str) -> Option<u32> {
+    let rest = device.strip_prefix("/dev/zram")?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// The writeback target a zram device would page to, from its
+/// `/sys/block/zramN/backing_dev` attribute. `None` means RAM only: the
+/// attribute says `none`, or the kernel has no zram writeback support and
+/// the attribute is absent.
+pub fn zram_writeback_target(backing_dev: Option<&str>) -> Option<String> {
+    let value = backing_dev?.trim();
+    if value.is_empty() || value == "none" {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -101,6 +175,30 @@ mod linux {
         dm_uuid_for(device)
             .map(|uuid| uuid.trim().starts_with("CRYPT-"))
             .unwrap_or(false)
+    }
+
+    /// Classify by what the device *is*: a zram device is RAM-only only
+    /// while it has no writeback target (Linux can page zram out to a
+    /// `backing_dev`); a dm-crypt mapping is encrypted; nothing is judged
+    /// by its name.
+    pub(super) fn classify_swap(device: &str) -> SwapSafety {
+        if let Some(n) = zram_index(device) {
+            let sysfs = format!("/sys/block/zram{n}");
+            if !std::path::Path::new(&sysfs).is_dir() {
+                return SwapSafety::Unsafe;
+            }
+            let attr = std::fs::read_to_string(format!("{sysfs}/backing_dev")).ok();
+            return match zram_writeback_target(attr.as_deref()) {
+                None => SwapSafety::RamOnly,
+                Some(target) if is_encrypted_swap(&target) => SwapSafety::Encrypted,
+                Some(_) => SwapSafety::Unsafe,
+            };
+        }
+        if is_encrypted_swap(device) {
+            SwapSafety::Encrypted
+        } else {
+            SwapSafety::Unsafe
+        }
     }
 
     pub fn apply(config: &VolumeConfig) -> Result<SecurityPosture, DaemonError> {
@@ -158,19 +256,36 @@ mod linux {
         }
 
         let swap_policy = if security.require_secure_swap_policy {
-            let text = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
-            let unsafe_entries = unsafe_swaps(&text, is_encrypted_swap);
+            // A check that cannot run has not passed: an unreadable or
+            // garbled /proc/swaps refuses attach instead of reading as
+            // "no swap" (F05).
+            let text = std::fs::read_to_string("/proc/swaps").map_err(|e| {
+                DaemonError::Unsupported(format!(
+                    "security.require_secure_swap_policy: cannot read /proc/swaps ({e}); \
+                     the swap layout is unknown, refusing to assume it is safe"
+                ))
+            })?;
+            let entries = parse_proc_swaps(&text).map_err(|e| {
+                DaemonError::Unsupported(format!(
+                    "security.require_secure_swap_policy: {e}; refusing to assume it is safe"
+                ))
+            })?;
+            let unsafe_entries: Vec<String> = entries
+                .iter()
+                .filter(|entry| classify_swap(&entry.name) == SwapSafety::Unsafe)
+                .map(|entry| entry.name.clone())
+                .collect();
             if !unsafe_entries.is_empty() {
                 return Err(DaemonError::Unsupported(format!(
-                    "security.require_secure_swap_policy: swap {:?} is neither zram nor \
-                     dm-crypt; disable it or encrypt it (SPEC 37)",
+                    "security.require_secure_swap_policy: swap {:?} is neither RAM-only zram \
+                     nor dm-crypt; disable it or encrypt it (SPEC 37)",
                     unsafe_entries
                 )));
             }
-            if text.lines().count() <= 1 {
+            if entries.is_empty() {
                 "enforced: no swap".to_string()
             } else {
-                "enforced: zram or encrypted swap only".to_string()
+                "enforced: RAM-only zram or encrypted swap only".to_string()
             }
         } else {
             "not required".to_string()
@@ -224,9 +339,21 @@ mod tests {
 /dev/dm-3                               partition\t4194300\t0\t-2
 /swapfile                               file\t\t1048572\t0\t-3
 ";
-        let flagged = unsafe_swaps(swaps, |name| name == "/dev/dm-3");
+        let classify = |name: &str| match name {
+            "/dev/dm-3" => SwapSafety::Encrypted,
+            "/dev/zram0" => SwapSafety::RamOnly,
+            _ => SwapSafety::Unsafe,
+        };
+        let flagged = unsafe_swaps(swaps, classify).unwrap();
         assert_eq!(flagged, vec!["/swapfile".to_string()]);
-        assert!(unsafe_swaps("Filename Type Size Used Priority\n", |_| false).is_empty());
-        assert!(unsafe_swaps("", |_| false).is_empty());
+        assert!(
+            unsafe_swaps("Filename Type Size Used Priority\n", |_| SwapSafety::Unsafe)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            unsafe_swaps("", |_| SwapSafety::Unsafe).is_err(),
+            "an empty file is not the /proc/swaps format"
+        );
     }
 }

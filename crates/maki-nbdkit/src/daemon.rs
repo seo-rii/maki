@@ -570,6 +570,7 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
         limits: EngineLimits {
             max_active_callbacks: config.limits.max_active_callbacks,
             max_plaintext_bytes: config.limits.max_plaintext_bytes.0,
+            max_request_bytes: config.nbd.maximum_io.0,
         },
         cache: match config.cache.mode {
             maki_format::config::CacheMode::Off => None,

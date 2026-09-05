@@ -59,6 +59,10 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - A process restart is not a power loss: recovery reads back page-cache bytes that were never fdatasync'd. Everything recovery accepts must be fsync'd before the writer resumes, or a later FLUSH acknowledges data the next power loss removes (K-01). `CrashableBacking` models this: `drop` + `recover` is a restart, only `crash*` drops pending writes.
 - An A/B side that passes its CRC but does not decode as the record type is *invalid*, not "newest": choose the side to overwrite from the typed view (O-10).
 - Anything an HTTP endpoint can steer must not re-send plaintext: redirects are refused, never followed (C-01).
+- A failed `fdatasync` is never retried by calling it again: Linux marks the dirty pages clean and the retry "succeeds" without writing them. The journal keeps its own copy of unsynced records and rewrites them before the next sync; recovery rewrites the unproven tail of the final segment before syncing it (F01). `CrashableBacking` models this by default (a failed sync loses its dirty writes).
+- `write_at` can persist a prefix and then fail: the file is then longer than the writer's logical end, and sealing it makes that tail "corruption". Truncate back to the logical end before appending or sealing; the debug sanitizer checks the file length (F03).
+- `mlock`/`munlock` work on whole pages with no reference count: locked secrets must live in page-isolated allocations, never in shared heap pages (F04).
+- Per-crate builds on Windows cover the cross-platform code; the Linux-only suites (`review_abi.rs`, `review_secret.rs` smaps check, the control backlog test, the backing symlink test) need WSL, where `nbdkit-plugin-dev` is installed for the ABI probe.
 
 ## External qualification
 

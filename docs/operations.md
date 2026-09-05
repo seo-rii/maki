@@ -240,9 +240,10 @@ entries immediately; setting it to zero disables caching.
 
 Monitor request and byte admission, endpoint inflight work, crypto latency and
 retries, retry-budget tokens, circuit state, failover count, journal size and
-durable sequence, checkpoint lag, FLUSH/FUA latency, cache hits and misses,
-backing free space, and volume state. Do not add unit indexes, LBAs, request IDs,
-or other high-cardinality values as metric labels.
+durable sequence, journal sync failures (`maki_journal_sync_failures_total`,
+`maki_journal_writeback_uncertain`), checkpoint lag, FLUSH/FUA latency, cache
+hits and misses, backing free space, and volume state. Do not add unit indexes,
+LBAs, request IDs, or other high-cardinality values as metric labels.
 
 ## Failure handling
 
@@ -251,6 +252,33 @@ or other high-cardinality values as metric labels.
 - Corrupt metadata, sequence gaps, missing journal segments, and journal
   corruption before the durable mark fail loudly.
 - A torn final journal tail after the durable mark is truncated during recovery.
+- A failed journal `fdatasync` fails the FLUSH or FUA that needed it, and
+  every later barrier keeps failing until the journal has *rewritten* the
+  unsynced records from its own copy and synced them (a bare retry of
+  `fdatasync` succeeds on Linux without writing anything). `maki status`
+  shows `journal_writeback_uncertain: true` and counts
+  `journal_sync_failures_total` while this lasts; reads keep working. After a
+  restart, recovery rewrites everything beyond the durable mark before it
+  syncs, so page-cache bytes a failed writeback left behind are never
+  acknowledged unwritten.
+- A journal write that fails part-way leaves no torn bytes behind: the
+  segment is truncated back to its last record before anything is appended
+  or the segment is sealed; while that truncation itself fails, writes and
+  barriers fail.
+- The NBD plugin splits requests larger than `nbd.maximum_io` into pieces of
+  at most that size (the kernel is not told the limit); the engine refuses a
+  larger request outright, so the value bounds the memory one request pins.
+- The control socket serves at most 64 sessions at once (further clients wait
+  in the listen backlog), closes a session idle for 60 s or a client that does
+  not drain a response within 10 s, and runs one `checkpoint` or `reload` at a
+  time: a concurrent one is answered `busy` and must be retried.
+- `maki-attach detach` re-reads the attach record under the attach lock and
+  refuses a plan the record no longer backs (`stale plan: ...`): the volume
+  was detached or re-attached since the plan was made. Re-run the detach.
+- `maki-attach attach` verifies, before the sentinel is written or the probe
+  runs, that the mounted filesystem is stored only on the NBD device it
+  connected (device-mapper stacks are walked through sysfs); a filesystem on
+  any other device, or a volume group spanning other devices, is refused.
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.

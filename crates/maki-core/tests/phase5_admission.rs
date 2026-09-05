@@ -73,6 +73,7 @@ async fn saturation_respects_callback_limit_and_flush_fua_complete() {
         EngineLimits {
             max_active_callbacks: 2,
             max_plaintext_bytes: 1 << 20,
+            max_request_bytes: 1 << 20,
         },
     )
     .await;
@@ -137,6 +138,7 @@ async fn byte_admission_bounds_inflight_plaintext() {
         EngineLimits {
             max_active_callbacks: 64,
             max_plaintext_bytes: UNIT as u64, // one unit at a time
+            max_request_bytes: 1 << 20,
         },
     )
     .await;

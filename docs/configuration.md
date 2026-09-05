@@ -62,8 +62,11 @@ schema, geometry, and secret-literal checks it rejects:
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
   `secure-buffers | all | off`;
 - NBD I/O sizes that are not powers of two or not ordered
-  `device_block_size <= minimum_io <= preferred_io <= maximum_io`, or an
-  `nbd.device_block_size` that differs from the volume's;
+  `device_block_size <= minimum_io <= preferred_io <= maximum_io`, an
+  `nbd.device_block_size` that differs from the volume's, or a
+  `limits.max_plaintext_bytes` smaller than `nbd.maximum_io` plus one crypto
+  unit (the admission budget must hold one maximal request; a request is
+  charged every unit it touches, in full);
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at
@@ -197,10 +200,10 @@ attached, fails closed on Linux, and is reported under `security` in
 |---|---|
 | `disable_core_dump` (default true) | `prctl(PR_SET_DUMPABLE, 0)` and `RLIMIT_CORE = 0`, verified after the call |
 | `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
-| `memory_lock_mode = "secure-buffers"` (default) | Every secret buffer (plaintext, keys, cache entries) is `mlock`ed for its lifetime; failures are counted and reported |
+| `memory_lock_mode = "secure-buffers"` (default) | Every secret buffer (plaintext, keys, cache entries) lives in its own page-aligned allocation that is `mlock`ed for its lifetime, so dropping one buffer never unlocks another's page; failures are counted and reported |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
 | `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
-| `require_secure_swap_policy` (default false) | When true, attach is refused unless `/proc/swaps` is empty or lists only zram or dm-crypt devices. Set it in production (the shipped example does) |
+| `require_secure_swap_policy` (default false) | When true, attach is refused unless `/proc/swaps` is readable, parseable, and lists only RAM-only zram devices (`/dev/zramN` whose `backing_dev` is `none`, or a dm-crypt one) or dm-crypt devices. Classification is by device identity, never by name: a swap file called `zram-backup` is a swap file. Set it in production (the shipped example does) |
 
 On non-Linux hosts nothing is enforced; the status document reports
 `platform = "unsupported-platform"` and a warning is logged.

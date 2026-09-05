@@ -1302,8 +1302,8 @@ Allowed:
 
 ```text
 swap disabled
-zram
-independently encrypted swap
+zram (RAM-only: no writeback backing device, or a dm-crypt backing device)
+independently encrypted swap (dm-crypt)
 ```
 
 Forbidden:
@@ -1311,7 +1311,13 @@ Forbidden:
 ```text
 swapfile on a Maki volume
 using the Maki /dev/nbdN device as swap
+zram configured to write back to an unencrypted device
+any swap device that cannot be classified (the check fails closed)
 ```
+
+The daemon decides by what a swap device *is* (`/dev/zramN` and its
+`backing_dev`, the device-mapper UUID), never by its name, and refuses to
+attach when `/proc/swaps` cannot be read or parsed.
 
 ---
 

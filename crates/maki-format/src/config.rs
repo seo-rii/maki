@@ -1296,6 +1296,21 @@ impl VolumeConfig {
                 "nbd I/O sizes must satisfy device_block_size <= minimum_io <= preferred_io <= maximum_io",
             ));
         }
+        // The engine charges a request every crypto unit it touches; a
+        // maximal request (unaligned to units) touches maximum_io plus one
+        // unit. The budget must admit it whole, or the semaphore would have
+        // to cap the charge and the limit would stop being a bound (F07).
+        let maximal_request = n
+            .maximum_io
+            .0
+            .saturating_add(self.volume.crypto_unit_size as u64);
+        if self.limits.max_plaintext_bytes.0 < maximal_request {
+            return Err(invalid(format!(
+                "limits.max_plaintext_bytes {} must be at least nbd.maximum_io {} plus one \
+                 crypto unit ({}): the admission budget must hold one maximal request",
+                self.limits.max_plaintext_bytes.0, n.maximum_io.0, self.volume.crypto_unit_size
+            )));
+        }
 
         if let Some(socket) = &self.control.socket {
             if socket.trim().is_empty() {

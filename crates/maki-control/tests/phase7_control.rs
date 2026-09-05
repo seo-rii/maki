@@ -47,7 +47,14 @@ impl ControlBackend for FakeBackend {
 
 async fn roundtrip(backend: Arc<FakeBackend>, request: Request) -> Value {
     let (client, server) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(async move { serve_connection(server, backend).await });
+    let server_task = tokio::spawn(async move {
+        serve_connection(
+            server,
+            backend,
+            maki_control::server::ControlLimits::default(),
+        )
+        .await
+    });
     let (mut rd, mut wr) = tokio::io::split(client);
     send_command(&mut wr, &request).await.unwrap();
     let response = read_response(&mut rd).await.unwrap();
@@ -104,7 +111,14 @@ async fn privileged_verbs_are_rejected() {
 async fn malformed_requests_are_rejected_cleanly() {
     let backend = Arc::new(FakeBackend::default());
     let (client, server) = tokio::io::duplex(4096);
-    let task = tokio::spawn(async move { serve_connection(server, backend).await });
+    let task = tokio::spawn(async move {
+        serve_connection(
+            server,
+            backend,
+            maki_control::server::ControlLimits::default(),
+        )
+        .await
+    });
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut rd, mut wr) = tokio::io::split(client);
     wr.write_all(b"this is not json\n").await.unwrap();
@@ -131,7 +145,14 @@ async fn malformed_requests_are_rejected_cleanly() {
 async fn oversized_request_line_is_refused() {
     let backend = Arc::new(FakeBackend::default());
     let (client, server) = tokio::io::duplex(1 << 20);
-    let task = tokio::spawn(async move { serve_connection(server, backend).await });
+    let task = tokio::spawn(async move {
+        serve_connection(
+            server,
+            backend,
+            maki_control::server::ControlLimits::default(),
+        )
+        .await
+    });
     use tokio::io::AsyncWriteExt;
     let (rd, mut wr) = tokio::io::split(client);
     let huge = vec![b'x'; 512 * 1024];

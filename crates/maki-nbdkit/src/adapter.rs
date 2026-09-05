@@ -5,6 +5,12 @@
 //! - Capability surface per SPEC §48: FLUSH + FUA supported; trim, write-
 //!   zeroes, and multi-connection disabled (nbdkit emulates zeroes via
 //!   pwrite).
+//! - `nbd.maximum_io` is enforced here, not only advertised: the plugin's
+//!   struct prefix cannot publish `.block_size`, so the kernel may send
+//!   requests up to its own limit; such a request is split into pieces of
+//!   at most the maximum before it reaches the engine, which refuses
+//!   anything larger outright (third review, F07). FUA applies to the last
+//!   piece, whose sync covers every earlier piece's records (SPEC §24).
 //! - `open_config` also binds and serves the per-volume control socket
 //!   (SPEC §7, review M-005) on the adapter's runtime; a socket that cannot
 //!   be bound fails attach. `shutdown` is the clean-detach path: FLUSH
@@ -73,7 +79,11 @@ pub struct NbdAdapter {
 impl NbdAdapter {
     pub fn from_engine(engine: Engine, runtime: tokio::runtime::Runtime) -> Self {
         let g = engine.geometry();
-        let block_sizes = (g.device_block_size, g.crypto_unit_size, 1 << 20);
+        let block_sizes = (
+            g.device_block_size,
+            g.crypto_unit_size,
+            engine.max_request_bytes().min(u32::MAX as u64) as u32,
+        );
         Self {
             runtime,
             state: parking_lot::RwLock::new(Some(Arc::new(AdapterState {
@@ -103,10 +113,13 @@ impl NbdAdapter {
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
         #[cfg(not(unix))]
         let _ = &crypto_stats; // only the Unix control socket reports them
+
+        // The engine's request bound is `nbd.maximum_io` (see
+        // `daemon::engine_options`); advertise and split at the same value.
         let block_sizes = (
             config.nbd.minimum_io,
             config.nbd.preferred_io,
-            config.nbd.maximum_io.0.min(u32::MAX as u64) as u32,
+            engine.max_request_bytes().min(u32::MAX as u64) as u32,
         );
 
         #[cfg(unix)]
@@ -214,21 +227,51 @@ impl NbdAdapter {
         true
     }
 
+    /// Largest piece handed to the engine at once (`nbd.maximum_io`).
+    fn max_io(&self) -> usize {
+        self.block_sizes().2.max(1) as usize
+    }
+
+    /// Split `[0, len)` into pieces of at most `max_io`. An empty request
+    /// yields one empty piece so the engine reports it as invalid.
+    fn pieces(&self, len: usize) -> Vec<(usize, usize)> {
+        let max = self.max_io();
+        if len == 0 {
+            return vec![(0, 0)];
+        }
+        (0..len)
+            .step_by(max)
+            .map(|start| (start, (len - start).min(max)))
+            .collect()
+    }
+
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<(), AdapterError> {
-        let len = buf.len();
-        // Plaintext stays in zeroizing buffers until it is copied into the
-        // caller's (nbdkit's) buffer (SPEC §36).
-        let data =
-            self.run(move |engine| Box::pin(async move { engine.read_secret(offset, len).await }))?;
-        buf.copy_from_slice(data.expose());
+        for (start, len) in self.pieces(buf.len()) {
+            let piece_offset = offset + start as u64;
+            // Plaintext stays in zeroizing buffers until it is copied into
+            // the caller's (nbdkit's) buffer (SPEC §36).
+            let data = self.run(move |engine| {
+                Box::pin(async move { engine.read_secret(piece_offset, len).await })
+            })?;
+            buf[start..start + len].copy_from_slice(data.expose());
+        }
         Ok(())
     }
 
     pub fn pwrite(&self, data: &[u8], offset: u64, fua: bool) -> Result<(), AdapterError> {
-        let owned = SecretBuffer::from_slice(data);
-        self.run(move |engine| {
-            Box::pin(async move { engine.write(offset, owned.expose(), fua).await })
-        })
+        let pieces = self.pieces(data.len());
+        let last = pieces.len() - 1;
+        for (i, (start, len)) in pieces.into_iter().enumerate() {
+            // Copy one piece at a time: the request's plaintext is never
+            // duplicated in full before admission.
+            let owned = SecretBuffer::from_slice(&data[start..start + len]);
+            let piece_offset = offset + start as u64;
+            let fua = fua && i == last;
+            self.run(move |engine| {
+                Box::pin(async move { engine.write(piece_offset, owned.expose(), fua).await })
+            })?;
+        }
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), AdapterError> {

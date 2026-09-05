@@ -42,6 +42,18 @@ final state passes strict Clippy, the full debug workspace suite (every
 Unix-only suite included), and all seven `phase*_gate_full` release gates
 under WSL Ubuntu, and strict Clippy plus the per-crate suites on Windows.
 
+A third external review (2026-09-05) examined the boundaries where the code's
+guarantees meet the operating system's partial failures, real device identity,
+and memory ownership (see
+[Third review](#third-review-2026-09-05-os-partial-failure-device-identity-memory-ownership)):
+ten findings F01 to F10 plus two smaller items, every one confirmed against
+HEAD and reproduced by a failing test before its fix. The two durability
+findings changed what the journal does after an I/O error: a failed
+`fdatasync` is answered by rewriting the unsynced records from the writer's
+own copy before the next sync, never by a bare retry (F01), and a partial
+`write_at` is truncated back to the logical end before anything is appended
+or sealed (F03). `CrashableBacking` now models both failure modes by default.
+
 What still needs an environment this repository cannot provide:
 
 - Real NBD/LVM/XFS attach, mount-identity verification, rollback, and device
@@ -186,22 +198,70 @@ K (core), C (crypto), O (operations).
 
 Not fixed, documented as limits:
 
-- **O-03: `nbd.maximum_io` is neither advertised nor enforced.** The plugin
-  publishes only the nbdkit v2 callback prefix, so clients never learn the
-  configured maximum and the kernel sends up to its own `max_sectors_kb`
-  (32 MiB, 64 MiB for libnbd). `validate_journal_bounds` sizes the journal
-  headroom from `maximum_io`, so a minimal configuration can leave a very
-  large request unable to fit after an inline reclaim and it fails with
-  ENOSPC (EIO to the filesystem). The fix is advertising `.block_size`
-  through the nbdkit ≥ 1.30 plugin struct, which this environment cannot
-  compile or test; until then size `backing.journal_max_bytes` for the
-  largest request the client can issue, not for `nbd.maximum_io`.
+- **O-03: `nbd.maximum_io` is not advertised.** The plugin publishes only
+  the nbdkit v2 callback prefix, so clients never learn the configured
+  maximum and the kernel sends up to its own `max_sectors_kb` (32 MiB,
+  64 MiB for libnbd). Since the third review (F07) the value *is* enforced:
+  the adapter splits a larger request into pieces of at most `maximum_io`
+  and the engine refuses anything larger, so `validate_journal_bounds` and
+  the admission budget are sized correctly again. Advertising `.block_size`
+  through the nbdkit ≥ 1.30 plugin struct remains open (the ABI test now
+  makes such an extension checkable against the installed header).
 - The scheduler's operation deadline starts when a batch is dispatched, not
   when the request is queued (C-04 note).
 - The checkpoint worker can hold the volume lock for the duration of one
   checkpoint after the last engine handle is dropped (K-10).
 - The accept-error test creates descriptor pressure in-process and is
   therefore best effort.
+
+## Third review (2026-09-05): OS partial failure, device identity, memory ownership
+
+The third external review (Korean, 2026-09-05) examined the source archive
+of HEAD and rated the structure and test base sound while identifying where
+the guarantees break at the operating-system boundary: partial I/O failures,
+real device identity, and memory ownership. It listed one P0 candidate,
+six P1 and three P2 findings (F01 to F10), and two smaller hardening items.
+Every finding was confirmed against the tree (the review's line numbers
+matched), reproduced by a failing test, and fixed in the same change; the
+review's own verification limits (no Rust build, no NBD mount, no memory
+dump) were closed by running the new tests, including the Linux-only ones
+under WSL.
+
+### Durability (P0 candidate and P1)
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| F01 | **A failed `fdatasync` was retried by calling it again.** Linux marks the dirty pages clean when writeback fails, so the retry succeeded without writing anything: the second FLUSH (or a later FUA) acknowledged records that never reached the disk, and recovery after a restart did the same for page-cache bytes (K-01 only synced them). | The writer keeps its own copy of every unsynced record and, once a sync has failed, rewrites that copy before it syncs again; a barrier succeeds only after the rewrite persisted. Recovery rewrites everything beyond the durable mark of the final segment before it syncs. `status`/`metrics` expose `journal_sync_failures_total` and `journal_writeback_uncertain`. `CrashableBacking` models the Linux behaviour by default (a failed sync loses its dirty writes; `set_lenient_sync_failures(true)` restores the old model). | `review_writeback.rs` (maki-core): `flush_after_a_failed_sync_rewrites_lost_records_before_acknowledging`, `fua_after_a_failed_sync_covers_every_pending_record`, `seal_after_a_failed_sync_rewrites_before_opening_a_successor`, `barriers_keep_failing_until_the_rewrite_persists`, `recovery_rewrites_page_cache_bytes_it_accepts_after_a_failed_writeback`; `failed_sync_marks_dirty_writes_clean_and_lost` (maki-test-support) |
+| F03 | **A partial `write_at` left a torn tail the next seal carried as corruption.** `write_all_at` can persist a prefix and then fail; the logical offset did not move, a shorter retry record did not cover the torn bytes, and the roll sealed the file at its physical length. Recovery treats a non-final segment as durable in full and refused the volume. | The writer marks the tail dirty on any append failure and truncates the file back to the logical end before the next append or seal; while that truncation fails, appends, rolls and barriers fail too. The debug sanitizer asserts the file length equals the logical end. `CrashableBacking` gained a partial-write hook. | `partial_append_failure_leaves_no_garbage_for_the_next_seal`, `crash_right_after_a_partial_append_is_a_torn_tail`, `appends_are_refused_while_the_torn_tail_cannot_be_normalized` (maki-core); `partial_write_hook_persists_a_prefix_and_fails` (maki-test-support) |
+
+### Security and operations (P1)
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| F02 | **The mount was verified by filesystem type, UUID, sentinel and probe, never by which block device it was on.** With `init_sentinel` the helper wrote the expected sentinel onto whatever XFS it had mounted (a local LV of the right name) and then verified its own sentinel: application data could land outside Maki in plaintext. | A new `verify-mount-device` step runs right after `mount`, before the sentinel or the probe touch the filesystem: the mount's `major:minor` is walked through the sysfs `slaves` relation (device-mapper, MD) down to the leaf devices, and every leaf must be the NBD device this attach connected (partitions fold into their device). Mixed volume groups and unresolvable topologies are refused. `verify_mount_identity` repeats the check. | `a_filesystem_not_stored_only_on_the_bound_nbd_device_is_refused_before_it_is_touched`, `leaf_devices_are_resolved_through_the_device_mapper_stack`, `mountinfo_parsing_exposes_the_device_number`, updated `init_sentinel_adds_a_write_step_before_verification` and `verifier_rejects_wrong_device_and_missing_sentinel` (maki-privileged). A real LVM-over-NBD run still needs the privileged Linux target. |
+| F04 | **Locked secret buffers shared heap pages.** `mlock`/`munlock` work on whole pages with no reference count: dropping one `SecretBuffer` unlocked the page of a live neighbour, which still reported itself locked. | With locking on, every buffer lives in its own page-aligned, page-multiple allocation; it is wiped in place while still locked, then unlocked, then freed. `from_vec` copies into the isolated pages and wipes the source. | `locked_buffers_are_page_isolated` (unit), `dropping_a_buffer_never_unlocks_a_live_neighbours_pages` (`review_secret.rs`, Linux: every survivor's address must still sit in a `VmFlags: lo` VMA in `/proc/self/smaps`), existing `dropping_locked_buffers_releases_their_pages` |
+| F05 | **The secure-swap check passed unsafe layouts.** Any path containing `zram` counted as safe (`/var/swap/zram-backup`), an unreadable `/proc/swaps` read as "no swap", and a real zram device with a writeback `backing_dev` was assumed RAM-only. | Classification is by device identity: `/dev/zramN` exactly, with `/sys/block/zramN/backing_dev` equal to `none` (or absent) for RAM-only, a dm-crypt backing for encrypted, anything else unsafe; dm-crypt by device-mapper UUID as before. `/proc/swaps` must be readable and start with its header line or attach is refused. SPEC §37 and the configuration reference say so. | `swap_classification_never_trusts_a_name`, `zram_writeback_target_is_read_from_sysfs_not_assumed`, `unparseable_proc_swaps_is_an_error_not_no_swap`, updated `swap_parser_is_strict` (maki-nbdkit) |
+| F06 | **A detach decided its device outside the attach lock.** `plan_detach` read the bound-device record before `execute` locked; a detach, re-attach (to another device) and another volume's attach in between left a stale plan that unmounted the current mount and disconnected the other volume's device. The record was also written before `nbd-client` ran and was not removed when a failed attach rolled back. | The executor re-reads the record under the lock and reconciles the plan: a placeholder binds to the current record (refused without one), a device the planner took from the record must still be the recorded one (`stale plan` otherwise), an operator-named device is left alone. The record is written only after `nbd-client` succeeded and removed when the rollback disconnects. | `a_detach_plan_is_reconciled_with_the_attach_record_under_the_lock` (maki-privileged); the process interleaving itself needs the privileged Linux target |
+| F07 | **`nbd.maximum_io` and the plaintext budget were not hard limits.** The byte semaphore capped an oversized request to the whole budget instead of bounding it, admission charged the request length while a partial write holds whole units, and the adapter copied the entire NBD request before admission. | The engine refuses any request above `max_request_bytes` (= `nbd.maximum_io`); the adapter splits kernel requests into pieces of at most that size (FUA on the last piece, whose sync covers all), copying one piece at a time; admission charges every touched crypto unit in full (`Engine::admission_cost`); validation requires `limits.max_plaintext_bytes >= nbd.maximum_io + crypto_unit_size`. | `requests_above_the_configured_maximum_are_refused`, `admission_charges_every_touched_unit_in_full` (maki-core `review_limits.rs`); `nbd_requests_above_the_maximum_are_split_and_the_engine_refuses_them` (maki-nbdkit `review_limits.rs`); a new case in `zero_and_inverted_bounds_are_rejected` (maki-format) |
+
+### Hygiene (P2 and additional items)
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| F08 | `can_fua` returned 1, which is `NBDKIT_FUA_EMULATE` (nbdkit-common.h: NONE 0, EMULATE 1, NATIVE 2), so nbdkit emulated FUA with a full flush after every FUA write and the engine's native FUA path was never exercised in production. | `can_fua` returns `NBDKIT_FUA_NATIVE`; every `NBDKIT_*` constant is named once. `review_abi.rs` compiles a C probe against the installed `nbdkit-plugin.h` (API version 2) and compares every field offset of the mirrored struct and every constant; CI's nightly job installs `nbdkit-plugin-dev` and runs it; WSL has the header installed. | `fua_is_advertised_as_native_not_emulated`, `declared_prefix_ends_after_the_v2_rpc_callbacks` (unit), `shim_constants_and_layout_match_the_installed_header` (Linux, header 1.46.2) |
+| F09 | The HTTP provider copied plaintext into plain vectors, JSON documents and request bodies that were never wiped, and parsed decrypt responses through plain buffers. | Every copy this crate makes is `Zeroizing`: payload copies, the serialized body (handed to reqwest through `Bytes::from_owner`, wiped when the body is released), the response body, decoded payloads; JSON documents are wiped in place after serialization or extraction. Copies inside reqwest, hyper, rustls and the kernel remain outside the crate's reach and are covered by the no-swap and no-core-dump posture, as documented. The WebSocket provider already sends slices; the gRPC provider's prost message copy remains a documented residual. | build (type changes) plus the existing provider conformance and chaos suites |
+| F10 | Control sessions were unbounded: one task per connection, no idle or write deadline, and administrative verbs queued behind each other. | At most 64 sessions are served at once (the slot is taken before `accept`, so excess clients wait in the backlog); a session idle for 60 s or a client that does not drain a response within 10 s is closed; `checkpoint` and `reload` run one at a time and a concurrent one is answered `busy`. | `review_limits.rs` (maki-control): `idle_session_is_closed_after_the_idle_timeout`, `an_active_session_outlives_the_idle_timeout`, `a_client_that_never_reads_is_disconnected_after_the_write_timeout`, `concurrent_mutating_verbs_are_refused_with_busy`, `extra_sessions_wait_in_the_backlog_until_a_slot_frees` (Unix) |
+| Backing paths | Lexical validation stopped `..` and absolute paths, but a symlink planted under the backing root redirected opens outside it. | No component under the root may be a symlink; Unix opens pass `O_NOFOLLOW`. | `symlinks_inside_the_root_are_never_followed` (maki-backing, Unix) |
+| CI | The CI workflow ran without `--locked`, unlike the documented commands. | `--locked` on every CI cargo invocation; the nbdkit ABI check joined the nightly job. | the workflow |
+
+Observability added for the operator (review item 5): `journal_sync_failures_total`
+and `journal_writeback_uncertain` in `status` and `metrics`. Still open from
+the review's recommendations: an attach state machine persisted with
+generations and connection identity (the record now carries the device and is
+written only once the device is held), memory accounting for callbacks waiting
+in admission (the per-piece copy bounds it to one `maximum_io` per callback),
+lock-wait latency measurement, and the narrow production profile (one geometry,
+one provider) that needs the Linux qualification environment.
 
 ## Recovery fail-closed rules
 

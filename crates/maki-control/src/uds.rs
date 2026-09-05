@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
+use tokio::sync::Semaphore;
 
-use crate::server::{serve_connection, ControlBackend};
+use crate::server::{serve_connection, ControlBackend, ControlLimits, SerializedBackend};
 
 /// A bound control socket: accepts connections until dropped, and removes
 /// its path when dropped.
@@ -118,6 +119,8 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
 
 use std::time::Duration;
 
+use crate::protocol::ProtocolError;
+
 /// Process umask override, restored on drop.
 struct UmaskGuard(libc::mode_t);
 
@@ -137,14 +140,36 @@ impl Drop for UmaskGuard {
     }
 }
 
+/// Serve connections on a bound socket until the future is dropped, with
+/// the default [`ControlLimits`].
+pub async fn serve(listener: ControlListener, backend: Arc<dyn ControlBackend>) -> io::Result<()> {
+    serve_with_limits(listener, backend, ControlLimits::default()).await
+}
+
 /// Serve connections on a bound socket until the future is dropped.
 ///
 /// An `accept` error is never fatal: EMFILE/ENFILE/ENOBUFS during a client
 /// burst or a transiently short descriptor table used to end this loop,
 /// unlink the socket, and leave the daemon without a control plane for the
 /// rest of its life (O-04). Log, pause briefly, and keep accepting.
-pub async fn serve(listener: ControlListener, backend: Arc<dyn ControlBackend>) -> io::Result<()> {
+///
+/// At most `limits.max_sessions` sessions are served at once: the session
+/// slot is taken *before* `accept`, so excess clients wait in the kernel
+/// backlog instead of each getting a task and a descriptor (F10). Mutating
+/// verbs are serialized through [`SerializedBackend`].
+pub async fn serve_with_limits(
+    listener: ControlListener,
+    backend: Arc<dyn ControlBackend>,
+    limits: ControlLimits,
+) -> io::Result<()> {
+    let backend: Arc<dyn ControlBackend> = Arc::new(SerializedBackend::new(backend));
+    let sessions = Arc::new(Semaphore::new(limits.max_sessions.max(1)));
     loop {
+        let slot = sessions
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session semaphore is never closed");
         let stream = match listener.listener.accept().await {
             Ok((stream, _addr)) => stream,
             Err(e) => {
@@ -155,8 +180,13 @@ pub async fn serve(listener: ControlListener, backend: Arc<dyn ControlBackend>) 
         };
         let backend = backend.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(stream, backend).await {
-                tracing::warn!("control session ended with error: {e}");
+            let _slot = slot;
+            match serve_connection(stream, backend, limits).await {
+                Ok(()) => {}
+                Err(ProtocolError::IdleTimeout) => {
+                    tracing::debug!("control session closed: idle timeout")
+                }
+                Err(e) => tracing::warn!("control session ended with error: {e}"),
             }
         });
     }

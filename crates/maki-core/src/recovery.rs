@@ -143,10 +143,28 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
     //    would acknowledge them anyway, and a successor segment would turn
     //    their torn tail into "corruption" after a real power loss (S-06).
     //    fsync every surviving segment and publish the mark for the last.
+    //
+    //    An fsync alone is not enough for the final segment: if the previous
+    //    process saw a *failed* writeback, those pages are clean and still
+    //    unpersisted, and fsync has nothing to write. Everything beyond the
+    //    proven prefix is rewritten from the page cache first so the sync
+    //    below really persists it (F01).
+    let last_index = scan.segments.last().map(|s| s.index);
     for seg in &scan.segments {
-        backing
-            .open(&layout::journal_segment(seg.index), false)?
-            .sync_data()?;
+        let file = backing.open(&layout::journal_segment(seg.index), false)?;
+        if Some(seg.index) == last_index {
+            let proven = scan
+                .mark
+                .map(|m| m.durable_size)
+                .unwrap_or(SEGMENT_HEADER_SIZE as u64)
+                .min(seg.size);
+            if seg.size > proven {
+                let mut tail = vec![0u8; (seg.size - proven) as usize];
+                file.read_at(proven, &mut tail)?;
+                file.write_at(proven, &tail)?;
+            }
+        }
+        file.sync_data()?;
     }
     if let Some(last) = scan.segments.last() {
         backing.sync_dir(layout::JOURNAL_DIR)?;

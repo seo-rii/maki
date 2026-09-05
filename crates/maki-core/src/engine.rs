@@ -78,7 +78,15 @@ pub enum AttachError {
 #[derive(Debug, Clone)]
 pub struct EngineLimits {
     pub max_active_callbacks: u32,
+    /// Plaintext-byte admission budget. A request is charged every crypto
+    /// unit it touches in full (see [`Engine::admission_cost`]).
     pub max_plaintext_bytes: u64,
+    /// Largest single read or write the engine accepts (`nbd.maximum_io`).
+    /// Larger requests are refused as invalid; the NBD adapter splits
+    /// kernel requests to fit, so the value is a real bound on the memory
+    /// one request can pin (third review, F07). Must be a multiple of the
+    /// device block size.
+    pub max_request_bytes: u64,
 }
 
 impl Default for EngineLimits {
@@ -86,6 +94,7 @@ impl Default for EngineLimits {
         Self {
             max_active_callbacks: 64,
             max_plaintext_bytes: 128 << 20,
+            max_request_bytes: 1 << 20,
         }
     }
 }
@@ -261,6 +270,8 @@ struct EngineInner {
     batch_max_bytes: u64,
     /// Request-count + plaintext-byte admission (SPEC §30).
     admission: maki_crypto::flow::DualSemaphore,
+    /// Hard bound on one request's length (F07).
+    max_request_bytes: u64,
     /// Versioned plaintext read cache (SPEC §29). `None` = mode off.
     cache: Option<maki_cache::VersionedLruCache>,
     policy: CheckpointPolicy,
@@ -386,6 +397,7 @@ impl Engine {
                 options.limits.max_active_callbacks,
                 options.limits.max_plaintext_bytes,
             ),
+            max_request_bytes: options.limits.max_request_bytes,
             cache: options.cache.map(|c| {
                 maki_cache::VersionedLruCache::new(
                     maki_cache::CacheConfig {
@@ -461,7 +473,34 @@ impl Engine {
                 "bad request range: offset {offset}, len {len}"
             )));
         }
+        if len as u64 > self.inner.max_request_bytes {
+            return Err(CoreError::Invalid(format!(
+                "request of {len} bytes exceeds the maximum I/O size {} (nbd.maximum_io)",
+                self.inner.max_request_bytes
+            )));
+        }
         Ok(())
+    }
+
+    /// Largest read or write [`Engine::read_secret`] / [`Engine::write`]
+    /// accept, in bytes.
+    pub fn max_request_bytes(&self) -> u64 {
+        self.inner.max_request_bytes
+    }
+
+    /// Plaintext bytes a request charges against the admission budget:
+    /// every crypto unit it touches, in full. A partial write reads,
+    /// modifies and re-encrypts whole units and a read decrypts whole
+    /// units, so the request length under-counts what is actually held in
+    /// memory (F07).
+    pub fn admission_cost(&self, offset: u64, len: usize) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        let unit = self.unit_size();
+        let first = offset / unit;
+        let last = (offset + len as u64 - 1) / unit;
+        (last - first + 1) * unit
     }
 
     fn unit_size(&self) -> u64 {
@@ -506,7 +545,11 @@ impl Engine {
     /// path; SPEC §36).
     pub async fn read_secret(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
-        let _admission = self.inner.admission.acquire(len as u64).await;
+        let _admission = self
+            .inner
+            .admission
+            .acquire(self.admission_cost(offset, len))
+            .await;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
@@ -572,7 +615,11 @@ impl Engine {
     /// durable before returning.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
-        let _admission = self.inner.admission.acquire(data.len() as u64).await;
+        let _admission = self
+            .inner
+            .admission
+            .acquire(self.admission_cost(offset, data.len()))
+            .await;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + data.len() as u64 - 1) / unit_size;
@@ -769,6 +816,8 @@ impl Engine {
             journal_segments: volume.journal_segment_count(),
             journal_pending_bytes: volume.journal_pending_bytes(),
             journal_total_bytes: volume.journal_total_bytes(),
+            journal_sync_failures_total: volume.journal_sync_failures(),
+            journal_writeback_uncertain: volume.journal_writeback_uncertain(),
             overlay_units: volume.overlay_len(),
             overlay_bytes: volume.overlay_bytes(),
             cache_hits: cache.hits,
@@ -1006,6 +1055,11 @@ pub struct EngineStats {
     pub journal_pending_bytes: u64,
     /// Every journal segment on disk.
     pub journal_total_bytes: u64,
+    /// Journal segment syncs that failed since attach (F01).
+    pub journal_sync_failures_total: u64,
+    /// A failed journal sync has not been followed by a successful rewrite
+    /// and sync yet: FLUSH and FUA are failing until it is.
+    pub journal_writeback_uncertain: bool,
     pub overlay_units: usize,
     pub overlay_bytes: u64,
     pub cache_hits: u64,

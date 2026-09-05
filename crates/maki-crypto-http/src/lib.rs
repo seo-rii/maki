@@ -14,11 +14,47 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
+use zeroize::{Zeroize, Zeroizing};
 
 use maki_crypto::{
     Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
     PlaintextUnit, SecretBuffer,
 };
+
+/// Bytes wiped when dropped: every copy of plaintext this crate makes on
+/// the way to and from the wire (third review, F09) — payload copies, the
+/// serialized request body, the response body, and decoded payloads.
+/// Copies made inside reqwest, hyper, rustls and the kernel are outside
+/// this crate's reach; the daemon's no-swap and no-core-dump posture is
+/// what covers them.
+pub type Sensitive = Zeroizing<Vec<u8>>;
+
+/// A request body wiped once reqwest has released it: `Bytes::from_owner`
+/// keeps the zeroizing vector alive while any clone of the body exists and
+/// drops (wipes) it afterwards, instead of copying it into a plain buffer.
+struct WipedOnDrop(Sensitive);
+
+impl AsRef<[u8]> for WipedOnDrop {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn body_from(bytes: Sensitive) -> reqwest::Body {
+    reqwest::Body::from(bytes::Bytes::from_owner(WipedOnDrop(bytes)))
+}
+
+/// Wipe every string in a JSON document in place. Payload encodings are
+/// reversible, so an encoded payload is plaintext; the document is wiped
+/// as soon as it has been serialized (request) or read (response).
+pub fn zeroize_json(value: &mut Value) {
+    match value {
+        Value::String(s) => s.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(zeroize_json),
+        Value::Object(map) => map.values_mut().for_each(zeroize_json),
+        _ => {}
+    }
+}
 
 // ---------------------------------------------------------------- spec types
 
@@ -330,7 +366,7 @@ impl HttpCryptoProvider {
         op: &OpSpec,
         body: reqwest::Body,
         json: bool,
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<Sensitive, CryptoError> {
         let method = reqwest::Method::from_bytes(op.method.as_bytes())
             .map_err(|_| fatal(format!("bad method {:?}", op.method)))?;
         let url = format!("{}{}", self.spec.base_url, op.path);
@@ -359,7 +395,7 @@ impl HttpCryptoProvider {
             }
         }
         // Stream with a hard cap regardless of the declared length.
-        let mut out = Vec::new();
+        let mut out = Zeroizing::new(Vec::new());
         let mut response = response;
         while let Some(chunk) = response.chunk().await.map_err(|e| classify_transport(&e))? {
             out.extend_from_slice(&chunk);
@@ -373,26 +409,37 @@ impl HttpCryptoProvider {
         Ok(out)
     }
 
-    fn parse_single(&self, op: &OpSpec, body: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    fn parse_single(&self, op: &OpSpec, body: &[u8]) -> Result<Sensitive, CryptoError> {
         match op.response.kind {
-            RespKind::Raw => Ok(body.to_vec()),
+            RespKind::Raw => Ok(Zeroizing::new(body.to_vec())),
             RespKind::Json => {
-                let value: Value = serde_json::from_slice(body)
+                let mut value: Value = serde_json::from_slice(body)
                     .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
-                let path = op
-                    .response
-                    .data_path
-                    .as_deref()
-                    .ok_or_else(|| fatal("response data_path missing"))?;
-                let data = value
-                    .pointer(path)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        CryptoError::Contract(format!("response missing string at {path:?}"))
-                    })?;
-                op.response.encoding.decode(data)
+                let result = (|| {
+                    let path = op
+                        .response
+                        .data_path
+                        .as_deref()
+                        .ok_or_else(|| fatal("response data_path missing"))?;
+                    let data = value
+                        .pointer(path)
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            CryptoError::Contract(format!("response missing string at {path:?}"))
+                        })?;
+                    op.response.encoding.decode(data).map(Zeroizing::new)
+                })();
+                zeroize_json(&mut value);
+                result
             }
         }
+    }
+
+    /// Serialize a request document and wipe it.
+    fn encode_and_wipe(root: &mut Value) -> Sensitive {
+        let encoded = Zeroizing::new(serde_json::to_vec(root).expect("JSON value serializes"));
+        zeroize_json(root);
+        encoded
     }
 
     /// One request per item.
@@ -400,19 +447,19 @@ impl HttpCryptoProvider {
         &self,
         op: &OpSpec,
         context: &CryptoContext,
-        items: &[(u64, Vec<u8>)],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+        items: &[(u64, Sensitive)],
+    ) -> Result<Vec<Sensitive>, CryptoError> {
         let mut out = Vec::with_capacity(items.len());
         for (batch_index, (unit_index, payload)) in items.iter().enumerate() {
             let (body, json): (reqwest::Body, bool) = match &op.body {
-                BodySpec::Raw => (payload.clone().into(), false),
+                BodySpec::Raw => (body_from(payload.clone()), false),
                 BodySpec::Json { fields, .. } => {
                     let mut root = Value::Object(serde_json::Map::new());
                     for (pointer, source) in fields {
                         let v = Self::scalar(source, context, *unit_index, batch_index, payload);
                         pointer_set(&mut root, pointer, v)?;
                     }
-                    (serde_json::to_vec(&root).unwrap().into(), true)
+                    (body_from(Self::encode_and_wipe(&mut root)), true)
                 }
             };
             let response = self.send(op, body, json).await?;
@@ -426,11 +473,11 @@ impl HttpCryptoProvider {
         &self,
         op: &OpSpec,
         context: &CryptoContext,
-        items: &[(u64, Vec<u8>)],
+        items: &[(u64, Sensitive)],
         items_path: &str,
         fields: &[(String, FieldSource)],
         item_fields: &[(String, FieldSource)],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+    ) -> Result<Vec<Sensitive>, CryptoError> {
         let mut root = Value::Object(serde_json::Map::new());
         for (pointer, source) in fields {
             let v = Self::scalar(source, context, 0, 0, &[]);
@@ -448,10 +495,21 @@ impl HttpCryptoProvider {
         pointer_set(&mut root, items_path, Value::Array(array))?;
 
         let response = self
-            .send(op, serde_json::to_vec(&root).unwrap().into(), true)
+            .send(op, body_from(Self::encode_and_wipe(&mut root)), true)
             .await?;
-        let value: Value = serde_json::from_slice(&response)
+        let mut value: Value = serde_json::from_slice(&response)
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
+        let result = Self::extract_batch(op, &value, items);
+        zeroize_json(&mut value);
+        result
+    }
+
+    /// Pull the per-item payloads out of a parsed batch response.
+    fn extract_batch(
+        op: &OpSpec,
+        value: &Value,
+        items: &[(u64, Sensitive)],
+    ) -> Result<Vec<Sensitive>, CryptoError> {
         let resp_items_path = op
             .response
             .items_path
@@ -488,7 +546,7 @@ impl HttpCryptoProvider {
             .ok_or_else(|| {
                 CryptoError::Contract(format!("batch element {i} missing payload string"))
             })?;
-            out.push(op.response.encoding.decode(data)?);
+            out.push(Zeroizing::new(op.response.encoding.decode(data)?));
         }
         Ok(out)
     }
@@ -497,8 +555,8 @@ impl HttpCryptoProvider {
         &self,
         op: &OpSpec,
         context: &CryptoContext,
-        items: &[(u64, Vec<u8>)],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+        items: &[(u64, Sensitive)],
+    ) -> Result<Vec<Sensitive>, CryptoError> {
         match &op.body {
             BodySpec::Json {
                 fields,
@@ -710,9 +768,9 @@ impl CryptoProvider for HttpCryptoProvider {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let payloads: Vec<(u64, Vec<u8>)> = items
+        let payloads: Vec<(u64, Sensitive)> = items
             .iter()
-            .map(|i| (i.unit_index, i.data.expose().to_vec()))
+            .map(|i| (i.unit_index, Zeroizing::new(i.data.expose().to_vec())))
             .collect();
         let results = self.run_op(&self.spec.encrypt, context, &payloads).await?;
         Ok(results
@@ -720,7 +778,7 @@ impl CryptoProvider for HttpCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| CiphertextUnit {
                 unit_index: item.unit_index,
-                data,
+                data: data.to_vec(),
             })
             .collect())
     }
@@ -730,9 +788,9 @@ impl CryptoProvider for HttpCryptoProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let payloads: Vec<(u64, Vec<u8>)> = items
+        let payloads: Vec<(u64, Sensitive)> = items
             .iter()
-            .map(|i| (i.unit_index, i.data.clone()))
+            .map(|i| (i.unit_index, Zeroizing::new(i.data.clone())))
             .collect();
         let results = self.run_op(&self.spec.decrypt, context, &payloads).await?;
         Ok(results
@@ -740,7 +798,7 @@ impl CryptoProvider for HttpCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| PlaintextUnit {
                 unit_index: item.unit_index,
-                data: SecretBuffer::from_vec(data),
+                data: SecretBuffer::from_slice(&data),
             })
             .collect())
     }

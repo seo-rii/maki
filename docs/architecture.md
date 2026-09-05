@@ -101,6 +101,23 @@ reused: recovery continues numbering above both the surviving segments and the
 mark. The [review remediation log](review-remediation.md) describes these rules
 in detail.
 
+Persistence errors are answered by rewriting, never by repeating the failed
+call. A failed `fdatasync` leaves the dirty pages clean and unpersisted on
+Linux, so the journal keeps its own copy of every unsynced record and, after a
+sync failure, rewrites that copy before it syncs again; no FLUSH or FUA is
+acknowledged until that succeeds, and the daemon reports the condition as
+`journal_writeback_uncertain`. Recovery rewrites everything beyond the proven
+prefix of the final segment before syncing it, so page-cache bytes a failed
+writeback left behind are never acknowledged unwritten. A write that fails
+part-way may have persisted a prefix; the segment is truncated back to its
+last record before anything is appended or the segment is sealed, and the
+writer refuses to proceed while that truncation fails.
+
+Secret buffers are page-isolated when locking is on: each one owns a
+page-aligned allocation that is `mlock`ed for its lifetime, wiped while still
+locked, and only then unlocked and freed, because `mlock` and `munlock` act on
+whole pages without reference counting.
+
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at
 checkpoint time. The durable boundary can move inside `append` itself (an

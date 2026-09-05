@@ -406,8 +406,14 @@ async fn differential_run(seed: u64, ops: usize) {
             }
         }
     }
-    // Full sweep at the end.
-    let got = engine.read(0, DEVICE_SIZE as usize).await.unwrap();
+    // Full sweep at the end, in pieces no larger than the engine accepts
+    // (`nbd.maximum_io` is a hard bound on one request, F07).
+    let piece = engine.max_request_bytes() as usize;
+    let mut got = Vec::with_capacity(DEVICE_SIZE as usize);
+    for start in (0..DEVICE_SIZE as usize).step_by(piece) {
+        let len = piece.min(DEVICE_SIZE as usize - start);
+        got.extend(engine.read(start as u64, len).await.unwrap());
+    }
     assert_eq!(got, model, "seed {seed}: final sweep mismatch");
 }
 

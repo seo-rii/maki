@@ -106,6 +106,7 @@ fn attach_plan_has_expected_step_order() {
             "set-block-size",
             "lvm-activate",
             "mount-xfs",
+            "verify-mount-device",
             "verify-mount-identity",
         ]
     );
@@ -177,6 +178,7 @@ fn good_observation() -> MountObservation {
         sentinel_volume_uuid: Some("0123-4567".to_string()),
         nbd_connected: true,
         rw_probe_ok: true,
+        backing_devices: vec!["/dev/nbd0".to_string()],
     }
 }
 
@@ -184,6 +186,7 @@ fn expectation() -> MountExpectation {
     MountExpectation {
         fs_uuid: Some("AAAA-BBBB".to_string()),
         volume_uuid: "0123-4567".to_string(),
+        nbd_device: "/dev/nbd0".to_string(),
     }
 }
 

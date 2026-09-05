@@ -22,8 +22,20 @@ use parking_lot::Mutex;
 
 use crate::adapter::NbdAdapter;
 
-const THREAD_MODEL_PARALLEL: c_int = 3;
-const API_VERSION: c_int = 2;
+/// Values from `nbdkit-common.h` / `nbdkit-plugin.h` the shim depends on.
+/// `tests/review_abi.rs` compiles a C probe against the installed header
+/// and checks every one of them plus the struct layout (third review,
+/// F08: `can_fua` used to return 1, which is `NBDKIT_FUA_EMULATE`).
+pub const NBDKIT_API_VERSION: c_int = 2;
+pub const NBDKIT_THREAD_MODEL_PARALLEL: c_int = 3;
+pub const NBDKIT_FUA_NONE: c_int = 0;
+pub const NBDKIT_FUA_EMULATE: c_int = 1;
+pub const NBDKIT_FUA_NATIVE: c_int = 2;
+/// `NBDKIT_FLAG_FUA` (`1 << 1`): the request flag on `pwrite`.
+pub const NBDKIT_FLAG_FUA: u32 = 1 << 1;
+
+const THREAD_MODEL_PARALLEL: c_int = NBDKIT_THREAD_MODEL_PARALLEL;
+const API_VERSION: c_int = NBDKIT_API_VERSION;
 
 static CONFIG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static ADAPTER: OnceLock<NbdAdapter> = OnceLock::new();
@@ -100,10 +112,17 @@ unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn can_fua(_h: *mut c_void) -> c_int {
-    1 // NBDKIT_FUA_NATIVE
+    // Native: the FUA flag reaches `pwrite_v2` and the engine syncs the
+    // request's records (SPEC 24). Returning EMULATE (1) would make nbdkit
+    // issue a full flush after every FUA write instead.
+    NBDKIT_FUA_NATIVE
 }
 
-const NBDKIT_FLAG_FUA: u32 = 2;
+/// What [`can_fua`] answers (exposed for the ABI test).
+pub fn can_fua_value() -> c_int {
+    // SAFETY: the handle is unused.
+    unsafe { can_fua(std::ptr::null_mut()) }
+}
 
 fn set_errno(errno: i32) {
     // errno_is_preserved = 1: nbdkit reads errno on failure.
@@ -250,4 +269,87 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
 #[no_mangle]
 extern "C" fn plugin_init() -> *const nbdkit_plugin {
     &PLUGIN
+}
+
+/// The shim's view of the C ABI: byte offset of every `nbdkit_plugin`
+/// field it populates (or must skip), the prefix size it declares, and the
+/// constants it relies on. `tests/review_abi.rs` compares this with a C
+/// probe compiled against the distribution's header.
+pub fn abi_layout() -> Vec<(&'static str, usize)> {
+    use std::mem::offset_of;
+    vec![
+        ("_struct_size", offset_of!(nbdkit_plugin, _struct_size)),
+        ("_api_version", offset_of!(nbdkit_plugin, _api_version)),
+        ("_thread_model", offset_of!(nbdkit_plugin, _thread_model)),
+        ("name", offset_of!(nbdkit_plugin, name)),
+        ("longname", offset_of!(nbdkit_plugin, longname)),
+        ("version", offset_of!(nbdkit_plugin, version)),
+        ("description", offset_of!(nbdkit_plugin, description)),
+        ("load", offset_of!(nbdkit_plugin, load)),
+        ("unload", offset_of!(nbdkit_plugin, unload)),
+        ("config", offset_of!(nbdkit_plugin, config)),
+        (
+            "config_complete",
+            offset_of!(nbdkit_plugin, config_complete),
+        ),
+        ("config_help", offset_of!(nbdkit_plugin, config_help)),
+        ("open", offset_of!(nbdkit_plugin, open)),
+        ("close", offset_of!(nbdkit_plugin, close)),
+        ("get_size", offset_of!(nbdkit_plugin, get_size)),
+        ("can_write", offset_of!(nbdkit_plugin, can_write)),
+        ("can_flush", offset_of!(nbdkit_plugin, can_flush)),
+        ("is_rotational", offset_of!(nbdkit_plugin, is_rotational)),
+        ("can_trim", offset_of!(nbdkit_plugin, can_trim)),
+        ("_pread_v1", offset_of!(nbdkit_plugin, _pread_v1)),
+        ("_pwrite_v1", offset_of!(nbdkit_plugin, _pwrite_v1)),
+        ("_flush_v1", offset_of!(nbdkit_plugin, _flush_v1)),
+        ("_trim_v1", offset_of!(nbdkit_plugin, _trim_v1)),
+        ("_zero_v1", offset_of!(nbdkit_plugin, _zero_v1)),
+        (
+            "errno_is_preserved",
+            offset_of!(nbdkit_plugin, errno_is_preserved),
+        ),
+        ("dump_plugin", offset_of!(nbdkit_plugin, dump_plugin)),
+        ("can_zero", offset_of!(nbdkit_plugin, can_zero)),
+        ("can_fua", offset_of!(nbdkit_plugin, can_fua)),
+        ("pread", offset_of!(nbdkit_plugin, pread)),
+        ("pwrite", offset_of!(nbdkit_plugin, pwrite)),
+        ("flush", offset_of!(nbdkit_plugin, flush)),
+        ("trim", offset_of!(nbdkit_plugin, trim)),
+        ("zero", offset_of!(nbdkit_plugin, zero)),
+        ("sizeof_prefix", std::mem::size_of::<nbdkit_plugin>()),
+        ("NBDKIT_API_VERSION", NBDKIT_API_VERSION as usize),
+        (
+            "NBDKIT_THREAD_MODEL_PARALLEL",
+            NBDKIT_THREAD_MODEL_PARALLEL as usize,
+        ),
+        ("NBDKIT_FUA_NONE", NBDKIT_FUA_NONE as usize),
+        ("NBDKIT_FUA_EMULATE", NBDKIT_FUA_EMULATE as usize),
+        ("NBDKIT_FUA_NATIVE", NBDKIT_FUA_NATIVE as usize),
+        ("NBDKIT_FLAG_FUA", NBDKIT_FLAG_FUA as usize),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fua_is_advertised_as_native_not_emulated() {
+        assert_eq!(can_fua_value(), NBDKIT_FUA_NATIVE);
+        assert_eq!(NBDKIT_FUA_NATIVE, 2, "nbdkit-common.h: NBDKIT_FUA_NATIVE 2");
+        assert_ne!(can_fua_value(), NBDKIT_FUA_EMULATE);
+    }
+
+    #[test]
+    fn declared_prefix_ends_after_the_v2_rpc_callbacks() {
+        let layout = abi_layout();
+        let of = |n: &str| layout.iter().find(|(k, _)| *k == n).unwrap().1;
+        assert_eq!(
+            of("sizeof_prefix"),
+            of("zero") + std::mem::size_of::<usize>()
+        );
+        assert_eq!(of("_struct_size"), 0);
+        assert_eq!(PLUGIN._struct_size as usize, of("sizeof_prefix"));
+    }
 }

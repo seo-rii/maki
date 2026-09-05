@@ -8,6 +8,60 @@
 pub struct MountEntry {
     pub source: String,
     pub fstype: String,
+    /// The mounted block device's `major:minor` (field 3), the handle
+    /// for walking its sysfs topology.
+    pub major_minor: String,
+}
+
+/// Follow the `slaves` relation (device-mapper, MD) from `start` down to
+/// the block devices that have none: the physical devices a filesystem's
+/// bytes end up on. `slaves_of` answers with the sysfs names of a device's
+/// slaves (`/sys/class/block/<name>/slaves`). Bounded depth and a seen set
+/// keep a cyclic or absurd tree from looping. Sorted, deduplicated.
+pub fn resolve_leaf_devices(
+    start: &str,
+    slaves_of: &mut dyn FnMut(&str) -> Vec<String>,
+) -> Vec<String> {
+    const MAX_DEPTH: usize = 16;
+    let mut leaves = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![(start.to_string(), 0usize)];
+    while let Some((device, depth)) = stack.pop() {
+        if !seen.insert(device.clone()) || depth > MAX_DEPTH {
+            continue;
+        }
+        let slaves = slaves_of(&device);
+        if slaves.is_empty() {
+            leaves.push(device);
+        } else {
+            for slave in slaves {
+                stack.push((slave, depth + 1));
+            }
+        }
+    }
+    leaves.sort();
+    leaves.dedup();
+    leaves
+}
+
+/// The `/dev/nbdN` a sysfs block name belongs to: `nbd3` itself or one of
+/// its partitions (`nbd3p1`). Anything else is not an NBD device.
+pub fn nbd_device_of(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("nbd")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let after = &rest[digits.len()..];
+    let partition = after
+        .strip_prefix('p')
+        .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false);
+    if after.is_empty() || partition {
+        Some(format!("/dev/nbd{digits}"))
+    } else {
+        None
+    }
 }
 
 /// Decode the octal escapes mountinfo uses (`\040` for a space, ...).
@@ -55,6 +109,7 @@ pub fn parse_mountinfo(text: &str, mountpoint: &str) -> Option<MountEntry> {
         found = Some(MountEntry {
             fstype: right[0].to_string(),
             source: unescape(right[1]),
+            major_minor: left[2].to_string(),
         });
     }
     found

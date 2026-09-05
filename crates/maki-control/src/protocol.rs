@@ -36,6 +36,12 @@ pub enum ProtocolError {
     Closed,
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    /// The client sent nothing for the session idle timeout (F10).
+    #[error("session idle timeout")]
+    IdleTimeout,
+    /// The client did not drain a response within the write timeout (F10).
+    #[error("response write timeout")]
+    WriteTimeout,
 }
 
 /// Read one bounded line. Returns `Closed` on clean EOF before any byte.

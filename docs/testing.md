@@ -53,7 +53,11 @@ The scheduled job runs:
 | `phase11_gate_dbsim_full` | 500 database-simulation runs |
 | `phase12_gate_full` | 500 barrier and 500 FUA power-loss simulations |
 
-It also builds the Linux cdylib and verifies the global `plugin_init` symbol.
+It also builds the Linux cdylib, verifies the global `plugin_init` symbol,
+installs `nbdkit-plugin-dev` and runs `review_abi.rs`, which compiles a C probe
+against the distribution's `nbdkit-plugin.h` and compares every field offset
+and `NBDKIT_*` constant the shim depends on. The same test runs under WSL
+when the header is installed there, and skips with a message otherwise.
 
 ## Test model
 
@@ -62,7 +66,7 @@ It also builds the Linux cdylib and verifies the global `plugin_init` symbol.
 | Component | Purpose |
 |---|---|
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
-| `CrashableBacking` | Independently keeps or loses unsynchronized operations and can model tearing |
+| `CrashableBacking` | Independently keeps or loses unsynchronized operations and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
 | `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses |
 | `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing |
 | `DeterministicScheduler` | Reproducible seeded interleavings |
@@ -87,6 +91,8 @@ has a constant residue.
 | Review regressions | `review_storage.rs`, `review_attach.rs`, `review_bounded.rs`, `review_check.rs` (maki-core), `review_deep.rs` (maki-check binary), `review_format.rs` and `review_config.rs` (maki-format), `review_daemon.rs`, `review_control.rs`, `review_sample.rs` and `review_security.rs` (maki-nbdkit), `review_uds.rs` (maki-control), `review_dispatch.rs` and `review_scheduler.rs` (maki-crypto), `review_ws.rs` (maki-crypto-websocket), `review_priv.rs` (maki-privileged), `review_attach.rs` (maki-attach binary): roll-vs-promotion ordering, allocation dirty-flag ordering, fail-closed recovery, durable mark, A/B error classification, key canary and identity checks, bounded journal and degraded state, control-socket lifecycle and ownership (Unix-only suites run under Linux CI and WSL), configuration validation matrix, plaintext-transport policy, TLS fail-closed, the production sample building its provider, retry-safety and absolute deadlines in the dispatcher, endpoint quarantine, and WebSocket unit echo; see the [remediation log](review-remediation.md) |
 | Sanitizers and randomized suites | Debug-build `check_invariants` on `Overlay`, `JournalWriter`, and `Volume` after every mutation; `review_fuzz.rs` (maki-format: single-bit-flip and random-mutation fuzz of every decoder, the journal scanner, URL parsing, and `validate()` on a mutated production sample), `review_stress.rs` and `review_corruption.rs` (maki-core: concurrent engine stress with a per-unit oracle, provider chaos, background checkpoints and a crash; engine-level sweep of all persistence failpoints; random single-file corruption with deep check and re-attach), `review_stress_crypto.rs` (maki-crypto: scheduler and dispatcher under random faults), `review_cache_model.rs` (maki-cache: model-based LRU check); findings S-01 to S-05 in the [remediation log](review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
 | Second audit regressions | `review_audit.rs` (maki-core: process-restart durability, covered-segment reclaim, adoption ordering, scanner bounds, covered-prefix resurrection, decrypt length), `review_audit2.rs`, `review_secret.rs` (maki-crypto: breaker probes, deadline accounting, background validation, lane concurrency, self-test strictness, pending items, page unlocking), `review_redirect.rs` (maki-crypto-http), `review_hang.rs` (maki-crypto-websocket), and the O-series additions to `review_priv.rs`, `review_uds.rs`, `review_control.rs`, `review_sample.rs`, `review_config.rs`, `review_format.rs`; findings K/C/O in the [remediation log](review-remediation.md#second-audit-2026-09-03-core-crypto-layer-operational-layers) |
+
+| Third review regressions | `review_writeback.rs` and `review_limits.rs` (maki-core: sync-retry rewrite, recovery rewrite of page-cache bytes, torn-tail normalization, request-size cap and per-unit admission cost), `review_limits.rs` and `review_abi.rs` (maki-nbdkit: NBD request splitting; the nbdkit struct layout and constants checked against the installed header by a compiled C probe, Linux), F05 additions to `review_security.rs` (swap classification by device identity, unreadable `/proc/swaps` refused), `review_secret.rs` page-isolation test (maki-crypto, Linux, reads `/proc/self/smaps`), `review_limits.rs` (maki-control: idle and write timeouts, busy refusal, session backlog), F02/F06 additions to `review_priv.rs` (mount topology through device-mapper `slaves`, detach reconciled with the attach record), the symlink test in `maki-backing`; findings F01 to F10 in the [remediation log](review-remediation.md#third-review-2026-09-05-os-partial-failure-device-identity-memory-ownership) |
 
 ## Current qualification status
 

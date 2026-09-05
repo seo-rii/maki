@@ -13,6 +13,17 @@
 //! as a point where `durable_sequence` may have moved (an automatic roll
 //! seals the previous segment).
 //!
+//! Persistence errors are never "retried" by repeating the syscall:
+//! - A failed `fdatasync` leaves the dirty pages *clean and unpersisted* on
+//!   Linux, so a second `fdatasync` succeeds without writing them. The
+//!   writer keeps its own copy of every unsynced record and, after a sync
+//!   failure, rewrites that copy before it syncs again; only then can a
+//!   barrier be acknowledged (third review, F01).
+//! - A failed `write_at` may have persisted a prefix, leaving the file
+//!   longer than the writer's logical end. The tail is truncated back to
+//!   the logical end before anything is appended or the segment is sealed;
+//!   until that truncation succeeds, appends and seals fail (F03).
+//!
 //! After every successful segment fdatasync the writer records the synced
 //! prefix in the durable mark (`journal/durable-mark`, see
 //! `maki_format::journal::DurableMark`) with a plain, un-synced write. The
@@ -59,6 +70,30 @@ struct ActiveSegment {
     /// File offset up to which this segment has been fdatasync'd.
     synced_offset: u64,
     unsynced: bool,
+    /// The writer's own copy of every byte in `[synced_offset,
+    /// write_offset)`: the trustworthy source a sync retry rewrites from
+    /// (F01). Bounded by the segment size and the pending-bytes policy.
+    pending: Vec<u8>,
+    /// A `sync_data` failed since the last successful one, so the pending
+    /// bytes may sit clean-but-unpersisted in the page cache; they are
+    /// rewritten before the next sync.
+    writeback_uncertain: bool,
+    /// A `write_at` failed, so the file may extend past `write_offset` with
+    /// a torn record (F03); it is truncated back before any append or seal.
+    tail_dirty: bool,
+}
+
+impl ActiveSegment {
+    /// Truncate a torn tail back to the logical end. Until this succeeds
+    /// nothing may be appended after it and the segment may not be sealed.
+    fn normalize_tail(&mut self) -> Result<(), CoreError> {
+        if self.tail_dirty {
+            fp("journal.tail.truncate")?;
+            self.file.set_len(self.write_offset)?;
+            self.tail_dirty = false;
+        }
+        Ok(())
+    }
 }
 
 pub struct JournalWriter {
@@ -78,6 +113,8 @@ pub struct JournalWriter {
     /// neighbours' deletion persisted (recovery accepts such holes, K-07)
     /// and the next checkpoint deletes them.
     holes_allowed_below: u64,
+    /// Segment syncs that failed since the writer resumed (observability).
+    sync_failures: u64,
 }
 
 impl JournalWriter {
@@ -103,7 +140,23 @@ impl JournalWriter {
             next_segment_index,
             mark: None,
             holes_allowed_below: 0,
+            sync_failures: 0,
         }
+    }
+
+    /// Whether the active segment holds bytes a failed sync left in an
+    /// unknown state; no barrier succeeds until they are rewritten and
+    /// synced.
+    pub fn writeback_uncertain(&self) -> bool {
+        self.active
+            .as_ref()
+            .map(|a| a.writeback_uncertain)
+            .unwrap_or(false)
+    }
+
+    /// Segment syncs that failed since the writer resumed.
+    pub fn sync_failures(&self) -> u64 {
+        self.sync_failures
     }
 
     /// Declare that sealed segments covered by `checkpoint_sequence` need
@@ -175,13 +228,36 @@ impl JournalWriter {
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
+        // A torn tail is normalized even when nothing is pending: a seal
+        // must never retire a segment longer than its records.
+        active.normalize_tail()?;
         if !active.unsynced {
             return Ok(());
         }
-        fp("journal.sync")?;
-        active.file.sync_data()?;
+        let sync: Result<(), CoreError> = (|| {
+            fp("journal.sync")?;
+            if active.writeback_uncertain {
+                // The earlier sync failed; on Linux the pages are clean and
+                // a plain retry writes nothing. Rewrite from our copy so
+                // the sync below has something to persist (F01).
+                fp("journal.rewrite")?;
+                active
+                    .file
+                    .write_at(active.synced_offset, &active.pending)?;
+            }
+            active.file.sync_data()?;
+            Ok(())
+        })();
+        if let Err(e) = sync {
+            active.writeback_uncertain = true;
+            self.sync_failures += 1;
+            self.sanitize();
+            return Err(e);
+        }
         active.unsynced = false;
         active.synced_offset = active.write_offset;
+        active.pending.clear();
+        active.writeback_uncertain = false;
         self.durable_sequence = self.appended_sequence;
         let mark = DurableMark {
             segment_index: active.info.index,
@@ -260,6 +336,9 @@ impl JournalWriter {
                     write_offset: SEGMENT_HEADER_SIZE as u64,
                     synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
+                    pending: Vec::new(),
+                    writeback_uncertain: false,
+                    tail_dirty: false,
                 });
                 // Point the mark at the new segment (header only) so it
                 // names the newest segment index even before the first
@@ -301,8 +380,21 @@ impl JournalWriter {
         };
         let bytes = encode_record(&record);
         let active = self.active.as_mut().expect("active segment after roll");
-        fp("journal.append.write")?;
-        active.file.write_at(active.write_offset, &bytes)?;
+        active.normalize_tail()?;
+        let written: Result<(), CoreError> = (|| {
+            fp("journal.append.write")?;
+            active.file.write_at(active.write_offset, &bytes)?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            // The write may have persisted a prefix: the file can now be
+            // longer than the logical end, holding a torn record that a
+            // shorter successor would not cover (F03).
+            active.tail_dirty = true;
+            self.sanitize();
+            return Err(e);
+        }
+        active.pending.extend_from_slice(&bytes);
         active.write_offset += bytes.len() as u64;
         active.info.record_count += 1;
         active.info.size = active.write_offset;
@@ -335,6 +427,9 @@ impl JournalWriter {
     /// * The active segment's synced prefix never exceeds its size, an
     ///   unsynced segment has bytes past the synced prefix, and a synced one
     ///   has none.
+    /// * The writer's pending copy is exactly the unsynced range, and the
+    ///   file is exactly as long as the logical end unless a torn tail is
+    ///   known and awaiting truncation.
     /// * Every sealed segment is fully durable: its last record is at or
     ///   below `durable_sequence`.
     /// * `next_segment_index` is above every segment index in use.
@@ -413,6 +508,23 @@ impl JournalWriter {
                 a.synced_offset <= a.write_offset,
                 "journal sanitizer: synced past written"
             );
+            assert_eq!(
+                a.pending.len() as u64,
+                a.write_offset - a.synced_offset,
+                "journal sanitizer: pending copy does not cover the unsynced range"
+            );
+            if !a.tail_dirty {
+                // The physical file must end exactly at the logical end;
+                // a longer file is a torn record the seal would carry into
+                // a non-final segment (F03). Unreadable length = skip.
+                if let Ok(len) = a.file.len() {
+                    assert_eq!(
+                        len, a.write_offset,
+                        "journal sanitizer: segment {} file length != logical end",
+                        a.info.index
+                    );
+                }
+            }
             if a.unsynced {
                 assert!(
                     a.synced_offset < a.write_offset,

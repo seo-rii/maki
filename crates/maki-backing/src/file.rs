@@ -26,9 +26,33 @@ impl FileBacking {
         let mut p = self.root.clone();
         for comp in rel.split('/').filter(|c| !c.is_empty()) {
             p.push(comp);
+            // The namespace is escape-proof only if it cannot be
+            // redirected: no component under the root may be a symlink
+            // (third review, backing path hardening). Unix opens also pass
+            // O_NOFOLLOW for the final component.
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                if meta.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid backing path {rel:?}: {} is a symlink", p.display()),
+                    ));
+                }
+            }
         }
         Ok(p)
     }
+}
+
+/// `OpenOptions` that never follow a symlink at the final component.
+fn open_options() -> OpenOptions {
+    #[allow(unused_mut)] // only Unix adds flags
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
 }
 
 pub struct RealFile {
@@ -122,7 +146,7 @@ impl VolumeLock for FileLock {}
 impl Backing for FileBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         let p = self.resolve(path, false)?;
-        let file = OpenOptions::new()
+        let file = open_options()
             .read(true)
             .write(true)
             .create(create)
@@ -163,7 +187,7 @@ impl Backing for FileBacking {
 
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
         let p = self.resolve(path, false)?;
-        let file = OpenOptions::new()
+        let file = open_options()
             .read(true)
             .write(true)
             .create(true)
@@ -255,6 +279,35 @@ mod tests {
         let backing = FileBacking::new(dir.path()).unwrap();
         assert!(backing.open("../evil", true).is_err());
         assert!(backing.open("/abs", true).is_err());
+    }
+
+    /// Lexical validation stops `..` and absolute paths; a symlink planted
+    /// under the root would still redirect an open outside it (third
+    /// review). Neither a directory nor a file symlink is ever followed.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_inside_the_root_are_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim"), b"data").unwrap();
+        let root = dir.path().join("root");
+        let backing = FileBacking::new(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("journal")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), root.join("seg")).unwrap();
+
+        assert!(backing.open("journal/victim", false).is_err());
+        assert!(backing.open("journal/new", true).is_err());
+        assert!(backing.open("seg", false).is_err());
+        assert!(backing.open("seg", true).is_err());
+        assert!(backing.try_lock("seg").is_err());
+        assert!(backing.list("journal").is_err());
+        assert!(backing.create_dir_all("journal/sub").is_err());
+        assert_eq!(fs::read(outside.join("victim")).unwrap(), b"data");
+        assert!(!outside.join("new").exists());
+        // Real entries next to the symlinks keep working.
+        backing.open("real", true).unwrap();
+        assert!(backing.exists("real").unwrap());
     }
 
     #[cfg(unix)]

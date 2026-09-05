@@ -64,6 +64,12 @@ pub enum PlannedStep {
         device: String,
         mountpoint: String,
     },
+    /// Prove the filesystem just mounted lives on `nbd_device` and nothing
+    /// else, before anything is written to it (F02).
+    VerifyMountDevice {
+        mountpoint: String,
+        nbd_device: String,
+    },
     /// Create `<mountpoint>/.maki-sentinel` holding the volume UUID if it
     /// does not exist yet; never overwrite a different value.
     WriteSentinel {
@@ -101,6 +107,7 @@ impl PlannedStep {
             PlannedStep::LvmActivate { .. } => "lvm-activate",
             PlannedStep::LvmDeactivate { .. } => "lvm-deactivate",
             PlannedStep::MountXfs { .. } => "mount-xfs",
+            PlannedStep::VerifyMountDevice { .. } => "verify-mount-device",
             PlannedStep::WriteSentinel { .. } => "write-sentinel",
             PlannedStep::VerifyMountIdentity { .. } => "verify-mount-identity",
             PlannedStep::Umount { .. } => "umount",
@@ -116,6 +123,7 @@ impl PlannedStep {
             PlannedStep::NbdConnect { device: d, .. }
             | PlannedStep::SetBlockSize { device: d, .. }
             | PlannedStep::NbdDisconnect { device: d }
+            | PlannedStep::VerifyMountDevice { nbd_device: d, .. }
             | PlannedStep::VerifyMountIdentity { nbd_device: d, .. } => [d],
             _ => return,
         };
@@ -144,6 +152,13 @@ impl fmt::Display for PlannedStep {
             PlannedStep::MountXfs { device, mountpoint } => {
                 write!(f, "mount -t xfs -o noatime {device} {mountpoint}")
             }
+            PlannedStep::VerifyMountDevice {
+                mountpoint,
+                nbd_device,
+            } => write!(
+                f,
+                "verify the filesystem at {mountpoint} is stored only on {nbd_device}"
+            ),
             PlannedStep::WriteSentinel {
                 mountpoint,
                 volume_uuid,
@@ -179,6 +194,68 @@ pub struct Plan {
     /// The volume the plan is for (names the bound-device record).
     pub volume: String,
     pub steps: Vec<PlannedStep>,
+    /// For a detach: the device the planner resolved from the attach
+    /// record, if that is where it came from. The executor re-reads the
+    /// record under the attach lock and refuses to run when it no longer
+    /// names this device (F06): a plan is an observation, not a permit.
+    pub recorded_device: Option<String>,
+}
+
+/// Bring a detach plan's device up to date with the attach record as read
+/// *under the attach lock*, or refuse it (F06):
+///
+/// - a placeholder device is bound to the recorded one, and refused when
+///   there is no record (never "the lowest free device", O-02);
+/// - a device the planner took from the record must still be what the
+///   record names: the volume may have been detached and re-attached (to
+///   another device, with another volume now on the planned one) since
+///   the plan was made;
+/// - a device the operator named explicitly is theirs to name.
+///
+/// Attach and grow plans (no disconnect) are unchanged.
+pub fn reconcile_detach_device(
+    plan: &mut Plan,
+    current_record: Option<&str>,
+) -> Result<(), String> {
+    let planned = plan.steps.iter().find_map(|s| match s {
+        PlannedStep::NbdDisconnect { device } => Some(device.clone()),
+        _ => None,
+    });
+    let Some(planned) = planned else {
+        return Ok(());
+    };
+    if plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, PlannedStep::NbdConnect { .. }))
+    {
+        return Ok(());
+    }
+    if planned == AUTO_NBD_DEVICE {
+        return match current_record {
+            Some(device) => {
+                plan.bind_device(device);
+                Ok(())
+            }
+            None => Err(format!(
+                "the NBD device is on auto and no device is recorded at {} for this volume; \
+                 refusing to guess which device to disconnect (pass --nbd-device)",
+                bound_device_record_path(&plan.volume).display()
+            )),
+        };
+    }
+    match (&plan.recorded_device, current_record) {
+        (None, _) => Ok(()),
+        (Some(recorded), Some(current)) if current == recorded && current == planned => Ok(()),
+        (Some(recorded), Some(current)) => Err(format!(
+            "stale plan: the attach record now names {current}, the plan was made for \
+             {recorded}; the volume was re-attached since, re-run the detach"
+        )),
+        (Some(recorded), None) => Err(format!(
+            "stale plan: the attach record for {recorded} is gone (the volume was detached \
+             since the plan was made); nothing to disconnect"
+        )),
+    }
 }
 
 impl Plan {
@@ -205,6 +282,7 @@ impl Plan {
                 PlannedStep::NbdConnect { device, .. }
                 | PlannedStep::SetBlockSize { device, .. }
                 | PlannedStep::NbdDisconnect { device }
+                | PlannedStep::VerifyMountDevice { nbd_device: device, .. }
                 | PlannedStep::VerifyMountIdentity { nbd_device: device, .. }
                 if device == AUTO_NBD_DEVICE
             )
@@ -248,6 +326,12 @@ pub fn plan_attach(request: &AttachRequest) -> Plan {
             device: format!("/dev/{}/{}", request.vg_name, request.lv_name),
             mountpoint: request.mountpoint.clone(),
         },
+        // Before the sentinel or the probe touch the filesystem: it must
+        // be on the device this plan connected, and only on it (F02).
+        PlannedStep::VerifyMountDevice {
+            mountpoint: request.mountpoint.clone(),
+            nbd_device: request.nbd_device.clone(),
+        },
     ];
     if request.init_sentinel {
         steps.push(PlannedStep::WriteSentinel {
@@ -265,6 +349,7 @@ pub fn plan_attach(request: &AttachRequest) -> Plan {
         description: format!("attach volume {}", request.volume),
         volume: request.volume.clone(),
         steps,
+        recorded_device: None,
     }
 }
 
@@ -291,10 +376,13 @@ pub fn recorded_bound_device(volume: &str) -> Option<String> {
 /// the one recorded at attach, and stays unresolved (refused by the
 /// executor, see [`Plan::unresolved_disconnect`]) when there is no record.
 pub fn plan_detach(request: &AttachRequest) -> Plan {
-    let device = if request.nbd_device == AUTO_NBD_DEVICE {
-        recorded_bound_device(&request.volume).unwrap_or_else(|| AUTO_NBD_DEVICE.to_string())
+    let (device, recorded_device) = if request.nbd_device == AUTO_NBD_DEVICE {
+        match recorded_bound_device(&request.volume) {
+            Some(recorded) => (recorded.clone(), Some(recorded)),
+            None => (AUTO_NBD_DEVICE.to_string(), None),
+        }
     } else {
-        request.nbd_device.clone()
+        (request.nbd_device.clone(), None)
     };
     Plan {
         description: format!("detach volume {}", request.volume),
@@ -308,6 +396,7 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
             },
             PlannedStep::NbdDisconnect { device },
         ],
+        recorded_device,
     }
 }
 
@@ -326,6 +415,7 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
                 mountpoint: request.mountpoint.clone(),
             },
         ],
+        recorded_device: None,
     }
 }
 

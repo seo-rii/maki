@@ -330,6 +330,8 @@ fn zero_and_inverted_bounds_are_rejected() {
         ("[nbd]\nthreads = 0", "nbd.threads"),
         ("[nbd]\nminimum_io = 4096\npreferred_io = 512", "nbd I/O sizes"),
         ("[nbd]\nminimum_io = 3000", "power of two"),
+        // F07: the admission budget must hold one maximal request.
+        ("[limits]\nmax_plaintext_bytes = \"1MiB\"\nmax_ciphertext_bytes = \"2MiB\"", "max_plaintext_bytes"),
         ("[backing]\nroot = \"/x\"\njournal_segment_size = \"1MiB\"\njournal_max_bytes = \"1MiB\"", "journal_max_bytes"),
         ("[control]\ngroup = \" \"", "control.group"),
         ("[security]\nmemory_lock_mode = \"maybe\"", "memory_lock_mode"),
