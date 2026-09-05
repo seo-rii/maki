@@ -49,6 +49,12 @@ records the evidence. The updated helper requires a new runtime layout and NBD
 backend identity support; follow the [upgrade procedure](docs/operations.md#upgrading-the-runtime-layout)
 and qualify it on the target host before deployment.
 
+A [further reliability review](docs/review-remediation.md#further-reliability-review-2026-09-05)
+reproduced and fixed partial journal writes, failed-writeback retries, cancelled
+crypto work, queue deadlines, NBD request limits, interrupted detach retries,
+and control-socket permission races.
+Each fix has a regression that failed before implementation.
+
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.
 

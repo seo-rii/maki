@@ -106,6 +106,22 @@ packaged configuration without installing services or creating users.
 | Credential source identity (BUG-007) | `maki-nbdkit/tests/review_credential_sources.rs`: conflicting sources for one name rejected before loading credentials; repeated same-source references and distinct names remain valid |
 | HTTP error redaction (BUG-008) | `maki-crypto-http/tests/review_redirect.rs`: connection failure, timeout, and truncated response errors omit request URLs and synthetic query secrets from both Display and Debug |
 | Administrative socket access (BUG-009) | `maki-nbdkit/tests/regression_control_packaging.rs`: default/example/custom paths, admin traversal, daemon access, and isolation from NBD and helper state under the packaged directory modes |
+| Interrupted detach (BUG-010) | `maki-privileged/src/detach_tests.rs`, `exec_tests.rs`, and `probe.rs`: retry after each completed step, safe record-only cleanup, wrong mount/backend refusal, escaped VG names, partition holders, and direct mounts; all device operations use fixtures |
+| NBD request limits (BUG-011, supersedes O-03) | `maki-nbdkit/tests/review_nbd_limits.rs`: oversized reads leave caller buffers untouched, oversized writes leave volume data unchanged, minimum alignment applies to offsets and lengths, valid maximum writes survive reopen, invalid wire sizes fail configuration validation, and real nbdkit/libnbd negotiation reports the configured tuple |
+| Scheduler cancellation (BUG-012) | `maki-crypto/tests/review_scheduler_cancellation.rs`: queued payload and admission release, cancellation behind a live blocked group, active-RPC cancellation, cancellation of one group in a coalesced batch, and continued service for live callers |
+| Queue deadlines (BUG-013) | `maki-crypto/tests/review_queued_deadline.rs`: ManualClock deadlines cover admission, coalescing, slot wait, and RPC under one caller budget; a live peer retains its own budget and stall mode remains unbounded |
+| Concurrent socket permissions (BUG-014) | `maki-control/tests/review_uds_umask.rs`: bind concurrently with private directory creation and verify mode 0700 is preserved; `review_uds.rs` also checks prepared socket mode/group, preservation on failed group lookup, cleanup on failed publication, and actual Linux connection at the maximum public path length |
+| Partial journal writes (BUG-020) | `maki-core/tests/review_journal_retry.rs`: a BackingFile that writes a prefix then returns EIO, shorter retries, roll/FLUSH without retry, cleanup failure, and recovery after sealing the segment |
+| Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO, retry and process recovery followed by power loss, changes after the scan, valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer |
+| gRPC authentication evidence (TEST-002) | `maki-nbdkit/tests/phase9_daemon.rs`: attach without metadata must fail after the server actually rejects it with Unauthenticated; valid metadata roundtrips with no authentication rejection, independently of which deadline's error text wins |
+
+The native NBD negotiation case requires Linux, `nbdkit`, and `nbdinfo` from
+libnbd. It uses Cargo's cdylib and an isolated child process with a private Unix
+socket; absent optional programs skip that case. It passed
+on this review host. An independent C probe against the installed
+`nbdkit-plugin.h` also confirmed the 384-byte published prefix and the
+`block_size` callback at offset 376 on this host. These checks qualify the
+userspace ABI and negotiation, without operating a kernel NBD device.
 
 ## Current qualification status
 

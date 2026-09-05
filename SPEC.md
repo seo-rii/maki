@@ -383,6 +383,12 @@ match the live NBD backend before detach and immediately before disconnect,
 including rollback. A missing or invalid record MUST fail closed, even when
 the caller supplies an explicit NBD device.
 
+A detach retry MAY skip a step whose completion is verified from current mount
+and block-device observations. Destructive steps still require matching live
+identity. If every detach step has already completed, the helper MAY retire
+the trusted record without device commands only after verifying mount absence,
+inactive VG mappings, and no remaining NBD or partition use.
+
 ---
 
 # 9. Credential Management
@@ -571,6 +577,12 @@ Block-related concepts are separated.
 | `max_ciphertext_size` | maximum ciphertext per unit   | provider contract |
 | `slot_alignment`      | backing slot alignment        |               512 |
 | `slot_size`           | physical slot size            |        calculated |
+
+The plugin MUST advertise the configured minimum, preferred, and maximum NBD
+I/O sizes. The minimum MUST be at most 64 KiB and the maximum MUST fit in the
+32-bit NBD field. Read and write callbacks MUST reject zero-length, oversized,
+out-of-range, or minimum-misaligned requests before copying write plaintext or
+submitting engine work. The preferred size is a performance hint.
 
 Recommended:
 
@@ -928,6 +940,10 @@ NBD completion
 
 Each volume has one ordered journal writer actor.
 
+A failed append MAY leave a partial physical tail, but subsequent appends and
+barriers MUST remove bytes beyond the last accepted record. Cleanup MUST stay
+pending until truncation and synchronization succeed, including before a roll.
+
 Tracked state includes:
 
 ```text
@@ -981,6 +997,11 @@ advance durable_sequence
  ↓
 FLUSH success
 ```
+
+After writeback failure, a successful sync retry alone MUST NOT establish
+durability. The writer MUST rewrite the accepted pending bytes, verify their
+identity, and synchronize them before advancing the durable boundary. Changed
+or lost bytes MUST cause failure without acknowledging them.
 
 ---
 
@@ -1046,9 +1067,11 @@ scan journal
  ↓
 discard/truncate partial tail
  ↓
-fdatasync every surviving segment, publish the durable mark
+rewrite and verify every accepted prefix, then fdatasync each segment
+and publish the durable mark
 (a process restart hands recovery page-cache bytes: nothing it
-accepts may stay unsynced once the writer resumes)
+accepts may stay unsynced once the writer resumes, including pages
+whose dirty bits were cleared by failed writeback)
  ↓
 rebuild overlay
  ↓
@@ -1289,6 +1312,11 @@ retry frequency remains bounded
 operator cancellation remains possible
 ```
 
+Cancellation MUST release queued payload and its admission charge together,
+including requests queued behind a live blocked request. A shared RPC MUST
+remain available to its live callers and MUST be abandoned once its final
+caller cancels.
+
 ## `bounded-error`
 
 After the configured maximum operation time:
@@ -1296,6 +1324,10 @@ After the configured maximum operation time:
 ```text
 return I/O error
 ```
+
+The crypto operation budget MUST include scheduler admission, coalescing,
+waiting for an RPC slot, and the RPC itself. Dispatch MUST NOT reset the
+caller's budget.
 
 ---
 

@@ -110,6 +110,19 @@ reused: recovery continues numbering above both the surviving segments and the
 mark. The [review remediation log](review-remediation.md) describes these rules
 in detail.
 
+A failed append can leave bytes beyond the last accepted record. The writer
+retains a cleanup flag until truncation and synchronization succeed, including
+when the next operation is a shorter write, FLUSH, or segment roll.
+
+After a journal writeback error, a plain fsync retry may leave clean but
+unpersisted page-cache bytes behind. The writer re-reads and rewrites its
+accepted pending range in 64 KiB chunks, compares an ephemeral streaming
+fingerprint, and only then synchronizes it. Recovery similarly binds each
+prefix to the bytes accepted by its scan, rewrites and verifies that prefix,
+then synchronizes before publishing a durable mark. Changed bytes refuse
+recovery or the durability acknowledgement. Normal successful live flushes
+avoid this extra rewrite; recovery pays an additional pass over valid data.
+
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at
 checkpoint time. The durable boundary can move inside `append` itself (an
@@ -169,6 +182,12 @@ growing memory. Each lane keeps several batches in flight (bounded by
 `limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
 requests behind it. Local providers are called directly.
 
+Queued groups own their payload and admission charge together. Cancellation
+removes the complete group even if it is behind another group waiting for an
+RPC slot. An active coalesced RPC remains necessary until its last caller
+leaves. For bounded-error calls, one caller budget covers admission, coalescing,
+the slot wait, and the provider response; dispatch does not restart it.
+
 The dispatcher validates quarantined endpoints in background tasks, never on
 the request path. Each admitted call owns a circuit-breaker permit for its
 generation. Completion, operation deadline, cancellation, request/provider
@@ -204,7 +223,13 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 ## Security boundaries
 
 - The nbdkit data plane runs as the `maki` user with no Linux capabilities.
+- The plugin advertises configured NBD block sizes and validates request
+  length, range, and alignment before copying write plaintext into Maki or
+  submitting work to the engine.
 - The control socket exposes status, metrics, checkpoint, and reload only.
+- Socket creation keeps the process umask unchanged. A private staging
+  directory hides the socket until its group and mode are set; rename then
+  publishes the ready socket at its configured path.
 - Its default path is `/run/maki-control/<volume>/control.sock`; the packaged
   runtime layout lets `maki-admin` reach it through a separate directory tree
   while keeping the NBD runtime tree restricted to the daemon's group.

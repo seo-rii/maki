@@ -213,6 +213,21 @@ deactivating a VG. It verifies the backend again immediately before disconnect,
 including rollback. Missing records or mismatched identities refuse execution;
 an explicit `--nbd-device` cannot bypass this check.
 
+Detach retries observe current mountinfo and sysfs state before each step.
+An already completed unmount or VG deactivation is skipped. A remaining mount
+must identify the expected LV device, XFS root, and volume sentinel, and active
+VG mappings must use the recorded NBD device. A different mount or backend,
+unreadable observations, remaining device holders (including partition
+holders), and direct mounts of the NBD device or its partitions block unsafe
+deactivation or disconnect.
+
+If disconnect succeeded but the process stopped before retiring its record,
+a retry may remove that record without running device commands only after
+confirming the mount is absent, the VG is inactive, and the disconnected NBD
+has no observed remaining use. This uses the helper's current mount namespace;
+cross-namespace operational qualification remains a target-host check. The
+trusted record format and the legacy migration requirements remain the same.
+
 This requires **nbd-client 3.27.0 or later built with netlink support**, and a
 kernel exposing the NBD backend identifier. The identifier option was added
 in [NBD 3.27.0](https://github.com/NetworkBlockDevice/nbd/releases/tag/nbd-3.27.0).

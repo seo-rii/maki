@@ -63,7 +63,8 @@ schema, geometry, and secret-literal checks it rejects:
   `secure-buffers | all | off`;
 - NBD I/O sizes that are not powers of two or not ordered
   `device_block_size <= minimum_io <= preferred_io <= maximum_io`, or an
-  `nbd.device_block_size` that differs from the volume's;
+  `nbd.device_block_size` that differs from the volume's. `minimum_io` must
+  not exceed 64 KiB, and `maximum_io` must fit in the NBD 32-bit wire field;
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at
@@ -157,8 +158,9 @@ Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request has been
 sent, and the WebSocket transport does not resend over a fresh connection. With
 `availability_policy = "bounded-error"`, `max_operation_time` is an absolute
-wall-clock deadline: backoff never sleeps past it and an in-flight request is
-abandoned when it expires. Endpoints that could not be cross-validated at attach
+wall-clock deadline: backoff never sleeps past it and an expired caller receives
+an error. A shared RPC remains active while it still has a live caller.
+Endpoints that could not be cross-validated at attach
 (unreachable at the time) are quarantined and start serving only after the
 cross-endpoint check succeeds against a validated endpoint.
 HalfOpen breaker probes return their admission slots on every exit, including
@@ -166,10 +168,29 @@ operation deadlines, cancellation, request/provider errors, and refusal by the
 retry budget. These neutral outcomes leave the endpoint's failure count
 unchanged, so later requests can still probe for recovery.
 
+For a batched crypto call, the operation budget begins before scheduler
+admission and includes coalescing, waiting for an RPC slot, and the RPC itself.
+Dispatch does not reset the caller's budget. Cancellation removes that caller's
+queued payload and admission charge; an in-flight coalesced RPC is abandoned
+when its final caller leaves. Other callers in that batch can still complete.
+
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
 Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
+
+## NBD request limits
+
+The plugin advertises `minimum_io`, `preferred_io`, and `maximum_io` through
+nbdkit's block-size callback. The adapter also rejects read/write requests with
+zero length, invalid minimum-size alignment, an out-of-range end, or a length
+above `maximum_io` with EINVAL, before copying write plaintext or entering the
+engine. Clients that ignore negotiation therefore cannot bypass the bound used
+to validate journal headroom. `preferred_io` remains a performance hint.
+
+This negotiation path was verified with the installed nbdkit header and a real
+rootless nbdkit/libnbd connection. Older clients can still connect, but requests
+outside the configured constraints fail cleanly.
 
 ## Journal bounds
 

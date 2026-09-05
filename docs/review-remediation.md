@@ -9,6 +9,78 @@ their regression evidence.
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
+## Further reliability review (2026-09-05)
+
+The next pass started from `aae6ee9` and reproduced seven more defects in the
+journal, crypto scheduler, NBD boundary, detach recovery, and control socket.
+Every fix followed RED (behavioral regression failure), implementation, and
+GREEN. The journal changes preserve the on-disk format and use bounded scratch
+space.
+
+| Finding | Status | Result and regression evidence |
+|---|---|---|
+| BUG-010: detach cannot resume after partial completion | Fixed | Observe current mountinfo and sysfs before each step; skip verified completed work while retaining mount, VG, and live backend checks. Already-disconnected records can be retired only with no remaining mount, VG, NBD, or partition use. Fixture tests cover interrupted steps, foreign mounts/backends, escaped VG names, partition holders, and direct mounts. |
+| BUG-011 / O-03: NBD limits are neither advertised nor enforced | Fixed | Publish the nbdkit `block_size` callback and reject invalid read/write lengths, ranges, and alignment before copying write plaintext or entering the engine. Configuration rejects minimum sizes above 64 KiB and maxima outside the NBD wire field. `review_nbd_limits.rs` verifies unchanged data on rejection, valid maximum I/O across reopen, and actual rootless NBD negotiation. |
+| BUG-012: cancelled scheduler work retains payload, admission, or RPC slots | Fixed | Pending groups own payload and admission together. Closed callers are removed even behind a live blocked group; shared RPCs are cancelled only when their final caller leaves. Seven `review_scheduler_cancellation.rs` cases cover coalescing, slot waits, queued tails, cancellation of one group in a coalesced batch, and live peers. |
+| BUG-013: bounded-error excludes time spent in the scheduler | Fixed | Forward the provider operation budget through wrappers and apply it around the entire scheduler submission. ManualClock tests cover admission, coalescing, waiting for a slot, and RPC under one deadline, with independent peer budgets and an unbounded stall control. |
+| BUG-014: control socket bind changes permissions in unrelated threads | Fixed | Remove the process-wide umask override. Prepare the socket inside a mode-0700 directory, apply group/mode, then rename it to the public path. Concurrent mode-0700 directory creation previously produced mode 0600. Tests now preserve that mode, the existing path on failed group lookup, cleanup on failed publication, and Linux's maximum usable public path length. |
+| BUG-020: a failed append leaves a corrupt tail after a shorter retry or roll | Fixed | Retain a tail-cleanup flag until truncation and sync succeed; remove unaccepted bytes before retrying, flushing, or sealing. `review_journal_retry.rs` injects a real partial BackingFile write and checks recovery after a shorter retry, roll without retry, and failed cleanup. |
+| BUG-021: sync retry or process recovery acknowledges lost journal writeback | Fixed | After actual sync failure, rewrite the accepted pending range, compare an ephemeral streaming fingerprint, and sync before acknowledging. Recovery rewrites each prefix accepted by its scan before sealing. `review_journal_writeback.rs` models lost dirty bits, subsequent power loss, cache changes, self-consistent header mutation, and ranges larger than the 64 KiB buffer. |
+| TEST-002: gRPC authentication regression depends on the winning deadline's error string | Fixed | `phase9_daemon.rs` now observes actual server-side Unauthenticated rejections and failed attach, with no rejection for valid metadata. A generic scheduler deadline is valid under BUG-013. The real-socket fixture has a two-second budget; precise deadline behavior remains covered by ManualClock tests. |
+
+Linux iomap can clear dirty bits even when page-cache writeback fails, so the
+writeback fixture models a documented kernel behavior. Recovery now pays an
+additional read/write pass over accepted journal data; ordinary successful live
+flushes avoid it. See the [kernel writeback documentation](https://www.kernel.org/doc/html/v6.17/filesystems/iomap/operations.html#pagecache-writeback).
+
+NBD clients can ignore negotiated sizes, which is why both advertisement and
+adapter validation are required. The installed C header and loaded plugin
+agreed on the 384-byte prefix, API version 2, and `block_size` offset 376; an
+actual nbdkit/libnbd connection reported the configured 4096/4096/8192 tuple.
+See the [nbdkit callback contract](https://libguestfs.org/nbdkit-plugin.3.html#block_size).
+
+All RED logs below returned **101** with behavioral failures; all GREEN logs
+returned **0**. Filenames are relative to `/home/seorii/logs/`, with private
+`.exit.json` sidecars preserving commands and exit status.
+
+| Issue | RED log | GREEN log |
+|---|---|---|
+| BUG-010 | `maki-fix-bug010-red-20260905T121013.730111Z.log`; partition use: `maki-fix-bug010-partition-red-20260905T122825.502887Z.log` | `maki-fix-bug010-partition-green-20260905T122953.767108Z.log` |
+| BUG-011 | `maki-fix-bug011-isolated-red-20260905T122132.775100Z.log` | `maki-fix-bug011-green-20260905T122308.662263Z.log` |
+| BUG-012 | `maki-fix-bug012-red-20260905T121106.912502Z.log`; queued tail: `maki-fix-bug012-tail-red-20260905T122059.475151Z.log` | `maki-fix-bug012-tail-green-20260905T122212.004436Z.log` |
+| BUG-013 | `maki-fix-bug013-red-20260905T121828.291381Z.log` | `maki-fix-bug013-green-20260905T122641.978514Z.log` |
+| BUG-014 | `maki-fix-bug014-red-20260905T124750.878309Z.log`; failed publication: `maki-fix-bug014-publication-red-20260905T125158.193474Z.log` | `maki-fix-bug014-green-20260905T125347.498590Z.log` |
+| BUG-020 | `maki-fix-bug020-red-20260905T121354.899842Z.log` | `maki-fix-bug020-green-20260905T121627.739081Z.log` |
+| BUG-021 | `maki-fix-bug021-red-20260905T122051.918638Z.log`; valid-header mutation: `maki-fix-bug021-header-red-20260905T122447.223461Z.log` | `maki-fix-bug021-green-20260905T122652.551362Z.log` |
+| TEST-002 | `maki-fix-test002-observed-auth-red-20260905T130857.232492Z.log` | `maki-fix-test002-auth-green-20260905T131019.262153Z.log` |
+
+Final Linux verification for this round:
+
+| Check | Result | Exit |
+|---|---|---:|
+| `cargo fmt --all --check` | Pass | 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Pass, no diagnostics | 0 |
+| `cargo test --workspace --locked` | 484 passed, 0 failed, 7 ignored | 0 |
+| `cargo test --workspace --release --locked -- --ignored` | 7 passed, 0 failed | 0 |
+| Independent C ABI probe and rootless NBD negotiation | Configured block-size callback layout and 4096/4096/8192 negotiation verified | 0 |
+
+Final baseline process PID `2886645` returned **0**:
+`/home/seorii/logs/maki-fix-followup-baseline-final-20260905T131121.236462Z.log`.
+Its `.exit.json` and `.summary.json` sidecars record the command and totals.
+The release-gates command returned **0** in process PID `2786564`:
+`/home/seorii/logs/maki-fix-followup-final-gates-20260905T125637.142287Z.log`.
+That earlier combined wrapper returned **1** because of the now-fixed TEST-002
+assertion; no production code changed after its successful release-gates step.
+The independent C probe was PID `2533875`, exit **0**:
+`/home/seorii/logs/maki-fix-bug011-abi-review-20260905T122540.302503Z.log`.
+
+The detach changes use the helper's current mount namespace and require target
+qualification for the installed kernel, nbd-client, LVM, XFS, and service
+layout. This pass used simulated device observations and private userspace
+sockets; it did not perform privileged device operations or deployment. The
+existing database, vendor-provider, TLS, and hardware power-loss qualification
+limits remain.
+
 ## Follow-up review (2026-09-05)
 
 The [project assessment](project-review-2026-09-05.md) of `8b06c53` found nine
@@ -75,9 +147,9 @@ This round used Linux fixtures and local sockets without activating services,
 creating users/groups, or operating real NBD devices. Offline systemd assertion
 and dependency checks do not replace a real service-start campaign. The new
 helper protocol still needs target-host qualification; the earlier kernel
-NBD/LVM/XFS reports describe older revisions. Existing O-03, queue-deadline,
-transport TLS, database, and power-loss qualification limitations remain outside
-these nine fixes.
+NBD/LVM/XFS reports describe older revisions. O-03 and queue deadlines remained
+outside those nine fixes and were subsequently resolved as BUG-011 and BUG-013
+above. Transport TLS, database, and power-loss qualification limits remain.
 
 ## Overall status (2026-09-03)
 
@@ -254,20 +326,16 @@ K (core), C (crypto), O (operations).
 | K-09 | Plaintext left `SecretBuffer` into plain `Vec<u8>` on the read and write paths of the adapter. | `Engine::read_secret` returns a zeroizing buffer; the adapter copies from it and wraps incoming writes. | build (the daemon path only) |
 | O-11 | The control socket existed with `0777 & ~umask` between `bind` and `chmod`. | `bind` runs under umask `0117`. | existing mode assertions |
 
-Not fixed, documented as limits:
+The temporary umask approach for O-11 was replaced by private preparation and
+atomic publication in BUG-014 above because a umask override also affected
+unrelated threads and child processes.
 
-- **O-03: `nbd.maximum_io` is neither advertised nor enforced.** The plugin
-  publishes only the nbdkit v2 callback prefix, so clients never learn the
-  configured maximum and the kernel sends up to its own `max_sectors_kb`
-  (32 MiB, 64 MiB for libnbd). `validate_journal_bounds` sizes the journal
-  headroom from `maximum_io`, so a minimal configuration can leave a very
-  large request unable to fit after an inline reclaim and it fails with
-  ENOSPC (EIO to the filesystem). The fix is advertising `.block_size`
-  through the nbdkit ≥ 1.30 plugin struct, which this environment cannot
-  compile or test; until then size `backing.journal_max_bytes` for the
-  largest request the client can issue, not for `nbd.maximum_io`.
-- The scheduler's operation deadline starts when a batch is dispatched, not
-  when the request is queued (C-04 note).
+The NBD maximum-I/O gap (O-03) and deadline starting only at dispatch (C-04
+note) were subsequently fixed as BUG-011 and BUG-013 in the
+[further reliability review](#further-reliability-review-2026-09-05).
+
+Still documented as limits:
+
 - The checkpoint worker can hold the volume lock for the duration of one
   checkpoint after the last engine handle is dropped (K-10).
 - The accept-error test creates descriptor pressure in-process and is
