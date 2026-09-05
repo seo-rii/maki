@@ -17,3 +17,6 @@ pub mod verify;
 
 #[cfg(target_os = "linux")]
 pub mod exec;
+
+#[cfg(target_os = "linux")]
+mod state;

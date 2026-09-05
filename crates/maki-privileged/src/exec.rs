@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use crate::plan::{rollback_steps, Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{choose_free_nbd, nbd_index, parse_mountinfo};
+use crate::state::{BoundDeviceRecord, TrustedState};
 use crate::verify::{verify_mount_identity, MountExpectation, MountObservation};
 
 /// Serializes attach helpers system-wide (device allocation + connect).
-pub const ATTACH_LOCK_PATH: &str = "/run/maki/attach.lock";
+pub const ATTACH_LOCK_PATH: &str = "/run/maki-attach/attach.lock";
 const NBD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
@@ -63,20 +64,13 @@ fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError
 /// the file lock is released when this is dropped.
 pub struct AttachLock {
     _file: File,
+    state: TrustedState,
 }
 
 pub fn lock_attach() -> io::Result<AttachLock> {
-    if let Some(dir) = Path::new(ATTACH_LOCK_PATH).parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(ATTACH_LOCK_PATH)?;
-    file.lock()?;
-    Ok(AttachLock { _file: file })
+    let state = TrustedState::open()?;
+    let file = state.lock()?;
+    Ok(AttachLock { _file: file, state })
 }
 
 fn nbd_connected(device: &str) -> bool {
@@ -260,7 +254,7 @@ pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> MountObservation {
     }
 }
 
-fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
+fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecError> {
     match step {
         PlannedStep::ModprobeNbd => run(step, "modprobe", &["nbd"]),
         PlannedStep::NbdConnect {
@@ -269,8 +263,21 @@ fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
             block_size,
         } => {
             let bs = block_size.to_string();
-            run(step, "nbd-client", &["-unix", socket, device, "-b", &bs])?;
-            wait_nbd_ready(step, device)
+            let identifier =
+                connection_id.ok_or_else(|| identity_error("missing connect identifier"))?;
+            run(
+                step,
+                "nbd-client",
+                &[
+                    "-unix",
+                    socket,
+                    device,
+                    "-b",
+                    &bs,
+                    "-identifier",
+                    identifier,
+                ],
+            )
         }
         PlannedStep::SetBlockSize { device, block_size } => run(
             step,
@@ -324,56 +331,168 @@ fn run_step(step: &PlannedStep) -> Result<(), ExecError> {
     }
 }
 
-/// Execute a plan. A plan that still needs an NBD device gets one allocated
-/// under the attach lock (held for the whole run). If a step fails, the
-/// executed prefix is rolled back in reverse and the original error is
-/// returned with the rollback outcome.
-pub fn execute(plan: &Plan) -> Result<(), ExecError> {
-    let mut plan = plan.clone();
-    if plan.unresolved_disconnect() {
-        return Err(ExecError::Step {
-            step: "nbd-disconnect".to_string(),
-            message: format!(
-                "the NBD device is on auto and no device was recorded at attach ({}); \
-                 refusing to guess which device to disconnect (pass --nbd-device)",
-                crate::plan::bound_device_record_path(&plan.volume).display()
-            ),
-        });
+fn identity_error(message: impl Into<String>) -> ExecError {
+    ExecError::Step {
+        step: "nbd-identity".into(),
+        message: message.into(),
     }
-    // Connecting *and* disconnecting serialize under the attach lock: a
-    // detach racing another volume's attach must not touch its device.
+}
+
+/// System interactions are isolated so tests exercise the same ordering,
+/// record validation, and rollback decisions without touching devices.
+trait System {
+    fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
+    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
+    fn allocate(&mut self) -> Result<String, ExecError>;
+    fn backend(&self, device: &str) -> io::Result<Option<String>>;
+}
+
+struct LinuxSystem;
+
+impl System for LinuxSystem {
+    fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
+        run_step(step, identifier)
+    }
+
+    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+        wait_nbd_ready(step, device)
+    }
+
+    fn allocate(&mut self) -> Result<String, ExecError> {
+        allocate_nbd_device()
+    }
+
+    fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        let index = nbd_index(device)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid NBD device"))?;
+        let path = format!("/sys/block/nbd{index}/backend");
+        match std::fs::read_to_string(path) {
+            Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ if !nbd_connected(device) => Ok(None),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "connected NBD device has no backend identifier; netlink identity support is required",
+            )),
+        }
+    }
+}
+
+fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
+    if system.backend(&record.device)?.as_deref() != Some(&record.connection_id) {
+        return Err(identity_error(format!(
+            "{} no longer has the recorded attachment identity; refusing to disconnect",
+            record.device,
+        )));
+    }
+    Ok(())
+}
+
+/// Execute under one root-controlled lock, resolving runtime records only
+/// after taking it. A pinned device never bypasses identity verification.
+pub fn execute(plan: &Plan) -> Result<(), ExecError> {
     let needs_lock = plan.steps.iter().any(|s| {
         matches!(
             s,
             PlannedStep::NbdConnect { .. } | PlannedStep::NbdDisconnect { .. }
         )
     });
-    let _lock = if needs_lock {
+    let lock = if needs_lock {
         Some(lock_attach()?)
     } else {
         None
     };
+    execute_with(
+        plan,
+        lock.as_ref().map(|lock| &lock.state),
+        &mut LinuxSystem,
+    )
+}
+
+fn execute_with(
+    plan: &Plan,
+    state: Option<&TrustedState>,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    let mut plan = plan.clone();
+    let connects = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, PlannedStep::NbdConnect { .. }));
+    let disconnects = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, PlannedStep::NbdDisconnect { .. }));
+    let mut record = None;
+    if connects || disconnects {
+        let state = state.ok_or_else(|| identity_error("attach state lock is required"))?;
+        let prior = state.read(&plan.volume)?;
+        if connects {
+            if let Some(prior) = &prior {
+                if system.backend(&prior.device)?.is_some() {
+                    return Err(identity_error(
+                        "recorded device is still connected; detach or verify its stale state before attaching",
+                    ));
+                }
+            }
+        } else {
+            let prior = prior.ok_or_else(|| identity_error(format!(
+                "no trusted attach record at {}; legacy device-only records are not imported, and a pinned device cannot bypass verification",
+                crate::plan::bound_device_record_path(&plan.volume).display(),
+            )))?;
+            if plan.attachment.as_ref() != Some(&prior.attachment)
+                || plan.steps.iter().any(|step| {
+                    matches!(step,
+                        PlannedStep::NbdDisconnect { device }
+                            if device != crate::plan::AUTO_NBD_DEVICE && device != &prior.device
+                    )
+                })
+            {
+                return Err(identity_error(
+                    "detach configuration does not match the trusted attach record",
+                ));
+            }
+            // Verify before umount or VG deactivation can affect anything.
+            verify_connection(&prior, system)?;
+            plan.bind_device(&prior.device);
+            record = Some(prior);
+        }
+    }
     if plan.needs_device_allocation() {
-        // The module must be loaded before sysfs lists any nbd device.
-        run(&PlannedStep::ModprobeNbd, "modprobe", &["nbd"])?;
-        let device = allocate_nbd_device()?;
+        system.run_step(&PlannedStep::ModprobeNbd, None)?;
+        let device = system.allocate()?;
         tracing::info!("maki-attach: allocated {device}");
         plan.bind_device(&device);
         println!("# bound NBD device: {device}");
     }
-    // Remember the device an attach binds, for the detach that follows
-    // (O-02). Written before connecting so a crash between the two leaves
-    // at worst a stale record naming an unconnected device.
-    let connects = plan.steps.iter().find_map(|s| match s {
-        PlannedStep::NbdConnect { device, .. } => Some(device.clone()),
-        _ => None,
-    });
-    if let Some(device) = &connects {
-        let record = crate::plan::bound_device_record_path(&plan.volume);
-        if let Some(dir) = record.parent() {
-            std::fs::create_dir_all(dir)?;
+    if connects {
+        let device = plan
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                PlannedStep::NbdConnect { device, .. } => Some(device.clone()),
+                _ => None,
+            })
+            .unwrap();
+        if system.backend(&device)?.is_some() {
+            return Err(identity_error("requested NBD device is already connected"));
         }
-        std::fs::write(&record, format!("{device}\n"))?;
+        let nonce = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?;
+        let prepared = BoundDeviceRecord {
+            version: 1,
+            volume: plan.volume.clone(),
+            attachment: plan
+                .attachment
+                .clone()
+                .ok_or_else(|| identity_error("missing attachment configuration identity"))?,
+            device,
+            connection_id: format!("maki-{}", nonce.trim()),
+        };
+        // Persist the unique identity before connecting: process death
+        // cannot leave an unrecorded connection or authorize a later reuse
+        // of the same /dev/nbdN by a different attachment.
+        state.unwrap().write(&prepared)?;
+        record = Some(prepared);
     }
 
     let mut executed: Vec<PlannedStep> = Vec::new();
@@ -383,32 +502,61 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
         // even if readiness times out, so the rollback disconnects it
         // instead of leaking a connected device (O-07).
         let result = match step {
-            PlannedStep::NbdConnect {
-                socket,
-                device,
-                block_size,
-            } => {
-                let bs = block_size.to_string();
-                match run(step, "nbd-client", &["-unix", socket, device, "-b", &bs]) {
+            PlannedStep::NbdConnect { device, .. } => {
+                let record = record.as_ref().unwrap();
+                match system.run_step(step, Some(&record.connection_id)) {
                     Ok(()) => {
                         executed.push(step.clone());
-                        match wait_nbd_ready(step, device) {
+                        match system
+                            .wait_ready(step, device)
+                            .and_then(|()| verify_connection(record, system))
+                        {
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         }
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        // A command can return failure after configuring
+                        // the kernel. Roll back only our unique backend.
+                        if verify_connection(record, system).is_ok() {
+                            executed.push(step.clone());
+                        }
+                        Err(e)
+                    }
                 }
             }
-            other => run_step(other),
+            PlannedStep::NbdDisconnect { .. } => {
+                verify_connection(record.as_ref().unwrap(), system)
+                    .and_then(|()| system.run_step(step, None))
+            }
+            other => system.run_step(other, None),
         };
         if let Err(error) = result {
             let rollback = rollback_steps(&executed);
             let mut failed = 0usize;
             for compensating in &rollback {
-                if let Err(e) = run_step(compensating) {
+                let result = if matches!(compensating, PlannedStep::NbdDisconnect { .. }) {
+                    verify_connection(record.as_ref().unwrap(), system)
+                        .and_then(|()| system.run_step(compensating, None))
+                } else {
+                    system.run_step(compensating, None)
+                };
+                if let Err(e) = result {
                     failed += 1;
                     tracing::error!("maki-attach: rollback step {compensating} failed: {e}");
+                }
+            }
+            if connects && failed == 0 {
+                let record = record.as_ref().unwrap();
+                if matches!(system.backend(&record.device), Ok(None)) {
+                    if let Err(error) = state.unwrap().remove(&plan.volume) {
+                        // Preserve the original failure and rollback
+                        // outcome. The record cannot authorize a different
+                        // backend even if its cleanup failed.
+                        tracing::warn!(
+                            "maki-attach: rolled back but could not retire attach record: {error}"
+                        );
+                    }
                 }
             }
             return Err(ExecError::RolledBack {
@@ -421,13 +569,12 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
     }
     // A completed detach retires the record; a failed one keeps it so the
     // next attempt still knows the device.
-    if plan
-        .steps
-        .iter()
-        .any(|s| matches!(s, PlannedStep::NbdDisconnect { .. }))
-        && connects.is_none()
-    {
-        let _ = std::fs::remove_file(crate::plan::bound_device_record_path(&plan.volume));
+    if disconnects && !connects {
+        state.unwrap().remove(&plan.volume)?;
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "exec_tests.rs"]
+mod tests;

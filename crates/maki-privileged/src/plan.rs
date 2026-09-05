@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Placeholder for "allocate a free `/dev/nbdN` at execution time".
 pub const AUTO_NBD_DEVICE: &str = "/dev/nbd<auto>";
 
@@ -178,7 +180,32 @@ pub struct Plan {
     pub description: String,
     /// The volume the plan is for (names the bound-device record).
     pub volume: String,
+    /// Expected configuration identity for attach/detach. The executor
+    /// compares this to the trusted record before any detach step runs.
+    pub attachment: Option<AttachmentIdentity>,
     pub steps: Vec<PlannedStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentIdentity {
+    pub volume_uuid: String,
+    pub nbd_socket: String,
+    pub mountpoint: String,
+    pub vg_name: String,
+    pub lv_name: String,
+}
+
+impl From<&AttachRequest> for AttachmentIdentity {
+    fn from(request: &AttachRequest) -> Self {
+        Self {
+            volume_uuid: request.volume_uuid.clone(),
+            nbd_socket: request.nbd_socket.clone(),
+            mountpoint: request.mountpoint.clone(),
+            vg_name: request.vg_name.clone(),
+            lv_name: request.lv_name.clone(),
+        }
+    }
 }
 
 impl Plan {
@@ -264,6 +291,7 @@ pub fn plan_attach(request: &AttachRequest) -> Plan {
     Plan {
         description: format!("attach volume {}", request.volume),
         volume: request.volume.clone(),
+        attachment: Some(request.into()),
         steps,
     }
 }
@@ -277,28 +305,16 @@ pub fn bound_device_record_path(volume: &str) -> std::path::PathBuf {
 }
 
 /// Directory of the per-volume bound-device records.
-pub const BOUND_DEVICE_RECORD_DIR: &str = "/run/maki/attach";
-
-/// The device recorded at attach for `volume`, if any and well-formed.
-pub fn recorded_bound_device(volume: &str) -> Option<String> {
-    let text = std::fs::read_to_string(bound_device_record_path(volume)).ok()?;
-    let device = text.trim().to_string();
-    let index = device.strip_prefix("/dev/nbd")?;
-    (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(device)
-}
+pub const BOUND_DEVICE_RECORD_DIR: &str = "/run/maki-attach";
 
 /// A detach never allocates a device: with the device on `auto` it uses
-/// the one recorded at attach, and stays unresolved (refused by the
-/// executor, see [`Plan::unresolved_disconnect`]) when there is no record.
+/// the executor resolves the trusted record under the attach lock. Plan
+/// rendering never reads runtime state or trusts a device-only record.
 pub fn plan_detach(request: &AttachRequest) -> Plan {
-    let device = if request.nbd_device == AUTO_NBD_DEVICE {
-        recorded_bound_device(&request.volume).unwrap_or_else(|| AUTO_NBD_DEVICE.to_string())
-    } else {
-        request.nbd_device.clone()
-    };
     Plan {
         description: format!("detach volume {}", request.volume),
         volume: request.volume.clone(),
+        attachment: Some(request.into()),
         steps: vec![
             PlannedStep::Umount {
                 mountpoint: request.mountpoint.clone(),
@@ -306,7 +322,9 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
             PlannedStep::LvmDeactivate {
                 vg_name: request.vg_name.clone(),
             },
-            PlannedStep::NbdDisconnect { device },
+            PlannedStep::NbdDisconnect {
+                device: request.nbd_device.clone(),
+            },
         ],
     }
 }
@@ -316,6 +334,7 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
     Plan {
         description: format!("grow volume {}", request.volume),
         volume: request.volume.clone(),
+        attachment: None,
         steps: vec![
             PlannedStep::LvExtend {
                 vg_name: request.vg_name.clone(),
