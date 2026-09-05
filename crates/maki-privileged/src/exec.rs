@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::detach::DetachObservation;
 use crate::plan::{rollback_steps, Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{choose_free_nbd, nbd_index, parse_mountinfo};
 use crate::state::{BoundDeviceRecord, TrustedState};
@@ -345,6 +346,7 @@ trait System {
     fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
+    fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation>;
 }
 
 struct LinuxSystem;
@@ -376,6 +378,14 @@ impl System for LinuxSystem {
             )),
         }
     }
+
+    fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        crate::detach::observe(
+            record,
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            Path::new("/sys/class/block"),
+        )
+    }
 }
 
 fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
@@ -386,6 +396,48 @@ fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result
         )));
     }
     Ok(())
+}
+
+fn verify_detach_state(
+    record: &BoundDeviceRecord,
+    system: &impl System,
+) -> Result<(bool, DetachObservation), ExecError> {
+    let connected = match system.backend(&record.device)? {
+        Some(identifier) if identifier == record.connection_id => true,
+        Some(_) => {
+            return Err(identity_error(
+                "recorded NBD device has a different backend identity",
+            ))
+        }
+        None => false,
+    };
+    let observed = system.detach_observation(record)?;
+    if !connected && (observed.mounted || observed.vg_active || observed.nbd_in_use) {
+        return Err(identity_error(
+            "NBD connection is absent but the attachment still has active mounts or mappings",
+        ));
+    }
+    Ok((connected, observed))
+}
+
+fn detach_step_needed(
+    step: &PlannedStep,
+    record: &BoundDeviceRecord,
+    system: &impl System,
+) -> Result<bool, ExecError> {
+    let (connected, observed) = verify_detach_state(record, system)?;
+    match step {
+        PlannedStep::Umount { .. } => Ok(observed.mounted),
+        PlannedStep::LvmDeactivate { .. } if !observed.mounted => Ok(observed.vg_active),
+        PlannedStep::NbdDisconnect { .. }
+            if !observed.mounted && !observed.vg_active && !observed.nbd_in_use =>
+        {
+            Ok(connected)
+        }
+        _ => Err(identity_error(
+            "earlier detach steps have not completed; refusing to deactivate or disconnect",
+        )),
+    }
 }
 
 /// Execute under one root-controlled lock, resolving runtime records only
@@ -453,7 +505,7 @@ fn execute_with(
                 ));
             }
             // Verify before umount or VG deactivation can affect anything.
-            verify_connection(&prior, system)?;
+            verify_detach_state(&prior, system)?;
             plan.bind_device(&prior.device);
             record = Some(prior);
         }
@@ -497,6 +549,13 @@ fn execute_with(
 
     let mut executed: Vec<PlannedStep> = Vec::new();
     for step in &plan.steps {
+        if disconnects && !connects {
+            // Reobserve before each step: a previous attempt may already
+            // have completed it, or the mount/device may have changed.
+            if !detach_step_needed(step, record.as_ref().unwrap(), system)? {
+                continue;
+            }
+        }
         // `nbd-client` connecting and the device becoming ready are two
         // outcomes: once the connect succeeded the step counts as executed
         // even if readiness times out, so the rollback disconnects it

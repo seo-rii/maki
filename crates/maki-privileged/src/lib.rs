@@ -20,3 +20,6 @@ pub mod exec;
 
 #[cfg(target_os = "linux")]
 mod state;
+
+#[cfg(target_os = "linux")]
+mod detach;

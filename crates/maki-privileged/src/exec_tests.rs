@@ -55,6 +55,13 @@ struct FakeSystem {
     replace_on_failure: bool,
     replace_after_deactivate: bool,
     obstruct_record_cleanup: Option<PathBuf>,
+    mounted: bool,
+    vg_active: bool,
+    fail_after_at: Option<&'static str>,
+    foreign_mount: bool,
+    foreign_vg: bool,
+    extra_holders: bool,
+    observation_error: bool,
 }
 
 impl System for FakeSystem {
@@ -68,6 +75,14 @@ impl System for FakeSystem {
             return Err(identity_error("fixture command failed"));
         }
         match step {
+            PlannedStep::MountXfs { .. } => self.mounted = true,
+            PlannedStep::Umount { .. } => {
+                if !self.mounted {
+                    return Err(identity_error("fixture mount is already absent"));
+                }
+                self.mounted = false;
+            }
+            PlannedStep::LvmActivate { .. } => self.vg_active = true,
             PlannedStep::NbdConnect { device, .. } => {
                 self.backends
                     .insert(device.clone(), identifier.unwrap().to_string());
@@ -79,11 +94,17 @@ impl System for FakeSystem {
                     std::fs::create_dir(path).unwrap();
                 }
             }
-            PlannedStep::LvmDeactivate { .. } if self.replace_after_deactivate => {
-                self.backends
-                    .insert("/dev/nbd3".into(), "other-connection".into());
+            PlannedStep::LvmDeactivate { .. } => {
+                self.vg_active = false;
+                if self.replace_after_deactivate {
+                    self.backends
+                        .insert("/dev/nbd3".into(), "other-connection".into());
+                }
             }
             _ => {}
+        }
+        if self.fail_after_at == Some(step.kind()) {
+            return Err(identity_error("fixture command failed after its effect"));
         }
         Ok(())
     }
@@ -102,6 +123,23 @@ impl System for FakeSystem {
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
         Ok(self.backends.get(device).cloned())
+    }
+
+    fn detach_observation(&self, _record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        if self.observation_error
+            || (self.mounted && self.foreign_mount)
+            || (self.vg_active && self.foreign_vg)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture mismatched or unreadable attachment",
+            ));
+        }
+        Ok(DetachObservation {
+            mounted: self.mounted,
+            vg_active: self.vg_active,
+            nbd_in_use: self.vg_active || self.extra_holders,
+        })
     }
 }
 
@@ -286,4 +324,108 @@ fn detach_rechecks_identity_immediately_before_disconnect() {
         system.backends.get("/dev/nbd3").map(String::as_str),
         Some("other-connection")
     );
+}
+
+#[test]
+fn partial_detach_retry_resumes_after_completed_unmount_and_deactivation() {
+    for failure in ["lvm-deactivate", "nbd-disconnect"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+        system.fail_at = Some(failure);
+        assert!(execute_with(&plan_detach(&request()), Some(&state), &mut system).is_err());
+        assert!(!system.mounted);
+        assert!(state.read("pg").unwrap().is_some());
+        system.steps.clear();
+        system.fail_at = None;
+        execute_with(&plan_detach(&request()), Some(&state), &mut system)
+            .unwrap_or_else(|error| panic!("retry after {failure}: {error}"));
+        assert_eq!(
+            system.steps,
+            if failure == "lvm-deactivate" {
+                vec!["lvm-deactivate", "nbd-disconnect"]
+            } else {
+                vec!["nbd-disconnect"]
+            }
+        );
+        assert!(!system.vg_active);
+        assert!(system.backends.is_empty());
+        assert!(state.read("pg").unwrap().is_none());
+    }
+}
+
+#[test]
+fn completed_detach_retry_retires_record_without_repeating_commands() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+    let record = state.read("pg").unwrap().unwrap();
+    execute_with(&plan_detach(&request()), Some(&state), &mut system).unwrap();
+    // Model process death after the kernel disconnect but before record retirement.
+    state.write(&record).unwrap();
+    system.steps.clear();
+    execute_with(&plan_detach(&request()), Some(&state), &mut system).unwrap();
+    assert!(system.steps.is_empty());
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn detach_retry_handles_commands_that_fail_after_completing_their_effect() {
+    for failure in ["umount", "lvm-deactivate", "nbd-disconnect"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+        system.fail_after_at = Some(failure);
+        assert!(execute_with(&plan_detach(&request()), Some(&state), &mut system).is_err());
+        assert!(state.read("pg").unwrap().is_some());
+        system.fail_after_at = None;
+        system.steps.clear();
+        execute_with(&plan_detach(&request()), Some(&state), &mut system).unwrap();
+        assert_eq!(
+            system.steps,
+            match failure {
+                "umount" => vec!["lvm-deactivate", "nbd-disconnect"],
+                "lvm-deactivate" => vec!["nbd-disconnect"],
+                _ => vec![],
+            }
+        );
+        assert!(state.read("pg").unwrap().is_none());
+        assert!(system.backends.is_empty());
+    }
+}
+
+#[test]
+fn detach_refuses_changed_incomplete_or_unreadable_state_before_any_command() {
+    for case in ["mount", "vg", "disconnected", "probe", "holders"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+        system.steps.clear();
+        match case {
+            "mount" => system.foreign_mount = true,
+            "vg" => system.foreign_vg = true,
+            "disconnected" => system.backends.clear(),
+            "probe" => system.observation_error = true,
+            "holders" => {
+                system.mounted = false;
+                system.vg_active = false;
+                system.extra_holders = true;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            execute_with(&plan_detach(&request()), Some(&state), &mut system).is_err(),
+            "{case}"
+        );
+        assert!(system.steps.is_empty(), "{case}");
+        assert!(state.read("pg").unwrap().is_some());
+    }
 }

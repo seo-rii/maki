@@ -11,7 +11,7 @@ pub struct MountEntry {
 }
 
 /// Decode the octal escapes mountinfo uses (`\040` for a space, ...).
-fn unescape(field: &str) -> String {
+pub(crate) fn unescape(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
