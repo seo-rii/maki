@@ -1,9 +1,11 @@
 //! A/B dual-copy metadata protocol (SPEC §43).
 //!
 //! Records carry a monotonically increasing generation and are CRC-protected.
-//! `store` always overwrites the *stale* side, so a torn write can only
-//! destroy the copy being replaced; `load` selects the valid copy with the
-//! highest generation.
+//! `store` makes the valid side it will preserve durable before overwriting
+//! the *stale* side, so a torn write can only destroy the copy being replaced;
+//! `load` selects the valid copy with the highest generation. Readable bytes
+//! are not proof of durability: a failed sync or a process restart can leave
+//! a newer valid copy in the page cache.
 //!
 //! Read classification: a side that is absent, empty, short, or fails its
 //! CRC/decode is an *invalid copy* (the other side is authoritative). Any
@@ -38,13 +40,13 @@ impl AbStore {
         }
     }
 
-    /// One side: `Ok(None)` for an absent or invalid copy, `Err` for a hard
-    /// I/O failure.
-    fn read_side<T: AbRecord>(
+    /// One side and its exact validated bytes: `Ok(None)` for an absent or
+    /// invalid copy, `Err` for a hard I/O failure.
+    fn read_copy<T: AbRecord>(
         &self,
         backing: &dyn Backing,
         path: &str,
-    ) -> Result<Option<T>, FormatError> {
+    ) -> Result<Option<(T, Vec<u8>)>, FormatError> {
         let file = match backing.open(path, false) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -62,7 +64,15 @@ impl AbStore {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(FormatError::Io(e)),
         }
-        Ok(T::decode(&buf).ok())
+        Ok(T::decode(&buf).ok().map(|record| (record, buf)))
+    }
+
+    fn read_side<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+        path: &str,
+    ) -> Result<Option<T>, FormatError> {
+        Ok(self.read_copy(backing, path)?.map(|(record, _)| record))
     }
 
     /// Best valid copy, if any. `Err` only for hard I/O failures.
@@ -128,6 +138,8 @@ impl AbStore {
     /// otherwise the older one. Choosing by raw generation alone would let a
     /// CRC-valid but undecodable side (wrong type, newer version, damaged
     /// payload) count as "newest" and the only loadable copy be overwritten.
+    /// This only selects a path; `store` establishes the preserved side's
+    /// durability before overwriting the selected target.
     pub fn next_target_path<T: AbRecord>(
         &self,
         backing: &dyn Backing,
@@ -138,9 +150,13 @@ impl AbStore {
 
     /// Bump the record's generation past both sides (raw generations, so a
     /// foreign or newer-version record never outranks the new one), write it
-    /// to the side `next_target_path` names, and fdatasync it. (Directory
-    /// durability of freshly created files is the caller's responsibility —
-    /// see `init::create_volume`.)
+    /// to the side `next_target_path` names, and fdatasync it. Before touching
+    /// that target, rewrite and sync the other typed-valid copy and sync its
+    /// parent directory: either may still be volatile after a failed store
+    /// or caller dirsync. Rewriting is required because writeback errors can
+    /// clear dirty page-cache bits without making those bytes durable.
+    /// Directory durability of the freshly created target remains the
+    /// caller's responsibility — see `init::create_volume`.
     pub fn store<T: AbRecord>(
         &self,
         backing: &dyn Backing,
@@ -148,10 +164,31 @@ impl AbStore {
     ) -> Result<(), FormatError> {
         let (ga, gb) = self.generations(backing)?;
         let max_existing = ga.into_iter().chain(gb).max().unwrap_or(0);
-        record.set_generation(max_existing.max(record.generation()) + 1);
-
-        let (ta, tb) = self.side_generations::<T>(backing)?;
+        let a = self.read_copy::<T>(backing, &self.a)?;
+        let b = self.read_copy::<T>(backing, &self.b)?;
+        let ta = a.as_ref().map(|(record, _)| record.generation());
+        let tb = b.as_ref().map(|(record, _)| record.generation());
         let target = self.target_for(ta, tb);
+        let preserved = if target == self.a {
+            b.map(|(_, bytes)| (self.b.as_str(), bytes))
+        } else {
+            a.map(|(_, bytes)| (self.a.as_str(), bytes))
+        };
+        if let Some((preserved, bytes)) = preserved {
+            // A failed sync can leave this newer generation readable but
+            // volatile. Retrying (even after restarting the process) must
+            // not overwrite the last durable copy until this one is safe.
+            // Redirty the exact validated image: after writeback EIO a
+            // plain fsync retry may succeed without persisting clean cache
+            // pages. Do not truncate or re-encode the preserved copy.
+            // Its dirent may also be new if the caller's dirsync failed.
+            let file = backing.open(preserved, false)?;
+            file.write_at(0, &bytes)?;
+            file.sync_data()?;
+            backing.sync_dir(maki_backing::path::parent(preserved))?;
+        }
+
+        record.set_generation(max_existing.max(record.generation()) + 1);
         let bytes = record.encode();
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;
