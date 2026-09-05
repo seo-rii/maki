@@ -39,10 +39,14 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 
-RuntimeDirectory=maki/%i
-RuntimeDirectoryMode=0750
+# Top-level tmpfiles directories select who can enter each socket tree.
+# Children permit traversal; NBD remains behind root:maki /run/maki,
+# while administrators enter root:maki-admin /run/maki-control.
+RuntimeDirectory=maki/%i maki-control/%i
+RuntimeDirectoryMode=0711
 ReadWritePaths=/var/lib/maki/%i
 ReadWritePaths=/run/maki/%i
+ReadWritePaths=/run/maki-control/%i
 
 # SPEC §9: secrets arrive as systemd credentials, never in the TOML.
 # Uncomment and point at the real secret source for the volume:
