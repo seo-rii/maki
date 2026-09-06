@@ -194,11 +194,18 @@ pub async fn serve_with_shutdown(
     let sessions = Arc::new(Semaphore::new(limits.max_sessions.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
-        let slot = sessions
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("session semaphore is never closed");
+        // Race the shutdown signal against the slot wait: when every session
+        // slot is held by a live session, `acquire_owned` would otherwise
+        // park here and never observe shutdown, so the drain below would
+        // never run and a clean detach could hang (a control session that
+        // keeps its connection open holds its slot indefinitely).
+        let slot = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            slot = sessions.clone().acquire_owned() => {
+                slot.expect("session semaphore is never closed")
+            }
+        };
         let stream = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
