@@ -386,7 +386,7 @@ impl Engine {
                 geometry.num_units()
             )));
         }
-        // The NBD adapter splits requests at this size, so a bound that is
+        // The NBD adapter advertises and enforces this size, so a bound that is
         // not a block multiple would make every large request fail as
         // misaligned instead of being served.
         let block = geometry.device_block_size as u64;

@@ -184,7 +184,7 @@ impl Request<'_> {
 
 const DEADLINE_MESSAGE: &str = "operation deadline exceeded";
 
-fn deadline_error() -> CryptoError {
+pub(crate) fn deadline_error() -> CryptoError {
     CryptoError::Retryable(DEADLINE_MESSAGE.to_string())
 }
 
@@ -512,9 +512,9 @@ impl EndpointSet {
             let candidates = self.candidates();
             let mut tried_any = false;
             for endpoint in candidates {
-                if !endpoint.breaker.allow() {
+                let Some(probe) = endpoint.breaker.acquire() else {
                     continue;
-                }
+                };
                 if calls_made > 0 {
                     // A re-send of a request that already reached a provider.
                     if !self.config.retry_safe {
@@ -551,24 +551,24 @@ impl EndpointSet {
                     .await
                 {
                     Ok(response) => {
-                        endpoint.breaker.on_success();
+                        probe.on_success();
                         return Ok(response);
                     }
                     Err(err) => {
                         if is_deadline_error(&err) {
                             // The operation's budget ran out mid-RPC: not
                             // an endpoint failure, so no breaker or budget
-                            // charge (C-06) — but a half-open probe slot
-                            // must come back, or abandoned probes wedge
-                            // the circuit (N-10).
-                            endpoint.breaker.on_abandoned();
+                            // charge (C-06). The probe permit drops here
+                            // and returns its half-open slot without a
+                            // verdict, or abandoned probes would wedge the
+                            // circuit (BUG-004 / N-10).
                             return Err(err);
                         }
                         match err.class() {
                             ErrorClass::Retryable
                             | ErrorClass::Throttled
                             | ErrorClass::EndpointFatal => {
-                                endpoint.breaker.on_failure();
+                                probe.on_failure();
                                 last_error = Some(err);
                                 if let Some(dl) = deadline {
                                     if self.clock.now() >= dl {
@@ -613,6 +613,10 @@ impl EndpointSet {
 
 #[async_trait]
 impl CryptoProvider for EndpointSet {
+    fn max_operation_time(&self) -> Option<Duration> {
+        self.config.max_operation_time
+    }
+
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
         // Endpoints are interchangeable (verified by the cross-endpoint
         // self-test); report a validated one's contract.

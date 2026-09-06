@@ -64,6 +64,8 @@ async fn ws_server() -> String {
 
 mod grpc {
     use super::XOR;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use tonic::codegen::http;
     use tonic::codegen::{BoxFuture, Service, StdError};
@@ -75,6 +77,7 @@ mod grpc {
     #[derive(Clone)]
     pub struct CryptoServer {
         pub require_token: Option<String>,
+        pub auth_rejections: Arc<AtomicUsize>,
     }
 
     impl CryptoServer {
@@ -90,7 +93,10 @@ mod grpc {
                     .and_then(|v| v.to_str().ok())
                 {
                     Some(got) if got == token => {}
-                    _ => return Err(Status::new(Code::Unauthenticated, "bad token")),
+                    _ => {
+                        self.auth_rejections.fetch_add(1, Ordering::SeqCst);
+                        return Err(Status::new(Code::Unauthenticated, "bad token"));
+                    }
                 }
             }
             let message = request.into_inner();
@@ -178,16 +184,21 @@ mod grpc {
         }
     }
 
-    pub async fn serve(require_token: Option<String>) -> String {
+    pub async fn serve(require_token: Option<String>) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let auth_rejections = Arc::new(AtomicUsize::new(0));
+        let server = CryptoServer {
+            require_token,
+            auth_rejections: auth_rejections.clone(),
+        };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(CryptoServer { require_token })
+                .add_service(server)
                 .serve_with_incoming(ListenerStream(listener))
                 .await;
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), auth_rejections)
     }
 }
 
@@ -255,7 +266,7 @@ async fn engine_roundtrips_through_grpc_provider_with_metadata() {
     // Credential-referenced authorization metadata, resolved through the
     // daemon's key router (env source in development, SPEC §9).
     std::env::set_var("MAKI_CREDENTIAL_GRPC_WIRING_TOKEN", "tok-wiring-1");
-    let url = grpc::serve(Some("tok-wiring-1".to_string())).await;
+    let (url, auth_rejections) = grpc::serve(Some("tok-wiring-1".to_string())).await;
     let dir = tempfile::tempdir().unwrap();
     let transport = format!(
         "[[crypto.grpc.endpoint]]\nname = \"ep0\"\nurl = \"{url}\"\n\
@@ -267,25 +278,27 @@ async fn engine_roundtrips_through_grpc_provider_with_metadata() {
 
     engine.write(0, &vec![0x77; UNIT], true).await.unwrap();
     assert_eq!(engine.read(0, UNIT).await.unwrap(), vec![0x77; UNIT]);
+    assert_eq!(auth_rejections.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_without_token_is_refused_by_server() {
     // Sanity: the token check above is real — attach without metadata fails
-    // (EndpointFatal from Unauthenticated at self-test time).
-    let url = grpc::serve(Some("tok-wiring-2".to_string())).await;
+    // after the server rejects the self-test with Unauthenticated.
+    let (url, auth_rejections) = grpc::serve(Some("tok-wiring-2".to_string())).await;
     let dir = tempfile::tempdir().unwrap();
     let transport = format!("[[crypto.grpc.endpoint]]\nname = \"ep0\"\nurl = \"{url}\"\n");
-    // Bounded-error so the endpoint-fatal failure surfaces instead of the
-    // stall policy retrying the self-test forever; a generous retry budget
-    // keeps the attempts backoff-paced rather than probe-rate-throttled.
-    let policy = "availability_policy = \"bounded-error\"\nmax_operation_time = \"200ms\"\n\
+    // Bounded-error ends retries; leave enough real-clock time to reach the
+    // loopback server under load. Exact deadlines have ManualClock tests.
+    // The scheduler may return its deadline before the dispatcher's last
+    // endpoint error, so observe authentication at the server itself.
+    let policy = "availability_policy = \"bounded-error\"\nmax_operation_time = \"2s\"\n\
                   [crypto.retry_budget]\nretry_ratio = 1.0\nburst = 64\nminimum_probe_rate = \"50/s\"\n";
     let config = base_config(&temp_root(&dir), "remote-grpc", policy, &transport);
     let err = attach(&config).await.unwrap_err();
     assert!(
-        err.to_lowercase().contains("token") || err.to_lowercase().contains("endpoint"),
-        "attach must fail against an auth-requiring server: {err}"
+        auth_rejections.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "server must have rejected missing metadata with Unauthenticated; attach result: {err}"
     );
 }
 

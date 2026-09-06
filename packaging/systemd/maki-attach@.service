@@ -13,7 +13,9 @@
 Description=Maki attach helper for volume %i
 Requires=maki@%i.service
 After=maki@%i.service
-ConditionPathExists=/etc/maki/attach/%i.toml
+# A missing required config must fail the start job: a Condition would
+# merely skip attach and permit ordered Requires= workloads to start.
+AssertPathExists=/etc/maki/attach/%i.toml
 
 [Service]
 Type=oneshot

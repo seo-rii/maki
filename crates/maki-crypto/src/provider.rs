@@ -1,6 +1,7 @@
 //! The `CryptoProvider` interface (SPEC §15).
 
 use async_trait::async_trait;
+use std::time::Duration;
 
 use crate::error::CryptoError;
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
@@ -15,6 +16,12 @@ use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextU
 ///   (or another error) — never fabricated plaintext.
 #[async_trait]
 pub trait CryptoProvider: Send + Sync {
+    /// Maximum elapsed time for one caller operation, including admission
+    /// and batching in outer wrappers. `None` keeps stall semantics.
+    fn max_operation_time(&self) -> Option<Duration> {
+        None
+    }
+
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError>;
 
     async fn encrypt_batch(

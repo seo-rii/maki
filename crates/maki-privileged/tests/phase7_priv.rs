@@ -122,6 +122,8 @@ fn plans_contain_no_credential_material() {
         plan_detach(&request()),
         plan_grow(&GrowRequest {
             volume: "postgres".into(),
+            volume_uuid: "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c".into(),
+            nbd_socket: "/run/maki/postgres/nbd.sock".into(),
             vg_name: "vg_maki_postgres".into(),
             lv_name: "data".into(),
             add_bytes: 10 << 30,
@@ -159,6 +161,8 @@ fn detach_plan_reverses_attach() {
 fn grow_plan_is_lvextend_then_xfs_growfs() {
     let plan = plan_grow(&GrowRequest {
         volume: "postgres".into(),
+        volume_uuid: "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c".into(),
+        nbd_socket: "/run/maki/postgres/nbd.sock".into(),
         vg_name: "vg".into(),
         lv_name: "data".into(),
         add_bytes: 1 << 30,

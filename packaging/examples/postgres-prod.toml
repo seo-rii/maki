@@ -174,7 +174,7 @@ threads = 64
 connections = 1
 
 [control]
-socket = "/run/maki/postgres-prod/control.sock"
+socket = "/run/maki-control/postgres-prod/control.sock"
 group = "maki-admin"
 
 [security]

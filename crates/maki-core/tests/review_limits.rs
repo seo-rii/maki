@@ -68,7 +68,7 @@ async fn requests_above_the_configured_maximum_are_refused() {
     assert_eq!(engine.read(0, 8192).await.unwrap(), vec![1u8; 8192]);
 }
 
-/// The adapter splits requests at `max_request_bytes`; a bound that is not
+/// The NBD limits are advertised from `max_request_bytes`; a bound that is not
 /// a block multiple would turn every split request into an alignment
 /// error. Attach refuses it instead (fourth pass).
 #[tokio::test]

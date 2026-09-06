@@ -5,12 +5,12 @@
 //! - Capability surface per SPEC §48: FLUSH + FUA supported; trim, write-
 //!   zeroes, and multi-connection disabled (nbdkit emulates zeroes via
 //!   pwrite).
-//! - `nbd.maximum_io` is enforced here, not only advertised: the plugin's
-//!   struct prefix cannot publish `.block_size`, so the kernel may send
-//!   requests up to its own limit; such a request is split into pieces of
-//!   at most the maximum before it reaches the engine, which refuses
-//!   anything larger outright (third review, F07). FUA applies to the last
-//!   piece, whose sync covers every earlier piece's records (SPEC §24).
+//! - The NBD I/O limits are advertised through the plugin's `block_size`
+//!   callback *and* enforced here: negotiation is advisory, so a request
+//!   outside the configured minimum/maximum, misaligned, or past the end of
+//!   the device is refused with EINVAL before any plaintext is copied or
+//!   the engine entered (BUG-011). The engine refuses anything above
+//!   `nbd.maximum_io` on its own as well (third review, F07).
 //! - `open_config` also binds and serves the per-volume control socket
 //!   (SPEC §7, review M-005) on the adapter's runtime; a socket that cannot
 //!   be bound fails attach. `shutdown` is the clean-detach path: FLUSH
@@ -66,6 +66,10 @@ struct AdapterState {
 #[cfg(unix)]
 struct ControlServer {
     task: tokio::task::JoinHandle<()>,
+    /// Signals the serve loop to stop accepting and drain live sessions,
+    /// so no control session keeps an `Engine` reference (and the volume
+    /// lock) alive past `shutdown` (BUG-015).
+    shutdown: tokio::sync::watch::Sender<bool>,
     path: std::path::PathBuf,
 }
 
@@ -115,7 +119,8 @@ impl NbdAdapter {
         let _ = (&crypto_stats, &endpoints); // only the Unix control socket reports them
 
         // The engine's request bound is `nbd.maximum_io` (see
-        // `daemon::engine_options`); advertise and split at the same value.
+        // `daemon::engine_options`, validated as a wire-sized value);
+        // advertise and validate at the same value.
         let block_sizes = (
             config.nbd.minimum_io,
             config.nbd_preferred_io(),
@@ -142,13 +147,18 @@ impl NbdAdapter {
                     )
                 })
                 .map_err(|e| AdapterError::new(EIO, format!("control socket {socket}: {e}")))?;
+            let (shutdown, rx) = tokio::sync::watch::channel(false);
+            let limits = maki_control::server::ControlLimits::default();
             let task = runtime.spawn(async move {
-                if let Err(e) = maki_control::uds::serve(listener, backend).await {
+                if let Err(e) =
+                    maki_control::uds::serve_with_shutdown(listener, backend, limits, rx).await
+                {
                     tracing::error!("control socket server stopped: {e}");
                 }
             });
             Some(ControlServer {
                 task,
+                shutdown,
                 path: std::path::PathBuf::from(socket),
             })
         };
@@ -228,51 +238,45 @@ impl NbdAdapter {
         true
     }
 
-    /// Largest piece handed to the engine at once (`nbd.maximum_io`).
-    fn max_io(&self) -> usize {
-        self.block_sizes().2.max(1) as usize
-    }
-
-    /// Split `[0, len)` into pieces of at most `max_io`. An empty request
-    /// yields one empty piece so the engine reports it as invalid.
-    fn pieces(&self, len: usize) -> Vec<(usize, usize)> {
-        let max = self.max_io();
-        if len == 0 {
-            return vec![(0, 0)];
+    /// Negotiation is advisory: clients may still send requests outside
+    /// these limits. Refuse them before copying plaintext or entering the
+    /// engine, whose journal headroom is sized for the configured maximum.
+    fn validate_request(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
+        let state = self.state()?;
+        let (minimum, _, maximum) = state.block_sizes;
+        if length == 0
+            || length as u64 > maximum as u64
+            || !(length as u64).is_multiple_of(minimum as u64)
+            || !offset.is_multiple_of(minimum as u64)
+            || offset
+                .checked_add(length as u64)
+                .is_none_or(|end| end > state.engine.size())
+        {
+            return Err(AdapterError::new(
+                EINVAL,
+                "request exceeds NBD size or alignment constraints",
+            ));
         }
-        (0..len)
-            .step_by(max)
-            .map(|start| (start, (len - start).min(max)))
-            .collect()
+        Ok(())
     }
 
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<(), AdapterError> {
-        for (start, len) in self.pieces(buf.len()) {
-            let piece_offset = offset + start as u64;
-            // Plaintext stays in zeroizing buffers until it is copied into
-            // the caller's (nbdkit's) buffer (SPEC §36).
-            let data = self.run(move |engine| {
-                Box::pin(async move { engine.read_secret(piece_offset, len).await })
-            })?;
-            buf[start..start + len].copy_from_slice(data.expose());
-        }
+        self.validate_request(offset, buf.len())?;
+        let len = buf.len();
+        // Plaintext stays in zeroizing buffers until it is copied into the
+        // caller's (nbdkit's) buffer (SPEC §36).
+        let data =
+            self.run(move |engine| Box::pin(async move { engine.read_secret(offset, len).await }))?;
+        buf.copy_from_slice(data.expose());
         Ok(())
     }
 
     pub fn pwrite(&self, data: &[u8], offset: u64, fua: bool) -> Result<(), AdapterError> {
-        let pieces = self.pieces(data.len());
-        let last = pieces.len() - 1;
-        for (i, (start, len)) in pieces.into_iter().enumerate() {
-            // Copy one piece at a time: the request's plaintext is never
-            // duplicated in full before admission.
-            let owned = SecretBuffer::from_slice(&data[start..start + len]);
-            let piece_offset = offset + start as u64;
-            let fua = fua && i == last;
-            self.run(move |engine| {
-                Box::pin(async move { engine.write(piece_offset, owned.expose(), fua).await })
-            })?;
-        }
-        Ok(())
+        self.validate_request(offset, data.len())?;
+        let owned = SecretBuffer::from_slice(data);
+        self.run(move |engine| {
+            Box::pin(async move { engine.write(offset, owned.expose(), fua).await })
+        })
     }
 
     pub fn flush(&self) -> Result<(), AdapterError> {
@@ -283,14 +287,24 @@ impl NbdAdapter {
         self.run(move |engine| Box::pin(async move { engine.checkpoint().await }))
     }
 
-    /// Stop serving the control socket and remove its path.
+    /// Stop serving the control socket and remove its path. Signals the
+    /// serve loop to drain its live sessions and *waits* for it, so no
+    /// session still holds the `Engine` when `shutdown` returns (BUG-015);
+    /// only then is the volume lock free to be released.
+    #[cfg(unix)]
     fn stop_control(&self) {
-        #[cfg(unix)]
         if let Some(control) = self.control.lock().take() {
-            control.task.abort();
+            let _ = control.shutdown.send(true);
+            // The serve loop breaks on the signal and awaits every session
+            // (JoinSet::shutdown); joining the task here makes that drain
+            // complete before we return.
+            let _ = self.runtime.block_on(control.task);
             let _ = std::fs::remove_file(&control.path);
         }
     }
+
+    #[cfg(not(unix))]
+    fn stop_control(&self) {}
 
     /// Clean detach: FLUSH, checkpoint, stop the control socket, release
     /// the volume lock.

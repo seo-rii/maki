@@ -6,23 +6,15 @@
 //! - never print contents in Debug
 //! - participate in memory budgeting (exact `len` is always known)
 //! - optionally pinned in RAM (SPEC §36 `secure-buffers`): when
-//!   [`set_page_locking`] is on, every buffer lives in its *own* page-aligned
-//!   allocation whose pages are `mlock`ed for its lifetime (Unix), so
-//!   plaintext and keys never reach swap. Locking is best-effort per buffer
-//!   because `RLIMIT_MEMLOCK` can be exhausted; failures are counted
-//!   ([`page_lock_failures`]) and reported by the daemon, and the
-//!   secure-swap policy is the second line of defence.
-//!
-//! Page isolation is what makes the lock a per-buffer guarantee: `mlock`
-//! and `munlock` work on whole pages and keep no reference count, so two
-//! buffers sharing a heap page would unlock each other's bytes when the
-//! first one dropped (third review, F04). A locked buffer therefore never
-//! shares a page with anything else, is wiped in place while still locked,
-//! and is unlocked only after the wipe.
+//!   [`set_page_locking`] is on, every buffer's pages are `mlock`ed for its
+//!   lifetime (Unix), so plaintext and keys never reach swap. Locking is
+//!   best-effort per buffer because `RLIMIT_MEMLOCK` can be exhausted;
+//!   failures are counted ([`page_lock_failures`]) and reported by the
+//!   daemon, and the secure-swap policy is the second line of defence.
 
-use std::alloc::Layout;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::{collections::HashMap, sync::OnceLock};
 
 use zeroize::Zeroize;
 
@@ -43,67 +35,74 @@ pub fn page_lock_failures() -> u64 {
     LOCK_FAILURES.load(Ordering::SeqCst)
 }
 
-/// The system page size (the unit `mlock` works in).
-pub fn page_size() -> usize {
-    use std::sync::OnceLock;
-    static PAGE: OnceLock<usize> = OnceLock::new();
-    *PAGE.get_or_init(|| {
-        #[cfg(unix)]
-        {
-            // SAFETY: sysconf is a plain query.
-            let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if value > 0 {
-                return value as usize;
-            }
-        }
-        4096
+#[cfg(unix)]
+struct PageLock {
+    start: usize,
+    last: usize,
+    page_size: usize,
+}
+
+#[cfg(unix)]
+fn locked_pages() -> &'static parking_lot::Mutex<HashMap<usize, usize>> {
+    static REFERENCES: OnceLock<parking_lot::Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    REFERENCES.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+fn lock_pages(data: &[u8]) -> Option<PageLock> {
+    if data.is_empty() {
+        return None;
+    }
+    // SAFETY: sysconf has no pointer arguments.
+    let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|size| *size > 0)?;
+    let address = data.as_ptr() as usize;
+    let start = address / page_size * page_size;
+    let last = (address + data.len() - 1) / page_size * page_size;
+    let mut references = locked_pages().lock();
+    // mlock/munlock do not stack: serialize them with the ownership counts.
+    // A failed mlock changes no locks and earns no references.
+    // SAFETY: every page intersects this buffer's live allocation. The
+    // aligned range also works on Unix hosts requiring page alignment.
+    if unsafe { libc::mlock(start as *const libc::c_void, last - start + page_size) } != 0 {
+        return None;
+    }
+    for page in (start..=last).step_by(page_size) {
+        *references.entry(page).or_default() += 1;
+    }
+    Some(PageLock {
+        start,
+        last,
+        page_size,
     })
 }
 
 #[cfg(unix)]
-fn lock_pages(ptr: *const u8, len: usize) -> bool {
-    // SAFETY: the range is exactly this buffer's own page-aligned allocation.
-    unsafe { libc::mlock(ptr as *const libc::c_void, len) == 0 }
-}
-
-#[cfg(unix)]
-fn unlock_pages(ptr: *const u8, len: usize) {
-    // SAFETY: the range was locked by `lock_pages` on the same allocation.
-    unsafe {
-        libc::munlock(ptr as *const libc::c_void, len);
+impl Drop for PageLock {
+    fn drop(&mut self) {
+        let mut references = locked_pages().lock();
+        for page in (self.start..=self.last).step_by(self.page_size) {
+            let owners = references.get_mut(&page).expect("page lock is registered");
+            *owners -= 1;
+            if *owners == 0 {
+                references.remove(&page);
+                // SAFETY: the buffer still owns its allocation during
+                // unlock, and no other SecretBuffer owns this page's lock.
+                unsafe {
+                    libc::munlock(page as *const libc::c_void, self.page_size);
+                }
+            }
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn lock_pages(_ptr: *const u8, _len: usize) -> bool {
-    false
-}
+struct PageLock;
 
 #[cfg(not(unix))]
-fn unlock_pages(_ptr: *const u8, _len: usize) {}
-
-/// Where a buffer's bytes live.
-enum Storage {
-    /// Plain heap memory (locking disabled, or an empty buffer).
-    Heap(Vec<u8>),
-    /// A page-aligned, page-multiple allocation shared with nothing else.
-    Pages {
-        ptr: NonNull<u8>,
-        len: usize,
-        layout: Layout,
-        locked: bool,
-    },
-}
-
-/// Allocate `len` bytes of zeroed, page-aligned memory rounded up to whole
-/// pages. `None` when the allocator refuses.
-fn alloc_pages(len: usize) -> Option<(NonNull<u8>, Layout)> {
-    let page = page_size();
-    let size = len.checked_next_multiple_of(page)?;
-    let layout = Layout::from_size_align(size, page).ok()?;
-    // SAFETY: the layout has a non-zero size (len > 0 rounds up to >= page).
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    NonNull::new(ptr).map(|p| (p, layout))
+fn lock_pages(_data: &[u8]) -> Option<PageLock> {
+    None
 }
 
 /// A byte buffer holding plaintext or key material.
@@ -111,183 +110,99 @@ fn alloc_pages(len: usize) -> Option<(NonNull<u8>, Layout)> {
 /// Deliberately does **not** implement `Clone`; copying secret material must be
 /// an explicit, visible act via [`SecretBuffer::duplicate`].
 pub struct SecretBuffer {
-    storage: Storage,
+    data: Vec<u8>,
+    page_lock: Option<PageLock>,
 }
 
-// SAFETY: a buffer uniquely owns its allocation (no aliasing pointers
-// escape), so moving it or sharing references across threads is as sound
-// as for a `Vec<u8>`.
-unsafe impl Send for SecretBuffer {}
-unsafe impl Sync for SecretBuffer {}
-
 impl SecretBuffer {
-    /// Build page-isolated storage for `len` bytes, locking it when
-    /// possible. `None` when locking is off, `len` is zero, or the
-    /// allocator refuses (the caller falls back to the heap).
-    fn isolated(len: usize) -> Option<Storage> {
-        if !page_locking_enabled() || len == 0 {
-            return None;
-        }
-        let (ptr, layout) = match alloc_pages(len) {
-            Some(alloc) => alloc,
-            None => {
+    fn wrap(data: Vec<u8>) -> Self {
+        let page_lock = if page_locking_enabled() {
+            let lock = lock_pages(&data);
+            if lock.is_none() && !data.is_empty() {
                 LOCK_FAILURES.fetch_add(1, Ordering::SeqCst);
-                return None;
             }
+            lock
+        } else {
+            None
         };
-        let locked = lock_pages(ptr.as_ptr(), layout.size());
-        if !locked {
-            LOCK_FAILURES.fetch_add(1, Ordering::SeqCst);
-        }
-        Some(Storage::Pages {
-            ptr,
-            len,
-            layout,
-            locked,
-        })
-    }
-
-    /// Take ownership of `data`. With locking on, the bytes move into an
-    /// isolated allocation and the source vector is wiped.
-    fn wrap(mut data: Vec<u8>) -> Self {
-        match Self::isolated(data.len()) {
-            Some(storage) => {
-                let mut buffer = Self { storage };
-                buffer.expose_mut().copy_from_slice(&data);
-                data.zeroize();
-                buffer
-            }
-            None => Self {
-                storage: Storage::Heap(data),
-            },
-        }
+        Self { data, page_lock }
     }
 
     /// A zero-filled buffer of `len` bytes.
     pub fn zeroed(len: usize) -> Self {
-        match Self::isolated(len) {
-            Some(storage) => Self { storage },
-            None => Self {
-                storage: Storage::Heap(vec![0u8; len]),
-            },
-        }
+        Self::wrap(vec![0u8; len])
     }
 
-    /// Take ownership of an existing byte vector (wiped if the bytes are
-    /// copied into locked pages).
+    /// Take ownership of an existing byte vector.
     pub fn from_vec(data: Vec<u8>) -> Self {
         Self::wrap(data)
     }
 
     /// Copy from a slice.
     pub fn from_slice(data: &[u8]) -> Self {
-        let mut buffer = Self::zeroed(data.len());
-        buffer.expose_mut().copy_from_slice(data);
-        buffer
+        Self::wrap(data.to_vec())
     }
 
     pub fn expose(&self) -> &[u8] {
-        match &self.storage {
-            Storage::Heap(v) => v,
-            // SAFETY: `ptr` is a live allocation of at least `len` bytes,
-            // initialized (zeroed at allocation), owned by `self`.
-            Storage::Pages { ptr, len, .. } => unsafe {
-                std::slice::from_raw_parts(ptr.as_ptr(), *len)
-            },
-        }
+        &self.data
     }
 
     pub fn expose_mut(&mut self) -> &mut [u8] {
-        match &mut self.storage {
-            Storage::Heap(v) => v,
-            // SAFETY: as in `expose`, and `&mut self` guarantees uniqueness.
-            Storage::Pages { ptr, len, .. } => unsafe {
-                std::slice::from_raw_parts_mut(ptr.as_ptr(), *len)
-            },
-        }
+        &mut self.data
     }
 
     pub fn len(&self) -> usize {
-        match &self.storage {
-            Storage::Heap(v) => v.len(),
-            Storage::Pages { len, .. } => *len,
-        }
+        self.data.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.data.is_empty()
     }
 
     /// Whether this buffer's pages are pinned in RAM.
     pub fn is_page_locked(&self) -> bool {
-        matches!(self.storage, Storage::Pages { locked: true, .. })
-    }
-
-    /// Whether this buffer lives in its own page-aligned allocation.
-    pub fn is_page_isolated(&self) -> bool {
-        matches!(self.storage, Storage::Pages { .. })
+        self.page_lock.is_some()
     }
 
     /// Explicit, intentional copy of secret material.
     pub fn duplicate(&self) -> Self {
-        Self::from_slice(self.expose())
+        Self::wrap(self.data.clone())
     }
 
-    /// Consume, returning the bytes as a plain vector. The caller takes
-    /// over the zeroization obligation; the pages this buffer held are
-    /// wiped and unlocked as it drops.
+    /// Consume, returning the inner vector. The caller takes over the
+    /// zeroization obligation. This releases the buffer's page-lock
+    /// ownership; a peer on the same page may still keep that page pinned.
     pub fn into_vec(mut self) -> Vec<u8> {
-        match &mut self.storage {
-            Storage::Heap(v) => std::mem::take(v),
-            Storage::Pages { .. } => self.expose().to_vec(),
-        }
+        self.page_lock.take();
+        std::mem::take(&mut self.data)
     }
 }
 
 impl Drop for SecretBuffer {
     fn drop(&mut self) {
-        match &mut self.storage {
-            Storage::Heap(v) => v.zeroize(),
-            Storage::Pages {
-                ptr,
-                len: _,
-                layout,
-                locked,
-            } => {
-                // Wipe while still locked (the bytes never become
-                // swappable), then unlock the whole allocation (only ours),
-                // then free it.
-                // SAFETY: the allocation is live and exclusively owned.
-                unsafe {
-                    std::slice::from_raw_parts_mut(ptr.as_ptr(), layout.size()).zeroize();
-                }
-                if *locked {
-                    unlock_pages(ptr.as_ptr(), layout.size());
-                    *locked = false;
-                }
-                // SAFETY: allocated by `alloc_pages` with this exact layout.
-                unsafe { std::alloc::dealloc(ptr.as_ptr(), *layout) };
-            }
-        }
+        // Keep the page locks through zeroization. The guard remembers the
+        // original range even though Vec::zeroize clears its length
+        // (C-02 / BUG-006).
+        self.data.zeroize();
+        self.page_lock.take();
     }
 }
 
 impl std::fmt::Debug for SecretBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SecretBuffer({} bytes, redacted)", self.len())
+        write!(f, "SecretBuffer({} bytes, redacted)", self.data.len())
     }
 }
 
 /// Constant-time-ish equality (length leak only). For tests and self-checks.
 impl PartialEq for SecretBuffer {
     fn eq(&self, other: &Self) -> bool {
-        let (a, b) = (self.expose(), other.expose());
-        if a.len() != b.len() {
+        if self.data.len() != other.data.len() {
             return false;
         }
         let mut acc = 0u8;
-        for (x, y) in a.iter().zip(b.iter()) {
-            acc |= x ^ y;
+        for (a, b) in self.data.iter().zip(other.data.iter()) {
+            acc |= a ^ b;
         }
         acc == 0
     }
@@ -336,43 +251,5 @@ mod tests {
         assert_eq!(plain.len(), 64);
         set_page_locking(false);
         assert!(!SecretBuffer::zeroed(64).is_page_locked());
-    }
-
-    /// With locking on, every buffer gets its own page-aligned allocation:
-    /// no two buffers can share a page, whatever the allocator would do.
-    #[test]
-    fn locked_buffers_are_page_isolated() {
-        let _serial = serial();
-        set_page_locking(true);
-        let page = page_size();
-        let buffers: Vec<SecretBuffer> = (0..8)
-            .map(|_| SecretBuffer::from_slice(&[7u8; 64]))
-            .collect();
-        for b in &buffers {
-            assert!(b.is_page_isolated());
-            assert_eq!(b.expose().as_ptr() as usize % page, 0, "page aligned");
-            assert_eq!(b.expose(), &[7u8; 64]);
-            assert_eq!(b.len(), 64);
-        }
-        let mut pages: Vec<usize> = buffers
-            .iter()
-            .map(|b| b.expose().as_ptr() as usize / page)
-            .collect();
-        pages.sort_unstable();
-        pages.dedup();
-        assert_eq!(pages.len(), buffers.len(), "two buffers share a page");
-        // from_vec copies into isolated pages and wipes the source.
-        let mut v = vec![9u8; 100];
-        let ptr = v.as_ptr();
-        let b = SecretBuffer::from_vec(std::mem::take(&mut v));
-        assert!(b.is_page_isolated());
-        assert_ne!(b.expose().as_ptr(), ptr);
-        assert_eq!(b.into_vec(), vec![9u8; 100]);
-        assert!(
-            !SecretBuffer::zeroed(0).is_page_isolated(),
-            "empty buffers allocate nothing"
-        );
-        set_page_locking(false);
-        assert!(!SecretBuffer::zeroed(64).is_page_isolated());
     }
 }

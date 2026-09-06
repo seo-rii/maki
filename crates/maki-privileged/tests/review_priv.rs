@@ -6,7 +6,7 @@ use maki_privileged::config::{
     check_abs_path, check_argument, check_uuid, parse, AttachConfig, AttachOverrides,
 };
 use maki_privileged::plan::{
-    plan_attach, plan_detach, reconcile_detach_device, rollback_steps, PlannedStep, AUTO_NBD_DEVICE,
+    plan_attach, plan_detach, rollback_steps, PlannedStep, AUTO_NBD_DEVICE,
 };
 use maki_privileged::probe::{
     choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
@@ -359,65 +359,6 @@ fn mountinfo_parsing_exposes_the_device_number() {
     let entry = parse_mountinfo(&first_two, "/srv/pg").unwrap();
     assert_eq!(entry.major_minor, "253:2");
     assert_eq!(parse_mountinfo(MOUNTINFO, "/").unwrap().major_minor, "8:1");
-}
-
-// ---------- F06 (third review): a detach decides its device under the lock ----------
-
-/// `plan_detach` read the attach record before the executor took the
-/// attach lock. Between the two the volume could be detached and
-/// re-attached to another device, with another volume now on the planned
-/// one: the stale plan would unmount the current mount and disconnect the
-/// other volume's device. The executor re-reads the record under the lock
-/// and refuses a plan the record no longer backs.
-#[test]
-fn a_detach_plan_is_reconciled_with_the_attach_record_under_the_lock() {
-    let mut request = request();
-    request.nbd_device = AUTO_NBD_DEVICE.to_string();
-    request.volume = "no-such-volume-for-this-test".to_string();
-    let unresolved = plan_detach(&request);
-    assert!(unresolved.recorded_device.is_none());
-
-    // Placeholder: bound to the record read under the lock, refused without one.
-    let mut plan = unresolved.clone();
-    reconcile_detach_device(&mut plan, Some("/dev/nbd2")).unwrap();
-    assert!(plan.steps.iter().any(|s| matches!(
-        s,
-        PlannedStep::NbdDisconnect { device } if device == "/dev/nbd2"
-    )));
-    let mut plan = unresolved.clone();
-    let err = reconcile_detach_device(&mut plan, None).unwrap_err();
-    assert!(err.contains("refusing to guess"), "{err}");
-
-    // Planned from a record naming nbd0: still nbd0 under the lock = fine;
-    // anything else is a stale plan.
-    let mut from_record = unresolved.clone();
-    from_record.bind_device("/dev/nbd0");
-    from_record.recorded_device = Some("/dev/nbd0".to_string());
-    reconcile_detach_device(&mut from_record.clone(), Some("/dev/nbd0")).unwrap();
-    let err = reconcile_detach_device(&mut from_record.clone(), Some("/dev/nbd1")).unwrap_err();
-    assert!(
-        err.contains("stale plan") && err.contains("/dev/nbd1"),
-        "{err}"
-    );
-    let err = reconcile_detach_device(&mut from_record.clone(), None).unwrap_err();
-    assert!(err.contains("stale plan"), "{err}");
-
-    // An operator-named device is the operator's decision.
-    let mut explicit = unresolved.clone();
-    explicit.bind_device("/dev/nbd7");
-    assert!(explicit.recorded_device.is_none());
-    reconcile_detach_device(&mut explicit, Some("/dev/nbd1")).unwrap();
-    reconcile_detach_device(&mut explicit, None).unwrap();
-    assert!(explicit.steps.iter().any(|s| matches!(
-        s,
-        PlannedStep::NbdDisconnect { device } if device == "/dev/nbd7"
-    )));
-
-    // Attach plans are untouched (their disconnect is only ever a rollback).
-    let attach = plan_attach(&request);
-    let mut reconciled = attach.clone();
-    reconcile_detach_device(&mut reconciled, Some("/dev/nbd3")).unwrap();
-    assert_eq!(reconciled.steps, attach.steps);
 }
 
 // ---------- O-02: a detach never guesses its device ----------

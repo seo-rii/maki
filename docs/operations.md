@@ -137,12 +137,21 @@ qualify `/dev/nbd`, LVM, XFS, or raw-device durability.
 ## Control plane
 
 The data plane binds the per-volume control socket while attaching, at
-`control.socket` or by default `/run/maki/<volume>/control.sock`, with mode
+`control.socket` or by default `/run/maki-control/<volume>/control.sock`, with mode
 0660 and the group named by `control.group` (`maki-admin` in the packaged
-units; `sysusers.d` makes `maki` a member so the unprivileged daemon can apply
+example configuration; `sysusers.d` makes `maki` a member so the unprivileged daemon can apply
 it). A socket that cannot be bound fails attach: a daemon without its control
 socket is not operable. Rootless runs must therefore set `control.socket` to a
 writable path. The socket is removed on clean detach.
+
+The packaged `/run/maki-control` directory is `root:maki-admin` 0750; its
+per-volume children are `maki:maki` 0711. This lets administrators traverse
+the control path while `/run/maki` (`root:maki` 0750) restricts access to NBD.
+The daemon keeps `Group=maki`. Set `control.group = "maki-admin"` to apply the
+administrative socket group; omitting it retains the daemon's socket group.
+NBD isolation relies on the restricted ancestor: nbdkit resets its own umask,
+so a service `UMask` is not a socket-mode guarantee.
+[nbdkit plugin manual](https://libguestfs.org/nbdkit-plugin.3.html#UMASK)
 
 The unprivileged control socket accepts newline-delimited JSON with a 64 KiB
 line limit. The `maki` CLI exposes the supported operations:
@@ -182,10 +191,12 @@ maki-attach grow --volume example --add-bytes 1073741824 --plan
 
 Execution (Linux, root) then:
 
-1. takes `/run/maki/attach.lock` and, unless a device is pinned, allocates the
-   lowest free `/dev/nbdN` from sysfs;
-2. connects NBD with the configured block size and waits until the device
-   reports a size;
+1. opens `/run/maki-attach` through verified root-owned directory descriptors,
+   takes its private `attach.lock`, and, unless a device is pinned, allocates
+   the lowest free `/dev/nbdN` from sysfs;
+2. records the requested attachment and a random connection identifier before
+   connecting NBD, then connects with the configured block size, waits until
+   the device reports a size, and verifies its kernel backend identifier;
 3. activates the VG, mounts XFS, and on `--init-sentinel` (or
    `init_sentinel = true`, first boot only) creates `<mountpoint>/.maki-sentinel`
    holding the volume UUID, never overwriting a different value;
@@ -196,18 +207,49 @@ Execution (Linux, root) then:
    name, so nothing planted there can make root overwrite or block);
 5. on any failure rolls back the executed steps in reverse (umount, VG
    deactivate, NBD disconnect — a device that connected but never became
-   ready is disconnected too) and exits non-zero, reporting rollback steps
-   that themselves failed.
+   ready is disconnected too, only if its recorded backend identity still
+   matches) and exits non-zero, reporting rollback steps that themselves failed.
 
-The device bound at attach is recorded in `/run/maki/attach/<volume>.nbd`.
-`maki-attach detach` uses that record when the attach configuration leaves
-`nbd_device` on auto, takes the same attach lock, and refuses to run when no
-device is recorded rather than guess (pass `--nbd-device` explicitly then).
+Attachment records live in `/run/maki-attach/<volume>.nbd`, under a
+`root:root` 0700 directory. Records are bounded, private, single-link regular
+files containing versioned JSON. The helper refuses symlinks, writable
+ancestors, unexpected ownership, and malformed or legacy device-only records.
+An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV, device,
+and random connection identifier.
+
+`maki-attach detach` takes the same lock and compares the requested attachment
+with that record and the live `/sys/block/nbdN/backend` before unmounting or
+deactivating a VG. It verifies the backend again immediately before disconnect,
+including rollback. Missing records or mismatched identities refuse execution;
+an explicit `--nbd-device` cannot bypass this check.
+
+Detach retries observe current mountinfo and sysfs state before each step.
+An already completed unmount or VG deactivation is skipped. A remaining mount
+must identify the expected LV device, XFS root, and volume sentinel, and active
+VG mappings must use the recorded NBD device. A different mount or backend,
+unreadable observations, remaining device holders (including partition
+holders), and direct mounts of the NBD device or its partitions block unsafe
+deactivation or disconnect.
+
+If disconnect succeeded but the process stopped before retiring its record,
+a retry may remove that record without running device commands only after
+confirming the mount is absent, the VG is inactive, and the disconnected NBD
+has no observed remaining use. This uses the helper's current mount namespace;
+cross-namespace operational qualification remains a target-host check. The
+trusted record format and the legacy migration requirements remain the same.
+
+This requires **nbd-client 3.27.0 or later built with netlink support**, and a
+kernel exposing the NBD backend identifier. The identifier option was added
+in [NBD 3.27.0](https://github.com/NetworkBlockDevice/nbd/releases/tag/nbd-3.27.0).
+An unsupported client or unverifiable connection fails closed. Qualify the
+updated helper on the intended Linux target before deployment; older privileged
+validation reports do not cover this connection-identity protocol.
 
 `maki-attach@<volume>.service` therefore stays active only after the identity
 check passed. Services that need the secure mount must declare
-`Requires=maki-attach@<volume>.service` and `After=` it; the unit is skipped
-when no attach configuration exists. Execution without a volume UUID is
+`Requires=maki-attach@<volume>.service` and `After=` it. `AssertPathExists`
+makes a missing attach configuration fail startup, so the dependent service's
+start job also fails. Execution without a volume UUID is
 refused.
 
 > [!CAUTION]
@@ -235,6 +277,26 @@ systemd-analyze verify maki@example.service maki-attach@example.service
 
 Also verify socket ACLs, effective capabilities, core-dump policy, duplicate
 attach rejection, mount identity, and normal I/O under the service sandbox.
+
+### Upgrading the runtime layout
+
+The September 2026 fixes change helper records and the default control socket
+path. Apply the package changes during a planned maintenance window:
+
+1. Stop dependent workloads and detach existing volumes **using the old
+   helper before replacing it**. Do not copy legacy
+   `/run/maki/attach/<volume>.nbd` files into the new helper directory.
+2. Install the updated helper, units, and tmpfiles rules, and ensure the
+   nbd-client and kernel requirements above are satisfied.
+3. Update explicit `control.socket` values to
+   `/run/maki-control/<volume>/control.sock`, or provision an equivalent custom
+   path whose ancestors permit the configured control group to traverse it.
+4. Reattach and verify the trusted record, mount identity, administrator control
+   access, and NBD socket isolation before starting workloads.
+
+If the helper has already been upgraded while a legacy attachment is live,
+missing trusted state requires independently verified manual cleanup. Pinning
+the NBD device is not a migration shortcut.
 
 ## Growth and cache reload
 
@@ -269,27 +331,32 @@ high-cardinality values as metric labels.
 - A torn final journal tail after the durable mark is truncated during recovery.
 - A failed journal `fdatasync` fails the FLUSH or FUA that needed it, and
   every later barrier keeps failing until the journal has *rewritten* the
-  unsynced records from its own copy and synced them (a bare retry of
-  `fdatasync` succeeds on Linux without writing anything). `maki status`
-  shows `journal_writeback_uncertain: true` and counts
-  `journal_sync_failures_total` while this lasts; reads keep working. After a
-  restart, recovery rewrites everything beyond the durable mark before it
-  syncs, so page-cache bytes a failed writeback left behind are never
-  acknowledged unwritten.
+  unsynced records, verified them against what it accepted, and synced them
+  (a bare retry of `fdatasync` succeeds on Linux without writing anything).
+  `maki status` shows `journal_writeback_uncertain: true` and counts
+  `journal_sync_failures_total` while this lasts; reads keep working. If the
+  cached bytes no longer match what was accepted, no barrier can succeed:
+  restart the daemon so recovery re-scans the journal and discards what was
+  never acknowledged. After a restart, recovery rewrites and verifies every
+  segment prefix it accepted before it syncs, so page-cache bytes a failed
+  writeback left behind are never acknowledged unwritten.
 - A journal write that fails part-way leaves no torn bytes behind: the
   segment is truncated back to its last record before anything is appended
-  or the segment is sealed; while that truncation itself fails, writes and
+  or the segment is sealed, and the cleanup stays pending until that
+  truncation is synced; while the truncation itself fails, writes and
   barriers fail.
-- The NBD plugin splits requests larger than `nbd.maximum_io` into pieces of
-  at most that size (the kernel is not told the limit); the engine refuses a
+- The NBD plugin advertises `nbd.minimum_io`, `preferred_io` and
+  `maximum_io` through nbdkit's block-size negotiation and refuses a request
+  outside them (EINVAL) before any plaintext is copied; the engine refuses a
   larger request outright, so the value bounds the memory one request pins.
 - The control socket serves at most 64 sessions at once (further clients wait
   in the listen backlog), closes a session idle for 60 s or a client that does
   not drain a response within 10 s, and runs one `checkpoint` or `reload` at a
   time: a concurrent one is answered `busy` and must be retried.
-- `maki-attach detach` re-reads the attach record under the attach lock and
-  refuses a plan the record no longer backs (`stale plan: ...`): the volume
-  was detached or re-attached since the plan was made. Re-run the detach.
+- `maki-attach detach` compares the request with the trusted attach record
+  under the attach lock and refuses one the record does not back (a different
+  device, mountpoint, VG or LV, a re-attached volume, a live backend with
+  another identity); see the helper section above.
 - `maki-attach attach` verifies, before the sentinel is written or the probe
   runs, that the mounted filesystem is stored only on the NBD device it
   connected (device-mapper stacks are walked through sysfs); a filesystem on
@@ -317,11 +384,10 @@ high-cardinality values as metric labels.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with mode `0600` or `0400`, or attach is
   refused.
-- The daemon runs under `UMask=0077`, so the NBD socket nbdkit creates is
-  connectable only by the daemon user and root (the attach helper). The
-  control socket is `0660` with `control.group`, and the daemon gives that
-  group search access to its runtime directory so `maki status` works for
-  administrators; `/run/maki` itself is `maki:maki-admin 0750`.
+- The control socket is `0660` with `control.group`; administrators reach it
+  through the `root:maki-admin` `/run/maki-control` tree, while the NBD
+  socket stays behind `/run/maki` (`root:maki` 0750), which only the daemon
+  user and root (the attach helper) can enter.
 
 Use [Testing and qualification](testing.md) before interpreting a successful
 userspace smoke test as production readiness.

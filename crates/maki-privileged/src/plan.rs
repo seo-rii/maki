@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Placeholder for "allocate a free `/dev/nbdN` at execution time".
 pub const AUTO_NBD_DEVICE: &str = "/dev/nbd<auto>";
 
@@ -36,6 +38,11 @@ pub struct AttachRequest {
 #[derive(Debug, Clone)]
 pub struct GrowRequest {
     pub volume: String,
+    /// The Maki volume UUID and NBD socket of the attachment being grown;
+    /// carried so the executor can verify the grow against the trusted
+    /// attach record before running LVM/XFS commands (BUG-018).
+    pub volume_uuid: String,
+    pub nbd_socket: String,
     pub vg_name: String,
     pub lv_name: String,
     pub add_bytes: u64,
@@ -193,68 +200,43 @@ pub struct Plan {
     pub description: String,
     /// The volume the plan is for (names the bound-device record).
     pub volume: String,
+    /// Expected configuration identity for attach/detach. The executor
+    /// compares this to the trusted record before any detach step runs.
+    pub attachment: Option<AttachmentIdentity>,
     pub steps: Vec<PlannedStep>,
-    /// For a detach: the device the planner resolved from the attach
-    /// record, if that is where it came from. The executor re-reads the
-    /// record under the attach lock and refuses to run when it no longer
-    /// names this device (F06): a plan is an observation, not a permit.
-    pub recorded_device: Option<String>,
 }
 
-/// Bring a detach plan's device up to date with the attach record as read
-/// *under the attach lock*, or refuse it (F06):
-///
-/// - a placeholder device is bound to the recorded one, and refused when
-///   there is no record (never "the lowest free device", O-02);
-/// - a device the planner took from the record must still be what the
-///   record names: the volume may have been detached and re-attached (to
-///   another device, with another volume now on the planned one) since
-///   the plan was made;
-/// - a device the operator named explicitly is theirs to name.
-///
-/// Attach and grow plans (no disconnect) are unchanged.
-pub fn reconcile_detach_device(
-    plan: &mut Plan,
-    current_record: Option<&str>,
-) -> Result<(), String> {
-    let planned = plan.steps.iter().find_map(|s| match s {
-        PlannedStep::NbdDisconnect { device } => Some(device.clone()),
-        _ => None,
-    });
-    let Some(planned) = planned else {
-        return Ok(());
-    };
-    if plan
-        .steps
-        .iter()
-        .any(|s| matches!(s, PlannedStep::NbdConnect { .. }))
-    {
-        return Ok(());
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentIdentity {
+    pub volume_uuid: String,
+    pub nbd_socket: String,
+    pub mountpoint: String,
+    pub vg_name: String,
+    pub lv_name: String,
+}
+
+impl From<&AttachRequest> for AttachmentIdentity {
+    fn from(request: &AttachRequest) -> Self {
+        Self {
+            volume_uuid: request.volume_uuid.clone(),
+            nbd_socket: request.nbd_socket.clone(),
+            mountpoint: request.mountpoint.clone(),
+            vg_name: request.vg_name.clone(),
+            lv_name: request.lv_name.clone(),
+        }
     }
-    if planned == AUTO_NBD_DEVICE {
-        return match current_record {
-            Some(device) => {
-                plan.bind_device(device);
-                Ok(())
-            }
-            None => Err(format!(
-                "the NBD device is on auto and no device is recorded at {} for this volume; \
-                 refusing to guess which device to disconnect (pass --nbd-device)",
-                bound_device_record_path(&plan.volume).display()
-            )),
-        };
-    }
-    match (&plan.recorded_device, current_record) {
-        (None, _) => Ok(()),
-        (Some(recorded), Some(current)) if current == recorded && current == planned => Ok(()),
-        (Some(recorded), Some(current)) => Err(format!(
-            "stale plan: the attach record now names {current}, the plan was made for \
-             {recorded}; the volume was re-attached since, re-run the detach"
-        )),
-        (Some(recorded), None) => Err(format!(
-            "stale plan: the attach record for {recorded} is gone (the volume was detached \
-             since the plan was made); nothing to disconnect"
-        )),
+}
+
+impl From<&GrowRequest> for AttachmentIdentity {
+    fn from(request: &GrowRequest) -> Self {
+        Self {
+            volume_uuid: request.volume_uuid.clone(),
+            nbd_socket: request.nbd_socket.clone(),
+            mountpoint: request.mountpoint.clone(),
+            vg_name: request.vg_name.clone(),
+            lv_name: request.lv_name.clone(),
+        }
     }
 }
 
@@ -348,8 +330,8 @@ pub fn plan_attach(request: &AttachRequest) -> Plan {
     Plan {
         description: format!("attach volume {}", request.volume),
         volume: request.volume.clone(),
+        attachment: Some(request.into()),
         steps,
-        recorded_device: None,
     }
 }
 
@@ -362,31 +344,16 @@ pub fn bound_device_record_path(volume: &str) -> std::path::PathBuf {
 }
 
 /// Directory of the per-volume bound-device records.
-pub const BOUND_DEVICE_RECORD_DIR: &str = "/run/maki/attach";
+pub const BOUND_DEVICE_RECORD_DIR: &str = "/run/maki-attach";
 
-/// The device recorded at attach for `volume`, if any and well-formed.
-pub fn recorded_bound_device(volume: &str) -> Option<String> {
-    let text = std::fs::read_to_string(bound_device_record_path(volume)).ok()?;
-    let device = text.trim().to_string();
-    let index = device.strip_prefix("/dev/nbd")?;
-    (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(device)
-}
-
-/// A detach never allocates a device: with the device on `auto` it uses
-/// the one recorded at attach, and stays unresolved (refused by the
-/// executor, see [`Plan::unresolved_disconnect`]) when there is no record.
+/// A detach never allocates a device: with the device on `auto`, the
+/// executor resolves the trusted record under the attach lock. Plan
+/// rendering never reads runtime state or trusts a device-only record.
 pub fn plan_detach(request: &AttachRequest) -> Plan {
-    let (device, recorded_device) = if request.nbd_device == AUTO_NBD_DEVICE {
-        match recorded_bound_device(&request.volume) {
-            Some(recorded) => (recorded.clone(), Some(recorded)),
-            None => (AUTO_NBD_DEVICE.to_string(), None),
-        }
-    } else {
-        (request.nbd_device.clone(), None)
-    };
     Plan {
         description: format!("detach volume {}", request.volume),
         volume: request.volume.clone(),
+        attachment: Some(request.into()),
         steps: vec![
             PlannedStep::Umount {
                 mountpoint: request.mountpoint.clone(),
@@ -394,9 +361,10 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
             PlannedStep::LvmDeactivate {
                 vg_name: request.vg_name.clone(),
             },
-            PlannedStep::NbdDisconnect { device },
+            PlannedStep::NbdDisconnect {
+                device: request.nbd_device.clone(),
+            },
         ],
-        recorded_device,
     }
 }
 
@@ -405,6 +373,7 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
     Plan {
         description: format!("grow volume {}", request.volume),
         volume: request.volume.clone(),
+        attachment: Some(request.into()),
         steps: vec![
             PlannedStep::LvExtend {
                 vg_name: request.vg_name.clone(),
@@ -415,7 +384,6 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
                 mountpoint: request.mountpoint.clone(),
             },
         ],
-        recorded_device: None,
     }
 }
 

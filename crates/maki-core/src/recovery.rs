@@ -29,6 +29,8 @@
 //! offline deep checker reuses it verbatim, so "what recovery would do" and
 //! "what the checker reports" can never drift apart.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
@@ -42,7 +44,7 @@ use maki_format::layout;
 use maki_format::superblock::Superblock;
 use maki_format::FormatError;
 
-use crate::journal::SegmentInfo;
+use crate::journal::{rewrite_verified_range, SegmentInfo};
 use crate::store::SlotStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +100,15 @@ pub struct JournalScan {
     pub repairs: Vec<JournalRepair>,
     /// Whether a durable mark was found for the final segment.
     pub mark: Option<DurableMark>,
+    /// Fingerprints bind recovery's later rewrite to the exact bytes this
+    /// read-only scan accepted, with constant metadata per segment.
+    verified_prefixes: Vec<VerifiedPrefix>,
+}
+
+struct VerifiedPrefix {
+    path: String,
+    len: u64,
+    fingerprint: u64,
 }
 
 /// Recover a volume. `segment_size` is the writer's effective segment size;
@@ -114,6 +125,25 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
 
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
+
+    // The selected checkpoint state gates which journal segments a later
+    // checkpoint may reclaim (`allow_covered_holes_below`, `delete_covered`).
+    // A restart hands recovery page-cache bytes that were never fdatasync'd,
+    // so the highest-generation copy we just chose may be durable only in the
+    // cache. If the writer then reclaims journal covered by it and a power
+    // loss follows, an older checkpoint would resurface with its covering
+    // segments already gone, and the next recovery would refuse to bridge
+    // ("base sequence N does not bridge from checkpoint M", BUG-022). Make
+    // the selected state durable *now*, before the writer resumes: re-store
+    // it (which rewrites and syncs a copy, and, per the A/B rules, preserves
+    // the other valid side first). A failure here fails recovery closed
+    // rather than reclaiming journal against a volatile checkpoint.
+    {
+        let ck_ab = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
+        let mut durable_checkpoint = checkpoint_state.clone();
+        ck_ab.store(backing.as_ref(), &mut durable_checkpoint)?;
+        backing.sync_dir(layout::CHECKPOINT_DIR)?;
+    }
 
     // 5./6. scan journal, then apply the repairs the scan decided on
     let scan = scan_journal(
@@ -142,28 +172,12 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
     //    no active one, so no later barrier would ever sync them, a FLUSH
     //    would acknowledge them anyway, and a successor segment would turn
     //    their torn tail into "corruption" after a real power loss (S-06).
-    //    fsync every surviving segment and publish the mark for the last.
-    //
-    //    An fsync alone is not enough for the final segment: if the previous
-    //    process saw a *failed* writeback, those pages are clean and still
-    //    unpersisted, and fsync has nothing to write. Everything beyond the
-    //    proven prefix is rewritten from the page cache first so the sync
-    //    below really persists it (F01).
-    let last_index = scan.segments.last().map(|s| s.index);
-    for seg in &scan.segments {
-        let file = backing.open(&layout::journal_segment(seg.index), false)?;
-        if Some(seg.index) == last_index {
-            let proven = scan
-                .mark
-                .map(|m| m.durable_size)
-                .unwrap_or(SEGMENT_HEADER_SIZE as u64)
-                .min(seg.size);
-            if seg.size > proven {
-                let mut tail = vec![0u8; (seg.size - proven) as usize];
-                file.read_at(proven, &mut tail)?;
-                file.write_at(proven, &tail)?;
-            }
-        }
+    //    A writeback EIO may also have cleared the cached pages' dirty bits:
+    //    plain fsync can then succeed without writing them. Rewrite each
+    //    accepted prefix, verify it against the scan, and only then sync it.
+    for prefix in &scan.verified_prefixes {
+        let file = backing.open(&prefix.path, false)?;
+        rewrite_verified_range(file.as_ref(), 0..prefix.len, prefix.fingerprint)?;
         file.sync_data()?;
     }
     if let Some(last) = scan.segments.last() {
@@ -241,6 +255,7 @@ pub fn scan_journal(
     let mut prev_last_seq: Option<u64> = None;
     let mut max_seq: u64 = 0;
     let mut final_mark: Option<DurableMark> = None;
+    let mut verified_prefixes = Vec::new();
 
     let count = names.len();
     for (pos, (index, name)) in names.into_iter().enumerate() {
@@ -438,6 +453,16 @@ pub fn scan_journal(
             record_count,
             size,
         });
+        // This fingerprint is ephemeral, never written to the disk format.
+        // CRC32 over CRC-protected headers would have a constant residue
+        // and fail to bind their contents, so use a different hash here.
+        let mut fingerprint = DefaultHasher::new();
+        fingerprint.write(&image[..size as usize]);
+        verified_prefixes.push(VerifiedPrefix {
+            path,
+            len: size,
+            fingerprint: fingerprint.finish(),
+        });
     }
 
     let durable_sequence = checkpoint_sequence.max(max_seq);
@@ -461,6 +486,7 @@ pub fn scan_journal(
         replay,
         repairs,
         mark: final_mark,
+        verified_prefixes,
     })
 }
 

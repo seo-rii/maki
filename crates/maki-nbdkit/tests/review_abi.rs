@@ -1,10 +1,11 @@
 //! F08 (third review): the nbdkit C ABI the shim mirrors by hand is checked
 //! against the *installed* header, not against comments. A C probe is
 //! compiled with the distribution's `nbdkit-plugin.h` at API version 2 and
-//! prints every constant and field offset the shim depends on; they must
-//! equal what `maki_nbdkit::plugin::abi_layout` reports. Skips (loudly)
-//! when the header or a C compiler is missing; CI's nightly job installs
-//! `nbdkit-plugin-dev` so it runs there.
+//! prints every constant and field offset the shim depends on, up to and
+//! including the `block_size` callback the published prefix now covers
+//! (BUG-011); they must equal what `maki_nbdkit::plugin::abi_layout`
+//! reports. Skips (loudly) when the header or a C compiler is missing; CI's
+//! nightly job installs `nbdkit-plugin-dev` so it runs there.
 
 #![cfg(target_os = "linux")]
 
@@ -32,6 +33,10 @@ int main(void) {
   OFF(_pread_v1); OFF(_pwrite_v1); OFF(_flush_v1); OFF(_trim_v1); OFF(_zero_v1);
   OFF(errno_is_preserved); OFF(dump_plugin); OFF(can_zero); OFF(can_fua);
   OFF(pread); OFF(pwrite); OFF(flush); OFF(trim); OFF(zero);
+  OFF(magic_config_key); OFF(can_multi_conn); OFF(can_extents); OFF(extents);
+  OFF(can_cache); OFF(cache); OFF(thread_model); OFF(can_fast_zero);
+  OFF(preconnect); OFF(get_ready); OFF(after_fork); OFF(list_exports);
+  OFF(default_export); OFF(export_description); OFF(cleanup); OFF(block_size);
   printf("sizeof_full %zu\n", sizeof(struct nbdkit_plugin));
   return 0;
 }

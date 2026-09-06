@@ -106,6 +106,8 @@ fn main() -> ExitCode {
             };
             plan_grow(&GrowRequest {
                 volume,
+                volume_uuid: request.volume_uuid.clone(),
+                nbd_socket: request.nbd_socket.clone(),
                 vg_name: request.vg_name.clone(),
                 lv_name: request.lv_name.clone(),
                 add_bytes: add,

@@ -727,6 +727,23 @@ impl VolumeConfig {
         refs
     }
 
+    /// Credential consumers resolve by name. Repeated references may share
+    /// that name only when they also declare the same source (BUG-007).
+    pub fn validate_credential_sources(&self) -> Result<(), ConfigError> {
+        let mut sources = BTreeMap::new();
+        for credential in self.credential_refs() {
+            if let Some(previous) = sources.insert(&credential.name, &credential.source) {
+                if previous != &credential.source {
+                    return Err(invalid(format!(
+                        "credential {:?} has conflicting sources {:?} and {:?}; use distinct names",
+                        credential.name, previous, credential.source
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The block size the NBD export advertises: `nbd.device_block_size`
     /// when set (validation requires it to equal the volume's), otherwise
     /// the volume's `device_block_size`.
@@ -802,6 +819,7 @@ impl VolumeConfig {
         self.validate_journal_bounds()?;
         self.validate_settings()?;
         self.validate_provider_sections()?;
+        self.validate_credential_sources()?;
         if !self
             .crypto
             .capabilities
@@ -1311,6 +1329,12 @@ impl VolumeConfig {
             if v == 0 || !v.is_power_of_two() {
                 return Err(invalid(format!("{name} must be a positive power of two")));
             }
+        }
+        if n.minimum_io > 65536 {
+            return Err(invalid("nbd.minimum_io must not exceed 65536 bytes"));
+        }
+        if n.maximum_io.0 > u32::MAX as u64 {
+            return Err(invalid("nbd.maximum_io must fit in the NBD u32 wire field"));
         }
         if (n.minimum_io as u64) < self.volume.device_block_size as u64
             || preferred < n.minimum_io

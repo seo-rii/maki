@@ -16,13 +16,16 @@
 //! Persistence errors are never "retried" by repeating the syscall:
 //! - A failed `fdatasync` leaves the dirty pages *clean and unpersisted* on
 //!   Linux, so a second `fdatasync` succeeds without writing them. The
-//!   writer keeps its own copy of every unsynced record and, after a sync
-//!   failure, rewrites that copy before it syncs again; only then can a
-//!   barrier be acknowledged (third review, F01).
+//!   writer fingerprints every record it accepts after the last successful
+//!   sync and, after a sync failure, re-reads and rewrites that range in
+//!   bounded chunks, verifies the fingerprint, and only then syncs again;
+//!   bytes that changed or were lost from the cache refuse the barrier
+//!   instead of being acknowledged (third review F01, BUG-021).
 //! - A failed `write_at` may have persisted a prefix, leaving the file
 //!   longer than the writer's logical end. The tail is truncated back to
-//!   the logical end before anything is appended or the segment is sealed;
-//!   until that truncation succeeds, appends and seals fail (F03).
+//!   the logical end before anything is appended or the segment is sealed,
+//!   and the cleanup stays pending until the truncation itself has been
+//!   synced; until it succeeds, appends and seals fail (F03, BUG-020).
 //!
 //! After every successful segment fdatasync the writer records the synced
 //! prefix in the durable mark (`journal/durable-mark`, see
@@ -30,6 +33,9 @@
 //! mark lets recovery tell durable-body corruption from a torn tail; it is
 //! only ever a lower bound, so a failed mark write is logged, not fatal.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+use std::ops::Range;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -70,30 +76,16 @@ struct ActiveSegment {
     /// File offset up to which this segment has been fdatasync'd.
     synced_offset: u64,
     unsynced: bool,
-    /// The writer's own copy of every byte in `[synced_offset,
-    /// write_offset)`: the trustworthy source a sync retry rewrites from
-    /// (F01). Bounded by the segment size and the pending-bytes policy.
-    pending: Vec<u8>,
-    /// A `sync_data` failed since the last successful one, so the pending
-    /// bytes may sit clean-but-unpersisted in the page cache; they are
-    /// rewritten before the next sync.
-    writeback_uncertain: bool,
-    /// A `write_at` failed, so the file may extend past `write_offset` with
-    /// a torn record (F03); it is truncated back before any append or seal.
-    tail_dirty: bool,
-}
-
-impl ActiveSegment {
-    /// Truncate a torn tail back to the logical end. Until this succeeds
-    /// nothing may be appended after it and the segment may not be sealed.
-    fn normalize_tail(&mut self) -> Result<(), CoreError> {
-        if self.tail_dirty {
-            fp("journal.tail.truncate")?;
-            self.file.set_len(self.write_offset)?;
-            self.tail_dirty = false;
-        }
-        Ok(())
-    }
+    /// A failed write may have extended the physical file beyond the last
+    /// accepted record. Keep cleanup pending until its truncation is synced.
+    needs_tail_cleanup: bool,
+    /// Linux may clear dirty page-cache bits after writeback EIO. Retrying
+    /// sync alone cannot make those bytes durable; rewrite them first.
+    needs_redirty: bool,
+    /// Fingerprint of exactly the records accepted after synced_offset.
+    /// Ephemeral state only: CRC32 cannot fingerprint self-checksummed
+    /// record headers, which all have the same CRC residue.
+    pending_fingerprint: DefaultHasher,
 }
 
 pub struct JournalWriter {
@@ -150,7 +142,7 @@ impl JournalWriter {
     pub fn writeback_uncertain(&self) -> bool {
         self.active
             .as_ref()
-            .map(|a| a.writeback_uncertain)
+            .map(|a| a.needs_redirty)
             .unwrap_or(false)
     }
 
@@ -228,36 +220,40 @@ impl JournalWriter {
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
-        // A torn tail is normalized even when nothing is pending: a seal
-        // must never retire a segment longer than its records.
-        active.normalize_tail()?;
-        if !active.unsynced {
+        if !active.unsynced && !active.needs_tail_cleanup {
             return Ok(());
         }
-        let sync: Result<(), CoreError> = (|| {
-            fp("journal.sync")?;
-            if active.writeback_uncertain {
-                // The earlier sync failed; on Linux the pages are clean and
-                // a plain retry writes nothing. Rewrite from our copy so
-                // the sync below has something to persist (F01).
-                fp("journal.rewrite")?;
-                active
-                    .file
-                    .write_at(active.synced_offset, &active.pending)?;
-            }
-            active.file.sync_data()?;
-            Ok(())
-        })();
-        if let Err(e) = sync {
-            active.writeback_uncertain = true;
+        if active.needs_tail_cleanup {
+            // Even a segment with no new accepted records can have a torn
+            // append. Its removal must be durable before a roll makes this
+            // segment non-final, where recovery rejects every damaged byte.
+            fp("journal.tail.truncate")?;
+            active.file.set_len(active.write_offset)?;
+        }
+        if active.needs_redirty {
+            // The earlier sync failed; on Linux the pages are clean and a
+            // plain retry writes nothing. Rewrite the accepted range so the
+            // sync below has something to persist (F01), refusing bytes
+            // that no longer match what was accepted.
+            fp("journal.rewrite")?;
+            rewrite_verified_range(
+                active.file.as_ref(),
+                active.synced_offset..active.write_offset,
+                active.pending_fingerprint.finish(),
+            )?;
+        }
+        fp("journal.sync")?;
+        if let Err(error) = active.file.sync_data() {
+            active.needs_redirty = true;
             self.sync_failures += 1;
             self.sanitize();
-            return Err(e);
+            return Err(error.into());
         }
         active.unsynced = false;
+        active.needs_tail_cleanup = false;
+        active.needs_redirty = false;
+        active.pending_fingerprint = DefaultHasher::new();
         active.synced_offset = active.write_offset;
-        active.pending.clear();
-        active.writeback_uncertain = false;
         self.durable_sequence = self.appended_sequence;
         let mark = DurableMark {
             segment_index: active.info.index,
@@ -336,9 +332,9 @@ impl JournalWriter {
                     write_offset: SEGMENT_HEADER_SIZE as u64,
                     synced_offset: SEGMENT_HEADER_SIZE as u64,
                     unsynced: false,
-                    pending: Vec::new(),
-                    writeback_uncertain: false,
-                    tail_dirty: false,
+                    needs_tail_cleanup: false,
+                    needs_redirty: false,
+                    pending_fingerprint: DefaultHasher::new(),
                 });
                 // Point the mark at the new segment (header only) so it
                 // names the newest segment index even before the first
@@ -380,21 +376,22 @@ impl JournalWriter {
         };
         let bytes = encode_record(&record);
         let active = self.active.as_mut().expect("active segment after roll");
-        active.normalize_tail()?;
-        let written: Result<(), CoreError> = (|| {
-            fp("journal.append.write")?;
-            active.file.write_at(active.write_offset, &bytes)?;
-            Ok(())
-        })();
-        if let Err(e) = written {
+        if active.needs_tail_cleanup {
+            // A shorter retry cannot overwrite the whole failed prefix.
+            // Retain the flag until fdatasync also persists this truncation.
+            fp("journal.tail.truncate")?;
+            active.file.set_len(active.write_offset)?;
+        }
+        fp("journal.append.write")?;
+        if let Err(error) = active.file.write_at(active.write_offset, &bytes) {
             // The write may have persisted a prefix: the file can now be
             // longer than the logical end, holding a torn record that a
             // shorter successor would not cover (F03).
-            active.tail_dirty = true;
+            active.needs_tail_cleanup = true;
             self.sanitize();
-            return Err(e);
+            return Err(error.into());
         }
-        active.pending.extend_from_slice(&bytes);
+        active.pending_fingerprint.write(&bytes);
         active.write_offset += bytes.len() as u64;
         active.info.record_count += 1;
         active.info.size = active.write_offset;
@@ -427,9 +424,8 @@ impl JournalWriter {
     /// * The active segment's synced prefix never exceeds its size, an
     ///   unsynced segment has bytes past the synced prefix, and a synced one
     ///   has none.
-    /// * The writer's pending copy is exactly the unsynced range, and the
-    ///   file is exactly as long as the logical end unless a torn tail is
-    ///   known and awaiting truncation.
+    /// * The file is exactly as long as the logical end unless a torn tail
+    ///   is known and its cleanup still awaits a sync.
     /// * Every sealed segment is fully durable: its last record is at or
     ///   below `durable_sequence`.
     /// * `next_segment_index` is above every segment index in use.
@@ -508,12 +504,7 @@ impl JournalWriter {
                 a.synced_offset <= a.write_offset,
                 "journal sanitizer: synced past written"
             );
-            assert_eq!(
-                a.pending.len() as u64,
-                a.write_offset - a.synced_offset,
-                "journal sanitizer: pending copy does not cover the unsynced range"
-            );
-            if !a.tail_dirty {
+            if !a.needs_tail_cleanup {
                 // The physical file must end exactly at the logical end;
                 // a longer file is a torn record the seal would carry into
                 // a non-final segment (F03). Unreadable length = skip.
@@ -589,6 +580,34 @@ impl JournalWriter {
             None => Ok(deleted),
         }
     }
+}
+
+/// Redirty the accepted journal image using bounded scratch space, and
+/// verify that re-read bytes still match the original in-memory fingerprint.
+/// No successful durability boundary may follow a changed or lost cache
+/// image. Callers fdatasync only after this verification succeeds.
+pub(crate) fn rewrite_verified_range(
+    file: &dyn BackingFile,
+    range: Range<u64>,
+    expected_fingerprint: u64,
+) -> Result<(), CoreError> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut fingerprint = DefaultHasher::new();
+    let mut offset = range.start;
+    while offset < range.end {
+        let len = (range.end - offset).min(buffer.len() as u64) as usize;
+        let chunk = &mut buffer[..len];
+        file.read_at(offset, chunk)?;
+        fingerprint.write(chunk);
+        file.write_at(offset, chunk)?;
+        offset += len as u64;
+    }
+    if fingerprint.finish() != expected_fingerprint {
+        return Err(CoreError::Corrupt(
+            "journal bytes changed after validation; refusing a durability acknowledgement".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The segment size the writer actually rolls at for a configured value

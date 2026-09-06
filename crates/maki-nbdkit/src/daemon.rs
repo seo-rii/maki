@@ -99,6 +99,9 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
 pub async fn build_provider_with_endpoints(
     config: &VolumeConfig,
 ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
+    // Public callers can supply an unvalidated configuration. Refuse name
+    // collisions before the name-only credential router loads any secret.
+    config.validate_credential_sources()?;
     let unit = config.volume.crypto_unit_size;
     let compat = config.crypto.crypto_compatibility_id.as_str();
     let set = match config.crypto.provider.as_str() {
@@ -672,11 +675,11 @@ pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonErro
 }
 
 /// The per-volume control socket path (SPEC §7): `control.socket`, or
-/// `/run/maki/<volume>/control.sock`.
+/// `/run/maki-control/<volume>/control.sock`.
 pub fn control_socket_path(config: &VolumeConfig) -> String {
     config
         .control
         .socket
         .clone()
-        .unwrap_or_else(|| format!("/run/maki/{}/control.sock", config.volume.name))
+        .unwrap_or_else(|| format!("/run/maki-control/{}/control.sock", config.volume.name))
 }

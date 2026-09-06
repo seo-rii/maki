@@ -17,6 +17,7 @@
 //! takes slices). Local providers gain nothing from coalescing, so the
 //! daemon only wraps remote ones.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,9 +112,50 @@ struct Group<I, O> {
     context: CryptoContext,
     items: Vec<I>,
     bytes: u64,
-    reply: oneshot::Sender<Result<Vec<O>, CryptoError>>,
+    reply: Reply<O>,
     /// Queue capacity, released when the group is dispatched.
+    _pending: PendingCharge,
+}
+
+type Reply<O> = oneshot::Sender<Result<Vec<O>, CryptoError>>;
+
+/// The queued data owns both its admission and its metrics. Cancellation
+/// and a stopped lane release them together, before dispatch or on drop.
+struct PendingCharge {
+    stats: Arc<SchedulerStats>,
+    items: u64,
+    bytes: u64,
     _permit: DualPermit,
+}
+
+impl Drop for PendingCharge {
+    fn drop(&mut self) {
+        self.stats
+            .pending_items
+            .fetch_sub(self.items, Ordering::SeqCst);
+        self.stats
+            .pending_bytes
+            .fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// A shared provider call remains necessary until its last caller leaves.
+async fn all_replies_closed<'a, O: 'a>(replies: impl Iterator<Item = &'a mut Reply<O>>) {
+    for reply in replies {
+        reply.closed().await;
+    }
+}
+
+async fn queued_caller_closed<I, O>(batch: &mut [Group<I, O>], queued: &mut VecDeque<Group<I, O>>) {
+    std::future::poll_fn(|cx| {
+        for group in batch.iter_mut().chain(queued.iter_mut()) {
+            if group.reply.poll_closed(cx).is_ready() {
+                return std::task::Poll::Ready(());
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await;
 }
 
 type CallFuture<O> =
@@ -150,7 +192,7 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         context: &CryptoContext,
         items: Vec<I>,
         bytes: u64,
-        stats: &SchedulerStats,
+        stats: &Arc<SchedulerStats>,
     ) -> Result<Vec<O>, CryptoError> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -170,11 +212,14 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
             items,
             bytes,
             reply: reply_tx,
-            _permit: permit,
+            _pending: PendingCharge {
+                stats: stats.clone(),
+                items: count,
+                bytes,
+                _permit: permit,
+            },
         };
         if self.tx.send(group).await.is_err() {
-            stats.pending_items.fetch_sub(count, Ordering::SeqCst);
-            stats.pending_bytes.fetch_sub(bytes, Ordering::SeqCst);
             return Err(CryptoError::ProviderFatal(
                 "crypto batch scheduler has stopped".to_string(),
             ));
@@ -197,15 +242,22 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
     call: LaneCall<I, O>,
     inflight: Arc<tokio::sync::Semaphore>,
 ) {
-    let mut carry: Option<Group<I, O>> = None;
-    loop {
-        let first = match carry.take() {
+    // Groups received while a full lane waits keep their payload and queue
+    // admission together. Unlike an unread mpsc tail, this FIFO can observe
+    // and remove cancelled callers even while an earlier live RPC stalls.
+    let mut queued = VecDeque::new();
+    let mut receiver_closed = false;
+    'lane: loop {
+        let first = match queued.pop_front() {
             Some(g) => g,
             None => match rx.recv().await {
                 Some(g) => g,
                 None => return,
             },
         };
+        if first.reply.is_closed() {
+            continue;
+        }
         let deadline = clock.now().saturating_add(config.max_wait);
         let mut batch: Vec<Group<I, O>> = vec![first];
         let mut items: usize = batch[0].items.len();
@@ -216,18 +268,32 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             if remaining.is_zero() {
                 break;
             }
-            let next = tokio::select! {
-                g = rx.recv() => g,
-                _ = clock.sleep(remaining) => None,
+            let next = if let Some(group) = queued.pop_front() {
+                Some(group)
+            } else {
+                tokio::select! {
+                    _ = queued_caller_closed(&mut batch, &mut queued) => {
+                        batch.retain(|g| !g.reply.is_closed());
+                        if batch.is_empty() { continue 'lane; }
+                        items = batch.iter().map(|g| g.items.len()).sum();
+                        bytes = batch.iter().map(|g| g.bytes).sum();
+                        continue;
+                    },
+                    g = rx.recv() => g,
+                    _ = clock.sleep(remaining) => None,
+                }
             };
             let Some(group) = next else {
                 break;
             };
+            if group.reply.is_closed() {
+                continue;
+            }
             let fits = items + group.items.len() <= config.max_items
                 && bytes + group.bytes <= config.max_bytes
                 && group.context == batch[0].context;
             if !fits {
-                carry = Some(group);
+                queued.push_front(group);
                 break;
             }
             items += group.items.len();
@@ -235,12 +301,32 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             batch.push(group);
         }
 
-        for g in &batch {
-            stats
-                .pending_items
-                .fetch_sub(g.items.len() as u64, Ordering::SeqCst);
-            stats.pending_bytes.fetch_sub(g.bytes, Ordering::SeqCst);
+        // Keep queued ownership while a prior batch occupies the lane. An
+        // abandoned batch must never wait forever for that slot or reach
+        // the provider after its caller has already cancelled it.
+        let slot = loop {
+            tokio::select! {
+                biased;
+                _ = queued_caller_closed(&mut batch, &mut queued) => {
+                    batch.retain(|g| !g.reply.is_closed());
+                    queued.retain(|g| !g.reply.is_closed());
+                    if batch.is_empty() { continue 'lane; }
+                },
+                slot = inflight.clone().acquire_owned() => break slot.expect("semaphore closed"),
+                group = rx.recv(), if !receiver_closed => {
+                    match group {
+                        Some(group) if !group.reply.is_closed() => queued.push_back(group),
+                        Some(_) => {},
+                        None => receiver_closed = true,
+                    }
+                },
+            }
+        };
+        batch.retain(|g| !g.reply.is_closed());
+        if batch.is_empty() {
+            continue;
         }
+        let items = batch.iter().map(|g| g.items.len()).sum::<usize>();
         stats.batches.fetch_add(1, Ordering::SeqCst);
         stats
             .batched_items
@@ -257,23 +343,27 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             lengths.push(g.items.len());
             replies.push(g.reply);
             all_items.extend(g.items);
-            // `_permit` drops here: the group left the queue.
+            // `_pending` drops here: the group left the queue.
         }
         // Dispatch off the lane task so the next batch forms while this one
         // is in flight (C-04); the inflight semaphore bounds the overlap.
-        let slot = inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
         let call = call.clone();
         let stats = stats.clone();
         tokio::spawn(async move {
             let _slot = slot;
+            // `inflight_batches` counts provider calls dispatched and not
+            // yet answered (SPEC 40), abandoned ones included until they
+            // are dropped.
             stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
-            let result = call(context, all_items).await;
+            let result = tokio::select! {
+                biased;
+                _ = all_replies_closed(replies.iter_mut()) => None,
+                result = call(context, all_items) => Some(result),
+            };
             stats.inflight_batches.fetch_sub(1, Ordering::SeqCst);
-            deliver(result, items, lengths, replies);
+            if let Some(result) = result {
+                deliver(result, items, lengths, replies);
+            }
         });
     }
 }
@@ -314,6 +404,7 @@ fn deliver<O>(
 /// inner provider.
 pub struct BatchScheduler {
     inner: Arc<dyn CryptoProvider>,
+    clock: Arc<dyn Clock>,
     encrypt: Lane<PlaintextUnit, CiphertextUnit>,
     decrypt: Lane<CiphertextUnit, PlaintextUnit>,
     stats: Arc<SchedulerStats>,
@@ -342,7 +433,7 @@ impl BatchScheduler {
         let decrypt = Lane::spawn(
             config.clone(),
             config.max_pending_ciphertext_bytes,
-            clock,
+            clock.clone(),
             stats.clone(),
             Arc::new(move |context, items: Vec<CiphertextUnit>| {
                 let inner = dec_inner.clone();
@@ -351,6 +442,7 @@ impl BatchScheduler {
         );
         Self {
             inner,
+            clock,
             encrypt,
             decrypt,
             stats,
@@ -360,10 +452,31 @@ impl BatchScheduler {
     pub fn stats(&self) -> Arc<SchedulerStats> {
         self.stats.clone()
     }
+
+    /// Start the caller's budget before its first queue-admission wait.
+    /// Expiry drops the submit future; the lane then removes that group or
+    /// abandons an RPC whose final caller has expired (BUG-012 / BUG-013).
+    async fn with_deadline<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, CryptoError>>,
+    ) -> Result<T, CryptoError> {
+        let Some(limit) = self.max_operation_time() else {
+            return operation.await;
+        };
+        tokio::select! {
+            biased;
+            _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
+            result = operation => result,
+        }
+    }
 }
 
 #[async_trait]
 impl CryptoProvider for BatchScheduler {
+    fn max_operation_time(&self) -> Option<Duration> {
+        self.inner.max_operation_time()
+    }
+
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
         self.inner.capabilities().await
     }
@@ -373,17 +486,20 @@ impl CryptoProvider for BatchScheduler {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
-        let owned: Vec<PlaintextUnit> = items
-            .iter()
-            .map(|i| PlaintextUnit {
-                unit_index: i.unit_index,
-                data: i.data.duplicate(),
-            })
-            .collect();
-        self.encrypt
-            .submit(context, owned, bytes, &self.stats)
-            .await
+        self.with_deadline(async {
+            let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+            let owned: Vec<PlaintextUnit> = items
+                .iter()
+                .map(|i| PlaintextUnit {
+                    unit_index: i.unit_index,
+                    data: i.data.duplicate(),
+                })
+                .collect();
+            self.encrypt
+                .submit(context, owned, bytes, &self.stats)
+                .await
+        })
+        .await
     }
 
     async fn decrypt_batch(
@@ -391,9 +507,12 @@ impl CryptoProvider for BatchScheduler {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
-        self.decrypt
-            .submit(context, items.to_vec(), bytes, &self.stats)
-            .await
+        self.with_deadline(async {
+            let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+            self.decrypt
+                .submit(context, items.to_vec(), bytes, &self.stats)
+                .await
+        })
+        .await
     }
 }

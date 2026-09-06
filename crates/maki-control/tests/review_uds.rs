@@ -75,53 +75,93 @@ async fn unknown_group_is_an_error() {
     let err = bind_control_socket(&path, Some("maki-no-such-group-xyz")).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
     assert!(!path.exists(), "failed bind leaves no socket behind");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn failed_group_setup_does_not_replace_existing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+    std::fs::write(&path, b"stale").unwrap();
+
+    assert!(bind_control_socket(&path, Some("maki-no-such-group-xyz")).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn publication_failure_leaves_no_temporary_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+    std::fs::create_dir(&path).unwrap();
+
+    assert!(bind_control_socket(&path, None).is_err());
+    assert!(path.is_dir());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn bind_applies_the_configured_group() {
+    use std::os::unix::fs::MetadataExt;
+
+    // Look up a group already held by this process, requiring no privilege
+    // or machine-specific group name to exercise the configured chgrp path.
+    let gid = unsafe { libc::getegid() };
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut result = std::ptr::null_mut();
+    // SAFETY: getgrgid_r writes only to these valid output buffers.
+    let rc = unsafe {
+        libc::getgrgid_r(
+            gid,
+            &mut group,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(!result.is_null());
+    // SAFETY: a successful lookup provides a NUL-terminated name in buffer.
+    let name = unsafe { std::ffi::CStr::from_ptr(group.gr_name) }
+        .to_str()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+
+    let listener = bind_control_socket(&path, Some(name)).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.gid(), gid);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+    drop(listener);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bind_supports_a_maximum_length_filesystem_socket_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Linux sun_path holds 108 bytes, including its terminating NUL. Use a
+    // one-byte filename so any intermediate directory would exceed it.
+    let padding = 107 - dir.path().as_os_str().as_bytes().len() - 3;
+    let parent = dir.path().join("p".repeat(padding));
+    std::fs::create_dir(&parent).unwrap();
+    let path = parent.join("s");
+    assert_eq!(path.as_os_str().as_bytes().len(), 107);
+    // Establish that this path was valid before adding private publication.
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+
+    let listener = bind_control_socket(&path, None).unwrap();
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    drop(stream);
+    drop(listener);
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn root_group_resolves_to_gid_zero() {
     assert_eq!(resolve_gid("root").unwrap(), 0);
-}
-
-/// N-11 (fifth pass): a 0660 socket is unreachable when its directory cannot
-/// be traversed. systemd creates the runtime directory owner-only for the
-/// daemon user, so an administrator in `control.group` could never connect.
-/// The daemon gives that group search access to the socket's directory.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn socket_directory_becomes_searchable_by_the_control_group() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    fn group_name(gid: u32) -> String {
-        // SAFETY: getgrgid returns a static buffer; read immediately.
-        unsafe {
-            let entry = libc::getgrgid(gid);
-            assert!(!entry.is_null(), "gid {gid} has no group entry");
-            std::ffi::CStr::from_ptr((*entry).gr_name)
-                .to_string_lossy()
-                .into_owned()
-        }
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    // The systemd shape: an owner-only runtime directory.
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    // The caller's own primary group stands in for maki-admin.
-    // SAFETY: plain getgid.
-    let gid = unsafe { libc::getgid() };
-    let group = group_name(gid);
-    let path = dir.path().join("control.sock");
-    let _listener = bind_control_socket(&path, Some(&group)).unwrap();
-
-    let meta = std::fs::metadata(dir.path()).unwrap();
-    assert_eq!(meta.gid(), gid, "directory chgrp'd to the control group");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o750,
-        "group can traverse the directory, others still cannot"
-    );
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o660
-    );
 }

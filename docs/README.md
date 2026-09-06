@@ -13,7 +13,8 @@ for storage, durability, provider, and security requirements.
 | Creating a volume configuration | [Configuration](configuration.md) |
 | Running or recovering a volume | [Operations](operations.md) |
 | Reviewing test evidence or release readiness | [Testing and qualification](testing.md) |
-| Checking what the 2026-09-02 external review found and what was fixed | [Review remediation log](review-remediation.md) |
+| Checking review findings and their fixes | [Review remediation log](review-remediation.md) |
+| Reading the 2026-09-05 project assessment | [Project review](project-review-2026-09-05.md) |
 | Implementing protocol or format changes | [Technical specification](../SPEC.md) |
 
 ## Validation evidence

@@ -266,7 +266,7 @@ maki grow
 Normal status and runtime configuration operations are performed over the daemon control socket:
 
 ```text
-/run/maki/<volume>/control.sock
+/run/maki-control/<volume>/control.sock
 ```
 
 Recommended ownership:
@@ -321,6 +321,15 @@ Recommended layout:
 /run/maki/
 ├── postgres/
 └── minio/
+
+/run/maki-control/
+├── postgres/
+└── minio/
+
+/run/maki-attach/
+├── attach.lock
+├── postgres.nbd
+└── minio.nbd
 ```
 
 Recommended permissions:
@@ -342,13 +351,19 @@ data/journal/metadata files
 maki:maki                 0600
 
 /run/maki
-maki:maki-admin           0750
+root:maki                 0750
 
-/run/maki/<volume>
-maki:maki-admin           0750
-(the daemon sets the group to `control.group`; administrators must be able
-to traverse the directory to reach control.sock, while nbd.sock is created
-0700 under the daemon's umask)
+/run/maki-control
+root:maki-admin           0750
+
+/run/maki/<volume> and /run/maki-control/<volume>
+maki:maki                 0711
+
+/run/maki-attach
+root:root                 0700
+
+/run/maki-attach/*
+root:root                 0600
 ```
 
 The NBD Unix Domain Socket:
@@ -357,7 +372,22 @@ The NBD Unix Domain Socket:
 /run/maki/<volume>/nbd.sock
 ```
 
-MUST be created inside a restrictive runtime directory.
+MUST be created behind a restrictive runtime ancestor.
+Administrative control access MUST NOT grant access to the NBD socket.
+
+Privileged attachment state MUST be opened through root-controlled directory
+descriptors without following symlinks. Detach MUST verify its requested
+volume UUID, socket, mountpoint, VG, LV, and device against a trusted record
+before executing any step. The record's unique connection identifier MUST
+match the live NBD backend before detach and immediately before disconnect,
+including rollback. A missing or invalid record MUST fail closed, even when
+the caller supplies an explicit NBD device.
+
+A detach retry MAY skip a step whose completion is verified from current mount
+and block-device observations. Destructive steps still require matching live
+identity. If every detach step has already completed, the helper MAY retire
+the trusted record without device commands only after verifying mount absence,
+inactive VG mappings, and no remaining NBD or partition use.
 
 ---
 
@@ -436,8 +466,11 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 
+RuntimeDirectory=maki/%i maki-control/%i
+RuntimeDirectoryMode=0711
 ReadWritePaths=/var/lib/maki/%i
 ReadWritePaths=/run/maki/%i
+ReadWritePaths=/run/maki-control/%i
 ```
 
 The exact sandbox options MUST be finalized after compatibility testing with nbdkit and all required shared libraries.
@@ -544,6 +577,12 @@ Block-related concepts are separated.
 | `max_ciphertext_size` | maximum ciphertext per unit   | provider contract |
 | `slot_alignment`      | backing slot alignment        |               512 |
 | `slot_size`           | physical slot size            |        calculated |
+
+The plugin MUST advertise the configured minimum, preferred, and maximum NBD
+I/O sizes. The minimum MUST be at most 64 KiB and the maximum MUST fit in the
+32-bit NBD field. Read and write callbacks MUST reject zero-length, oversized,
+out-of-range, or minimum-misaligned requests before copying write plaintext or
+submitting engine work. The preferred size is a performance hint.
 
 Recommended:
 
@@ -901,6 +940,10 @@ NBD completion
 
 Each volume has one ordered journal writer actor.
 
+A failed append MAY leave a partial physical tail, but subsequent appends and
+barriers MUST remove bytes beyond the last accepted record. Cleanup MUST stay
+pending until truncation and synchronization succeed, including before a roll.
+
 Tracked state includes:
 
 ```text
@@ -954,6 +997,11 @@ advance durable_sequence
  ↓
 FLUSH success
 ```
+
+After writeback failure, a successful sync retry alone MUST NOT establish
+durability. The writer MUST rewrite the accepted pending bytes, verify their
+identity, and synchronize them before advancing the durable boundary. Changed
+or lost bytes MUST cause failure without acknowledging them.
 
 ---
 
@@ -1019,9 +1067,11 @@ scan journal
  ↓
 discard/truncate partial tail
  ↓
-fdatasync every surviving segment, publish the durable mark
+rewrite and verify every accepted prefix, then fdatasync each segment
+and publish the durable mark
 (a process restart hands recovery page-cache bytes: nothing it
-accepts may stay unsynced once the writer resumes)
+accepts may stay unsynced once the writer resumes, including pages
+whose dirty bits were cleared by failed writeback)
  ↓
 rebuild overlay
  ↓
@@ -1262,6 +1312,11 @@ retry frequency remains bounded
 operator cancellation remains possible
 ```
 
+Cancellation MUST release queued payload and its admission charge together,
+including requests queued behind a live blocked request. A shared RPC MUST
+remain available to its live callers and MUST be abandoned once its final
+caller cancels.
+
 ## `bounded-error`
 
 After the configured maximum operation time:
@@ -1269,6 +1324,10 @@ After the configured maximum operation time:
 ```text
 return I/O error
 ```
+
+The crypto operation budget MUST include scheduler admission, coalescing,
+waiting for an RPC slot, and the RPC itself. Dispatch MUST NOT reset the
+caller's budget.
 
 ---
 
@@ -1894,7 +1953,7 @@ threads = 64
 connections = 1
 
 [control]
-socket = "/run/maki/postgres-prod/control.sock"
+socket = "/run/maki-control/postgres-prod/control.sock"
 group = "maki-admin"
 
 [security]

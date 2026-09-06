@@ -65,10 +65,11 @@ schema, geometry, and secret-literal checks it rejects:
 - NBD I/O sizes that are not powers of two or not ordered
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
-  `nbd.device_block_size` that differs from the volume's, or a
-  `limits.max_plaintext_bytes` smaller than `nbd.maximum_io` plus one crypto
-  unit (the admission budget must hold one maximal request; a request is
-  charged every unit it touches, in full);
+  `nbd.device_block_size` that differs from the volume's, a `minimum_io`
+  above 64 KiB, a `maximum_io` that does not fit in the NBD 32-bit wire
+  field, or a `limits.max_plaintext_bytes` smaller than `nbd.maximum_io`
+  plus one crypto unit (the admission budget must hold one maximal request;
+  a request is charged every unit it touches, in full);
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at
@@ -88,7 +89,8 @@ schema, geometry, and secret-literal checks it rejects:
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
-- the `keyring` credential source, which this build does not implement.
+- the `keyring` credential source, which this build does not implement, and
+  the same credential name declared with different sources.
 
 The HTTP provider additionally refuses to start when a CA or client certificate
 file cannot be read or parsed, and reads `client_key` from its credential source
@@ -124,6 +126,11 @@ Every credential reference is loaded from exactly the `source` it declares:
 directory is unset, `file` reads the named file, `env` reads
 `MAKI_CREDENTIAL_<NAME>`. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
+Within one volume configuration, references may reuse a name only when they
+declare the same source. For example, `name = "token"` in both the encrypt and
+decrypt mappings is valid with `source = "credential"` on both. Combining that
+name with `source = "env"` is rejected during validation and provider
+construction; use distinct names for distinct sources.
 Do not place plaintext keys or bearer tokens in TOML, command lines, logs, or
 operation plans.
 
@@ -137,6 +144,8 @@ index. Binary data may use base64, base64url, or hexadecimal encoding.
 Responses can be single-item or batched. If an item index is returned, Maki
 validates it; missing, duplicate, reordered, oversized, or partial responses are
 provider contract errors. Response bodies are read under a hard size limit.
+Transport error messages omit the request URL, including its query values,
+for connection failures, timeouts, and response-body failures.
 
 ## WebSocket and gRPC contracts
 
@@ -145,20 +154,48 @@ stale response IDs are discarded, pending requests are scoped to a connection
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
+Timeout or cancellation retires the connection generation and releases its
+socket and reader/writer task. Reconnection uses a new generation; cleanup of
+the retired one cannot close it or fail its requests. Dropping the provider
+also closes an otherwise idle connection.
 
 Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request has been
 sent, and the WebSocket transport does not resend over a fresh connection. With
 `availability_policy = "bounded-error"`, `max_operation_time` is an absolute
-wall-clock deadline: backoff never sleeps past it and an in-flight request is
-abandoned when it expires. Endpoints that could not be cross-validated at attach
+wall-clock deadline: backoff never sleeps past it and an expired caller receives
+an error. A shared RPC remains active while it still has a live caller.
+Endpoints that could not be cross-validated at attach
 (unreachable at the time) are quarantined and start serving only after the
 cross-endpoint check succeeds against a validated endpoint.
+HalfOpen breaker probes return their admission slots on every exit, including
+operation deadlines, cancellation, request/provider errors, and refusal by the
+retry budget. These neutral outcomes leave the endpoint's failure count
+unchanged, so later requests can still probe for recovery.
+
+For a batched crypto call, the operation budget begins before scheduler
+admission and includes coalescing, waiting for an RPC slot, and the RPC itself.
+Dispatch does not reset the caller's budget. Cancellation removes that caller's
+queued payload and admission charge; an in-flight coalesced RPC is abandoned
+when its final caller leaves. Other callers in that batch can still complete.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
 Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
+
+## NBD request limits
+
+The plugin advertises `minimum_io`, `preferred_io`, and `maximum_io` through
+nbdkit's block-size callback. The adapter also rejects read/write requests with
+zero length, invalid minimum-size alignment, an out-of-range end, or a length
+above `maximum_io` with EINVAL, before copying write plaintext or entering the
+engine. Clients that ignore negotiation therefore cannot bypass the bound used
+to validate journal headroom. `preferred_io` remains a performance hint.
+
+This negotiation path was verified with the installed nbdkit header and a real
+rootless nbdkit/libnbd connection. Older clients can still connect, but requests
+outside the configured constraints fail cleanly.
 
 ## Journal bounds
 
@@ -194,6 +231,12 @@ scheduler under `crypto`, and metrics expose `maki_crypto_pending_items`,
 
 ## Security settings
 
+The default administrative socket is
+`/run/maki-control/<volume>/control.sock`. The shipped runtime directories allow
+`maki-admin` to traverse this tree while the NBD socket remains under the
+daemon group's `/run/maki` tree. `control.socket` can override the path; its
+parent directories must permit traversal by the configured control group.
+
 The `[security]` section is applied by the daemon before the volume is
 attached, fails closed on Linux, and is reported under `security` in
 `maki status` so nothing in it is a placebo.
@@ -202,10 +245,15 @@ attached, fails closed on Linux, and is reported under `security` in
 |---|---|
 | `disable_core_dump` (default true) | `prctl(PR_SET_DUMPABLE, 0)` and `RLIMIT_CORE = 0`, verified after the call |
 | `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
-| `memory_lock_mode = "secure-buffers"` (default) | Every secret buffer (plaintext, keys, cache entries) lives in its own page-aligned allocation that is `mlock`ed for its lifetime, so dropping one buffer never unlocks another's page; failures are counted and reported |
+| `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` every secret buffer (plaintext, keys, cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
 | `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
 | `require_secure_swap_policy` (default false) | When true, attach is refused unless `/proc/swaps` is readable, parseable, and lists only RAM-only zram devices (`/dev/zramN` whose `backing_dev` is `none`, or a dm-crypt one) or dm-crypt devices. Classification is by device identity, never by name: a swap file called `zram-backup` is a swap file. Set it in production (the shipped example does) |
+
+Buffers are zeroized before their page-lock ownership is released. Exporting a
+buffer as a plain vector releases that buffer's ownership and transfers the
+zeroization obligation to the caller; other buffers sharing its pages retain
+their locks.
 
 On non-Linux hosts nothing is enforced; the status document reports
 `platform = "unsupported-platform"` and a warning is logged.

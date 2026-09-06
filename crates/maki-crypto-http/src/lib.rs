@@ -255,6 +255,16 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
+/// Decode one JSON Pointer reference token (RFC 6901 §4): `~1` is `/` and
+/// `~0` is `~`, in that order, so `~01` decodes to `~1` and a literal
+/// slash or tilde in a field name round-trips. The response side reads
+/// with `serde_json`'s `Value::pointer`, which decodes the same way; the
+/// request side must match it or a vendor field named `key/slot` is sent
+/// as the wrong field `key~1slot` (BUG-024).
+fn decode_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
 /// Insert `value` at a JSON pointer, creating intermediate objects.
 fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), CryptoError> {
     let mut current = root;
@@ -268,19 +278,23 @@ fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), Cryp
             *current = Value::Object(serde_json::Map::new());
         }
         let map = current.as_object_mut().unwrap();
+        let key = decode_pointer_token(token);
         if i + 1 == tokens.len() {
-            map.insert(token.to_string(), value);
+            map.insert(key, value);
             return Ok(());
         }
         current = map
-            .entry(token.to_string())
+            .entry(key)
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
     }
     Err(fatal(format!("empty JSON pointer {pointer:?}")))
 }
 
 /// Classify a transport error (SPEC §31).
-fn classify_transport(e: &reqwest::Error) -> CryptoError {
+fn classify_transport(e: reqwest::Error) -> CryptoError {
+    // Transport errors include the request URL in Display and Debug. Drop
+    // it before either classification or logging can expose query secrets.
+    let e = e.without_url();
     if e.is_timeout() {
         return CryptoError::Retryable(format!("request timeout: {e}"));
     }
@@ -381,7 +395,7 @@ impl HttpCryptoProvider {
             .body(body)
             .send()
             .await
-            .map_err(|e| classify_transport(&e))?;
+            .map_err(classify_transport)?;
 
         if let Some(err) = classify_status(response.status()) {
             return Err(err);
@@ -397,7 +411,7 @@ impl HttpCryptoProvider {
         // Stream with a hard cap regardless of the declared length.
         let mut out = Zeroizing::new(Vec::new());
         let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(|e| classify_transport(&e))? {
+        while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
             out.extend_from_slice(&chunk);
             if out.len() > self.spec.max_response_bytes {
                 return Err(CryptoError::NonRetryableRequest(format!(
@@ -801,5 +815,49 @@ impl CryptoProvider for HttpCryptoProvider {
                 data: SecretBuffer::from_slice(&data),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::{decode_pointer_token, pointer_set};
+    use serde_json::{json, Value};
+
+    /// BUG-024: request pointers must decode RFC 6901 escapes (`~1` → `/`,
+    /// `~0` → `~`) the same way `Value::pointer` does on the response side.
+    /// A vendor field literally named `key/slot` is addressed as `/key~1slot`
+    /// and must land in the field `key/slot`, not `key~1slot`.
+    #[test]
+    fn pointer_set_decodes_rfc6901_escapes() {
+        let mut root = Value::Object(Default::default());
+        pointer_set(&mut root, "/key~1slot", json!(1)).unwrap();
+        pointer_set(&mut root, "/tilde~0field", json!(2)).unwrap();
+        pointer_set(&mut root, "/nested/~01combo", json!(3)).unwrap();
+        pointer_set(&mut root, "/a/b", json!(4)).unwrap();
+
+        // The written field names are the decoded ones.
+        assert_eq!(root["key/slot"], json!(1));
+        assert_eq!(root["tilde~field"], json!(2));
+        assert_eq!(root["nested"]["~1combo"], json!(3));
+        assert_eq!(root["a"]["b"], json!(4));
+        assert!(root.get("key~1slot").is_none(), "escape was not decoded");
+
+        // Request and response rules agree: what pointer_set wrote is exactly
+        // what Value::pointer reads back for the same pointer string.
+        for (p, v) in [
+            ("/key~1slot", json!(1)),
+            ("/tilde~0field", json!(2)),
+            ("/nested/~01combo", json!(3)),
+            ("/a/b", json!(4)),
+        ] {
+            assert_eq!(root.pointer(p), Some(&v), "round-trip mismatch for {p}");
+        }
+    }
+
+    #[test]
+    fn decode_pointer_token_matches_rfc6901_order() {
+        assert_eq!(decode_pointer_token("~01"), "~1");
+        assert_eq!(decode_pointer_token("~1~0"), "/~");
+        assert_eq!(decode_pointer_token("plain"), "plain");
     }
 }

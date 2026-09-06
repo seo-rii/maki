@@ -3,10 +3,9 @@
 //!
 //! Layout notes:
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
-//!   populate; `_struct_size` stops after the v2 rpc callbacks, so later
-//!   optional fields (`can_multi_conn`, `block_size`, …) read as NULL in
-//!   nbdkit — their defaults match our requirements (multi-conn OFF, zero
-//!   emulated via pwrite, trim absent).
+//!   populate; `_struct_size` includes the block_size callback so clients
+//!   can negotiate the configured limits. Other optional callbacks stay
+//!   NULL (multi-conn OFF, zero emulated via pwrite, trim absent).
 //! - The tokio runtime is created lazily at first `open`, which happens
 //!   after nbdkit forks — equivalent to the `after_fork` hook without
 //!   depending on newer struct fields.
@@ -89,6 +88,23 @@ unsafe extern "C" fn close(_handle: *mut c_void) {}
 unsafe extern "C" fn get_size(handle: *mut c_void) -> i64 {
     let a = unsafe { &*(handle as *const NbdAdapter) };
     a.get_size() as i64
+}
+
+unsafe extern "C" fn block_size(
+    handle: *mut c_void,
+    minimum: *mut u32,
+    preferred: *mut u32,
+    maximum: *mut u32,
+) -> c_int {
+    let a = unsafe { &*(handle as *const NbdAdapter) };
+    let sizes = a.block_sizes();
+    // nbdkit supplies valid output pointers for the negotiation callback.
+    unsafe {
+        *minimum = sizes.0;
+        *preferred = sizes.1;
+        *maximum = sizes.2;
+    }
+    0
 }
 
 unsafe extern "C" fn can_write(_h: *mut c_void) -> c_int {
@@ -226,6 +242,22 @@ struct nbdkit_plugin {
     flush: Option<unsafe extern "C" fn(*mut c_void, u32) -> c_int>,
     trim: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32) -> c_int>,
     zero: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32) -> c_int>,
+    magic_config_key: *const c_char,
+    can_multi_conn: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    can_extents: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    extents: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32, *mut c_void) -> c_int>,
+    can_cache: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    cache: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u32) -> c_int>,
+    thread_model: Option<unsafe extern "C" fn() -> c_int>,
+    can_fast_zero: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    preconnect: Option<unsafe extern "C" fn(c_int) -> c_int>,
+    get_ready: Option<unsafe extern "C" fn() -> c_int>,
+    after_fork: Option<unsafe extern "C" fn() -> c_int>,
+    list_exports: Option<unsafe extern "C" fn(c_int, c_int, *mut c_void) -> c_int>,
+    default_export: Option<unsafe extern "C" fn(c_int, c_int) -> *const c_char>,
+    export_description: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
+    cleanup: Option<unsafe extern "C" fn()>,
+    block_size: Option<unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32) -> c_int>,
 }
 
 unsafe impl Sync for nbdkit_plugin {}
@@ -264,6 +296,22 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     flush: Some(flush_v2),
     trim: None,
     zero: None,
+    magic_config_key: std::ptr::null(),
+    can_multi_conn: None,
+    can_extents: None,
+    extents: None,
+    can_cache: None,
+    cache: None,
+    thread_model: None,
+    can_fast_zero: None,
+    preconnect: None,
+    get_ready: None,
+    after_fork: None,
+    list_exports: None,
+    default_export: None,
+    export_description: None,
+    cleanup: None,
+    block_size: Some(block_size),
 };
 
 #[no_mangle]
@@ -317,6 +365,28 @@ pub fn abi_layout() -> Vec<(&'static str, usize)> {
         ("flush", offset_of!(nbdkit_plugin, flush)),
         ("trim", offset_of!(nbdkit_plugin, trim)),
         ("zero", offset_of!(nbdkit_plugin, zero)),
+        (
+            "magic_config_key",
+            offset_of!(nbdkit_plugin, magic_config_key),
+        ),
+        ("can_multi_conn", offset_of!(nbdkit_plugin, can_multi_conn)),
+        ("can_extents", offset_of!(nbdkit_plugin, can_extents)),
+        ("extents", offset_of!(nbdkit_plugin, extents)),
+        ("can_cache", offset_of!(nbdkit_plugin, can_cache)),
+        ("cache", offset_of!(nbdkit_plugin, cache)),
+        ("thread_model", offset_of!(nbdkit_plugin, thread_model)),
+        ("can_fast_zero", offset_of!(nbdkit_plugin, can_fast_zero)),
+        ("preconnect", offset_of!(nbdkit_plugin, preconnect)),
+        ("get_ready", offset_of!(nbdkit_plugin, get_ready)),
+        ("after_fork", offset_of!(nbdkit_plugin, after_fork)),
+        ("list_exports", offset_of!(nbdkit_plugin, list_exports)),
+        ("default_export", offset_of!(nbdkit_plugin, default_export)),
+        (
+            "export_description",
+            offset_of!(nbdkit_plugin, export_description),
+        ),
+        ("cleanup", offset_of!(nbdkit_plugin, cleanup)),
+        ("block_size", offset_of!(nbdkit_plugin, block_size)),
         ("sizeof_prefix", std::mem::size_of::<nbdkit_plugin>()),
         ("NBDKIT_API_VERSION", NBDKIT_API_VERSION as usize),
         (
@@ -341,14 +411,19 @@ mod tests {
         assert_ne!(can_fua_value(), NBDKIT_FUA_EMULATE);
     }
 
+    /// The published prefix ends right after `block_size` (nbdkit >= 1.30),
+    /// the last callback the shim populates: 384 bytes on LP64, with
+    /// `block_size` at offset 376 (BUG-011; the C probe in
+    /// `tests/review_abi.rs` confirms both against the installed header).
     #[test]
-    fn declared_prefix_ends_after_the_v2_rpc_callbacks() {
+    fn declared_prefix_ends_after_the_block_size_callback() {
         let layout = abi_layout();
         let of = |n: &str| layout.iter().find(|(k, _)| *k == n).unwrap().1;
         assert_eq!(
             of("sizeof_prefix"),
-            of("zero") + std::mem::size_of::<usize>()
+            of("block_size") + std::mem::size_of::<usize>()
         );
+        assert!(of("block_size") > of("zero"));
         assert_eq!(of("_struct_size"), 0);
         assert_eq!(PLUGIN._struct_size as usize, of("sizeof_prefix"));
     }

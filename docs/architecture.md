@@ -71,11 +71,20 @@ writes.
 | Journal durable mark | CRC, single copy, never fsync'd | Lower bound on the fdatasync'd prefix of the active segment |
 | Checkpoint state | Two generations plus CRC, written at creation | Highest durably applied journal sequence |
 
-Metadata updates overwrite the stale A/B side and then advance generation. A
-torn new copy therefore falls back to the older valid generation. A side that
-is absent, empty, short, or fails its CRC is an invalid copy; any other read
-error is an I/O error and refuses attach rather than silently selecting the
-other side.
+Metadata updates select an absent, invalid, or older A/B side for replacement.
+Before touching it, the store rewrites the preserved, typed-valid copy's exact
+bytes without truncation, synchronizes that file, and synchronizes its parent
+directory. Only then does it advance the generation, write the replacement,
+and synchronize the new contents. The caller must synchronize the replacement's
+directory entry when it creates a file.
+
+This preservation step also runs after a failed store or a process restart:
+readable, CRC-valid bytes may still be volatile, and writeback errors can clear
+dirty page-cache bits without persisting them. If preservation fails, the
+replacement side is untouched. A torn replacement can therefore fall back to
+the preserved generation. A side that is absent, empty, short, or fails its
+CRC or typed decode is an invalid copy; any other read error is an I/O error
+and refuses attach rather than silently selecting the other side.
 
 ## Recovery and checkpointing
 
@@ -101,22 +110,21 @@ reused: recovery continues numbering above both the surviving segments and the
 mark. The [review remediation log](review-remediation.md) describes these rules
 in detail.
 
-Persistence errors are answered by rewriting, never by repeating the failed
-call. A failed `fdatasync` leaves the dirty pages clean and unpersisted on
-Linux, so the journal keeps its own copy of every unsynced record and, after a
-sync failure, rewrites that copy before it syncs again; no FLUSH or FUA is
-acknowledged until that succeeds, and the daemon reports the condition as
-`journal_writeback_uncertain`. Recovery rewrites everything beyond the proven
-prefix of the final segment before syncing it, so page-cache bytes a failed
-writeback left behind are never acknowledged unwritten. A write that fails
-part-way may have persisted a prefix; the segment is truncated back to its
-last record before anything is appended or the segment is sealed, and the
-writer refuses to proceed while that truncation fails.
+A failed append can leave bytes beyond the last accepted record. The writer
+retains a cleanup flag until truncation and synchronization succeed, including
+when the next operation is a shorter write, FLUSH, or segment roll.
 
-Secret buffers are page-isolated when locking is on: each one owns a
-page-aligned allocation that is `mlock`ed for its lifetime, wiped while still
-locked, and only then unlocked and freed, because `mlock` and `munlock` act on
-whole pages without reference counting.
+After a journal writeback error, a plain fsync retry may leave clean but
+unpersisted page-cache bytes behind. The writer re-reads and rewrites its
+accepted pending range in 64 KiB chunks, compares an ephemeral streaming
+fingerprint, and only then synchronizes it. Recovery similarly binds each
+prefix to the bytes accepted by its scan, rewrites and verifies that prefix,
+then synchronizes before publishing a durable mark. Changed bytes refuse
+recovery or the durability acknowledgement. Normal successful live flushes
+avoid this extra rewrite; recovery pays an additional pass over valid data.
+While a rewrite is still owed, the engine reports the volume `degraded` and
+`journal_writeback_uncertain`, and counts `journal_sync_failures_total`; a
+successful barrier clears the flag, a successful checkpoint does not.
 
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at
@@ -177,11 +185,28 @@ growing memory. Each lane keeps several batches in flight (bounded by
 `limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
 requests behind it. Local providers are called directly.
 
+Queued groups own their payload and admission charge together. Cancellation
+removes the complete group even if it is behind another group waiting for an
+RPC slot. An active coalesced RPC remains necessary until its last caller
+leaves. For bounded-error calls, one caller budget covers admission, coalescing,
+the slot wait, and the provider response; dispatch does not restart it.
+
 The dispatcher validates quarantined endpoints in background tasks, never on
-the request path; an RPC abandoned at the operation deadline releases its
-inflight slot and is not charged to the endpoint's circuit breaker; and the
-HTTP transport never follows a redirect (a 3xx fails the endpoint over rather
-than re-sending plaintext to a server-chosen URL).
+the request path. Each admitted call owns a circuit-breaker permit for its
+generation. Completion, operation deadline, cancellation, request/provider
+errors, and retry-budget refusal all release a HalfOpen probe slot; outcomes
+that are not endpoint failures do not advance the failure count. A stale
+permit cannot affect a later breaker generation. Abandoning an RPC also
+releases its transport inflight slot.
+
+The HTTP transport never follows a redirect (a 3xx fails the endpoint over
+rather than re-sending plaintext to a server-chosen URL). It removes request
+URLs from transport errors before classification and formatting, keeping query
+credentials out of those error messages. Each WebSocket connection generation
+owns both reader and writer futures in one task. Timeout, request cancellation,
+connection replacement, and provider drop retire that generation, cancel its
+task, release its socket, and fail its pending requests without disturbing a
+successor connection.
 
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
@@ -201,10 +226,25 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 ## Security boundaries
 
 - The nbdkit data plane runs as the `maki` user with no Linux capabilities.
+- The plugin advertises configured NBD block sizes and validates request
+  length, range, and alignment before copying write plaintext into Maki or
+  submitting work to the engine.
 - The control socket exposes status, metrics, checkpoint, and reload only.
+- Socket creation keeps the process umask unchanged. A private staging
+  directory hides the socket until its group and mode are set; rename then
+  publishes the ready socket at its configured path.
+- Its default path is `/run/maki-control/<volume>/control.sock`; the packaged
+  runtime layout lets `maki-admin` reach it through a separate directory tree
+  while keeping the NBD runtime tree restricted to the daemon's group.
 - Privileged storage operations are isolated in `maki-attach`.
 - Keys and plaintext use redacted, zeroizing buffers and must not be logged.
+- Optional buffer page locks have shared ownership: buffers on the same page
+  keep it locked until the final owner releases it. Drop zeroizes before
+  releasing ownership; `into_vec` transfers zeroization to the caller and
+  releases only that buffer's lock ownership.
 - Configuration rejects literal values for sensitive headers.
+- Repeated credential names must declare the same source throughout a volume
+  configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.
 
 See [Configuration](configuration.md), [Operations](operations.md), and the

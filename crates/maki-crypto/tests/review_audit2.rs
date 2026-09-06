@@ -499,39 +499,3 @@ async fn checked_provider_pins_decrypt_length_to_the_unit_size() {
         .expect_err("short plaintext accepted");
     assert!(matches!(err, CryptoError::Contract(_)), "{err}");
 }
-
-/// N-10 (fifth pass): a half-open probe abandoned at the operation deadline
-/// (its RPC future dropped, C-06) never reported back, so its slot was never
-/// returned; `half_open_max_requests` abandoned probes wedged the circuit
-/// half-open forever with no probe ever admitted again.
-#[test]
-fn abandoned_half_open_probes_return_their_slots() {
-    let clock = Arc::new(ManualClock::new());
-    let breaker = CircuitBreaker::new(
-        BreakerConfig {
-            failure_threshold: 1,
-            open_initial: Duration::from_millis(10),
-            open_max: Duration::from_millis(100),
-            half_open_max_requests: 2,
-            success_threshold: 1,
-        },
-        clock.clone(),
-    );
-    breaker.on_failure();
-    assert_eq!(breaker.state(), CircuitState::Open);
-    clock.advance(Duration::from_millis(20));
-    assert!(breaker.allow(), "first probe");
-    assert!(breaker.allow(), "second probe");
-    assert!(!breaker.would_allow(), "both probe slots are in flight");
-    breaker.on_abandoned();
-    breaker.on_abandoned();
-    assert!(
-        breaker.would_allow() && breaker.allow(),
-        "abandoned probes must return their slots: circuit wedged half-open"
-    );
-    breaker.on_success();
-    assert_eq!(breaker.state(), CircuitState::Closed);
-    // Outside half-open the call is a no-op.
-    breaker.on_abandoned();
-    assert_eq!(breaker.state(), CircuitState::Closed);
-}

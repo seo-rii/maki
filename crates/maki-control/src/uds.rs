@@ -9,6 +9,7 @@
 //! member of — `packaging/sysusers.d` adds `maki` to `maki-admin`).
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,111 +76,74 @@ pub fn resolve_gid(name: &str) -> io::Result<u32> {
 }
 
 /// Bind the control socket (replacing a stale file), apply `group` if
-/// given, and restrict the mode to 0660 — all before returning, so no
-/// client can observe a wider mode. Must be called inside a tokio runtime.
+/// given, and restrict the mode to 0660 before publishing its path. Must
+/// be called inside a tokio runtime.
 pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<ControlListener> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "control socket directory {} does not exist",
-                    parent.display()
-                ),
-            ));
-        }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "control socket directory {} does not exist",
+                parent.display()
+            ),
+        ));
     }
-    let _ = std::fs::remove_file(path);
-    // Bind under a restrictive umask so the socket never exists world- or
-    // group-connectable before chgrp/chmod run (O-11); connections made in
-    // that window would sit in the backlog and be served.
-    let listener = {
-        let _umask = UmaskGuard::set(0o117);
-        UnixListener::bind(path)?
+    // Validate the public address even when the private bind uses a shorter
+    // path: clients still need to connect through the requested address.
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
+    let gid = group.map(resolve_gid).transpose()?;
+
+    // BUG-014: umask is shared by every thread (and inherited by children).
+    // A temporary override could strip directory traversal from unrelated
+    // file creation. Hide the socket in a private directory instead, then
+    // publish it atomically only after its group and permissions are ready.
+    let staging = tempfile::Builder::new()
+        .prefix(".maki-control-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    // Creation honors the inherited umask; restore owner traversal without
+    // ever allowing another user to enter the private directory.
+    std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
+    let staged_path = staging.path().join("socket");
+    let listener = UnixListener::bind(&staged_path);
+    #[cfg(target_os = "linux")]
+    let listener = listener.or_else(|error| {
+        use std::os::fd::AsRawFd;
+
+        if std::os::unix::net::SocketAddr::from_pathname(&staged_path).is_ok() {
+            return Err(error);
+        }
+        // Staging must not reduce Linux's valid public socket path length.
+        // An open directory supplies a short address for the same inode;
+        // the ordinary path above keeps short binds independent of procfs.
+        let directory = std::fs::File::open(staging.path())?;
+        UnixListener::bind(format!("/proc/self/fd/{}/socket", directory.as_raw_fd()))
+    });
+    let mut bound = ControlListener {
+        listener: listener?,
+        path: staged_path.clone(),
     };
-    let bound = ControlListener {
-        listener,
-        path: path.to_path_buf(),
-    };
-    if let Some(group) = group {
-        let gid = resolve_gid(group)?;
-        std::os::unix::fs::chown(path, None, Some(gid)).map_err(|e| {
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(&staged_path, None, Some(gid)).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!("chgrp {group:?} on {}: {e}", path.display()),
             )
         })?;
-        // A 0660 socket is unreachable when its directory cannot be
-        // traversed: systemd creates the runtime directory maki:maki, so an
-        // administrator in `control.group` could not connect at all (fifth
-        // pass, N-11). Give the group search access to the socket's own
-        // directory when we own it; anything else is the operator's layout.
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            grant_group_search(parent, gid, group);
-        }
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    }
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::rename(&staged_path, path)?;
+    bound.path = path.to_path_buf();
     Ok(bound)
 }
 
 use std::time::Duration;
 
 use crate::protocol::ProtocolError;
-
-/// chgrp `dir` to `gid` and add group read+search, when the directory is
-/// ours to change. Failures are logged, not fatal: the socket itself is
-/// correct, only its reachability for the group depends on the directory.
-fn grant_group_search(dir: &Path, gid: u32, group: &str) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(meta) = std::fs::metadata(dir) else {
-        return;
-    };
-    // SAFETY: plain getuid.
-    let ours = meta.uid() == unsafe { libc::getuid() };
-    if !ours {
-        tracing::warn!(
-            "control socket directory {} is not owned by the daemon; make sure group \
-             {group:?} can traverse it",
-            dir.display()
-        );
-        return;
-    }
-    if meta.gid() != gid {
-        if let Err(e) = std::os::unix::fs::chown(dir, None, Some(gid)) {
-            tracing::warn!("chgrp {group:?} on {}: {e}", dir.display());
-            return;
-        }
-    }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o050 != 0o050 {
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o050))
-        {
-            tracing::warn!("chmod g+rx on {}: {e}", dir.display());
-        }
-    }
-}
-
-/// Process umask override, restored on drop.
-struct UmaskGuard(libc::mode_t);
-
-impl UmaskGuard {
-    fn set(mask: libc::mode_t) -> Self {
-        // SAFETY: umask is a plain process-wide syscall wrapper.
-        Self(unsafe { libc::umask(mask) })
-    }
-}
-
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        // SAFETY: restores the value returned by the earlier call.
-        unsafe {
-            libc::umask(self.0);
-        }
-    }
-}
 
 /// Serve connections on a bound socket until the future is dropped, with
 /// the default [`ControlLimits`].
@@ -188,6 +152,22 @@ pub async fn serve(listener: ControlListener, backend: Arc<dyn ControlBackend>) 
 }
 
 /// Serve connections on a bound socket until the future is dropped.
+pub async fn serve_with_limits(
+    listener: ControlListener,
+    backend: Arc<dyn ControlBackend>,
+    limits: ControlLimits,
+) -> io::Result<()> {
+    // No external shutdown signal: hold a sender for the whole call so the
+    // receiver never fires. The loop then ends only when this future is
+    // dropped (its task aborted), which drops the session `JoinSet` and
+    // aborts every live session — the historical behaviour for callers that
+    // stop the server by aborting its task.
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    serve_with_shutdown(listener, backend, limits, rx).await
+}
+
+/// Serve connections until `shutdown` fires (its value changes or its
+/// sender drops), then stop accepting and drain every live session.
 ///
 /// An `accept` error is never fatal: EMFILE/ENFILE/ENOBUFS during a client
 /// burst or a transiently short descriptor table used to end this loop,
@@ -198,29 +178,42 @@ pub async fn serve(listener: ControlListener, backend: Arc<dyn ControlBackend>) 
 /// slot is taken *before* `accept`, so excess clients wait in the kernel
 /// backlog instead of each getting a task and a descriptor (F10). Mutating
 /// verbs are serialized through [`SerializedBackend`].
-pub async fn serve_with_limits(
+///
+/// Sessions run in a [`JoinSet`](tokio::task::JoinSet); on shutdown the set
+/// is aborted *and awaited*, so every `Engine` reference a session held is
+/// dropped before this returns. A clean detach relies on that to release
+/// the volume lock (BUG-015): a session still holding the engine would keep
+/// the lock even after `shutdown` reported success.
+pub async fn serve_with_shutdown(
     listener: ControlListener,
     backend: Arc<dyn ControlBackend>,
     limits: ControlLimits,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let backend: Arc<dyn ControlBackend> = Arc::new(SerializedBackend::new(backend));
     let sessions = Arc::new(Semaphore::new(limits.max_sessions.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
         let slot = sessions
             .clone()
             .acquire_owned()
             .await
             .expect("session semaphore is never closed");
-        let stream = match listener.listener.accept().await {
-            Ok((stream, _addr)) => stream,
-            Err(e) => {
-                tracing::warn!("control socket accept failed (retrying): {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+        let stream = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            accepted = listener.listener.accept() => match accepted {
+                Ok((stream, _addr)) => stream,
+                Err(e) => {
+                    tracing::warn!("control socket accept failed (retrying): {e}");
+                    drop(slot);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
         };
         let backend = backend.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _slot = slot;
             match serve_connection(stream, backend, limits).await {
                 Ok(()) => {}
@@ -230,7 +223,11 @@ pub async fn serve_with_limits(
                 Err(e) => tracing::warn!("control session ended with error: {e}"),
             }
         });
+        // Reap finished sessions so the set stays bounded over a long life.
+        while tasks.try_join_next().is_some() {}
     }
+    tasks.shutdown().await;
+    Ok(())
 }
 
 /// Bind with restrictive permissions and serve forever.

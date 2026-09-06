@@ -171,9 +171,6 @@ impl GrpcCryptoProvider {
         let mut grpc = tonic::client::Grpc::new(self.channel.clone())
             .max_decoding_message_size(self.spec.max_message_bytes)
             .max_encoding_message_size(self.spec.max_message_bytes);
-        grpc.ready()
-            .await
-            .map_err(|e| CryptoError::Retryable(format!("grpc endpoint not ready: {e}")))?;
 
         let mut request = tonic::Request::new(message);
         for (key, value) in &self.spec.metadata {
@@ -187,10 +184,30 @@ impl GrpcCryptoProvider {
 
         let codec: tonic::codec::ProstCodec<CryptoBatchRequest, CryptoBatchResponse> =
             tonic::codec::ProstCodec::default();
-        let response = grpc
-            .unary(request, path, codec)
+
+        // `Channel::timeout` bounds the connection, not the whole exchange:
+        // a server that stalls after the response headers, or between the
+        // message and the trailers, would hold this RPC open indefinitely,
+        // pinning its inflight slot and blocking that request's retry and
+        // failover (BUG-017). Bound readiness plus the unary call together
+        // by the configured operation timeout. The `bounded-error` policy's
+        // outer deadline (BUG-013) is separate and still applies.
+        let exchange = async {
+            grpc.ready()
+                .await
+                .map_err(|e| CryptoError::Retryable(format!("grpc endpoint not ready: {e}")))?;
+            grpc.unary(request, path, codec)
+                .await
+                .map_err(|status| map_status(&status))
+        };
+        let response = tokio::time::timeout(self.spec.timeout, exchange)
             .await
-            .map_err(|status| map_status(&status))?
+            .map_err(|_| {
+                CryptoError::Retryable(format!(
+                    "grpc operation exceeded the {:?} transport timeout",
+                    self.spec.timeout
+                ))
+            })??
             .into_inner();
 
         if response.items.len() != expected.len() {
