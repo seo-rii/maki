@@ -1,0 +1,65 @@
+# Coverage-guided (libFuzzer) fuzz targets. Detached from the main workspace
+# (the empty [workspace] table below) so it never affects `cargo build
+# --workspace` and only builds under `cargo +nightly fuzz`.
+#
+# Run (Linux, nightly):
+#   cargo +nightly fuzz run format_decoders -- -max_total_time=60
+#   cargo +nightly fuzz run journal_scan    -- -max_total_time=60
+#   cargo +nightly fuzz run config_parse    -- -max_total_time=60
+#   cargo +nightly fuzz run endpoint_url    -- -max_total_time=60
+#   cargo +nightly fuzz run probe_parsers   -- -max_total_time=60
+
+[package]
+name = "maki-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+maki-format = { path = "../crates/maki-format" }
+maki-privileged = { path = "../crates/maki-privileged" }
+
+[[bin]]
+name = "format_decoders"
+path = "fuzz_targets/format_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_scan"
+path = "fuzz_targets/journal_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint_url"
+path = "fuzz_targets/endpoint_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe_parsers"
+path = "fuzz_targets/probe_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Detach from the parent workspace.
+[workspace]

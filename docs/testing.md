@@ -145,7 +145,7 @@ systemd workloads or attach real devices; follow the
 | Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
-| Parser fuzzing | 24 CPU-hours per target | Partial | 5,500 mutation inputs plus `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz); maintained cargo-fuzz corpus not wired |
+| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke | Pass on Debian 12/KVM | Guarded privileged run completed on a disposable NBD target |
 | Real databases | Required | Partial | SQLite WAL smoke passed; crash campaigns and other engines remain open |
@@ -215,7 +215,9 @@ WSL is suitable for Linux syscall integration but not for power-loss claims.
 - Credential rotation and TLS certificate rotation.
 - Real SQLite and PostgreSQL workloads before broader database qualification.
 - QEMU and bare-metal power cuts with an independent acknowledgement ledger.
-- Maintained cargo-fuzz targets and long-duration provider and mixed-I/O soaks.
+- Long-duration (24 CPU-hour-per-target) `cargo-fuzz` corpus runs (the
+  targets exist in `fuzz/`; only short smoke runs have been done) and
+  long-duration provider and mixed-I/O soaks.
 
 These checks are privileged, destructive, externally credentialed, or
 long-running. Run them only in explicitly authorized environments.
