@@ -1005,6 +1005,7 @@ dependencies = [
  "maki-format",
  "maki-test-support",
  "parking_lot",
+ "rand 0.9.5",
  "rcgen",
  "reqwest",
  "rustls",

@@ -21,6 +21,7 @@ zeroize.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+rand.workspace = true
 maki-test-support.workspace = true
 parking_lot.workspace = true
 tempfile.workspace = true
