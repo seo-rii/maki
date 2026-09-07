@@ -499,3 +499,66 @@ async fn checked_provider_pins_decrypt_length_to_the_unit_size() {
         .expect_err("short plaintext accepted");
     assert!(matches!(err, CryptoError::Contract(_)), "{err}");
 }
+
+// ---------- MAKI-010 / MAKI-011 (2026-09-07): self-test robustness ----------
+
+/// MAKI-010: a provider with a small or absent batch capability (max_items 1
+/// or 2, or a byte budget of a single unit) is valid. The self-test must
+/// split its fixed patterns into admissible RPCs rather than send one
+/// oversized batch that the provider then rejects.
+#[tokio::test]
+async fn self_test_splits_patterns_for_a_small_batch_provider() {
+    for max_items in [1u32, 2] {
+        let p = FakeCryptoProvider::new(UNIT as u32).with_max_batch(max_items, u64::MAX);
+        provider_self_test(&p, &ctx(), UNIT, "test-profile-v1")
+            .await
+            .unwrap_or_else(|e| panic!("max_items={max_items}: {e}"));
+    }
+    // A byte budget that holds only a single unit must also pass.
+    let p = FakeCryptoProvider::new(UNIT as u32).with_max_batch(128, UNIT as u64);
+    provider_self_test(&p, &ctx(), UNIT, "test-profile-v1")
+        .await
+        .unwrap();
+}
+
+/// A provider whose only failure mode on a bad/moved ciphertext is a transport
+/// error (a timeout or retryable blip), never a definitive integrity
+/// rejection: it masks every real integrity/context rejection as a transient.
+struct TamperReportsTransportError(Arc<FakeCryptoProvider>);
+
+#[async_trait]
+impl CryptoProvider for TamperReportsTransportError {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.0.capabilities().await
+    }
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        self.0.encrypt_batch(context, items).await
+    }
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        match self.0.decrypt_batch(context, items).await {
+            Err(CryptoError::Integrity(m)) => Err(CryptoError::Retryable(format!("blip: {m}"))),
+            other => other,
+        }
+    }
+}
+
+/// MAKI-011: an integrity (or context-binding) claim is proven only by a
+/// definitive bad-ciphertext rejection. A provider that returns a transport
+/// error on the tampered/moved request — and only then — leaves the claim
+/// unproven, so the self-test must refuse rather than pass on it.
+#[tokio::test]
+async fn self_test_rejects_integrity_proven_only_by_a_transport_error() {
+    let p = TamperReportsTransportError(fake());
+    let err = provider_self_test(&p, &ctx(), UNIT, "test-profile-v1")
+        .await
+        .expect_err("a transport error on tamper/move must not prove integrity");
+    assert!(matches!(err, CryptoError::ProviderFatal(_)), "{err}");
+}
