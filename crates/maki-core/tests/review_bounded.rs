@@ -126,8 +126,12 @@ async fn sustained_writes_keep_journal_and_overlay_within_hard_limits() {
         let s = engine.stats().await;
         max_journal = max_journal.max(s.journal_total_bytes);
         max_overlay = max_overlay.max(s.overlay_bytes);
+        // Strict hard bound (R08): admission charges the exact append
+        // footprint, including any new segment header, before appending, so
+        // the on-disk total after every admitted write is at or below the
+        // limit — no `+ SEGMENT + RECORD` slack.
         assert!(
-            s.journal_total_bytes <= p.journal_max_bytes + SEGMENT + RECORD,
+            s.journal_total_bytes <= p.journal_max_bytes,
             "write {i}: journal {} exceeds hard limit {}",
             s.journal_total_bytes,
             p.journal_max_bytes
@@ -323,4 +327,40 @@ fn failed_reclaim_at_hard_limit_degrades_then_recovers() {
     assert_eq!(engine.state(), EngineState::Ready, "success clears degraded");
     assert_eq!(engine.read(off(0), UNIT as usize).await.unwrap(), data(0xEE));
     });
+}
+
+/// Review R08 (2026-09-07): journal admission counted record headers and
+/// payloads but not the 48-byte segment header a roll creates. With the
+/// on-disk total exactly at the hard limit and the active segment full, a
+/// record-only admission check saw equality (not `>`), admitted the write,
+/// and the automatic roll then pushed the on-disk total past the documented
+/// hard bound. Admission must charge the exact append footprint including any
+/// new segment headers, and reclaim (or refuse) before the roll.
+#[tokio::test]
+async fn audit_20260907_journal_hard_limit_counts_new_segment_headers() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let header = maki_format::journal::SEGMENT_HEADER_SIZE as u64;
+    let records_per_segment = (SEGMENT - header) / RECORD;
+    let filled_segments = 200u64;
+    let before_roll = filled_segments * (header + records_per_segment * RECORD);
+    let mut p = policy();
+    p.journal_max_bytes = before_roll + RECORD;
+    // Keep the watermark from reclaiming before the hard-limit path runs.
+    p.journal_high_watermark_bytes = p.journal_max_bytes;
+    let e = engine(&backing, p.clone(), None).await;
+    for i in 0..filled_segments * records_per_segment {
+        e.write(off(i % UNITS), &data(i as u8), false).await.unwrap();
+    }
+    assert_eq!(e.stats().await.journal_total_bytes, before_roll);
+    // Record-only admission sees exact equality. The actual append must also
+    // create a segment header, so it must first reclaim or refuse safely.
+    let _ = e.write(off(0), &data(0xA5), false).await;
+    let actual = e.stats().await.journal_total_bytes;
+    assert!(
+        actual <= p.journal_max_bytes,
+        "journal hard limit {} exceeded by {} bytes",
+        p.journal_max_bytes,
+        actual.saturating_sub(p.journal_max_bytes)
+    );
 }

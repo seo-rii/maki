@@ -521,6 +521,20 @@ attach). Not a durability bug; a fail-*open* diagnostic gap.
 |---|---|---|---|
 | BUG-027 | **`maki check` passed a volume `maki attach` would reject: a cataloged shard with a missing data file was only a warning when its allocation map was empty.** The fast checker errored on a missing data file *only* inside the `map.set_count() > 0` arm, then pushed an unconditional "data file not yet created" warning otherwise — so a cataloged shard with a valid but empty allocation map and no data file left the report error-free (`ok() == true`). `SlotStore::open`, though, opens every cataloged shard's data file with `create=false` regardless of its allocation map and returns `CoreError::Corrupt` if it is absent, so recovery refuses to attach. The "not yet created" state the warning described cannot arise for a *cataloged* shard: `ensure_shard` creates and `sync_dir`s the data file's dirent *before* the catalog names the shard (the reverse ordering only ever yields an orphan data file, which is adopted, not a cataloged shard with no file). | The missing-data-file check is a single unconditional error per cataloged shard, matching recovery, and the misleading warning is removed. `maki check` now fails exactly when attach would. | `fast_check_flags_a_cataloged_shard_with_no_data_file` (maki-core `review_check.rs`) |
 
+## Supplementary review (2026-09-07): R01–R08
+
+A follow-up review (`maki-review-20260907`) of the privileged attach/detach/grow
+lifecycle, the crypto scheduler's admission accounting, and the journal hard
+bound, with six proposed RED regression tests it could not compile in its own
+environment. Each finding below was reproduced (RED) against the actual source,
+fixed, and reverified (GREEN); the proposed tests were adapted to the real
+fixtures. Findings needing a native-Linux VM or peak-RSS experiments (see the
+"deferred" note at the end of this section) are tracked but not closed here.
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| R08 | **The journal hard limit counted record headers and payloads but not the 48-byte segment header an automatic roll creates.** With the on-disk total exactly at `journal_max_bytes` and the active segment full, admission's record-only check saw equality (not `>`), admitted the write, and the roll then pushed the on-disk total 48 bytes past the documented hard bound. Multiple rolls in one request could add several headers. | `JournalWriter::append_footprint` computes the exact bytes an append adds — records **plus** any new segment headers — by projecting `append`/`roll` step by step. `admit_journal` checks `journal_total_bytes + append_footprint` against the limit, recomputing the footprint after inline reclaim (reclaim can change the active segment). Record-byte accounting and the footprint share one `record_len` helper so they cannot drift. The `sustained_writes…` assertion was tightened from `+ SEGMENT + RECORD` slack to the strict bound. | `audit_20260907_journal_hard_limit_counts_new_segment_headers` and the tightened `sustained_writes_keep_journal_and_overlay_within_hard_limits` (maki-core `review_bounded.rs`) |
+
 ## Recovery fail-closed rules
 
 Recovery (`maki-core/src/recovery.rs`) now refuses to attach on anything that

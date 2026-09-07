@@ -353,6 +353,14 @@ fn enospc(msg: impl Into<String>) -> CoreError {
     ))
 }
 
+/// Encoded on-disk size of one journal record for `ct`: the fixed record
+/// header plus its ciphertext payload — the amount `JournalWriter::append`
+/// advances the active segment by. Journal admission's incoming-byte total and
+/// its append-footprint accounting must agree on this, so both go through here.
+fn record_len(ct: &CiphertextUnit) -> u64 {
+    maki_format::journal::RECORD_HEADER_SIZE as u64 + ct.data.len() as u64
+}
+
 impl Engine {
     /// Recover the volume, verify the provider (self-test + compatibility +
     /// geometry contract + identity + key canary), start the checkpoint
@@ -755,7 +763,7 @@ impl Engine {
                 bad.data.len()
             ))));
         }
-        let incoming: u64 = cts.iter().map(|c| 32 + c.data.len() as u64).sum();
+        let incoming: u64 = cts.iter().map(record_len).sum();
 
         // Journal + publish under the exclusive volume lock.
         {
@@ -781,7 +789,7 @@ impl Engine {
         cts: &[CiphertextUnit],
         fua: bool,
     ) -> Result<(), CoreError> {
-        self.admit_journal(volume, incoming)?;
+        self.admit_journal(volume, incoming, cts)?;
         for ct in cts {
             volume.write_ct(ct.unit_index, &ct.data, false)?;
             // Any cached plaintext of an older version is now dead. The
@@ -801,10 +809,23 @@ impl Engine {
         Ok(())
     }
 
-    /// Journal admission for `incoming` bytes of records (SPEC §30 "journal
-    /// queue"; review M-004): emergency free-space reserve, unsynced-bytes
-    /// barrier, and the hard journal limit with inline reclaim.
-    fn admit_journal(&self, volume: &mut Volume, incoming: u64) -> Result<(), CoreError> {
+    /// Journal admission for one request (SPEC §30 "journal queue"; review
+    /// M-004): emergency free-space reserve, unsynced-bytes barrier, and the
+    /// hard journal limit with inline reclaim.
+    ///
+    /// `incoming` is the record bytes (headers + payloads) the request adds;
+    /// it drives the pending-barrier flush, whose unsynced tail never includes
+    /// a roll's segment header (a roll syncs both the sealed segment and the
+    /// new header immediately). The hard limit, though, bounds the on-disk
+    /// *total*, which does count those headers, so it is checked against the
+    /// exact append footprint (records + any new segment headers), recomputed
+    /// after reclaim because reclaim can change the active segment (R08).
+    fn admit_journal(
+        &self,
+        volume: &mut Volume,
+        incoming: u64,
+        cts: &[CiphertextUnit],
+    ) -> Result<(), CoreError> {
         let policy = &self.inner.policy;
         if policy.emergency_reserve_bytes > 0 {
             if let Some(free) = self.backing_free_bytes() {
@@ -820,11 +841,21 @@ impl Engine {
         if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
             volume.flush()?;
         }
-        if volume.journal_total_bytes().saturating_add(incoming) > policy.journal_max_bytes {
+        let footprint =
+            |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
+        if volume
+            .journal_total_bytes()
+            .saturating_add(footprint(volume))
+            > policy.journal_max_bytes
+        {
             // Everything sealed becomes reclaimable once it is durable.
             volume.flush()?;
             self.inner.checkpoint_locked(volume)?;
-            if volume.journal_total_bytes().saturating_add(incoming) > policy.journal_max_bytes {
+            if volume
+                .journal_total_bytes()
+                .saturating_add(footprint(volume))
+                > policy.journal_max_bytes
+            {
                 return Err(enospc(format!(
                     "journal at hard limit {} bytes and cannot be reclaimed",
                     policy.journal_max_bytes
