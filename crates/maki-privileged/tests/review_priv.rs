@@ -353,6 +353,55 @@ fn leaf_devices_are_resolved_through_the_device_mapper_stack() {
     assert_eq!(nbd_device_of("sda"), None);
 }
 
+/// A sysfs topology deeper than the walker's bound must fail *closed*, not
+/// drop the over-deep subtree. Dropping it can hide a foreign backing device
+/// below the depth limit while the shallow NBD leaf is still returned, so
+/// `verify_mount_device` would then pass on an incomplete picture and the
+/// F02 guarantee ("bytes live only on the bound NBD device") is defeated.
+/// Like `detach.rs::depends_only_on`, an unresolvable (too deep) tree must
+/// resolve to no leaves so the caller refuses. Regression for the
+/// resolve_leaf_devices fail-open.
+#[test]
+fn an_over_deep_topology_resolves_to_no_leaves_not_a_partial_set() {
+    // `top` branches into the bound NBD device (a shallow leaf) and a long
+    // chain that only reaches a foreign disk far below the depth bound.
+    let mut tree: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    tree.insert(
+        "top".to_string(),
+        vec!["nbd0".to_string(), "chain-0".to_string()],
+    );
+    for i in 0..40u32 {
+        tree.insert(format!("chain-{i}"), vec![format!("chain-{}", i + 1)]);
+    }
+    tree.insert("chain-40".to_string(), vec!["sda2".to_string()]);
+    let mut slaves_of = |name: &str| -> Vec<String> { tree.get(name).cloned().unwrap_or_default() };
+
+    // Must not silently return just ["nbd0"] (the foreign `sda2` hides below
+    // the depth bound); an unresolvable tree yields no leaves so the caller
+    // fails closed. Before the fix this returned ["nbd0"], letting
+    // verify_mount_device pass on a filesystem partly backed by sda2.
+    let leaves = resolve_leaf_devices("top", &mut slaves_of);
+    assert!(
+        leaves.is_empty(),
+        "an over-deep topology must resolve to no leaves (fail closed), got {leaves:?}"
+    );
+    // The verifier then refuses (empty backing = "could not resolve").
+    let observed = MountObservation {
+        mountpoint_exists: true,
+        fstype: Some("xfs".to_string()),
+        fs_uuid: None,
+        sentinel_volume_uuid: None,
+        nbd_connected: true,
+        rw_probe_ok: false,
+        backing_devices: leaves
+            .into_iter()
+            .map(|l| nbd_device_of(&l).unwrap_or_else(|| format!("/dev/{l}")))
+            .collect(),
+    };
+    assert!(verify_mount_device("/dev/nbd0", &observed).is_err());
+}
+
 #[test]
 fn mountinfo_parsing_exposes_the_device_number() {
     let first_two: String = MOUNTINFO.lines().take(2).collect::<Vec<_>>().join("\n");

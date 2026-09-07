@@ -294,6 +294,15 @@ pub struct HttpSection {
     pub max_response_bytes: Option<ByteSize>,
 }
 
+/// Default WebSocket frame-size cap when `[crypto.websocket].max_frame_bytes`
+/// is unset. Must match the daemon's transport wiring; validation and the
+/// runtime use the same value so a config that validates also runs.
+pub const DEFAULT_WS_MAX_FRAME_BYTES: u64 = 8 << 20;
+
+/// Default gRPC message-size cap when `[crypto.grpc].max_message_bytes` is
+/// unset. Must match the daemon's transport wiring.
+pub const DEFAULT_GRPC_MAX_MESSAGE_BYTES: u64 = 4 << 20;
+
 /// WebSocket transport (SPEC §18).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1482,6 +1491,28 @@ impl VolumeConfig {
                     ));
                 }
                 validate_endpoints("websocket", &ws.endpoint, "ws", "wss", false)?;
+                let frame = ws
+                    .max_frame_bytes
+                    .map(|b| b.0)
+                    .unwrap_or(DEFAULT_WS_MAX_FRAME_BYTES);
+                if frame == 0 {
+                    return Err(invalid("[crypto.websocket] max_frame_bytes must be positive"));
+                }
+                // A batch is sent as one JSON frame with base64 payloads
+                // (~4/3 the raw bytes). If a maximal batch's base64 payload
+                // alone cannot fit the frame, every large batch fails at
+                // runtime with a non-retryable frame-limit error on a volume
+                // that validated cleanly. This is a necessary bound; leave
+                // headroom above it for the surrounding JSON structure.
+                let encoded = self.crypto.batch.max_bytes.0.div_ceil(3).saturating_mul(4);
+                if encoded > frame {
+                    return Err(invalid(format!(
+                        "[crypto.websocket] max_frame_bytes {frame} cannot carry a \
+                         crypto.batch.max_bytes {} batch (~{encoded} bytes once base64-encoded); \
+                         lower crypto.batch.max_bytes or raise max_frame_bytes",
+                        self.crypto.batch.max_bytes.0
+                    )));
+                }
             }
             "remote-grpc" => {
                 if crypto.key.is_some() {
@@ -1507,6 +1538,26 @@ impl VolumeConfig {
                     if let HeaderValue::Credential(c) = value {
                         validate_credential(c)?;
                     }
+                }
+                let message = grpc
+                    .max_message_bytes
+                    .map(|b| b.0)
+                    .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_BYTES);
+                if message == 0 {
+                    return Err(invalid("[crypto.grpc] max_message_bytes must be positive"));
+                }
+                // A whole batch is one gRPC message. If crypto.batch.max_bytes
+                // exceeds the message limit, every large batch is rejected at
+                // the transport (non-retryable) on a volume that validated
+                // cleanly. Necessary bound; leave headroom for protobuf
+                // framing (~16 bytes per item plus a fixed prefix).
+                if self.crypto.batch.max_bytes.0 > message {
+                    return Err(invalid(format!(
+                        "[crypto.grpc] max_message_bytes {message} cannot carry a \
+                         crypto.batch.max_bytes {} batch; lower crypto.batch.max_bytes or raise \
+                         max_message_bytes",
+                        self.crypto.batch.max_bytes.0
+                    )));
                 }
             }
             _ => {}

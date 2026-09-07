@@ -258,7 +258,10 @@ async fn remote_websocket_provider(config: &VolumeConfig) -> Result<Arc<Endpoint
                     .timeout
                     .map(|d| d.0)
                     .unwrap_or(std::time::Duration::from_secs(10)),
-                max_frame_bytes: ws.max_frame_bytes.map(|b| b.0 as usize).unwrap_or(8 << 20),
+                max_frame_bytes: ws
+                    .max_frame_bytes
+                    .map(|b| b.0 as usize)
+                    .unwrap_or(maki_format::config::DEFAULT_WS_MAX_FRAME_BYTES as usize),
             });
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
@@ -322,7 +325,7 @@ async fn remote_grpc_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>,
                 max_message_bytes: grpc
                     .max_message_bytes
                     .map(|b| b.0 as usize)
-                    .unwrap_or(4 << 20),
+                    .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
             })?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }

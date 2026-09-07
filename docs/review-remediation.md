@@ -494,6 +494,21 @@ Fixed in this change:
 | BUG-015 | **A clean `shutdown` stopped accepting but left live control sessions running**, each holding an `Engine` reference and so the volume lock; a detach that reported success left the volume `VOLUME_ALREADY_ATTACHED`. | Sessions run in a `JoinSet`; `serve_with_shutdown` aborts *and awaits* them on a shutdown signal, and the adapter signals then joins the serve task before releasing the engine, so no session outlives `shutdown`. | `shutdown_terminates_live_sessions_and_releases_the_volume_lock` (maki-nbdkit `review_next_control.rs`) |
 | BUG-024 | **HTTP request JSON pointers were not RFC 6901-unescaped**, so a vendor field named `key/slot` (`/key~1slot`) was sent as the wrong field `key~1slot`; the response side already decoded with `Value::pointer`. | `pointer_set` decodes each reference token (`~1`→`/`, `~0`→`~`, in order) to match the response side. | `pointer_set_decodes_rfc6901_escapes`, `decode_pointer_token_matches_rfc6901_order` (maki-crypto-http, in-crate) |
 
+## Deeper review pass (2026-09-07): two further findings (BUG-025, BUG-026)
+
+A whole-codebase re-read (crypto flow control, core durability, control,
+privileged, backing, local providers) plus four targeted review agents over
+the daemon/config wiring, the remote providers, the format decoders, and the
+privileged probes. The format decoders and the remote providers came back
+clean; the other two surfaces each yielded one concrete finding. Both are
+fail-*open*/availability gaps that contradict the project's fail-closed
+stance, not data-loss bugs.
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| BUG-025 | **`resolve_leaf_devices` dropped an over-deep subtree instead of failing closed.** The F02 topology walk (`probe.rs`) skipped any node past `MAX_DEPTH` with a bare `continue`, so a branching sysfs `slaves` stack with a *foreign* leaf hidden below depth 16 resolved to just the shallow NBD leaf; `verify_mount_device` then passed on an incomplete picture and the helper wrote plaintext onto a filesystem partly backed by a non-Maki device. (Low reachability — building an 18-deep dm/MD stack needs `CAP_SYS_ADMIN`, which the untrusted tenant lacks — but a genuine fail-open contradicting its sibling walker `detach.rs::depends_only_on`, which errors on the same condition.) | Exceeding the depth bound now returns *no leaves*, so the caller refuses (empty `backing_devices` ⇒ `verify_mount_device` fails). A diamond (a device reached by two paths) is still merely not re-walked. | `an_over_deep_topology_resolves_to_no_leaves_not_a_partial_set` (maki-privileged `review_priv.rs`) |
+| BUG-026 | **`crypto.batch.max_bytes` was never validated against the transport frame/message limit.** A whole batch is sent as one gRPC message / one WebSocket frame; a `batch.max_bytes` above `grpc.max_message_bytes` (default 4 MiB) or the base64-inflated `ws.max_frame_bytes` (default 8 MiB) validated cleanly but then failed *every* large batch at runtime with a non-retryable transport error (EIO to the client) on a volume that attached fine. A zero `max_message_bytes`/`max_frame_bytes` also passed (unlike HTTP's `max_response_bytes`). | `validate_provider_sections` now checks the batch fits: gRPC `batch.max_bytes ≤ max_message_bytes`, WebSocket `base64(batch.max_bytes) ≤ max_frame_bytes` (necessary bounds; the error advises leaving headroom for framing/JSON structure), and both limits must be positive. The default is a shared constant (`DEFAULT_WS_MAX_FRAME_BYTES`, `DEFAULT_GRPC_MAX_MESSAGE_BYTES`) used by both validation and the daemon wiring so a config that validates also runs. | `remote_transport_batch_must_fit_the_frame_or_message_limit` (maki-format `review_config.rs`) |
+
 ## Recovery fail-closed rules
 
 Recovery (`maki-core/src/recovery.rs`) now refuses to attach on anything that

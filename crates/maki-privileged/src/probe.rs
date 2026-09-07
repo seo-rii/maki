@@ -27,7 +27,19 @@ pub fn resolve_leaf_devices(
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![(start.to_string(), 0usize)];
     while let Some((device, depth)) = stack.pop() {
-        if !seen.insert(device.clone()) || depth > MAX_DEPTH {
+        // A stack deeper than this is not a real block-device topology.
+        // Fail *closed*: return no leaves so the caller refuses, exactly as
+        // `detach.rs::depends_only_on` errors on the same condition. Dropping
+        // only the over-deep subtree (an earlier bug) would hide a foreign
+        // leaf below the bound while still returning the shallow NBD leaf,
+        // letting `verify_mount_device` pass on an incomplete picture (F02).
+        if depth > MAX_DEPTH {
+            return Vec::new();
+        }
+        // A diamond (a device reached by more than one path) is normal and is
+        // simply not re-walked; only the depth bound above is a resolution
+        // failure.
+        if !seen.insert(device.clone()) {
             continue;
         }
         let slaves = slaves_of(&device);

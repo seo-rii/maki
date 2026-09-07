@@ -190,6 +190,79 @@ root = "/x"
     assert!(err(missing).contains("crypto.grpc"));
 }
 
+#[test]
+fn remote_transport_batch_must_fit_the_frame_or_message_limit() {
+    // A whole crypto batch is sent as one gRPC message / one WebSocket
+    // frame. A crypto.batch.max_bytes larger than the transport can carry
+    // validates cleanly today but then fails every large batch at runtime
+    // with a non-retryable transport error (EIO to the client) on a volume
+    // that attached fine. Reject the mismatch up front, and reject a zero
+    // transport limit (consistent with HTTP's max_response_bytes check).
+    let grpc = |batch: &str, grpc_extra: &str| -> String {
+        format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[crypto.batch]
+max_bytes = "{batch}"
+[crypto.grpc]
+{grpc_extra}
+[[crypto.grpc.endpoint]]
+name = "a"
+url = "http://localhost:7000"
+[backing]
+root = "/x"
+"#
+        )
+    };
+    // 8 MiB batch exceeds the 4 MiB default gRPC message limit.
+    assert!(err(&grpc("8MiB", "")).contains("max_message_bytes"));
+    // Raising the message limit above the batch makes it valid again.
+    ok(&grpc("8MiB", "max_message_bytes = \"16MiB\""));
+    // A zero limit is refused rather than silently rejecting every request.
+    assert!(err(&grpc("1MiB", "max_message_bytes = \"0\"")).contains("max_message_bytes"));
+
+    let ws = |batch: &str, ws_extra: &str| -> String {
+        format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-websocket"
+crypto_compatibility_id = "v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[crypto.batch]
+max_bytes = "{batch}"
+[crypto.websocket]
+{ws_extra}
+[[crypto.websocket.endpoint]]
+name = "a"
+url = "ws://127.0.0.1:7000"
+[backing]
+root = "/x"
+"#
+        )
+    };
+    // 7 MiB raw base64-encodes to ~9.3 MiB, past the 8 MiB default frame.
+    assert!(err(&ws("7MiB", "")).contains("max_frame_bytes"));
+    // 4 MiB raw (~5.3 MiB encoded) fits the 8 MiB frame.
+    ok(&ws("4MiB", ""));
+    // A zero frame limit is refused.
+    assert!(err(&ws("1MiB", "max_frame_bytes = \"0\"")).contains("max_frame_bytes"));
+}
+
 // ---------- plaintext transport policy (M-015) ----------
 
 #[test]
