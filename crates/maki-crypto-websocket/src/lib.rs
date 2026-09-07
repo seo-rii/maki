@@ -394,11 +394,15 @@ impl WsCryptoProvider {
         let expected = requested.len();
         if let Some(error) = response.get("error") {
             let class = error.get("class").and_then(|c| c.as_str()).unwrap_or("");
-            let message = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("provider error")
-                .to_string();
+            // The remote error text is untrusted: sanitize it (strip control
+            // chars, cap length) before it enters an error and the logs
+            // (MAKI-016).
+            let message = maki_crypto::sanitize_external_message(
+                error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider error"),
+            );
             return Err(match class {
                 "throttled" => CryptoError::Throttled(message),
                 "retryable" => CryptoError::Retryable(message),

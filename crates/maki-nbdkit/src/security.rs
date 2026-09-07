@@ -148,6 +148,29 @@ pub fn zram_writeback_target(backing_dev: Option<&str>) -> Option<String> {
     }
 }
 
+/// Classify a zram device from the *result* of reading its `backing_dev`
+/// attribute plus a check for whether a writeback target is itself encrypted.
+///
+/// A missing attribute (`NotFound`) means the kernel lacks zram writeback
+/// support, so the device is genuinely RAM-only. Any *other* read failure
+/// (`PermissionDenied`, an I/O error, …) is ambiguous: the device may have a
+/// plaintext writeback target we simply could not read, so it fails closed as
+/// `Unsafe` rather than being trusted as RAM-only (MAKI-017).
+pub fn classify_zram_backing(
+    backing_dev: Result<String, std::io::ErrorKind>,
+    is_encrypted: impl Fn(&str) -> bool,
+) -> SwapSafety {
+    match backing_dev {
+        Ok(value) => match zram_writeback_target(Some(&value)) {
+            None => SwapSafety::RamOnly,
+            Some(target) if is_encrypted(&target) => SwapSafety::Encrypted,
+            Some(_) => SwapSafety::Unsafe,
+        },
+        Err(std::io::ErrorKind::NotFound) => SwapSafety::RamOnly,
+        Err(_) => SwapSafety::Unsafe,
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -187,12 +210,10 @@ mod linux {
             if !std::path::Path::new(&sysfs).is_dir() {
                 return SwapSafety::Unsafe;
             }
-            let attr = std::fs::read_to_string(format!("{sysfs}/backing_dev")).ok();
-            return match zram_writeback_target(attr.as_deref()) {
-                None => SwapSafety::RamOnly,
-                Some(target) if is_encrypted_swap(&target) => SwapSafety::Encrypted,
-                Some(_) => SwapSafety::Unsafe,
-            };
+            // Preserve the read error kind: a missing attribute is RAM-only,
+            // but EACCES/EIO is ambiguous and must fail closed (MAKI-017).
+            let read = std::fs::read_to_string(format!("{sysfs}/backing_dev")).map_err(|e| e.kind());
+            return classify_zram_backing(read, is_encrypted_swap);
         }
         if is_encrypted_swap(device) {
             SwapSafety::Encrypted
@@ -354,6 +375,41 @@ mod tests {
         assert!(
             unsafe_swaps("", |_| SwapSafety::Unsafe).is_err(),
             "an empty file is not the /proc/swaps format"
+        );
+    }
+
+    /// MAKI-017: an unreadable `backing_dev` (EACCES/EIO) is ambiguous and must
+    /// fail closed as Unsafe, not be trusted as RAM-only; only a genuinely
+    /// absent attribute (NotFound) or an explicit `none` is RAM-only.
+    #[test]
+    fn zram_backing_read_failure_is_unsafe_not_ram_only() {
+        use std::io::ErrorKind;
+        let enc = |t: &str| t == "/dev/mapper/cryptswap";
+        // Genuinely RAM-only: no writeback support, or writeback disabled.
+        assert_eq!(
+            classify_zram_backing(Err(ErrorKind::NotFound), enc),
+            SwapSafety::RamOnly
+        );
+        assert_eq!(
+            classify_zram_backing(Ok("none\n".to_string()), enc),
+            SwapSafety::RamOnly
+        );
+        // Ambiguous read failures must not be trusted as RAM-only.
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            assert_eq!(
+                classify_zram_backing(Err(kind), enc),
+                SwapSafety::Unsafe,
+                "{kind:?}"
+            );
+        }
+        // A readable writeback target is classified by whether it is encrypted.
+        assert_eq!(
+            classify_zram_backing(Ok("/dev/sda2\n".to_string()), enc),
+            SwapSafety::Unsafe
+        );
+        assert_eq!(
+            classify_zram_backing(Ok("/dev/mapper/cryptswap\n".to_string()), enc),
+            SwapSafety::Encrypted
         );
     }
 }

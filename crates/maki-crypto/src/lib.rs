@@ -18,7 +18,7 @@ pub mod selftest;
 pub mod types;
 
 pub use clock::{Clock, SystemClock};
-pub use error::{CryptoError, ErrorClass};
+pub use error::{sanitize_external_message, CryptoError, ErrorClass};
 pub use provider::CryptoProvider;
 pub use secret::SecretBuffer;
 pub use types::{

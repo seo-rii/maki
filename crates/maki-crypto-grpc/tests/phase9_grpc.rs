@@ -13,8 +13,8 @@ use tonic::{Code, Request, Response, Status};
 use maki_crypto::selftest::provider_conformance;
 use maki_crypto::{CryptoContext, CryptoProvider, ErrorClass, PlaintextUnit, SecretBuffer};
 use maki_crypto_grpc::{
-    class_of_code, CryptoBatchRequest, CryptoBatchResponse, CryptoItem, GrpcCryptoProvider,
-    GrpcProviderSpec,
+    class_of_code, map_status, CryptoBatchRequest, CryptoBatchResponse, CryptoItem,
+    GrpcCryptoProvider, GrpcProviderSpec,
 };
 
 const UNIT: usize = 256;
@@ -351,4 +351,19 @@ async fn grpc_passes_provider_conformance() {
     provider_conformance(&p, &ctx(), UNIT, "grpc-profile-v1")
         .await
         .unwrap();
+}
+
+/// MAKI-016: a remote gRPC status message is untrusted. `map_status` must
+/// sanitize it — no control characters (which could inject log lines) reach
+/// the resulting error — while preserving the mapped class.
+#[test]
+fn map_status_sanitizes_remote_message() {
+    let status = Status::new(Code::Internal, "boom\ninjected line: token=SECRET\r\n");
+    let err = map_status(&status);
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains('\n') && !rendered.contains('\r'),
+        "control characters leaked into the error: {rendered:?}"
+    );
+    assert_eq!(err.class(), ErrorClass::Retryable);
 }
