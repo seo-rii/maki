@@ -505,3 +505,82 @@ fn review_next_grow_rejects_reused_backend_and_changed_targets() {
     // The record is retained: a grow is not a detach.
     assert!(state.read("pg").unwrap().is_some());
 }
+
+/// Review R01 (2026-09-07): rollback compensations ran even after an earlier
+/// one failed, so a failed umount did not stop the disconnect beneath it —
+/// the backing could be torn out from under a still-mounted filesystem. A
+/// failed upper-level cleanup must stop the destructive lower-level cleanup.
+#[test]
+fn audit_20260907_failed_unmount_must_not_disconnect_live_mount() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        fail_after_at: Some("verify-mount-identity"),
+        fail_at: Some("umount"),
+        ..Default::default()
+    };
+    assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+    assert!(system.mounted, "the injected umount failed before its effect");
+    assert!(
+        !system.steps.contains(&"nbd-disconnect"),
+        "rollback attempted NBD disconnect after failed umount: {:?}",
+        system.steps
+    );
+    assert!(system.backends.contains_key("/dev/nbd3"));
+    assert!(state.read("pg").unwrap().is_some());
+}
+
+/// Review R01 (2026-09-07): a command can report failure *after* its effect
+/// took hold. Unlike NbdConnect, a failed mount was not folded into the
+/// executed prefix, so rollback skipped its umount while still disconnecting
+/// its backing. Rollback re-observes and either unmounts the live mount or
+/// leaves its backing connected.
+#[test]
+fn audit_20260907_mount_failure_after_effect_requires_reobservation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        fail_after_at: Some("mount-xfs"),
+        ..Default::default()
+    };
+    assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+    // Either verified cleanup removes the mount, or its live backing must stay.
+    assert!(
+        !system.mounted || system.backends.contains_key("/dev/nbd3"),
+        "failed mount command had an effect but rollback disconnected it: {:?}",
+        system.steps
+    );
+}
+
+/// Review R03 (2026-09-07): grow verified only the stored config and the live
+/// NBD identity, not the current mount / VG topology, so a replaced mountpoint
+/// or a foreign VG mapping (both leaving the record and NBD id intact) still
+/// ran lvextend/xfs_growfs. Grow now re-observes the live attachment and
+/// refuses before any mutation.
+#[test]
+fn audit_20260907_grow_rechecks_live_mount_and_vg_topology() {
+    for fault in 0..3 {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+        system.steps.clear();
+        match fault {
+            0 => system.foreign_mount = true,
+            1 => system.foreign_vg = true,
+            _ => system.observation_error = true,
+        }
+        // The trusted config and live NBD identifier are unchanged. Only the
+        // currently mounted filesystem / active mapping became unsafe.
+        let result = execute_with(&plan_grow(&grow_request()), Some(&state), &mut system);
+        assert!(result.is_err(), "grow accepted live topology fault {fault}");
+        assert!(
+            !system.steps.contains(&"lvextend") && !system.steps.contains(&"xfs-growfs"),
+            "grow changed storage before rejecting fault {fault}: {:?}",
+            system.steps
+        );
+    }
+}

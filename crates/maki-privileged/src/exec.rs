@@ -478,6 +478,27 @@ fn verify_detach_state(
     Ok((connected, observed))
 }
 
+/// Re-observe the live attachment a grow is about to mutate: the recorded
+/// backend must still be connected under its identity, and the observed mount
+/// and VG must belong to this attachment (not foreign) and be readable. A
+/// grow that verified only the NBD identity could `lvextend`/`xfs_growfs` a
+/// replaced mountpoint or a foreign VG mapping even though the stored config
+/// and the live NBD identity still matched (review R03). Shares
+/// `verify_detach_state`'s observation so grow and detach agree on what "the
+/// live attachment" is; unlike detach it requires the connection present.
+fn verify_live_attachment(
+    record: &BoundDeviceRecord,
+    system: &impl System,
+) -> Result<(), ExecError> {
+    let (connected, _observed) = verify_detach_state(record, system)?;
+    if !connected {
+        return Err(identity_error(
+            "recorded NBD device is no longer connected; refusing to grow",
+        ));
+    }
+    Ok(())
+}
+
 fn detach_step_needed(
     step: &PlannedStep,
     record: &BoundDeviceRecord,
@@ -580,8 +601,11 @@ fn execute_with(
                 plan.bind_device(&prior.device);
             } else {
                 // Grow: the attachment must still be the live one whose
-                // identity the record names, before any lvextend/xfs_growfs.
-                verify_connection(&prior, system)?;
+                // identity the record names *and* whose live mount / VG the
+                // record describes, before any lvextend/xfs_growfs — a stored
+                // config plus a matching NBD identity can still coexist with a
+                // replaced mountpoint or a changed active VG mapping (R03).
+                verify_live_attachment(&prior, system)?;
             }
             record = Some(prior);
         }
@@ -667,8 +691,48 @@ fn execute_with(
             other => system.run_step(other, None),
         };
         if let Err(error) = result {
+            // A command can report failure *after* its effect took hold — a
+            // mount that reports failure yet mounted, a VG activation that
+            // reports failure yet mapped. Such a step never entered
+            // `executed`, so a naive rollback would skip its compensation
+            // while still running a lower-level one, tearing the backing out
+            // from under a live mount. Re-observe and fold any effect that
+            // actually happened into the rollback set, newest-effect last so
+            // `rollback_steps` orders it first (umount before deactivate
+            // before disconnect). Attach only: a failed detach is resumed on
+            // the next attempt, never rolled back (R01).
+            if connects {
+                if let Ok(observed) = system.detach_observation(record.as_ref().unwrap()) {
+                    if observed.vg_active
+                        && !executed
+                            .iter()
+                            .any(|s| matches!(s, PlannedStep::LvmActivate { .. }))
+                    {
+                        if let Some(s) = plan
+                            .steps
+                            .iter()
+                            .find(|s| matches!(s, PlannedStep::LvmActivate { .. }))
+                        {
+                            executed.push(s.clone());
+                        }
+                    }
+                    if observed.mounted
+                        && !executed
+                            .iter()
+                            .any(|s| matches!(s, PlannedStep::MountXfs { .. }))
+                    {
+                        if let Some(s) = plan
+                            .steps
+                            .iter()
+                            .find(|s| matches!(s, PlannedStep::MountXfs { .. }))
+                        {
+                            executed.push(s.clone());
+                        }
+                    }
+                }
+            }
             let rollback = rollback_steps(&executed);
-            let mut failed = 0usize;
+            let mut rolled_back = 0usize;
             for compensating in &rollback {
                 let result = if matches!(compensating, PlannedStep::NbdDisconnect { .. }) {
                     verify_connection(record.as_ref().unwrap(), system)
@@ -677,10 +741,19 @@ fn execute_with(
                     system.run_step(compensating, None)
                 };
                 if let Err(e) = result {
-                    failed += 1;
-                    tracing::error!("maki-attach: rollback step {compensating} failed: {e}");
+                    // A failed upper-level cleanup must stop the destructive
+                    // lower-level cleanup beneath it: leave the remaining
+                    // resources in place rather than, say, disconnecting the
+                    // backing while the filesystem is still mounted (R01).
+                    tracing::error!(
+                        "maki-attach: rollback step {compensating} failed: {e}; \
+                         stopping further rollback to avoid unsafe teardown"
+                    );
+                    break;
                 }
+                rolled_back += 1;
             }
+            let failed = rollback.len() - rolled_back;
             if connects && failed == 0 {
                 let record = record.as_ref().unwrap();
                 if matches!(system.backend(&record.device), Ok(None)) {
@@ -696,7 +769,7 @@ fn execute_with(
             }
             return Err(ExecError::RolledBack {
                 error: Box::new(error),
-                rolled_back: rollback.len() - failed,
+                rolled_back,
                 rollback_failed: failed,
             });
         }
