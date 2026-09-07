@@ -1292,6 +1292,34 @@ impl VolumeConfig {
                 "crypto.batch.target_bytes must be within 1..=max_bytes",
             ));
         }
+        // The batch scheduler admits a request as one whole group (it never
+        // splits): a lane's pending capacity must cover the largest batch, or
+        // a full batch could never be admitted and the scheduler would reject
+        // otherwise-valid requests at runtime (review R04). Both lanes share
+        // `max_pending_crypto_items`; the encrypt lane's pending bytes are
+        // `max_pending_crypto_bytes` and the decrypt lane's are
+        // `max_ciphertext_bytes` (see `daemon::scheduler_config`).
+        if (l.max_pending_crypto_items as u64) < bt.max_items as u64 {
+            return Err(invalid(format!(
+                "limits.max_pending_crypto_items ({}) must be at least crypto.batch.max_items ({}) \
+                 so a full batch can be admitted",
+                l.max_pending_crypto_items, bt.max_items
+            )));
+        }
+        if l.max_pending_crypto_bytes.0 < bt.max_bytes.0 {
+            return Err(invalid(format!(
+                "limits.max_pending_crypto_bytes ({}) must be at least crypto.batch.max_bytes ({}) \
+                 so the encrypt lane can admit a full batch",
+                l.max_pending_crypto_bytes.0, bt.max_bytes.0
+            )));
+        }
+        if l.max_ciphertext_bytes.0 < bt.max_bytes.0 {
+            return Err(invalid(format!(
+                "limits.max_ciphertext_bytes ({}) must be at least crypto.batch.max_bytes ({}) \
+                 so the decrypt lane can admit a full batch",
+                l.max_ciphertext_bytes.0, bt.max_bytes.0
+            )));
+        }
 
         let mode = self.crypto.capabilities.mode.as_str();
         if !["declared", "hybrid", "probed"].contains(&mode) {

@@ -8,9 +8,12 @@
 //! `max_wait` after its first item arrived; it never exceeds `max_items` /
 //! `max_bytes`. Requests are whole groups: a request's items are never
 //! split across batches and their order is preserved, so per-position
-//! validation in `CheckedProvider` keeps working. Encrypt and decrypt run
-//! on separate lanes, each bounded (count + bytes) so pending crypto work
-//! can never grow without limit (SPEC §12).
+//! validation in `CheckedProvider` keeps working. A request larger than a
+//! lane can admit as one group — more than `max_items`/`max_bytes`, or more
+//! than the lane's pending capacity — is *rejected*, never split or silently
+//! clamped, so its pending charge can never exceed the budget (R04). Encrypt
+//! and decrypt run on separate lanes, each bounded (count + bytes) so pending
+//! crypto work can never grow without limit (SPEC §12).
 //!
 //! Costs: a request pays at most `max_wait` of extra latency when it is
 //! alone, and plaintext is copied once into the lane (the provider trait
@@ -165,6 +168,13 @@ type LaneCall<I, O> = Arc<dyn Fn(CryptoContext, Vec<I>) -> CallFuture<O> + Send 
 struct Lane<I, O> {
     tx: mpsc::Sender<Group<I, O>>,
     admission: DualSemaphore,
+    /// The largest single request this lane can admit whole: the batch
+    /// maxima capped by the lane's pending capacity. A request beyond it is
+    /// rejected (this scheduler never splits a request); config validation
+    /// makes pending ≥ the batch maxima so a valid config only ever rejects a
+    /// request that already exceeds `max_items`/`max_bytes` (review R04).
+    max_admit_items: usize,
+    max_admit_bytes: u64,
 }
 
 impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
@@ -180,11 +190,31 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         let inflight = Arc::new(tokio::sync::Semaphore::new(
             config.max_inflight_batches.max(1) as usize,
         ));
+        let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
+        let max_admit_bytes = config.max_bytes.min(max_pending_bytes).max(1);
         tokio::spawn(run_lane(rx, config, clock, stats, call, inflight));
         Self {
             tx,
             admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
+            max_admit_items,
+            max_admit_bytes,
         }
+    }
+
+    /// Reject a request that cannot be admitted as one group: more items than
+    /// `max_admit_items` or more bytes than `max_admit_bytes`. Callers check
+    /// this before copying the payload, so an inadmissible request neither
+    /// duplicates plaintext nor charges the pending counters — the two ways
+    /// the old clamp-and-serialize path let a group exceed the budget (R04).
+    fn check_admissible(&self, items: usize, bytes: u64) -> Result<(), CryptoError> {
+        if items > self.max_admit_items || bytes > self.max_admit_bytes {
+            return Err(CryptoError::NonRetryableRequest(format!(
+                "request of {items} item(s) / {bytes} byte(s) exceeds the batch scheduler's \
+                 admittable maximum of {} item(s) / {} byte(s) per request",
+                self.max_admit_items, self.max_admit_bytes
+            )));
+        }
+        Ok(())
     }
 
     async fn submit(
@@ -488,6 +518,9 @@ impl CryptoProvider for BatchScheduler {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         self.with_deadline(async {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+            // Validate before duplicating the plaintext: an inadmissible
+            // request must not copy secrets or charge pending capacity (R04).
+            self.encrypt.check_admissible(items.len(), bytes)?;
             let owned: Vec<PlaintextUnit> = items
                 .iter()
                 .map(|i| PlaintextUnit {
@@ -509,6 +542,8 @@ impl CryptoProvider for BatchScheduler {
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
         self.with_deadline(async {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
+            // Validate before cloning the ciphertext into the lane (R04).
+            self.decrypt.check_admissible(items.len(), bytes)?;
             self.decrypt
                 .submit(context, items.to_vec(), bytes, &self.stats)
                 .await

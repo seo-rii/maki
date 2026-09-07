@@ -228,3 +228,59 @@ async fn capabilities_pass_through() {
     assert_eq!(caps.crypto_compatibility_id, "test-profile-v1");
     let _ = h.clock.now();
 }
+
+/// Review R04 (2026-09-07): a single request larger than the lane's pending
+/// budget must not be admitted. `DualSemaphore` clamps an oversized group's
+/// item/byte charge to the whole budget and serializes it, but the pending
+/// *stats* (and the real allocations) still counted the full group, so a
+/// two-item request slipped past a one-item pending budget. Rejecting or
+/// splitting the oversize request are both acceptable; this scheduler rejects
+/// (it never splits a request), so pending stays within the bound.
+#[tokio::test]
+async fn audit_20260907_one_group_cannot_exceed_pending_budgets() {
+    let mut c = cfg();
+    c.max_pending_items = 1;
+    c.max_pending_plaintext_bytes = UNIT as u64;
+    c.target_items = 8;
+    c.target_bytes = 8 * UNIT as u64;
+    c.max_wait = Duration::from_secs(60);
+    let h = harness(c);
+    let s = h.scheduler.clone();
+    let task = tokio::spawn(async move { s.encrypt_batch(&ctx(), &[pt(1), pt(2)]).await });
+    settle().await;
+    let observed = (
+        h.scheduler.stats().pending_items(),
+        h.scheduler.stats().pending_bytes(),
+    );
+    task.abort();
+    let _ = task.await;
+    settle().await;
+    // Rejecting or splitting the oversize group are both acceptable here.
+    assert!(observed.0 <= 1, "one group bypassed item admission: {observed:?}");
+    assert!(
+        observed.1 <= UNIT as u64,
+        "one group bypassed byte admission: {observed:?}"
+    );
+}
+
+/// Review R04 (2026-09-07): `run_lane` takes its first group unconditionally
+/// and applies the batch maxima only to *additional* groups, so a lone request
+/// larger than `max_items` / `max_bytes` reached the provider whole. Normal
+/// engine chunking supplies already-batch-sized requests, but the public
+/// scheduler API must validate the first group too — reject it or split it.
+#[tokio::test]
+async fn audit_20260907_first_group_obeys_batch_maxima() {
+    let mut c = cfg();
+    c.target_items = 1;
+    c.max_items = 1;
+    c.target_bytes = UNIT as u64;
+    c.max_bytes = UNIT as u64;
+    let h = harness(c);
+    let result = h.scheduler.encrypt_batch(&ctx(), &[pt(1), pt(2)]).await;
+    // This tests the public scheduler API, not normal engine chunking.
+    // The original engine usually supplies already batch-sized requests.
+    assert!(
+        result.is_err() || h.provider.encrypt_calls() >= 2,
+        "two units reached a one-unit batch in one successful provider call"
+    );
+}

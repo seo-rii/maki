@@ -567,3 +567,37 @@ fn nbd_device_block_size_must_match_the_volume() {
     let msg = err(&format!("{small}\n[nbd]\ndevice_block_size = 4096\n"));
     assert!(msg.contains("nbd.device_block_size"), "{msg}");
 }
+
+/// Review R04 (2026-09-07): the batch scheduler admits a request as one whole
+/// group and never splits it, so a lane's pending capacity must cover the
+/// largest batch. Positive-value validation alone let `max_pending_crypto_*`
+/// (and the decrypt lane's `max_ciphertext_bytes`) fall below the batch
+/// maxima, so a config that validated then rejected every full batch at
+/// runtime. Validation now requires the cover; exact equality is allowed.
+#[test]
+fn audit_20260907_pending_capacity_must_cover_a_full_batch() {
+    // Fewer pending item slots than a full batch.
+    let msg = err(&with(
+        "[limits]\nmax_pending_crypto_items = 4\n\
+         [crypto.batch]\ntarget_items = 8\nmax_items = 16\n",
+    ));
+    assert!(msg.contains("max_pending_crypto_items"), "{msg}");
+    // Smaller encrypt-lane pending budget than a full batch.
+    let msg = err(&with(
+        "[limits]\nmax_pending_crypto_bytes = \"512KiB\"\n\
+         [crypto.batch]\nmax_bytes = \"1MiB\"\n",
+    ));
+    assert!(msg.contains("max_pending_crypto_bytes"), "{msg}");
+    // Smaller decrypt-lane pending budget than a full batch.
+    let msg = err(&with(
+        "[limits]\nmax_ciphertext_bytes = \"512KiB\"\nmax_plaintext_bytes = \"256KiB\"\n\
+         [crypto.batch]\nmax_bytes = \"1MiB\"\n",
+    ));
+    assert!(msg.contains("max_ciphertext_bytes"), "{msg}");
+    // Exact cover of the item count (pending == max_items) is accepted; the
+    // default byte budgets comfortably cover the default batch max_bytes.
+    ok(&with(
+        "[limits]\nmax_pending_crypto_items = 16\n\
+         [crypto.batch]\ntarget_items = 8\nmax_items = 16\n",
+    ));
+}
