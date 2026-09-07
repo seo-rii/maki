@@ -528,15 +528,61 @@ lifecycle, the crypto scheduler's admission accounting, and the journal hard
 bound, with six proposed RED regression tests it could not compile in its own
 environment. Each finding below was reproduced (RED) against the actual source,
 fixed, and reverified (GREEN); the proposed tests were adapted to the real
-fixtures. Findings needing a native-Linux VM or peak-RSS experiments (see the
-"deferred" note at the end of this section) are tracked but not closed here.
+fixtures. R05 also has a landed service-boundary fix. Findings needing a
+native-Linux VM, an allocation observer, or peak-RSS experiments are scoped
+under "Tracked, not closed in this pass" below rather than closed here.
 
 | ID | Finding | Fix | Regression tests |
 |---|---|---|---|
 | R01 | **Attach rollback continued compensating even after an earlier step failed, and a command that failed *after* its effect was skipped.** After an attach failure the rollback ran every compensating step regardless of whether the previous one succeeded, so a failed umount did not stop the disconnect beneath it — the backing could be torn out from under a still-mounted filesystem. Separately, a command that reports failure after taking effect (a mount that mounted, a VG activation that mapped) never entered the executed prefix, so its compensation was skipped while a lower-level one still ran. | Rollback re-observes live state first and folds any effect that actually happened (mount, VG activation) into the compensation set in dependency order, and it **stops** at the first compensating failure rather than proceeding to the destructive step beneath it. Attach only — a failed detach is resumed, not rolled back. | `audit_20260907_failed_unmount_must_not_disconnect_live_mount`, `audit_20260907_mount_failure_after_effect_requires_reobservation` (maki-privileged `exec_tests.rs`) |
 | R03 | **Grow trusted the saved config plus the NBD identity, not the current topology.** A correct stored record and a matching live NBD connection can coexist with a replaced mountpoint or a changed active VG mapping; the grow branch checked only `verify_connection`, then ran `lvextend`/`xfs_growfs` on the configured names. | Grow re-observes the live attachment (`verify_live_attachment`, sharing `verify_detach_state`'s mount/VG/leaf observation) and refuses on a foreign mount, a foreign VG, or an unreadable observation before any mutation, while still requiring the connection present. | `audit_20260907_grow_rechecks_live_mount_and_vg_topology` (maki-privileged `exec_tests.rs`) |
 | R04 | **A single request larger than a lane's pending budget was admitted anyway, and `run_lane` took its first group without checking the batch maxima.** `DualSemaphore::acquire_n` clamps an oversized group's item/byte charge to the whole budget and serializes it, but the pending *stats* and the real allocations still counted the full group, so a two-item request slipped past a one-item pending budget. Separately, `run_lane` applied `max_items`/`max_bytes` only to *additional* groups, so a lone request above the batch maxima reached the provider whole. Positive-value config validation did not require the pending/inflight capacities to cover the configured maximum batch, so a config that validated could reject full batches at runtime. | The scheduler validates every request against the lane's admittable maximum (batch maxima capped by pending capacity) **before** copying the payload, and *rejects* an oversized one (it never splits a request; the reject charges nothing and copies no secret). Config validation now requires `max_pending_crypto_items ≥ batch.max_items`, `max_pending_crypto_bytes ≥ batch.max_bytes` (encrypt lane) and `max_ciphertext_bytes ≥ batch.max_bytes` (decrypt lane), so a validated config never rejects an in-spec request. | `audit_20260907_one_group_cannot_exceed_pending_budgets`, `audit_20260907_first_group_obeys_batch_maxima` (maki-crypto `review_scheduler.rs`); `audit_20260907_pending_capacity_must_cover_a_full_batch` (maki-format `review_config.rs`) |
+| R05 | **A hung external command could hold the global attach lock indefinitely.** `Command::output` has no deadline, and systemd disables the *start* timeout by default for `Type=oneshot`, so a stuck `nbd-client`/`mount`/`umount` in one volume's helper would block every other volume's attach/detach/grow. | The packaged unit now sets a finite `TimeoutStartSec`/`TimeoutStopSec`, above the internal 15s NBD readiness wait plus expected XFS mount recovery, so systemd terminates a stuck helper and releases the lock; the next attempt re-observes actual kernel state. The finer in-process per-command deadline is tracked below. | `audit_20260907_attach_unit_bounds_a_hung_helper` (maki-privileged `regression_missing_attach_config.rs`) |
 | R08 | **The journal hard limit counted record headers and payloads but not the 48-byte segment header an automatic roll creates.** With the on-disk total exactly at `journal_max_bytes` and the active segment full, admission's record-only check saw equality (not `>`), admitted the write, and the roll then pushed the on-disk total 48 bytes past the documented hard bound. Multiple rolls in one request could add several headers. | `JournalWriter::append_footprint` computes the exact bytes an append adds — records **plus** any new segment headers — by projecting `append`/`roll` step by step. `admit_journal` checks `journal_total_bytes + append_footprint` against the limit, recomputing the footprint after inline reclaim (reclaim can change the active segment). Record-byte accounting and the footprint share one `record_len` helper so they cannot drift. The `sustained_writes…` assertion was tightened from `+ SEGMENT + RECORD` slack to the strict bound. | `audit_20260907_journal_hard_limit_counts_new_segment_headers` and the tightened `sustained_writes_keep_journal_and_overlay_within_hard_limits` (maki-core `review_bounded.rs`) |
+
+### Tracked, not closed in this pass
+
+These findings from the same review need a native-Linux VM, an allocation
+observer, or peak-RSS measurement — infrastructure the review itself calls for
+and that WSL/CI simulation cannot substitute for. Each is scoped here so it is
+not silently dropped; none is a data-durability defect.
+
+- **R02 (P1) — mount target verified only after a read-write mount.** The plan
+  activates the VG and mounts the LV read-write before `VerifyMountDevice`
+  runs, and a read-write XFS mount can itself modify a filesystem (log
+  recovery) before the post-mount check rejects it. The fix — resolve the
+  LV device's PV/VG/LV identity and *all* backing leaves and confirm they are
+  exactly the bound NBD device *before* the read-write mount, retaining the
+  post-mount check — requires a device-path leaf probe (not the current
+  mountpoint-based one) and must be qualified against a real dirty XFS in a VM
+  (a rejected attach must perform no writes). Administrative accident-safety,
+  not a privilege-escalation or plaintext-persistence path.
+- **R05 in-process command deadline (P1).** The service-boundary timeout above
+  is landed; the finer per-command deadline with bounded captured output and
+  process-group cleanup/reaping (tested against a child that never exits, a
+  descendant holding output pipes open, and a verbose child) is a careful
+  systems change to root-privileged code that the review says to qualify in a
+  VM before shipping.
+- **R06 (P2) — WebSocket/gRPC make plaintext copies outside `SecretBuffer`.**
+  The transports build JSON/Base64 strings and prost `Vec`s without explicit
+  zeroization, and error/cancellation paths can drop decoded plaintext before
+  it is wrapped. Closing this needs owned wire types with RAII zeroization and
+  an allocation/deallocation observer to prove the lifetime; the review notes
+  reading freed memory directly in a test is itself invalid, so a meaningful
+  regression needs that observer harness first.
+- **R07 (P2) — recovery memory grows with all uncheckpointed records.**
+  Recovery collects every newer journal record before reducing them into the
+  overlay, so a GiB-sized journal needs comparable scratch memory even when the
+  live overlay is small. A streaming/two-pass replay that reduces into the
+  overlay as it scans would bound this, but it touches the recovery ordering
+  the release gates guard (second-crash-during-recovery, superseded-record
+  validation); it needs peak-RSS measurement and the full ignored release
+  gates, done deliberately, not folded into this pass.
+- **Additional improvements.** `plugin.rs` cold-open initialization is not
+  serialized (concurrent first opens can both attempt the exclusive volume
+  lock); synchronous storage calls remain on async engine paths; the CI comment
+  references a `docs/ci.md` and weekly/release tiers the uploaded workflow does
+  not implement. These are availability/accuracy items, not correctness bugs.
 
 ## Recovery fail-closed rules
 

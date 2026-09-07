@@ -55,6 +55,15 @@ crypto work, queue deadlines, NBD request limits, interrupted detach retries,
 and control-socket permission races.
 Each fix has a regression that failed before implementation.
 
+A [supplementary review (2026-09-07)](docs/review-remediation.md#supplementary-review-2026-09-07-r01r08)
+addressed safe attach rollback, live-topology grow checks, the batch
+scheduler's admission bound, a hung-helper lock timeout, and the journal
+hard-limit segment-header accounting, each with a TDD regression. Its remaining
+P1/P2 items (pre-mount target verification, an in-process command deadline,
+transport plaintext zeroization, and recovery peak memory) are scoped in the
+same log under "Tracked, not closed in this pass" pending native-VM and
+measurement infrastructure.
+
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.
 
