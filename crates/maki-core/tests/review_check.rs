@@ -118,6 +118,61 @@ fn deep_check_finds_slot_damage_the_fast_check_misses() {
     assert!(errors(&report).contains("unit 5"), "{}", errors(&report));
 }
 
+/// A shard the catalog names but whose data file is gone is corruption, not a
+/// pending "not yet created" state: shard creation makes the data file
+/// durable before the catalog names it, and `SlotStore::open` opens every
+/// cataloged shard's data file (a missing one => EIO/attach refused) whatever
+/// its allocation map says. Even with an *empty* allocation map the fast
+/// check must report an error, not pass with a warning, so `maki check` never
+/// says "passed" for a volume `maki attach` would reject. Regression for
+/// BUG-027 (fast-checker / recovery drift).
+#[test]
+fn fast_check_flags_a_cataloged_shard_with_no_data_file() {
+    use maki_format::ab::AbStore;
+    use maki_format::allocation::AllocationMap;
+    use maki_format::catalog::ShardCatalog;
+
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
+
+    // Catalog names shard 0 with a valid but *empty* allocation map; its data
+    // file was never created (or was deleted). set_count == 0 is the case the
+    // old check downgraded to a benign warning.
+    let g = geometry();
+    let mut catalog = ShardCatalog::new();
+    catalog.insert(0);
+    AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B)
+        .store(backing.as_ref(), &mut catalog)
+        .unwrap();
+    let mut map = AllocationMap::new(g.units_per_shard());
+    AbStore::new(layout::shard_alloc_a(0), layout::shard_alloc_b(0))
+        .store(backing.as_ref(), &mut map)
+        .unwrap();
+    assert!(!backing.exists(&layout::shard_data(0)).unwrap());
+
+    let report = fast(&backing);
+    assert!(
+        !report.ok(),
+        "fast check must reject a cataloged shard with no data file; warnings={:?}",
+        report.warnings
+    );
+    assert!(
+        errors(&report).contains("data file is missing"),
+        "{}",
+        errors(&report)
+    );
+
+    // Recovery agrees: it refuses to attach such a volume.
+    assert!(Volume::recover(
+        backing.clone() as Arc<dyn Backing>,
+        VolumeOptions {
+            journal_segment_size: SEGMENT,
+        },
+    )
+    .is_err());
+}
+
 #[test]
 fn deep_check_requires_checkpoint_state() {
     let _guard = failpoints::test_lock();

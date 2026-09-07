@@ -75,18 +75,20 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
                         geometry.units_per_shard()
                     ));
                 }
-                if map.set_count() > 0 && !backing.exists(&layout::shard_data(shard))? {
-                    report.errors.push(format!(
-                        "shard {shard}: {} allocated unit(s) but data file missing",
-                        map.set_count()
-                    ));
-                }
             }
         }
+        // A cataloged shard always has a data file: shard creation makes the
+        // data file's dirent durable *before* the catalog names the shard, so
+        // a missing one is not a pending state ("not yet created") but
+        // corruption that recovery refuses to attach — SlotStore::open opens
+        // every cataloged shard's data file unconditionally, whatever its
+        // allocation map says. Report it as an error, matching recovery,
+        // rather than a benign warning that lets `maki check` pass on a
+        // volume `maki attach` would reject.
         if !backing.exists(&layout::shard_data(shard))? {
-            report
-                .warnings
-                .push(format!("shard {shard}: data file not yet created"));
+            report.errors.push(format!(
+                "shard {shard}: cataloged but its data file is missing; recovery would refuse to attach"
+            ));
         }
     }
 
