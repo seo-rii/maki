@@ -249,8 +249,11 @@ fn temp_root(dir: &tempfile::TempDir) -> String {
 async fn engine_roundtrips_through_websocket_provider() {
     let url = ws_server().await;
     let dir = tempfile::tempdir().unwrap();
+    // max_frame_bytes must carry a base64-encoded full batch: the default
+    // crypto.batch.max_bytes is 1 MiB, which inflates to ~1.4 MiB once
+    // base64-encoded, plus JSON framing (BUG-026 validation).
     let transport = format!(
-        "[crypto.websocket]\nmax_frame_bytes = \"1MiB\"\n\
+        "[crypto.websocket]\nmax_frame_bytes = \"2MiB\"\n\
          [[crypto.websocket.endpoint]]\nname = \"ep0\"\nurl = \"{url}\"\n"
     );
     let config = base_config(&temp_root(&dir), "remote-websocket", "", &transport);

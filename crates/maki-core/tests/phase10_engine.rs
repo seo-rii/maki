@@ -215,8 +215,18 @@ async fn cache_resize_at_runtime() {
 /// Growth during workload: the virtual device is fixed-size; "growth" is
 /// writes reaching previously untouched regions, creating shards on demand
 /// while other I/O continues.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Growing into fresh shards hits the process-global `store.catalog_store`
+// failpoint site (shard catalog commit) and this test also checkpoints, so it
+// must serialize against `crash_during_shard_creation`, which injects a
+// failure there. A `parking_lot` guard is `!Send`, so the runtime is
+// current-thread; the spawned steady/grower tasks still interleave
+// cooperatively at await points, and engine writes serialize under the volume
+// lock regardless — the concurrent-growth consistency this test asserts is
+// unchanged. The guard intentionally spans awaits.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn growth_during_workload_creates_shards_consistently() {
+    let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, None).await;
@@ -324,8 +334,13 @@ async fn crash_during_shard_creation_recovers() {
 
 // ---------- metrics ----------
 
+// This test checkpoints (hitting the process-global `store.catalog_store`
+// failpoint site), so it must serialize against `crash_during_shard_creation`,
+// which injects a failure there; the guard intentionally spans awaits.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn stats_expose_required_metrics_inputs() {
+    let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, read_cache()).await;
