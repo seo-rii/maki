@@ -21,6 +21,16 @@ AssertPathExists=/etc/maki/attach/%i.toml
 Type=oneshot
 RemainAfterExit=yes
 
+# systemd disables the *start* timeout by default for Type=oneshot, so a hung
+# helper — a stuck nbd-client, mount, or umount — would hold the global attach
+# lock indefinitely and block every other volume's attach/detach/grow. Bound
+# both jobs so systemd terminates a stuck helper and releases the lock. The
+# values sit above the internal 15s NBD readiness wait plus expected XFS mount
+# log recovery; timeout recovery still re-observes actual kernel state on the
+# next attempt (R05).
+TimeoutStartSec=180
+TimeoutStopSec=120
+
 ExecStart=/usr/bin/maki-attach attach --volume %i
 ExecStop=/usr/bin/maki-attach detach --volume %i
 

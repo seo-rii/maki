@@ -16,6 +16,34 @@ fn missing_attach_config_is_a_start_assertion() {
     );
 }
 
+/// Review R05 (2026-09-07): the packaged `Type=oneshot` unit set no start or
+/// stop timeout, and systemd disables the default start timeout for oneshot
+/// services. A hung helper (a stuck nbd-client, mount, or umount) would then
+/// hold the global attach lock forever, blocking every other volume's
+/// attach/detach/grow. Both the attach (ExecStart) and detach (ExecStop) jobs
+/// must carry a finite bound so systemd terminates a stuck helper and releases
+/// the lock. (The in-process per-command deadline is tracked separately in the
+/// remediation log; this is the service-boundary guard.)
+#[test]
+fn audit_20260907_attach_unit_bounds_a_hung_helper() {
+    let finite = |key: &str| {
+        let line = ATTACH_UNIT
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("{key}=")))
+            .unwrap_or_else(|| {
+                panic!("{key} must be set so a hung helper cannot hold the attach lock forever")
+            });
+        let value = line.split_once('=').unwrap().1.trim();
+        assert!(
+            !value.is_empty() && !value.eq_ignore_ascii_case("infinity") && value != "0",
+            "{key} must be a finite bound, got {value:?}"
+        );
+    };
+    finite("TimeoutStartSec");
+    finite("TimeoutStopSec");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn systemd_evaluates_the_packaged_assertion_against_missing_and_present_files() {
