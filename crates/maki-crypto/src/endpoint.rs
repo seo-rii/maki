@@ -413,8 +413,8 @@ impl EndpointSet {
         bytes: u64,
     ) -> Result<Response, CryptoError> {
         // Permits live only for the duration of the RPC.
-        let _global = self.global.acquire(bytes).await;
-        let _local = endpoint.semaphore.acquire(bytes).await;
+        let _global = self.global.acquire(bytes).await?;
+        let _local = endpoint.semaphore.acquire(bytes).await?;
         endpoint.inflight.fetch_add(1, Ordering::SeqCst);
         let _inflight = InflightGuard(&endpoint.inflight);
         let started = self.clock.now();

@@ -1216,6 +1216,14 @@ impl VolumeConfig {
             if value == 0 {
                 return Err(invalid(format!("{name} must be positive")));
             }
+            // Match DualSemaphore's supported byte capacity. A larger TOML
+            // budget would be silently truncated before runtime admission.
+            if name.contains("_bytes") && value > (u32::MAX as u64 >> 1) {
+                return Err(invalid(format!(
+                    "{name} ({value}) exceeds the admission capacity of {} bytes",
+                    u32::MAX as u64 >> 1
+                )));
+            }
         }
         if l.max_ciphertext_bytes.0 < l.max_plaintext_bytes.0 {
             return Err(invalid(
@@ -1313,31 +1321,30 @@ impl VolumeConfig {
                 l.max_pending_crypto_bytes.0, bt.max_bytes.0
             )));
         }
-        if l.max_ciphertext_bytes.0 < bt.max_bytes.0 {
-            return Err(invalid(format!(
-                "limits.max_ciphertext_bytes ({}) must be at least crypto.batch.max_bytes ({}) \
-                 so the decrypt lane can admit a full batch",
-                l.max_ciphertext_bytes.0, bt.max_bytes.0
-            )));
-        }
-        // A dispatched batch is charged whole against the endpoint inflight
-        // byte budgets. If those are smaller than a batch, the `DualSemaphore`
-        // would clamp the charge to the budget and let an over-budget RPC
-        // through instead of bounding it — so require both the global and the
-        // per-endpoint inflight byte budgets to cover a full batch (FUP-013).
-        if l.max_crypto_inflight_bytes.0 < bt.max_bytes.0 {
-            return Err(invalid(format!(
-                "limits.max_crypto_inflight_bytes ({}) must be at least crypto.batch.max_bytes \
-                 ({}) so an in-flight batch stays within its byte budget",
-                l.max_crypto_inflight_bytes.0, bt.max_bytes.0
-            )));
-        }
-        if l.max_inflight_bytes_per_endpoint.0 < bt.max_bytes.0 {
-            return Err(invalid(format!(
-                "limits.max_inflight_bytes_per_endpoint ({}) must be at least \
-                 crypto.batch.max_bytes ({}) so a per-endpoint in-flight batch stays within budget",
-                l.max_inflight_bytes_per_endpoint.0, bt.max_bytes.0
-            )));
+        // Batch bytes are logical plaintext bytes. The ciphertext queue and
+        // RPC admission hold ciphertext, including the provider's declared
+        // maximum overhead. Both item and logical limits bound a full batch.
+        let batch_units = u64::from(bt.max_items).min(bt.max_bytes.0 / unit);
+        let ciphertext_batch = batch_units
+            .checked_mul(u64::from(self.crypto.capabilities.max_ciphertext_size))
+            .ok_or_else(|| invalid("maximum ciphertext batch size overflows u64"))?;
+        for (name, budget) in [
+            ("limits.max_ciphertext_bytes", l.max_ciphertext_bytes.0),
+            (
+                "limits.max_crypto_inflight_bytes",
+                l.max_crypto_inflight_bytes.0,
+            ),
+            (
+                "limits.max_inflight_bytes_per_endpoint",
+                l.max_inflight_bytes_per_endpoint.0,
+            ),
+        ] {
+            if budget < ciphertext_batch {
+                return Err(invalid(format!(
+                    "{name} ({budget}) must hold the maximum ciphertext batch \
+                     ({ciphertext_batch} bytes for {batch_units} units)"
+                )));
+            }
         }
 
         let mode = self.crypto.capabilities.mode.as_str();
@@ -1543,7 +1550,9 @@ impl VolumeConfig {
                     .map(|b| b.0)
                     .unwrap_or(DEFAULT_WS_MAX_FRAME_BYTES);
                 if frame == 0 {
-                    return Err(invalid("[crypto.websocket] max_frame_bytes must be positive"));
+                    return Err(invalid(
+                        "[crypto.websocket] max_frame_bytes must be positive",
+                    ));
                 }
                 // A batch is sent as one JSON frame with base64 payloads
                 // (~4/3 the raw bytes). If a maximal batch's base64 payload

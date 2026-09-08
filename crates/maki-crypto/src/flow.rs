@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::error::CryptoError;
+
 /// A semaphore bounding both item count and total bytes.
 pub struct DualSemaphore {
     items: Arc<Semaphore>,
@@ -34,58 +36,49 @@ impl DualSemaphore {
         }
     }
 
-    fn byte_permits(&self, bytes: u64) -> u32 {
-        // An oversized request is capped to the whole budget (it serializes
-        // against everything else rather than deadlocking forever).
-        bytes.min(self.max_bytes) as u32
+    fn check_request(&self, items: u32, bytes: u64) -> Result<(), CryptoError> {
+        if items == 0 || items as usize > self.max_items || bytes > self.max_bytes {
+            return Err(CryptoError::NonRetryableRequest(format!(
+                "admission request of {items} item(s) / {bytes} byte(s) exceeds \
+                 capacity of {} item(s) / {} byte(s), or has no items",
+                self.max_items, self.max_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// Acquire one item slot plus `bytes` of byte budget.
-    pub async fn acquire(&self, bytes: u64) -> DualPermit {
-        let items = self
-            .items
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
-        let bytes = self
-            .bytes
-            .clone()
-            .acquire_many_owned(self.byte_permits(bytes))
-            .await
-            .expect("semaphore closed");
-        DualPermit {
-            _items: items,
-            _bytes: bytes,
-        }
+    /// Returns a non-retryable request error if it cannot fit the total budget.
+    pub async fn acquire(&self, bytes: u64) -> Result<DualPermit, CryptoError> {
+        self.acquire_n(1, bytes).await
     }
 
-    /// Acquire `items` item slots plus `bytes` of byte budget. An oversized
-    /// request is capped to the whole budget, like bytes.
-    pub async fn acquire_n(&self, items: u32, bytes: u64) -> DualPermit {
-        let count = (items as usize).clamp(1, self.max_items) as u32;
+    /// Acquire `items` item slots plus `bytes` of byte budget. Oversized or
+    /// zero-item requests fail before acquiring any capacity.
+    pub async fn acquire_n(&self, items: u32, bytes: u64) -> Result<DualPermit, CryptoError> {
+        self.check_request(items, bytes)?;
         let items = self
             .items
             .clone()
-            .acquire_many_owned(count)
+            .acquire_many_owned(items)
             .await
             .expect("semaphore closed");
         let bytes = self
             .bytes
             .clone()
-            .acquire_many_owned(self.byte_permits(bytes))
+            .acquire_many_owned(bytes as u32)
             .await
             .expect("semaphore closed");
-        DualPermit {
+        Ok(DualPermit {
             _items: items,
             _bytes: bytes,
-        }
+        })
     }
 
     /// Non-blocking acquire. Returns `None` when capacity is unavailable or
     /// the request exceeds the total byte budget.
     pub fn try_acquire(&self, bytes: u64) -> Option<DualPermit> {
-        if bytes > self.max_bytes {
+        if self.check_request(1, bytes).is_err() {
             return None;
         }
         let items = self.items.clone().try_acquire_owned().ok()?;
@@ -136,11 +129,12 @@ impl<T> BoundedQueue<T> {
     }
 
     /// Enqueue, waiting for capacity (count and bytes).
-    pub async fn push(&self, item: T, bytes: u64) {
-        let permit = self.capacity.acquire(bytes).await;
+    pub async fn push(&self, item: T, bytes: u64) -> Result<(), CryptoError> {
+        let permit = self.capacity.acquire(bytes).await?;
         self.inner.lock().push_back((item, permit));
         self.len.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
+        Ok(())
     }
 
     fn try_pop(&self) -> Option<T> {

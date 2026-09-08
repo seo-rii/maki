@@ -617,10 +617,11 @@ pub async fn attach_from_config_with_stats(
     let backing = build_backing(config)?;
     let (provider, endpoints) = build_provider_with_endpoints(config).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
-        let scheduler = maki_crypto::scheduler::BatchScheduler::new(
+        let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
             provider,
             scheduler_config(config),
             Arc::new(maki_crypto::SystemClock::new()),
+            config.volume.crypto_unit_size,
         );
         let stats = scheduler.stats();
         (Arc::new(scheduler) as Arc<dyn CryptoProvider>, Some(stats))

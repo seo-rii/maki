@@ -76,7 +76,7 @@ async fn global_semaphore_bounds_concurrency() {
     for _ in 0..50 {
         let (sem, current, max_seen) = (sem.clone(), current.clone(), max_seen.clone());
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire(1000).await;
+            let _permit = sem.acquire(1000).await.unwrap();
             let now = current.fetch_add(1, Ordering::SeqCst) + 1;
             max_seen.fetch_max(now, Ordering::SeqCst);
             tokio::task::yield_now().await;
@@ -102,7 +102,7 @@ async fn byte_semaphore_bounds_total_bytes() {
         let (sem, bytes_in_flight, max_bytes) =
             (sem.clone(), bytes_in_flight.clone(), max_bytes.clone());
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire(1024).await;
+            let _permit = sem.acquire(1024).await.unwrap();
             let now = bytes_in_flight.fetch_add(1024, Ordering::SeqCst) + 1024;
             max_bytes.fetch_max(now, Ordering::SeqCst);
             tokio::task::yield_now().await;
@@ -126,7 +126,7 @@ async fn oversized_acquire_is_rejected() {
     let sem = DualSemaphore::new(4, 1024);
     assert!(sem.try_acquire(4096).is_none());
     let r = tokio::time::timeout(Duration::from_millis(100), sem.acquire(4096)).await;
-    assert!(r.is_err() || r.is_ok(), "documented: capped to budget");
+    assert!(matches!(r, Ok(Err(CryptoError::NonRetryableRequest(_)))));
 }
 
 // ---------- bounded queue ----------
@@ -136,13 +136,13 @@ async fn bounded_queue_blocks_at_capacity_and_preserves_fifo() {
     let queue = Arc::new(BoundedQueue::<u32>::new(4, 10_000));
     // Fill to capacity.
     for i in 0..4u32 {
-        queue.push(i, 100).await;
+        queue.push(i, 100).await.unwrap();
     }
     assert_eq!(queue.len(), 4);
     // Fifth push must block until a pop.
     let q2 = queue.clone();
     let pusher = tokio::spawn(async move {
-        q2.push(4, 100).await;
+        q2.push(4, 100).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!pusher.is_finished(), "push beyond capacity must block");
@@ -157,11 +157,11 @@ async fn bounded_queue_blocks_at_capacity_and_preserves_fifo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_queue_enforces_byte_limit() {
     let queue = Arc::new(BoundedQueue::<Vec<u8>>::new(100, 2048));
-    queue.push(vec![0; 1024], 1024).await;
-    queue.push(vec![0; 1024], 1024).await;
+    queue.push(vec![0; 1024], 1024).await.unwrap();
+    queue.push(vec![0; 1024], 1024).await.unwrap();
     let q2 = queue.clone();
     let pusher = tokio::spawn(async move {
-        q2.push(vec![0; 512], 512).await;
+        q2.push(vec![0; 512], 512).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!pusher.is_finished(), "byte-full queue must block pushes");
@@ -178,7 +178,7 @@ async fn hundred_thousand_requests_through_bounded_queue() {
         let queue = queue.clone();
         tokio::spawn(async move {
             for i in 0..total {
-                queue.push(i, 8).await;
+                queue.push(i, 8).await.unwrap();
                 assert!(queue.len() <= 512, "queue bound violated");
             }
         })

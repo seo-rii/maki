@@ -617,7 +617,7 @@ impl Engine {
             .inner
             .admission
             .acquire(self.admission_cost(offset, len))
-            .await;
+            .await?;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
@@ -687,7 +687,7 @@ impl Engine {
             .inner
             .admission
             .acquire(self.admission_cost(offset, data.len()))
-            .await;
+            .await?;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + data.len() as u64 - 1) / unit_size;

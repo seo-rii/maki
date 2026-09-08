@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OnceCell};
 
 use crate::clock::Clock;
 use crate::error::CryptoError;
@@ -114,7 +114,7 @@ impl SchedulerStats {
 struct Group<I, O> {
     context: CryptoContext,
     items: Vec<I>,
-    bytes: u64,
+    logical_bytes: u64,
     reply: Reply<O>,
     /// Queue capacity, released when the group is dispatched.
     _pending: PendingCharge,
@@ -174,20 +174,13 @@ struct Lane<I, O> {
     /// makes pending ≥ the batch maxima so a valid config only ever rejects a
     /// request that already exceeds `max_items`/`max_bytes` (review R04).
     max_admit_items: usize,
-    max_admit_bytes: u64,
+    max_admit_logical_bytes: u64,
 }
 
 impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
     fn spawn(
         config: SchedulerConfig,
         max_pending_bytes: u64,
-        // The per-batch byte cap in *this lane's own units*: `crypto.batch.max_bytes`
-        // is defined in plaintext bytes, so it caps the encrypt lane, while the
-        // decrypt lane processes ciphertext and is bounded by its ciphertext
-        // pending budget instead — otherwise a single ciphertext unit (unit +
-        // overhead) would exceed a plaintext-sized `max_bytes` and be rejected
-        // (FUP-007).
-        max_batch_bytes: u64,
         clock: Arc<dyn Clock>,
         stats: Arc<SchedulerStats>,
         call: LaneCall<I, O>,
@@ -198,13 +191,13 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
             config.max_inflight_batches.max(1) as usize,
         ));
         let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
-        let max_admit_bytes = max_batch_bytes.min(max_pending_bytes).max(1);
+        let max_admit_logical_bytes = config.max_bytes;
         tokio::spawn(run_lane(rx, config, clock, stats, call, inflight));
         Self {
             tx,
             admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
             max_admit_items,
-            max_admit_bytes,
+            max_admit_logical_bytes,
         }
     }
 
@@ -213,12 +206,23 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
     /// this before copying the payload, so an inadmissible request neither
     /// duplicates plaintext nor charges the pending counters — the two ways
     /// the old clamp-and-serialize path let a group exceed the budget (R04).
-    fn check_admissible(&self, items: usize, bytes: u64) -> Result<(), CryptoError> {
-        if items > self.max_admit_items || bytes > self.max_admit_bytes {
+    fn check_admissible(
+        &self,
+        items: usize,
+        logical_bytes: u64,
+        resident_bytes: u64,
+    ) -> Result<(), CryptoError> {
+        if items > self.max_admit_items
+            || logical_bytes > self.max_admit_logical_bytes
+            || resident_bytes > self.admission.max_bytes()
+        {
             return Err(CryptoError::NonRetryableRequest(format!(
-                "request of {items} item(s) / {bytes} byte(s) exceeds the batch scheduler's \
-                 admittable maximum of {} item(s) / {} byte(s) per request",
-                self.max_admit_items, self.max_admit_bytes
+                "request of {items} item(s) / {logical_bytes} logical byte(s) / \
+                 {resident_bytes} resident byte(s) exceeds the scheduler maximum of \
+                 {} item(s) / {} logical byte(s) / {} resident byte(s)",
+                self.max_admit_items,
+                self.max_admit_logical_bytes,
+                self.admission.max_bytes()
             )));
         }
         Ok(())
@@ -229,17 +233,13 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         context: &CryptoContext,
         items: Vec<I>,
         bytes: u64,
+        logical_bytes: u64,
+        permit: DualPermit,
         stats: &Arc<SchedulerStats>,
     ) -> Result<Vec<O>, CryptoError> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        // One item permit per *item* (C-10): the pending bound is stated in
-        // items, and a request of many items must count as many.
-        let permit = self
-            .admission
-            .acquire_n(u32::try_from(items.len()).unwrap_or(u32::MAX), bytes)
-            .await;
         let (reply_tx, reply_rx) = oneshot::channel();
         let count = items.len() as u64;
         stats.pending_items.fetch_add(count, Ordering::SeqCst);
@@ -247,7 +247,7 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         let group = Group {
             context: context.clone(),
             items,
-            bytes,
+            logical_bytes,
             reply: reply_tx,
             _pending: PendingCharge {
                 stats: stats.clone(),
@@ -298,7 +298,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
         let deadline = clock.now().saturating_add(config.max_wait);
         let mut batch: Vec<Group<I, O>> = vec![first];
         let mut items: usize = batch[0].items.len();
-        let mut bytes: u64 = batch[0].bytes;
+        let mut bytes: u64 = batch[0].logical_bytes;
 
         while items < config.target_items && bytes < config.target_bytes {
             let remaining = deadline.saturating_sub(clock.now());
@@ -313,7 +313,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
                         batch.retain(|g| !g.reply.is_closed());
                         if batch.is_empty() { continue 'lane; }
                         items = batch.iter().map(|g| g.items.len()).sum();
-                        bytes = batch.iter().map(|g| g.bytes).sum();
+                        bytes = batch.iter().map(|g| g.logical_bytes).sum();
                         continue;
                     },
                     g = rx.recv() => g,
@@ -327,14 +327,14 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
                 continue;
             }
             let fits = items + group.items.len() <= config.max_items
-                && bytes + group.bytes <= config.max_bytes
+                && bytes + group.logical_bytes <= config.max_bytes
                 && group.context == batch[0].context;
             if !fits {
                 queued.push_front(group);
                 break;
             }
             items += group.items.len();
-            bytes += group.bytes;
+            bytes += group.logical_bytes;
             batch.push(group);
         }
 
@@ -445,6 +445,8 @@ pub struct BatchScheduler {
     encrypt: Lane<PlaintextUnit, CiphertextUnit>,
     decrypt: Lane<CiphertextUnit, PlaintextUnit>,
     stats: Arc<SchedulerStats>,
+    unit_size: Option<u32>,
+    caps: OnceCell<CryptoCapabilities>,
 }
 
 impl BatchScheduler {
@@ -454,13 +456,32 @@ impl BatchScheduler {
         config: SchedulerConfig,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::build(inner, config, clock, None)
+    }
+
+    /// Pin logical decrypt cost to the attached volume's plaintext unit size.
+    /// The unpinned constructor conservatively uses the provider's largest
+    /// supported plaintext size because ciphertext does not encode this cost.
+    pub fn with_unit_size(
+        inner: Arc<dyn CryptoProvider>,
+        config: SchedulerConfig,
+        clock: Arc<dyn Clock>,
+        unit_size: u32,
+    ) -> Self {
+        Self::build(inner, config, clock, Some(unit_size))
+    }
+
+    fn build(
+        inner: Arc<dyn CryptoProvider>,
+        config: SchedulerConfig,
+        clock: Arc<dyn Clock>,
+        unit_size: Option<u32>,
+    ) -> Self {
         let stats = Arc::new(SchedulerStats::default());
         let enc_inner = inner.clone();
         let encrypt = Lane::spawn(
             config.clone(),
             config.max_pending_plaintext_bytes,
-            // Encrypt input is plaintext, which `crypto.batch.max_bytes` bounds.
-            config.max_bytes,
             clock.clone(),
             stats.clone(),
             Arc::new(move |context, items: Vec<PlaintextUnit>| {
@@ -471,10 +492,6 @@ impl BatchScheduler {
         let dec_inner = inner.clone();
         let decrypt = Lane::spawn(
             config.clone(),
-            config.max_pending_ciphertext_bytes,
-            // Decrypt input is ciphertext (unit + overhead), so the plaintext
-            // `max_bytes` does not apply; the ciphertext pending budget bounds
-            // it (FUP-007).
             config.max_pending_ciphertext_bytes,
             clock.clone(),
             stats.clone(),
@@ -489,6 +506,8 @@ impl BatchScheduler {
             encrypt,
             decrypt,
             stats,
+            unit_size,
+            caps: OnceCell::new(),
         }
     }
 
@@ -533,7 +552,17 @@ impl CryptoProvider for BatchScheduler {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
             // Validate before duplicating the plaintext: an inadmissible
             // request must not copy secrets or charge pending capacity (R04).
-            self.encrypt.check_admissible(items.len(), bytes)?;
+            self.encrypt.check_admissible(items.len(), bytes, bytes)?;
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Reserve before copying: waiting callers retain only their own
+            // input, never an uncharged duplicate owned by this scheduler.
+            let permit = self
+                .encrypt
+                .admission
+                .acquire_n(items.len() as u32, bytes)
+                .await?;
             let owned: Vec<PlaintextUnit> = items
                 .iter()
                 .map(|i| PlaintextUnit {
@@ -542,7 +571,7 @@ impl CryptoProvider for BatchScheduler {
                 })
                 .collect();
             self.encrypt
-                .submit(context, owned, bytes, &self.stats)
+                .submit(context, owned, bytes, bytes, permit, &self.stats)
                 .await
         })
         .await
@@ -555,10 +584,51 @@ impl CryptoProvider for BatchScheduler {
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
         self.with_deadline(async {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
-            // Validate before cloning the ciphertext into the lane (R04).
-            self.decrypt.check_admissible(items.len(), bytes)?;
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            let caps = self
+                .caps
+                .get_or_try_init(|| self.inner.capabilities())
+                .await?;
+            let unit_size = self
+                .unit_size
+                .or_else(|| caps.supported_plaintext_sizes.iter().copied().max())
+                .filter(|size| *size > 0 && caps.supported_plaintext_sizes.contains(size))
+                .ok_or_else(|| {
+                    CryptoError::Contract("provider has no compatible plaintext unit size".into())
+                })?;
+            let logical_bytes = (items.len() as u64)
+                .checked_mul(u64::from(unit_size))
+                .ok_or_else(|| {
+                    CryptoError::NonRetryableRequest("logical batch size overflow".into())
+                })?;
+            if items
+                .iter()
+                .any(|item| item.data.len() > caps.max_ciphertext_size as usize)
+            {
+                return Err(CryptoError::NonRetryableRequest(
+                    "ciphertext exceeds the declared maximum unit size".into(),
+                ));
+            }
+            // Check logical batching independently of resident ciphertext,
+            // then reserve its full resident cost before cloning (R3-003).
             self.decrypt
-                .submit(context, items.to_vec(), bytes, &self.stats)
+                .check_admissible(items.len(), logical_bytes, bytes)?;
+            let permit = self
+                .decrypt
+                .admission
+                .acquire_n(items.len() as u32, bytes)
+                .await?;
+            self.decrypt
+                .submit(
+                    context,
+                    items.to_vec(),
+                    bytes,
+                    logical_bytes,
+                    permit,
+                    &self.stats,
+                )
                 .await
         })
         .await
