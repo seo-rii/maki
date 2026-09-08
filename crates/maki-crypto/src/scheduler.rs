@@ -181,6 +181,13 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
     fn spawn(
         config: SchedulerConfig,
         max_pending_bytes: u64,
+        // The per-batch byte cap in *this lane's own units*: `crypto.batch.max_bytes`
+        // is defined in plaintext bytes, so it caps the encrypt lane, while the
+        // decrypt lane processes ciphertext and is bounded by its ciphertext
+        // pending budget instead — otherwise a single ciphertext unit (unit +
+        // overhead) would exceed a plaintext-sized `max_bytes` and be rejected
+        // (FUP-007).
+        max_batch_bytes: u64,
         clock: Arc<dyn Clock>,
         stats: Arc<SchedulerStats>,
         call: LaneCall<I, O>,
@@ -191,7 +198,7 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
             config.max_inflight_batches.max(1) as usize,
         ));
         let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
-        let max_admit_bytes = config.max_bytes.min(max_pending_bytes).max(1);
+        let max_admit_bytes = max_batch_bytes.min(max_pending_bytes).max(1);
         tokio::spawn(run_lane(rx, config, clock, stats, call, inflight));
         Self {
             tx,
@@ -452,6 +459,8 @@ impl BatchScheduler {
         let encrypt = Lane::spawn(
             config.clone(),
             config.max_pending_plaintext_bytes,
+            // Encrypt input is plaintext, which `crypto.batch.max_bytes` bounds.
+            config.max_bytes,
             clock.clone(),
             stats.clone(),
             Arc::new(move |context, items: Vec<PlaintextUnit>| {
@@ -462,6 +471,10 @@ impl BatchScheduler {
         let dec_inner = inner.clone();
         let decrypt = Lane::spawn(
             config.clone(),
+            config.max_pending_ciphertext_bytes,
+            // Decrypt input is ciphertext (unit + overhead), so the plaintext
+            // `max_bytes` does not apply; the ciphertext pending budget bounds
+            // it (FUP-007).
             config.max_pending_ciphertext_bytes,
             clock.clone(),
             stats.clone(),
