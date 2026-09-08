@@ -86,6 +86,7 @@ fn journal_reclaim_never_outruns_checkpoint_state_durability() {
         volume.checkpoint().is_err(),
         "the checkpoint-state sync failure must surface"
     );
+    assert_eq!(volume.checkpoint_sequence(), s1);
     backing.set_fault_hook(None);
 
     // Process restart (not a power loss): the page cache survives.
@@ -107,8 +108,8 @@ fn journal_reclaim_never_outruns_checkpoint_state_durability() {
     // Recovery must not be refused, and every FUA-acknowledged unit is here.
     let volume = Volume::recover(backing.clone() as Arc<dyn Backing>, options())
         .expect("power-loss recovery must not be refused after checkpoint-state loss");
-    assert_eq!(volume.read_ct(0).unwrap().map(|(_, d)| d), Some(first));
-    assert_eq!(volume.read_ct(1).unwrap().map(|(_, d)| d), Some(second));
-    assert_eq!(volume.read_ct(2).unwrap().map(|(_, d)| d), Some(third));
+    assert_eq!(volume.read_ct(0).unwrap(), Some((s1, first)));
+    assert_eq!(volume.read_ct(1).unwrap(), Some((s2, second)));
+    assert_eq!(volume.read_ct(2).unwrap(), Some((s3, third)));
     assert!(volume.journal_durable_sequence() >= s3);
 }

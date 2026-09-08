@@ -4,7 +4,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use crate::config::{parse, AttachOverrides};
-use crate::plan::{plan_attach, plan_detach, plan_grow, AttachRequest, GrowRequest, AUTO_NBD_DEVICE};
+use crate::plan::{
+    plan_attach, plan_detach, plan_grow, AttachRequest, GrowRequest, AUTO_NBD_DEVICE,
+};
 
 struct Fixture(PathBuf);
 
@@ -491,7 +493,10 @@ fn review_next_grow_rejects_reused_backend_and_changed_targets() {
         let mut changed = grow_request();
         mutate(&mut changed);
         assert!(execute_with(&plan_grow(&changed), Some(&state), &mut system).is_err());
-        assert!(system.steps.is_empty(), "a changed-target grow ran commands");
+        assert!(
+            system.steps.is_empty(),
+            "a changed-target grow ran commands"
+        );
     }
 
     // Reused backend: the device now carries a different connection identity.
@@ -525,7 +530,10 @@ fn audit_20260907_failed_unmount_must_not_disconnect_live_mount() {
         ..Default::default()
     };
     assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
-    assert!(system.mounted, "the injected umount failed before its effect");
+    assert!(
+        system.mounted,
+        "the injected umount failed before its effect"
+    );
     assert!(
         !system.steps.contains(&"nbd-disconnect"),
         "rollback attempted NBD disconnect after failed umount: {:?}",
@@ -612,7 +620,10 @@ fn followup_observation_failure_after_activation_must_not_disconnect() {
         "unknown mappings must block lower teardown: {:?}",
         system.steps
     );
-    assert!(state.read("pg").unwrap().is_some(), "preserve recovery provenance");
+    assert!(
+        state.read("pg").unwrap().is_some(),
+        "preserve recovery provenance"
+    );
 }
 
 /// FUP-002: a missing NBD backend does not authorize replacing the trusted
@@ -654,5 +665,186 @@ fn followup_grow_requires_a_live_mount_before_extending_lv() {
         system.steps.is_empty(),
         "missing mount must be rejected before lvextend: {:?}",
         system.steps
+    );
+}
+
+/// Command execution and kernel files are fixtures, while sentinel I/O,
+/// mountinfo parsing, the final mount verifier, and executor ordering are
+/// the actual implementation. No subprocess or real block device is used.
+struct ReviewForeignMountSystem {
+    inner: FakeSystem,
+    mountinfo: String,
+    sysfs: PathBuf,
+}
+
+impl ReviewForeignMountSystem {
+    fn observe(&self, mountpoint: &str, nbd_device: &str, touch: bool) -> MountObservation {
+        let entry = parse_mountinfo(&self.mountinfo, mountpoint);
+        let start = entry.as_ref().and_then(|mount| {
+            std::fs::read_dir(&self.sysfs)
+                .unwrap()
+                .flatten()
+                .find(|device| {
+                    std::fs::read_to_string(device.path().join("dev"))
+                        .is_ok_and(|number| number.trim() == mount.major_minor)
+                })
+                .map(|device| device.file_name().to_string_lossy().into_owned())
+        });
+        let backing_devices = start
+            .map(|start| {
+                let mut slaves_of = |name: &str| {
+                    std::fs::read_dir(self.sysfs.join(name).join("slaves"))
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                resolve_leaf_devices(&start, &mut slaves_of)
+                    .into_iter()
+                    .map(|leaf| nbd_device_of(&leaf).unwrap_or_else(|| format!("/dev/{leaf}")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        MountObservation {
+            mountpoint_exists: Path::new(mountpoint).is_dir(),
+            fstype: entry.as_ref().map(|entry| entry.fstype.clone()),
+            fs_uuid: Some("11111111-2222-4333-8444-555555555555".into()),
+            sentinel_volume_uuid: if touch {
+                read_sentinel(mountpoint)
+            } else {
+                None
+            },
+            nbd_connected: self
+                .sysfs
+                .join(format!("nbd{}", nbd_index(nbd_device).unwrap()))
+                .join("pid")
+                .exists(),
+            rw_probe_ok: touch && entry.is_some() && rw_probe(mountpoint),
+            backing_devices,
+        }
+    }
+}
+
+impl System for ReviewForeignMountSystem {
+    fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
+        self.inner.run_step(step, identifier)?;
+        match step {
+            PlannedStep::VerifyMountDevice {
+                mountpoint,
+                nbd_device,
+            } => {
+                let observed = self.observe(mountpoint, nbd_device, false);
+                verify_mount_device(nbd_device, &observed)?;
+                Ok(())
+            }
+            PlannedStep::WriteSentinel {
+                mountpoint,
+                volume_uuid,
+            } => write_sentinel(step, mountpoint, volume_uuid),
+            PlannedStep::VerifyMountIdentity {
+                mountpoint,
+                volume_uuid,
+                fs_uuid,
+                nbd_device,
+            } => {
+                let observed = self.observe(mountpoint, nbd_device, true);
+                verify_mount_identity(
+                    &MountExpectation {
+                        fs_uuid: fs_uuid.clone(),
+                        volume_uuid: volume_uuid.clone(),
+                        nbd_device: nbd_device.clone(),
+                    },
+                    &observed,
+                )?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+        self.inner.wait_ready(step, device)
+    }
+
+    fn allocate(&mut self) -> Result<String, ExecError> {
+        self.inner.allocate()
+    }
+
+    fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        self.inner.backend(device)
+    }
+
+    fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        crate::detach::observe(record, &self.mountinfo, &self.sysfs)
+    }
+}
+
+#[test]
+fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mountpoint = fixture.0.join("filesystem");
+    std::fs::create_dir(&mountpoint).unwrap();
+    let sysfs = fixture.0.join("sysfs");
+    for directory in ["nbd3/holders", "dm-0/dm", "dm-0/slaves/sda", "sda/slaves"] {
+        std::fs::create_dir_all(sysfs.join(directory)).unwrap();
+    }
+    for (path, contents) in [
+        ("nbd3/pid", "123\n"),
+        ("nbd3/dev", "43:96\n"),
+        ("dm-0/dev", "253:0\n"),
+        ("dm-0/dm/name", "vg_maki_pg-data\n"),
+        ("dm-0/dm/uuid", "LVM-fixture\n"),
+    ] {
+        std::fs::write(sysfs.join(path), contents).unwrap();
+    }
+    let mut request = request();
+    request.mountpoint = mountpoint.to_str().unwrap().into();
+    request.init_sentinel = true;
+    // fs_uuid is unpinned, as in the default first-boot configuration. The
+    // configured VG/LV resolves to a local-disk mapping, not our NBD export.
+    assert!(request.fs_uuid.is_none());
+    let mut system = ReviewForeignMountSystem {
+        inner: FakeSystem::default(),
+        mountinfo: format!(
+            "50 1 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+            request.mountpoint
+        ),
+        sysfs,
+    };
+    let expected_record = BoundDeviceRecord {
+        version: 1,
+        volume: request.volume.clone(),
+        attachment: (&request).into(),
+        device: "/dev/nbd3".into(),
+        connection_id: "maki-fixture".into(),
+    };
+    // Positive control: the production topology observer rejects this exact
+    // mapping, and the fixture resolves its leaf to the unrelated local disk.
+    let topology_error = system.detach_observation(&expected_record).unwrap_err();
+    assert!(
+        topology_error
+            .to_string()
+            .contains("not backed exclusively by the recorded NBD device"),
+        "{topology_error}"
+    );
+    assert_eq!(
+        system
+            .observe(&request.mountpoint, "/dev/nbd3", false)
+            .backing_devices,
+        ["/dev/sda"]
+    );
+
+    let result = execute_with(&plan_attach(&request), Some(&state), &mut system);
+    assert!(system.inner.steps.contains(&"verify-mount-device"));
+    assert!(
+        result.is_err() && read_sentinel(&request.mountpoint).is_none(),
+        "attach accepted/initialized a non-NBD filesystem: result={result:?}, sentinel={:?}; commands={:?}",
+        read_sentinel(&request.mountpoint),
+        system.inner.steps
     );
 }
