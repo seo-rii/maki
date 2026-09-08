@@ -1,25 +1,5 @@
 //! Crypto error taxonomy (SPEC §31).
 
-/// Sanitize an externally-supplied message — a remote provider's gRPC status
-/// text or WebSocket `error.message` — before it enters a Maki error or the
-/// logs. Control characters (newlines and tabs included) are replaced with a
-/// space so a hostile or buggy provider cannot inject log lines through the
-/// tracing path, and the length is capped so it cannot flood the logs
-/// (MAKI-016). This does not detect secrets a provider may reflect; the mapped
-/// error class and a request id remain the primary diagnostics.
-pub fn sanitize_external_message(msg: &str) -> String {
-    const MAX_CHARS: usize = 200;
-    let mut out = String::new();
-    for (count, ch) in msg.chars().enumerate() {
-        if count >= MAX_CHARS {
-            out.push('…');
-            break;
-        }
-        out.push(if ch.is_control() { ' ' } else { ch });
-    }
-    out
-}
-
 /// Classification driving retry/circuit-breaker behavior (SPEC §31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
@@ -85,27 +65,5 @@ impl CryptoError {
             CryptoError::Integrity(m) => CryptoError::Integrity(m.clone()),
             CryptoError::Contract(m) => CryptoError::Contract(m.clone()),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// MAKI-016: an external provider message must not carry control
-    /// characters (which could inject log lines) into an error, and must be
-    /// length-capped.
-    #[test]
-    fn sanitize_strips_control_chars_and_caps_length() {
-        let s = sanitize_external_message("line1\nline2\r\tX\u{7}end");
-        assert!(
-            !s.contains('\n') && !s.contains('\r') && !s.contains('\t') && !s.contains('\u{7}'),
-            "{s:?}"
-        );
-        assert_eq!(s, "line1 line2  X end");
-        let capped = sanitize_external_message(&"a".repeat(1000));
-        assert!(capped.chars().count() <= 201, "{}", capped.chars().count());
-        assert!(capped.ends_with('…'));
-        assert_eq!(sanitize_external_message("ok"), "ok");
     }
 }

@@ -51,13 +51,11 @@ pub struct CryptoBatchResponse {
 /// gRPC status → Maki error class (SPEC §31, §51 "status mapping").
 pub fn map_status(status: &tonic::Status) -> CryptoError {
     use tonic::Code;
-    // The remote status text is untrusted: sanitize it (strip control chars,
-    // cap length) before it enters an error and the logs (MAKI-016).
-    let message = format!(
-        "grpc {:?}: {}",
-        status.code(),
-        maki_crypto::sanitize_external_message(status.message())
-    );
+    // The remote status *text* is untrusted and may reflect secrets or inject
+    // log lines: it is dropped entirely. Only the allowlisted gRPC code (an
+    // enum, not free text) carries into the error and the logs (MAKI-016 /
+    // FUP-006). The status code still drives the class mapping below.
+    let message = format!("grpc status {:?} from remote crypto provider", status.code());
     match status.code() {
         Code::ResourceExhausted => CryptoError::Throttled(message),
         Code::Unavailable | Code::DeadlineExceeded | Code::Aborted | Code::Internal => {

@@ -353,17 +353,18 @@ async fn grpc_passes_provider_conformance() {
         .unwrap();
 }
 
-/// MAKI-016: a remote gRPC status message is untrusted. `map_status` must
-/// sanitize it — no control characters (which could inject log lines) reach
-/// the resulting error — while preserving the mapped class.
+/// MAKI-016 / FUP-006: a remote gRPC status message is untrusted and may
+/// reflect secrets or inject log lines. `map_status` drops the remote text
+/// entirely — only the allowlisted status code reaches the error — while
+/// preserving the mapped class. Control-character sanitization alone is not
+/// redaction.
 #[test]
-fn map_status_sanitizes_remote_message() {
-    let status = Status::new(Code::Internal, "boom\ninjected line: token=SECRET\r\n");
-    let err = map_status(&status);
-    let rendered = err.to_string();
+fn followup_remote_status_does_not_expose_reflected_secrets() {
+    let error = map_status(&Status::internal("token=SECRET plaintext=PRIVATE\ninjected"));
+    let text = error.to_string();
     assert!(
-        !rendered.contains('\n') && !rendered.contains('\r'),
-        "control characters leaked into the error: {rendered:?}"
+        !text.contains("SECRET") && !text.contains("PRIVATE") && !text.contains('\n'),
+        "remote status text must not reach the error: {text}"
     );
-    assert_eq!(err.class(), ErrorClass::Retryable);
+    assert_eq!(error.class(), ErrorClass::Retryable);
 }

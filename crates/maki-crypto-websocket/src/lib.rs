@@ -393,21 +393,24 @@ impl WsCryptoProvider {
     ) -> Result<Vec<Vec<u8>>, CryptoError> {
         let expected = requested.len();
         if let Some(error) = response.get("error") {
+            // The remote error *message* is untrusted and may reflect secrets
+            // or inject log lines: it is dropped. Only the allowlisted `class`
+            // token (from our own protocol) selects the error, and the message
+            // is a fixed description — no remote text (MAKI-016 / FUP-006).
             let class = error.get("class").and_then(|c| c.as_str()).unwrap_or("");
-            // The remote error text is untrusted: sanitize it (strip control
-            // chars, cap length) before it enters an error and the logs
-            // (MAKI-016).
-            let message = maki_crypto::sanitize_external_message(
-                error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("provider error"),
-            );
             return Err(match class {
-                "throttled" => CryptoError::Throttled(message),
-                "retryable" => CryptoError::Retryable(message),
-                "bad-request" => CryptoError::NonRetryableRequest(message),
-                _ => CryptoError::ProviderFatal(message),
+                "throttled" => {
+                    CryptoError::Throttled("remote crypto provider signalled throttling".into())
+                }
+                "retryable" => {
+                    CryptoError::Retryable("remote crypto provider signalled a retryable error".into())
+                }
+                "bad-request" => CryptoError::NonRetryableRequest(
+                    "remote crypto provider rejected the request".into(),
+                ),
+                _ => CryptoError::ProviderFatal(
+                    "remote crypto provider returned an unrecognized error class".into(),
+                ),
             });
         }
         let items = response
