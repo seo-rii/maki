@@ -322,3 +322,53 @@ async fn canary_from_another_volume_is_rejected() {
         Err(AttachError::KeyMismatch(_))
     ));
 }
+
+// ---------- Follow-up review 2026-09-08: FUP-010 ----------
+
+/// A provider that corrupts the ciphertext it produces at the reserved canary
+/// index (but is otherwise correct on the self-test's units 0..2).
+struct FollowupBrokenCanary(Arc<FakeCryptoProvider>);
+
+#[async_trait]
+impl CryptoProvider for FollowupBrokenCanary {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.0.capabilities().await
+    }
+    async fn encrypt_batch(
+        &self,
+        c: &CryptoContext,
+        i: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        let mut out = self.0.encrypt_batch(c, i).await?;
+        for ct in &mut out {
+            if ct.unit_index == CANARY_UNIT_INDEX {
+                ct.data[0] ^= 0x80;
+            }
+        }
+        Ok(out)
+    }
+    async fn decrypt_batch(
+        &self,
+        c: &CryptoContext,
+        i: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.0.decrypt_batch(c, i).await
+    }
+}
+
+/// FUP-010: the first attach must decrypt-verify the freshly written canary at
+/// the reserved index before publishing it, so a provider that mishandles that
+/// index cannot persist an unverifiable canary and succeed.
+#[tokio::test]
+async fn followup_first_attach_verifies_new_canary_before_publication() {
+    let backing = fresh();
+    let provider = Arc::new(FollowupBrokenCanary(key(KEY_A)));
+    assert!(
+        attach(&backing, provider).await.is_err(),
+        "fresh reserved-index ciphertext must be decrypted and checked before attach succeeds"
+    );
+    assert!(
+        !canary_present(backing.as_ref()),
+        "do not persist an unverified canary"
+    );
+}

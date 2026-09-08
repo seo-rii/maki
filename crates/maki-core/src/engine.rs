@@ -1155,7 +1155,7 @@ async fn verify_key_canary(
             context,
             &[PlaintextUnit {
                 unit_index: CANARY_UNIT_INDEX,
-                data: SecretBuffer::from_vec(expected),
+                data: SecretBuffer::from_slice(&expected),
             }],
         )
         .await?;
@@ -1164,6 +1164,28 @@ async fn verify_key_canary(
             "canary encrypt returned no item".to_string(),
         ))
     })?;
+    // Verify the freshly-written canary decrypts back to its known plaintext at
+    // the reserved index *before* publishing it. The self-test exercises unit
+    // indices 0..2, never this large reserved index, so a provider that
+    // mishandles it (or a wrong key routing) would otherwise persist an
+    // unverifiable canary that only surfaces as a key mismatch on the next
+    // attach (FUP-010). All endpoints back this provider, so all must agree.
+    let decrypted = decrypt_probe(
+        provider,
+        context,
+        CiphertextUnit {
+            unit_index: CANARY_UNIT_INDEX,
+            data: ct.data.clone(),
+        },
+    )
+    .await?;
+    if decrypted.expose() != expected.as_slice() {
+        return Err(AttachError::KeyMismatch(
+            "the freshly written key canary did not decrypt back to its known plaintext at the \
+             reserved index; refusing to publish an unverifiable canary"
+                .to_string(),
+        ));
+    }
     let mut record = KeyCanary {
         generation: 0,
         volume_uuid: superblock.volume_uuid,
