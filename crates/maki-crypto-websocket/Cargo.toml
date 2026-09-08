@@ -9,6 +9,7 @@ authors.workspace = true
 maki-crypto.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -19,4 +20,8 @@ tokio-tungstenite = "0.26"
 futures-util = "0.3"
 
 [dev-dependencies]
+maki-backing.workspace = true
+maki-core.workspace = true
+maki-format.workspace = true
+maki-crypto-local.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

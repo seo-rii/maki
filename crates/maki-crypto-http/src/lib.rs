@@ -311,9 +311,29 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
     CryptoError::Retryable(format!("transport error: {e}"))
 }
 
-fn classify_status(status: reqwest::StatusCode) -> Option<CryptoError> {
+fn classify_status(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<CryptoError> {
     if status.is_success() {
         return None;
+    }
+    // Only the explicit wire contract proves cryptographic rejection. Do
+    // not infer integrity from a generic 4xx or reflect a remote body/header.
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        let mut reasons = headers.get_all("maki-crypto-error").iter();
+        if let (Some(reason), None) = (reasons.next(), reasons.next()) {
+            let message = match reason.as_bytes() {
+                b"auth-tag-mismatch" => {
+                    Some("remote crypto provider rejected the authentication tag")
+                }
+                b"context-mismatch" => Some("remote crypto provider rejected the crypto context"),
+                _ => None,
+            };
+            if let Some(message) = message {
+                return Some(CryptoError::Integrity(message.into()));
+            }
+        }
     }
     let code = status.as_u16();
     Some(match code {
@@ -397,7 +417,7 @@ impl HttpCryptoProvider {
             .await
             .map_err(classify_transport)?;
 
-        if let Some(err) = classify_status(response.status()) {
+        if let Some(err) = classify_status(response.status(), response.headers()) {
             return Err(err);
         }
         if let Some(len) = response.content_length() {

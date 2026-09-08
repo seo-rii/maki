@@ -51,11 +51,31 @@ pub struct CryptoBatchResponse {
 /// gRPC status → Maki error class (SPEC §31, §51 "status mapping").
 pub fn map_status(status: &tonic::Status) -> CryptoError {
     use tonic::Code;
+    // FailedPrecondition alone is a request error. Integrity additionally
+    // requires exactly one allowlisted ASCII metadata value, never free text.
+    if status.code() == Code::FailedPrecondition {
+        let mut reasons = status.metadata().get_all("maki-crypto-error").iter();
+        if let (Some(reason), None) = (reasons.next(), reasons.next()) {
+            let message = match reason.as_encoded_bytes() {
+                b"auth-tag-mismatch" => {
+                    Some("remote crypto provider rejected the authentication tag")
+                }
+                b"context-mismatch" => Some("remote crypto provider rejected the crypto context"),
+                _ => None,
+            };
+            if let Some(message) = message {
+                return CryptoError::Integrity(message.into());
+            }
+        }
+    }
     // The remote status *text* is untrusted and may reflect secrets or inject
     // log lines: it is dropped entirely. Only the allowlisted gRPC code (an
     // enum, not free text) carries into the error and the logs (MAKI-016 /
     // FUP-006). The status code still drives the class mapping below.
-    let message = format!("grpc status {:?} from remote crypto provider", status.code());
+    let message = format!(
+        "grpc status {:?} from remote crypto provider",
+        status.code()
+    );
     match status.code() {
         Code::ResourceExhausted => CryptoError::Throttled(message),
         Code::Unavailable | Code::DeadlineExceeded | Code::Aborted | Code::Internal => {

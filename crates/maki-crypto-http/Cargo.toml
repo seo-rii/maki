@@ -21,6 +21,10 @@ zeroize.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+maki-backing.workspace = true
+maki-core.workspace = true
+maki-format.workspace = true
+futures-util = "0.3"
 rand.workspace = true
 maki-test-support.workspace = true
 parking_lot.workspace = true

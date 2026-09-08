@@ -6,6 +6,8 @@
 //!             "volume": …, "items": [{"unit": u, "data": base64}, …]}`
 //! Response: `{"id": n, "items": [{"data": base64}, …]}`
 //!        or `{"id": n, "error": {"class": …, "message": …}}`
+//! Integrity errors require `class: "integrity"` and a `reason` of exactly
+//! `"auth-tag-mismatch"` or `"context-mismatch"`; remote messages are ignored.
 //!
 //! Concurrency-safe request/response correlation by `id`: responses may
 //! arrive out of order; responses with unknown ids (stale, from an earlier
@@ -151,6 +153,26 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
     CryptoError::Retryable(msg.to_string())
 }
 
+// Value silently overwrites duplicate object keys. Before an integrity
+// frame can prove a negative self-test, deserialize its security-relevant
+// fields as structs, whose derived visitors reject duplicate fields. The
+// success path keeps its existing configurable payload parsing.
+#[derive(serde::Deserialize)]
+struct IntegrityEnvelope {
+    #[serde(rename = "id")]
+    _id: u64,
+    #[serde(rename = "error")]
+    _error: IntegrityFields,
+}
+
+#[derive(serde::Deserialize)]
+struct IntegrityFields {
+    #[serde(rename = "class")]
+    _class: String,
+    #[serde(rename = "reason")]
+    _reason: String,
+}
+
 impl WsCryptoProvider {
     pub fn new(spec: WsProviderSpec) -> Self {
         Self {
@@ -223,6 +245,17 @@ impl WsCryptoProvider {
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
                             continue;
                         };
+                        let frame = if value.pointer("/error/class").and_then(Value::as_str)
+                            == Some("integrity")
+                            && serde_json::from_str::<IntegrityEnvelope>(&text).is_err()
+                        {
+                            Err(CryptoError::Contract(
+                                "remote crypto provider returned an invalid integrity envelope"
+                                    .into(),
+                            ))
+                        } else {
+                            Ok(value)
+                        };
                         let response = {
                             let mut pending = reader_pending.lock();
                             if pending.get(&id).is_some_and(|(g, _)| *g == generation) {
@@ -233,7 +266,7 @@ impl WsCryptoProvider {
                         };
                         match response {
                             Some((_, tx)) => {
-                                let _ = tx.send(Ok(value));
+                                let _ = tx.send(frame);
                             }
                             None => {
                                 // Stale or foreign response (SPEC §51):
@@ -402,12 +435,23 @@ impl WsCryptoProvider {
                 "throttled" => {
                     CryptoError::Throttled("remote crypto provider signalled throttling".into())
                 }
-                "retryable" => {
-                    CryptoError::Retryable("remote crypto provider signalled a retryable error".into())
-                }
+                "retryable" => CryptoError::Retryable(
+                    "remote crypto provider signalled a retryable error".into(),
+                ),
                 "bad-request" => CryptoError::NonRetryableRequest(
                     "remote crypto provider rejected the request".into(),
                 ),
+                "integrity" => match error.get("reason").and_then(Value::as_str) {
+                    Some("auth-tag-mismatch") => CryptoError::Integrity(
+                        "remote crypto provider rejected the authentication tag".into(),
+                    ),
+                    Some("context-mismatch") => CryptoError::Integrity(
+                        "remote crypto provider rejected the crypto context".into(),
+                    ),
+                    _ => CryptoError::Contract(
+                        "remote crypto provider returned an unrecognized integrity reason".into(),
+                    ),
+                },
                 _ => CryptoError::ProviderFatal(
                     "remote crypto provider returned an unrecognized error class".into(),
                 ),
