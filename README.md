@@ -74,6 +74,17 @@ multi-endpoint self-test) are scoped in the same log's "Tracked, not closed in
 this pass" pending the native-VM, real-database, and measurement infrastructure
 the review itself calls for.
 
+A [follow-up review (2026-09-08)](docs/review-remediation.md#follow-up-review-2026-09-08-fup-001015)
+audited those fixes, found several incomplete and one availability regression,
+and its testable items are now closed with TDD regressions: observation-based
+attach rollback that fails closed, stale-record and live-mount grow guards,
+full remote-error redaction, plaintext-vs-ciphertext scheduler budgets,
+inconclusive-vs-proven self-test probes, volume-UUID context binding,
+first-attach canary verification, tighter A/B read bounds, and in-flight byte
+budget validation. The residual items (an in-process command deadline, a
+FileBacking `openat2` TOCTOU fix, grow idempotency, and a shutdown logging
+lifecycle) are tracked in the same log.
+
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.
 

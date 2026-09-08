@@ -630,6 +630,44 @@ regression.
 - **MAKI-020 / MAKI-021 / MAKI-022 (durability & space)** — the durable-mark-plus-final-segment ambiguity threat model, physical-space reservation/admission, and TRIM/deallocation. Durability-model and on-disk-format work requiring the release gates and power-loss campaigns.
 - **MAKI-024 / MAKI-037 / MAKI-038 / MAKI-039 / MAKI-041 / MAKI-048 / MAKI-049 / MAKI-050 (observability, capacity, docs, qualification)** — deep-check grading vs. authenticated/recovery-view checks, thread-count config surfacing, remote-crypto I/O contract, lock-independent health, capacity/slot-span accounting, doc/CI drift, and the outstanding real-DB/power-loss/soak qualification and DB support matrix.
 
+## Follow-up review (2026-09-08): FUP-001–015
+
+A follow-up review (`maki-followup-review-2026-09-08`) of the updated tree
+audited the fixes above, found several incomplete and one regression, and added
+15 findings with twelve proposed RED tests. Each item below was reproduced,
+fixed, and reverified (GREEN); the proposed tests were adapted to the real
+fixtures.
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| FUP-001 (P0) | Attach rollback ignored a re-observation *failure* (`if let Ok(observed)`) and gated disconnect only on backend identity, so it could disconnect a device with unknown live mappings. | Rollback is now fully observation-based (`attach_rollback`): tears down the top present layer, disconnects only our own backend, and **fails closed** — halting and keeping the record — on any unreadable observation, remaining holder, foreign backend, or step failure. | `followup_observation_failure_after_activation_must_not_disconnect` (maki-privileged) |
+| FUP-002 | A new attach replaced the trusted record when the NBD backend was merely absent, even with a live mount/VG/holder. | Re-observe before replacement; refuse unless every upper-layer resource is also gone (unreadable observation fails closed). | `followup_stale_backend_with_live_mapping_must_not_replace_record` (maki-privileged) |
+| FUP-003 | Grow required only `connected`, not a live mount/active VG. | `verify_live_attachment` now requires `mounted` and `vg_active` before any lvextend/xfs_growfs. (Relative-size idempotency of MAKI-003 still tracked.) | `followup_grow_requires_a_live_mount_before_extending_lv` (maki-privileged) |
+| FUP-006 | The remote gRPC/WS error *text* was sanitized but still embedded, leaking reflected secrets. | Drop the remote message entirely; only the allowlisted gRPC code / WS class token (mapped to a fixed description) reaches the error. Removed `sanitize_external_message`. | `followup_remote_status_does_not_expose_reflected_secrets` (maki-crypto-grpc) |
+| FUP-007 | The decrypt lane charged ciphertext bytes against the plaintext `crypto.batch.max_bytes`, rejecting even a single unit. | The decrypt lane is bounded by its ciphertext pending budget, not the plaintext `max_bytes`; plaintext and wire budgets are kept distinct. | `followup_single_plaintext_unit_budget_works_through_scheduler` (maki-crypto) |
+| FUP-008 (regression) | The self-test folded a *transport* error on a negative probe into `ProviderFatal`, aborting the whole attach instead of quarantining one flaky endpoint. | `classify_probe_err` returns a transport error unchanged (inconclusive) so the dispatcher quarantines; only `Integrity` proves the claim. | `followup_inconclusive_negative_probe_preserves_retry_class` (maki-crypto) |
+| FUP-009 | `NonRetryableRequest` (incl. generic bad-request) counted as integrity proof, and an empty/malformed `Ok` to a probe passed unchecked. | Only `CryptoError::Integrity` proves it; `Ok` responses are shape-validated. | `followup_empty_moved_reply_does_not_prove_context_binding` (maki-crypto) |
+| FUP-010 | The first attach persisted a new key canary without decrypt-verifying it at the reserved index. | Decrypt-probe the new canary at the reserved index and compare to the known plaintext before publishing. | `followup_first_attach_verifies_new_canary_before_publication` (maki-core) |
+| FUP-011 | Context-binding was probed only on the unit index, not the volume UUID. | Probe both the unit index and a different volume UUID; XTS (context_binding Absent) is unaffected, AEAD binds the full context. | `followup_context_binding_selftest_exercises_volume_uuid` (maki-crypto) |
+| FUP-012 | The per-type A/B read cap missed CheckpointState (kept 1 GiB, ignored trailing bytes) and the `store` generation probe (read via unbounded `RawGeneration`). | CheckpointState declares `MAX_ENCODED_LEN = 32` and rejects trailing bytes; `generations::<T>` bounds the probe by `T::MAX_ENCODED_LEN`. | `followup_checkpoint_v1_has_a_tight_read_bound`, `followup_checkpoint_rejects_crc_valid_trailing_payload`, `followup_superblock_store_raw_generation_probe_is_also_bounded` (maki-format) |
+| FUP-013 | Config allowed the in-flight byte budgets to fall below a batch, so the `DualSemaphore` clamped an over-budget RPC through. | Config validation requires `max_crypto_inflight_bytes` and `max_inflight_bytes_per_endpoint` ≥ `crypto.batch.max_bytes`. (Unifying the DualSemaphore oversize semantics still tracked.) | `followup_inflight_byte_budgets_must_cover_a_full_batch` (maki-format) |
+| FUP-005 | The unload shutdown error used `tracing::error!` with no production subscriber. | Also write it to stderr (nbdkit captures it, as with open-path failures). (A fuller subscriber/`nbdkit_error` lifecycle with a subprocess log test remains tracked.) | — (C unload shim; not unit-testable) |
+| FUP-015 | The failpoint-isolation fix had reduced growth stress to a single thread. | Restored to a 4-worker runtime while holding the failpoint lock (the `!Send` guard lives only in the `block_on`'d test body, never in spawned tasks). | restored `growth_during_workload_creates_shards_consistently` (maki-core) |
+
+### Tracked, not closed in this pass
+
+- **FUP-004 (P1)** — the in-process per-command deadline (bounded output,
+  process-group reaping) — same as R05/MAKI-004, still needs the native-VM
+  qualification.
+- **FUP-014 (P2)** — a TOCTOU between `FileBacking::resolve` and open
+  (`O_NOFOLLOW` on the final component only). Needs `openat2`
+  (`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`) with a pinned root dirfd and an
+  old-kernel fallback, plus a deterministic resolve-then-swap hook to test.
+- **Residual sub-parts** — MAKI-003 relative-grow idempotency (persist the
+  absolute target), the FUP-007 config alignment to guarantee one max ciphertext
+  unit fits every layer, the FUP-013 blocking/non-blocking DualSemaphore oversize
+  semantics, and the FUP-005 full logging lifecycle.
+
 ## Recovery fail-closed rules
 
 Recovery (`maki-core/src/recovery.rs`) now refuses to attach on anything that
