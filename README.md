@@ -64,6 +64,16 @@ transport plaintext zeroization, and recovery peak memory) are scoped in the
 same log under "Tracked, not closed in this pass" pending native-VM and
 measurement infrastructure.
 
+A wider [comprehensive review (2026-09-07)](docs/review-remediation.md#comprehensive-review-2026-09-07-maki-001050)
+of 50 items followed. Its self-contained code defects — robust provider
+self-test batching and integrity proof, remote-error redaction, fail-closed
+zram-swap classification, per-type A/B read bounds, and checked generation
+arithmetic — are fixed with TDD regressions; the many design, performance,
+deployment, capacity, and qualification items (including the P0 real-UUID
+multi-endpoint self-test) are scoped in the same log's "Tracked, not closed in
+this pass" pending the native-VM, real-database, and measurement infrastructure
+the review itself calls for.
+
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.
 

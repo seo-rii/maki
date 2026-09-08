@@ -584,6 +584,52 @@ not silently dropped; none is a data-durability defect.
   references a `docs/ci.md` and weekly/release tiers the uploaded workflow does
   not implement. These are availability/accuracy items, not correctness bugs.
 
+## Comprehensive review (2026-09-07): MAKI-001–050
+
+A 50-item review (`maki-review-2026-09-07`) spanning the privileged lifecycle,
+crypto verification, durability, memory/scalability, performance, Docker
+deployment, capacity, and qualification. The review compiled no Rust and marks
+every item `runtime_reproduced: false`; most items are design constraints,
+performance limits, deployment/ops gaps, or qualification work that need a
+native-Linux VM, real databases, or measurement infrastructure. This pass
+fixed the self-contained code defects with RED→GREEN regression tests; several
+findings restate defects the earlier 2026-09-07 supplementary review already
+closed.
+
+### New code defects fixed this pass
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| MAKI-008 | **The nbdkit `unload` callback discarded a shutdown error** (`let _ = a.shutdown()`), so a failed final flush/checkpoint looked like a clean stop. | The error is recorded via structured tracing before `unload` returns (a void C callback cannot propagate it). No unit test — the C shim is covered by the ABI probe, not unit tests; the fuller shutdown-report feature is tracked below. | — |
+| MAKI-010 | **The provider self-test sent all patterns in one batch**, rejecting a valid single-item or small-batch provider at attach. | The self-test splits every batch into capability-respecting RPCs (`batch_ranges`) in `provider_self_test`, `provider_conformance`, and `cross_endpoint_self_test`. | `self_test_splits_patterns_for_a_small_batch_provider` (maki-crypto `review_audit2.rs`) |
+| MAKI-011 | **The tamper and context-binding self-tests accepted *any* error** as proof, so a provider that returns a transport error only on the tampered/moved request passed. | Both require a definitive bad-ciphertext rejection (`NonRetryableRequest` class); a transport/retryable error leaves the claim unproven and refuses attach. Context binding also accepts Ok-with-different-plaintext. | `self_test_rejects_integrity_proven_only_by_a_transport_error` (maki-crypto `review_audit2.rs`) |
+| MAKI-016 | **gRPC/WebSocket embedded the remote error message verbatim** in an error, allowing log injection (newlines) or log flooding — unlike HTTP. | `maki_crypto::sanitize_external_message` (strips control chars, caps length) wraps both remote messages; the mapped error class is preserved. | `sanitize_strips_control_chars_and_caps_length` (maki-crypto), `map_status_sanitizes_remote_message` (maki-crypto-grpc) |
+| MAKI-017 | **An unreadable zram `backing_dev` (EACCES/EIO) was classified RAM-only**, so an unencrypted writeback target could be trusted as safe swap. | `classify_zram_backing` keeps a missing attribute (NotFound) as RAM-only but fails closed (Unsafe) on any other read failure. | `zram_backing_read_failure_is_unsafe_not_ram_only` (maki-nbdkit `security.rs`) |
+| MAKI-026 | **A corrupt small metadata file was read up to the 1 GiB common cap**, and `Superblock::decode` accepts its valid prefix. | Per-type `AbRecord::MAX_ENCODED_LEN` rejects an over-long copy by size before allocating (Superblock = one block, KeyCanary = header + max canary ciphertext). | `oversized_superblock_copy_is_rejected_before_it_is_read` (maki-format `review_format.rs`) |
+| MAKI-027 | **A/B `store` incremented the generation with an unchecked `+ 1`** (panics in debug, wraps in release at u64::MAX). | `checked_add` fails closed with `FormatError::Invalid` on exhaustion. | `storing_at_max_generation_fails_closed_instead_of_wrapping` (maki-format `review_format.rs`) |
+
+### Already closed by the 2026-09-07 supplementary review (R01–R08)
+
+- **MAKI-001** (attach rollback disconnecting beneath a failed step) = **R01** — fixed (observation-reconciled, stop-on-failure rollback).
+- **MAKI-002** (grow re-verifying live mount/VG) = **R03** — fixed (`verify_live_attachment`). MAKI-002 additionally asks for per-step re-checks of PV/VG/LV/FS UUIDs and the sentinel immediately before *each* of lvextend and xfs_growfs; that finer per-step identity re-observation is tracked below.
+- **MAKI-004 / MAKI-005** (hung-command global lock; pre-mount device topology) = **R05 / R02** — R05's service-boundary timeout is landed; the in-process command deadline and the pre-mount identity probe remain tracked (see the R01–R08 "Tracked" section above).
+
+### Tracked, not closed in this pass
+
+Each needs a native-Linux VM, real DB/transport servers, an allocation
+observer, peak-RSS measurement, or a careful on-disk/attach-flow redesign that
+the review itself says to qualify before shipping. None is a newly-introduced
+regression.
+
+- **MAKI-009 (P0) — multi-endpoint self-test uses `Uuid::nil`, not the real volume UUID.** `dispatch_endpoint_set` runs its per-endpoint and cross-endpoint checks under a synthetic nil-UUID context before `Engine::attach` reads the superblock, so two endpoints keyed identically for nil but differently for the real UUID pass interchangeability. The fix reads the superblock's real UUID/profile/version first and validates every endpoint (individually and cross) under that context and the real key canary. It restructures the attach flow, and its mismatch-rejection acceptance test needs UUID-divergent transport servers (integration/VM), so it is not landed as an untested change to the crypto-verification path.
+- **MAKI-003 (P1) — relative-size grow is not idempotent.** `lvextend -L +bytes` then `xfs_growfs`: a retry after a mid-grow failure can extend the LV twice. Needs a persisted grow op (id, original size, absolute target), observed LV/FS sizes, and skip-completed-steps logic in the privileged executor — VM-qualified.
+- **MAKI-023 / MAKI-025 / MAKI-028 / MAKI-035 (memory & scalability)** — deep-check builds the full allocated-unit list; recovery accumulates every replay record; the overlay holds latest+durable+checkpoint ciphertext copies; resident bitmaps and the fallback scan bound large-volume RTO. Each needs streaming/paged redesigns and peak-RSS measurement against real target sizes.
+- **MAKI-029 / MAKI-030 / MAKI-031 / MAKI-032 / MAKI-033 / MAKI-034 / MAKI-036 (performance)** — checkpoint under the exclusive lock, synchronous backing I/O on async threads, serial per-chunk crypto, plaintext admission vs. real copies, per-unit syscalls, full-shard bitmap rewrites, per-FUA flush. Design/measurement work, not correctness bugs.
+- **MAKI-006 / MAKI-007 / MAKI-040 / MAKI-042 / MAKI-043 / MAKI-044 / MAKI-045 / MAKI-046 / MAKI-047 (deployment & ops)** — readiness vs. process start, a whole-stack recovery controller, a container mount-identity gate, the DB write-path encryption boundary, boot-dependency cycles, failure-domain isolation, backup/restore/key/format procedures, installable packaging, and the systemd credential drop-ins. These are packaging and operational designs to build and qualify on the target host.
+- **MAKI-012 / MAKI-013 / MAKI-014 / MAKI-015 / MAKI-018 / MAKI-019 (crypto policy & security)** — the postgres-prod example permitting unauthenticated crypto, replay/rollback outside the threat model, WSS/gRPC TLS unimplemented, transport plaintext copies outside `SecretBuffer` (MAKI-015 overlaps R06), Maki-backed encrypted swap recursion, and the credential/endpoint/key-rotation runbook. Policy decisions plus an allocation observer for MAKI-015.
+- **MAKI-020 / MAKI-021 / MAKI-022 (durability & space)** — the durable-mark-plus-final-segment ambiguity threat model, physical-space reservation/admission, and TRIM/deallocation. Durability-model and on-disk-format work requiring the release gates and power-loss campaigns.
+- **MAKI-024 / MAKI-037 / MAKI-038 / MAKI-039 / MAKI-041 / MAKI-048 / MAKI-049 / MAKI-050 (observability, capacity, docs, qualification)** — deep-check grading vs. authenticated/recovery-view checks, thread-count config surfacing, remote-crypto I/O contract, lock-independent health, capacity/slot-span accounting, doc/CI drift, and the outstanding real-DB/power-loss/soak qualification and DB support matrix.
+
 ## Recovery fail-closed rules
 
 Recovery (`maki-core/src/recovery.rs`) now refuses to attach on anything that
