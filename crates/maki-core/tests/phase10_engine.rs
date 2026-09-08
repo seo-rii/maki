@@ -217,14 +217,14 @@ async fn cache_resize_at_runtime() {
 /// while other I/O continues.
 // Growing into fresh shards hits the process-global `store.catalog_store`
 // failpoint site (shard catalog commit) and this test also checkpoints, so it
-// must serialize against `crash_during_shard_creation`, which injects a
-// failure there. A `parking_lot` guard is `!Send`, so the runtime is
-// current-thread; the spawned steady/grower tasks still interleave
-// cooperatively at await points, and engine writes serialize under the volume
-// lock regardless — the concurrent-growth consistency this test asserts is
-// unchanged. The guard intentionally spans awaits.
+// must serialize against `crash_during_shard_creation`, which injects a failure
+// there — hence the `test_lock()` guard. It stays on a real multi-thread
+// runtime for true parallel growth coverage (FUP-015): the `!Send`
+// `parking_lot` guard is held only by the test's own `block_on`'d body, never
+// moved into the spawned `Send` worker tasks, so it compiles and correctly
+// serializes this test. The guard intentionally spans awaits.
 #[allow(clippy::await_holding_lock)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn growth_during_workload_creates_shards_consistently() {
     let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
