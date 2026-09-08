@@ -512,11 +512,11 @@ fn verify_live_attachment(
 /// Roll back a failed attach by re-observing live state and tearing down what
 /// is actually present — mount, then VG, then our own NBD backend — top layer
 /// first. Returns `true` only if it fully cleaned up. It never removes a lower
-/// layer while an upper one remains, never disconnects a replaced/foreign
-/// backend, and *fails closed* (stops and keeps the trusted record) on any
+/// layer while an upper one remains, verifies backend ownership before every
+/// teardown, and *fails closed* (stops and keeps the trusted record) on any
 /// command failure, remaining holder, or unreadable observation — so a lower
 /// layer is never torn out from under an unknown or still-live upper one
-/// (R01 / FUP-001).
+/// (R01 / FUP-001 / R3-002).
 fn attach_rollback(
     plan: &Plan,
     record: &BoundDeviceRecord,
@@ -533,6 +533,34 @@ fn attach_rollback(
                 return false;
             }
         };
+        // Topology alone cannot prove ownership of a reused NBD device. Check
+        // its recorded nonce after each observation, before any upper-layer
+        // teardown as well as disconnect. Missing identity permits cleanup
+        // only when observation proves that every live resource is gone.
+        match system.backend(&record.device) {
+            Ok(Some(id)) if id == record.connection_id => {}
+            Ok(None) if !observed.mounted && !observed.vg_active && !observed.nbd_in_use => {
+                return true;
+            }
+            Ok(None) => {
+                tracing::error!(
+                    "maki-attach: rollback halted, backend absent with live resources; \
+                     keeping the attach record"
+                );
+                return false;
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    "maki-attach: rollback left a replaced/foreign backend in place; \
+                     keeping the attach record"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::error!("maki-attach: rollback halted, backend unreadable: {e}");
+                return false;
+            }
+        }
         let step = if observed.mounted {
             plan.steps.iter().find_map(|s| match s {
                 PlannedStep::MountXfs { mountpoint, .. } => Some(PlannedStep::Umount {
@@ -551,23 +579,9 @@ fn attach_rollback(
             tracing::error!("maki-attach: rollback halted, device still has holders");
             return false;
         } else {
-            match system.backend(&record.device) {
-                Ok(Some(id)) if id == record.connection_id => Some(PlannedStep::NbdDisconnect {
-                    device: record.device.clone(),
-                }),
-                Ok(None) => return true,
-                Ok(Some(_)) => {
-                    tracing::warn!(
-                        "maki-attach: rollback left a replaced/foreign backend in place; \
-                         keeping the attach record"
-                    );
-                    return false;
-                }
-                Err(e) => {
-                    tracing::error!("maki-attach: rollback halted, backend unreadable: {e}");
-                    return false;
-                }
-            }
+            Some(PlannedStep::NbdDisconnect {
+                device: record.device.clone(),
+            })
         };
         let Some(step) = step else {
             return false;

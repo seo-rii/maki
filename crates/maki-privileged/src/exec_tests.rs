@@ -48,6 +48,13 @@ fn request() -> AttachRequest {
         .unwrap()
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BackendFault {
+    Foreign,
+    Missing,
+    Unreadable,
+}
+
 #[derive(Default)]
 struct FakeSystem {
     backends: HashMap<String, String>,
@@ -64,6 +71,7 @@ struct FakeSystem {
     foreign_vg: bool,
     extra_holders: bool,
     observation_error: bool,
+    backend_fault_after: Option<(&'static str, BackendFault)>,
 }
 
 impl System for FakeSystem {
@@ -124,6 +132,15 @@ impl System for FakeSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        if let Some((step, fault)) = self.backend_fault_after {
+            if self.steps.contains(&step) {
+                return match fault {
+                    BackendFault::Foreign => Ok(Some("other-connection".into())),
+                    BackendFault::Missing => Ok(None),
+                    BackendFault::Unreadable => Err(io::Error::other("fixture backend unreadable")),
+                };
+            }
+        }
         Ok(self.backends.get(device).cloned())
     }
 
@@ -313,6 +330,106 @@ fn rollback_does_not_disconnect_a_replacement_connection() {
         Some("other-connection")
     );
     assert!(state.read("pg").unwrap().is_some());
+}
+
+#[test]
+fn r3_foreign_backend_stops_every_rollback_mutation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        fail_at: Some("mount-xfs"),
+        replace_on_failure: true,
+        ..Default::default()
+    };
+    assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+    assert!(state.read("pg").unwrap().is_some());
+    for forbidden in ["umount", "lvm-deactivate", "nbd-disconnect"] {
+        assert!(
+            !system.steps.contains(&forbidden),
+            "backend ownership was lost, but rollback ran {forbidden}: {:?}",
+            system.steps
+        );
+    }
+}
+
+fn assert_rollback_rechecks_backend_before_each_step(fault: BackendFault) {
+    for (changed_after, expected) in [
+        ("verify-mount-identity", vec![]),
+        ("umount", vec!["umount"]),
+        ("lvm-deactivate", vec!["umount", "lvm-deactivate"]),
+    ] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem {
+            fail_at: Some("verify-mount-identity"),
+            backend_fault_after: Some((changed_after, fault)),
+            ..Default::default()
+        };
+        let error = execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap_err();
+        let destructive: Vec<_> = system
+            .steps
+            .iter()
+            .copied()
+            .filter(|step| matches!(*step, "umount" | "lvm-deactivate" | "nbd-disconnect"))
+            .collect();
+        assert_eq!(destructive, expected, "{fault:?} after {changed_after}");
+        // Absence is safe only after all upper layers were already removed.
+        let clean = matches!(fault, BackendFault::Missing) && expected.len() == 2;
+        assert!(
+            matches!(error, ExecError::RolledBack { rollback_failed, .. }
+                if rollback_failed == usize::from(!clean)),
+            "{fault:?} after {changed_after}: {error}"
+        );
+        assert_eq!(
+            state.read("pg").unwrap().is_none(),
+            clean,
+            "retain the recovery identity unless all resources are gone"
+        );
+        assert_eq!(system.mounted, expected.is_empty());
+        assert_eq!(system.vg_active, expected.len() < 2);
+        assert!(system.backends.contains_key("/dev/nbd3"));
+    }
+}
+
+#[test]
+fn r3_foreign_backend_is_rechecked_before_each_rollback_step() {
+    assert_rollback_rechecks_backend_before_each_step(BackendFault::Foreign);
+}
+
+#[test]
+fn r3_unreadable_backend_is_rechecked_before_each_rollback_step() {
+    assert_rollback_rechecks_backend_before_each_step(BackendFault::Unreadable);
+}
+
+#[test]
+fn r3_missing_backend_with_live_resources_stops_rollback() {
+    assert_rollback_rechecks_backend_before_each_step(BackendFault::Missing);
+}
+
+#[test]
+fn r3_absent_backend_without_live_resources_retires_record() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        fail_at: Some("nbd-connect"),
+        ..Default::default()
+    };
+    let error = execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap_err();
+    assert!(matches!(
+        error,
+        ExecError::RolledBack {
+            rollback_failed: 0,
+            ..
+        }
+    ));
+    assert!(!system
+        .steps
+        .iter()
+        .any(|step| matches!(*step, "umount" | "lvm-deactivate" | "nbd-disconnect")));
+    assert!(state.read("pg").unwrap().is_none());
 }
 
 #[test]
