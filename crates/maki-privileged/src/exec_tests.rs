@@ -228,7 +228,11 @@ fn a_disconnected_stale_record_can_be_replaced_but_an_active_attachment_cannot()
     assert!(execute_with(&plan_attach(&request), Some(&state), &mut system).is_err());
     assert!(system.steps.is_empty());
     assert_eq!(state.read("pg").unwrap().unwrap(), before);
+    // A truly stale record can be replaced only when the volume is *fully*
+    // detached: no backend, and no live mount/VG/holder either (FUP-002).
     system.backends.clear();
+    system.mounted = false;
+    system.vg_active = false;
     execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
     assert_ne!(
         state.read("pg").unwrap().unwrap().connection_id,
@@ -583,4 +587,72 @@ fn audit_20260907_grow_rechecks_live_mount_and_vg_topology() {
             system.steps
         );
     }
+}
+
+// ---------- Follow-up review 2026-09-08: FUP-001 / FUP-002 / FUP-003 ----------
+
+/// FUP-001: when the live state cannot be re-observed during rollback (EIO /
+/// EACCES), the destructive lower-level teardown must halt rather than
+/// disconnect a device whose mappings are unknown, and the trusted record must
+/// be preserved for recovery.
+#[test]
+fn followup_observation_failure_after_activation_must_not_disconnect() {
+    let f = Fixture::new();
+    let state = f.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        fail_after_at: Some("lvm-activate"),
+        observation_error: true,
+        ..Default::default()
+    };
+    assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+    assert!(system.vg_active, "fixture must leave activation in effect");
+    assert!(
+        !system.steps.contains(&"nbd-disconnect"),
+        "unknown mappings must block lower teardown: {:?}",
+        system.steps
+    );
+    assert!(state.read("pg").unwrap().is_some(), "preserve recovery provenance");
+}
+
+/// FUP-002: a missing NBD backend does not authorize replacing the trusted
+/// record while a live mount / VG / holder remains — that would discard the
+/// recovery identity of a still partly-attached volume.
+#[test]
+fn followup_stale_backend_with_live_mapping_must_not_replace_record() {
+    let f = Fixture::new();
+    let state = f.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+    let old = state.read("pg").unwrap().unwrap();
+    system.backends.clear();
+    system.steps.clear();
+    assert!(system.mounted && system.vg_active);
+    assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+    assert!(
+        system.steps.is_empty(),
+        "reattach must not mutate an incompletely detached volume: {:?}",
+        system.steps
+    );
+    assert_eq!(state.read("pg").unwrap().unwrap(), old);
+}
+
+/// FUP-003: grow operates in place on a mounted, active filesystem; a missing
+/// mount must be refused before any lvextend.
+#[test]
+fn followup_grow_requires_a_live_mount_before_extending_lv() {
+    let f = Fixture::new();
+    let state = f.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+    system.mounted = false;
+    system.steps.clear();
+    assert!(execute_with(&plan_grow(&grow_request()), Some(&state), &mut system).is_err());
+    assert!(
+        system.steps.is_empty(),
+        "missing mount must be rejected before lvextend: {:?}",
+        system.steps
+    );
 }

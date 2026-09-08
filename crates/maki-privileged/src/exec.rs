@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::detach::DetachObservation;
-use crate::plan::{rollback_steps, Plan, PlannedStep, SENTINEL_FILE};
+use crate::plan::{Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{
     choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
 };
@@ -490,13 +490,99 @@ fn verify_live_attachment(
     record: &BoundDeviceRecord,
     system: &impl System,
 ) -> Result<(), ExecError> {
-    let (connected, _observed) = verify_detach_state(record, system)?;
+    let (connected, observed) = verify_detach_state(record, system)?;
     if !connected {
         return Err(identity_error(
             "recorded NBD device is no longer connected; refusing to grow",
         ));
     }
+    // A grow operates in place on a mounted, active filesystem. A missing
+    // mount or an inactive VG means the target is not the live attachment the
+    // record names — extending it would lvextend an unmounted or foreign LV
+    // (and xfs_growfs would then fail) — so require both before any mutation
+    // (FUP-003).
+    if !observed.mounted || !observed.vg_active {
+        return Err(identity_error(
+            "attachment is not fully live (mount or VG mapping missing); refusing to grow",
+        ));
+    }
     Ok(())
+}
+
+/// Roll back a failed attach by re-observing live state and tearing down what
+/// is actually present — mount, then VG, then our own NBD backend — top layer
+/// first. Returns `true` only if it fully cleaned up. It never removes a lower
+/// layer while an upper one remains, never disconnects a replaced/foreign
+/// backend, and *fails closed* (stops and keeps the trusted record) on any
+/// command failure, remaining holder, or unreadable observation — so a lower
+/// layer is never torn out from under an unknown or still-live upper one
+/// (R01 / FUP-001).
+fn attach_rollback(
+    plan: &Plan,
+    record: &BoundDeviceRecord,
+    system: &mut impl System,
+    rolled_back: &mut usize,
+) -> bool {
+    // Each successful step removes one of at most three layers; the bound just
+    // guards against an observation that never converges.
+    for _ in 0..16 {
+        let observed = match system.detach_observation(record) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!("maki-attach: rollback halted, live state unreadable: {e}");
+                return false;
+            }
+        };
+        let step = if observed.mounted {
+            plan.steps.iter().find_map(|s| match s {
+                PlannedStep::MountXfs { mountpoint, .. } => Some(PlannedStep::Umount {
+                    mountpoint: mountpoint.clone(),
+                }),
+                _ => None,
+            })
+        } else if observed.vg_active {
+            plan.steps.iter().find_map(|s| match s {
+                PlannedStep::LvmActivate { vg_name } => Some(PlannedStep::LvmDeactivate {
+                    vg_name: vg_name.clone(),
+                }),
+                _ => None,
+            })
+        } else if observed.nbd_in_use {
+            tracing::error!("maki-attach: rollback halted, device still has holders");
+            return false;
+        } else {
+            match system.backend(&record.device) {
+                Ok(Some(id)) if id == record.connection_id => Some(PlannedStep::NbdDisconnect {
+                    device: record.device.clone(),
+                }),
+                Ok(None) => return true,
+                Ok(Some(_)) => {
+                    tracing::warn!(
+                        "maki-attach: rollback left a replaced/foreign backend in place; \
+                         keeping the attach record"
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    tracing::error!("maki-attach: rollback halted, backend unreadable: {e}");
+                    return false;
+                }
+            }
+        };
+        let Some(step) = step else {
+            return false;
+        };
+        let done = matches!(step, PlannedStep::NbdDisconnect { .. });
+        if let Err(e) = system.run_step(&step, None) {
+            tracing::error!("maki-attach: rollback step {step} failed: {e}; stopping");
+            return false;
+        }
+        *rolled_back += 1;
+        if done {
+            return true;
+        }
+    }
+    false
 }
 
 fn detach_step_needed(
@@ -576,6 +662,20 @@ fn execute_with(
                         "recorded device is still connected; detach or verify its stale state before attaching",
                     ));
                 }
+                // A missing NBD backend is not proof the volume is fully
+                // detached: a crashed daemon can leave a live mount, an active
+                // VG, or other holders behind. Replacing the trusted record
+                // then would discard the recovery identity of a volume that is
+                // still partly attached, so re-observe and refuse unless every
+                // upper-layer resource is also gone (FUP-002). An unreadable
+                // observation fails closed via `?`.
+                let observed = system.detach_observation(prior)?;
+                if observed.mounted || observed.vg_active || observed.nbd_in_use {
+                    return Err(identity_error(
+                        "recorded device is disconnected but the attachment still has an active \
+                         mount, VG mapping, or holder; complete detach before re-attaching",
+                    ));
+                }
             }
         } else {
             let prior = prior.ok_or_else(|| identity_error(format!(
@@ -647,7 +747,6 @@ fn execute_with(
         record = Some(prepared);
     }
 
-    let mut executed: Vec<PlannedStep> = Vec::new();
     for step in &plan.steps {
         if disconnects && !connects {
             // Reobserve before each step: a previous attempt may already
@@ -657,31 +756,23 @@ fn execute_with(
             }
         }
         // `nbd-client` connecting and the device becoming ready are two
-        // outcomes: once the connect succeeded the step counts as executed
-        // even if readiness times out, so the rollback disconnects it
-        // instead of leaking a connected device (O-07).
+        // outcomes: once the connect command runs, a partially-connected
+        // device is cleaned up by the observation-based rollback below, which
+        // disconnects any backend that carries our identity — so a readiness
+        // timeout (or a failure after the kernel was configured) never leaks a
+        // connected device (O-07), without a separately tracked prefix.
         let result = match step {
             PlannedStep::NbdConnect { device, .. } => {
                 let record = record.as_ref().unwrap();
                 match system.run_step(step, Some(&record.connection_id)) {
-                    Ok(()) => {
-                        executed.push(step.clone());
-                        match system
-                            .wait_ready(step, device)
-                            .and_then(|()| verify_connection(record, system))
-                        {
-                            Ok(()) => continue,
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Err(e) => {
-                        // A command can return failure after configuring
-                        // the kernel. Roll back only our unique backend.
-                        if verify_connection(record, system).is_ok() {
-                            executed.push(step.clone());
-                        }
-                        Err(e)
-                    }
+                    Ok(()) => match system
+                        .wait_ready(step, device)
+                        .and_then(|()| verify_connection(record, system))
+                    {
+                        Ok(()) => continue,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
                 }
             }
             PlannedStep::NbdDisconnect { .. } => {
@@ -691,76 +782,23 @@ fn execute_with(
             other => system.run_step(other, None),
         };
         if let Err(error) = result {
-            // A command can report failure *after* its effect took hold — a
-            // mount that reports failure yet mounted, a VG activation that
-            // reports failure yet mapped. Such a step never entered
-            // `executed`, so a naive rollback would skip its compensation
-            // while still running a lower-level one, tearing the backing out
-            // from under a live mount. Re-observe and fold any effect that
-            // actually happened into the rollback set, newest-effect last so
-            // `rollback_steps` orders it first (umount before deactivate
-            // before disconnect). Attach only: a failed detach is resumed on
-            // the next attempt, never rolled back (R01).
-            if connects {
-                if let Ok(observed) = system.detach_observation(record.as_ref().unwrap()) {
-                    if observed.vg_active
-                        && !executed
-                            .iter()
-                            .any(|s| matches!(s, PlannedStep::LvmActivate { .. }))
-                    {
-                        if let Some(s) = plan
-                            .steps
-                            .iter()
-                            .find(|s| matches!(s, PlannedStep::LvmActivate { .. }))
-                        {
-                            executed.push(s.clone());
-                        }
-                    }
-                    if observed.mounted
-                        && !executed
-                            .iter()
-                            .any(|s| matches!(s, PlannedStep::MountXfs { .. }))
-                    {
-                        if let Some(s) = plan
-                            .steps
-                            .iter()
-                            .find(|s| matches!(s, PlannedStep::MountXfs { .. }))
-                        {
-                            executed.push(s.clone());
-                        }
-                    }
-                }
-            }
-            let rollback = rollback_steps(&executed);
+            // Roll back by re-observing live state and tearing down what is
+            // actually present, top layer first, halting on any unknown or
+            // still-live upper layer (R01 / FUP-001). Attach only: a failed
+            // detach is resumed on the next attempt, never rolled back.
             let mut rolled_back = 0usize;
-            for compensating in &rollback {
-                let result = if matches!(compensating, PlannedStep::NbdDisconnect { .. }) {
-                    verify_connection(record.as_ref().unwrap(), system)
-                        .and_then(|()| system.run_step(compensating, None))
-                } else {
-                    system.run_step(compensating, None)
-                };
-                if let Err(e) = result {
-                    // A failed upper-level cleanup must stop the destructive
-                    // lower-level cleanup beneath it: leave the remaining
-                    // resources in place rather than, say, disconnecting the
-                    // backing while the filesystem is still mounted (R01).
-                    tracing::error!(
-                        "maki-attach: rollback step {compensating} failed: {e}; \
-                         stopping further rollback to avoid unsafe teardown"
-                    );
-                    break;
-                }
-                rolled_back += 1;
-            }
-            let failed = rollback.len() - rolled_back;
-            if connects && failed == 0 {
+            let clean = if connects {
+                attach_rollback(&plan, record.as_ref().unwrap(), system, &mut rolled_back)
+            } else {
+                true
+            };
+            if connects && clean {
                 let record = record.as_ref().unwrap();
                 if matches!(system.backend(&record.device), Ok(None)) {
                     if let Err(error) = state.unwrap().remove(&plan.volume) {
-                        // Preserve the original failure and rollback
-                        // outcome. The record cannot authorize a different
-                        // backend even if its cleanup failed.
+                        // Preserve the original failure and rollback outcome.
+                        // The record cannot authorize a different backend even
+                        // if its cleanup failed.
                         tracing::warn!(
                             "maki-attach: rolled back but could not retire attach record: {error}"
                         );
@@ -770,10 +808,9 @@ fn execute_with(
             return Err(ExecError::RolledBack {
                 error: Box::new(error),
                 rolled_back,
-                rollback_failed: failed,
+                rollback_failed: usize::from(!clean),
             });
         }
-        executed.push(step.clone());
     }
     // A completed detach retires the record; a failed one keeps it so the
     // next attempt still knows the device.
