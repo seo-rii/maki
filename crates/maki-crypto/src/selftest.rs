@@ -105,6 +105,60 @@ fn patterns(unit_size: usize) -> Vec<PlaintextUnit> {
     ]
 }
 
+/// Classify the error of a negative self-test probe (a tampered or moved
+/// ciphertext that must *not* decrypt to the original plaintext):
+///
+/// - a definitive integrity/authentication failure proves the capability
+///   (`Ok(())`) — only `CryptoError::Integrity` counts, not the broader
+///   `NonRetryableRequest` class which also carries generic bad-request /
+///   not-found errors (FUP-009);
+/// - a transport/availability error is *inconclusive* and returned unchanged,
+///   so the dispatcher retries and quarantines this one endpoint rather than
+///   failing the whole attach as if the provider were proven wrong (FUP-008);
+/// - any other error is not integrity evidence and refuses attach.
+fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
+    if matches!(e, CryptoError::Integrity(_)) {
+        return Ok(());
+    }
+    match e.class() {
+        ErrorClass::Retryable | ErrorClass::Throttled | ErrorClass::EndpointFatal => Err(e),
+        _ => Err(CryptoError::ProviderFatal(format!(
+            "{what} self-test: the negative probe was rejected with a {:?}-class error, not a \
+             definitive integrity failure — the capability is not proven; attach refused",
+            e.class()
+        ))),
+    }
+}
+
+/// One context-binding probe: decrypt `probe` under `probe_context` and require
+/// that it does not reproduce `original`. An `Ok` response is shape-validated
+/// first (an empty or malformed success is a contract violation, never proof —
+/// FUP-009); a matching plaintext means the claimed binding is not enforced.
+async fn check_context_probe(
+    provider: &dyn CryptoProvider,
+    probe_context: &CryptoContext,
+    probe: &CiphertextUnit,
+    original: &SecretBuffer,
+    caps: &CryptoCapabilities,
+    what: &str,
+) -> Result<(), CryptoError> {
+    match provider
+        .decrypt_batch(probe_context, std::slice::from_ref(probe))
+        .await
+    {
+        Ok(pts) => {
+            validate_decrypt_result(std::slice::from_ref(probe), &pts, caps)?;
+            if pts.first().map(|p| p.data == *original).unwrap_or(false) {
+                return Err(CryptoError::ProviderFatal(format!(
+                    "provider claims context binding but {what} decrypts to the original plaintext"
+                )));
+            }
+            Ok(())
+        }
+        Err(e) => classify_probe_err(e, what),
+    }
+}
+
 /// Full pre-attach self-test of one provider:
 /// capability coherence, round trip, batch order, size limits, and (when
 /// integrity is claimed) tamper detection.
@@ -157,63 +211,59 @@ pub async fn provider_self_test(
         ));
     }
 
-    // A claimed context binding is exercised, not trusted: the same
-    // ciphertext presented under another unit index must not decrypt to the
-    // same plaintext. Different plaintext (a non-authenticated cipher rebinds
-    // by tweak) or a *definitive* rejection are both fine — but a transport
-    // error (a provider that times out or drops the connection only on the
-    // moved request) proves nothing and must not be read as verification
-    // (MAKI-011).
+    // A claimed context binding is *exercised*, not trusted. The capability
+    // (per `CryptoContext`) binds the ciphertext to the whole context, so both
+    // the unit index and the volume UUID are probed: the same ciphertext under
+    // a different unit index, and under a different volume UUID, must not
+    // reproduce the original plaintext (FUP-011). Each probe distinguishes a
+    // definitive rejection / correct rebinding (pass) from an inconclusive
+    // transport error (quarantine) and an empty or malformed success (refuse).
     if caps.context_binding.present() {
-        let mut moved = cts[0].clone();
-        moved.unit_index = cts[0].unit_index.wrapping_add(1);
-        match provider.decrypt_batch(context, &[moved]).await {
-            Ok(pts) => {
-                if pts
-                    .first()
-                    .map(|p| p.data == items[0].data)
-                    .unwrap_or(false)
-                {
-                    return Err(CryptoError::ProviderFatal(
-                        "provider claims context binding but decrypts under a different unit index"
-                            .to_string(),
-                    ));
-                }
-            }
-            Err(e) if e.class() == ErrorClass::NonRetryableRequest => {}
-            Err(e) => {
-                return Err(CryptoError::ProviderFatal(format!(
-                    "context-binding self-test inconclusive: the moved ciphertext failed with a \
-                     {:?}-class error, not a definitive rejection — attach refused",
-                    e.class()
-                )));
-            }
-        }
+        let mut moved_index = cts[0].clone();
+        moved_index.unit_index = cts[0].unit_index.wrapping_add(1);
+        check_context_probe(
+            provider,
+            context,
+            &moved_index,
+            &items[0].data,
+            &caps,
+            "context-binding (unit index)",
+        )
+        .await?;
+
+        let mut other_volume = context.clone();
+        other_volume.volume_uuid =
+            uuid::Uuid::from_u128(context.volume_uuid.as_u128() ^ 0xFFFF_FFFF_FFFF_FFFF);
+        check_context_probe(
+            provider,
+            &other_volume,
+            &cts[0],
+            &items[0].data,
+            &caps,
+            "context-binding (volume uuid)",
+        )
+        .await?;
     }
 
     // Tamper detection: a flipped ciphertext byte must be rejected with a
-    // *definitive* integrity/bad-ciphertext error. Accepting it is fatal; a
-    // transport/retryable error (a provider that only ever times out on the
-    // tampered request) leaves integrity unproven, so the self-test refuses
-    // rather than passing on it (MAKI-011).
+    // *definitive* integrity failure. Any Ok is fatal (the provider returned
+    // plaintext for corrupt input); a transport error is inconclusive and is
+    // propagated so the endpoint is quarantined, not the whole attach refused
+    // (FUP-008); a non-integrity rejection does not prove integrity (FUP-009).
     if caps.integrity.present() {
-        let mut tampered: Vec<CiphertextUnit> = vec![cts[2].clone()];
-        let mid = tampered[0].data.len() / 2;
-        tampered[0].data[mid] ^= 0x01;
-        match provider.decrypt_batch(context, &tampered).await {
+        let mut tampered = cts[2].clone();
+        let mid = tampered.data.len() / 2;
+        tampered.data[mid] ^= 0x01;
+        match provider
+            .decrypt_batch(context, std::slice::from_ref(&tampered))
+            .await
+        {
             Ok(_) => {
                 return Err(CryptoError::ProviderFatal(
                     "provider claims integrity but accepted tampered ciphertext".to_string(),
                 ))
             }
-            Err(e) if e.class() == ErrorClass::NonRetryableRequest => {}
-            Err(e) => {
-                return Err(CryptoError::ProviderFatal(format!(
-                    "integrity self-test inconclusive: tampered ciphertext was rejected with a \
-                     {:?}-class error, not a definitive integrity failure — attach refused",
-                    e.class()
-                )))
-            }
+            Err(e) => classify_probe_err(e, "integrity")?,
         }
     }
 

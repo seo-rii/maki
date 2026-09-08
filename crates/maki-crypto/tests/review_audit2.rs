@@ -550,15 +550,102 @@ impl CryptoProvider for TamperReportsTransportError {
     }
 }
 
-/// MAKI-011: an integrity (or context-binding) claim is proven only by a
-/// definitive bad-ciphertext rejection. A provider that returns a transport
-/// error on the tampered/moved request — and only then — leaves the claim
-/// unproven, so the self-test must refuse rather than pass on it.
+/// MAKI-011 / FUP-008: an integrity or context-binding claim is proven only by
+/// a definitive bad-ciphertext rejection. A provider that returns a transport
+/// error on the tampered/moved request leaves the claim unproven — but the
+/// self-test must return that error with its *original* class (inconclusive),
+/// not fold it into a ProviderFatal that aborts the whole attach, so the
+/// dispatcher can quarantine and retry this one endpoint.
 #[tokio::test]
-async fn self_test_rejects_integrity_proven_only_by_a_transport_error() {
-    let p = TamperReportsTransportError(fake());
-    let err = provider_self_test(&p, &ctx(), UNIT, "test-profile-v1")
+async fn followup_inconclusive_negative_probe_preserves_retry_class() {
+    let provider = TamperReportsTransportError(fake());
+    let error = provider_self_test(&provider, &ctx(), UNIT, "test-profile-v1")
         .await
-        .expect_err("a transport error on tamper/move must not prove integrity");
-    assert!(matches!(err, CryptoError::ProviderFatal(_)), "{err}");
+        .expect_err("transport failure cannot prove the capability");
+    assert_eq!(
+        error.class(),
+        maki_crypto::ErrorClass::Retryable,
+        "leave this endpoint unvalidated, not a global provider failure: {error}"
+    );
+}
+
+/// A provider that returns an empty success for the moved-ciphertext probe.
+struct FollowupEmptyMovedReply(Arc<FakeCryptoProvider>);
+
+#[async_trait]
+impl CryptoProvider for FollowupEmptyMovedReply {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.0.capabilities().await
+    }
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        self.0.encrypt_batch(context, items).await
+    }
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        match self.0.decrypt_batch(context, items).await {
+            Err(CryptoError::Integrity(_)) if items.len() == 1 => Ok(vec![]),
+            other => other,
+        }
+    }
+}
+
+/// FUP-009: a malformed success (an empty result) to a negative probe is a
+/// contract violation, never proof of context binding.
+#[tokio::test]
+async fn followup_empty_moved_reply_does_not_prove_context_binding() {
+    let provider = FollowupEmptyMovedReply(fake());
+    assert!(
+        provider_self_test(&provider, &ctx(), UNIT, "test-profile-v1")
+            .await
+            .is_err(),
+        "an empty success response violates the result-shape contract"
+    );
+}
+
+/// A provider that binds the unit index but ignores the volume UUID.
+struct FollowupIgnoresVolumeUuid(Arc<FakeCryptoProvider>);
+
+#[async_trait]
+impl CryptoProvider for FollowupIgnoresVolumeUuid {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.0.capabilities().await
+    }
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        let mut normalized = context.clone();
+        normalized.volume_uuid = uuid::Uuid::nil();
+        self.0.encrypt_batch(&normalized, items).await
+    }
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        let mut normalized = context.clone();
+        normalized.volume_uuid = uuid::Uuid::nil();
+        self.0.decrypt_batch(&normalized, items).await
+    }
+}
+
+/// FUP-011: a full-context binding claim must bind the volume UUID, not only
+/// the unit index. A provider that ignores the UUID must fail the self-test.
+#[tokio::test]
+async fn followup_context_binding_selftest_exercises_volume_uuid() {
+    let provider = FollowupIgnoresVolumeUuid(fake());
+    assert!(
+        provider_self_test(&provider, &ctx(), UNIT, "test-profile-v1")
+            .await
+            .is_err(),
+        "unit-index binding alone must not certify volume-UUID binding"
+    );
 }
