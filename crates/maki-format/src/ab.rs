@@ -17,10 +17,19 @@ use maki_backing::Backing;
 
 use crate::error::FormatError;
 
-/// Sanity cap on a metadata record file; larger is an invalid copy.
+/// Last-resort cap on a metadata record file; larger is an invalid copy. Each
+/// record type tightens this with `MAX_ENCODED_LEN` so a corrupt or tampered
+/// *small* record file (a superblock, a canary) cannot force a large read
+/// before it is even decoded (MAKI-026).
 const MAX_RECORD_SIZE: u64 = 1 << 30;
 
 pub trait AbRecord: Sized {
+    /// The largest a valid encoding of this record can be. A copy longer than
+    /// this is rejected as invalid *before* it is read into memory, bounding
+    /// the allocation a corrupt length can trigger. Variable-length records
+    /// keep the generous default; fixed or tightly-bounded ones override it.
+    const MAX_ENCODED_LEN: u64 = MAX_RECORD_SIZE;
+
     fn generation(&self) -> u64;
     fn set_generation(&mut self, generation: u64);
     fn encode(&self) -> Vec<u8>;
@@ -53,7 +62,9 @@ impl AbStore {
             Err(e) => return Err(FormatError::Io(e)),
         };
         let len = file.len()?;
-        if len == 0 || len > MAX_RECORD_SIZE {
+        // Reject an over-long copy by its size before allocating for it: a
+        // valid encoding never exceeds the record type's bound (MAKI-026).
+        if len == 0 || len > T::MAX_ENCODED_LEN {
             return Ok(None);
         }
         let mut buf = vec![0u8; len as usize];
@@ -188,7 +199,20 @@ impl AbStore {
             backing.sync_dir(maki_backing::path::parent(preserved))?;
         }
 
-        record.set_generation(max_existing.max(record.generation()) + 1);
+        // Checked increment: a corrupt existing generation near u64::MAX (or a
+        // genuinely exhausted sequence) must fail closed, not wrap to 0 — a
+        // wrapped generation would silently lose to every existing copy and
+        // could never be selected (MAKI-027).
+        let next = max_existing
+            .max(record.generation())
+            .checked_add(1)
+            .ok_or_else(|| {
+                FormatError::Invalid(
+                    "A/B record generation space exhausted (near u64::MAX); refusing to store"
+                        .to_string(),
+                )
+            })?;
+        record.set_generation(next);
         let bytes = record.encode();
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;

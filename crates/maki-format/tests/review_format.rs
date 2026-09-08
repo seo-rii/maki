@@ -423,3 +423,40 @@ fn ab_store_overwrites_the_side_that_does_not_decode_as_the_record_type() {
     let loaded = ab.load::<CheckpointState>(&backing).unwrap().unwrap();
     assert_eq!((loaded.generation(), loaded.checkpoint_sequence), (11, 4));
 }
+
+// ---------- MAKI-026 / MAKI-027 (2026-09-07): parser and integer robustness ----------
+
+/// MAKI-026: a superblock copy is always exactly one fixed-size block. A file
+/// longer than that is corruption and must be rejected as an invalid copy
+/// *by its size*, before it is read into memory — not read whole and then
+/// decoded from its valid-looking prefix (which would both accept corruption
+/// and allow a tampered length to force a large allocation).
+#[test]
+fn oversized_superblock_copy_is_rejected_before_it_is_read() {
+    let backing = Arc::new(CrashableBacking::new());
+    let encoded = sb().encode();
+    let file = backing.open(layout::SUPERBLOCK_A, true).unwrap();
+    file.write_at(0, &encoded).unwrap();
+    // A valid superblock prefix followed by padding: a larger-than-a-block file.
+    file.set_len(encoded.len() as u64 * 4).unwrap();
+    file.sync_data().unwrap();
+    let store = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
+    assert!(
+        store.load::<Superblock>(backing.as_ref()).unwrap().is_none(),
+        "an over-long superblock copy must be treated as invalid, not decoded from its prefix"
+    );
+}
+
+/// MAKI-027: an A/B store at the top of the generation space must fail closed
+/// rather than wrap `generation + 1` to 0 (a wrapped record would lose to every
+/// existing copy and could never be selected).
+#[test]
+fn storing_at_max_generation_fails_closed_instead_of_wrapping() {
+    use maki_format::ab::AbRecord;
+    let backing = Arc::new(CrashableBacking::new());
+    let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
+    let mut state = CheckpointState::default();
+    state.set_generation(u64::MAX);
+    let err = store.store(backing.as_ref(), &mut state).unwrap_err();
+    assert!(matches!(err, FormatError::Invalid(_)), "{err:?}");
+}

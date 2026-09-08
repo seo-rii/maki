@@ -127,6 +127,10 @@ impl Superblock {
 }
 
 impl crate::ab::AbRecord for Superblock {
+    // A superblock is always exactly one fixed-size block; anything larger is
+    // corruption and is rejected before it is read (MAKI-026).
+    const MAX_ENCODED_LEN: u64 = SUPERBLOCK_SIZE as u64;
+
     fn generation(&self) -> u64 {
         self.generation
     }

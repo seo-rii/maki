@@ -109,6 +109,10 @@ impl KeyCanary {
 }
 
 impl AbRecord for KeyCanary {
+    // Header + one canary ciphertext (bounded by MAX_CANARY_CIPHERTEXT); a
+    // longer copy is corruption and is rejected before it is read (MAKI-026).
+    const MAX_ENCODED_LEN: u64 = MAX_CANARY_CIPHERTEXT as u64 + 4096;
+
     fn generation(&self) -> u64 {
         self.generation
     }
