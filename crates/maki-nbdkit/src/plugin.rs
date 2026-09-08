@@ -202,7 +202,13 @@ unsafe extern "C" fn flush_v2(handle: *mut c_void, _flags: u32) -> c_int {
 
 unsafe extern "C" fn unload() {
     if let Some(a) = ADAPTER.get() {
-        let _ = a.shutdown();
+        // `unload` is a void C callback, so a shutdown error cannot propagate
+        // to the caller — but it must not be swallowed: a failed final
+        // flush/checkpoint at shutdown is recorded so an operator sees the
+        // failure rather than mistaking it for a clean stop (MAKI-008).
+        if let Err(e) = a.shutdown() {
+            tracing::error!(error = %e, "maki-nbdkit: shutdown during unload failed");
+        }
     }
 }
 
