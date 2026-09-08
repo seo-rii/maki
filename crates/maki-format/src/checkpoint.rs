@@ -41,14 +41,30 @@ impl CheckpointState {
                 "checkpoint state version {version}"
             )));
         }
+        let generation = r.u64()?;
+        let checkpoint_sequence = r.u64()?;
+        // A frozen fixed-length v1 record must consume exactly its payload:
+        // trailing bytes (even under a valid CRC) are corruption, never a
+        // forward-compatible extension (FUP-012).
+        if r.remaining() != 0 {
+            return Err(FormatError::Invalid(
+                "checkpoint state: unexpected trailing bytes after a fixed-length v1 record"
+                    .to_string(),
+            ));
+        }
         Ok(Self {
-            generation: r.u64()?,
-            checkpoint_sequence: r.u64()?,
+            generation,
+            checkpoint_sequence,
         })
     }
 }
 
 impl AbRecord for CheckpointState {
+    // A v1 checkpoint record is a fixed 32 bytes (magic+version+generation+
+    // checkpoint_sequence+crc); a larger file is corruption, rejected before it
+    // is read rather than inheriting the 1 GiB last-resort cap (FUP-012).
+    const MAX_ENCODED_LEN: u64 = 32;
+
     fn generation(&self) -> u64 {
         self.generation
     }

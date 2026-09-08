@@ -102,17 +102,44 @@ impl AbStore {
         })
     }
 
-    fn generations(
+    /// Raw generation of one side, read type-agnostically (so a foreign or
+    /// newer-version record still ranks) but bounded by `max_len` — the caller
+    /// record type's `MAX_ENCODED_LEN` — so the generation probe cannot be
+    /// forced to read a large corrupt file that `read_copy::<T>` would already
+    /// reject on the typed path (FUP-012).
+    fn raw_generation(
+        &self,
+        backing: &dyn Backing,
+        path: &str,
+        max_len: u64,
+    ) -> Result<Option<u64>, FormatError> {
+        let file = match backing.open(path, false) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(FormatError::Io(e)),
+        };
+        let len = file.len()?;
+        if len == 0 || len > max_len {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; len as usize];
+        match file.read_at(0, &mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(FormatError::Io(e)),
+        }
+        Ok(RawGeneration::decode(&buf).ok().map(|r| r.generation))
+    }
+
+    fn generations<T: AbRecord>(
         &self,
         backing: &dyn Backing,
     ) -> Result<(Option<u64>, Option<u64>), FormatError> {
-        let ga = self
-            .read_side::<RawGeneration>(backing, &self.a)?
-            .map(|r| r.generation);
-        let gb = self
-            .read_side::<RawGeneration>(backing, &self.b)?
-            .map(|r| r.generation);
-        Ok((ga, gb))
+        let max = T::MAX_ENCODED_LEN;
+        Ok((
+            self.raw_generation(backing, &self.a, max)?,
+            self.raw_generation(backing, &self.b, max)?,
+        ))
     }
 
     fn target_for(&self, ga: Option<u64>, gb: Option<u64>) -> &str {
@@ -173,7 +200,7 @@ impl AbStore {
         backing: &dyn Backing,
         record: &mut T,
     ) -> Result<(), FormatError> {
-        let (ga, gb) = self.generations(backing)?;
+        let (ga, gb) = self.generations::<T>(backing)?;
         let max_existing = ga.into_iter().chain(gb).max().unwrap_or(0);
         let a = self.read_copy::<T>(backing, &self.a)?;
         let b = self.read_copy::<T>(backing, &self.b)?;

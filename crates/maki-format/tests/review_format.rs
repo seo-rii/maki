@@ -460,3 +460,112 @@ fn storing_at_max_generation_fails_closed_instead_of_wrapping() {
     let err = store.store(backing.as_ref(), &mut state).unwrap_err();
     assert!(matches!(err, FormatError::Invalid(_)), "{err:?}");
 }
+
+// ---------- Follow-up review 2026-09-08: FUP-012 (A/B read bounds) ----------
+
+/// FUP-012: the fixed-size checkpoint record must carry a tight per-type read
+/// bound, not inherit the 1 GiB last-resort cap.
+#[test]
+fn followup_checkpoint_v1_has_a_tight_read_bound() {
+    assert_eq!(CheckpointState::default().encode().len(), 32);
+    assert_eq!(
+        <CheckpointState as maki_format::ab::AbRecord>::MAX_ENCODED_LEN,
+        32,
+        "the fixed-size checkpoint must not inherit a 1GiB allocation cap"
+    );
+}
+
+/// FUP-012: a frozen v1 record must consume exactly its length; trailing bytes
+/// under a valid CRC are corruption, not a forward-compatible extension.
+#[test]
+fn followup_checkpoint_rejects_crc_valid_trailing_payload() {
+    let encoded = CheckpointState::default().encode();
+    let mut padded = encoded[..encoded.len() - 4].to_vec();
+    padded.extend_from_slice(&[0x55; 4096]);
+    let crc = crc32fast::hash(&padded);
+    padded.extend_from_slice(&crc.to_le_bytes());
+    assert!(
+        CheckpointState::decode(&padded).is_err(),
+        "a v1 record must consume exactly its frozen format length"
+    );
+}
+
+struct FollowupReadSpy {
+    inner: Arc<CrashableBacking>,
+    largest: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct FollowupReadSpyFile {
+    inner: Arc<dyn maki_backing::BackingFile>,
+    largest: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl maki_backing::BackingFile for FollowupReadSpyFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.largest
+            .fetch_max(buf.len(), std::sync::atomic::Ordering::SeqCst);
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+}
+impl Backing for FollowupReadSpy {
+    fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn maki_backing::BackingFile>> {
+        Ok(Arc::new(FollowupReadSpyFile {
+            inner: self.inner.open(path, create)?,
+            largest: self.largest.clone(),
+        }))
+    }
+    fn exists(&self, p: &str) -> io::Result<bool> {
+        self.inner.exists(p)
+    }
+    fn remove(&self, p: &str) -> io::Result<()> {
+        self.inner.remove(p)
+    }
+    fn rename(&self, a: &str, b: &str) -> io::Result<()> {
+        self.inner.rename(a, b)
+    }
+    fn create_dir_all(&self, p: &str) -> io::Result<()> {
+        self.inner.create_dir_all(p)
+    }
+    fn list(&self, p: &str) -> io::Result<Vec<String>> {
+        self.inner.list(p)
+    }
+    fn sync_dir(&self, p: &str) -> io::Result<()> {
+        self.inner.sync_dir(p)
+    }
+    fn try_lock(&self, p: &str) -> io::Result<Box<dyn maki_backing::VolumeLock>> {
+        self.inner.try_lock(p)
+    }
+}
+
+/// FUP-012: the generation probe on the write (store) path must also respect
+/// the per-type read bound — a corrupt oversized file must not be read whole by
+/// `RawGeneration` before the typed parse.
+#[test]
+fn followup_superblock_store_raw_generation_probe_is_also_bounded() {
+    let backing = Arc::new(CrashableBacking::new());
+    let file = backing.open(layout::SUPERBLOCK_A, true).unwrap();
+    file.write_at(0, &vec![0x55; 16384]).unwrap();
+    let largest = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spy = FollowupReadSpy {
+        inner: backing,
+        largest: largest.clone(),
+    };
+    let mut current = sb();
+    AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)
+        .store(&spy, &mut current)
+        .unwrap();
+    assert!(
+        largest.load(std::sync::atomic::Ordering::SeqCst) <= 4096,
+        "RawGeneration must not reintroduce an oversized whole-file read before typed parsing"
+    );
+}
