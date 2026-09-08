@@ -1320,6 +1320,25 @@ impl VolumeConfig {
                 l.max_ciphertext_bytes.0, bt.max_bytes.0
             )));
         }
+        // A dispatched batch is charged whole against the endpoint inflight
+        // byte budgets. If those are smaller than a batch, the `DualSemaphore`
+        // would clamp the charge to the budget and let an over-budget RPC
+        // through instead of bounding it — so require both the global and the
+        // per-endpoint inflight byte budgets to cover a full batch (FUP-013).
+        if l.max_crypto_inflight_bytes.0 < bt.max_bytes.0 {
+            return Err(invalid(format!(
+                "limits.max_crypto_inflight_bytes ({}) must be at least crypto.batch.max_bytes \
+                 ({}) so an in-flight batch stays within its byte budget",
+                l.max_crypto_inflight_bytes.0, bt.max_bytes.0
+            )));
+        }
+        if l.max_inflight_bytes_per_endpoint.0 < bt.max_bytes.0 {
+            return Err(invalid(format!(
+                "limits.max_inflight_bytes_per_endpoint ({}) must be at least \
+                 crypto.batch.max_bytes ({}) so a per-endpoint in-flight batch stays within budget",
+                l.max_inflight_bytes_per_endpoint.0, bt.max_bytes.0
+            )));
+        }
 
         let mode = self.crypto.capabilities.mode.as_str();
         if !["declared", "hybrid", "probed"].contains(&mode) {

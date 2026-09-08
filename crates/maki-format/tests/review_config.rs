@@ -601,3 +601,20 @@ fn audit_20260907_pending_capacity_must_cover_a_full_batch() {
          [crypto.batch]\ntarget_items = 8\nmax_items = 16\n",
     ));
 }
+
+/// FUP-013: the in-flight byte budgets (global and per-endpoint) must also
+/// cover a full batch, or an over-budget RPC would be clamped and let through
+/// rather than bounded.
+#[test]
+fn followup_inflight_byte_budgets_must_cover_a_full_batch() {
+    let msg = err(&with(
+        "[limits]\nmax_crypto_inflight_bytes = \"512KiB\"\n\
+         [crypto.batch]\nmax_bytes = \"1MiB\"\n",
+    ));
+    assert!(msg.contains("max_crypto_inflight_bytes"), "{msg}");
+    let msg = err(&with(
+        "[limits]\nmax_inflight_bytes_per_endpoint = \"512KiB\"\n\
+         [crypto.batch]\nmax_bytes = \"1MiB\"\n",
+    ));
+    assert!(msg.contains("max_inflight_bytes_per_endpoint"), "{msg}");
+}
