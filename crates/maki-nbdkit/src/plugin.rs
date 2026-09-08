@@ -204,9 +204,14 @@ unsafe extern "C" fn unload() {
     if let Some(a) = ADAPTER.get() {
         // `unload` is a void C callback, so a shutdown error cannot propagate
         // to the caller — but it must not be swallowed: a failed final
-        // flush/checkpoint at shutdown is recorded so an operator sees the
-        // failure rather than mistaking it for a clean stop (MAKI-008).
+        // flush/checkpoint at shutdown is surfaced so an operator sees the
+        // failure rather than mistaking it for a clean stop (MAKI-008). It is
+        // written to stderr — which nbdkit captures to its log regardless of
+        // whether a `tracing` subscriber is installed, the channel this crate
+        // already uses for `open`-path failures (FUP-005) — as well as emitted
+        // as a `tracing` event for hosts that do install one.
         if let Err(e) = a.shutdown() {
+            eprintln!("maki-nbdkit: shutdown during unload failed: {e}");
             tracing::error!(error = %e, "maki-nbdkit: shutdown during unload failed");
         }
     }
