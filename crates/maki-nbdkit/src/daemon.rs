@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use maki_backing::{Backing, FileBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
-use maki_core::volume::VolumeOptions;
+use maki_core::volume::{Volume, VolumeOptions};
 use maki_crypto::endpoint::EndpointSet;
 use maki_crypto::CryptoProvider;
 use maki_crypto_local::keysource::{
@@ -99,6 +99,13 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
 pub async fn build_provider_with_endpoints(
     config: &VolumeConfig,
 ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
+    build_provider_for_volume(config, None).await
+}
+
+async fn build_provider_for_volume(
+    config: &VolumeConfig,
+    volume: Option<&Volume>,
+) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
     // Public callers can supply an unvalidated configuration. Refuse name
     // collisions before the name-only credential router loads any secret.
     config.validate_credential_sources()?;
@@ -130,9 +137,9 @@ pub async fn build_provider_with_endpoints(
             };
             return Ok((provider, None));
         }
-        "remote-http" => remote_http_provider(config).await?,
-        "remote-websocket" => remote_websocket_provider(config).await?,
-        "remote-grpc" => remote_grpc_provider(config).await?,
+        "remote-http" => remote_http_provider(config, volume).await?,
+        "remote-websocket" => remote_websocket_provider(config, volume).await?,
+        "remote-grpc" => remote_grpc_provider(config, volume).await?,
         other => return Err(DaemonError::Unsupported(format!("provider {other:?}"))),
     };
     Ok((set.clone() as Arc<dyn CryptoProvider>, Some(set)))
@@ -197,7 +204,10 @@ impl KeySource for RoutedKeySource {
 /// Assemble the multi-endpoint HTTP provider: per-endpoint transports,
 /// cross-endpoint interchangeability check (SPEC §34), and the dispatcher
 /// (retry/budget/breaker/failover) from configuration.
-async fn remote_http_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>, DaemonError> {
+async fn remote_http_provider(
+    config: &VolumeConfig,
+    volume: Option<&Volume>,
+) -> Result<Arc<EndpointSet>, DaemonError> {
     let http = config
         .crypto
         .http
@@ -217,14 +227,17 @@ async fn remote_http_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>,
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints).await
+    dispatch_endpoint_set(config, endpoints, volume).await
 }
 
 /// `remote-websocket`: per-endpoint WS transports through the shared
 /// dispatcher. The transport build has no TLS support yet, so `wss://` or a
 /// `[crypto.websocket.tls]` section refuses attach — fail closed, never a
 /// silent downgrade.
-async fn remote_websocket_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>, DaemonError> {
+async fn remote_websocket_provider(
+    config: &VolumeConfig,
+    volume: Option<&Volume>,
+) -> Result<Arc<EndpointSet>, DaemonError> {
     let ws = config
         .crypto
         .websocket
@@ -265,14 +278,17 @@ async fn remote_websocket_provider(config: &VolumeConfig) -> Result<Arc<Endpoint
             });
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints).await
+    dispatch_endpoint_set(config, endpoints, volume).await
 }
 
 /// `remote-grpc`: fixed reference contract
 /// (`packaging/examples/maki-crypto.proto`) at configurable method paths,
 /// with credential-resolved ascii metadata. Same TLS fail-closed rule as the
 /// websocket transport.
-async fn remote_grpc_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>, DaemonError> {
+async fn remote_grpc_provider(
+    config: &VolumeConfig,
+    volume: Option<&Volume>,
+) -> Result<Arc<EndpointSet>, DaemonError> {
     let grpc = config
         .crypto
         .grpc
@@ -329,7 +345,7 @@ async fn remote_grpc_provider(config: &VolumeConfig) -> Result<Arc<EndpointSet>,
             })?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints).await
+    dispatch_endpoint_set(config, endpoints, volume).await
 }
 
 /// Declared `[crypto.capabilities]` as `CryptoCapabilities` (the same
@@ -396,7 +412,20 @@ fn resolve_metadata_value(
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
+    volume: Option<&Volume>,
 ) -> Result<Arc<EndpointSet>, DaemonError> {
+    // Provider-only construction still needs a real, exclusively held volume;
+    // constructing transports first retains early credential/config errors.
+    let recovered;
+    let volume = match volume {
+        Some(volume) => volume,
+        None => {
+            recovered = Volume::recover(build_backing(config)?, engine_options(config).volume)
+                .map_err(AttachError::from)?;
+            &recovered
+        }
+    };
+    use maki_crypto::checked::CheckedProvider;
     use maki_crypto::clock::SystemClock;
     use maki_crypto::endpoint::{DispatchConfig, EndpointValidator};
     use maki_crypto::selftest::{cross_endpoint_self_test, provider_self_test};
@@ -411,12 +440,20 @@ async fn dispatch_endpoint_set(
                 | maki_crypto::ErrorClass::EndpointFatal
         )
     };
-    // Synthetic context with the configured profile; the volume UUID is
-    // bound by the attach-time self-test and by later revalidation.
+    let superblock = volume.superblock();
+    if superblock.provider_type != config.crypto.provider
+        || superblock.crypto_compatibility_id != compat
+        || superblock.geometry.crypto_unit_size != config.volume.crypto_unit_size
+        || superblock.geometry.max_ciphertext_size != config.crypto.capabilities.max_ciphertext_size
+    {
+        return Err(DaemonError::Unsupported(
+            "remote configuration does not match the locked volume identity/geometry".into(),
+        ));
+    }
     let context = maki_crypto::CryptoContext {
-        volume_uuid: uuid::Uuid::nil(),
-        format_version: 1,
-        crypto_compatibility_id: compat.clone(),
+        volume_uuid: superblock.volume_uuid,
+        format_version: superblock.format_version,
+        crypto_compatibility_id: superblock.crypto_compatibility_id.clone(),
     };
 
     // 1. Reachability: every endpoint on its own, tolerating a few transient
@@ -435,8 +472,28 @@ async fn dispatch_endpoint_set(
         for attempt in 0..3 {
             match provider_self_test(provider.as_ref(), &context, unit, &compat).await {
                 Ok(()) => {
-                    last = None;
-                    break;
+                    let caps = provider.capabilities().await?;
+                    let checked = CheckedProvider::pinned(provider.clone(), unit as u32);
+                    match maki_core::engine::verify_key_canary(
+                        volume,
+                        &checked,
+                        &context,
+                        caps.integrity.present(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            last = None;
+                            break;
+                        }
+                        Err(AttachError::Crypto(e)) if transport_failure(&e) => {
+                            last = Some(e);
+                            if attempt < 2 {
+                                tokio::time::sleep(probe_delay).await;
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 Err(e) if transport_failure(&e) => {
                     last = Some(e);
@@ -491,8 +548,42 @@ async fn dispatch_endpoint_set(
         flagged.push((name, provider, false));
     }
 
-    let validator: EndpointValidator = Arc::new(move |reference, candidate, context| {
+    let canary = maki_format::ab::AbStore::new(
+        maki_format::layout::KEY_CANARY_A,
+        maki_format::layout::KEY_CANARY_B,
+    )
+    .load::<maki_format::canary::KeyCanary>(volume.backing().as_ref())?;
+    let validation_context = context.clone();
+    let validator: EndpointValidator = Arc::new(move |reference, candidate, _request_context| {
+        let context = validation_context.clone();
+        let canary = canary.clone();
         Box::pin(async move {
+            provider_self_test(
+                candidate.as_ref(),
+                &context,
+                unit,
+                &context.crypto_compatibility_id,
+            )
+            .await?;
+            if let Some(canary) = canary {
+                let checked = CheckedProvider::pinned(candidate.clone(), unit as u32);
+                let plain = checked
+                    .decrypt_batch(
+                        &context,
+                        &[maki_crypto::CiphertextUnit {
+                            unit_index: canary.unit_index,
+                            data: canary.ciphertext,
+                        }],
+                    )
+                    .await?;
+                if plain[0].data.expose()
+                    != maki_format::canary::canary_plaintext(&context.volume_uuid, unit)
+                {
+                    return Err(maki_crypto::CryptoError::ProviderFatal(
+                        "quarantined endpoint does not match the volume key canary".into(),
+                    ));
+                }
+            }
             cross_endpoint_self_test(reference.as_ref(), candidate.as_ref(), &context, unit).await
         })
     });
@@ -615,7 +706,9 @@ pub async fn attach_from_config_with_stats(
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
     let backing = build_backing(config)?;
-    let (provider, endpoints) = build_provider_with_endpoints(config).await?;
+    let options = engine_options(config);
+    let volume = Volume::recover(backing, options.volume.clone()).map_err(AttachError::from)?;
+    let (provider, endpoints) = build_provider_for_volume(config, Some(&volume)).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
             provider,
@@ -628,7 +721,7 @@ pub async fn attach_from_config_with_stats(
     } else {
         (provider, None)
     };
-    let engine = Engine::attach(backing, provider, engine_options(config)).await?;
+    let engine = Engine::attach_recovered(volume, provider, options).await?;
     Ok((engine, stats, endpoints))
 }
 

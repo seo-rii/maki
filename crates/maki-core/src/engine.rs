@@ -370,7 +370,18 @@ impl Engine {
         provider: Arc<dyn CryptoProvider>,
         options: EngineOptions,
     ) -> Result<Self, AttachError> {
-        let volume = Volume::recover(backing.clone(), options.volume)?;
+        let volume = Volume::recover(backing, options.volume.clone())?;
+        Self::attach_recovered(volume, provider, options).await
+    }
+
+    /// Finish attaching an already recovered volume without releasing its
+    /// exclusive lock while the daemon validates individual remote endpoints.
+    pub async fn attach_recovered(
+        volume: Volume,
+        provider: Arc<dyn CryptoProvider>,
+        options: EngineOptions,
+    ) -> Result<Self, AttachError> {
+        let backing = volume.backing().clone();
         let superblock = volume.superblock().clone();
         let geometry = superblock.geometry.clone();
 
@@ -1087,7 +1098,7 @@ fn spawn_checkpoint_worker(weak: Weak<EngineInner>, notify: Arc<Notify>, clock: 
 ///   with an integrity-capable provider, decrypt one existing unit as the
 ///   proof instead, then establish the canary; without integrity there is
 ///   no proof, so attach is refused.
-async fn verify_key_canary(
+pub async fn verify_key_canary(
     volume: &Volume,
     provider: &CheckedProvider,
     context: &CryptoContext,
@@ -1169,7 +1180,8 @@ async fn verify_key_canary(
     // indices 0..2, never this large reserved index, so a provider that
     // mishandles it (or a wrong key routing) would otherwise persist an
     // unverifiable canary that only surfaces as a key mismatch on the next
-    // attach (FUP-010). All endpoints back this provider, so all must agree.
+    // attach (FUP-010). The daemon separately verifies every remote endpoint
+    // against this same persisted canary before it can serve volume I/O.
     let decrypted = decrypt_probe(
         provider,
         context,
