@@ -303,16 +303,9 @@ pub async fn provider_conformance(
 
     // Statelessness sanity: encrypting the same unit twice must decrypt
     // identically both times.
-    let again = provider
-        .encrypt_batch(
-            context,
-            &[PlaintextUnit {
-                unit_index: 1000,
-                data: items[0].data.duplicate(),
-            }],
-        )
-        .await?;
-    let back = provider.decrypt_batch(context, &again).await?;
+    let repeated = std::slice::from_ref(&items[0]);
+    let again = encrypt_chunked(provider, context, repeated, &caps).await?;
+    let back = decrypt_chunked(provider, context, &again, &caps).await?;
     if back[0].data != items[0].data {
         return Err(CryptoError::ProviderFatal(
             "conformance: repeated encryption round trip mismatch".to_string(),
