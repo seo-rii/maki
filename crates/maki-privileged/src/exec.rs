@@ -12,6 +12,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[path = "command.rs"]
+mod command;
+
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{
@@ -54,12 +57,12 @@ pub enum ExecError {
 
 fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError> {
     tracing::info!("maki-attach: {step}");
-    let out = Command::new(program).args(args).output()?;
+    let out = command::capture(Command::new(program).args(args), command::Policy::STEP)?;
     if !out.status.success() {
         return Err(ExecError::StepFailed {
             step: step.to_string(),
             status: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: "external command output omitted".into(),
         });
     }
     Ok(())
@@ -128,10 +131,11 @@ fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
 }
 
 fn blkid_uuid(device: &str) -> Option<String> {
-    let out = Command::new("blkid")
-        .args(["-o", "value", "-s", "UUID", device])
-        .output()
-        .ok()?;
+    let out = command::capture(
+        Command::new("blkid").args(["-o", "value", "-s", "UUID", device]),
+        command::Policy::PROBE,
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -837,3 +841,7 @@ fn execute_with(
 #[cfg(test)]
 #[path = "exec_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "command_tests.rs"]
+mod command_tests;
