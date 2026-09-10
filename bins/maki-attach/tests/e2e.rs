@@ -40,11 +40,18 @@ fn detach_and_grow_plans_print() {
         "detach must deactivate LVM"
     );
 
-    let out = run(&["grow", "--volume", "v3", "--add-bytes", "1048576", "--plan"]);
+    let out = run(&[
+        "grow",
+        "--volume",
+        "v3",
+        "--size-bytes",
+        "1048576",
+        "--plan",
+    ]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("grow"));
 
-    // grow without --add-bytes is a usage error.
+    // grow without --size-bytes is a usage error.
     let out = run(&["grow", "--volume", "v3", "--plan"]);
     assert_eq!(out.status.code(), Some(2));
 }
@@ -71,5 +78,41 @@ fn execution_is_refused_off_linux() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("# attach volume v9"),
         "plan still printed for audit"
+    );
+}
+
+#[test]
+fn grow_requires_an_absolute_target_for_safe_retries() {
+    let out = run(&[
+        "grow",
+        "--volume",
+        "v3",
+        "--size-bytes",
+        "2147483648",
+        "--plan",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan = String::from_utf8_lossy(&out.stdout);
+    assert!(plan.contains("lvextend -L 2147483648b"), "{plan}");
+    assert!(
+        !plan.contains("+2147483648"),
+        "retry must not add twice: {plan}"
+    );
+    let relative = run(&[
+        "grow",
+        "--volume",
+        "v3",
+        "--add-bytes",
+        "1073741824",
+        "--plan",
+    ]);
+    assert_eq!(
+        relative.status.code(),
+        Some(2),
+        "ambiguous relative growth must be refused"
     );
 }

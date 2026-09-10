@@ -126,7 +126,7 @@ fn plans_contain_no_credential_material() {
             nbd_socket: "/run/maki/postgres/nbd.sock".into(),
             vg_name: "vg_maki_postgres".into(),
             lv_name: "data".into(),
-            add_bytes: 10 << 30,
+            target_bytes: 10 << 30,
             mountpoint: "/srv/postgres".into(),
         })
     );
@@ -165,7 +165,7 @@ fn grow_plan_is_lvextend_then_xfs_growfs() {
         nbd_socket: "/run/maki/postgres/nbd.sock".into(),
         vg_name: "vg".into(),
         lv_name: "data".into(),
-        add_bytes: 1 << 30,
+        target_bytes: 1 << 30,
         mountpoint: "/srv/postgres".into(),
     });
     let kinds: Vec<&'static str> = plan.steps.iter().map(|s| s.kind()).collect();

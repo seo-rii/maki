@@ -72,6 +72,7 @@ struct FakeSystem {
     replace_after_deactivate: bool,
     obstruct_record_cleanup: Option<PathBuf>,
     mounted: bool,
+    lv_size: u64,
     vg_active: bool,
     fail_after_at: Option<&'static str>,
     foreign_mount: bool,
@@ -83,6 +84,9 @@ struct FakeSystem {
 }
 
 impl System for FakeSystem {
+    fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
+        Ok(self.lv_size)
+    }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.steps.push(step.kind());
         if self.fail_at == Some(step.kind()) {
@@ -101,6 +105,9 @@ impl System for FakeSystem {
                 self.mounted = false;
             }
             PlannedStep::LvmActivate { .. } => self.vg_active = true,
+            PlannedStep::LvExtend { target_bytes, .. } => {
+                self.lv_size = self.lv_size.max(*target_bytes)
+            }
             PlannedStep::NbdConnect { device, .. } => {
                 self.backends
                     .insert(device.clone(), identifier.unwrap().to_string());
@@ -572,7 +579,7 @@ fn grow_request() -> GrowRequest {
         nbd_socket: r.nbd_socket,
         vg_name: r.vg_name,
         lv_name: r.lv_name,
-        add_bytes: 1 << 30,
+        target_bytes: 2 << 30,
         mountpoint: r.mountpoint,
     }
 }
@@ -1098,4 +1105,48 @@ fn a_new_attach_does_not_adopt_unrecorded_live_resources() {
         );
         assert!(state.read("pg").unwrap().is_none());
     }
+}
+
+#[test]
+fn growth_retry_does_not_apply_an_increase_twice() {
+    for failure in ["lvextend", "xfs-growfs"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem {
+            lv_size: 1 << 30,
+            ..Default::default()
+        };
+        execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+        let plan = plan_grow(&grow_request());
+        system.fail_after_at = Some(failure);
+        assert!(execute_with(&plan, Some(&state), &mut system).is_err());
+        system.fail_after_at = None;
+        execute_with(&plan, Some(&state), &mut system).unwrap();
+        assert_eq!(
+            system.lv_size,
+            2 << 30,
+            "retry after {failure} must reuse the same absolute target"
+        );
+    }
+}
+
+#[test]
+fn growth_rechecks_ownership_between_lv_and_filesystem_changes() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        lv_size: 1 << 30,
+        ..Default::default()
+    };
+    execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+    system.backend_fault_after = Some(("lvextend", BackendFault::Foreign));
+    assert!(execute_with(&plan_grow(&grow_request()), Some(&state), &mut system).is_err());
+    assert_eq!(
+        system.steps,
+        ["lvextend"],
+        "filesystem change must re-check live ownership"
+    );
 }

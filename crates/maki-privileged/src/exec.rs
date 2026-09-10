@@ -380,13 +380,13 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
         PlannedStep::LvExtend {
             vg_name,
             lv_name,
-            add_bytes,
+            target_bytes,
         } => run(
             step,
             "lvextend",
             &[
                 "-L",
-                &format!("+{add_bytes}b"),
+                &format!("{target_bytes}b"),
                 &format!("{vg_name}/{lv_name}"),
             ],
         ),
@@ -404,6 +404,9 @@ fn identity_error(message: impl Into<String>) -> ExecError {
 /// System interactions are isolated so tests exercise the same ordering,
 /// record validation, and rollback decisions without touching devices.
 trait System {
+    fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
+        Err(identity_error("logical volume size cannot be observed"))
+    }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
     fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
@@ -421,6 +424,20 @@ trait System {
 struct LinuxSystem;
 
 impl System for LinuxSystem {
+    fn lv_size(&self, vg: &str, lv: &str) -> Result<u64, ExecError> {
+        let out = command::capture(
+            Command::new("blockdev").args(["--getsize64", &format!("/dev/{vg}/{lv}")]),
+            command::Policy::PROBE,
+        )?;
+        if !out.status.success() {
+            return Err(identity_error("logical volume size probe failed"));
+        }
+        std::str::from_utf8(&out.stdout)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .filter(|size| *size > 0)
+            .ok_or_else(|| identity_error("logical volume size probe returned invalid bytes"))
+    }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         run_step(step, identifier)
     }
@@ -798,6 +815,26 @@ fn execute_with(
     }
 
     for step in &plan.steps {
+        if grows {
+            // Never let a changed mount/backend slip between lvextend and
+            // xfs_growfs. Absolute targets make retries safe after either
+            // command performed its effect but reported failure.
+            verify_live_attachment(record.as_ref().unwrap(), system)?;
+            if let PlannedStep::LvExtend {
+                vg_name,
+                lv_name,
+                target_bytes,
+            } = step
+            {
+                if *target_bytes == 0 {
+                    return Err(identity_error("growth target must be positive"));
+                }
+                if system.lv_size(vg_name, lv_name)? >= *target_bytes {
+                    continue;
+                }
+                verify_live_attachment(record.as_ref().unwrap(), system)?;
+            }
+        }
         if disconnects && !connects {
             // Reobserve before each step: a previous attempt may already
             // have completed it, or the mount/device may have changed.

@@ -186,8 +186,16 @@ plan mode first:
 ```bash
 maki-attach attach --volume example --plan
 maki-attach detach --volume example --plan
-maki-attach grow --volume example --add-bytes 1073741824 --plan
+maki-attach grow --volume example --size-bytes 2147483648 --plan
 ```
+
+`grow --size-bytes` is an absolute minimum LV size in bytes. LVM may round
+up to its extent size; an LV already at or above the target is left unchanged,
+and XFS growth is retried. Reuse the same target after a timeout or failure,
+including a failure after `lvextend` already changed the LV. The former
+`--add-bytes` option is rejected because a relative increase cannot identify
+a retry. Growth revalidates the live attachment before each mutation and
+never shrinks the LV or filesystem.
 
 Execution (Linux, root) then:
 

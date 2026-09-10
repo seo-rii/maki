@@ -45,7 +45,8 @@ pub struct GrowRequest {
     pub nbd_socket: String,
     pub vg_name: String,
     pub lv_name: String,
-    pub add_bytes: u64,
+    /// Absolute minimum LV size; reuse the same target when retrying.
+    pub target_bytes: u64,
     pub mountpoint: String,
 }
 
@@ -98,7 +99,7 @@ pub enum PlannedStep {
     LvExtend {
         vg_name: String,
         lv_name: String,
-        add_bytes: u64,
+        target_bytes: u64,
     },
     XfsGrowfs {
         mountpoint: String,
@@ -188,8 +189,8 @@ impl fmt::Display for PlannedStep {
             PlannedStep::LvExtend {
                 vg_name,
                 lv_name,
-                add_bytes,
-            } => write!(f, "lvextend -L +{add_bytes}b {vg_name}/{lv_name}"),
+                target_bytes,
+            } => write!(f, "lvextend -L {target_bytes}b {vg_name}/{lv_name}"),
             PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {mountpoint}"),
         }
     }
@@ -378,7 +379,7 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
             PlannedStep::LvExtend {
                 vg_name: request.vg_name.clone(),
                 lv_name: request.lv_name.clone(),
-                add_bytes: request.add_bytes,
+                target_bytes: request.target_bytes,
             },
             PlannedStep::XfsGrowfs {
                 mountpoint: request.mountpoint.clone(),

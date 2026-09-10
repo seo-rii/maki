@@ -19,7 +19,7 @@ fn usage() -> ExitCode {
                      [--vg <vg>] [--lv <lv>] [--mountpoint <dir>] [--socket <path>]
                      [--uuid <volume-uuid>] [--fs-uuid <xfs-uuid>] [--init-sentinel] [--plan]
   maki-attach detach --volume <v> [...]
-  maki-attach grow   --volume <v> --add-bytes <n> [...]
+  maki-attach grow   --volume <v> --size-bytes <n> [...]
 
 Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
 requires the volume UUID (config or --uuid); --plan prints the plan without it."
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
         "--socket",
         "--uuid",
         "--fs-uuid",
-        "--add-bytes",
+        "--size-bytes",
     ] {
         if let Some(value) = flag(&args, name) {
             if let Err(e) = config::check_argument(name, &value) {
@@ -101,7 +101,14 @@ fn main() -> ExitCode {
         "attach" => plan_attach(&request),
         "detach" => plan_detach(&request),
         "grow" => {
-            let Some(add) = flag(&args, "--add-bytes").and_then(|v| v.parse().ok()) else {
+            if args.iter().any(|arg| arg == "--add-bytes") {
+                eprintln!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
+                return ExitCode::from(2);
+            }
+            let Some(target) = flag(&args, "--size-bytes")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|size| *size > 0)
+            else {
                 return usage();
             };
             plan_grow(&GrowRequest {
@@ -110,7 +117,7 @@ fn main() -> ExitCode {
                 nbd_socket: request.nbd_socket.clone(),
                 vg_name: request.vg_name.clone(),
                 lv_name: request.lv_name.clone(),
-                add_bytes: add,
+                target_bytes: target,
                 mountpoint: request.mountpoint.clone(),
             })
         }
