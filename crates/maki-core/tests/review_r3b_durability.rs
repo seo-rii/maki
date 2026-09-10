@@ -28,7 +28,7 @@ use rand::{Rng, SeedableRng};
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{AttachError, Engine, EngineOptions};
+use maki_core::engine::{AttachError, Engine, EngineCacheConfig, EngineOptions};
 use maki_core::error::CoreError;
 use maki_format::geometry::Geometry;
 use maki_format::init;
@@ -65,13 +65,32 @@ fn superblock() -> Superblock {
 }
 
 async fn try_attach(backing: &Arc<CrashableBacking>) -> Result<Engine, AttachError> {
+    try_attach_with(backing, false).await
+}
+
+/// A deliberately tiny plaintext cache (a few units) so that hits, misses,
+/// evictions and version changes all happen constantly under the sweeps.
+fn cache_options(unit: u32, cache: bool) -> EngineOptions {
+    EngineOptions {
+        cache: cache.then(|| EngineCacheConfig {
+            max_bytes: 6 * unit as u64,
+            ttl: std::time::Duration::from_secs(3600),
+        }),
+        ..EngineOptions::default()
+    }
+}
+
+async fn try_attach_with(
+    backing: &Arc<CrashableBacking>,
+    cache: bool,
+) -> Result<Engine, AttachError> {
     if !backing.exists("superblock.a").unwrap() {
         init::create_volume(backing.as_ref(), superblock()).unwrap();
     }
     Engine::attach(
         backing.clone() as Arc<dyn Backing>,
         Arc::new(FakeCryptoProvider::new(UNIT)),
-        EngineOptions::default(),
+        cache_options(UNIT, cache),
     )
     .await
 }
@@ -188,7 +207,11 @@ struct Cycle {
 
 /// One seeded workload → crash/restart → recovery → oracle cycle set.
 async fn sweep(seed: u64, cycles: usize, sync_fault_permille: u32) {
-    sweep_verbose(seed, cycles, sync_fault_permille, None).await
+    sweep_verbose(seed, cycles, sync_fault_permille, None, false).await
+}
+
+async fn sweep_cached(seed: u64, cycles: usize, sync_fault_permille: u32) {
+    sweep_verbose(seed, cycles, sync_fault_permille, None, true).await
 }
 
 async fn sweep_verbose(
@@ -196,6 +219,7 @@ async fn sweep_verbose(
     cycles: usize,
     sync_fault_permille: u32,
     verbose: Option<&'static str>,
+    cache: bool,
 ) {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9).wrapping_add(0x1234));
     let backing = Arc::new(CrashableBacking::new().with_tearing(128));
@@ -203,7 +227,7 @@ async fn sweep_verbose(
     let mut maybe = Maybe::default();
     let mut stamp: u32 = 0;
     let mut trace = Trace::default();
-    let mut engine = attach(&backing).await;
+    let mut engine = try_attach_with(&backing, cache).await.unwrap();
 
     if sync_fault_permille > 0 {
         backing.set_fault_hook(Some(sync_fault_hook(
@@ -324,7 +348,7 @@ async fn sweep_verbose(
             trace.op("restart".into());
             format!("seed {seed} cycle {cycle_index} (restart)")
         };
-        engine = match try_attach(&backing).await {
+        engine = match try_attach_with(&backing, cache).await {
             Ok(engine) => engine,
             Err(e) => panic!(
                 "{what}: recovery refused the volume: {e}\n{}",
@@ -535,5 +559,249 @@ async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
             image(unit, stamp),
             "unit {unit}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent, partial-unit (read-modify-write) workloads.
+//
+// The sweeps above write whole units from one task. Real NBD traffic writes
+// 512-byte blocks inside 4 KiB crypto units from many callbacks at once, so
+// this sweep hands each writer task its own contiguous unit range, lets it
+// issue block-aligned sub-unit and multi-unit writes (FUA or not) and live
+// reads, while the main task issues FLUSH and checkpoints concurrently, then
+// cuts power or restarts and checks every unit against the oracle.
+
+const BIG_UNIT: u32 = 4096;
+const BLOCK: u64 = 512;
+const WRITERS: u64 = 4;
+const UNITS_PER_WRITER: u64 = 12;
+
+fn big_superblock() -> Superblock {
+    Superblock {
+        generation: 0,
+        volume_uuid: Uuid::from_u128(0xB16),
+        provider_type: "fake".into(),
+        crypto_compatibility_id: "test-profile-v1".into(),
+        key_identity: "k".into(),
+        geometry: Geometry::compute(
+            BLOCK as u32,
+            BIG_UNIT,
+            512,
+            BIG_UNIT + 8,
+            DEVICE_UNITS * BIG_UNIT as u64,
+            8 * BIG_UNIT as u64,
+        )
+        .unwrap(),
+        format_version: 1,
+        created_unix: 0,
+    }
+}
+
+async fn attach_big(backing: &Arc<CrashableBacking>, cache: bool) -> Arc<Engine> {
+    if !backing.exists("superblock.a").unwrap() {
+        init::create_volume(backing.as_ref(), big_superblock()).unwrap();
+    }
+    Arc::new(
+        Engine::attach(
+            backing.clone() as Arc<dyn Backing>,
+            Arc::new(FakeCryptoProvider::new(BIG_UNIT)),
+            cache_options(BIG_UNIT, cache),
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+/// What a writer task acknowledged, in order, for the main task's model.
+enum Ack {
+    Write { unit: u64, data: Vec<u8>, fua: bool },
+}
+
+async fn writer_task(
+    engine: Arc<Engine>,
+    seed: u64,
+    first_unit: u64,
+    initial: BTreeMap<u64, Vec<u8>>,
+    acks: tokio::sync::mpsc::UnboundedSender<Ack>,
+) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut expected = initial;
+    let last_unit = first_unit + UNITS_PER_WRITER;
+    let unit = BIG_UNIT as u64;
+    for step in 0..rng.random_range(10..40u32) {
+        if rng.random_bool(0.8) {
+            // Block-aligned range inside this task's units, up to 1.5 units.
+            let start_unit = rng.random_range(first_unit..last_unit);
+            let start = start_unit * unit + rng.random_range(0..unit / BLOCK) * BLOCK;
+            let max_len = (last_unit * unit - start).min(unit + unit / 2);
+            let len = rng.random_range(1..=max_len / BLOCK) * BLOCK;
+            let stamp = (seed as u32).wrapping_mul(1000).wrapping_add(step);
+            let data: Vec<u8> = (0..len)
+                .map(|i| (stamp.wrapping_mul(0x9E37_79B1) ^ (i as u32)).to_le_bytes()[1])
+                .collect();
+            let fua = rng.random_bool(0.25);
+            engine.write(start, &data, fua).await.unwrap();
+            // Compose the acknowledged unit images.
+            let first = start / unit;
+            let last = (start + len - 1) / unit;
+            for u in first..=last {
+                let image = expected
+                    .entry(u)
+                    .or_insert_with(|| vec![0u8; unit as usize]);
+                let unit_start = u * unit;
+                let from = start.max(unit_start) - unit_start;
+                let to = (start + len).min(unit_start + unit) - unit_start;
+                let src = start.max(unit_start) - start;
+                image[from as usize..to as usize]
+                    .copy_from_slice(&data[src as usize..src as usize + (to - from) as usize]);
+                let _ = acks.send(Ack::Write {
+                    unit: u,
+                    data: image.clone(),
+                    fua,
+                });
+            }
+        } else {
+            // Live read of a block range this task owns: must equal what it
+            // acknowledged (nobody else writes these units).
+            let u = rng.random_range(first_unit..last_unit);
+            let block = rng.random_range(0..unit / BLOCK);
+            let got = engine
+                .read(u * unit + block * BLOCK, BLOCK as usize)
+                .await
+                .unwrap();
+            let want = expected
+                .get(&u)
+                .map(|img| img[(block * BLOCK) as usize..((block + 1) * BLOCK) as usize].to_vec())
+                .unwrap_or_else(|| vec![0u8; BLOCK as usize]);
+            assert_eq!(
+                got, want,
+                "writer {seed}: live block read of unit {u} block {block}"
+            );
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC0DE);
+    let backing = Arc::new(CrashableBacking::new().with_tearing(256));
+    let mut model = ReferenceBlockModel::new(BIG_UNIT as usize, DEVICE_UNITS);
+    let mut maybe = Maybe::default();
+    let mut engine = attach_big(&backing, cache).await;
+
+    for cycle in 0..cycles {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let first_unit = w * UNITS_PER_WRITER;
+            let initial: BTreeMap<u64, Vec<u8>> = (first_unit..first_unit + UNITS_PER_WRITER)
+                .map(|u| (u, model.read(u)))
+                .collect();
+            tasks.push(tokio::spawn(writer_task(
+                engine.clone(),
+                seed * 100 + cycle as u64 * 10 + w,
+                first_unit,
+                initial,
+                tx.clone(),
+            )));
+        }
+        drop(tx);
+        // Barriers race the writers: a FLUSH covers what was acknowledged
+        // before it started; whatever is acknowledged afterwards stays
+        // pending in the model (the engine may make it durable too, which
+        // the oracle allows).
+        let apply = |model: &mut ReferenceBlockModel,
+                     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Ack>| {
+            while let Ok(Ack::Write { unit, data, fua }) = rx.try_recv() {
+                if fua {
+                    model.write_fua(unit, &data);
+                } else {
+                    model.write(unit, &data);
+                }
+            }
+        };
+        for _ in 0..rng.random_range(1..4) {
+            tokio::task::yield_now().await;
+            apply(&mut model, &mut rx);
+            if rng.random_bool(0.7) {
+                engine.flush().await.unwrap();
+                model.flush();
+            } else {
+                engine.checkpoint().await.unwrap();
+            }
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        apply(&mut model, &mut rx);
+
+        drop(engine);
+        let what = if rng.random_bool(0.7) {
+            backing.crash(&mut rng);
+            format!("seed {seed} cycle {cycle} (power loss)")
+        } else {
+            format!("seed {seed} cycle {cycle} (restart)")
+        };
+        engine = attach_big(&backing, cache).await;
+        let stats = engine.stats().await;
+        assert!(
+            stats.checkpoint_sequence <= stats.durable_sequence,
+            "{what}"
+        );
+        for unit in 0..DEVICE_UNITS {
+            let actual = engine
+                .read(unit * BIG_UNIT as u64, BIG_UNIT as usize)
+                .await
+                .unwrap();
+            if let Err(violation) = model.crash_adopt(unit, &actual) {
+                panic!("{what}: {violation}");
+            }
+        }
+        maybe.by_unit.clear();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_partial_unit_workloads_survive_power_loss_and_restart() {
+    for seed in 0..24u64 {
+        concurrent_sweep(seed, 3, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "release gate: long concurrent partial-unit durability sweep"]
+async fn phase_r3b_concurrent_gate_full() {
+    for seed in 0..300u64 {
+        concurrent_sweep(seed, 4, false).await;
+    }
+    for seed in 0..150u64 {
+        concurrent_sweep(seed, 4, true).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The same sweeps with the versioned plaintext cache enabled (a tiny one, so
+// eviction and version turnover are constant): a stale or mis-keyed cache
+// entry shows up as a live read that disagrees with the acknowledged value.
+
+#[tokio::test]
+async fn random_workloads_with_a_plaintext_cache_survive_power_loss_and_restart() {
+    for seed in 0..60u64 {
+        sweep_cached(seed, 4, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn random_workloads_with_a_plaintext_cache_and_sync_failures_never_show_foreign_data() {
+    for seed in 0..40u64 {
+        sweep_cached(seed, 4, 150).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_partial_unit_workloads_with_a_plaintext_cache() {
+    for seed in 0..12u64 {
+        concurrent_sweep(seed, 3, true).await;
     }
 }
