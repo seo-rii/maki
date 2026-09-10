@@ -134,6 +134,12 @@ fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
 /// that it does not reproduce `original`. An `Ok` response is shape-validated
 /// first (an empty or malformed success is a contract violation, never proof —
 /// FUP-009); a matching plaintext means the claimed binding is not enforced.
+///
+/// `explicit_rejection_ok` accepts a plain request rejection as honouring the
+/// binding: a provider may refuse an unsupported format version or a foreign
+/// compatibility id at the schema level instead of decrypting to garbage. It
+/// is not integrity evidence (FUP-009), only proof that the wrong context did
+/// not yield the plaintext (R3-006).
 async fn check_context_probe(
     provider: &dyn CryptoProvider,
     probe_context: &CryptoContext,
@@ -141,6 +147,7 @@ async fn check_context_probe(
     original: &SecretBuffer,
     caps: &CryptoCapabilities,
     what: &str,
+    explicit_rejection_ok: bool,
 ) -> Result<(), CryptoError> {
     match provider
         .decrypt_batch(probe_context, std::slice::from_ref(probe))
@@ -153,6 +160,15 @@ async fn check_context_probe(
                     "provider claims context binding but {what} decrypts to the original plaintext"
                 )));
             }
+            Ok(())
+        }
+        // A provider refuses a foreign compatibility id as provider-fatal
+        // (the local and reference providers do) and an unknown format
+        // version as a bad request: either way the wrong context yielded
+        // nothing.
+        Err(CryptoError::NonRetryableRequest(_) | CryptoError::ProviderFatal(_))
+            if explicit_rejection_ok =>
+        {
             Ok(())
         }
         Err(e) => classify_probe_err(e, what),
@@ -212,12 +228,13 @@ pub async fn provider_self_test(
     }
 
     // A claimed context binding is *exercised*, not trusted. The capability
-    // (per `CryptoContext`) binds the ciphertext to the whole context, so both
-    // the unit index and the volume UUID are probed: the same ciphertext under
-    // a different unit index, and under a different volume UUID, must not
-    // reproduce the original plaintext (FUP-011). Each probe distinguishes a
-    // definitive rejection / correct rebinding (pass) from an inconclusive
-    // transport error (quarantine) and an empty or malformed success (refuse).
+    // (per `CryptoContext`) binds the ciphertext to the whole context, so
+    // every field is probed: the same ciphertext under a different unit
+    // index, volume UUID, format version or compatibility id must not
+    // reproduce the original plaintext (FUP-011, R3-006). Each probe
+    // distinguishes a definitive rejection / correct rebinding (pass) from an
+    // inconclusive transport error (quarantine) and an empty or malformed
+    // success (refuse). The schema-level fields may also be refused outright.
     if caps.context_binding.present() {
         let mut moved_index = cts[0].clone();
         moved_index.unit_index = cts[0].unit_index.wrapping_add(1);
@@ -228,6 +245,7 @@ pub async fn provider_self_test(
             &items[0].data,
             &caps,
             "context-binding (unit index)",
+            false,
         )
         .await?;
 
@@ -241,6 +259,34 @@ pub async fn provider_self_test(
             &items[0].data,
             &caps,
             "context-binding (volume uuid)",
+            false,
+        )
+        .await?;
+
+        let mut other_format = context.clone();
+        other_format.format_version = context.format_version.wrapping_add(1);
+        check_context_probe(
+            provider,
+            &other_format,
+            &cts[0],
+            &items[0].data,
+            &caps,
+            "context-binding (format version)",
+            true,
+        )
+        .await?;
+
+        let mut other_profile = context.clone();
+        other_profile.crypto_compatibility_id =
+            format!("{}.selftest-probe", context.crypto_compatibility_id);
+        check_context_probe(
+            provider,
+            &other_profile,
+            &cts[0],
+            &items[0].data,
+            &caps,
+            "context-binding (compatibility id)",
+            true,
         )
         .await?;
     }

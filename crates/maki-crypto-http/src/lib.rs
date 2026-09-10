@@ -119,6 +119,8 @@ pub enum FieldSource {
     UnitIndex,
     VolumeId,
     CompatibilityId,
+    /// The volume's on-disk format version (part of the crypto context).
+    FormatVersion,
     BatchIndex,
 }
 
@@ -131,6 +133,7 @@ impl FieldSource {
             "unit_index" => Ok(Self::UnitIndex),
             "volume_id" => Ok(Self::VolumeId),
             "compatibility_id" => Ok(Self::CompatibilityId),
+            "format_version" => Ok(Self::FormatVersion),
             "batch_index" => Ok(Self::BatchIndex),
             other => Err(CryptoError::ProviderFatal(format!(
                 "unknown field source {other:?}"
@@ -391,6 +394,7 @@ impl HttpCryptoProvider {
             FieldSource::UnitIndex => Value::from(unit_index),
             FieldSource::VolumeId => Value::String(context.volume_uuid.to_string()),
             FieldSource::CompatibilityId => Value::String(context.crypto_compatibility_id.clone()),
+            FieldSource::FormatVersion => Value::from(u64::from(context.format_version)),
             FieldSource::BatchIndex => Value::from(batch_index as u64),
         }
     }

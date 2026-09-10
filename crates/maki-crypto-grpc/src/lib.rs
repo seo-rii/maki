@@ -38,6 +38,10 @@ pub struct CryptoBatchRequest {
     pub compatibility_id: String,
     #[prost(message, repeated, tag = "3")]
     pub items: Vec<CryptoItem>,
+    /// The volume's on-disk format version: part of the crypto context a
+    /// context-binding provider must tie ciphertext to (R3-006).
+    #[prost(uint32, tag = "4")]
+    pub format_version: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -190,6 +194,7 @@ impl GrpcCryptoProvider {
             volume_id: context.volume_uuid.to_string(),
             compatibility_id: context.crypto_compatibility_id.clone(),
             items,
+            format_version: context.format_version,
         };
 
         let mut grpc = tonic::client::Grpc::new(self.channel.clone())

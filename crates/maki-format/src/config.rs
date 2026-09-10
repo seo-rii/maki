@@ -423,7 +423,8 @@ fn d_json() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldMapping {
-    /// "payload", "unit_index", "volume_id", "compatibility_id", "batch_index".
+    /// "payload", "unit_index", "volume_id", "compatibility_id",
+    /// "format_version", "batch_index".
     pub source: String,
     #[serde(default)]
     pub encoding: Option<String>,

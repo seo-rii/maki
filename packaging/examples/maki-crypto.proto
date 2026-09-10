@@ -23,6 +23,10 @@ message CryptoBatchRequest {
   string volume_id = 1;
   string compatibility_id = 2;
   repeated CryptoItem items = 3;
+  // Volume format version. Together with volume_id and compatibility_id this
+  // is the crypto context; a provider declaring context binding MUST tie
+  // ciphertext to all three (Maki probes each field at attach).
+  uint32 format_version = 4;
 }
 
 message CryptoBatchResponse {

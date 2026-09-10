@@ -22,7 +22,7 @@ enum Mode {
 async fn response(request: &Value, seed: u8) -> Value {
     let context = maki_crypto::CryptoContext {
         volume_uuid: request["volume"].as_str().unwrap().parse().unwrap(),
-        format_version: 1,
+        format_version: request["format"].as_u64().unwrap() as u32,
         crypto_compatibility_id: request["profile"].as_str().unwrap().into(),
     };
     let provider = local(seed);
@@ -60,6 +60,12 @@ async fn response(request: &Value, seed: u8) -> Value {
     match result {
         Ok(items) => {
             json!({"id": request["id"], "items": items.into_iter().map(|(unit, data)| json!({"unit": unit, "data": base64::engine::general_purpose::STANDARD.encode(data)})).collect::<Vec<_>>() })
+        }
+        // A foreign compatibility id is refused as a plain bad request (the
+        // self-test's compatibility-id probe); only a failed authentication
+        // is an integrity error.
+        Err(CryptoError::ProviderFatal(_)) => {
+            json!({"id": request["id"], "error": {"class": "bad-request", "message": REMOTE_SECRET}})
         }
         Err(error) => {
             assert!(matches!(error, CryptoError::Integrity(_)), "{error}");

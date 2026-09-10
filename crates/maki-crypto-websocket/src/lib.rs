@@ -3,7 +3,10 @@
 //!
 //! Protocol: one JSON object per text frame.
 //! Request:  `{"id": n, "op": "encrypt"|"decrypt", "profile": …,
-//!             "volume": …, "items": [{"unit": u, "data": base64}, …]}`
+//!             "volume": …, "format": v,
+//!             "items": [{"unit": u, "data": base64}, …]}`
+//! (`profile`, `volume` and `format` are the crypto context a context-binding
+//! provider must tie ciphertext to.)
 //! Response: `{"id": n, "items": [{"data": base64}, …]}`
 //!        or `{"id": n, "error": {"class": …, "message": …}}`
 //! Integrity errors require `class: "integrity"` and a `reason` of exactly
@@ -402,6 +405,7 @@ impl WsCryptoProvider {
                 "op": op,
                 "profile": context.crypto_compatibility_id,
                 "volume": context.volume_uuid.to_string(),
+                "format": context.format_version,
                 "items": items
                     .iter()
                     .map(|(unit, data)| json!({"unit": unit, "data": b64(data)}))

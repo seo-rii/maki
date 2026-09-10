@@ -757,6 +757,17 @@ Retry safety: a provider whose capabilities do not declare `retry_safe` is
 sent each request at most once. No retry, failover, or transport-level resend
 happens after the request has been sent.
 
+Context on the wire: every request carries the whole crypto context — the
+volume UUID, the crypto compatibility ID and the format version. For HTTP
+these are the `volume_id`, `compatibility_id` and `format_version` field
+sources; for WebSocket the `volume`, `profile` and `format` request fields;
+for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
+`CryptoBatchRequest`. A provider that declares context binding MUST tie
+ciphertext to all of them. Maki's attach self-test probes each field
+separately (plus the unit index) and refuses attach when a foreign value
+decrypts to the original plaintext; an explicit rejection of an unsupported
+format version or compatibility ID is acceptable, a decrypt is not.
+
 ---
 
 # 19. HTTP Configuration Example
@@ -781,6 +792,14 @@ type = "json"
 
 "/volume" = {
     source = "volume_id"
+}
+
+"/profile" = {
+    source = "compatibility_id"
+}
+
+"/format" = {
+    source = "format_version"
 }
 
 [crypto.http.encrypt.response]
@@ -1836,6 +1855,7 @@ items_path = "/items"
 [crypto.http.encrypt.body.fields]
 "/volume" = { source = "volume_id" }
 "/profile" = { source = "compatibility_id" }
+"/format" = { source = "format_version" }
 
 [crypto.http.encrypt.body.item_fields]
 "/unit" = { source = "unit_index" }
@@ -1862,6 +1882,7 @@ items_path = "/items"
 [crypto.http.decrypt.body.fields]
 "/volume" = { source = "volume_id" }
 "/profile" = { source = "compatibility_id" }
+"/format" = { source = "format_version" }
 
 [crypto.http.decrypt.body.item_fields]
 "/unit" = { source = "unit_index" }

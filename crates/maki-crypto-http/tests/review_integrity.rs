@@ -23,8 +23,8 @@ fn authenticated(seed: u8) -> Handler {
         let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         let context = maki_crypto::CryptoContext {
             volume_uuid: value["volume"].as_str().unwrap().parse().unwrap(),
-            format_version: 1,
-            crypto_compatibility_id: PROFILE.into(),
+            format_version: value["format"].as_u64().unwrap() as u32,
+            crypto_compatibility_id: value["profile"].as_str().unwrap().into(),
         };
         let unit_index = value["unit"].as_u64().unwrap();
         let data = base64::engine::general_purpose::STANDARD
@@ -61,6 +61,13 @@ fn authenticated(seed: u8) -> Handler {
                 response.body = REMOTE_SECRET.as_bytes().to_vec();
                 response
             }
+            // A foreign compatibility id is a plain bad request (the
+            // self-test's compatibility-id probe), never an integrity error.
+            Err(CryptoError::ProviderFatal(_)) => {
+                let mut response = ResponseSpec::status(400);
+                response.body = REMOTE_SECRET.as_bytes().to_vec();
+                response
+            }
             Err(error) => panic!("unexpected fixture error: {error}"),
         }
     })
@@ -79,6 +86,8 @@ async fn provider(url: &str, timeout: Duration) -> HttpCryptoProvider {
                 ),
                 ("/unit".into(), FieldSource::UnitIndex),
                 ("/volume".into(), FieldSource::VolumeId),
+                ("/format".into(), FieldSource::FormatVersion),
+                ("/profile".into(), FieldSource::CompatibilityId),
             ],
             items_path: None,
             item_fields: vec![],

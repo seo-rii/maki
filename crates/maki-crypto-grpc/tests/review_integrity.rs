@@ -25,6 +25,9 @@ enum Mode {
 #[derive(Clone)]
 struct Server(Arc<Mutex<Mode>>);
 impl Server {
+    // `tonic::Status` is the wire error a real service returns; a test
+    // fixture does not box it.
+    #[allow(clippy::result_large_err)]
     async fn handle(
         &self,
         request: Request<CryptoBatchRequest>,
@@ -46,7 +49,7 @@ impl Server {
                 let message = request.into_inner();
                 let context = maki_crypto::CryptoContext {
                     volume_uuid: message.volume_id.parse().unwrap(),
-                    format_version: 1,
+                    format_version: message.format_version,
                     crypto_compatibility_id: message.compatibility_id,
                 };
                 let provider = local(seed);
@@ -90,6 +93,11 @@ impl Server {
                 result
                     .map(|items| CryptoBatchResponse { items })
                     .map_err(|error| {
+                        // A foreign compatibility id is a plain invalid
+                        // argument (the self-test's compatibility-id probe).
+                        if matches!(error, CryptoError::ProviderFatal(_)) {
+                            return Status::new(Code::InvalidArgument, REMOTE_SECRET);
+                        }
                         assert!(matches!(error, CryptoError::Integrity(_)), "{error}");
                         let mut status = Status::new(Code::FailedPrecondition, REMOTE_SECRET);
                         status

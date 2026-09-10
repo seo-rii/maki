@@ -57,6 +57,7 @@ items_path = "/items"
 [crypto.http.encrypt.body.fields]
 "/volume" = { source = "volume_id" }
 "/profile" = { source = "compatibility_id" }
+"/format" = { source = "format_version" }
 
 [crypto.http.encrypt.body.item_fields]
 "/unit" = { source = "unit_index" }
@@ -83,6 +84,7 @@ items_path = "/items"
 [crypto.http.decrypt.body.fields]
 "/volume" = { source = "volume_id" }
 "/profile" = { source = "compatibility_id" }
+"/format" = { source = "format_version" }
 
 [crypto.http.decrypt.body.item_fields]
 "/unit" = { source = "unit_index" }
