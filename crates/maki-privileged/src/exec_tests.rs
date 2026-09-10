@@ -1,4 +1,9 @@
 use super::*;
+
+/// Fixture directories are named by pid + wall clock; the clock can repeat
+/// within one process (coarse ticks), so a per-process sequence keeps them
+/// unique.
+static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
@@ -19,6 +24,8 @@ impl Fixture {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
+                | (u128::from(FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    << 96)
         ));
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
