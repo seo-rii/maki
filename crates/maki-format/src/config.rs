@@ -1516,6 +1516,31 @@ impl VolumeConfig {
                 })?;
                 validate_http_op("encrypt", encrypt)?;
                 validate_http_op("decrypt", decrypt)?;
+                // A provider can only bind ciphertext to a context it
+                // receives: a declared context binding needs every context
+                // field on the wire, or the attach self-test's probes fail
+                // late with a confusing "decrypts to the original plaintext"
+                // (R3-006). WebSocket and gRPC always send all three.
+                if crypto.capabilities.context_binding != "none" {
+                    for (name, op) in [("encrypt", encrypt), ("decrypt", decrypt)] {
+                        let sources: Vec<&str> = op
+                            .body
+                            .iter()
+                            .flat_map(|b| b.fields.values().chain(b.item_fields.values()))
+                            .map(|m| m.source.as_str())
+                            .collect();
+                        for required in ["volume_id", "compatibility_id", "format_version"] {
+                            if !sources.contains(&required) {
+                                return Err(invalid(format!(
+                                    "[crypto.http.{name}.body]: capabilities.context_binding = \
+                                     {:?} but no field has source = {required:?}; a provider \
+                                     cannot bind ciphertext to a context it never receives",
+                                    crypto.capabilities.context_binding
+                                )));
+                            }
+                        }
+                    }
+                }
                 if let Some(tls) = &http.tls {
                     validate_tls("http", tls)?;
                 }
