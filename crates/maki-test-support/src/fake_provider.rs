@@ -193,10 +193,9 @@ impl FakeCryptoProvider {
             return Err(err);
         }
         if context.crypto_compatibility_id != self.compat_id {
-            return Err(CryptoError::ProviderFatal(format!(
-                "crypto compatibility mismatch: volume={} provider={}",
-                context.crypto_compatibility_id, self.compat_id
-            )));
+            return Err(CryptoError::UnsupportedContext(
+                maki_crypto::ContextField::CompatibilityId,
+            ));
         }
         if items as u32 > self.max_batch_items {
             return Err(CryptoError::NonRetryableRequest(format!(

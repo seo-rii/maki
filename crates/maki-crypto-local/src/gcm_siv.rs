@@ -74,10 +74,9 @@ impl AesGcmSivProvider {
 
     fn check_context(&self, context: &CryptoContext) -> Result<(), CryptoError> {
         if context.crypto_compatibility_id != self.compatibility_id {
-            return Err(CryptoError::ProviderFatal(format!(
-                "crypto compatibility mismatch: context {:?}, provider {:?}",
-                context.crypto_compatibility_id, self.compatibility_id
-            )));
+            return Err(CryptoError::UnsupportedContext(
+                maki_crypto::ContextField::CompatibilityId,
+            ));
         }
         Ok(())
     }

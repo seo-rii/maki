@@ -156,20 +156,20 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
     CryptoError::Retryable(msg.to_string())
 }
 
-// Value silently overwrites duplicate object keys. Before an integrity
+// Value silently overwrites duplicate object keys. Before an error
 // frame can prove a negative self-test, deserialize its security-relevant
 // fields as structs, whose derived visitors reject duplicate fields. The
 // success path keeps its existing configurable payload parsing.
 #[derive(serde::Deserialize)]
-struct IntegrityEnvelope {
+struct ProbeErrorEnvelope {
     #[serde(rename = "id")]
     _id: u64,
     #[serde(rename = "error")]
-    _error: IntegrityFields,
+    _error: ProbeErrorFields,
 }
 
 #[derive(serde::Deserialize)]
-struct IntegrityFields {
+struct ProbeErrorFields {
     #[serde(rename = "class")]
     _class: String,
     #[serde(rename = "reason")]
@@ -248,12 +248,14 @@ impl WsCryptoProvider {
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
                             continue;
                         };
-                        let frame = if value.pointer("/error/class").and_then(Value::as_str)
-                            == Some("integrity")
-                            && serde_json::from_str::<IntegrityEnvelope>(&text).is_err()
+                        let frame = if matches!(
+                            value.pointer("/error/class").and_then(Value::as_str),
+                            Some("integrity" | "unsupported-context")
+                        ) && serde_json::from_str::<ProbeErrorEnvelope>(&text)
+                            .is_err()
                         {
                             Err(CryptoError::Contract(
-                                "remote crypto provider returned an invalid integrity envelope"
+                                "remote crypto provider returned an invalid probe error envelope"
                                     .into(),
                             ))
                         } else {
@@ -454,6 +456,17 @@ impl WsCryptoProvider {
                     ),
                     _ => CryptoError::Contract(
                         "remote crypto provider returned an unrecognized integrity reason".into(),
+                    ),
+                },
+                "unsupported-context" => match error.get("reason").and_then(Value::as_str) {
+                    Some("unsupported-format-version") => {
+                        CryptoError::UnsupportedContext(maki_crypto::ContextField::FormatVersion)
+                    }
+                    Some("unsupported-compatibility-id") => {
+                        CryptoError::UnsupportedContext(maki_crypto::ContextField::CompatibilityId)
+                    }
+                    _ => CryptoError::Contract(
+                        "remote crypto provider returned an unrecognized context refusal".into(),
                     ),
                 },
                 _ => CryptoError::ProviderFatal(

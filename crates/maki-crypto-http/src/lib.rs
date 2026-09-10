@@ -326,15 +326,23 @@ fn classify_status(
     if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
         let mut reasons = headers.get_all("maki-crypto-error").iter();
         if let (Some(reason), None) = (reasons.next(), reasons.next()) {
-            let message = match reason.as_bytes() {
-                b"auth-tag-mismatch" => {
-                    Some("remote crypto provider rejected the authentication tag")
-                }
-                b"context-mismatch" => Some("remote crypto provider rejected the crypto context"),
+            let error = match reason.as_bytes() {
+                b"auth-tag-mismatch" => Some(CryptoError::Integrity(
+                    "remote crypto provider rejected the authentication tag".into(),
+                )),
+                b"context-mismatch" => Some(CryptoError::Integrity(
+                    "remote crypto provider rejected the crypto context".into(),
+                )),
+                b"unsupported-format-version" => Some(CryptoError::UnsupportedContext(
+                    maki_crypto::ContextField::FormatVersion,
+                )),
+                b"unsupported-compatibility-id" => Some(CryptoError::UnsupportedContext(
+                    maki_crypto::ContextField::CompatibilityId,
+                )),
                 _ => None,
             };
-            if let Some(message) = message {
-                return Some(CryptoError::Integrity(message.into()));
+            if let Some(error) = error {
+                return Some(error);
             }
         }
     }

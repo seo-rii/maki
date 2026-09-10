@@ -765,8 +765,21 @@ for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
 `CryptoBatchRequest`. A provider that declares context binding MUST tie
 ciphertext to all of them. Maki's attach self-test probes each field
 separately (plus the unit index) and refuses attach when a foreign value
-decrypts to the original plaintext; an explicit rejection of an unsupported
-format version or compatibility ID is acceptable, a decrypt is not.
+decrypts to the original plaintext. A schema-level refusal is accepted only as
+`CryptoError::UnsupportedContext` for the exact field that probe changed:
+`FormatVersion` or `CompatibilityId`. A generic bad request, provider failure,
+or a refusal of another field does not prove context binding. Definitive
+`CryptoError::Integrity` or a valid changed plaintext also satisfies a context
+probe; an unavailable endpoint remains inconclusive.
+
+Explicit schema refusals use HTTP status `422` or gRPC status
+`FailedPrecondition` with exactly one `maki-crypto-error` header/metadata value:
+`unsupported-format-version` or `unsupported-compatibility-id`. WebSocket uses
+`error.class = "unsupported-context"` and one of the same `error.reason` values.
+Missing, unknown, duplicated, or conflicting classification fields are never
+context evidence. These tokens denote a field refusal, not an authentication
+failure; they cannot satisfy unit-index, volume-UUID, or tamper probes. Remote
+error text is ignored.
 
 ---
 

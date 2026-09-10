@@ -15,6 +15,17 @@ pub enum ErrorClass {
     ProviderFatal,
 }
 
+/// Context fields a provider may explicitly refuse to interpret. This is
+/// distinct from authentication failure and is evidence only when a self-test
+/// intentionally changes the same field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ContextField {
+    #[error("format version")]
+    FormatVersion,
+    #[error("compatibility id")]
+    CompatibilityId,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("retryable: {0}")]
@@ -27,6 +38,8 @@ pub enum CryptoError {
     EndpointFatal(String),
     #[error("provider fatal: {0}")]
     ProviderFatal(String),
+    #[error("unsupported crypto context: {0}")]
+    UnsupportedContext(ContextField),
     /// Ciphertext failed authentication/integrity verification.
     /// Corrupted encrypted data is never returned as plaintext (SPEC §12).
     #[error("integrity failure: {0}")]
@@ -45,7 +58,9 @@ impl CryptoError {
                 ErrorClass::NonRetryableRequest
             }
             CryptoError::EndpointFatal(_) => ErrorClass::EndpointFatal,
-            CryptoError::ProviderFatal(_) | CryptoError::Contract(_) => ErrorClass::ProviderFatal,
+            CryptoError::ProviderFatal(_)
+            | CryptoError::UnsupportedContext(_)
+            | CryptoError::Contract(_) => ErrorClass::ProviderFatal,
         }
     }
 
@@ -62,6 +77,7 @@ impl CryptoError {
             CryptoError::NonRetryableRequest(m) => CryptoError::NonRetryableRequest(m.clone()),
             CryptoError::EndpointFatal(m) => CryptoError::EndpointFatal(m.clone()),
             CryptoError::ProviderFatal(m) => CryptoError::ProviderFatal(m.clone()),
+            CryptoError::UnsupportedContext(field) => CryptoError::UnsupportedContext(*field),
             CryptoError::Integrity(m) => CryptoError::Integrity(m.clone()),
             CryptoError::Contract(m) => CryptoError::Contract(m.clone()),
         }

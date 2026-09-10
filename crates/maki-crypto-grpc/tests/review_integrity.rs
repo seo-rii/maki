@@ -4,7 +4,8 @@ mod common;
 
 use common::*;
 use maki_crypto::{
-    CiphertextUnit, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit, SecretBuffer,
+    CiphertextUnit, ContextField, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    SecretBuffer,
 };
 use maki_crypto_grpc::{
     CryptoBatchRequest, CryptoBatchResponse, CryptoItem, GrpcCryptoProvider, GrpcProviderSpec,
@@ -93,16 +94,20 @@ impl Server {
                 result
                     .map(|items| CryptoBatchResponse { items })
                     .map_err(|error| {
-                        // A foreign compatibility id is a plain invalid
-                        // argument (the self-test's compatibility-id probe).
-                        if matches!(error, CryptoError::ProviderFatal(_)) {
-                            return Status::new(Code::InvalidArgument, REMOTE_SECRET);
-                        }
-                        assert!(matches!(error, CryptoError::Integrity(_)), "{error}");
+                        let reason = match error {
+                            CryptoError::UnsupportedContext(ContextField::FormatVersion) => {
+                                "unsupported-format-version"
+                            }
+                            CryptoError::UnsupportedContext(ContextField::CompatibilityId) => {
+                                "unsupported-compatibility-id"
+                            }
+                            CryptoError::Integrity(_) => "auth-tag-mismatch",
+                            _ => panic!("unexpected fixture error: {error}"),
+                        };
                         let mut status = Status::new(Code::FailedPrecondition, REMOTE_SECRET);
                         status
                             .metadata_mut()
-                            .insert("maki-crypto-error", "auth-tag-mismatch".parse().unwrap());
+                            .insert("maki-crypto-error", reason.parse().unwrap());
                         status
                     })
             }
@@ -279,4 +284,58 @@ async fn grpc_timeout_remains_inconclusive_through_scheduler() {
 async fn authenticated_grpc_tamper_and_context_probes() {
     let (url, _) = server(Mode::Authenticated(1)).await;
     verify_probes(&provider(&url, Duration::from_secs(2)).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_context_refusals_require_exact_status_and_one_field() {
+    let (url, state) = server(Mode::Authenticated(1)).await;
+    let provider = provider(&url, Duration::from_secs(2)).await;
+    for (reason, field) in [
+        ("unsupported-format-version", ContextField::FormatVersion),
+        (
+            "unsupported-compatibility-id",
+            ContextField::CompatibilityId,
+        ),
+    ] {
+        *state.lock().unwrap() = Mode::Error(Code::FailedPrecondition, vec![reason.into()]);
+        let error = provider
+            .encrypt_batch(&context(), &[plaintext()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CryptoError::UnsupportedContext(got) if got == field),
+            "{error}"
+        );
+        assert_private(&error);
+    }
+    for (code, reasons) in [
+        (Code::InvalidArgument, vec!["unsupported-format-version"]),
+        (Code::Unavailable, vec!["unsupported-format-version"]),
+        (
+            Code::FailedPrecondition,
+            vec!["unsupported-format-version", "unsupported-format-version"],
+        ),
+        (
+            Code::FailedPrecondition,
+            vec!["unsupported-format-version", "unsupported-compatibility-id"],
+        ),
+        (
+            Code::FailedPrecondition,
+            vec!["unsupported-format-version, unsupported-compatibility-id"],
+        ),
+    ] {
+        *state.lock().unwrap() =
+            Mode::Error(code, reasons.into_iter().map(str::to_string).collect());
+        let error = provider
+            .encrypt_batch(&context(), &[plaintext()])
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(
+                error,
+                CryptoError::UnsupportedContext(_) | CryptoError::Integrity(_)
+            ),
+            "{error}"
+        );
+    }
 }

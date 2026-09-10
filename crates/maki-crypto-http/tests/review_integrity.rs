@@ -6,7 +6,8 @@ use base64::Engine as _;
 use common::*;
 use futures_util::FutureExt;
 use maki_crypto::{
-    CiphertextUnit, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit, SecretBuffer,
+    CiphertextUnit, ContextField, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    SecretBuffer,
 };
 use maki_crypto_http::{
     BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding, RespKind,
@@ -61,10 +62,15 @@ fn authenticated(seed: u8) -> Handler {
                 response.body = REMOTE_SECRET.as_bytes().to_vec();
                 response
             }
-            // A foreign compatibility id is a plain bad request (the
-            // self-test's compatibility-id probe), never an integrity error.
-            Err(CryptoError::ProviderFatal(_)) => {
-                let mut response = ResponseSpec::status(400);
+            Err(CryptoError::UnsupportedContext(field)) => {
+                let reason = match field {
+                    ContextField::FormatVersion => "unsupported-format-version",
+                    ContextField::CompatibilityId => "unsupported-compatibility-id",
+                };
+                let mut response = ResponseSpec::status(422);
+                response
+                    .headers
+                    .push(("maki-crypto-error".into(), reason.into()));
                 response.body = REMOTE_SECRET.as_bytes().to_vec();
                 response
             }
@@ -214,4 +220,69 @@ async fn http_timeout_remains_inconclusive_through_scheduler() {
 async fn authenticated_http_tamper_and_context_probes() {
     let server = TestServer::start(authenticated(1)).await;
     verify_probes(&provider_for(&server).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_context_refusals_require_exact_status_and_one_field() {
+    let server = TestServer::start(Arc::new(|_| ResponseSpec::status(400))).await;
+    let provider = provider_for(&server).await;
+    for (reason, field) in [
+        ("unsupported-format-version", ContextField::FormatVersion),
+        (
+            "unsupported-compatibility-id",
+            ContextField::CompatibilityId,
+        ),
+    ] {
+        let response = ResponseSpec {
+            headers: vec![("maki-crypto-error".into(), reason.into())],
+            body: REMOTE_SECRET.as_bytes().to_vec(),
+            ..ResponseSpec::status(422)
+        };
+        server.set_handler(Arc::new(move |_| response.clone()));
+        let error = provider
+            .encrypt_batch(&context(), &[plaintext()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CryptoError::UnsupportedContext(got) if got == field),
+            "{error}"
+        );
+        assert_private(&error);
+    }
+    for (status, reasons) in [
+        (400, vec!["unsupported-format-version"]),
+        (503, vec!["unsupported-format-version"]),
+        (
+            422,
+            vec!["unsupported-format-version", "unsupported-format-version"],
+        ),
+        (
+            422,
+            vec!["unsupported-format-version", "unsupported-compatibility-id"],
+        ),
+        (
+            422,
+            vec!["unsupported-format-version, unsupported-compatibility-id"],
+        ),
+    ] {
+        let response = ResponseSpec {
+            headers: reasons
+                .into_iter()
+                .map(|r| ("maki-crypto-error".into(), r.into()))
+                .collect(),
+            ..ResponseSpec::status(status)
+        };
+        server.set_handler(Arc::new(move |_| response.clone()));
+        let error = provider
+            .encrypt_batch(&context(), &[plaintext()])
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(
+                error,
+                CryptoError::UnsupportedContext(_) | CryptoError::Integrity(_)
+            ),
+            "{error}"
+        );
+    }
 }

@@ -12,7 +12,8 @@ use async_trait::async_trait;
 
 use maki_crypto::selftest::provider_self_test;
 use maki_crypto::{
-    CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
+    CiphertextUnit, ContextField, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
+    PlaintextUnit,
 };
 use maki_test_support::fake_provider::FakeCryptoProvider;
 
@@ -90,15 +91,18 @@ async fn context_binding_selftest_exercises_compatibility_id() {
 }
 
 /// A provider that refuses a foreign format version or compatibility id with
-/// a plain request error (rather than decrypting to garbage) is honouring the
+/// an explicit field refusal (rather than decrypting to garbage) is honouring the
 /// binding: the probes must accept an explicit rejection.
 struct RejectsForeignContext(Arc<FakeCryptoProvider>);
 
 impl RejectsForeignContext {
     fn check(context: &CryptoContext) -> Result<(), CryptoError> {
-        if context.format_version != 1 || context.crypto_compatibility_id != PROFILE {
-            return Err(CryptoError::NonRetryableRequest(
-                "unsupported crypto context".into(),
+        if context.format_version != 1 {
+            return Err(CryptoError::UnsupportedContext(ContextField::FormatVersion));
+        }
+        if context.crypto_compatibility_id != PROFILE {
+            return Err(CryptoError::UnsupportedContext(
+                ContextField::CompatibilityId,
             ));
         }
         Ok(())

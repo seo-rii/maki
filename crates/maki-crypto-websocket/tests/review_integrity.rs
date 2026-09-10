@@ -6,7 +6,8 @@ use base64::Engine as _;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use maki_crypto::{
-    CiphertextUnit, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit, SecretBuffer,
+    CiphertextUnit, ContextField, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    SecretBuffer,
 };
 use maki_crypto_websocket::{WsCryptoProvider, WsProviderSpec};
 use serde_json::{json, Value};
@@ -61,11 +62,12 @@ async fn response(request: &Value, seed: u8) -> Value {
         Ok(items) => {
             json!({"id": request["id"], "items": items.into_iter().map(|(unit, data)| json!({"unit": unit, "data": base64::engine::general_purpose::STANDARD.encode(data)})).collect::<Vec<_>>() })
         }
-        // A foreign compatibility id is refused as a plain bad request (the
-        // self-test's compatibility-id probe); only a failed authentication
-        // is an integrity error.
-        Err(CryptoError::ProviderFatal(_)) => {
-            json!({"id": request["id"], "error": {"class": "bad-request", "message": REMOTE_SECRET}})
+        Err(CryptoError::UnsupportedContext(field)) => {
+            let reason = match field {
+                ContextField::FormatVersion => "unsupported-format-version",
+                ContextField::CompatibilityId => "unsupported-compatibility-id",
+            };
+            json!({"id": request["id"], "error": {"class": "unsupported-context", "reason": reason, "message": REMOTE_SECRET}})
         }
         Err(error) => {
             assert!(matches!(error, CryptoError::Integrity(_)), "{error}");
@@ -207,4 +209,43 @@ async fn websocket_timeout_remains_inconclusive_through_scheduler() {
 async fn authenticated_websocket_tamper_and_context_probes() {
     let (url, _) = server(Mode::Authenticated(1)).await;
     verify_probes(&provider(&url, Duration::from_secs(2)).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_context_refusals_require_an_unambiguous_field() {
+    let (url, state) = server(Mode::Authenticated(1)).await;
+    let provider = provider(&url, Duration::from_secs(2)).await;
+    for (reason, field) in [
+        ("unsupported-format-version", ContextField::FormatVersion),
+        (
+            "unsupported-compatibility-id",
+            ContextField::CompatibilityId,
+        ),
+    ] {
+        *state.lock().unwrap() = Mode::Error(
+            json!({"class":"unsupported-context", "reason":reason, "message":REMOTE_SECRET})
+                .to_string(),
+        );
+        let error = provider
+            .encrypt_batch(&context(), &[plaintext()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CryptoError::UnsupportedContext(got) if got == field),
+            "{error}"
+        );
+        assert_private(&error);
+    }
+    for error in [
+        json!({"class":"bad-request", "reason":"unsupported-format-version"}).to_string(),
+        json!({"class":"unsupported-context", "reason":"context-mismatch"}).to_string(),
+        json!({"class":"unsupported-context", "reason":null}).to_string(),
+        r#"{"class":"unsupported-context","reason":"unsupported-format-version","reason":"unsupported-format-version"}"#.into(),
+        r#"{"class":"unsupported-context","reason":"unsupported-format-version","reason":"unsupported-compatibility-id"}"#.into(),
+        r#"{"class":"bad-request","class":"unsupported-context","reason":"unsupported-format-version"}"#.into(),
+    ] {
+        *state.lock().unwrap() = Mode::Error(error);
+        let error = provider.encrypt_batch(&context(), &[plaintext()]).await.unwrap_err();
+        assert!(!matches!(error, CryptoError::UnsupportedContext(_) | CryptoError::Integrity(_)), "{error}");
+    }
 }
