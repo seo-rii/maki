@@ -146,7 +146,11 @@ fn ordinary_exit_status_and_captured_output_are_preserved() {
 #[test]
 #[ignore = "subprocess fixture, invoked explicitly by the command tests"]
 fn child_fixture() {
-    let scenario = std::env::var("MAKI_COMMAND_SCENARIO").unwrap();
+    // The release gate runs every ignored test directly (`-- --ignored`);
+    // invoked without a driving test there is nothing to do.
+    let Ok(scenario) = std::env::var("MAKI_COMMAND_SCENARIO") else {
+        return;
+    };
     let directory = PathBuf::from(std::env::var_os("MAKI_COMMAND_FIXTURE_DIR").unwrap());
     std::fs::write(directory.join("parent"), std::process::id().to_string()).unwrap();
     match scenario.as_str() {
