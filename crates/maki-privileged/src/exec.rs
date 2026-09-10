@@ -409,6 +409,13 @@ trait System {
     fn allocate(&mut self) -> Result<String, ExecError>;
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation>;
+    fn rollback_observation(
+        &self,
+        record: &BoundDeviceRecord,
+        _allow_missing_sentinel: bool,
+    ) -> io::Result<DetachObservation> {
+        self.detach_observation(record)
+    }
 }
 
 struct LinuxSystem;
@@ -446,6 +453,19 @@ impl System for LinuxSystem {
             record,
             &std::fs::read_to_string("/proc/self/mountinfo")?,
             Path::new("/sys/class/block"),
+        )
+    }
+
+    fn rollback_observation(
+        &self,
+        record: &BoundDeviceRecord,
+        allow_missing_sentinel: bool,
+    ) -> io::Result<DetachObservation> {
+        crate::detach::observe_rollback(
+            record,
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            Path::new("/sys/class/block"),
+            allow_missing_sentinel,
         )
     }
 }
@@ -526,11 +546,12 @@ fn attach_rollback(
     record: &BoundDeviceRecord,
     system: &mut impl System,
     rolled_back: &mut usize,
+    allow_missing_sentinel: bool,
 ) -> bool {
     // Each successful step removes one of at most three layers; the bound just
     // guards against an observation that never converges.
     for _ in 0..16 {
-        let observed = match system.detach_observation(record) {
+        let observed = match system.rollback_observation(record, allow_missing_sentinel) {
             Ok(o) => o,
             Err(e) => {
                 tracing::error!("maki-attach: rollback halted, live state unreadable: {e}");
@@ -665,10 +686,12 @@ fn execute_with(
     // held against the same trusted record and serialized under the attach
     // lock as attach/detach, or it could extend an unrelated volume group,
     // or run while a detach is in flight (BUG-018).
-    let grows = plan
-        .steps
-        .iter()
-        .any(|s| matches!(s, PlannedStep::LvExtend { .. } | PlannedStep::XfsGrowfs { .. }));
+    let grows = plan.steps.iter().any(|s| {
+        matches!(
+            s,
+            PlannedStep::LvExtend { .. } | PlannedStep::XfsGrowfs { .. }
+        )
+    });
     let mut record = None;
     if connects || disconnects || grows {
         let state = state.ok_or_else(|| identity_error("attach state lock is required"))?;
@@ -758,6 +781,15 @@ fn execute_with(
             device,
             connection_id: format!("maki-{}", nonce.trim()),
         };
+        // A new operation owns only resources it creates. Refuse an already
+        // mounted target, active VG, or holder before connecting or publishing
+        // a record that could later authorize their rollback.
+        let before = system.detach_observation(&prepared)?;
+        if before.mounted || before.vg_active || before.nbd_in_use {
+            return Err(identity_error(
+                "new attachment has pre-existing mounts, mappings, or holders; refusing to adopt them",
+            ));
+        }
         // Persist the unique identity before connecting: process death
         // cannot leave an unrecorded connection or authorize a later reuse
         // of the same /dev/nbdN by a different attachment.
@@ -806,7 +838,15 @@ fn execute_with(
             // detach is resumed on the next attempt, never rolled back.
             let mut rolled_back = 0usize;
             let clean = if connects {
-                attach_rollback(&plan, record.as_ref().unwrap(), system, &mut rolled_back)
+                attach_rollback(
+                    &plan,
+                    record.as_ref().unwrap(),
+                    system,
+                    &mut rolled_back,
+                    plan.steps
+                        .iter()
+                        .any(|s| matches!(s, PlannedStep::WriteSentinel { .. })),
+                )
             } else {
                 true
             };

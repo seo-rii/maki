@@ -78,6 +78,7 @@ struct FakeSystem {
     foreign_vg: bool,
     extra_holders: bool,
     observation_error: bool,
+    observation_error_after: Option<&'static str>,
     backend_fault_after: Option<(&'static str, BackendFault)>,
 }
 
@@ -153,6 +154,9 @@ impl System for FakeSystem {
 
     fn detach_observation(&self, _record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         if self.observation_error
+            || self
+                .observation_error_after
+                .is_some_and(|step| self.steps.contains(&step))
             || (self.mounted && self.foreign_mount)
             || (self.vg_active && self.foreign_vg)
         {
@@ -734,7 +738,7 @@ fn followup_observation_failure_after_activation_must_not_disconnect() {
     let _lock = state.lock().unwrap();
     let mut system = FakeSystem {
         fail_after_at: Some("lvm-activate"),
-        observation_error: true,
+        observation_error_after: Some("lvm-activate"),
         ..Default::default()
     };
     assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
@@ -964,11 +968,134 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
     );
 
     let result = execute_with(&plan_attach(&request), Some(&state), &mut system);
-    assert!(system.inner.steps.contains(&"verify-mount-device"));
+    assert!(
+        !system.inner.steps.contains(&"nbd-connect"),
+        "foreign topology must fail before connecting"
+    );
     assert!(
         result.is_err() && read_sentinel(&request.mountpoint).is_none(),
         "attach accepted/initialized a non-NBD filesystem: result={result:?}, sentinel={:?}; commands={:?}",
         read_sentinel(&request.mountpoint),
         system.inner.steps
     );
+}
+
+// Audit fixtures: production observer + production executor; no real commands.
+struct ObservedSystem {
+    fake: FakeSystem,
+    sysfs: PathBuf,
+}
+
+impl System for ObservedSystem {
+    fn run_step(&mut self, step: &PlannedStep, id: Option<&str>) -> Result<(), ExecError> {
+        let result = self.fake.run_step(step, id);
+        let dm = self.sysfs.join("dm-0");
+        if self.fake.vg_active {
+            std::fs::create_dir_all(dm.join("dm")).unwrap();
+            std::fs::create_dir_all(dm.join("slaves")).unwrap();
+            std::fs::write(dm.join("dm/name"), "vg_maki_pg-data\n").unwrap();
+            std::fs::write(dm.join("dm/uuid"), "LVM-audit\n").unwrap();
+            std::fs::write(dm.join("dev"), "253:0\n").unwrap();
+            std::fs::write(dm.join("slaves/nbd3"), "").unwrap();
+            std::fs::write(self.sysfs.join("nbd3/holders/dm-0"), "").unwrap();
+        } else {
+            let _ = std::fs::remove_dir_all(dm);
+            let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-0"));
+        }
+        result
+    }
+    fn wait_ready(&mut self, s: &PlannedStep, d: &str) -> Result<(), ExecError> {
+        self.fake.wait_ready(s, d)
+    }
+    fn allocate(&mut self) -> Result<String, ExecError> {
+        self.fake.allocate()
+    }
+    fn backend(&self, d: &str) -> io::Result<Option<String>> {
+        self.fake.backend(d)
+    }
+    fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        self.rollback_observation(record, false)
+    }
+    fn rollback_observation(
+        &self,
+        record: &BoundDeviceRecord,
+        allow_missing: bool,
+    ) -> io::Result<DetachObservation> {
+        let mounts = if self.fake.mounted {
+            format!(
+                "40 25 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+                record.attachment.mountpoint
+            )
+        } else {
+            String::new()
+        };
+        crate::detach::observe_rollback(record, &mounts, &self.sysfs, allow_missing)
+    }
+}
+
+fn mount_failure_after_effect(existing_sentinel: bool) {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut req = request();
+    req.init_sentinel = true;
+    req.mountpoint = fixture.0.join("mount").to_str().unwrap().to_string();
+    std::fs::create_dir(&req.mountpoint).unwrap();
+    if existing_sentinel {
+        std::fs::write(
+            Path::new(&req.mountpoint).join(SENTINEL_FILE),
+            &req.volume_uuid,
+        )
+        .unwrap();
+    }
+    let sysfs = fixture.0.join("sys");
+    std::fs::create_dir_all(sysfs.join("nbd3/holders")).unwrap();
+    std::fs::write(sysfs.join("nbd3/dev"), "43:3\n").unwrap();
+    let mut system = ObservedSystem {
+        fake: FakeSystem {
+            fail_after_at: Some("mount-xfs"),
+            ..Default::default()
+        },
+        sysfs,
+    };
+    let result = execute_with(&plan_attach(&req), Some(&state), &mut system);
+    let record_present = state.read("pg").unwrap().is_some();
+    assert!(result.is_err(), "must inject failure after mount effect");
+    assert!(!system.fake.mounted && !system.fake.vg_active && system.fake.backends.is_empty() && !record_present,
+        "first-attach rollback must recover its own verified mount even before sentinel publication");
+}
+
+#[test]
+fn existing_sentinel_allows_real_observer_rollback() {
+    mount_failure_after_effect(true);
+}
+#[test]
+fn missing_initial_sentinel_does_not_strand_our_mount() {
+    mount_failure_after_effect(false);
+}
+
+#[test]
+fn a_new_attach_does_not_adopt_unrecorded_live_resources() {
+    for layer in ["mount", "vg", "holder"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut req = request();
+        req.nbd_device = "/dev/nbd3".into();
+        req.init_sentinel = true;
+        let mut system = FakeSystem {
+            mounted: layer == "mount",
+            vg_active: layer == "vg",
+            extra_holders: layer == "holder",
+            ..Default::default()
+        };
+        let result = execute_with(&plan_attach(&req), Some(&state), &mut system);
+        assert!(result.is_err(), "adopted unrecorded {layer}");
+        assert!(
+            system.steps.is_empty(),
+            "modified unrecorded {layer}: {:?}",
+            system.steps
+        );
+        assert!(state.read("pg").unwrap().is_none());
+    }
 }
