@@ -31,8 +31,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::OnceCell;
 
 use crate::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
+use crate::checked::{validate_decrypt_result, validate_encrypt_result};
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
 use crate::flow::DualSemaphore;
@@ -161,6 +163,7 @@ pub struct EndpointSet {
     config: DispatchConfig,
     metrics: DispatchMetrics,
     validator: Option<EndpointValidator>,
+    caps: OnceCell<CryptoCapabilities>,
 }
 
 enum Request<'a> {
@@ -258,7 +261,90 @@ impl EndpointSet {
             config,
             metrics: DispatchMetrics::default(),
             validator,
+            caps: OnceCell::new(),
         }
+    }
+
+    /// Freeze the contract across all configured peers, including ones that
+    /// are quarantined. Promotion must never lower the serving limits.
+    async fn common_caps(&self) -> Result<&CryptoCapabilities, CryptoError> {
+        self.caps
+            .get_or_try_init(|| async {
+                let first = self
+                    .endpoints
+                    .iter()
+                    .position(|e| e.validated.load(Ordering::SeqCst))
+                    .expect("EndpointSet requires a validated endpoint");
+                let mut common = self.endpoints[first].provider.capabilities().await?;
+                // Preserve the validated endpoint's identity, while including
+                // the limits of every compatible peer that might later serve.
+                for index in std::iter::once(first)
+                    .chain((0..self.endpoints.len()).filter(|index| *index != first))
+                {
+                    let endpoint = &self.endpoints[index];
+                    let caps = if index == first {
+                        common.clone()
+                    } else {
+                        endpoint.provider.capabilities().await?
+                    };
+                    if caps.crypto_compatibility_id != common.crypto_compatibility_id {
+                        if !endpoint.validated.load(Ordering::SeqCst) {
+                            // A known incompatible peer cannot serve under
+                            // this contract, even if its validator is lax.
+                            endpoint.rejected.store(true, Ordering::SeqCst);
+                            continue;
+                        }
+                        return Err(CryptoError::Contract(format!(
+                            "endpoint {:?} reports compatibility id {:?}, the set requires {:?}",
+                            endpoint.name,
+                            caps.crypto_compatibility_id,
+                            common.crypto_compatibility_id
+                        )));
+                    }
+                    if caps.batch.max_items == 0
+                        || caps.batch.max_bytes == 0
+                        || caps.max_ciphertext_size == 0
+                        || caps.supported_plaintext_sizes.is_empty()
+                        || caps.supported_plaintext_sizes.contains(&0)
+                    {
+                        return Err(CryptoError::ProviderFatal(format!(
+                            "endpoint {:?} advertises an empty crypto contract",
+                            endpoint.name
+                        )));
+                    }
+                    if index != first {
+                        common = common.intersect(&caps);
+                    }
+                }
+                common.supported_plaintext_sizes.sort_unstable();
+                common.supported_plaintext_sizes.dedup();
+                if !common.batch.supported {
+                    common.batch.max_items = 1;
+                }
+                Ok(common)
+            })
+            .await
+    }
+
+    async fn common_caps_with_deadline(
+        &self,
+        deadline: Option<Duration>,
+    ) -> Result<&CryptoCapabilities, CryptoError> {
+        let Some(deadline) = deadline else {
+            return self.common_caps().await;
+        };
+        let remaining = deadline.saturating_sub(self.clock.now());
+        if !remaining.is_zero() {
+            let timer = self.clock.sleep(remaining);
+            tokio::select! {
+                result = self.common_caps() => return result,
+                _ = timer => {}
+            }
+        }
+        self.metrics
+            .deadline_exceeded
+            .fetch_add(1, Ordering::SeqCst);
+        Err(deadline_error())
     }
 
     pub fn metrics(&self) -> &DispatchMetrics {
@@ -473,13 +559,10 @@ impl EndpointSet {
         &self,
         context: &CryptoContext,
         request: Request<'_>,
+        deadline: Option<Duration>,
+        retry_safe: bool,
     ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
-        let started = self.clock.now();
-        let deadline = self
-            .config
-            .max_operation_time
-            .map(|d| started.saturating_add(d));
         let mut calls_made = 0u32;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
@@ -517,7 +600,7 @@ impl EndpointSet {
                 };
                 if calls_made > 0 {
                     // A re-send of a request that already reached a provider.
-                    if !self.config.retry_safe {
+                    if !retry_safe {
                         self.metrics
                             .retries_refused_unsafe
                             .fetch_add(1, Ordering::SeqCst);
@@ -575,7 +658,7 @@ impl EndpointSet {
                                         return Err(last_error.unwrap());
                                     }
                                 }
-                                if !self.config.retry_safe {
+                                if !retry_safe {
                                     // The request may have reached the
                                     // provider: never send it again.
                                     self.metrics
@@ -618,40 +701,7 @@ impl CryptoProvider for EndpointSet {
     }
 
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        // The set is one provider made of several: a batch built against
-        // this contract can be routed to any endpoint — including a
-        // quarantined one admitted later without callers re-reading the
-        // contract — so report the intersection over all of them, never one
-        // endpoint's own (review R3-004). Identity fields come from a
-        // validated endpoint; the cross-endpoint self-test proves the
-        // compatibility ids agree.
-        let first = self
-            .endpoints
-            .iter()
-            .position(|e| e.validated.load(Ordering::SeqCst))
-            .unwrap_or(0);
-        let mut merged = self.endpoints[first].provider.capabilities().await?;
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
-            if index == first {
-                continue;
-            }
-            let caps = endpoint.provider.capabilities().await?;
-            if caps.crypto_compatibility_id != merged.crypto_compatibility_id {
-                if !endpoint.validated.load(Ordering::SeqCst) {
-                    // Quarantined and not interchangeable: the validator
-                    // will never admit it, so it cannot serve a batch.
-                    continue;
-                }
-                // A serving endpoint that is not interchangeable: there is
-                // no contract for the set.
-                return Err(CryptoError::Contract(format!(
-                    "endpoint {:?} reports compatibility id {:?}, the set requires {:?}",
-                    endpoint.name, caps.crypto_compatibility_id, merged.crypto_compatibility_id
-                )));
-            }
-            merged = merged.intersect(&caps);
-        }
-        Ok(merged)
+        Ok(self.common_caps().await?.clone())
     }
 
     async fn encrypt_batch(
@@ -659,10 +709,52 @@ impl CryptoProvider for EndpointSet {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        match self.dispatch(context, Request::Encrypt(items)).await? {
-            Response::Encrypted(out) => Ok(out),
-            Response::Decrypted(_) => unreachable!(),
+        let deadline = self
+            .config
+            .max_operation_time
+            .map(|d| self.clock.now().saturating_add(d));
+        let caps = self.common_caps_with_deadline(deadline).await?;
+        // Validate the entire input before sending even the first chunk.
+        if items.iter().any(|item| {
+            !caps.accepts_plaintext_size(item.data.len())
+                || item.data.len() as u64 > caps.batch.max_bytes
+        }) {
+            return Err(CryptoError::NonRetryableRequest(
+                "plaintext unit exceeds the common endpoint contract".into(),
+            ));
         }
+        let mut out = Vec::with_capacity(items.len());
+        let mut start = 0;
+        while start < items.len() {
+            let mut end = start;
+            let mut bytes = 0u64;
+            while end < items.len() && end - start < caps.batch.max_items as usize {
+                let size = items[end].data.len() as u64;
+                if size > caps.batch.max_bytes - bytes {
+                    break;
+                }
+                bytes += size;
+                end += 1;
+            }
+            let chunk = &items[start..end];
+            match self
+                .dispatch(
+                    context,
+                    Request::Encrypt(chunk),
+                    deadline,
+                    self.config.retry_safe && caps.retry_safe,
+                )
+                .await?
+            {
+                Response::Encrypted(mut result) => {
+                    validate_encrypt_result(chunk, &result, caps)?;
+                    out.append(&mut result);
+                }
+                Response::Decrypted(_) => unreachable!(),
+            }
+            start = end;
+        }
+        Ok(out)
     }
 
     async fn decrypt_batch(
@@ -670,9 +762,49 @@ impl CryptoProvider for EndpointSet {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        match self.dispatch(context, Request::Decrypt(items)).await? {
-            Response::Decrypted(out) => Ok(out),
-            Response::Encrypted(_) => unreachable!(),
+        let deadline = self
+            .config
+            .max_operation_time
+            .map(|d| self.clock.now().saturating_add(d));
+        let caps = self.common_caps_with_deadline(deadline).await?;
+        if items
+            .iter()
+            .any(|item| item.data.is_empty() || item.data.len() > caps.max_ciphertext_size as usize)
+        {
+            return Err(CryptoError::NonRetryableRequest(
+                "ciphertext unit exceeds the common endpoint contract".into(),
+            ));
         }
+        // Ciphertext length is not plaintext length. Without a pinned volume
+        // size, reserve the largest common plaintext size for every item.
+        let logical_size = u64::from(*caps.supported_plaintext_sizes.last().ok_or_else(|| {
+            CryptoError::NonRetryableRequest("endpoints have no common plaintext unit size".into())
+        })?);
+        let chunk_size =
+            (caps.batch.max_bytes / logical_size).min(u64::from(caps.batch.max_items)) as usize;
+        if chunk_size == 0 {
+            return Err(CryptoError::NonRetryableRequest(
+                "plaintext unit exceeds the common endpoint batch byte limit".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for chunk in items.chunks(chunk_size) {
+            match self
+                .dispatch(
+                    context,
+                    Request::Decrypt(chunk),
+                    deadline,
+                    self.config.retry_safe && caps.retry_safe,
+                )
+                .await?
+            {
+                Response::Decrypted(mut result) => {
+                    validate_decrypt_result(chunk, &result, caps)?;
+                    out.append(&mut result);
+                }
+                Response::Encrypted(_) => unreachable!(),
+            }
+        }
+        Ok(out)
     }
 }
