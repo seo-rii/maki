@@ -618,14 +618,27 @@ impl CryptoProvider for EndpointSet {
     }
 
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        // Endpoints are interchangeable (verified by the cross-endpoint
-        // self-test); report a validated one's contract.
-        let endpoint = self
+        // The set is one provider made of several: a batch built against
+        // this contract can be routed to any endpoint — including a
+        // quarantined one admitted later without callers re-reading the
+        // contract — so report the intersection over all of them, never one
+        // endpoint's own (review R3-004). Identity fields come from a
+        // validated endpoint; the cross-endpoint self-test proves the
+        // compatibility ids agree.
+        let first = self
             .endpoints
             .iter()
-            .find(|e| e.validated.load(Ordering::SeqCst))
-            .unwrap_or(&self.endpoints[0]);
-        endpoint.provider.capabilities().await
+            .position(|e| e.validated.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let mut merged = self.endpoints[first].provider.capabilities().await?;
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if index == first {
+                continue;
+            }
+            let caps = endpoint.provider.capabilities().await?;
+            merged = merged.intersect(&caps);
+        }
+        Ok(merged)
     }
 
     async fn encrypt_batch(

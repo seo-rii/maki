@@ -46,6 +46,23 @@ impl Capability {
     pub fn present(self) -> bool {
         !matches!(self, Capability::Absent)
     }
+
+    /// The weaker of two claims: what only one of two interchangeable
+    /// providers delivers is not delivered by a set containing both.
+    pub fn weakest(self, other: Capability) -> Capability {
+        fn rank(c: Capability) -> u8 {
+            match c {
+                Capability::Absent => 0,
+                Capability::Contractual => 1,
+                Capability::Verified => 2,
+            }
+        }
+        if rank(other) < rank(self) {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +104,35 @@ pub struct CryptoCapabilities {
 }
 
 impl CryptoCapabilities {
+    /// The contract a set of interchangeable providers can honour as a whole:
+    /// a batch built against it may be routed to any member, so batch limits
+    /// are the minimum, accepted plaintext sizes the intersection, the
+    /// ciphertext bound the maximum any member produces, and every security
+    /// claim the weakest one (SPEC §16: a capability the set cannot
+    /// guarantee is `Absent`). Identity fields are taken from `self`.
+    pub fn intersect(self, other: &CryptoCapabilities) -> CryptoCapabilities {
+        CryptoCapabilities {
+            provider_id: self.provider_id,
+            crypto_compatibility_id: self.crypto_compatibility_id,
+            supported_plaintext_sizes: self
+                .supported_plaintext_sizes
+                .into_iter()
+                .filter(|size| other.supported_plaintext_sizes.contains(size))
+                .collect(),
+            max_ciphertext_size: self.max_ciphertext_size.max(other.max_ciphertext_size),
+            stateless: self.stateless && other.stateless,
+            retry_safe: self.retry_safe && other.retry_safe,
+            batch: BatchCapability {
+                supported: self.batch.supported && other.batch.supported,
+                max_items: self.batch.max_items.min(other.batch.max_items),
+                max_bytes: self.batch.max_bytes.min(other.batch.max_bytes),
+            },
+            integrity: self.integrity.weakest(other.integrity),
+            context_binding: self.context_binding.weakest(other.context_binding),
+            replay_protection: self.replay_protection.weakest(other.replay_protection),
+        }
+    }
+
     /// True if `plaintext_len` is an accepted plaintext size.
     pub fn accepts_plaintext_size(&self, plaintext_len: usize) -> bool {
         u32::try_from(plaintext_len)
