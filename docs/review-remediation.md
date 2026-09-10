@@ -668,6 +668,23 @@ fixtures.
   unit fits every layer, the FUP-013 blocking/non-blocking DualSemaphore oversize
   semantics, and the FUP-005 full logging lifecycle.
 
+## Third-round follow-up (2026-09-10): R3-004, R3-006, K-03 residual
+
+The R3 review (`maki-review-r3`, 2026-09-08) left R3-004 and R3-006 open
+after the first batch of R3 fixes. Both were confirmed with RED tests and
+fixed. A new randomized multi-cycle durability sweep (workload → power loss
+*or* restart → recovery → oracle, with random `fdatasync` failures) then
+found two residual conditions of K-03 in the slot store, each minimised to a
+named regression test.
+
+| ID | Finding | Fix | Regression tests |
+|---|---|---|---|
+| R3-004 | `EndpointSet::capabilities` returned the first validated endpoint's contract, so a batch built against it could be routed (load balancing, failover, a quarantined endpoint admitted later) to an endpoint with smaller `max_items`/`max_bytes` or without a claimed security capability. | The set reports the intersection over *all* endpoints: minimum batch limits, intersected plaintext sizes, the largest ciphertext bound, and the weakest security claim (`Capability::weakest`, `CryptoCapabilities::intersect`). | `aggregate_batch_limits_are_the_minimum_over_all_endpoints`, `aggregate_security_capabilities_are_the_weakest_claim`, `quarantined_endpoints_count_towards_the_aggregate`, `aggregate_plaintext_sizes_are_the_intersection`, `batch_within_the_aggregate_survives_failover_to_the_weakest_endpoint` (maki-crypto `review_r3b_endpoints.rs`) |
+| R3-006 | The context-binding self-test probed the unit index and the volume UUID only; a provider that normalized `format_version` or the compatibility id passed as fully bound. No wire transport even carried `format_version`. | Two more negative probes (format version, compatibility id); an explicit request-level or provider-fatal rejection of the foreign value is accepted, a decrypt to the original plaintext is not. HTTP gained the `format_version` field source, WebSocket the `format` request field, gRPC `CryptoBatchRequest.format_version = 4`; the reference fixtures bind all three fields (SPEC §18 "Context on the wire"). | `context_binding_selftest_exercises_format_version`, `context_binding_selftest_exercises_compatibility_id`, `explicit_rejection_of_a_foreign_context_passes_the_selftest`, `integrity_for_every_decrypt_never_certifies_a_provider`, `retryable_for_every_decrypt_never_certifies_a_provider` (maki-crypto `review_r3b_selftest.rs`); the authenticated pipelines in each transport's `review_integrity.rs` now run all four probes over the wire |
+| K-03 (residual, creation path) | `ensure_shard`'s catalog commit publishes the whole in-memory catalog, which after open names any *adopted* orphan shard — before that shard's allocation map has ever reached disk (only `persist_allocations` had the K-03 ordering). An interrupted checkpoint after such a commit plus a power loss left a cataloged shard with no allocation copy: every later attach refused. | Every shard tracks `map_stored`; `commit_adopted_maps` stores and dir-syncs the maps of adopted shards before *any* catalog commit, in `ensure_shard` as well as `persist_allocations`. | `adopted_shard_is_never_cataloged_by_another_shards_creation` (maki-core `review_r3b_durability.rs`) |
+| K-03 (residual, restart path) | After a plain restart an orphan's allocation copy can still be *readable* from the page cache although its sync failed (K-01); `open` loaded it as a valid copy and nothing re-stored it, so the next catalog commit named the shard and the next power loss dropped its only copy. | An adopted shard's loaded map is never trusted as durable: it is re-stored (preserve-first, so the readable copy becomes durable) before the shard can be cataloged. | `adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged`, plus the sweeps `random_workloads_survive_power_loss_and_restart_cycles`, `random_workloads_with_sync_failures_never_show_foreign_data`, `restart_followed_by_power_loss_keeps_recovered_state` and the `phase_r3b_durability_gate_full` release gate (maki-core `review_r3b_durability.rs`) |
+| test hygiene | Four maki-privileged fixtures named temp directories by pid + nanosecond clock; WSL's coarse clock let two tests collide (`File exists`). | A per-process sequence number is folded into the name. | (flake fix; `detach::tests::observation_distinguishes_complete_and_partial_detach` and siblings) |
+
 ## Recovery fail-closed rules
 
 Recovery (`maki-core/src/recovery.rs`) now refuses to attach on anything that
