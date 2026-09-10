@@ -9,7 +9,10 @@
 //! Shard creation protocol: data file + allocation map are created, synced,
 //! and their dirents made durable *before* the catalog commits the shard —
 //! a crash in between leaves harmless orphans, never a cataloged shard with
-//! missing metadata.
+//! missing metadata. Every catalog commit publishes the whole in-memory
+//! catalog, so a shard adopted at open (see below) gets its map stored
+//! before *any* commit — the one in `persist_allocations` and the one made
+//! by another shard's creation alike (K-03).
 //!
 //! Allocation persistence: a shard's dirty flag is cleared only after the
 //! data-directory fsync that makes the fresh A/B copy's dirent durable has
@@ -53,6 +56,10 @@ struct Shard {
     alloc_ab: AbStore,
     data: Arc<dyn BackingFile>,
     dirty_alloc: bool,
+    /// At least one allocation-map copy of this shard is on disk. False only
+    /// for a shard adopted at open with no valid copy: the catalog must not
+    /// name it until `commit_adopted_maps` has stored one (K-03).
+    map_stored: bool,
 }
 
 pub struct SlotStore {
@@ -161,21 +168,26 @@ impl SlotStore {
                 layout::shard_alloc_b(shard_idx),
             );
             let (side_a, side_b) = alloc_ab.side_generations::<AllocationMap>(backing.as_ref())?;
-            let (alloc, dirty_alloc) = match alloc_ab.load::<AllocationMap>(backing.as_ref())? {
-                Some(alloc) => (alloc, false),
-                // A shard the catalog never committed may have died before
-                // its (empty) map was stored: start it empty.
-                None if adopted.contains(&shard_idx) => {
-                    (AllocationMap::new(geometry.units_per_shard()), true)
-                }
-                // SPEC §27: a cataloged shard with no valid copy refuses
-                // attach rather than guess (offline repair territory).
-                None => {
-                    return Err(CoreError::Corrupt(format!(
-                        "shard {shard_idx}: no valid allocation map copy"
-                    )))
-                }
-            };
+            let (alloc, dirty_alloc, map_stored) =
+                match alloc_ab.load::<AllocationMap>(backing.as_ref())? {
+                    // An adopted shard's copy may be readable only from the
+                    // page cache (its sync failed, then the process
+                    // restarted — K-01): nothing proves it durable, so it is
+                    // re-stored before any catalog commit names the shard.
+                    Some(alloc) => (alloc, false, !adopted.contains(&shard_idx)),
+                    // A shard the catalog never committed may have died before
+                    // its (empty) map was stored: start it empty.
+                    None if adopted.contains(&shard_idx) => {
+                        (AllocationMap::new(geometry.units_per_shard()), true, false)
+                    }
+                    // SPEC §27: a cataloged shard with no valid copy refuses
+                    // attach rather than guess (offline repair territory).
+                    None => {
+                        return Err(CoreError::Corrupt(format!(
+                            "shard {shard_idx}: no valid allocation map copy"
+                        )))
+                    }
+                };
             if alloc.units() != geometry.units_per_shard() {
                 return Err(CoreError::Corrupt(format!(
                     "shard {shard_idx}: allocation map size mismatch"
@@ -191,6 +203,7 @@ impl SlotStore {
                 alloc_ab,
                 data,
                 dirty_alloc,
+                map_stored,
             };
             // With one copy invalid or absent the loaded copy may be the
             // older generation, which does not list the newest slots: audit
@@ -301,7 +314,13 @@ impl SlotStore {
         );
         let mut alloc = AllocationMap::new(self.geometry.units_per_shard());
         alloc_ab.store(self.backing.as_ref(), &mut alloc)?;
-        // 3. dirents durable before the catalog names the shard
+        // 3. dirents durable before the catalog names the shard. The commit
+        //    below publishes the whole in-memory catalog, so a shard adopted
+        //    at open needs its map on disk first as well (K-03 residual: an
+        //    interrupted checkpoint after this commit, then a power loss,
+        //    otherwise leaves a cataloged shard with no allocation copy,
+        //    which every later attach refuses).
+        self.commit_adopted_maps()?;
         fp("store.shard_dirsync")?;
         self.backing.sync_dir(layout::DATA_DIR)?;
         // 4. catalog commit
@@ -318,8 +337,39 @@ impl SlotStore {
                 alloc_ab,
                 data,
                 dirty_alloc: false,
+                map_stored: true,
             },
         );
+        Ok(())
+    }
+
+    /// Store the allocation map of every adopted shard that has no copy on
+    /// disk yet and make the data-directory dirents durable, so that a
+    /// catalog commit can never name a shard without an allocation copy.
+    /// Their in-memory map holds only what open proved from slot headers.
+    fn commit_adopted_maps(&mut self) -> Result<(), CoreError> {
+        let pending: Vec<u64> = self
+            .shards
+            .iter()
+            .filter(|(_, s)| !s.map_stored)
+            .map(|(idx, _)| *idx)
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for idx in &pending {
+            fp("store.adopted_alloc_store")?;
+            let shard = self.shards.get_mut(idx).unwrap();
+            shard
+                .alloc_ab
+                .store(self.backing.as_ref(), &mut shard.alloc)?;
+        }
+        self.backing.sync_dir(layout::DATA_DIR)?;
+        for idx in &pending {
+            let shard = self.shards.get_mut(idx).unwrap();
+            shard.map_stored = true;
+            shard.dirty_alloc = false;
+        }
         Ok(())
     }
 
@@ -380,10 +430,12 @@ impl SlotStore {
     /// any step leaves every affected shard dirty so a retry redoes the
     /// whole step.
     pub fn persist_allocations(&mut self) -> Result<(), CoreError> {
+        // Adopted shards whose map is not proven on disk are stored here
+        // too, before the catalog commit below can name them (K-03).
         let dirty: Vec<u64> = self
             .shards
             .iter()
-            .filter(|(_, s)| s.dirty_alloc)
+            .filter(|(_, s)| s.dirty_alloc || !s.map_stored)
             .map(|(idx, _)| *idx)
             .collect();
         if !dirty.is_empty() {
@@ -397,7 +449,9 @@ impl SlotStore {
             fp("checkpoint.alloc_dirsync")?;
             self.backing.sync_dir(layout::DATA_DIR)?;
             for idx in &dirty {
-                self.shards.get_mut(idx).unwrap().dirty_alloc = false;
+                let shard = self.shards.get_mut(idx).unwrap();
+                shard.dirty_alloc = false;
+                shard.map_stored = true;
             }
         }
         // The catalog commits an adopted shard only *after* its allocation
