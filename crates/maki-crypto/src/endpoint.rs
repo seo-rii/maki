@@ -636,6 +636,19 @@ impl CryptoProvider for EndpointSet {
                 continue;
             }
             let caps = endpoint.provider.capabilities().await?;
+            if caps.crypto_compatibility_id != merged.crypto_compatibility_id {
+                if !endpoint.validated.load(Ordering::SeqCst) {
+                    // Quarantined and not interchangeable: the validator
+                    // will never admit it, so it cannot serve a batch.
+                    continue;
+                }
+                // A serving endpoint that is not interchangeable: there is
+                // no contract for the set.
+                return Err(CryptoError::Contract(format!(
+                    "endpoint {:?} reports compatibility id {:?}, the set requires {:?}",
+                    endpoint.name, caps.crypto_compatibility_id, merged.crypto_compatibility_id
+                )));
+            }
             merged = merged.intersect(&caps);
         }
         Ok(merged)

@@ -193,3 +193,23 @@ async fn batch_within_the_aggregate_survives_failover_to_the_weakest_endpoint() 
     assert_eq!(a.encrypt_calls(), 1);
     assert_eq!(b.encrypt_calls(), 1);
 }
+
+/// Endpoints whose ciphertext is not interchangeable (different
+/// compatibility ids) have no common contract to report: the aggregate must
+/// fail closed rather than quietly present one endpoint's id for the set.
+#[tokio::test]
+async fn mismatched_compatibility_ids_have_no_aggregate_contract() {
+    let a: Arc<dyn CryptoProvider> = Arc::new(FakeCryptoProvider::new(UNIT));
+    let b: Arc<dyn CryptoProvider> =
+        Arc::new(FakeCryptoProvider::new(UNIT).with_compat_id("other-profile-v9"));
+    let set = EndpointSet::new(
+        vec![("a".to_string(), a), ("b".to_string(), b)],
+        cfg(),
+        Arc::new(ManualClock::new()),
+    );
+    let err = set.capabilities().await.unwrap_err();
+    assert!(
+        matches!(err, CryptoError::Contract(_)),
+        "mismatched ids must be a contract error, got {err:?}"
+    );
+}
