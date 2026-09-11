@@ -212,7 +212,8 @@ mod linux {
             }
             // Preserve the read error kind: a missing attribute is RAM-only,
             // but EACCES/EIO is ambiguous and must fail closed (MAKI-017).
-            let read = std::fs::read_to_string(format!("{sysfs}/backing_dev")).map_err(|e| e.kind());
+            let read =
+                std::fs::read_to_string(format!("{sysfs}/backing_dev")).map_err(|e| e.kind());
             return classify_zram_backing(read, is_encrypted_swap);
         }
         if is_encrypted_swap(device) {

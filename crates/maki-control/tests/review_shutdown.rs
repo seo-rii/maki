@@ -55,7 +55,9 @@ async fn shutdown_drains_when_all_session_slots_are_busy() {
     // and the accept loop parks waiting for a second slot.
     let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
     let (mut rd, mut wr) = tokio::io::split(stream);
-    send_command(&mut wr, &Request::new("status")).await.unwrap();
+    send_command(&mut wr, &Request::new("status"))
+        .await
+        .unwrap();
     let response = read_response(&mut rd).await.unwrap();
     assert_eq!(response["ok"], json!(true));
 

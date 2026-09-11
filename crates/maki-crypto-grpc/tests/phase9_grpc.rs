@@ -360,7 +360,9 @@ async fn grpc_passes_provider_conformance() {
 /// redaction.
 #[test]
 fn followup_remote_status_does_not_expose_reflected_secrets() {
-    let error = map_status(&Status::internal("token=SECRET plaintext=PRIVATE\ninjected"));
+    let error = map_status(&Status::internal(
+        "token=SECRET plaintext=PRIVATE\ninjected",
+    ));
     let text = error.to_string();
     assert!(
         !text.contains("SECRET") && !text.contains("PRIVATE") && !text.contains('\n'),

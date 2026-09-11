@@ -228,7 +228,10 @@ impl JournalWriter {
         // Projected active-segment state as records are appended:
         // (write_offset, record_count). `None` = no active segment, which
         // forces a roll on the first record exactly as `append` does.
-        let mut projected = self.active.as_ref().map(|a| (a.write_offset, a.info.record_count));
+        let mut projected = self
+            .active
+            .as_ref()
+            .map(|a| (a.write_offset, a.info.record_count));
         for record_len in record_lens {
             let needs_roll = match projected {
                 None => true,

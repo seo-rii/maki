@@ -256,7 +256,10 @@ async fn audit_20260907_one_group_cannot_exceed_pending_budgets() {
     let _ = task.await;
     settle().await;
     // Rejecting or splitting the oversize group are both acceptable here.
-    assert!(observed.0 <= 1, "one group bypassed item admission: {observed:?}");
+    assert!(
+        observed.0 <= 1,
+        "one group bypassed item admission: {observed:?}"
+    );
     assert!(
         observed.1 <= UNIT as u64,
         "one group bypassed byte admission: {observed:?}"

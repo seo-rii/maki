@@ -365,8 +365,7 @@ fn leaf_devices_are_resolved_through_the_device_mapper_stack() {
 fn an_over_deep_topology_resolves_to_no_leaves_not_a_partial_set() {
     // `top` branches into the bound NBD device (a shallow leaf) and a long
     // chain that only reaches a foreign disk far below the depth bound.
-    let mut tree: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut tree: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     tree.insert(
         "top".to_string(),
         vec!["nbd0".to_string(), "chain-0".to_string()],

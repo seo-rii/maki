@@ -187,9 +187,8 @@ fn random_response(rng: &mut StdRng) -> ResponseSpec {
 async fn fuzz_provider(op: OpSpec, iterations: usize, seed: u64) {
     let rng = Arc::new(Mutex::new(StdRng::seed_from_u64(seed)));
     let handler_rng = rng.clone();
-    let handler: Handler = Arc::new(move |_req: &RecordedRequest| {
-        random_response(&mut handler_rng.lock().unwrap())
-    });
+    let handler: Handler =
+        Arc::new(move |_req: &RecordedRequest| random_response(&mut handler_rng.lock().unwrap()));
     let server = TestServer::start(handler).await;
     let provider = provider(&server.url(), op);
 

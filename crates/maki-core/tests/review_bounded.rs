@@ -350,7 +350,9 @@ async fn audit_20260907_journal_hard_limit_counts_new_segment_headers() {
     p.journal_high_watermark_bytes = p.journal_max_bytes;
     let e = engine(&backing, p.clone(), None).await;
     for i in 0..filled_segments * records_per_segment {
-        e.write(off(i % UNITS), &data(i as u8), false).await.unwrap();
+        e.write(off(i % UNITS), &data(i as u8), false)
+            .await
+            .unwrap();
     }
     assert_eq!(e.stats().await.journal_total_bytes, before_roll);
     // Record-only admission sees exact equality. The actual append must also

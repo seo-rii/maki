@@ -663,7 +663,8 @@ async fn followup_single_plaintext_unit_budget_works_through_scheduler() {
     config.max_bytes = UNIT as u64;
     config.target_bytes = UNIT as u64;
     config.max_wait = Duration::ZERO;
-    let scheduler = BatchScheduler::new(provider, config, Arc::new(maki_crypto::SystemClock::new()));
+    let scheduler =
+        BatchScheduler::new(provider, config, Arc::new(maki_crypto::SystemClock::new()));
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         provider_self_test(&scheduler, &ctx(), UNIT, "test-profile-v1"),
