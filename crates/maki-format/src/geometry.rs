@@ -77,6 +77,14 @@ impl Geometry {
                 "max_virtual_size {max_virtual_size} must be a positive multiple of crypto_unit_size"
             )));
         }
+        // nbdkit's get_size callback returns a signed 64-bit byte count.
+        // Reject an unexportable geometry at creation and superblock decode,
+        // before its size could wrap into the callback's error range.
+        if max_virtual_size > i64::MAX as u64 {
+            return Err(FormatError::Invalid(format!(
+                "max_virtual_size {max_virtual_size} exceeds the signed NBD export size limit"
+            )));
+        }
         if shard_logical_size == 0 || !shard_logical_size.is_multiple_of(crypto_unit_size as u64) {
             return Err(FormatError::Invalid(format!(
                 "shard_logical_size {shard_logical_size} must be a positive multiple of crypto_unit_size"
