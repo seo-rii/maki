@@ -46,6 +46,26 @@ WebSocket and gRPC fail closed when TLS is configured. Use `remote-http` when a
 remote production deployment requires TLS until those transports gain rustls
 support.
 
+## Capability declarations and checks
+
+`crypto.capabilities.mode` supports only `declared` (also the default).
+`hybrid` and `probed` are rejected because endpoint capability discovery is
+not implemented. Replace either old mode with `declared` and confirm the
+configured limits against the endpoint's documented contract.
+
+| Mode / claim | Runtime behavior |
+|---|---|
+| `declared` | Use configured limits; mandatory round-trip, response-shape, declared security and cross-endpoint checks still run. |
+| `hybrid`, `probed` | Configuration error; no discovery or volume attach occurs. |
+| Remote `none` | Capability is absent. |
+| Remote `contractual` or legacy `verified` | Capability is contractual; a TOML declaration is not independent verification. |
+| Intrinsic local AEAD capability | Remains verified by the local implementation. |
+
+Endpoint status `validated` means the configured volume's conformance and
+key checks passed. It does not mean that every limit was discovered, that
+all possible inputs were checked, or that replay protection was proven.
+Changing a mode cannot bypass the mandatory integrity/context tests.
+
 ## Validation rules
 
 `validate()` runs before a volume is created and before every attach. Beyond
@@ -57,8 +77,8 @@ schema, geometry, and secret-literal checks it rejects:
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
   targets above their maxima, or a batch byte limit smaller than one crypto
   unit;
-- a retry strategy other than `exponential-full-jitter`, an unknown
-  `capabilities.mode`, `availability_policy = "bounded-error"` without a
+- a retry strategy other than `exponential-full-jitter`, a
+  `capabilities.mode` other than `declared`, `availability_policy = "bounded-error"` without a
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
   `secure-buffers | all | off`;
 - a `backing.root` that is not an absolute path;

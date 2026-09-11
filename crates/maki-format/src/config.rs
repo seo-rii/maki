@@ -249,7 +249,7 @@ impl CryptoSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesSection {
-    /// "declared" (trust config), "hybrid" (verify what we can), "probed".
+    /// Only "declared" is implemented; mandatory conformance probes still run.
     #[serde(default = "d_mode")]
     pub mode: String,
     pub supported_plaintext_sizes: Vec<u32>,
@@ -1349,9 +1349,9 @@ impl VolumeConfig {
         }
 
         let mode = self.crypto.capabilities.mode.as_str();
-        if !["declared", "hybrid", "probed"].contains(&mode) {
+        if mode != "declared" {
             return Err(invalid(format!(
-                "crypto.capabilities.mode {mode:?} must be declared|hybrid|probed"
+                "crypto.capabilities.mode {mode:?} is unsupported; use declared (capability discovery is not implemented)"
             )));
         }
         if let Some(t) = &self.crypto.max_operation_time {

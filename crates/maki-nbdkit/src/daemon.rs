@@ -356,7 +356,7 @@ fn capabilities_from_config(
 ) -> maki_crypto::CryptoCapabilities {
     let caps_cfg = &config.crypto.capabilities;
     let capability = |s: &str| match s {
-        "verified" => maki_crypto::Capability::Verified,
+        "verified" => maki_crypto::Capability::Contractual,
         "contractual" => maki_crypto::Capability::Contractual,
         _ => maki_crypto::Capability::Absent,
     };
@@ -779,4 +779,51 @@ pub fn control_socket_path(config: &VolumeConfig) -> String {
         .socket
         .clone()
         .unwrap_or_else(|| format!("/run/maki-control/{}/control.sock", config.volume.name))
+}
+
+#[cfg(test)]
+mod capability_mode_tests {
+    use super::*;
+    use maki_crypto::Capability;
+
+    #[test]
+    fn websocket_and_grpc_security_declarations_are_at_most_contractual() {
+        let mut config = maki_format::config::parse_config(include_str!(
+            "../../maki-format/tests/data/full_config.toml"
+        ))
+        .unwrap();
+        for provider in ["remote-websocket", "remote-grpc"] {
+            for (level, expected) in [
+                ("none", Capability::Absent),
+                ("contractual", Capability::Contractual),
+                ("verified", Capability::Contractual),
+            ] {
+                config.crypto.capabilities.integrity = level.into();
+                config.crypto.capabilities.context_binding = level.into();
+                config.crypto.capabilities.replay_protection = level.into();
+                let capabilities = capabilities_from_config(&config, provider);
+                assert_eq!(capabilities.integrity, expected, "{provider}: {level}");
+                assert_eq!(
+                    capabilities.context_binding, expected,
+                    "{provider}: {level}"
+                );
+                assert_eq!(
+                    capabilities.replay_protection, expected,
+                    "{provider}: {level}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn intrinsic_local_verification_remains_verified() {
+        let mut keys = maki_crypto_local::keysource::MapKeySource::new();
+        keys.insert("test", vec![0x42; 32]);
+        let provider =
+            maki_crypto_local::AesGcmSivProvider::new(&keys, "test", 512, "test-v1").unwrap();
+        let capabilities = provider.capabilities().await.unwrap();
+        assert_eq!(capabilities.integrity, Capability::Verified);
+        assert_eq!(capabilities.context_binding, Capability::Verified);
+        assert_eq!(capabilities.replay_protection, Capability::Absent);
+    }
 }

@@ -717,7 +717,7 @@ impl HttpCryptoProvider {
 
         let caps_cfg = &config.crypto.capabilities;
         let capability = |s: &str| match s {
-            "verified" => Capability::Verified,
+            "verified" => Capability::Contractual,
             "contractual" => Capability::Contractual,
             _ => Capability::Absent,
         };
