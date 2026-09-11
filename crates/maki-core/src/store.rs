@@ -264,20 +264,23 @@ impl SlotStore {
     }
 
     /// Every allocated unit, in ascending order (offline check input).
-    pub fn allocated_units(&self) -> Vec<u64> {
+    ///
+    /// Allocation maps stay borrowed while unit IDs are streamed. Traversal
+    /// stores only the sorted shard indices, so auxiliary memory grows with
+    /// the shard count rather than the number of allocated units.
+    pub fn allocated_units(&self) -> impl Iterator<Item = u64> + '_ {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();
         shards.sort_unstable();
         let per_shard = self.geometry.units_per_shard();
-        let mut out = Vec::new();
-        for shard_idx in shards {
+        shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
-            for in_shard in 0..shard.alloc.units() {
-                if shard.alloc.get(in_shard) {
-                    out.push(shard_idx * per_shard + in_shard);
-                }
-            }
-        }
-        out
+            (0..shard.alloc.units()).filter_map(move |in_shard| {
+                shard
+                    .alloc
+                    .get(in_shard)
+                    .then_some(shard_idx * per_shard + in_shard)
+            })
+        })
     }
 
     /// Lowest allocated unit, if any slot has ever been checkpointed.
