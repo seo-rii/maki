@@ -26,7 +26,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -36,6 +38,8 @@ use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
     SecretBuffer,
 };
+
+mod request;
 
 #[derive(Clone)]
 pub struct WsProviderSpec {
@@ -148,6 +152,7 @@ pub struct WsCryptoProvider {
     dead_generation: Arc<AtomicU64>,
 }
 
+#[cfg(test)]
 fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
@@ -316,16 +321,8 @@ impl WsCryptoProvider {
         })
     }
 
-    async fn request_once(&self, body: &Value) -> Result<Value, CryptoError> {
-        let id = body["id"].as_u64().expect("id set");
-        let encoded = body.to_string();
-        if encoded.len() > self.spec.max_frame_bytes {
-            return Err(CryptoError::NonRetryableRequest(format!(
-                "request of {} bytes exceeds frame limit {}",
-                encoded.len(),
-                self.spec.max_frame_bytes
-            )));
-        }
+    async fn request_once(&self, id: u64, encoded: SecretBuffer) -> Result<Value, CryptoError> {
+        let message = request::into_message(encoded)?;
 
         let (tx, rx) = oneshot::channel();
         let mut pending_request = {
@@ -350,9 +347,7 @@ impl WsCryptoProvider {
                 pending: self.pending.clone(),
                 cancellation: Some(conn.cancellation.clone()),
             };
-            let sent =
-                tokio::time::timeout(self.spec.timeout, conn.sender.send(Message::text(encoded)))
-                    .await;
+            let sent = tokio::time::timeout(self.spec.timeout, conn.sender.send(message)).await;
             if !matches!(sent, Ok(Ok(()))) {
                 // Writer gone or wedged: drop this connection if it's still
                 // the registered one.
@@ -402,18 +397,9 @@ impl WsCryptoProvider {
         };
         for _attempt in 0..attempts {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-            let body = json!({
-                "id": id,
-                "op": op,
-                "profile": context.crypto_compatibility_id,
-                "volume": context.volume_uuid.to_string(),
-                "format": context.format_version,
-                "items": items
-                    .iter()
-                    .map(|(unit, data)| json!({"unit": unit, "data": b64(data)}))
-                    .collect::<Vec<_>>(),
-            });
-            match self.request_once(&body).await {
+            let encoded =
+                request::encode_request(id, op, context, items, self.spec.max_frame_bytes)?;
+            match self.request_once(id, encoded).await {
                 Ok(response) => return self.parse_response(&response, items),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),
@@ -580,3 +566,7 @@ impl CryptoProvider for WsCryptoProvider {
 #[cfg(test)]
 #[path = "decoded_response_tests.rs"]
 mod decoded_response_tests;
+
+#[cfg(test)]
+#[path = "request_secret_tests.rs"]
+mod request_secret_tests;

@@ -141,6 +141,19 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-015의 WS 요청도 중간 JSON tree/base64 String을 없애고 고정
+`SecretBuffer`에 직접 직렬화했다. 실제 요청의 연결 전 취소·과대 frame RED
+2개(PID 577718, exit 101;
+`/home/seorii/logs/maki-r3-ws-request-secrets-red-20260912T100655.147157Z.log`)와
+주소 가능 capacity 초과 RED(PID 602314, exit 101;
+`/home/seorii/logs/maki-r3-ws-request-capacity-red-20260912T101104.921254Z.log`)를
+확인했다. 마지막 Bytes/Message 소유자까지 보호하며 전체 WS 35 passed,
+exit 0(PID 608315;
+`/home/seorii/logs/maki-r3-ws-request-secrets-verified-green-20260912T101156.856770Z.log`),
+strict Clippy exit 0(PID 613372;
+`/home/seorii/logs/maki-r3-ws-request-secrets-verified-clippy-20260912T101249.221580Z.log`)이다.
+응답 Value와 library-private scratch/frame copies, 전체 resident budget은 남는다.
+
 MAKI-021의 stale free-space admission을 별도로 수정했다. 시계를 전진하지
 않고 여유 공간을 high→low, low→high, unknown→known-low로 바꾸는 RED 3개가
 실패했다(PID 583843, exit 101;

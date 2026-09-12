@@ -12,11 +12,12 @@ const OLD_DECODE_CAPACITY: usize = 258;
 const FILL: u8 = 0xA5;
 
 #[derive(Clone, Copy, Default, Debug)]
-struct Inspection {
+pub(super) struct Inspection {
     address: usize,
-    allocated: usize,
-    freed: usize,
-    all_zero: bool,
+    sizes: [usize; 2],
+    pub(super) allocated: usize,
+    pub(super) freed: usize,
+    pub(super) all_zero: bool,
     plaintext_prefix: bool,
 }
 
@@ -27,7 +28,7 @@ thread_local! {
 struct InspectDecodedAllocation;
 
 // SAFETY: all operations delegate to System. Only alloc_zeroed allocations of
-// the selected decoder sizes are registered, so every inspected byte was
+// the selected secret-buffer sizes are registered, so every inspected byte was
 // initialized. Inspection occurs before System.dealloc, never after freeing.
 // The observer is thread-local and performs no allocation itself.
 unsafe impl GlobalAlloc for InspectDecodedAllocation {
@@ -37,12 +38,14 @@ unsafe impl GlobalAlloc for InspectDecodedAllocation {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
-        if !pointer.is_null() && matches!(layout.size(), PAYLOAD_LEN | OLD_DECODE_CAPACITY) {
+        if !pointer.is_null() {
             let _ = INSPECTION.try_with(|cell| {
                 if let Some(mut inspection) = cell.get() {
-                    inspection.allocated += 1;
-                    inspection.address = pointer as usize;
-                    cell.set(Some(inspection));
+                    if inspection.sizes.contains(&layout.size()) {
+                        inspection.allocated += 1;
+                        inspection.address = pointer as usize;
+                        cell.set(Some(inspection));
+                    }
                 }
             });
         }
@@ -56,8 +59,8 @@ unsafe impl GlobalAlloc for InspectDecodedAllocation {
                     // SAFETY: this exact allocation came from alloc_zeroed,
                     // remains live, and layout describes its entire capacity.
                     let bytes = unsafe { std::slice::from_raw_parts(pointer, layout.size()) };
-                    inspection.all_zero = bytes.iter().all(|byte| *byte == 0);
-                    inspection.plaintext_prefix = bytes[..64].iter().all(|byte| *byte == FILL);
+                    inspection.all_zero &= bytes.iter().all(|byte| *byte == 0);
+                    inspection.plaintext_prefix |= bytes.iter().take(64).all(|byte| *byte == FILL);
                     inspection.freed += 1;
                     inspection.address = 0;
                     cell.set(Some(inspection));
@@ -71,17 +74,27 @@ unsafe impl GlobalAlloc for InspectDecodedAllocation {
 #[global_allocator]
 static ALLOCATOR: InspectDecodedAllocation = InspectDecodedAllocation;
 
-struct Watch;
+pub(super) struct Watch;
 
 impl Watch {
     fn start() -> Self {
+        Self::sizes([PAYLOAD_LEN, OLD_DECODE_CAPACITY])
+    }
+
+    pub(super) fn sizes(sizes: [usize; 2]) -> Self {
         INSPECTION.with(|cell| {
-            assert!(cell.replace(Some(Inspection::default())).is_none());
+            assert!(cell
+                .replace(Some(Inspection {
+                    sizes,
+                    all_zero: true,
+                    ..Inspection::default()
+                }))
+                .is_none());
         });
         Self
     }
 
-    fn finish(self) -> Inspection {
+    pub(super) fn finish(self) -> Inspection {
         INSPECTION.with(|cell| cell.replace(None).unwrap())
     }
 }
@@ -92,7 +105,7 @@ impl Drop for Watch {
     }
 }
 
-fn provider() -> WsCryptoProvider {
+pub(super) fn provider() -> WsCryptoProvider {
     WsCryptoProvider::new(WsProviderSpec {
         url: "ws://unused.invalid/".into(),
         capabilities: CryptoCapabilities {

@@ -6,6 +6,27 @@ The `secure-buffers` setting covers registered buffers, and does not prove that
 every transport allocation is locked or erased. Logical request budgets also
 do not measure total resident memory.
 
+## WebSocket requests
+
+Request serialization borrows input units and streams base64 and JSON directly
+into fixed `SecretBuffer` storage. It does not create the former intermediate
+request JSON tree or owned base64 strings. A counting pass uses the same
+serializer to enforce the frame limit, checked arithmetic and addressable
+buffer capacity before allocating the output. A second pass cannot grow the
+buffer; partial errors erase anything already written.
+
+The encoded allocation remains owned through the WebSocket message queue and
+`Bytes`/`Message` clones. Its last owner erases the buffer before releasing its
+optional page lock. Cancellation before connecting also drops the owner. The
+existing wire order, escaping and payload encoding are preserved.
+
+This protects Maki's owned request storage. Serializer/base64 scratch and
+tungstenite's internal output/framing copies are outside this guarantee, as
+are incoming JSON and frame buffers. The final request unit passed all
+35 WebSocket package tests and strict Clippy on 2026-09-12, including actual
+request cancellation, rejection before output allocation, partial writer
+failure, exact wire compatibility and final clone ownership.
+
 ## WebSocket decoded responses
 
 Base64 output is decoded directly into an exactly sized `SecretBuffer`, with
@@ -15,10 +36,10 @@ data, or invalid encoding, the earlier decoded items are also erased.
 Successful decryption transfers these guards to the caller without copying;
 encryption transfers the known ciphertext into ordinary output vectors.
 
-The JSON/base64 strings, parsed JSON values and WebSocket frame/library
-buffers are separate allocations. Their complete lifetime is not protected by
-this decoded-output change. MAKI-015 and the total-memory work in MAKI-032
-remain open.
+Incoming JSON/base64 strings, parsed response values and WebSocket
+frame/library buffers are separate allocations. Their complete lifetime is
+not protected by this decoded-output change. MAKI-015 and the total-memory
+work in MAKI-032 remain open.
 
 The `decoded_response_tests` unit suite observes initialized allocations
 immediately before deallocation, including partial decoder output and a later
