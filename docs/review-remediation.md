@@ -672,10 +672,13 @@ fixtures.
 - **FUP-004 (P1)** — the in-process per-command deadline (bounded output,
   process-group reaping) — same as R05/MAKI-004, still needs the native-VM
   qualification.
-- **FUP-014 (P2)** — a TOCTOU between `FileBacking::resolve` and open
-  (`O_NOFOLLOW` on the final component only). Needs `openat2`
-  (`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`) with a pinned root dirfd and an
-  old-kernel fallback, plus a deterministic resolve-then-swap hook to test.
+- **FUP-014 (P2, later closed on Linux)** — at this review point a TOCTOU
+  remained between `FileBacking::resolve` and open (`O_NOFOLLOW` covered only
+  the final component). `df886a3` superseded this item on Linux: the backing
+  root and every parent are pinned by directory descriptors and all operations
+  are descriptor-relative with `O_NOFOLLOW`. Symlink, root-replacement, and
+  ancestor-permission regressions pass. The pathname implementation on
+  non-Linux development hosts does not claim the same guarantee.
 - **Residual sub-parts** — MAKI-003 relative-grow idempotency (persist the
   absolute target), the FUP-007 config alignment to guarantee one max ciphertext
   unit fits every layer, the FUP-013 blocking/non-blocking DualSemaphore oversize
