@@ -116,3 +116,22 @@ fn grow_requires_an_absolute_target_for_safe_retries() {
         "ambiguous relative growth must be refused"
     );
 }
+
+#[test]
+fn recovery_plan_only_lists_conditional_disconnected_storage_cleanup() {
+    let out = run(&["recover", "--volume", "v1", "--plan"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan = String::from_utf8_lossy(&out.stdout);
+    assert!(plan.contains("recover disconnected volume v1"), "{plan}");
+    assert!(plan.contains("umount /srv/v1"), "{plan}");
+    assert!(plan.contains("vgchange -an"), "{plan}");
+    assert!(
+        !plan.contains("nbd-client"),
+        "recovery never disconnects a live backend: {plan}"
+    );
+    assert!(!plan.contains("systemctl"), "{plan}");
+}

@@ -19,7 +19,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn device_number(value: &str) -> io::Result<(u32, u32)> {
+pub(crate) fn device_number(value: &str) -> io::Result<(u32, u32)> {
     let (major, minor) = value
         .trim()
         .split_once(':')
@@ -34,7 +34,7 @@ fn device_number(value: &str) -> io::Result<(u32, u32)> {
     ))
 }
 
-fn mapped_volume_group(name: &str) -> Option<String> {
+pub(crate) fn mapped_volume_group(name: &str) -> Option<String> {
     let mut group = String::new();
     let mut chars = name.chars().peekable();
     while let Some(c) = chars.next() {
@@ -49,7 +49,7 @@ fn mapped_volume_group(name: &str) -> Option<String> {
     None
 }
 
-fn is_nbd_partition(sysfs: &Path, name: &str, nbd: &str) -> io::Result<bool> {
+pub(crate) fn is_nbd_partition(sysfs: &Path, name: &str, nbd: &str) -> io::Result<bool> {
     let Some(suffix) = name.strip_prefix(&format!("{nbd}p")) else {
         return Ok(false);
     };
@@ -118,6 +118,17 @@ pub(crate) fn observe_rollback(
     mountinfo: &str,
     sysfs: &Path,
     allow_missing_sentinel: bool,
+) -> io::Result<DetachObservation> {
+    observe_kernel(record, mountinfo, sysfs, allow_missing_sentinel, true)
+}
+
+/// Recovery observes only kernel metadata, never the disconnected filesystem.
+pub(crate) fn observe_kernel(
+    record: &BoundDeviceRecord,
+    mountinfo: &str,
+    sysfs: &Path,
+    allow_missing_sentinel: bool,
+    check_sentinel: bool,
 ) -> io::Result<DetachObservation> {
     let nbd_index = crate::probe::nbd_index(&record.device)
         .ok_or_else(|| invalid("invalid recorded NBD device"))?;
@@ -203,6 +214,7 @@ pub(crate) fn observe_rollback(
     }
     let mounted = mounted_device.is_some();
     if mounted
+        && check_sentinel
         && crate::exec::read_sentinel(&record.attachment.mountpoint).as_deref()
             != Some(&record.attachment.volume_uuid)
     {

@@ -19,6 +19,7 @@ fn usage() -> ExitCode {
                      [--vg <vg>] [--lv <lv>] [--mountpoint <dir>] [--socket <path>]
                      [--uuid <volume-uuid>] [--fs-uuid <xfs-uuid>] [--init-sentinel] [--plan]
   maki-attach detach --volume <v> [...]
+  maki-attach recover --volume <v> [...] (disconnected storage only; stop workloads first)
   maki-attach grow   --volume <v> --size-bytes <n> [...]
 
 Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
@@ -99,7 +100,7 @@ fn main() -> ExitCode {
 
     let plan = match verb.as_str() {
         "attach" => plan_attach(&request),
-        "detach" => plan_detach(&request),
+        "detach" | "recover" => plan_detach(&request),
         "grow" => {
             if args.iter().any(|arg| arg == "--add-bytes") {
                 eprintln!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
@@ -124,14 +125,28 @@ fn main() -> ExitCode {
         _ => return usage(),
     };
 
-    print!("{plan}");
+    if verb == "recover" {
+        println!("# recover disconnected volume {}; require an absent backend and unchanged persisted kernel identities before each conditional cleanup step", request.volume);
+        // Recovery consumes the detach identity but never disconnects NBD.
+        // Print only the conditional upper-layer cleanup it can execute.
+        for (index, step) in plan.steps.iter().take(2).enumerate() {
+            println!("{}. {step} (only if still present)", index + 1);
+        }
+    } else {
+        print!("{plan}");
+    }
     if plan_only {
         return ExitCode::SUCCESS;
     }
 
     #[cfg(target_os = "linux")]
     {
-        match maki_privileged::exec::execute(&plan) {
+        let result = if verb == "recover" {
+            maki_privileged::exec::recover(&plan)
+        } else {
+            maki_privileged::exec::execute(&plan)
+        };
+        match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");

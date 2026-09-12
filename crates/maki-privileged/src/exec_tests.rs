@@ -81,6 +81,8 @@ struct FakeSystem {
     observation_error: bool,
     observation_error_after: Option<&'static str>,
     backend_fault_after: Option<(&'static str, BackendFault)>,
+    backend_fault_on_probe: Option<(usize, BackendFault)>,
+    backend_probes: std::cell::Cell<usize>,
 }
 
 impl System for FakeSystem {
@@ -147,6 +149,17 @@ impl System for FakeSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        let probe = self.backend_probes.get() + 1;
+        self.backend_probes.set(probe);
+        if let Some((expected, fault)) = self.backend_fault_on_probe {
+            if probe == expected {
+                return match fault {
+                    BackendFault::Foreign => Ok(Some("other-connection".into())),
+                    BackendFault::Missing => Ok(None),
+                    BackendFault::Unreadable => Err(io::Error::other("fixture backend unreadable")),
+                };
+            }
+        }
         if let Some((step, fault)) = self.backend_fault_after {
             if self.steps.contains(&step) {
                 return match fault {
@@ -957,6 +970,7 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
         attachment: (&request).into(),
         device: "/dev/nbd3".into(),
         connection_id: "maki-fixture".into(),
+        recovery: None,
     };
     // Positive control: the production topology observer rejects this exact
     // mapping, and the fixture resolves its leaf to the unrelated local disk.
@@ -993,13 +1007,36 @@ struct ObservedSystem {
     sysfs: PathBuf,
 }
 
+impl ObservedSystem {
+    fn mounts(&self, record: &BoundDeviceRecord) -> String {
+        if self.fake.mounted {
+            format!(
+                "40 25 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+                record.attachment.mountpoint
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
 impl System for ObservedSystem {
+    fn recovery_proof(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<Option<recover::RecoveryProof>> {
+        recover::capture(record, &self.mounts(record), &self.sysfs).map(Some)
+    }
+    fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        recover::observe(record, &self.mounts(record), &self.sysfs)
+    }
     fn run_step(&mut self, step: &PlannedStep, id: Option<&str>) -> Result<(), ExecError> {
         let result = self.fake.run_step(step, id);
         let dm = self.sysfs.join("dm-0");
         if self.fake.vg_active {
             std::fs::create_dir_all(dm.join("dm")).unwrap();
             std::fs::create_dir_all(dm.join("slaves")).unwrap();
+            std::fs::create_dir_all(dm.join("holders")).unwrap();
             std::fs::write(dm.join("dm/name"), "vg_maki_pg-data\n").unwrap();
             std::fs::write(dm.join("dm/uuid"), "LVM-audit\n").unwrap();
             std::fs::write(dm.join("dev"), "253:0\n").unwrap();
@@ -1150,3 +1187,6 @@ fn growth_rechecks_ownership_between_lv_and_filesystem_changes() {
         "filesystem change must re-check live ownership"
     );
 }
+
+#[path = "recover_tests.rs"]
+mod recover_tests;

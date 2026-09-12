@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 #[path = "command.rs"]
 mod command;
 
+#[path = "recover.rs"]
+pub(crate) mod recover;
+
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{
@@ -85,6 +88,26 @@ fn nbd_connected(device: &str) -> bool {
     match nbd_index(device) {
         Some(n) => Path::new(&format!("/sys/block/nbd{n}/pid")).exists(),
         None => false,
+    }
+}
+
+/// Keep absence and an unreadable kernel observation distinct: recovery may
+/// tear down upper layers only when the backend is known to be absent.
+fn nbd_backend_at(sysfs: &Path, device: &str) -> io::Result<Option<String>> {
+    let index = nbd_index(device)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid NBD device"))?;
+    let path = sysfs.join(format!("nbd{index}"));
+    match std::fs::read_to_string(path.join("backend")) {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => match std::fs::symlink_metadata(path.join("pid")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "connected NBD device has no backend identifier; netlink identity support is required",
+            )),
+        },
     }
 }
 
@@ -404,6 +427,15 @@ fn identity_error(message: impl Into<String>) -> ExecError {
 /// System interactions are isolated so tests exercise the same ordering,
 /// record validation, and rollback decisions without touching devices.
 trait System {
+    fn recovery_proof(
+        &self,
+        _record: &BoundDeviceRecord,
+    ) -> io::Result<Option<recover::RecoveryProof>> {
+        Ok(None)
+    }
+    fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        self.detach_observation(record)
+    }
     fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
         Err(identity_error("logical volume size cannot be observed"))
     }
@@ -424,6 +456,24 @@ trait System {
 struct LinuxSystem;
 
 impl System for LinuxSystem {
+    fn recovery_proof(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<Option<recover::RecoveryProof>> {
+        recover::capture(
+            record,
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            Path::new("/sys/class/block"),
+        )
+        .map(Some)
+    }
+    fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        recover::observe(
+            record,
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            Path::new("/sys/class/block"),
+        )
+    }
     fn lv_size(&self, vg: &str, lv: &str) -> Result<u64, ExecError> {
         let out = command::capture(
             Command::new("blockdev").args(["--getsize64", &format!("/dev/{vg}/{lv}")]),
@@ -451,18 +501,7 @@ impl System for LinuxSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
-        let index = nbd_index(device)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid NBD device"))?;
-        let path = format!("/sys/block/nbd{index}/backend");
-        match std::fs::read_to_string(path) {
-            Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ if !nbd_connected(device) => Ok(None),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "connected NBD device has no backend identifier; netlink identity support is required",
-            )),
-        }
+        nbd_backend_at(Path::new("/sys/block"), device)
     }
 
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
@@ -797,6 +836,7 @@ fn execute_with(
                 .ok_or_else(|| identity_error("missing attachment configuration identity"))?,
             device,
             connection_id: format!("maki-{}", nonce.trim()),
+            recovery: None,
         };
         // A new operation owns only resources it creates. Refuse an already
         // mounted target, active VG, or holder before connecting or publishing
@@ -866,6 +906,32 @@ fn execute_with(
                 verify_connection(record.as_ref().unwrap(), system)
                     .and_then(|()| system.run_step(step, None))
             }
+            PlannedStep::LvmActivate { .. } if connects => {
+                let current = record.as_mut().unwrap();
+                verify_connection(current, system).and_then(|()| {
+                    system.run_step(step, None)?;
+                    verify_connection(current, system)?;
+                    current.recovery = system.recovery_proof(current)?;
+                    verify_connection(current, system)?;
+                    state.unwrap().write(current)?;
+                    Ok(())
+                })
+            }
+            PlannedStep::MountXfs { .. } if connects => {
+                let current = record.as_ref().unwrap();
+                verify_connection(current, system).and_then(|()| {
+                    if current.recovery.is_some() {
+                        let observed = system.recovery_observation(current)?;
+                        if observed.mounted || !observed.vg_active {
+                            return Err(identity_error(
+                                "mount target or mapping changed after recording recovery identity",
+                            ));
+                        }
+                        verify_connection(current, system)?;
+                    }
+                    system.run_step(step, None)
+                })
+            }
             other => system.run_step(other, None),
         };
         if let Err(error) = result {
@@ -922,3 +988,18 @@ mod tests;
 #[cfg(test)]
 #[path = "command_tests.rs"]
 mod command_tests;
+
+/// Recover only disconnected storage, under the same root-controlled lock as attach.
+/// Callers must stop workloads first; this command never starts or repairs a database.
+pub fn recover(plan: &Plan) -> Result<(), ExecError> {
+    let lock = lock_attach()?;
+    recover_with(plan, &lock.state, &mut LinuxSystem)
+}
+
+fn recover_with(
+    plan: &Plan,
+    state: &TrustedState,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    recover::execute(plan, state, system)
+}

@@ -28,6 +28,9 @@ pub(crate) struct BoundDeviceRecord {
     /// Passed to nbd-client's netlink identifier and checked against the
     /// live kernel backend attribute, including before rollback.
     pub connection_id: String,
+    /// Kernel identity captured with this backend still connected, before mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::exec::recover::RecoveryProof>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
