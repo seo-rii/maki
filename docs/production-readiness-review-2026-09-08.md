@@ -1,6 +1,6 @@
 # 운영 준비 검토 및 R3 수정 기록 — 2026-09-08
 
-최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace/9 release gates/CI 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 TDD 수정과 단위별 커밋을 이어갔다. 이 기준선은 v2 proof, 복구/검사 메모리, 전송 소유 버퍼, mount 전 검사와 fresh-space admission 변경을 포함한다. 후속 카운터 경계 수정의 검증은 별도로 기록한다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
+최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 최신 검사는 LVM 사전 검사와 native 초기 준비 완료 통지를 포함한다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
 **운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 전송 라이브러리의 평문 복사본, 물리 공간 admission과 고유 단위·metadata의 전체 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
 
@@ -188,6 +188,11 @@ simulation CI와 실제 DB/XFS qualification 목표, 등록된 SecretBuffer의 �
 최종 대조했다. MAKI-048 문서 일관성 항목은 완료했으며, 다른 코드·운영 검증
 항목의 종료나 운영 승인을 뜻하지 않는다.
 
+후속 native 검토에서 operations의 오래된 FUA/블록 크기 설명이 대조에서
+누락됐음을 확인했다. `5269b0e`에서 실제 ABI·협상 검사에 맞게 native FUA와
+블록 크기 callback 설명을 고쳤다. 이전 문서 대조 결과를 모든 문장의 완전성
+보증으로 확대하지 않는다.
+
 ## 수신 응답·overlay·workload verify 통합 snapshot — b3c5103
 
 `b3c510333da44b73f8b1819a269bd87779a08613`의 커밋된 소스만 추출해 전체
@@ -203,6 +208,29 @@ PID 812671, 통합 exit 0, 237.68초; 로그:
 
 현재 문서 13개의 로컬 파일 링크와 SPEC/packaged production TOML의 의미상
 일치를 확인했다. R3 원본 SHA256도 exit 0이며 미해결 원본 항목은 보존한다.
+
+## LVM 사전 검사·native 준비 상태 통합 snapshot — 2a3f023
+
+`2a3f023365e1aef759a2a92ad3d024454c94df2d`의 커밋된 소스만 추출해 fmt,
+workspace/all-targets strict Clippy와 workspace 검사를 완료했다.
+모두 exit 0이며 **901 passed, 0 failed, 10 ignored**다. PID 915222,
+통합 exit 0, 188.09초; 로그:
+`/home/seorii/logs/maki-r3-native-ready-final-verified-20260912T115825.561153Z.log`.
+별도 집중 검사에서는 설치된 nbdkit 1.32.5로 native startup 9개를 실제 실행했다.
+이 lifecycle 변경에서 전체 release 9개나 DB simulation을 반복하지 않았으며,
+해당 결과는 위 `fb3da46`/`b3c5103` 기준으로 남긴다.
+
+정상 푸시도 exit 0(PID 938352;
+`/home/seorii/logs/maki-r3-native-ready-push-20260912T120211.908393Z.log`)이다.
+[해당 커밋의 Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34692584706)가
+모두 성공했다. Linux는 nbdkit·plugin header·libnbd 도구 설치와 실행 확인을
+통과한 뒤 workspace 검사를 실행했다. Windows는 Linux 전용 설치를 건너뛰고
+자기 플랫폼의 fmt·strict Clippy·workspace 검사를 통과했다.
+CI의 nbdkit 1.36.3/libnbd 1.20.0에서도 native startup **9 passed**를 실행
+로그로 확인했다. 완료된 Linux job 로그 수집 PID 978013, exit 0:
+`/home/seorii/logs/maki-r3-native-ready-ci-linux-complete-20260912T120853.861042Z.log`.
+최종 문서 15개의 로컬 파일 링크 118개는 모두 실제 대상 파일을 가리킨다.
+실제 운영 서비스 배포, kernel NBD/LVM/XFS 및 DB 검증은 실행하지 않았다.
 
 ## 남은 리뷰 항목과 종료 조건
 

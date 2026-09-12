@@ -34,6 +34,8 @@ provided.
 - Offline format checking and deterministic crash simulation.
 - Privilege-separated attach, detach, recovery and growth operations, with a
   repeatable read-only storage identity check before workload starts.
+- Native startup notification after recovery, provider checks and control
+  binding, before the first NBD client.
 
 ## Project status
 
@@ -43,7 +45,7 @@ provided.
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
 | HTTP transport TLS and loopback chaos handling | Validated in automated tests |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
-| Kernel `/dev/nbd`, LVM, XFS, and fio path | Validated on Debian 12/KVM; broader destructive qualification open |
+| Kernel `/dev/nbd`, LVM, XFS, and fio path | Historical Debian 12/KVM smoke; current preflight and workload verification still require target-host qualification |
 | Real database and vendor-provider workloads | SQLite smoke passed; broader qualification open |
 | QEMU and bare-metal power-loss testing | Not qualified |
 | 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
@@ -100,8 +102,11 @@ The current [R3 readiness record](docs/production-readiness-review-2026-09-08.md
 supersedes the historical remaining-work lists above. MAKI-020 now has required
 mirrored acknowledgement evidence: `fb3da46` passed 812 workspace tests,
 nine release gates, and Linux/Windows CI. The later `b3c5103` snapshot passed
-865 workspace tests, the release DB simulation, and Linux/Windows CI; revision-
-specific gate results are recorded separately. Volume recovery streams segments,
+865 workspace tests and the release DB simulation. The `2a3f023` snapshot adds
+LVM preflight and native startup readiness and passed 901 workspace tests,
+formatting, strict Clippy, and Linux/Windows CI. Linux CI now installs the native
+NBD test tools before its workspace run. Revision-specific gate results are
+recorded separately. Volume recovery streams segments,
 retains the latest record per unit and shares identical internal overlay versions.
 Distinct versions and metadata still need a total memory bound. Production
 approval remains pending.
