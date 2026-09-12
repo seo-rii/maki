@@ -1,0 +1,17 @@
+# Fail-closed recovery coordinator for one Maki workload lifecycle. Starting
+# this unit first stops the registered workloads, attach helper, and daemon.
+# Cleanup must succeed before OnSuccess can start a fresh lifecycle.
+
+[Unit]
+Description=Recover Maki workload lifecycle %i
+Conflicts=maki-workload@%i.target maki-attach@%i.service maki@%i.service
+After=maki-workload@%i.target maki-attach@%i.service maki@%i.service
+OnSuccess=maki-workload@%i.target
+# Include time spent waiting for workload and storage stop jobs. A timeout
+# leaves the lifecycle stopped and never reaches OnSuccess.
+JobTimeoutSec=360
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+ExecStart=/usr/bin/maki-attach cleanup --volume %i

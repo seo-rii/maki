@@ -32,9 +32,9 @@ fn data_plane_unit_is_unprivileged_and_sandboxed() {
         "CapabilityBoundingSet=", // PRIV-002: empty capability set
         "AmbientCapabilities=",
         "NoNewPrivileges=yes",
-        "LimitCORE=0",          // PRIV-015: no core dumps
-        "Restart=on-failure",   // PRIV-012: restart after failure
-        "ProtectSystem=strict", // PRIV-004: /etc immutable
+        "LimitCORE=0",                       // PRIV-015: no core dumps
+        "OnFailure=maki-recover@%i.service", // PRIV-012: fail through cleanup
+        "ProtectSystem=strict",              // PRIV-004: /etc immutable
         "ProtectHome=yes",
         "PrivateTmp=yes",
         "ReadWritePaths=/var/lib/maki/%i",

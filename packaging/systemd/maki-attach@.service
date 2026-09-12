@@ -13,8 +13,9 @@
 
 [Unit]
 Description=Maki attach helper for volume %i
-Requires=maki@%i.service
+BindsTo=maki@%i.service
 After=maki@%i.service
+PartOf=maki-workload@%i.target
 # A missing required config must fail the start job: a Condition would
 # merely skip attach and permit ordered Requires= workloads to start.
 AssertPathExists=/etc/maki/attach/%i.toml
@@ -34,7 +35,4 @@ TimeoutStartSec=180
 TimeoutStopSec=120
 
 ExecStart=/usr/bin/maki-attach attach --volume %i
-ExecStop=/usr/bin/maki-attach detach --volume %i
-
-[Install]
-WantedBy=multi-user.target
+ExecStop=/usr/bin/maki-attach cleanup --volume %i

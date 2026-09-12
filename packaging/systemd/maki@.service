@@ -6,6 +6,11 @@
 Description=Maki encrypted volume %i
 After=network-online.target
 Wants=network-online.target
+OnFailure=maki-recover@%i.service
+OnFailureJobMode=replace-irreversibly
+# Bound automatic recovery loops when daemon startup cannot succeed.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 # The native plugin initializes after fork and sends READY only after recovery,
@@ -22,9 +27,6 @@ ExecStart=/usr/bin/nbdkit \
     -U /run/maki/%i/nbd.sock \
     /usr/lib/maki/maki-nbdkit.so \
     config=/etc/maki/volumes/%i.toml
-
-Restart=on-failure
-RestartSec=2
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -56,6 +58,3 @@ ReadWritePaths=/run/maki-control/%i
 # This directive is enabled: provision the per-volume token file before start.
 # Override its source path in a service drop-in if secrets are stored elsewhere.
 LoadCredential=crypto-token:/etc/maki/secrets/%i.token
-
-[Install]
-WantedBy=multi-user.target
