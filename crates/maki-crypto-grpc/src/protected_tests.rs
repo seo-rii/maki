@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use prost::bytes::Bytes;
 use prost::Message;
@@ -100,14 +100,9 @@ fn request(item: WireItem) -> WireRequest {
     }
 }
 
-struct NoopWake;
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let waker = Waker::from(Arc::new(NoopWake));
-    future.poll(&mut Context::from_waker(&waker))
+    let waker = Waker::noop();
+    future.poll(&mut Context::from_waker(waker))
 }
 
 #[test]
@@ -318,8 +313,8 @@ fn tonic_encoding_releases_the_original_owned_item_with_zeroization() {
         None,
         None,
     ));
-    let waker = Waker::from(Arc::new(NoopWake));
-    let result = tonic::codegen::Body::poll_frame(body.as_mut(), &mut Context::from_waker(&waker));
+    let waker = Waker::noop();
+    let result = tonic::codegen::Body::poll_frame(body.as_mut(), &mut Context::from_waker(waker));
     assert!(matches!(result, Poll::Ready(Some(Ok(_)))));
     assert_zeroized(); // The separate encoded tonic buffer is intentionally not watched.
 }
