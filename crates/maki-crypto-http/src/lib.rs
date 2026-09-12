@@ -90,8 +90,36 @@ pub fn zeroize_json(value: &mut Value) {
     match value {
         Value::String(s) => s.zeroize(),
         Value::Array(items) => items.iter_mut().for_each(zeroize_json),
-        Value::Object(map) => map.values_mut().for_each(zeroize_json),
+        Value::Object(map) => {
+            // `serde_json::Map` exposes mutable values but not mutable keys.
+            // Drain the object so each owned key can be wiped before its
+            // allocation is released, while recursively wiping every value.
+            for (mut key, mut child) in std::mem::take(map) {
+                key.zeroize();
+                zeroize_json(&mut child);
+            }
+        }
         _ => {}
+    }
+}
+
+/// Own a JSON tree while it can still contain reversible plaintext. Any
+/// early return or unwind wipes the complete tree before releasing it.
+struct WipedJson(Value);
+
+impl WipedJson {
+    fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    fn take(&mut self) -> Value {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for WipedJson {
+    fn drop(&mut self) {
+        zeroize_json(&mut self.0);
     }
 }
 
@@ -361,6 +389,9 @@ fn decode_pointer_token(token: &str) -> String {
 
 /// Insert `value` at a JSON pointer, creating intermediate objects.
 fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), CryptoError> {
+    // Keep ownership under a wipe guard until insertion succeeds. This also
+    // covers malformed pointers rejected before the tree is traversed.
+    let mut value = WipedJson::new(value);
     let mut current = root;
     let tokens: Vec<&str> = pointer
         .strip_prefix('/')
@@ -369,12 +400,15 @@ fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), Cryp
         .collect();
     for (i, token) in tokens.iter().enumerate() {
         if !current.is_object() {
+            zeroize_json(current);
             *current = Value::Object(serde_json::Map::new());
         }
         let map = current.as_object_mut().unwrap();
         let key = decode_pointer_token(token);
         if i + 1 == tokens.len() {
-            map.insert(key, value);
+            if let Some(mut replaced) = map.insert(key, value.take()) {
+                zeroize_json(&mut replaced);
+            }
             return Ok(());
         }
         current = map
@@ -585,12 +619,12 @@ impl HttpCryptoProvider {
             let (body, json): (reqwest::Body, bool) = match &op.body {
                 BodySpec::Raw => (body_from(payload.clone()), false),
                 BodySpec::Json { fields, .. } => {
-                    let mut root = Value::Object(serde_json::Map::new());
+                    let mut root = WipedJson::new(Value::Object(serde_json::Map::new()));
                     for (pointer, source) in fields {
                         let v = Self::scalar(source, context, *unit_index, batch_index, payload);
-                        pointer_set(&mut root, pointer, v)?;
+                        pointer_set(&mut root.0, pointer, v)?;
                     }
-                    (body_from(Self::encode_and_wipe(&mut root)), true)
+                    (body_from(Self::encode_and_wipe(&mut root.0)), true)
                 }
             };
             let response = self.send(op, body, json).await?;
@@ -609,24 +643,28 @@ impl HttpCryptoProvider {
         fields: &[(String, FieldSource)],
         item_fields: &[(String, FieldSource)],
     ) -> Result<Vec<Sensitive>, CryptoError> {
-        let mut root = Value::Object(serde_json::Map::new());
+        let mut root = WipedJson::new(Value::Object(serde_json::Map::new()));
         for (pointer, source) in fields {
             let v = Self::scalar(source, context, 0, 0, &[]);
-            pointer_set(&mut root, pointer, v)?;
+            pointer_set(&mut root.0, pointer, v)?;
         }
-        let mut array = Vec::with_capacity(items.len());
+        let mut array = WipedJson::new(Value::Array(Vec::with_capacity(items.len())));
         for (batch_index, (unit_index, payload)) in items.iter().enumerate() {
-            let mut element = Value::Object(serde_json::Map::new());
+            let mut element = WipedJson::new(Value::Object(serde_json::Map::new()));
             for (pointer, source) in item_fields {
                 let v = Self::scalar(source, context, *unit_index, batch_index, payload);
-                pointer_set(&mut element, pointer, v)?;
+                pointer_set(&mut element.0, pointer, v)?;
             }
-            array.push(element);
+            array
+                .0
+                .as_array_mut()
+                .expect("batch request remains an array")
+                .push(element.take());
         }
-        pointer_set(&mut root, items_path, Value::Array(array))?;
+        pointer_set(&mut root.0, items_path, array.take())?;
 
         let response = self
-            .send(op, body_from(Self::encode_and_wipe(&mut root)), true)
+            .send(op, body_from(Self::encode_and_wipe(&mut root.0)), true)
             .await?;
         let mut value: Value = serde_json::from_slice(&response)
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
