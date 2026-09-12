@@ -275,6 +275,13 @@ cachevol 사전 거절 2개(PID 856473, exit 101;
 롤백과 kernel parent/range/device/holder 제어를 포함한다. 실제 장치의 LVM
 report/activation이나 DB 검증은 실행하지 않았다.
 
+이 단위는 `1dd4069d3407f8f7b78dd5f26fe0b380b2b20fb3`로 정상 푸시했다
+(PID 872497, exit 0;
+`/home/seorii/logs/maki-r3-lvm-preflight-push-20260912T113801.079900Z.log`).
+[해당 커밋의 Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34691556494)는
+fmt, strict Clippy, workspace 검사를 모두 통과했다. 이 helper 단위 때문에
+이전 9개 release simulation gate를 반복하지는 않았다.
+
 MAKI-028의 동일 ciphertext 중복 보유를 별도 수정했다. 64×64KiB의 promotion과
 실제 FileBacking checkpoint에서 전체 ciphertext가 재복사되는 RED 2개와
 기존 버전/API 제어 2개의 통과를 먼저 확인했다(PID 758308, exit 101;
