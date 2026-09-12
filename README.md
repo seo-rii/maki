@@ -38,7 +38,7 @@ provided.
 
 | Area | Status |
 |---|---|
-| Core engine, format, recovery, and provider contracts | Prior workspace baseline passed; v2 durability changes have local regression coverage, with full validation pending |
+| Core engine, format, recovery, and provider contracts | v2 durability baseline passed workspace tests, nine release gates and Linux/Windows CI; subsequent fixes and remaining limits are tracked in the [R3 readiness record](docs/production-readiness-review-2026-09-08.md) |
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
 | HTTP transport TLS and loopback chaos handling | Validated in automated tests |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
@@ -97,7 +97,7 @@ remaining release gates.
 
 The current [R3 readiness record](docs/production-readiness-review-2026-09-08.md)
 supersedes the historical remaining-work lists above. MAKI-020 now has required
-mirrored acknowledgement evidence: `1bc0ab5` passed 768 workspace tests,
+mirrored acknowledgement evidence: `fb3da46` passed 812 workspace tests,
 nine release gates, and Linux/Windows CI. Follow-up changes are tracked
 separately. Volume recovery streams segments and retains the latest record per
 unit; distinct-unit, overlay and metadata memory limits remain open. Neither change

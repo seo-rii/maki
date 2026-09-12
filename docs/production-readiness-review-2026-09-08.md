@@ -1,6 +1,6 @@
 # 운영 준비 검토 및 R3 수정 기록 — 2026-09-08
 
-최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace/9 release gates/CI 기준선은 `1bc0ab5`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 TDD 수정과 단위별 커밋을 이어갔다. 후속 복구 메모리 변경 `972399d`도 core 전체·관련 release gate 6개·Linux/Windows CI를 통과했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
+최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace/9 release gates/CI 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 TDD 수정과 단위별 커밋을 이어갔다. 이 기준선은 v2 proof, 복구/검사 메모리, 전송 소유 버퍼, mount 전 검사와 fresh-space admission 변경을 포함한다. 후속 카운터 경계 수정의 검증은 별도로 기록한다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
 **운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 평문 직렬화 복사본, 물리 공간 admission과 replay 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
 
@@ -139,6 +139,34 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 이 커밋의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34686934432)도
 모두 성공했다. 나머지 3개 release gate의 최근 실행은 `1bc0ab5` 기준이다.
 
+## 최신 전체 snapshot 검증 — fb3da46
+
+커밋된 소스만 추출한 `fb3da461d5d399b13e87c90fd3b951045b5bb29b`에서
+아래 검사를 완료했다. 이전 snapshot의 성공을 재사용한 결과가 아니다.
+
+| 검사 | 완료 결과 |
+|---|---|
+| 전체 fmt 및 workspace/all-targets strict Clippy | 모두 exit 0 |
+| `cargo test --workspace --locked -j 2` | **812 passed, 0 failed, 10 ignored**, exit 0 |
+| 지정 release gate 9개 | **9 passed, 0 failed, 0 ignored**, exit 0 |
+| Linux·Windows CI | 모두 성공, [CI run](https://github.com/seo-rii/maki/actions/runs/34688000506) |
+
+PID 625199, 통합 exit 0, 645.46초. 로그:
+`/home/seorii/logs/maki-r3-transport-final-verified-20260912T101639.234527Z.log`.
+release는 같은 snapshot의 workspace에서 `--release --locked -- --ignored`
+뒤에 phase0/3/4/11/12, phase5 endpoint/breaker, R3B durability/concurrent의
+9개 이름을 지정했다. 일반 suite의 ignored 10개를 성공으로 합산하지 않았다.
+후속 카운터 수정은 이 snapshot에 포함되지 않는다.
+
+추가 의존성 검사 `cargo audit --json`도 exit 0으로 끝났으며 알려진 취약점
+0건, 경고 0건이었다. RustSec DB revision은
+`b50980aad8b8f14f77e25a97b32dd94bf008b0af`(마지막 갱신 2026-09-09),
+PID 622494; 로그
+`/home/seorii/logs/maki-r3-dependency-audit-20260912T101606.925259Z.log`.
+이는 해당 advisory DB와 Cargo.lock 대조 결과이며 알려지지 않은 취약점이나
+배포 환경의 안전성을 증명하지 않는다. 원본 R3 리뷰의 SHA256 검사는 통과했고
+미해결 항목이 있으므로 원본을 계속 보존한다.
+
 ## 남은 리뷰 항목과 종료 조건
 
 MAKI-015의 WS 요청도 중간 JSON tree/base64 String을 없애고 고정
@@ -219,12 +247,12 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |
 |---|---|---|
-| MAKI-005 | 코드: 전체 PV/VG/LV·filesystem 신원 증명이 VG 활성화 전에 끝나지 않음 | 활성화 전 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 |
+| MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 및 probe 전후 mapping/backend 검증 완료. PV/VG/LV의 독립 신원 검증은 VG 활성화 전에 끝나지 않음 | 활성화 전 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 코드·수명주기: 명령 deadline과 기록 기반 recover는 추가됐지만 activation→proof 게시 crash 공백, 실제 READY, 다른 mount namespace와 workload restart 우회가 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
-| MAKI-015/032 | 코드: 논리·암호문 budget 수정은 완료했으나 WS/gRPC 직렬화와 codec의 일반 평문 복사본 수명·전체 resident 비용이 남음 | 성공·오류·취소마다 소유 버퍼 정리와 peak resident 상한을 검증하고 전송 계층의 남는 보장 범위를 명시 |
+| MAKI-015/032 | 부분 수정: WS 요청과 decoded output, gRPC private item의 소유 버퍼 보호 완료. incoming JSON/frame·tonic 등 별도 할당의 수명·잠금과 전체 resident 비용이 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
-| MAKI-021/041 | 코드·용량: free-space threshold는 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약이 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
-| MAKI-025 | 부분 수정: segment streaming과 실제 Volume attach의 단위별 최신 replay 보유로 반복 overwrite 이력의 payload/pending 인덱스 증가를 제거. 고유 단위, overlay 두 사본, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
+| MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
+| MAKI-025 | 부분 수정: segment streaming, Volume attach의 단위별 최신 replay 보유, deep checker의 검증 후 payload 폐기로 반복 이력에 따른 payload/pending 증가를 제거. 고유 단위, overlay 두 사본, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
 | MAKI-028 | 자원 구조: latest/durable/checkpoint overlay의 ciphertext 중복이 남음 | 실제 최대 overlay에서 peak RSS 한도 검증, 필요 시 보관 구조 수정; 논리 budget 통과를 전체 메모리 증거로 사용하지 않음 |
 | MAKI-029/030 | 구조·성능: checkpoint의 exclusive lock과 async worker 위 동기 backing I/O가 남음 | 목표 부하의 최악 I/O 정지·runtime 여유를 검증하고 기준 미달 시 작업 격리/잠금 범위 수정. MAKI-039의 snapshot이 이를 해결한 것은 아님 |
 | MAKI-013 | 위협 모델: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음 | replay를 지원 위협 모델에서 제외하는 결정과 제한을 명시하거나 세대 인증·독립 anchor를 구현하고 공격 회귀 실행 |

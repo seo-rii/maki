@@ -6,6 +6,11 @@ and listed 18 findings (M-001 … M-018). This page tracks what has been done
 about each one, in the review's own order, and records subsequent reviews and
 their regression evidence.
 
+These dated sections preserve the findings and evidence from each review
+pass. For current revisions, support limits and completed versus pending
+qualification, use the [R3 readiness record](production-readiness-review-2026-09-08.md).
+Later fixes can supersede an older section's remaining-work list.
+
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 

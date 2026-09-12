@@ -1541,6 +1541,14 @@ read/write probe succeeds
 
 If the secure mount is unavailable, the container MUST NOT start.
 
+The attach helper probes the activated LV before mounting and requires XFS
+TYPE plus the configured `fs_uuid`, when present. It revalidates the NBD
+backend and recorded mapping before and after that bounded probe, then retains
+the post-mount checks above. The current helper permits `fs_uuid` to be omitted
+for compatibility; that does not establish the filesystem UUID match required
+by this production profile. The probe follows LVM activation and does not
+provide activation-time identity proof or automatic container reattachment.
+
 Example systemd dependency:
 
 ```text

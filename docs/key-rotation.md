@@ -1,5 +1,10 @@
 # Credential rotation and key migration
 
+Check [format compatibility](durable-recovery.md) before restarting a volume
+with the current binary. Writable recovery requires v2 metadata; a legacy v1
+volume needs the separate preservation and migration procedure. Credential
+rotation alone does not upgrade its format or prove ambiguous legacy history.
+
 An authentication credential can be replaced on an existing volume only when
 the provider still uses the same encryption key and cryptographic profile.
 Changing the actual encryption key requires a new volume and a data migration.

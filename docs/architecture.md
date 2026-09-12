@@ -146,10 +146,13 @@ or make those records checkpoint-eligible. Recovery publishes every accepted
 horizon to both proof copies before READY.
 
 Segment scanning uses fixed 64 KiB scratch and discards checkpoint-covered
-payloads as they are validated. In the covered-segment memory regression, extra
-heap peak fell from 135,397,624 bytes to 488 bytes; fixed stack scratch is
-separate. Replay payloads and the overlay still grow with outstanding history,
-so this is not a whole-recovery memory bound (MAKI-025).
+payloads as they are validated. Volume attach retains only the latest record
+per unit, and the deep checker discards each validated payload after counting
+it. The four-unit overwrite regression measures 33,988 bytes of extra heap
+for recovery and 9,176 bytes for deep checking at both 1 MiB and 64 MiB history.
+Distinct units, overlay copies and segment/allocation metadata still consume
+memory; public all-record APIs retain their return contract. See the
+[measurements and limits](durable-recovery.md#cost-and-verification-limits).
 
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at

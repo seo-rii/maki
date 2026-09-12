@@ -265,9 +265,12 @@ Execution (Linux, root) then:
 2. records the requested attachment and a random connection identifier before
    connecting NBD, then connects with the configured block size, waits until
    the device reports a size, and verifies its kernel backend identifier;
-3. activates the VG, mounts XFS, and on `--init-sentinel` (or
-   `init_sentinel = true`, first boot only) creates `<mountpoint>/.maki-sentinel`
-   holding the volume UUID, never overwriting a different value;
+3. activates the VG and records its mapping identity, then verifies XFS TYPE
+   and the optional configured `fs_uuid` with a bounded block probe before
+   mounting. It rechecks backend/mapping identity around that probe. After
+   mounting, `--init-sentinel` (or `init_sentinel = true`, first boot only)
+   creates `<mountpoint>/.maki-sentinel` holding the volume UUID, never
+   overwriting a different value; see [attachment limits](storage-recovery.md);
 4. verifies the mount identity from `/proc/self/mountinfo`, `blkid`, sysfs NBD
    state, the sentinel, and a read/write probe (the mount root belongs to the
    workload: the sentinel is opened without following symlinks and read to a
@@ -444,9 +447,12 @@ high-cardinality values as metric labels.
 - Writes fail with ENOSPC when backing free space is below
   `backing.journal_emergency_reserve_bytes`, or when the journal has reached
   `backing.journal_max_bytes` and an inline checkpoint could not reclaim it.
-  Reads keep working. `maki status` then shows `state: degraded` with the
-  checkpoint error; the state returns to `ready` once a checkpoint succeeds
-  (the worker retries on its interval, and every write retries the reclaim).
+  Admission refreshes the free-space observation; it does not reserve physical
+  storage. A reserve-only refusal leaves existing data readable and does not
+  by itself set a checkpoint error or change the engine state. A failed
+  checkpoint reports `state: degraded` with its error, cleared by a successful
+  checkpoint; the worker retries on its interval and writes retry necessary
+  reclaim. Other outstanding failure states can still prevent `ready`.
 - `maki reload` returns an error naming the section for any change the running
   daemon cannot apply; only `cache` is applied at runtime today. An error means
   the change was not applied: restart the daemon.
