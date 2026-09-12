@@ -51,6 +51,7 @@ fn record() -> BoundDeviceRecord {
             mountpoint: "/srv/pg".into(),
             vg_name: "vg_maki_pg".into(),
             lv_name: "data".into(),
+            lvm_identity: None,
         },
         device: "/dev/nbd3".into(),
         connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),

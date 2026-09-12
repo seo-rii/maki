@@ -87,6 +87,7 @@ fn request() -> AttachRequest {
         device_block_size: 4096,
         vg_name: "vg_maki_postgres".to_string(),
         lv_name: "data".to_string(),
+        lvm_identity: None,
         mountpoint: "/srv/postgres".to_string(),
         volume_uuid: "0123-4567".to_string(),
         fs_uuid: None,
@@ -127,6 +128,7 @@ fn plans_contain_no_credential_material() {
             nbd_socket: "/run/maki/postgres/nbd.sock".into(),
             vg_name: "vg_maki_postgres".into(),
             lv_name: "data".into(),
+            lvm_identity: None,
             target_bytes: 10 << 30,
             mountpoint: "/srv/postgres".into(),
         })
@@ -166,6 +168,7 @@ fn grow_plan_is_lvextend_then_xfs_growfs() {
         nbd_socket: "/run/maki/postgres/nbd.sock".into(),
         vg_name: "vg".into(),
         lv_name: "data".into(),
+        lvm_identity: None,
         target_bytes: 1 << 30,
         mountpoint: "/srv/postgres".into(),
     });

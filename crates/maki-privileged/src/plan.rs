@@ -14,6 +14,17 @@ use serde::{Deserialize, Serialize};
 /// Placeholder for "allocate a free `/dev/nbdN` at execution time".
 pub const AUTO_NBD_DEVICE: &str = "/dev/nbd<auto>";
 
+/// Administrator-pinned LVM identity for a production attachment. PV UUIDs
+/// are stored in sorted order so configuration order does not change the
+/// trusted attachment identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LvmIdentityPins {
+    pub pv_uuids: Vec<String>,
+    pub vg_uuid: String,
+    pub lv_uuid: String,
+}
+
 /// Name of the sentinel file the mount guard reads (SPEC §39).
 pub const SENTINEL_FILE: &str = ".maki-sentinel";
 
@@ -26,6 +37,8 @@ pub struct AttachRequest {
     pub device_block_size: u32,
     pub vg_name: String,
     pub lv_name: String,
+    /// Exact PV/VG/target-LV identity required before LVM activation.
+    pub lvm_identity: Option<LvmIdentityPins>,
     pub mountpoint: String,
     /// The Maki volume UUID the mounted filesystem's sentinel must carry.
     pub volume_uuid: String,
@@ -45,6 +58,7 @@ pub struct GrowRequest {
     pub nbd_socket: String,
     pub vg_name: String,
     pub lv_name: String,
+    pub lvm_identity: Option<LvmIdentityPins>,
     /// Absolute minimum LV size; reuse the same target when retrying.
     pub target_bytes: u64,
     pub mountpoint: String,
@@ -228,6 +242,8 @@ pub struct AttachmentIdentity {
     pub mountpoint: String,
     pub vg_name: String,
     pub lv_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lvm_identity: Option<LvmIdentityPins>,
 }
 
 impl From<&AttachRequest> for AttachmentIdentity {
@@ -238,6 +254,7 @@ impl From<&AttachRequest> for AttachmentIdentity {
             mountpoint: request.mountpoint.clone(),
             vg_name: request.vg_name.clone(),
             lv_name: request.lv_name.clone(),
+            lvm_identity: request.lvm_identity.clone(),
         }
     }
 }
@@ -250,6 +267,7 @@ impl From<&GrowRequest> for AttachmentIdentity {
             mountpoint: request.mountpoint.clone(),
             vg_name: request.vg_name.clone(),
             lv_name: request.lv_name.clone(),
+            lvm_identity: request.lvm_identity.clone(),
         }
     }
 }

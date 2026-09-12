@@ -53,6 +53,9 @@ impl BoundDeviceRecord {
             .map_err(|e| invalid(e.to_string()))?;
         check_lvm_name("vg_name", &self.attachment.vg_name).map_err(|e| invalid(e.to_string()))?;
         check_lvm_name("lv_name", &self.attachment.lv_name).map_err(|e| invalid(e.to_string()))?;
+        if let Some(pins) = &self.attachment.lvm_identity {
+            crate::config::check_lvm_identity(pins).map_err(|e| invalid(e.to_string()))?;
+        }
         let nonce = self
             .connection_id
             .strip_prefix("maki-")

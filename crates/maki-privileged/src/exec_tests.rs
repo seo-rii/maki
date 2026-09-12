@@ -55,6 +55,20 @@ fn request() -> AttachRequest {
         .unwrap()
 }
 
+fn pinned_request() -> AttachRequest {
+    parse(
+        r#"volume_uuid = '0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c'
+[lvm_identity]
+pv_uuids = ['111111-2222-3333-4444-5555-6666-777777']
+vg_uuid = 'aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg'
+lv_uuid = 'hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn'
+"#,
+    )
+    .unwrap()
+    .into_request("pg", AttachOverrides::default(), true)
+    .unwrap()
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BackendFault {
     Foreign,
@@ -195,6 +209,7 @@ impl System for FakeSystem {
             .into(),
             &record.attachment.vg_name,
             &record.attachment.lv_name,
+            record.attachment.lvm_identity.as_ref(),
             |path| {
                 if path == record.device {
                     Ok((43, 3))
@@ -358,6 +373,41 @@ impl System for FakeSystem {
             nbd_in_use: self.vg_active || self.extra_holders,
         })
     }
+}
+
+#[test]
+fn lvm_pin_mismatch_stops_before_activation_or_lvm_teardown() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut request = pinned_request();
+    request.lvm_identity.as_mut().unwrap().vg_uuid =
+        "333333-aaaa-bbbb-cccc-dddd-eeee-ffffff".into();
+    let mut system = FakeSystem::default();
+
+    assert!(execute_with(&plan_attach(&request), Some(&state), &mut system).is_err());
+    assert!(!system.steps.contains(&"lvm-activate"));
+    assert!(!system.steps.contains(&"lvm-deactivate"));
+}
+
+#[test]
+fn changed_or_missing_lvm_pins_cannot_authorize_detach_mutations() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let pinned = pinned_request();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&pinned), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+
+    let mut changed = pinned.clone();
+    changed.lvm_identity = None;
+    assert!(execute_with(&plan_detach(&changed), Some(&state), &mut system).is_err());
+    assert!(system.steps.is_empty());
+
+    let mut changed = pinned;
+    changed.lvm_identity.as_mut().unwrap().lv_uuid =
+        "333333-aaaa-bbbb-cccc-dddd-eeee-ffffff".into();
+    assert!(execute_with(&plan_detach(&changed), Some(&state), &mut system).is_err());
+    assert!(system.steps.is_empty());
 }
 
 #[test]
@@ -759,6 +809,7 @@ fn grow_request() -> GrowRequest {
         nbd_socket: r.nbd_socket,
         vg_name: r.vg_name,
         lv_name: r.lv_name,
+        lvm_identity: r.lvm_identity,
         target_bytes: 2 << 30,
         mountpoint: r.mountpoint,
     }

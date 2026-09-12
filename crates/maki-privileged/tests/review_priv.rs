@@ -6,7 +6,7 @@ use maki_privileged::config::{
     check_abs_path, check_argument, check_uuid, parse, AttachConfig, AttachOverrides,
 };
 use maki_privileged::plan::{
-    plan_attach, plan_detach, rollback_steps, PlannedStep, AUTO_NBD_DEVICE,
+    plan_attach, plan_detach, rollback_steps, LvmIdentityPins, PlannedStep, AUTO_NBD_DEVICE,
 };
 use maki_privileged::probe::{
     choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
@@ -28,6 +28,22 @@ device_block_size = 4096
     )
 }
 
+fn pinned_config_text() -> String {
+    format!(
+        r#"
+{}
+[lvm_identity]
+pv_uuids = [
+  "888888-9999-aaaa-bbbb-cccc-dddd-eeeeee",
+  "111111-2222-3333-4444-5555-6666-777777",
+]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"
+"#,
+        config_text()
+    )
+}
+
 // ---------- configuration ----------
 
 #[test]
@@ -42,6 +58,70 @@ fn config_resolves_defaults_and_auto_device() {
     assert_eq!(request.mountpoint, "/srv/pg");
     assert_eq!(request.volume_uuid, UUID);
     assert!(!request.init_sentinel);
+    assert_eq!(request.lvm_identity, None);
+}
+
+#[test]
+fn configured_lvm_identity_pins_are_normalized_and_carried_into_plans() {
+    let request = parse(&pinned_config_text())
+        .unwrap()
+        .into_request("pg", AttachOverrides::default(), true)
+        .unwrap();
+    let pins = LvmIdentityPins {
+        pv_uuids: vec![
+            "111111-2222-3333-4444-5555-6666-777777".into(),
+            "888888-9999-aaaa-bbbb-cccc-dddd-eeeeee".into(),
+        ],
+        vg_uuid: "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg".into(),
+        lv_uuid: "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn".into(),
+    };
+    assert_eq!(request.lvm_identity.as_ref(), Some(&pins));
+    assert_eq!(
+        plan_attach(&request)
+            .attachment
+            .unwrap()
+            .lvm_identity
+            .as_ref(),
+        Some(&pins)
+    );
+}
+
+#[test]
+fn configured_lvm_identity_rejects_missing_duplicate_and_malformed_pins() {
+    for table in [
+        r#"pv_uuids = []
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn""#,
+        r#"pv_uuids = ["111111-2222-3333-4444-5555-6666-777777", "111111-2222-3333-4444-5555-6666-777777"]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn""#,
+        r#"pv_uuids = ["bad"]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn""#,
+        r#"pv_uuids = ["111111-2222-3333-4444-5555-6666-777777"]
+vg_uuid = "bad"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn""#,
+        r#"pv_uuids = ["111111-2222-3333-4444-5555-6666-777777"]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "bad""#,
+    ] {
+        let text = format!("{}\n[lvm_identity]\n{table}\n", config_text());
+        let error = parse(&text)
+            .unwrap()
+            .into_request("pg", AttachOverrides::default(), true)
+            .unwrap_err();
+        assert!(error.to_string().contains("lvm_identity"), "{error}");
+    }
+
+    for incomplete in [
+        r#"pv_uuids = ["111111-2222-3333-4444-5555-6666-777777"]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg""#,
+        r#"vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn""#,
+    ] {
+        let text = format!("{}\n[lvm_identity]\n{incomplete}\n", config_text());
+        assert!(parse(&text).is_err(), "accepted incomplete pins: {text}");
+    }
 }
 
 #[test]

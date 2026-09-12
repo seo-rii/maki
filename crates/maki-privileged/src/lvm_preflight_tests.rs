@@ -1,4 +1,5 @@
 use super::*;
+use crate::plan::LvmIdentityPins;
 use std::os::unix::process::ExitStatusExt;
 
 const VG: &str = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg";
@@ -59,6 +60,27 @@ fn check(value: &serde_json::Value) -> io::Result<VerifiedLvm> {
         labels(),
         "vg_maki_pg",
         "data",
+        None,
+        resolve_name,
+    )
+}
+
+fn pins() -> LvmIdentityPins {
+    LvmIdentityPins {
+        pv_uuids: vec![PV1.into(), PV2.into()],
+        vg_uuid: VG.into(),
+        lv_uuid: LV.into(),
+    }
+}
+
+fn check_pinned(value: &serde_json::Value, pins: &LvmIdentityPins) -> io::Result<VerifiedLvm> {
+    validate(
+        &serde_json::to_vec(value).unwrap(),
+        devices(),
+        labels(),
+        "vg_maki_pg",
+        "data",
+        Some(pins),
         resolve_name,
     )
 }
@@ -90,6 +112,63 @@ fn multiple_pvs_and_hidden_metadata_lvs_are_supported_without_layout_restriction
         .unwrap()
         .reverse();
     assert_eq!(check(&reordered).unwrap(), verified);
+}
+
+#[test]
+fn administrator_lvm_pins_require_an_exact_pv_set_vg_and_target_lv() {
+    let expected = pins();
+    assert!(check_pinned(&fixture(), &expected).is_ok());
+
+    let foreign = "333333-aaaa-bbbb-cccc-dddd-eeee-ffffff";
+    for changed in [
+        LvmIdentityPins {
+            pv_uuids: vec![PV1.into()],
+            ..expected.clone()
+        },
+        LvmIdentityPins {
+            pv_uuids: vec![PV1.into(), foreign.into()],
+            ..expected.clone()
+        },
+        LvmIdentityPins {
+            pv_uuids: vec![PV1.into(), PV1.into()],
+            ..expected.clone()
+        },
+        LvmIdentityPins {
+            pv_uuids: vec![PV1.into(), "bad".into()],
+            ..expected.clone()
+        },
+        LvmIdentityPins {
+            vg_uuid: foreign.into(),
+            ..expected.clone()
+        },
+        LvmIdentityPins {
+            lv_uuid: foreign.into(),
+            ..expected.clone()
+        },
+    ] {
+        assert!(
+            check_pinned(&fixture(), &changed).is_err(),
+            "accepted non-exact administrator pins: {changed:?}"
+        );
+    }
+}
+
+#[test]
+fn recovery_rechecks_persisted_lvm_identity_against_administrator_pins() {
+    let mut report = fixture();
+    report["report"][0]["lv"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    let verified = check(&report).unwrap();
+    let mut record = record();
+    record.attachment.lvm_identity = Some(pins());
+    let result = validate_recovery_identity(&record, &verified);
+    assert!(result.is_ok(), "{result:?}");
+
+    record.attachment.lvm_identity.as_mut().unwrap().vg_uuid =
+        "333333-aaaa-bbbb-cccc-dddd-eeee-ffffff".into();
+    assert!(validate_recovery_identity(&record, &verified).is_err());
 }
 
 #[test]
@@ -146,6 +225,7 @@ fn omitted_independent_label_cannot_be_hidden_by_a_clean_fullreport() {
         independent,
         "vg_maki_pg",
         "data",
+        None,
         resolve_name
     )
     .is_err());
@@ -195,6 +275,7 @@ fn report_parse_is_bounded_and_required_fields_cannot_disappear() {
         labels(),
         "vg_maki_pg",
         "data",
+        None,
         resolve_name
     )
     .is_err());
@@ -210,6 +291,7 @@ fn report_parse_is_bounded_and_required_fields_cannot_disappear() {
         labels(),
         "vg_maki_pg",
         "data",
+        None,
         resolve_name
     )
     .is_err());
@@ -273,6 +355,7 @@ fn independently_labelled_pvs_must_not_overlap_underlying_nbd_sectors() {
         labels(),
         "vg_maki_pg",
         "data",
+        None,
         resolve_name
     )
     .is_err());
@@ -328,6 +411,7 @@ fn record() -> BoundDeviceRecord {
             mountpoint: "/mount".into(),
             vg_name: "vg_maki_pg".into(),
             lv_name: "data".into(),
+            lvm_identity: None,
         },
         recovery: None,
         recovery_intent: None,
@@ -480,6 +564,7 @@ fn whole_device_pv_overlapping_a_partition_pv_is_rejected() {
         labels,
         "vg_maki_pg",
         "data",
+        None,
         resolve_name
     )
     .is_err());

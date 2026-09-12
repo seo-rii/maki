@@ -46,6 +46,7 @@ impl Fixture {
                     mountpoint: mountpoint.to_str().unwrap().into(),
                     vg_name: "vg-maki".into(),
                     lv_name: "data-lv".into(),
+                    lvm_identity: None,
                 },
                 device: "/dev/nbd3".into(),
                 connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),

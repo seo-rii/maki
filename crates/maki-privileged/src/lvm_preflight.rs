@@ -1,7 +1,8 @@
-//! Pre-activation containment, not authentication against a configured LVM
-//! UUID. Read-only reports are lockless; external privileged LVM/udev actions
-//! are outside the helper lock. The verified identity is also persisted before
-//! activation so recovery can scope cleanup across the proof-publication gap.
+//! Pre-activation containment and optional authentication against configured
+//! PV/VG/LV UUIDs. Read-only reports are lockless; external privileged
+//! LVM/udev actions are outside the helper lock. The verified identity is also
+//! persisted before activation so recovery can scope cleanup across the
+//! proof-publication gap.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{command, identity_error, verify_connection, ExecError, LinuxSystem};
 use crate::detach::device_number;
+use crate::plan::LvmIdentityPins;
 use crate::state::BoundDeviceRecord;
 
 const MAX_DEVICES: usize = 64;
@@ -133,21 +135,35 @@ pub(super) fn validate_recovery_identity(
     {
         return Err(invalid("inconsistent persisted LVM identity"));
     }
+    verify_administrator_pins(verified, record.attachment.lvm_identity.as_ref())?;
     Ok(())
 }
 
 fn uuid(value: &str) -> io::Result<String> {
-    // LVM IDs are alphanumeric, not RFC 4122 UUIDs.
-    let widths = [6, 4, 4, 4, 4, 4, 6];
-    let parts: Vec<_> = value.split('-').collect();
-    if parts.len() != widths.len()
-        || parts.iter().zip(widths).any(|(part, width)| {
-            part.len() != width || !part.bytes().all(|b| b.is_ascii_alphanumeric())
-        })
-    {
-        return Err(invalid("invalid LVM UUID"));
-    }
+    crate::config::check_lvm_uuid("LVM UUID", value).map_err(|_| invalid("invalid LVM UUID"))?;
     Ok(value.to_owned())
+}
+
+fn verify_administrator_pins(
+    verified: &VerifiedLvm,
+    pins: Option<&LvmIdentityPins>,
+) -> io::Result<()> {
+    let Some(pins) = pins else {
+        return Ok(());
+    };
+    crate::config::check_lvm_identity(pins)
+        .map_err(|_| invalid("invalid configured LVM identity pins"))?;
+    let expected_pvs: BTreeSet<_> = pins.pv_uuids.iter().collect();
+    let actual_pvs: BTreeSet<_> = verified.labels.values().collect();
+    if expected_pvs != actual_pvs
+        || pins.vg_uuid != verified.vg_uuid
+        || pins.lv_uuid != verified.lv_uuid
+    {
+        return Err(invalid(
+            "LVM metadata does not match configured administrator pins",
+        ));
+    }
+    Ok(())
 }
 
 fn kernel_u64(path: &Path) -> io::Result<u64> {
@@ -390,6 +406,7 @@ pub(super) fn validate(
     labels: BTreeMap<String, String>,
     vg_name: &str,
     lv_name: &str,
+    pins: Option<&LvmIdentityPins>,
     mut resolve_device: impl FnMut(&str) -> io::Result<(u32, u32)>,
 ) -> io::Result<VerifiedLvm> {
     if bytes.len() > MAX_REPORT || devices.is_empty() || devices.len() > MAX_DEVICES {
@@ -528,7 +545,7 @@ pub(super) fn validate(
     }
     let (vg_uuid, vg_seqno, lv_uuid, lvs, layouts) =
         selected.ok_or_else(|| invalid("configured VG is absent"))?;
-    Ok(VerifiedLvm {
+    let verified = VerifiedLvm {
         devices,
         labels,
         vg_uuid,
@@ -536,7 +553,9 @@ pub(super) fn validate(
         lv_uuid,
         lvs,
         layouts,
-    })
+    };
+    verify_administrator_pins(&verified, pins)?;
+    Ok(verified)
 }
 
 pub(super) fn prepare(record: &BoundDeviceRecord) -> Result<VerifiedLvm, ExecError> {
@@ -555,6 +574,7 @@ pub(super) fn prepare(record: &BoundDeviceRecord) -> Result<VerifiedLvm, ExecErr
         labels,
         &record.attachment.vg_name,
         &record.attachment.lv_name,
+        record.attachment.lvm_identity.as_ref(),
         |path| number(Path::new(path)),
     )?)
 }

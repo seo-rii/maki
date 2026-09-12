@@ -166,6 +166,7 @@ fn main() -> ExitCode {
                 nbd_socket: request.nbd_socket.clone(),
                 vg_name: request.vg_name.clone(),
                 lv_name: request.lv_name.clone(),
+                lvm_identity: request.lvm_identity.clone(),
                 target_bytes: target,
                 mountpoint: request.mountpoint.clone(),
             })
