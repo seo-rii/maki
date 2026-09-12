@@ -532,6 +532,15 @@ trait System {
     ) -> Result<(), ExecError> {
         Err(identity_error("verified LVM rollback is unavailable"))
     }
+    fn recover_deactivate_lvm(
+        &mut self,
+        _record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        Err(identity_error(
+            "verified LVM recovery deactivation is unavailable",
+        ))
+    }
     fn recovery_proof(
         &self,
         _record: &BoundDeviceRecord,
@@ -595,6 +604,13 @@ impl System for LinuxSystem {
         verified: &lvm_preflight::VerifiedLvm,
     ) -> Result<(), ExecError> {
         lvm_preflight::deactivate(record, verified)
+    }
+    fn recover_deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        lvm_preflight::deactivate_recovery(record, verified)
     }
     fn recovery_proof(
         &self,
@@ -1012,6 +1028,7 @@ fn execute_with(
             device,
             connection_id: format!("maki-{}", nonce.trim()),
             recovery: None,
+            recovery_intent: None,
         };
         // A new operation owns only resources it creates. Refuse an already
         // mounted target, active VG, or holder before connecting or publishing
@@ -1089,10 +1106,14 @@ fn execute_with(
                     let verified = system.lvm_preflight(current)?;
                     verify_connection(current, system)?;
                     activation_identity = Some(verified.clone());
+                    current.recovery_intent = Some(recover::RecoveryIntent::new(&verified));
+                    state.unwrap().write(current)?;
+                    verify_connection(current, system)?;
                     system.activate_lvm(current, &verified, &mut activation_attempted)?;
                     verify_connection(current, system)?;
                     system.verify_activated_lvm(current, &verified)?;
                     current.recovery = system.recovery_proof(current)?;
+                    current.recovery_intent = None;
                     verify_connection(current, system)?;
                     state.unwrap().write(current)?;
                     Ok(())

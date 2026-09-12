@@ -242,6 +242,25 @@ fn activation_always_uses_exact_validated_devices_uuid_and_complete_mode() {
     let args: Vec<_> = report.get_args().map(|arg| arg.to_str().unwrap()).collect();
     assert!(args.contains(&"--readonly") && args.contains(&"--all") && args.contains(&"--devices"));
     assert!(!args.contains(&"--uuid"));
+
+    let command = deactivation_command(&verified);
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "--activate",
+            "n",
+            "--devices",
+            "/dev/nbd3,/dev/nbd3p1,/dev/nbd3p2",
+            "--select",
+            &format!("vg_uuid={VG}"),
+            "--config",
+            "devices { allow_changes_with_duplicate_pvs=0 }"
+        ]
+    );
 }
 
 #[test]
@@ -311,6 +330,7 @@ fn record() -> BoundDeviceRecord {
             lv_name: "data".into(),
         },
         recovery: None,
+        recovery_intent: None,
     }
 }
 

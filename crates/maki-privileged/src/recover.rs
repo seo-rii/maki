@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{identity_error, ExecError, System};
+use super::{identity_error, lvm_preflight, ExecError, System};
 use crate::detach::{device_number, is_nbd_partition, mapped_volume_group, DetachObservation};
 use crate::plan::{Plan, PlannedStep, AUTO_NBD_DEVICE};
 use crate::state::{BoundDeviceRecord, TrustedState};
@@ -18,6 +18,28 @@ pub(crate) struct RecoveryProof {
     nodes: Vec<BlockIdentity>,
     /// Attach verified that the target was empty before publishing this proof.
     mount_permitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryIntent {
+    verified: lvm_preflight::VerifiedLvm,
+}
+
+impl RecoveryIntent {
+    pub(super) fn new(verified: &lvm_preflight::VerifiedLvm) -> Self {
+        Self {
+            verified: verified.clone(),
+        }
+    }
+
+    pub(super) fn verified(&self) -> &lvm_preflight::VerifiedLvm {
+        &self.verified
+    }
+
+    pub(crate) fn validate(&self, record: &BoundDeviceRecord) -> io::Result<()> {
+        lvm_preflight::validate_recovery_identity(record, &self.verified)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +210,24 @@ pub(super) fn observe(
 ) -> io::Result<DetachObservation> {
     let observed = crate::detach::observe_kernel(record, mounts, sysfs, false, false)?;
     let Some(proof) = &record.recovery else {
+        if let Some(intent) = &record.recovery_intent {
+            if observed.mounted {
+                return Err(invalid(
+                    "pre-activation recovery identity never authorized an upper layer",
+                ));
+            }
+            lvm_preflight::verify_recovery_device_identity(record, intent.verified(), sysfs)?;
+            if observed.vg_active {
+                lvm_preflight::verify_recovery_mapping(record, intent.verified(), sysfs)?;
+            } else if observed.nbd_in_use {
+                return Err(invalid(
+                    "pre-activation recovery identity has an unexpected holder",
+                ));
+            }
+            let nodes = inventory(record, sysfs)?;
+            check_mounts(record, mounts, &nodes)?;
+            return Ok(observed);
+        }
         if observed.mounted || observed.vg_active || observed.nbd_in_use {
             return Err(invalid(
                 "legacy attachment has no independent recovery proof; refusing live cleanup",
@@ -320,7 +360,15 @@ pub(super) fn execute(
         };
         // A failed command may already have applied its effect. Keep the
         // original record; a retry observes which upper layers remain.
-        system.run_step(&step, None)?;
+        if matches!(step, PlannedStep::LvmDeactivate { .. }) && record.recovery.is_none() {
+            if let Some(intent) = &record.recovery_intent {
+                system.recover_deactivate_lvm(&record, intent.verified())?;
+            } else {
+                system.run_step(&step, None)?;
+            }
+        } else {
+            system.run_step(&step, None)?;
+        }
     }
     Err(identity_error(
         "recovery did not converge; keeping attachment record",

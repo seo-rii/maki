@@ -83,6 +83,7 @@ struct FakeSystem {
     extra_holders: bool,
     observation_error: bool,
     observation_error_after: Option<&'static str>,
+    process_death_after_activation: bool,
     backend_fault_after: Option<(&'static str, BackendFault)>,
     backend_fault_on_probe: Option<(usize, BackendFault)>,
     backend_probes: std::cell::Cell<usize>,
@@ -227,6 +228,18 @@ impl System for FakeSystem {
         Ok(())
     }
     fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.run_step(
+            &PlannedStep::LvmDeactivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn recover_deactivate_lvm(
         &mut self,
         record: &BoundDeviceRecord,
         _verified: &lvm_preflight::VerifiedLvm,
@@ -1151,6 +1164,7 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
         device: "/dev/nbd3".into(),
         connection_id: "maki-fixture".into(),
         recovery: None,
+        recovery_intent: None,
     };
     // Positive control: the production topology observer rejects this exact
     // mapping, and the fixture resolves its leaf to the unrelated local disk.
@@ -1229,6 +1243,9 @@ impl System for ObservedSystem {
         record: &BoundDeviceRecord,
         verified: &lvm_preflight::VerifiedLvm,
     ) -> io::Result<()> {
+        if self.fake.process_death_after_activation {
+            panic!("fixture process died after LVM activation");
+        }
         lvm_preflight::verify_mapping(record, verified, &self.sysfs)
     }
     fn verify_rollback_lvm(
@@ -1239,6 +1256,18 @@ impl System for ObservedSystem {
         lvm_preflight::verify_rollback_mapping(record, verified, &self.sysfs)
     }
     fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.run_step(
+            &PlannedStep::LvmDeactivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn recover_deactivate_lvm(
         &mut self,
         record: &BoundDeviceRecord,
         _verified: &lvm_preflight::VerifiedLvm,

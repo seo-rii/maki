@@ -1,6 +1,7 @@
 //! Pre-activation containment, not authentication against a configured LVM
 //! UUID. Read-only reports are lockless; external privileged LVM/udev actions
-//! are outside the helper lock. Activation-to-proof crash recovery is separate.
+//! are outside the helper lock. The verified identity is also persisted before
+//! activation so recovery can scope cleanup across the proof-publication gap.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -10,7 +11,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Output};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{command, identity_error, verify_connection, ExecError, LinuxSystem};
 use crate::detach::device_number;
@@ -23,7 +24,8 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Device {
     pub(super) path: String,
     pub(super) number: (u32, u32),
@@ -31,7 +33,8 @@ pub(super) struct Device {
     pub(super) sectors: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct VerifiedLvm {
     devices: Vec<Device>,
     labels: BTreeMap<String, String>,
@@ -40,6 +43,94 @@ pub(super) struct VerifiedLvm {
     lv_uuid: String,
     lvs: BTreeMap<String, String>,
     layouts: BTreeMap<String, BTreeSet<String>>,
+}
+
+pub(super) fn validate_recovery_identity(
+    record: &BoundDeviceRecord,
+    verified: &VerifiedLvm,
+) -> io::Result<()> {
+    if verified.devices.is_empty() || verified.devices.len() > MAX_DEVICES {
+        return Err(invalid("invalid persisted LVM device count"));
+    }
+    let nbd = record
+        .device
+        .strip_prefix("/dev/")
+        .ok_or_else(|| invalid("invalid NBD path"))?;
+    let mut paths = BTreeSet::new();
+    let mut numbers = BTreeSet::new();
+    let mut root_sectors = None;
+    for device in &verified.devices {
+        let name = device
+            .path
+            .strip_prefix("/dev/")
+            .ok_or_else(|| invalid("invalid persisted LVM device path"))?;
+        let partition = name.strip_prefix(&format!("{nbd}p"));
+        if name != nbd
+            && partition.is_none_or(|suffix| {
+                suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return Err(invalid("invalid persisted LVM device path"));
+        }
+        if device.sectors == 0
+            || device.start.checked_add(device.sectors).is_none()
+            || !paths.insert(device.path.clone())
+            || !numbers.insert(device.number)
+        {
+            return Err(invalid("invalid persisted LVM device identity"));
+        }
+        if name == nbd && (device.start != 0 || root_sectors.replace(device.sectors).is_some()) {
+            return Err(invalid("invalid persisted root NBD identity"));
+        }
+    }
+    let root_sectors = root_sectors.ok_or_else(|| invalid("persisted NBD root is missing"))?;
+    if verified
+        .devices
+        .iter()
+        .any(|device| device.start + device.sectors > root_sectors)
+    {
+        return Err(invalid("persisted NBD partition is outside the device"));
+    }
+    let mut labels = BTreeSet::new();
+    if verified.labels.is_empty()
+        || verified.labels.iter().any(|(path, id)| {
+            !paths.contains(path) || uuid(id).is_err() || !labels.insert(id.clone())
+        })
+        || uuid(&verified.vg_uuid).is_err()
+        || uuid(&verified.lv_uuid).is_err()
+        || verified.lvs.is_empty()
+        || verified.lvs.len() > MAX_DEVICES
+    {
+        return Err(invalid("invalid persisted LVM metadata identity"));
+    }
+    let mut lv_ids = BTreeSet::new();
+    for (name, id) in &verified.lvs {
+        crate::config::check_lvm_name("persisted_lv_name", name)
+            .map_err(|_| invalid("invalid persisted LV name"))?;
+        if uuid(id).is_err() || !lv_ids.insert(id.clone()) {
+            return Err(invalid("invalid persisted LV identity"));
+        }
+    }
+    if verified.lvs.get(&record.attachment.lv_name) != Some(&verified.lv_uuid)
+        || verified.layouts.keys().collect::<BTreeSet<_>>()
+            != verified.lvs.values().collect::<BTreeSet<_>>()
+        || verified.layouts.values().any(|layout| {
+            layout.is_empty()
+                || layout.iter().any(|token| {
+                    token.is_empty()
+                        || !token.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || byte == b'_'
+                                || byte == b'-'
+                        })
+                })
+                || (layout.contains("cache") && layout.contains("cachevol"))
+        })
+    {
+        return Err(invalid("inconsistent persisted LVM identity"));
+    }
+    Ok(())
 }
 
 fn uuid(value: &str) -> io::Result<String> {
@@ -540,6 +631,76 @@ pub(super) fn verify_rollback_mapping(
     verify_mappings(record, verified, sysfs, false)
 }
 
+fn verify_recovery_devices(
+    record: &BoundDeviceRecord,
+    verified: &VerifiedLvm,
+    sysfs: &Path,
+) -> io::Result<()> {
+    let nbd = record
+        .device
+        .strip_prefix("/dev/")
+        .ok_or_else(|| invalid("invalid NBD path"))?;
+    let mut actual = BTreeSet::new();
+    for entry in std::fs::read_dir(sysfs)? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid("invalid block name"))?;
+        if name == nbd || crate::detach::is_nbd_partition(sysfs, &name, nbd)? {
+            actual.insert(name);
+        }
+    }
+    let expected: BTreeSet<_> = verified
+        .devices
+        .iter()
+        .map(|device| {
+            device
+                .path
+                .strip_prefix("/dev/")
+                .ok_or_else(|| invalid("invalid persisted LVM device path"))
+                .map(str::to_owned)
+        })
+        .collect::<io::Result<_>>()?;
+    if actual != expected {
+        return Err(invalid(
+            "current NBD devices do not match the pre-activation identity",
+        ));
+    }
+    for device in &verified.devices {
+        let name = device.path.strip_prefix("/dev/").unwrap();
+        let path = sysfs.join(name);
+        if device_number(&std::fs::read_to_string(path.join("dev"))?)? != device.number
+            || kernel_u64(&path.join("size"))? != device.sectors
+            || (name != nbd
+                && (kernel_u64(&path.join("start"))? != device.start
+                    || !crate::detach::is_nbd_partition(sysfs, name, nbd)?))
+            || (name == nbd && device.start != 0)
+        {
+            return Err(invalid(
+                "current NBD geometry does not match the pre-activation identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_recovery_mapping(
+    record: &BoundDeviceRecord,
+    verified: &VerifiedLvm,
+    sysfs: &Path,
+) -> io::Result<()> {
+    verify_recovery_devices(record, verified, sysfs)?;
+    verify_mappings(record, verified, sysfs, true)
+}
+
+pub(super) fn verify_recovery_device_identity(
+    record: &BoundDeviceRecord,
+    verified: &VerifiedLvm,
+    sysfs: &Path,
+) -> io::Result<()> {
+    verify_recovery_devices(record, verified, sysfs)
+}
+
 fn verify_mappings(
     record: &BoundDeviceRecord,
     verified: &VerifiedLvm,
@@ -612,6 +773,14 @@ pub(super) fn deactivate(
         }
     }
     verify_connection(record, &LinuxSystem)?;
+    let output = command::capture(&mut deactivation_command(verified), command::Policy::STEP)?;
+    if !output.status.success() {
+        return Err(identity_error("scoped LVM rollback failed"));
+    }
+    Ok(())
+}
+
+fn deactivation_command(verified: &VerifiedLvm) -> Command {
     let mut command = controlled_command("vgchange");
     command.args([
         "--activate",
@@ -623,9 +792,29 @@ pub(super) fn deactivate(
         "--config",
         "devices { allow_changes_with_duplicate_pvs=0 }",
     ]);
-    let output = command::capture(&mut command, command::Policy::STEP)?;
+    command
+}
+
+pub(super) fn deactivate_recovery(
+    record: &BoundDeviceRecord,
+    verified: &VerifiedLvm,
+) -> Result<(), ExecError> {
+    verify_recovery_mapping(record, verified, Path::new("/sys/class/block"))?;
+    for device in &verified.devices {
+        if number(Path::new(&device.path))? != device.number {
+            return Err(identity_error(
+                "LVM recovery candidate was replaced before deactivation",
+            ));
+        }
+    }
+    if super::nbd_backend_at(Path::new("/sys/block"), &record.device)?.is_some() {
+        return Err(identity_error(
+            "NBD backend reappeared before recovery deactivation",
+        ));
+    }
+    let output = command::capture(&mut deactivation_command(verified), command::Policy::STEP)?;
     if !output.status.success() {
-        return Err(identity_error("scoped LVM rollback failed"));
+        return Err(identity_error("scoped LVM recovery deactivation failed"));
     }
     Ok(())
 }

@@ -32,6 +32,10 @@ pub(crate) struct BoundDeviceRecord {
     /// Kernel identity captured with this backend still connected, before mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<crate::exec::recover::RecoveryProof>,
+    /// Verified LVM identity published before activation. It authorizes only
+    /// scoped recovery of that exact mapping if activation outlives the helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_intent: Option<crate::exec::recover::RecoveryIntent>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -56,6 +60,12 @@ impl BoundDeviceRecord {
         check_uuid("connection_id", nonce).map_err(|e| invalid(e.to_string()))?;
         if self.version != 1 || nbd_index(&self.device).is_none() {
             return Err(invalid("unsupported or invalid attach record"));
+        }
+        if self.recovery.is_some() && self.recovery_intent.is_some() {
+            return Err(invalid("attach record has conflicting recovery states"));
+        }
+        if let Some(intent) = &self.recovery_intent {
+            intent.validate(self)?;
         }
         Ok(())
     }
