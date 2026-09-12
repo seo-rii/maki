@@ -157,7 +157,7 @@ impl PayloadEncoding {
                     b'A'..=b'F' => Some(byte - b'A' + 10),
                     _ => None,
                 };
-                for (index, pair) in bytes.chunks_exact(2).enumerate() {
+                for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
                     let high = digit(pair[0]).ok_or_else(|| bad("invalid hex digit".into()))?;
                     let low = digit(pair[1]).ok_or_else(|| bad("invalid hex digit".into()))?;
                     decoded[index] = high << 4 | low;
