@@ -74,6 +74,17 @@ size.
 Run offline checks only after the daemon or nbdkit process has released the
 volume lock.
 
+## Swap dependency checks
+
+With `security.require_secure_swap_policy`, Linux attach accepts no swap,
+RAM-only zram, or dm-crypt whose complete kernel dependency graph terminates
+at independent physical devices. The same check applies to zram writeback.
+Encrypted swap above NBD, including through partitions, LVM, or MD, is refused:
+paging out Maki must not require Maki to serve that paging I/O. Missing or
+inconsistent sysfs metadata, cycles, and unproven virtual backing are refused.
+Keep swap and its dependency topology fixed while the attachment is running;
+this is an attach-time check, not a watcher of privileged device changes.
+
 ## Key binding at first attach
 
 The first attach of a freshly created volume binds the configured provider and

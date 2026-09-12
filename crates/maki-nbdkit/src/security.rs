@@ -8,11 +8,12 @@
 //! | `madv_dontdump` | Honoured through `disable_core_dump` (a non-dumpable process writes no core); validation refuses it without that flag |
 //! | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; failure refuses attach |
 //! | `memory_lock_mode = "secure-buffers"` | Every `SecretBuffer` is `mlock`ed for its lifetime (best effort, failures counted) |
-//! | `require_secure_swap_policy` | `/proc/swaps` must be readable and list only RAM-only zram devices (`/dev/zramN` with no `backing_dev`) or dm-crypt devices (a zram whose writeback target is dm-crypt counts); anything else, an unreadable file, or an unparseable one refuses attach |
+//! | `require_secure_swap_policy` | `/proc/swaps` must be readable and list only RAM-only zram devices (`/dev/zramN` with no `backing_dev`) or dm-crypt devices with independent physical backing (the same rule applies to zram writeback); anything else, an unreadable file, or an unparseable one refuses attach |
 //! | `cache.lock_memory` | Cache plaintext lives in `SecretBuffer`s, so it follows `memory_lock_mode` (validation refuses it with `off`) |
 //!
 //! On non-Linux hosts nothing is enforced; the posture says so and a
-//! warning is logged. Production runs on Linux.
+//! warning is logged. Production runs on Linux. The swap topology is checked
+//! at attach; operators must keep it fixed for the lifetime of the attachment.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -68,7 +69,7 @@ pub fn posture_json() -> Value {
 pub enum SwapSafety {
     /// A zram device with no writeback backing device: RAM only.
     RamOnly,
-    /// A dm-crypt mapping, or a zram whose writeback target is one.
+    /// A dm-crypt mapping with independent backing, or zram writing to one.
     Encrypted,
     /// Everything else, including devices that could not be classified.
     Unsafe,
@@ -161,6 +162,7 @@ pub fn classify_zram_backing(
     is_encrypted: impl Fn(&str) -> bool,
 ) -> SwapSafety {
     match backing_dev {
+        Ok(value) if value.trim().is_empty() => SwapSafety::Unsafe,
         Ok(value) => match zram_writeback_target(Some(&value)) {
             None => SwapSafety::RamOnly,
             Some(target) if is_encrypted(&target) => SwapSafety::Encrypted,
@@ -175,48 +177,175 @@ pub fn classify_zram_backing(
 mod linux {
     use super::*;
 
-    fn dm_uuid_for(device: &str) -> Option<String> {
-        // /dev/dm-N -> /sys/block/dm-N/dm/uuid; /dev/mapper/<name> -> find by dm/name.
-        if let Some(dm) = device.strip_prefix("/dev/") {
-            if dm.starts_with("dm-") {
-                return std::fs::read_to_string(format!("/sys/block/{dm}/dm/uuid")).ok();
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    type Device = (u32, u32);
+
+    fn device_number(path: &Path) -> Option<Device> {
+        let value = std::fs::read_to_string(path.join("dev")).ok()?;
+        let (major, minor) = value.trim().split_once(':')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    }
+
+    /// Resolve through the kernel's major:minor index, then cross-check the
+    /// target. A device pathname or a stale/inconsistent dependency is not proof.
+    fn block_node(sysfs: &Path, device: Device) -> Option<PathBuf> {
+        let path = sysfs
+            .join(format!("dev/block/{}:{}", device.0, device.1))
+            .canonicalize()
+            .ok()?;
+        (path.starts_with(sysfs.join("devices")) && device_number(&path) == Some(device))
+            .then_some(path)
+    }
+
+    /// A bounded proof that every dependency terminates at a physical device.
+    /// In particular, dm-crypt above Maki (or any other NBD server) can recurse
+    /// into the process being paged out and is never safe swap for that process.
+    struct IndependentBacking<'a> {
+        sysfs: &'a Path,
+        visiting: HashSet<Device>,
+        proven: HashSet<Device>,
+        remaining: usize,
+    }
+
+    impl IndependentBacking<'_> {
+        fn prove(&mut self, device: Device, depth: usize) -> Option<()> {
+            if depth >= 64 || self.remaining == 0 {
+                return None;
             }
-            if let Some(name) = dm.strip_prefix("mapper/") {
-                for entry in std::fs::read_dir("/sys/block").ok()?.flatten() {
-                    let path = entry.path();
-                    let dm_name = std::fs::read_to_string(path.join("dm/name")).ok();
-                    if dm_name.map(|n| n.trim() == name).unwrap_or(false) {
-                        return std::fs::read_to_string(path.join("dm/uuid")).ok();
+            self.remaining -= 1;
+            let path = block_node(self.sysfs, device)?;
+            let name = path.file_name()?.to_str()?;
+            // NBD has the reserved block major 43; the name check also refuses
+            // an unexpected sysfs identity instead of weakening the policy.
+            if device.0 == 43 || name.starts_with("nbd") {
+                return None;
+            }
+            if self.proven.contains(&device) {
+                return Some(());
+            }
+            if !self.visiting.insert(device) {
+                return None;
+            }
+
+            match std::fs::read_to_string(path.join("partition")) {
+                Ok(index) => {
+                    if index.trim().parse::<u32>().ok()? == 0 {
+                        return None;
+                    }
+                    // A partition inherits the whole disk's dependencies.
+                    let parent = path.parent()?;
+                    let parent_device = device_number(parent)?;
+                    if block_node(self.sysfs, parent_device)? != parent {
+                        return None;
+                    }
+                    self.prove(parent_device, depth + 1)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut has_dependencies = false;
+                    for entry in std::fs::read_dir(path.join("slaves")).ok()? {
+                        let dependency = entry.ok()?.path().canonicalize().ok()?;
+                        let child = device_number(&dependency)?;
+                        if block_node(self.sysfs, child)? != dependency {
+                            return None;
+                        }
+                        has_dependencies = true;
+                        self.prove(child, depth + 1)?;
+                    }
+                    if !has_dependencies {
+                        // Loop, NBD, ublk, and other unknown virtual leaves do
+                        // not establish independent backing. Physical leaves
+                        // must expose a kernel device link outside virtual/.
+                        let virtual_devices = self.sysfs.join("devices/virtual");
+                        std::fs::read_link(path.join("device")).ok()?;
+                        let physical = path.join("device").canonicalize().ok()?;
+                        if path.starts_with(&virtual_devices)
+                            || !physical.starts_with(self.sysfs.join("devices"))
+                            || physical.starts_with(&virtual_devices)
+                        {
+                            return None;
+                        }
                     }
                 }
+                Err(_) => return None,
             }
+            // Fail closed if the indexed node disappeared or changed during
+            // the walk. Operators must keep swap topology fixed while attached.
+            if block_node(self.sysfs, device)? != path {
+                return None;
+            }
+            self.visiting.remove(&device);
+            self.proven.insert(device);
+            Some(())
         }
-        None
     }
 
-    fn is_encrypted_swap(device: &str) -> bool {
-        dm_uuid_for(device)
-            .map(|uuid| uuid.trim().starts_with("CRYPT-"))
-            .unwrap_or(false)
+    fn is_encrypted_swap(device: Device, sysfs: &Path) -> bool {
+        let Some(path) = block_node(sysfs, device) else {
+            return false;
+        };
+        if !std::fs::read_to_string(path.join("dm/uuid"))
+            .is_ok_and(|uuid| uuid.trim().starts_with("CRYPT-"))
+        {
+            return false;
+        }
+        IndependentBacking {
+            sysfs,
+            visiting: HashSet::new(),
+            proven: HashSet::new(),
+            remaining: 256,
+        }
+        .prove(device, 0)
+        .is_some()
     }
 
-    /// Classify by what the device *is*: a zram device is RAM-only only
-    /// while it has no writeback target (Linux can page zram out to a
-    /// `backing_dev`); a dm-crypt mapping is encrypted; nothing is judged
-    /// by its name.
+    /// Resolve aliases to their block-device identity before inspecting sysfs.
+    /// Only RAM-only zram or dm-crypt with proven independent backing passes.
     pub(super) fn classify_swap(device: &str) -> SwapSafety {
-        if let Some(n) = zram_index(device) {
-            let sysfs = format!("/sys/block/zram{n}");
-            if !std::path::Path::new(&sysfs).is_dir() {
-                return SwapSafety::Unsafe;
+        classify_swap_with(device, Path::new("/sys"), &|path| {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let metadata = std::fs::metadata(path).ok()?;
+            if !metadata.file_type().is_block_device() {
+                return None;
             }
-            // Preserve the read error kind: a missing attribute is RAM-only,
-            // but EACCES/EIO is ambiguous and must fail closed (MAKI-017).
-            let read =
-                std::fs::read_to_string(format!("{sysfs}/backing_dev")).map_err(|e| e.kind());
-            return classify_zram_backing(read, is_encrypted_swap);
+            Some((libc::major(metadata.rdev()), libc::minor(metadata.rdev())))
+        })
+    }
+
+    pub(super) fn classify_swap_with(
+        device: &str,
+        sysfs_root: &Path,
+        resolve: &impl Fn(&str) -> Option<Device>,
+    ) -> SwapSafety {
+        let Some(device) = resolve(device) else {
+            return SwapSafety::Unsafe;
+        };
+        let Ok(sysfs) = sysfs_root.canonicalize() else {
+            return SwapSafety::Unsafe;
+        };
+        let Some(path) = block_node(&sysfs, device) else {
+            return SwapSafety::Unsafe;
+        };
+        let is_zram = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| zram_index(&format!("/dev/{name}")))
+            .is_some()
+            && path.parent() == Some(sysfs.join("devices/virtual/block").as_path());
+        if is_zram {
+            let read = std::fs::read_to_string(path.join("backing_dev")).map_err(|e| e.kind());
+            let result = classify_zram_backing(read, |target| {
+                resolve(target).is_some_and(|target| is_encrypted_swap(target, &sysfs))
+            });
+            // A disappearing zram is not a device without writeback support.
+            return if block_node(&sysfs, device).as_ref() == Some(&path) {
+                result
+            } else {
+                SwapSafety::Unsafe
+            };
         }
-        if is_encrypted_swap(device) {
+        if is_encrypted_swap(device, &sysfs) {
             SwapSafety::Encrypted
         } else {
             SwapSafety::Unsafe
@@ -300,14 +429,15 @@ mod linux {
             if !unsafe_entries.is_empty() {
                 return Err(DaemonError::Unsupported(format!(
                     "security.require_secure_swap_policy: swap {:?} is neither RAM-only zram \
-                     nor dm-crypt; disable it or encrypt it (SPEC 37)",
+                     nor dm-crypt with proven independent backing; disable it or use encrypted \
+                     swap on an independent physical device (SPEC 37)",
                     unsafe_entries
                 )));
             }
             if entries.is_empty() {
                 "enforced: no swap".to_string()
             } else {
-                "enforced: RAM-only zram or encrypted swap only".to_string()
+                "enforced: RAM-only zram or independently backed encrypted swap only".to_string()
             }
         } else {
             "not required".to_string()
@@ -414,3 +544,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "security_swap_tests.rs"]
+mod swap_topology_tests;
