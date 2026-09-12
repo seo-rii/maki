@@ -799,15 +799,22 @@ sudo -n env PATH="$PATH" "$attach_bin" verify --volume "$volume_name" \
     --config "$attach_config_path" >"$run_dir/maki-verify-after-workload.txt" 2>&1
 pass "workload gate still verifies the live attachment after database I/O"
 
-log "running the real maki-attach detach helper"
+log "running the real idempotent maki-attach cleanup helper"
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
-sudo -n env PATH="$PATH" "$attach_bin" detach --volume "$volume_name" \
+sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
     --config "$attach_config_path" \
-    >"$run_dir/maki-detach.txt" 2>&1
+    >"$run_dir/maki-cleanup.txt" 2>&1
 mount_active=false
 nbd_connected=false
-pass "maki-attach clean unmount, LVM deactivation, and NBD disconnect"
+pass "maki-attach cleanup unmounted XFS, deactivated LVM, and disconnected NBD"
+
+# A service stop and its recovery coordinator may both request cleanup. The
+# second call must converge as success without a trusted record or live state.
+sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
+    --config "$attach_config_path" \
+    >"$run_dir/maki-cleanup-idempotent.txt" 2>&1
+pass "repeated maki-attach cleanup is idempotent"
 
 log "removing the disposable LVM metadata"
 sudo -n nbd-client -unix "$socket_path" "$device" -b 4096

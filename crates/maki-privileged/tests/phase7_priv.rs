@@ -96,6 +96,7 @@ fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
         "lv_uuid = \"$lv_uuid\"",
         "fs_uuid = \"$fs_uuid\"",
         "\"$attach_bin\" verify --volume",
+        "\"$attach_bin\" cleanup --volume",
         "--config \"$attach_config_path\"",
         "nbd-client 3.27.0 or later",
     ] {
