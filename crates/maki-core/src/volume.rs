@@ -62,6 +62,7 @@ impl Volume {
             store,
             checkpoint_state,
             durable_sequence,
+            durable_proof,
             next_segment_index,
             segments,
             replay,
@@ -74,6 +75,7 @@ impl Volume {
             durable_sequence,
             next_segment_index,
             segments,
+            durable_proof,
         );
         journal.allow_covered_holes_below(checkpoint_state.checkpoint_sequence);
 

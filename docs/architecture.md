@@ -62,13 +62,14 @@ writes.
 
 | Structure | Protection | Role |
 |---|---|---|
-| Superblock | Two generations plus CRC | Volume identity, geometry, provider type, key name, and compatibility ID |
+| Superblock | Two generations plus CRC; new volumes use envelope v2 | Volume identity, geometry, provider type, key name, compatibility ID, and required recovery policy |
 | Key canary | Two generations plus CRC, written at first attach | Provider/key-bound ciphertext of a fixed plaintext; must decrypt on every attach |
 | Shard catalog | Two generations plus CRC | Durable set of allocated shard files |
 | Allocation map | Per-shard A/B copies | Distinguishes unwritten units from allocated slots |
 | Slot | Header CRC and ciphertext CRC | Stores one encrypted unit and write sequence |
 | Journal segment | Header and record CRCs | Ordered ciphertext writes pending checkpoint |
-| Journal durable mark | CRC, single copy, never fsync'd | Lower bound on the fdatasync'd prefix of the active segment |
+| Journal durable proof | Two 64-byte CRC records, both published before a barrier succeeds | Required sequence and exact segment/record-end boundary for v2 recovery |
+| Legacy journal durable mark | CRC, single advisory copy | Retained advisory metadata; does not replace or weaken the v2 proof requirement |
 | Checkpoint state | Two generations plus CRC, written at creation | Highest durably applied journal sequence |
 
 Metadata updates select an absent, invalid, or older A/B side for replacement.
@@ -86,10 +87,24 @@ the preserved generation. A side that is absent, empty, short, or fails its
 CRC or typed decode is an invalid copy; any other read error is an I/O error
 and refuses attach rather than silently selecting the other side.
 
+The required durable-proof store prevalidates future versions and semantic
+consistency before using A/B storage. It performs two publications of the same
+horizon, including directory syncs, so both copies attest every successfully
+acknowledged boundary. One ordinary A/B update would leave the fallback horizon
+behind an ACK. Unsupported proof versions, contradictory generations and
+regressing horizons therefore fail explicitly rather than selecting or
+overwriting a convenient older side.
+
+Envelope v2 is distinct from the crypto AAD's `format_version`. Old binaries
+reject v2; the current writable recovery path refuses legacy v1. Read-only
+legacy inspection remains available with a warning. The
+[compatibility and migration procedure](durable-recovery.md) requires a separate
+verified data migration; there is no automatic in-place upgrade.
+
 ## Recovery and checkpointing
 
-Recovery acquires the volume lock, validates superblock and allocation state,
-loads the checkpoint state (required on every volume), scans journal segments,
+Recovery acquires the volume lock, checks the superblock envelope and required
+proof, validates allocation state, loads checkpoint state, scans journal segments,
 and rebuilds the in-memory overlay from records newer than the checkpoint. It
 fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
@@ -97,18 +112,18 @@ larger than the writer can produce is rejected before it is read, and a
 complete-but-invalid final segment header is treated as damage rather than as
 a creation crash.
 
-Journal tails may be truncated after a crash, but only after the point the
-durable mark proves was fdatasync'd. Damage inside that prefix is corruption
-even at the very end of the segment; damage after it is a torn tail even when
-an intact record follows, because unsynced records may persist in any order.
-The mark itself is a plain write, so the crash it describes may lose it; when
-no mark names the final segment only its header counts as proven, and every
-damage beyond it is a torn tail. Recovery never infers durability from what
-follows a damaged record.
-Because the mark outlives the segment it names, segment indexes are never
-reused: recovery continues numbering above both the surviving segments and the
-mark. The [review remediation log](review-remediation.md) describes these rules
-in detail.
+The journal above the selected checkpoint must bridge through the proof's
+required sequence and exact record-end offset before recovery changes metadata.
+A missing final segment, a shortened complete-record prefix, or corruption
+inside that required prefix fails explicitly. A proof may name a pruned segment
+only when the checkpoint already covers its horizon. Both proof copies absent
+or invalid is an error even for an empty-looking v2 volume.
+
+Unproven final-tail bytes may be truncated after a crash. Intact later records
+do not prove the durability of earlier damaged bytes, because unsynced sectors
+may persist out of order. A missing/stale advisory mark cannot weaken the v2
+proof requirement. Recovered sequence/index bookkeeping also accounts for proof
+metadata that can outlive the segment it names.
 
 A failed append can leave bytes beyond the last accepted record. The writer
 retains a cleanup flag until truncation and synchronization succeed, including
@@ -119,18 +134,28 @@ unpersisted page-cache bytes behind. The writer re-reads and rewrites its
 accepted pending range in 64 KiB chunks, compares an ephemeral streaming
 fingerprint, and only then synchronizes it. Recovery similarly binds each
 prefix to the bytes accepted by its scan, rewrites and verifies that prefix,
-then synchronizes before publishing a durable mark. Changed bytes refuse
+then synchronizes before publishing both required proofs. Changed bytes refuse
 recovery or the durability acknowledgement. Normal successful live flushes
 avoid this extra rewrite; recovery pays an additional pass over valid data.
 While a rewrite is still owed, the engine reports the volume `degraded` and
 `journal_writeback_uncertain`, and counts `journal_sync_failures_total`; a
-successful barrier clears the flag, a successful checkpoint does not.
+successful barrier clears the flag, a successful checkpoint does not. Proof
+publication failure also keeps the barrier pending, including when its retry
+has no new append. Data sync alone does not advance the public durable boundary
+or make those records checkpoint-eligible. Recovery publishes every accepted
+horizon to both proof copies before READY.
+
+Segment scanning uses fixed 64 KiB scratch and discards checkpoint-covered
+payloads as they are validated. In the covered-segment memory regression, extra
+heap peak fell from 135,397,624 bytes to 488 bytes; fixed stack scratch is
+separate. Replay payloads and the overlay still grow with outstanding history,
+so this is not a whole-recovery memory bound (MAKI-025).
 
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at
-checkpoint time. The durable boundary can move inside `append` itself (an
-automatic segment roll fdatasyncs the sealed segment), so the volume promotes
-the overlay after every journal operation and *before* publishing a newer
+checkpoint time. The durable boundary can move inside `append` itself: an
+automatic segment roll synchronizes the sealed segment and publishes its proof.
+The volume promotes the overlay after every journal operation and *before* publishing a newer
 version of the same unit; checkpointing re-derives the checkpointable set from
 the journal's own boundary rather than trusting earlier promotions.
 
@@ -138,6 +163,11 @@ Checkpointing writes slots, synchronizes data, writes allocation metadata and
 fsyncs the data directory before clearing any dirty flag, commits checkpoint
 state, and only then deletes covered journal segments. A checkpoint that fails
 part-way leaves every incomplete step marked for the retry.
+
+Proof replicas share the backing filesystem. Their CRCs do not provide
+authenticity or an external freshness anchor against coordinated valid rollback.
+Additional proof-file and directory syncs need target-system latency measurement;
+the current protocol prioritizes durable evidence over reducing barrier calls.
 
 Slot headers are authoritative; the shard catalog and the allocation maps are
 accelerators that an A/B fallback can leave one generation behind. Opening the

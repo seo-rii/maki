@@ -7,9 +7,10 @@ use maki_backing::Backing;
 use crate::ab::AbStore;
 use crate::allocation::AllocationMap;
 use crate::catalog::ShardCatalog;
+use crate::durable_proof::DurableProofStore;
 use crate::error::FormatError;
 use crate::layout;
-use crate::superblock::Superblock;
+use crate::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V2};
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -27,16 +28,31 @@ impl CheckReport {
 pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     let mut report = CheckReport::default();
 
-    let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
-    let superblock = match sb_ab.load::<Superblock>(backing)? {
-        Some(sb) => sb,
-        None => {
+    let envelope = match load_volume_superblock(backing) {
+        Ok(envelope) => envelope,
+        Err(error @ FormatError::Io(_)) => return Err(error),
+        Err(error) => {
             report
                 .errors
-                .push("no valid superblock copy found".to_string());
+                .push(format!("no valid superblock policy: {error}"));
             return Ok(report);
         }
     };
+    let superblock = envelope.superblock;
+    if envelope.metadata_version == SUPERBLOCK_VERSION_V2 {
+        match DurableProofStore::load(backing, superblock.volume_uuid) {
+            Ok(proof) => report.info.push(format!(
+                "required durable proof: sequence {}",
+                proof.durable_sequence
+            )),
+            Err(error @ FormatError::Io(_)) => return Err(error),
+            Err(error) => report
+                .errors
+                .push(format!("required durable proof: {error}")),
+        }
+    } else {
+        report.warnings.push("legacy v1 volume: writable recovery requires explicit migration; tail inspection cannot establish a missing durable horizon".into());
+    }
     report.info.push(format!(
         "superblock: volume {} generation {} slot_size {}",
         superblock.volume_uuid, superblock.generation, superblock.geometry.slot_size

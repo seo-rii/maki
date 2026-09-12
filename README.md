@@ -17,6 +17,13 @@ Maki is designed around four constraints:
 > Forced-crash, broader database, vendor-provider, and hardware power-loss
 > qualification remain open.
 
+**Volume compatibility:** new volumes require superblock envelope v2 and
+mirrored durable proofs. Older binaries reject v2, and this build refuses
+writable recovery of legacy v1 volumes. The crypto AAD format version is
+unchanged. Read [durable recovery and migration](docs/durable-recovery.md)
+before replacing an existing installation; no automatic in-place upgrade is
+provided.
+
 ## Features
 
 - Crash-safe ciphertext journal, checkpointing, and A/B metadata.
@@ -31,7 +38,7 @@ Maki is designed around four constraints:
 
 | Area | Status |
 |---|---|
-| Core engine, format, recovery, and provider contracts | Implemented and covered by workspace tests |
+| Core engine, format, recovery, and provider contracts | Prior workspace baseline passed; v2 durability changes have local regression coverage, with full validation pending |
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
 | HTTP transport TLS and loopback chaos handling | Validated in automated tests |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
@@ -88,6 +95,13 @@ lifecycle) are tracked in the same log.
 See [Testing and qualification](docs/testing.md) for the exact evidence and
 remaining release gates.
 
+The current [R3 readiness record](docs/production-readiness-review-2026-09-08.md)
+supersedes the historical remaining-work lists above. MAKI-020 now has required
+mirrored acknowledgement evidence and focused local regressions; whole-version
+validation remains pending. MAKI-025's segment scanner now streams, while
+replay payload and overlay memory remain unresolved limits. Neither change
+constitutes production approval.
+
 ## Build
 
 The Rust workspace builds on Linux, macOS, and Windows. The nbdkit plugin and
@@ -119,6 +133,7 @@ Review the configuration and use a disposable backing directory before running
 | [Architecture](docs/architecture.md) | Data path, durability model, provider boundary, and security model |
 | [Configuration](docs/configuration.md) | Configuration sections, providers, credentials, and compatibility |
 | [Operations](docs/operations.md) | Volume lifecycle, nbdkit, systemd, control socket, and recovery |
+| [Durable recovery and migration](docs/durable-recovery.md) | Required v2 acknowledgement proofs, legacy-volume compatibility, and corruption limits |
 | [Testing and qualification](docs/testing.md) | CI, fault testing, database tests, power loss, and release status |
 | [Privileged Linux validation](docs/privileged-linux-validation.md) | Reproducible kernel NBD, LVM, XFS, fio, privilege, and SQLite run |
 | [Technical specification](SPEC.md) | Normative storage and security requirements |

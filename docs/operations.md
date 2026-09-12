@@ -8,6 +8,21 @@ appropriate privileges.
 The repository includes a guarded, destructive-target-restricted procedure in
 [Privileged Linux validation](privileged-linux-validation.md).
 
+## Volume compatibility before upgrade
+
+New volumes use superblock envelope v2 with two required durable-proof files.
+Older binaries reject v2. This build refuses writable recovery of legacy v1
+before changing recovery metadata, although it may acquire/create the advisory
+lock first. Read-only checks support v1 with a warning; they cannot certify
+history whose durable horizon is missing.
+
+Read [durable recovery and migration](durable-recovery.md) before replacing an
+existing installation. There is no automatic in-place format upgrade. Preserve
+an untouched source, old software and provider/key material, then use an
+isolated recovery copy and verified logical/DB-native transfer to a fresh v2
+volume. Do not remove proofs or change format bytes to bypass a refusal. The
+crypto context's `format_version` is unchanged by the envelope version.
+
 ## Prerequisites
 
 Building the Rust workspace requires a Rust toolchain. The Linux data path also
@@ -61,11 +76,13 @@ maki-check /var/lib/maki/example --deep
 maki check /etc/maki/volumes/example.toml --deep
 ```
 
-Without `--deep` the check covers the superblock, shard catalog, allocation-map
-sizes, and file presence only. `--deep` additionally verifies both checkpoint
-state copies, the key canary, the durable mark, every journal segment exactly
-as recovery would scan it (reporting the repairs recovery would make), and
-every allocated slot's stored structure and checksums. A successful deep check
+Without `--deep` the check covers the superblock, required v2 proof records,
+shard catalog, allocation-map sizes, and file presence. `--deep` additionally
+verifies both checkpoint state copies, the key canary, and every journal
+segment as recovery would scan it, including the required horizon and its
+exact record end (or the legacy advisory-mark policy). It reports the repairs
+recovery would make and checks every allocated slot's stored structure and
+checksums. A successful deep check
 does not decrypt data, authenticate its ciphertext, establish freshness, or
 prove filesystem or database consistency. Canary checking here validates its
 stored structure and volume identity; actual key verification happens at
@@ -382,11 +399,14 @@ high-cardinality values as metric labels.
 
 - Provider contract or compatibility failures refuse attach.
 - A wrong key, key name, or provider type refuses attach (key canary).
-- Corrupt metadata, sequence gaps, missing journal segments, and journal
-  corruption before the durable mark fail loudly.
-- A torn final journal tail after the durable mark is truncated during recovery.
-- A failed journal `fdatasync` fails the FLUSH or FUA that needed it, and
-  every later barrier keeps failing until the journal has *rewritten* the
+- Corrupt metadata, sequence gaps, and failure to reach the required v2 horizon
+  at its exact record end fail loudly. Its segment may be absent only when the
+  selected checkpoint already covers it. Losing both valid proof copies also
+  refuses recovery of an otherwise empty-looking volume.
+- A torn final journal tail beyond the proven boundary may be truncated during
+  recovery. A missing/stale advisory mark does not weaken the v2 proof rule.
+- A failed journal `fdatasync` or required proof publication fails the FLUSH or
+  FUA that needed it, and every later barrier keeps failing until the journal has *rewritten* the
   unsynced records, verified them against what it accepted, and synced them
   (a bare retry of `fdatasync` succeeds on Linux without writing anything).
   `maki status` shows `journal_writeback_uncertain: true` and counts
@@ -394,8 +414,9 @@ high-cardinality values as metric labels.
   cached bytes no longer match what was accepted, no barrier can succeed:
   restart the daemon so recovery re-scans the journal and discards what was
   never acknowledged. After a restart, recovery rewrites and verifies every
-  segment prefix it accepted before it syncs, so page-cache bytes a failed
-  writeback left behind are never acknowledged unwritten.
+  segment prefix it accepted before it syncs, then publishes both required
+  proofs before READY. New records become checkpoint-eligible only after
+  their proof publication succeeds. See [durability ordering and limits](durable-recovery.md).
 - A journal write that fails part-way leaves no torn bytes behind: the
   segment is truncated back to its last record before anything is appended
   or the segment is sealed, and the cleanup stays pending until that

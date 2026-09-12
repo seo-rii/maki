@@ -876,16 +876,61 @@ LRU cache size
 ├── data/
 ├── journal/
 │   ├── seg-<index>
-│   └── durable-mark
+│   ├── durable-proof.a
+│   ├── durable-proof.b
+│   └── durable-mark       (legacy/advisory)
 └── checkpoint/
     ├── state.a
     └── state.b
 ```
 
-`checkpoint/state.{a,b}` are written at creation (sequence 0) and recovery
-requires a valid copy. `journal/durable-mark` records the fdatasync'd prefix of
-the active segment after every sync, as a never-fsync'd lower bound; recovery
-uses it to distinguish durable-body corruption from a torn tail.
+New volumes MUST use superblock envelope v2 and require
+`journal/durable-proof.{a,b}`. The envelope version is separate from the crypto
+context's `format_version`; changing the envelope MUST NOT silently change AAD.
+Both initial proof copies and their directory entries MUST be durable before
+publishing the v2 superblock. `checkpoint/state.{a,b}` are also written at
+creation (sequence 0), and recovery requires a valid checkpoint copy.
+
+A durable proof is exactly 64 bytes:
+
+```text
+magic[8] = MAKIJDP1
+version u32 = 1
+generation u64
+volume_uuid[16]
+durable_sequence u64
+segment_index u64
+durable_size u64
+crc32
+```
+
+Sequence zero MUST use segment index zero and size zero. A positive horizon
+MUST identify an exact journal record end after the segment header. Decoders
+MUST enforce field and file-size bounds. Unsupported proof versions and hard
+I/O errors MUST NOT be downgraded to an invalid-copy fallback. Foreign UUIDs,
+contradictory equal generations and regressing horizons MUST fail explicitly.
+An unchanged sequence MUST NOT move to a different record end merely because
+an empty successor segment was created.
+
+After journal data sync, two preserve-first A/B publications of the same horizon
+and their directory syncs MUST complete before the public durable sequence or
+FUA/FLUSH acknowledgement advances. Both copies then attest that horizon even
+though their generations differ. The highest valid proof MUST be preserved
+before replacing the lower or invalid side. One missing/stale/corrupt copy may
+be tolerated when another retains the current horizon; both invalid/absent
+copies MUST refuse v2 recovery, including on an empty-looking volume.
+
+The single `journal/durable-mark` remains advisory and MAY be absent or stale.
+It MUST NOT replace or weaken required v2 evidence. Local CRC records do not
+authenticate metadata, prevent coordinated valid rollback, or provide separate
+physical failure domains.
+
+Older envelope-v1-only binaries reject v2. Current writable recovery MUST refuse
+v1 before changing recovery metadata; acquiring or creating the advisory lock
+may happen first. Read-only checks MAY inspect v1 with an explicit warning that
+its missing horizon cannot be reconstructed. No automatic in-place upgrade is
+provided: preserve the source and perform a verified data migration as described
+in [Durable recovery and migration](docs/durable-recovery.md).
 
 Maki MUST acquire an exclusive volume lock.
 
@@ -998,6 +1043,8 @@ journal append
  ↓
 journal fdatasync
  ↓
+publish the same required horizon to both proof copies and sync directory entries
+ ↓
 verify durable_sequence
  ↓
 success
@@ -1025,6 +1072,8 @@ A/B append complete
  ↓
 journal fdatasync
  ↓
+publish the same required horizon to both proof copies and sync directory entries
+ ↓
 advance durable_sequence
  ↓
 FLUSH success
@@ -1033,7 +1082,12 @@ FLUSH success
 After writeback failure, a successful sync retry alone MUST NOT establish
 durability. The writer MUST rewrite the accepted pending bytes, verify their
 identity, and synchronize them before advancing the durable boundary. Changed
-or lost bytes MUST cause failure without acknowledging them.
+or lost bytes MUST cause failure without acknowledging them. Proof write, sync
+or directory-sync failure MUST likewise fail the barrier and keep its pending
+range retryable, even without a new append. Public durable_sequence and
+checkpoint eligibility MUST remain behind that failed publication. Additional
+metadata and directory sync costs MUST be included in target-system FUA/FLUSH
+latency qualification.
 
 ---
 
@@ -1091,16 +1145,20 @@ acquire volume lock
  ↓
 select valid superblock
  ↓
-validate shard catalog (adopt unlisted shard data files)
+require envelope v2 and load valid durable proof (both missing/invalid = error)
  ↓
-validate allocation metadata (repair from slot headers when a copy is invalid)
+read shard catalog and allocation metadata
  ↓
-scan journal
+load selected checkpoint state
+ ↓
+scan journal and validate the required sequence and exact record-end boundary
+ ↓
+persist selected checkpoint state and apply approved metadata repairs
  ↓
 discard/truncate partial tail
  ↓
 rewrite and verify every accepted prefix, then fdatasync each segment
-and publish the durable mark
+and durably publish the accepted horizon to both required proof copies
 (a process restart hands recovery page-cache bytes: nothing it
 accepts may stay unsynced once the writer resumes, including pages
 whose dirty bits were cleared by failed writeback)
@@ -1117,6 +1175,22 @@ verify key canary
  ↓
 READY
 ```
+
+Above the selected checkpoint, the surviving journal MUST bridge through the
+required horizon. Missing its entire segment or truncating it at an earlier
+complete-record boundary MUST fail. A proof's segment may have been pruned only
+when the checkpoint covers its horizon. Required-horizon validation MUST precede
+recovery metadata changes and tail repairs.
+
+Damage beyond the required final-tail boundary MAY be treated as torn unsynced
+data. An intact later record MUST NOT be used to infer earlier durability:
+unsynced sectors may persist out of order. Recovery MUST rewrite, verify and
+sync accepted prefixes, then publish both proofs before READY. It MUST NOT
+lower the horizon to make a damaged volume attach.
+
+The scanner streams segment data and discards covered payloads, but replay and
+overlay memory remain separate costs. No whole-recovery RSS bound or current
+hardware/DB power-loss qualification is implied by that implementation.
 
 Key canary: on the first attach of a pristine volume, Maki encrypts a fixed,
 volume-bound plaintext at a reserved unit index and stores it A/B-replicated

@@ -12,7 +12,7 @@
 //! artifact:
 //! - a torn tail is legal only in the *last* segment (older segments were
 //!   fdatasync'd before their successor was created), and only *after* the
-//!   prefix the writer's durable mark proves was fdatasync'd;
+//!   prefix proved by the required v2 evidence (and advisory durable mark);
 //! - a final segment shorter than a header, or entirely zero-filled, is a
 //!   creation crash and is discarded; a *complete* but invalid header is
 //!   durable damage;
@@ -34,12 +34,13 @@ use std::sync::Arc;
 use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
     max_segment_file_size, DurableMark, JournalRecord, ScanOutcome, SegmentHeader,
     DURABLE_MARK_SIZE, SEGMENT_HEADER_SIZE,
 };
 use maki_format::layout;
-use maki_format::superblock::Superblock;
+use maki_format::superblock::{load_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2};
 use maki_format::FormatError;
 
 use crate::journal::{rewrite_verified_range, SegmentInfo};
@@ -77,6 +78,7 @@ pub struct Recovered {
     pub store: SlotStore,
     pub checkpoint_state: CheckpointState,
     pub durable_sequence: u64,
+    pub durable_proof: DurableProof,
     pub next_segment_index: u64,
     pub segments: Vec<SegmentInfo>,
     /// Records with sequence > checkpoint_sequence, in sequence order.
@@ -120,7 +122,16 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
     let lock = acquire_lock(backing)?;
 
     // 2. superblock
-    let superblock = load_superblock(backing)?;
+    let envelope = load_volume_superblock(backing.as_ref())?;
+    if envelope.metadata_version != SUPERBLOCK_VERSION_V2 {
+        return Err(RecoveryError::Format(FormatError::Unsupported(
+            "legacy v1 volume requires an explicit migration; writable recovery refuses it without changing recovery metadata".into(),
+        )));
+    }
+    let superblock = envelope.superblock;
+    // Missing evidence must fail even on an empty-looking volume, before
+    // checkpoint metadata or any recovery repair is written.
+    let mut durable_proof = DurableProofStore::load(backing.as_ref(), superblock.volume_uuid)?;
 
     // 3./4. catalog + allocation metadata
     let store = SlotStore::open(backing.clone(), superblock.geometry.clone())?;
@@ -128,6 +139,14 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
 
+    // 5./6. scan journal, then apply the repairs the scan decided on
+    let scan = scan_journal_with_proof(
+        backing,
+        &superblock,
+        checkpoint_state.checkpoint_sequence,
+        segment_size,
+        Some(&durable_proof),
+    )?;
     // The selected checkpoint state gates which journal segments a later
     // checkpoint may reclaim (`allow_covered_holes_below`, `delete_covered`).
     // A restart hands recovery page-cache bytes that were never fdatasync'd,
@@ -147,13 +166,6 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
         backing.sync_dir(layout::CHECKPOINT_DIR)?;
     }
 
-    // 5./6. scan journal, then apply the repairs the scan decided on
-    let scan = scan_journal(
-        backing,
-        &superblock,
-        checkpoint_state.checkpoint_sequence,
-        segment_size,
-    )?;
     for repair in &scan.repairs {
         match repair {
             JournalRepair::Discard { path } => {
@@ -193,12 +205,32 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
         file.sync_data()?;
     }
 
+    // Recovery adopts every accepted tail as durable. Publish that decision
+    // in both required copies before exposing the resumed writer. If the
+    // checkpoint already covers the old proof's segment, retain its location;
+    // it is valid for that segment to have been pruned.
+    if scan.durable_sequence > durable_proof.durable_sequence {
+        if let Some(last) = scan.segments.iter().rev().find(|segment| {
+            segment.record_count > 0 && segment.last_sequence() == scan.durable_sequence
+        }) {
+            durable_proof.durable_sequence = scan.durable_sequence;
+            durable_proof.segment_index = last.index;
+            durable_proof.durable_size = last.size;
+        } else if scan.durable_sequence > checkpoint_state.checkpoint_sequence {
+            return Err(RecoveryError::Corrupt(
+                "recovered durable horizon has no journal boundary".into(),
+            ));
+        }
+    }
+    DurableProofStore::advance(backing.as_ref(), &mut durable_proof)?;
+
     Ok(Recovered {
         lock,
         superblock,
         store,
         checkpoint_state,
         durable_sequence: scan.durable_sequence,
+        durable_proof,
         next_segment_index: scan.next_segment_index,
         segments: scan.segments,
         replay: scan.replay,
@@ -217,9 +249,7 @@ pub fn acquire_lock(backing: &Arc<dyn Backing>) -> Result<Box<dyn VolumeLock>, R
 }
 
 pub fn load_superblock(backing: &Arc<dyn Backing>) -> Result<Superblock, RecoveryError> {
-    AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)
-        .load::<Superblock>(backing.as_ref())?
-        .ok_or_else(|| RecoveryError::Corrupt("no valid superblock copy".to_string()))
+    Ok(load_volume_superblock(backing.as_ref())?.superblock)
 }
 
 /// Checkpoint state is written at volume creation, so an initialized volume
@@ -243,9 +273,40 @@ pub fn scan_journal(
     checkpoint_sequence: u64,
     segment_size: u64,
 ) -> Result<JournalScan, RecoveryError> {
-    // The writer's fdatasync high-water mark (absent or invalid = no
-    // information; the scan then falls back to the heuristic).
+    let envelope = load_volume_superblock(backing.as_ref())?;
+    if envelope.superblock.volume_uuid != superblock.volume_uuid {
+        return Err(RecoveryError::Corrupt(
+            "journal scan superblock identity mismatch".into(),
+        ));
+    }
+    let proof = if envelope.metadata_version == SUPERBLOCK_VERSION_V2 {
+        Some(DurableProofStore::load(
+            backing.as_ref(),
+            superblock.volume_uuid,
+        )?)
+    } else {
+        None // read-only legacy inspection retains its historical classification
+    };
+    scan_journal_with_proof(
+        backing,
+        superblock,
+        checkpoint_sequence,
+        segment_size,
+        proof.as_ref(),
+    )
+}
+
+fn scan_journal_with_proof(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+    checkpoint_sequence: u64,
+    segment_size: u64,
+    proof: Option<&DurableProof>,
+) -> Result<JournalScan, RecoveryError> {
+    // V2 never relies solely on this optional advisory lower bound.
     let mark = load_durable_mark(backing)?;
+    let required = proof.filter(|proof| proof.durable_sequence > checkpoint_sequence);
+    let mut required_seen = false;
 
     let mut names: Vec<(u64, String)> = backing
         .list(layout::JOURNAL_DIR)?
@@ -277,9 +338,13 @@ pub fn scan_journal(
         }
 
         // What the durable mark proves about *this* segment, if anything.
+        let proof_here = proof.filter(|p| p.durable_sequence > 0 && p.segment_index == index);
         let marked_durable: Option<u64> = mark
             .filter(|m| m.segment_index == index)
-            .map(|m| m.durable_size);
+            .map(|m| m.durable_size)
+            .into_iter()
+            .chain(proof_here.map(|p| p.durable_size))
+            .max();
         if let Some(durable) = marked_durable {
             if durable > len {
                 return Err(RecoveryError::Corrupt(format!(
@@ -342,10 +407,10 @@ pub fn scan_journal(
 
         let body_len = len - SEGMENT_HEADER_SIZE as u64;
         // Non-final segments were fdatasync'd in full before their
-        // successor was created; the final one is durable up to the mark.
-        // Without a mark for it (the mark's plain write was lost in the
-        // crash, or it names an older segment) nothing beyond the header
-        // is *proven* durable, so every damage there is a torn tail. Never
+        // successor was created; the final one uses the stronger of the
+        // required proof and the advisory mark. If neither covers it, that
+        // successor has no proven durable records, so damage after its
+        // header can be an unacknowledged torn tail. Never
         // fall back to classifying by what follows the damage: unsynced
         // records persist in any order, and an intact record after a torn
         // one is a normal crash state (M-007, S-04).
@@ -362,12 +427,20 @@ pub fn scan_journal(
             body_len,
             first_sequence: header.base_sequence,
             durable_len,
-            required_boundary: None,
+            required_boundary: required.filter(|p| p.segment_index == index).map(|p| {
+                (
+                    p.durable_sequence,
+                    p.durable_size - SEGMENT_HEADER_SIZE as u64,
+                )
+            }),
             geometry: &superblock.geometry,
             checkpoint_sequence,
             name: &name,
         }
         .scan(&mut replay)?;
+        if required.is_some_and(|p| p.segment_index == index) {
+            required_seen = true;
+        }
 
         let mut size = len;
         match scanned.outcome {
@@ -450,6 +523,12 @@ pub fn scan_journal(
         });
     }
 
+    if required.is_some() && !required_seen {
+        return Err(RecoveryError::Corrupt(
+            "required durable journal segment is missing; refusing to discard acknowledged history"
+                .into(),
+        ));
+    }
     let durable_sequence = checkpoint_sequence.max(max_seq);
     // Segment indexes must never be reused: the durable mark is a plain,
     // never-cleaned file naming the newest segment it saw, so a fresh
@@ -462,7 +541,13 @@ pub fn scan_journal(
         .map(|s| s.index + 1)
         .max()
         .unwrap_or(0)
-        .max(mark.map(|m| m.segment_index + 1).unwrap_or(0));
+        .max(mark.map(|m| m.segment_index + 1).unwrap_or(0))
+        .max(
+            proof
+                .filter(|p| p.durable_sequence > 0)
+                .map(|p| p.segment_index + 1)
+                .unwrap_or(0),
+        );
 
     Ok(JournalScan {
         durable_sequence,
