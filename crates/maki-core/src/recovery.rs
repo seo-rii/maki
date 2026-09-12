@@ -26,8 +26,8 @@
 //! [`scan_journal`] is the read-only core of the scan: it returns the
 //! records to replay together with the repairs recovery *would* apply
 //! (discarding an unwritten final segment, truncating a torn tail). The
-//! offline deep checker reuses it verbatim, so "what recovery would do" and
-//! "what the checker reports" can never drift apart.
+//! offline deep checker uses the same validation with payload retention
+//! disabled; repair decisions and corruption checks remain shared.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -123,6 +123,7 @@ struct VerifiedPrefix {
 enum ReplayRecords {
     All(Vec<JournalRecord>),
     Latest(BTreeMap<u64, JournalRecord>),
+    Discard,
 }
 
 impl ReplayRecords {
@@ -132,6 +133,7 @@ impl ReplayRecords {
             Self::Latest(records) => {
                 records.insert(record.unit_index, record);
             }
+            Self::Discard => {}
         }
     }
 
@@ -143,6 +145,7 @@ impl ReplayRecords {
                 records.sort_unstable_by_key(|record| record.sequence);
                 records
             }
+            Self::Discard => Vec::new(),
         }
     }
 }
@@ -329,6 +332,63 @@ pub fn scan_journal(
     checkpoint_sequence: u64,
     segment_size: u64,
 ) -> Result<JournalScan, RecoveryError> {
+    scan_journal_with_replay(
+        backing,
+        superblock,
+        checkpoint_sequence,
+        segment_size,
+        ReplayRecords::All(Vec::new()),
+    )
+}
+
+/// The checker needs counts and repair decisions, not replay payloads. Keep
+/// the empty replay representation private so the public all-record API keeps
+/// its contract. Each candidate is still fully read and validated; at most
+/// one geometry-bounded payload allocation is alive at a time.
+pub(crate) struct JournalSummary {
+    pub segment_count: usize,
+    pub uncovered_records: u64,
+    pub durable_sequence: u64,
+    pub repairs: Vec<JournalRepair>,
+}
+
+pub(crate) fn summarize_journal(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+    checkpoint_sequence: u64,
+    segment_size: u64,
+) -> Result<JournalSummary, RecoveryError> {
+    let scan = scan_journal_with_replay(
+        backing,
+        superblock,
+        checkpoint_sequence,
+        segment_size,
+        ReplayRecords::Discard,
+    )?;
+    let uncovered_records = scan
+        .segments
+        .iter()
+        .map(|segment| {
+            segment
+                .record_count
+                .min(segment.last_sequence().saturating_sub(checkpoint_sequence))
+        })
+        .sum();
+    Ok(JournalSummary {
+        segment_count: scan.segments.len(),
+        uncovered_records,
+        durable_sequence: scan.durable_sequence,
+        repairs: scan.repairs,
+    })
+}
+
+fn scan_journal_with_replay(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+    checkpoint_sequence: u64,
+    segment_size: u64,
+    replay: ReplayRecords,
+) -> Result<JournalScan, RecoveryError> {
     let envelope = load_volume_superblock(backing.as_ref())?;
     if envelope.superblock.volume_uuid != superblock.volume_uuid {
         return Err(RecoveryError::Corrupt(
@@ -349,7 +409,7 @@ pub fn scan_journal(
         checkpoint_sequence,
         segment_size,
         proof.as_ref(),
-        ReplayRecords::All(Vec::new()),
+        replay,
     )
 }
 

@@ -245,6 +245,75 @@ fn repeated_overwrites_use_memory_for_latest_units_during_full_recovery() {
     );
 }
 
+fn deep_check_allocations(records: u64) -> Allocations {
+    let fixture = overwrite_fixture(records);
+    ALLOCATIONS.with(|cell| cell.set(Some(Allocations::default())));
+    let result = maki_core::check::deep_check(fixture.backing.clone(), 256 << 20);
+    let stats = ALLOCATIONS.with(|cell| cell.replace(None).unwrap());
+    let report = result.unwrap();
+    assert!(report.ok(), "{:?}", report.errors);
+    assert!(report.info.contains(&format!(
+        "journal: 1 segment(s), {records} record(s) newer than the checkpoint, durable sequence {records}"
+    )));
+    stats
+}
+
+#[test]
+fn deep_check_does_not_retain_the_replay_payload_history() {
+    let small = deep_check_allocations(256);
+    let large = deep_check_allocations(16_384);
+    eprintln!("deep check allocations: small={small:?}, large={large:?}");
+    assert!(
+        large.largest <= 128 * 1024
+            && large.peak <= 512 * 1024
+            && large.peak <= small.peak + 64 * 1024,
+        "a read-only report must not retain replay history: small={small:?}, large={large:?}"
+    );
+}
+
+#[test]
+fn deep_check_preserves_checkpoint_counts_tail_repairs_and_read_only_state() {
+    use maki_format::ab::AbStore;
+    use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+
+    for checkpoint in [0, 5, 12] {
+        let fixture = overwrite_fixture(12);
+        let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
+        let mut state = store
+            .load::<CheckpointState>(fixture.backing.as_ref())
+            .unwrap()
+            .unwrap();
+        state.checkpoint_sequence = checkpoint;
+        store.store(fixture.backing.as_ref(), &mut state).unwrap();
+        let before = store
+            .side_generations::<CheckpointState>(fixture.backing.as_ref())
+            .unwrap();
+        let file = fixture
+            .backing
+            .open(&layout::journal_segment(0), false)
+            .unwrap();
+        let valid_end = file.len().unwrap();
+        file.write_at(valid_end, &record(13)[..47]).unwrap();
+        let report = maki_core::check::deep_check(fixture.backing.clone(), 256 << 20).unwrap();
+        assert!(report.ok(), "{:?}", report.errors);
+        assert!(report.info.contains(&format!(
+            "journal: 1 segment(s), {} record(s) newer than the checkpoint, durable sequence 12",
+            12 - checkpoint
+        )));
+        assert!(report
+            .info
+            .iter()
+            .any(|line| line.contains(&format!("would truncate it to {valid_end} bytes"))));
+        assert_eq!(file.len().unwrap(), valid_end + 47);
+        assert_eq!(
+            store
+                .side_generations::<CheckpointState>(fixture.backing.as_ref())
+                .unwrap(),
+            before
+        );
+    }
+}
+
 #[test]
 fn superseded_durable_record_damage_is_still_rejected() {
     let fixture = overwrite_fixture(12);
@@ -266,6 +335,12 @@ fn superseded_durable_record_damage_is_still_rejected() {
     // Scanning stops at the damaged old record, so the required-boundary
     // check refuses the scan before its requested H=12 can be reached.
     assert!(error.contains("required durable record 12"), "{error}");
+    let report = maki_core::check::deep_check(fixture.backing.clone(), 256 << 20).unwrap();
+    assert!(!report.ok());
+    assert!(report
+        .errors
+        .iter()
+        .any(|error| error.contains("required durable record 12")));
 }
 
 #[test]
@@ -305,6 +380,13 @@ fn latest_replay_spans_segments_and_checkpoints_the_latest_versions() {
     volume.flush().unwrap();
     assert!(volume.journal_segment_count() > 1);
     drop(volume);
+
+    let report = maki_core::check::deep_check(fixture.backing.clone(), 4096).unwrap();
+    assert!(report.ok(), "{:?}", report.errors);
+    assert!(report
+        .info
+        .iter()
+        .any(|line| line.contains("16 record(s) newer than the checkpoint, durable sequence 24")));
 
     let mut volume = Volume::recover(fixture.backing.clone(), options.clone()).unwrap();
     assert_eq!(volume.checkpoint_sequence(), 8);

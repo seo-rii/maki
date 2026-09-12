@@ -109,6 +109,8 @@ The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
 | Volume recovery before latest-record retention, four overwritten units | 1,060,000 bytes | 67,765,408 bytes |
 | Volume recovery with latest-record retention, the same four units | 33,988 bytes | 33,988 bytes |
 | Checkpoint-covered public scan, including v2 metadata loading | 8,260 bytes | 8,260 bytes |
+| Deep checker before discarding validated replay payloads | 1,060,242 bytes | 67,765,650 bytes |
+| Deep checker with report-only retention, the same four units | 9,176 bytes | 9,176 bytes |
 
 These are allocations made by the measured recovery thread, not process RSS or
 filesystem cache. Fixed stack scratch is separate. The earlier 488-byte
@@ -118,8 +120,11 @@ historical intermediate result.
 MAKI-025 remains partial. Distinct units, the overlay's latest/durable copies,
 segment metadata, shard catalogs and allocation maps still consume memory.
 The public `scan_journal` and `recovery::recover` APIs retain their all-record
-return contract; the deep checker still uses that public scan. No new arbitrary
-RAM refusal limit has been applied to existing readable volumes.
+return contract. The deep checker uses the same validation with immediate
+payload disposal, retaining at most one bounded candidate payload plus segment
+metadata for the journal report. It still checks every record and reports the
+same counts, corruption and repair decisions; it does not apply repairs. No
+new arbitrary RAM refusal limit has been applied to existing readable volumes.
 
 The MAKI-020 integration in `1bc0ab5` passed 768 workspace tests (10 ignored),
 all nine selected release gates, and Linux/Windows CI. The subsequent latest-

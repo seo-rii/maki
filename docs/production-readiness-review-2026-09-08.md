@@ -141,6 +141,18 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-025의 deep checker도 전체 replay payload 보유를 제거했다. 1 MiB/64 MiB
+저널에서 추가 heap peak가 각각 1,060,242/67,765,650 bytes로 늘어나는 RED를
+확인했다(PID 567161, exit 101;
+`/home/seorii/logs/maki-r3-deep-scan-memory-red-20260912T100444.042988Z.log`).
+검증한 payload를 즉시 버리고 기존 기록 수·required proof·손상·torn-tail
+판정을 공유한 뒤 두 경우 모두 9,176 bytes로 줄었다. checker/recovery/proof
+회귀 27 passed, exit 0(PID 580442;
+`/home/seorii/logs/maki-r3-deep-scan-memory-final-20260912T100741.192029Z.log`),
+관련 strict Clippy exit 0(PID 580858;
+`/home/seorii/logs/maki-r3-deep-scan-memory-clippy-20260912T100741.568824Z.log`).
+공개 all-record API와 실제 attach의 고유 단위·overlay/metadata 메모리는 남는다.
+
 MAKI-015의 WebSocket decoded-output 단위는 별도로 완료했다. 부분 base64
 디코딩 오류와 뒤 항목 거절에서 해제 직전 평문 잔존을 확인한 RED 2개를
 먼저 실행했다(PID 505010, exit 101;
