@@ -12,6 +12,7 @@ pub mod checker;
 pub mod checkpoint;
 pub mod codec;
 pub mod config;
+pub mod durable_proof;
 pub mod error;
 pub mod geometry;
 pub mod init;
