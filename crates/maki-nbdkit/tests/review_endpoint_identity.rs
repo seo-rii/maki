@@ -138,6 +138,7 @@ data_path = "/data"
 encoding = "base64"
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 [cache]
 mode = "off"
 "#

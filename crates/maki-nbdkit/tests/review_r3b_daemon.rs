@@ -47,6 +47,7 @@ supported_plaintext_sizes = [{unit}]
 max_ciphertext_size = {max_ct}
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 "#,
             max_ct = unit + 64,
             root = self.root

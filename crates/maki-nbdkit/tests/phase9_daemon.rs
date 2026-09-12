@@ -227,6 +227,7 @@ max_delay = "200ms"
 {transport}
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 "#
     )
 }
