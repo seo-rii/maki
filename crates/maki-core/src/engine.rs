@@ -283,6 +283,10 @@ struct EngineInner {
     checkpoint_failures_total: AtomicU64,
     last_checkpoint_at: parking_lot::Mutex<Duration>,
     free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
+    /// Published samples have their own memory-only locks: `free_space`
+    /// may be held across a stalled statvfs, and `volume` across storage I/O.
+    observed_free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
+    observed_volume: parking_lot::Mutex<VolumeSnapshot>,
     /// Mirrors `Volume::journal_writeback_uncertain` after every journal
     /// operation, so [`Engine::state`] can report it without the volume
     /// lock: a journal that cannot be synced is a degraded volume.
@@ -456,6 +460,7 @@ impl Engine {
             .clock
             .unwrap_or_else(|| Arc::new(SystemClock::new()));
         let notify = Arc::new(Notify::new());
+        let observed_volume = VolumeSnapshot::new(&volume, EngineState::Ready, clock.now());
         let inner = Arc::new(EngineInner {
             volume: RwLock::new(volume),
             backing,
@@ -488,6 +493,8 @@ impl Engine {
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
             free_space: parking_lot::Mutex::new(None),
+            observed_free_space: parking_lot::Mutex::new(None),
+            observed_volume: parking_lot::Mutex::new(observed_volume),
             journal_uncertain: AtomicBool::new(false),
             flush_latency: LatencyStats::default(),
             fua_latency: LatencyStats::default(),
@@ -893,6 +900,7 @@ impl Engine {
             }
         };
         *cache = Some((value, now));
+        *self.inner.observed_free_space.lock() = Some((value, now));
         value
     }
 
@@ -940,25 +948,63 @@ impl Engine {
             .map(|c| c.stats())
             .unwrap_or_default();
         let backing_free_bytes = self.backing_free_bytes();
-        let admission = &self.inner.admission;
-        let active_callbacks = (admission.max_items() - admission.available_items()) as u64;
-        let plaintext_bytes_in_flight = admission.max_bytes() - admission.available_bytes();
         let volume = self.inner.volume.read().await;
+        let snapshot = VolumeSnapshot::new(&volume, self.state(), self.inner.clock.now());
+        self.stats_from_snapshot(&snapshot, cache, backing_free_bytes)
+    }
+
+    /// Monitoring never acquires the storage lock or refreshes free space.
+    /// A busy volume uses its last completed observation, with age and busy
+    /// flags; cache contention is explicitly unavailable. The snapshot is
+    /// observational and cannot authorize writes, drain or workload startup.
+    pub fn monitoring_snapshot(&self) -> MonitoringSnapshot {
+        let now = self.inner.clock.now();
+        let (volume, volume_busy) = match self.inner.volume.try_read() {
+            Ok(volume) => (VolumeSnapshot::new(&volume, self.state(), now), false),
+            Err(_) => (self.inner.observed_volume.lock().clone(), true),
+        };
+        let cache = self
+            .inner
+            .cache
+            .as_ref()
+            .map(|cache| cache.try_stats())
+            .unwrap_or(Some(maki_cache::CacheStats::default()));
+        let free_space = *self.inner.observed_free_space.lock();
+        MonitoringSnapshot {
+            stats: self.stats_from_snapshot(
+                &volume,
+                cache.unwrap_or_default(),
+                free_space.and_then(|(bytes, _)| bytes),
+            ),
+            volume_busy,
+            volume_snapshot_age: now.saturating_sub(volume.at),
+            cache,
+            backing_space_age: free_space.map(|(_, at)| now.saturating_sub(at)),
+        }
+    }
+
+    fn stats_from_snapshot(
+        &self,
+        volume: &VolumeSnapshot,
+        cache: maki_cache::CacheStats,
+        backing_free_bytes: Option<u64>,
+    ) -> EngineStats {
+        let admission = &self.inner.admission;
         EngineStats {
-            active_callbacks,
-            plaintext_bytes_in_flight,
+            active_callbacks: (admission.max_items() - admission.available_items()) as u64,
+            plaintext_bytes_in_flight: admission.max_bytes() - admission.available_bytes(),
             flush_latency: self.inner.flush_latency.snapshot(),
             fua_latency: self.inner.fua_latency.snapshot(),
-            durable_sequence: volume.journal_durable_sequence(),
-            appended_sequence: volume.journal_appended_sequence(),
-            checkpoint_sequence: volume.checkpoint_sequence(),
-            journal_segments: volume.journal_segment_count(),
-            journal_pending_bytes: volume.journal_pending_bytes(),
-            journal_total_bytes: volume.journal_total_bytes(),
-            journal_sync_failures_total: volume.journal_sync_failures(),
-            journal_writeback_uncertain: volume.journal_writeback_uncertain(),
-            overlay_units: volume.overlay_len(),
-            overlay_bytes: volume.overlay_bytes(),
+            durable_sequence: volume.durable_sequence,
+            appended_sequence: volume.appended_sequence,
+            checkpoint_sequence: volume.checkpoint_sequence,
+            journal_segments: volume.journal_segments,
+            journal_pending_bytes: volume.journal_pending_bytes,
+            journal_total_bytes: volume.journal_total_bytes,
+            journal_sync_failures_total: volume.journal_sync_failures_total,
+            journal_writeback_uncertain: volume.journal_writeback_uncertain,
+            overlay_units: volume.overlay_units,
+            overlay_bytes: volume.overlay_bytes,
             cache_hits: cache.hits,
             cache_misses: cache.misses,
             cache_bytes: cache.bytes,
@@ -966,7 +1012,7 @@ impl Engine {
             backing_free_bytes,
             checkpoints_total: self.inner.checkpoints_total.load(Ordering::Relaxed),
             checkpoint_failures_total: self.inner.checkpoint_failures_total.load(Ordering::Relaxed),
-            state: self.inner.effective_state(self.inner.state.lock().clone()),
+            state: volume.state.clone(),
         }
     }
 }
@@ -977,6 +1023,12 @@ impl EngineInner {
     fn note_journal(&self, volume: &Volume) {
         self.journal_uncertain
             .store(volume.journal_writeback_uncertain(), Ordering::SeqCst);
+        let snapshot = VolumeSnapshot::new(
+            volume,
+            self.effective_state(self.state.lock().clone()),
+            self.clock.now(),
+        );
+        *self.observed_volume.lock() = snapshot;
     }
 
     /// The reported state: a checkpoint-degraded volume stays degraded; a
@@ -1230,6 +1282,59 @@ async fn decrypt_probe(
         }
         Err(e) => Err(AttachError::KeyMismatch(e.to_string())),
     }
+}
+
+/// Last coherent volume metadata observation. No backing operations occur
+/// while constructing or publishing it.
+#[derive(Clone)]
+struct VolumeSnapshot {
+    at: Duration,
+    state: EngineState,
+    durable_sequence: u64,
+    appended_sequence: u64,
+    checkpoint_sequence: u64,
+    journal_segments: usize,
+    journal_pending_bytes: u64,
+    journal_total_bytes: u64,
+    journal_sync_failures_total: u64,
+    journal_writeback_uncertain: bool,
+    overlay_units: usize,
+    overlay_bytes: u64,
+}
+
+impl VolumeSnapshot {
+    fn new(volume: &Volume, state: EngineState, at: Duration) -> Self {
+        Self {
+            at,
+            state,
+            durable_sequence: volume.journal_durable_sequence(),
+            appended_sequence: volume.journal_appended_sequence(),
+            checkpoint_sequence: volume.checkpoint_sequence(),
+            journal_segments: volume.journal_segment_count(),
+            journal_pending_bytes: volume.journal_pending_bytes(),
+            journal_total_bytes: volume.journal_total_bytes(),
+            journal_sync_failures_total: volume.journal_sync_failures(),
+            journal_writeback_uncertain: volume.journal_writeback_uncertain(),
+            overlay_units: volume.overlay_len(),
+            overlay_bytes: volume.overlay_bytes(),
+        }
+    }
+}
+
+/// An observation for status/metrics, which must remain usable during stalls.
+#[derive(Debug, Clone)]
+pub struct MonitoringSnapshot {
+    /// Volume fields use the observation described by `volume_busy` and
+    /// `volume_snapshot_age`; admission and latency counters are sampled now.
+    /// Use `cache` for cache fields: `stats` has placeholders if unavailable.
+    pub stats: EngineStats,
+    pub volume_busy: bool,
+    pub volume_snapshot_age: Duration,
+    /// `None` while a cache insertion, eviction or resize owns its lock.
+    pub cache: Option<maki_cache::CacheStats>,
+    /// `None` before a storage operation has completed a free-space query.
+    /// An available sample can still report unknown free bytes.
+    pub backing_space_age: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]

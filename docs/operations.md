@@ -361,6 +361,11 @@ entries immediately; setting it to zero disables caching.
 
 ## Metrics and health
 
+Status and metrics use in-memory observations and remain callable while a
+volume operation or free-space query is blocked. Busy, cached, and unavailable
+fields must not be interpreted as current readiness or zero counters; see
+[observation freshness and failure limits](observability.md).
+
 `maki metrics` carries every metric SPEC §40 names: request and byte admission
 (`maki_active_callbacks`, `maki_plaintext_bytes`), ciphertext held in memory,
 the crypto submission queue and inflight batches and bytes, per-endpoint
