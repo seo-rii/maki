@@ -26,8 +26,14 @@ max_ciphertext_size = 4384
 stateless = true
 retry_safe = true
 
-integrity = "none"
-context_binding = "none"
+# Required vendor contract: authenticated ciphertext bound to the full
+# context below. Attach probes each claim and fails closed if the endpoint
+# lacks it. The server must return the explicit integrity/context error
+# tokens defined in SPEC (HTTP 422 + maki-crypto-error). Do not lower these
+# requirements to bypass a failed probe; select a conforming provider.
+integrity = "contractual"
+context_binding = "contractual"
+# Authentication alone does not prevent replay of older valid ciphertext.
 replay_protection = "none"
 
 [[crypto.http.endpoint]]
