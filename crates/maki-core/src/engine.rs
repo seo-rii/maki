@@ -131,8 +131,9 @@ pub struct CheckpointPolicy {
     /// are refused with ENOSPC unless known free space covers this reserve
     /// plus the exact append footprint (0 disables). Reads always continue.
     pub emergency_reserve_bytes: u64,
-    /// Backing free space below which the worker checkpoints eagerly to
-    /// reclaim journal segments (0 disables).
+    /// Backing free space preserved as checkpoint headroom after the next
+    /// journal append when emergency-reserve admission is enabled. The worker
+    /// also checkpoints eagerly below this value (0 disables both behaviors).
     pub low_space_checkpoint_bytes: u64,
     /// The worker checkpoints at least this often while anything is
     /// pending; unsynced records are synced first so they can be applied.
@@ -854,15 +855,20 @@ impl Engine {
             // filesystem user or an earlier operation may have consumed the
             // space. This remains a threshold check, not a physical reservation.
             let append_footprint = footprint(volume);
-            let required = policy
+            let reserved = policy
                 .emergency_reserve_bytes
-                .checked_add(append_footprint)
+                .checked_add(policy.low_space_checkpoint_bytes)
                 .ok_or_else(|| {
                     enospc(format!(
-                        "emergency reserve {} plus journal append footprint {append_footprint} exceeds free-space accounting range",
-                        policy.emergency_reserve_bytes
+                        "emergency reserve {} plus checkpoint headroom {} exceeds free-space accounting range",
+                        policy.emergency_reserve_bytes, policy.low_space_checkpoint_bytes
                     ))
                 })?;
+            let required = reserved.checked_add(append_footprint).ok_or_else(|| {
+                enospc(format!(
+                    "reserves {reserved} plus journal append footprint {append_footprint} exceeds free-space accounting range"
+                ))
+            })?;
             let Some(free) = self.backing_free_bytes(Duration::ZERO) else {
                 return Err(enospc(
                     "backing free space unavailable while emergency reserve is enabled",
@@ -870,8 +876,8 @@ impl Engine {
             };
             if free < required {
                 return Err(enospc(format!(
-                    "backing free space {free} below required {required} bytes (emergency reserve {} + journal append footprint {append_footprint})",
-                    policy.emergency_reserve_bytes
+                    "backing free space {free} below required {required} bytes (emergency reserve {} + checkpoint headroom {} + journal append footprint {append_footprint})",
+                    policy.emergency_reserve_bytes, policy.low_space_checkpoint_bytes
                 )));
             }
         }

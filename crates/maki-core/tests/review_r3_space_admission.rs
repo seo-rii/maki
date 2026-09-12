@@ -22,6 +22,7 @@ use maki_test_support::{CrashableBacking, ManualClock};
 
 const UNIT: u32 = 1024;
 const RESERVE: u64 = 1 << 20;
+const CHECKPOINT_HEADROOM: u64 = 2 << 20;
 const FIRST_APPEND_FOOTPRINT: u64 =
     SEGMENT_HEADER_SIZE as u64 + RECORD_HEADER_SIZE as u64 + UNIT as u64 + 8;
 
@@ -68,6 +69,13 @@ impl Backing for SpaceBacking {
 }
 
 async fn fixture(reserve: u64) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) {
+    fixture_with_checkpoint_headroom(reserve, 0).await
+}
+
+async fn fixture_with_checkpoint_headroom(
+    reserve: u64,
+    checkpoint_headroom: u64,
+) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) {
     let backing = Arc::new(SpaceBacking::default());
     let clock = Arc::new(ManualClock::new());
     init::create_volume(
@@ -104,7 +112,7 @@ async fn fixture(reserve: u64) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) 
                 journal_max_bytes: u64::MAX,
                 max_pending_bytes: u64::MAX,
                 emergency_reserve_bytes: reserve,
-                low_space_checkpoint_bytes: 0,
+                low_space_checkpoint_bytes: checkpoint_headroom,
                 interval: Duration::from_secs(3600),
             },
             clock: Some(clock.clone()),
@@ -114,6 +122,50 @@ async fn fixture(reserve: u64) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) 
     .await
     .unwrap();
     (backing, clock, engine)
+}
+
+#[tokio::test]
+async fn admission_preserves_configured_checkpoint_headroom() {
+    let (backing, _, engine) = fixture_with_checkpoint_headroom(RESERVE, CHECKPOINT_HEADROOM).await;
+    let required = RESERVE + CHECKPOINT_HEADROOM + FIRST_APPEND_FOOTPRINT;
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    backing.storage.set_free_bytes(Some(required - 1));
+    assert_storage_full(engine.write(0, &[0x31; UNIT as usize], false).await);
+    let rejected = engine.monitoring_snapshot().stats;
+    assert_eq!(rejected.appended_sequence, before.appended_sequence);
+    assert_eq!(rejected.durable_sequence, before.durable_sequence);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+
+    backing.storage.set_free_bytes(Some(required));
+    engine
+        .write(0, &[0x32; UNIT as usize], false)
+        .await
+        .expect("the exact emergency, checkpoint, and append boundary must pass");
+}
+
+#[tokio::test]
+async fn zero_emergency_reserve_disables_headroom_admission() {
+    let (backing, _, engine) = fixture_with_checkpoint_headroom(0, CHECKPOINT_HEADROOM).await;
+    backing.storage.set_free_bytes(Some(0));
+
+    engine
+        .write(0, &[0x41; UNIT as usize], false)
+        .await
+        .expect("zero emergency reserve must retain the admission opt-out");
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+}
+
+#[tokio::test]
+async fn overflowing_checkpoint_headroom_requirement_fails_closed() {
+    let (backing, _, engine) = fixture_with_checkpoint_headroom(1, u64::MAX).await;
+    backing.storage.set_free_bytes(Some(u64::MAX));
+    let writes = backing.storage.pending_write_count();
+
+    assert_storage_full(engine.write(0, &[0x51; UNIT as usize], false).await);
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 0);
+    assert_eq!(backing.storage.pending_write_count(), writes);
 }
 
 fn assert_storage_full(result: Result<(), CoreError>) {
