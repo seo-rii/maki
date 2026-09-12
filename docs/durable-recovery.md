@@ -115,7 +115,8 @@ The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
 | Measured heap peak | 1 MiB history | 64 MiB history |
 |---|---:|---:|
 | Volume recovery before latest-record retention, four overwritten units | 1,060,000 bytes | 67,765,408 bytes |
-| Volume recovery with latest-record retention, the same four units | 33,988 bytes | 33,988 bytes |
+| Volume recovery with latest-record retention, before overlay sharing, the same four units | 33,988 bytes | 33,988 bytes |
+| Volume recovery with latest-record retention and shared overlay, the same four units | 21,280 bytes | 21,280 bytes |
 | Checkpoint-covered public scan, including v2 metadata loading | 8,260 bytes | 8,260 bytes |
 | Deep checker before discarding validated replay payloads | 1,060,242 bytes | 67,765,650 bytes |
 | Deep checker with report-only retention, the same four units | 9,176 bytes | 9,176 bytes |
@@ -125,7 +126,20 @@ filesystem cache. Fixed stack scratch is separate. The earlier 488-byte
 covered-scan result in `133d36d` predates v2 envelope/proof loading and is a
 historical intermediate result.
 
-MAKI-025 remains partial. Distinct units, the overlay's latest/durable copies,
+An unchanged latest/durable overlay version now shares its immutable
+ciphertext, including the internal checkpoint snapshot. A newer volatile
+overwrite and its older durable predecessor still have separate storage.
+Public `OverlayVersion` and `collect_durable` keep their independently owned
+vector contract. `overlay.bytes()` also retains the conservative logical charge
+for both latest and durable versions, even when they share one allocation.
+
+With 64 units of 64 KiB ciphertext, the measured additional allocation peak
+for promotion fell from 4,192,480 to 0 bytes. The real-file checkpoint peak
+fell from 4,262,528 to 66,688 bytes; its per-slot encoding allocation remains.
+These are controlled thread-local heap measurements, not total resident memory
+or a new maximum supported overlay size.
+
+MAKI-025/028 remain partial. Distinct units and latest/durable versions,
 segment metadata, shard catalogs and allocation maps still consume memory.
 The public `scan_journal` and `recovery::recover` APIs retain their all-record
 return contract. The deep checker uses the same validation with immediate

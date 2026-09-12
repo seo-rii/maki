@@ -150,7 +150,7 @@ payloads as they are validated. Volume attach retains only the latest record
 per unit, and the deep checker discards each validated payload after counting
 it. The four-unit overwrite regression measures 33,988 bytes of extra heap
 for recovery and 9,176 bytes for deep checking at both 1 MiB and 64 MiB history.
-Distinct units, overlay copies and segment/allocation metadata still consume
+Distinct units, different latest/durable versions and segment/allocation metadata still consume
 memory; public all-record APIs retain their return contract. See the
 [measurements and limits](durable-recovery.md#cost-and-verification-limits).
 

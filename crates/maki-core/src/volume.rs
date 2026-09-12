@@ -291,7 +291,7 @@ impl Volume {
             self.sanitize();
             return Ok(self.ck_state.checkpoint_sequence);
         }
-        let items = self.overlay.collect_durable(durable);
+        let items = self.overlay.collect_durable_shared(durable);
 
         // 1. write main slots
         for (unit, version) in &items {

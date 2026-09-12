@@ -188,6 +188,26 @@ simulation CI와 실제 DB/XFS qualification 목표, 등록된 SecretBuffer의 �
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-028의 동일 ciphertext 중복 보유를 별도 수정했다. 64×64KiB의 promotion과
+실제 FileBacking checkpoint에서 전체 ciphertext가 재복사되는 RED 2개와
+기존 버전/API 제어 2개의 통과를 먼저 확인했다(PID 758308, exit 101;
+`/home/seorii/logs/maki-r3-overlay-sharing-red2-20260912T105007.223459Z.log`).
+private Arc로 동일 latest/durable와 내부 checkpoint snapshot만 공유하며
+공개 owned-copy API와 두 버전을 합산하는 논리적 `bytes()`는 유지한다.
+추가 heap peak는 promotion 4,192,480→0 bytes, checkpoint
+4,262,528→66,688 bytes였다. 기존 네 단위 1/64MiB 복구 fixture도 재측정해
+둘 다 21,280 bytes를 확인했다(PID 783468, exit 0;
+`/home/seorii/logs/maki-r3-overlay-sharing-recovery-measure-20260912T105408.761843Z.log`).
+이전 33,988 bytes는 overlay 공유 전 결과다. core 전체 197 passed,
+6 ignored, exit 0(PID 771865;
+`/home/seorii/logs/maki-r3-overlay-sharing-core-20260912T105212.001171Z.log`),
+all-targets strict Clippy exit 0(PID 772112;
+`/home/seorii/logs/maki-r3-overlay-sharing-clippy-20260912T105212.382385Z.log`),
+관련 phase3/4/12 및 R3B durability/concurrent release gate 5개도 모두 통과했다
+(PID 775728, exit 0, debug symbols만 비활성화;
+`/home/seorii/logs/maki-r3-overlay-sharing-release-gates-20260912T105247.376322Z.log`).
+이 후속 변경은 `55ef3ec` snapshot 검증에 포함되지 않는다.
+
 후속 복구 카운터 검사는 CRC가 유효한 극단값에서 panic/wrap하거나 metadata
 재기록 이후 중단하는 경로를 수정했다. scan/deep_check/Volume::recover의
 RED 6 failed(PID 655635, exit 101;
@@ -303,8 +323,8 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-015/032 | 부분 수정: WS 요청과 decoded output, gRPC private item의 소유 버퍼 보호 완료. incoming JSON/frame·tonic 등 별도 할당의 수명·잠금과 전체 resident 비용이 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
-| MAKI-025 | 부분 수정: segment streaming, Volume attach의 단위별 최신 replay 보유, deep checker의 검증 후 payload 폐기로 반복 이력에 따른 payload/pending 증가를 제거. 고유 단위, overlay 두 사본, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
-| MAKI-028 | 자원 구조: latest/durable/checkpoint overlay의 ciphertext 중복이 남음 | 실제 최대 overlay에서 peak RSS 한도 검증, 필요 시 보관 구조 수정; 논리 budget 통과를 전체 메모리 증거로 사용하지 않음 |
+| MAKI-025 | 부분 수정: segment streaming, Volume attach의 단위별 최신 replay 보유, deep checker의 검증 후 payload 폐기로 반복 이력에 따른 payload/pending 증가를 제거. 고유 단위, 서로 다른 latest/durable 버전, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
+| MAKI-028 | 부분 수정: 동일한 latest/durable 버전과 내부 checkpoint snapshot은 immutable ciphertext를 공유. 서로 다른 버전·공개 owned snapshot·slot codec·metadata 비용은 남음 | 실제 최대 overlay에서 peak RSS 한도 검증; 두 버전을 합산하는 보수적 논리 budget을 유지하며 전체 메모리 증거로 사용하지 않음 |
 | MAKI-029/030 | 구조·성능: checkpoint의 exclusive lock과 async worker 위 동기 backing I/O가 남음 | 목표 부하의 최악 I/O 정지·runtime 여유를 검증하고 기준 미달 시 작업 격리/잠금 범위 수정. MAKI-039의 snapshot이 이를 해결한 것은 아님 |
 | MAKI-013 | 위협 모델: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음 | replay를 지원 위협 모델에서 제외하는 결정과 제한을 명시하거나 세대 인증·독립 anchor를 구현하고 공격 회귀 실행 |
 | MAKI-014 | 지원 기능: WSS/gRPC TLS를 명시 거절하며 HTTP TLS를 지원 | TLS가 필요한 지원 프로파일을 HTTP로 제한하거나 해당 transport TLS와 인증서 실패 회귀를 구현. 평문으로 조용히 연결하는 결함으로 표현하지 않음 |
