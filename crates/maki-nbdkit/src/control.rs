@@ -35,6 +35,7 @@ impl EngineControlBackend {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn with_admission(mut self, admission: Arc<crate::drain::DrainGate>) -> Self {
         self.admission = admission;
         self
