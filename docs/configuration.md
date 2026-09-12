@@ -206,6 +206,20 @@ The gRPC transport uses the message shape in
 Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
 
+## Backing directory identity
+
+On Linux, `backing.root` and its ancestors must be real directories; symlink
+aliases are refused. The backing pins the selected directory with an open
+descriptor. Subsequent file, lock, rename, removal, listing, directory sync,
+and free-space operations resolve through directory descriptors without
+following symlinks. Renaming the root and replacing its old pathname cannot
+redirect an existing backing instance to another volume.
+
+Keep the backing tree writable only by its owner. Descriptor confinement does
+not authenticate file contents or prevent a process with direct write access
+from altering the volume. Other development platforms retain pathname-based
+checks; this Linux confinement guarantee does not apply to them.
+
 ## NBD request limits
 
 `nbd.threads` sets the number of Tokio runtime worker threads used by the

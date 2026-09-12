@@ -1,26 +1,52 @@
 //! Real-filesystem backing rooted at a volume directory.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(not(target_os = "linux"), test))]
+use std::fs;
+use std::fs::File;
+#[cfg(not(target_os = "linux"))]
+use std::fs::OpenOptions;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(any(not(target_os = "linux"), test))]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
 use std::sync::Arc;
 
+#[cfg(not(target_os = "linux"))]
 use crate::path::validate;
 use crate::{Backing, BackingFile, VolumeLock};
 
-/// `Backing` over a real directory tree. Paths are validated so no operation
-/// can escape `root`.
+#[cfg(target_os = "linux")]
+#[path = "file_linux.rs"]
+mod linux;
+
+/// `Backing` over a real directory tree. Linux pins the root and resolves
+/// every component through directory descriptors without following symlinks.
+/// Other development platforms perform pathname validation only.
 pub struct FileBacking {
+    #[cfg(target_os = "linux")]
+    directory: linux::Directory,
+    #[cfg(not(target_os = "linux"))]
     root: PathBuf,
 }
 
 impl FileBacking {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        create_private_dir_all(&root)?;
-        Ok(Self { root })
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                directory: linux::Directory::new(&root)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            create_private_dir_all(&root)?;
+            Ok(Self { root })
+        }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn resolve(&self, rel: &str, allow_empty: bool) -> io::Result<PathBuf> {
         validate(rel, allow_empty)?;
         let mut p = self.root.clone();
@@ -46,6 +72,7 @@ impl FileBacking {
 /// `OpenOptions` that never follow a symlink at the final component and
 /// create files owner-only (SPEC §8: data, journal and metadata files are
 /// `maki:maki 0600`).
+#[cfg(not(target_os = "linux"))]
 fn open_options() -> OpenOptions {
     #[allow(unused_mut)] // only Unix adds flags
     let mut options = OpenOptions::new();
@@ -61,6 +88,7 @@ fn open_options() -> OpenOptions {
 /// `create_dir_all` with owner-only directories (SPEC §8: the volume
 /// directory and everything under it are `maki:maki 0700`). Existing
 /// directories keep their mode.
+#[cfg(not(target_os = "linux"))]
 fn create_private_dir_all(path: &Path) -> io::Result<()> {
     #[allow(unused_mut)] // only Unix sets a mode
     let mut builder = fs::DirBuilder::new();
@@ -161,6 +189,7 @@ struct FileLock {
 
 impl VolumeLock for FileLock {}
 
+#[cfg(not(target_os = "linux"))]
 impl Backing for FileBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         let p = self.resolve(path, false)?;
@@ -244,7 +273,7 @@ impl Backing for FileBacking {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn sync_dir_impl(p: &Path) -> io::Result<()> {
     File::open(p)?.sync_all()
 }
