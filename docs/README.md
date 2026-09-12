@@ -13,6 +13,7 @@ for storage, durability, provider, and security requirements.
 | Creating a volume configuration | [Configuration](configuration.md) |
 | Running or recovering a volume | [Operations](operations.md) |
 | Cleaning up a disconnected attachment | [Storage recovery and its limits](storage-recovery.md) |
+| Checking storage before starting a workload | [Repeatable attachment verification](storage-recovery.md#checking-storage-before-each-workload-start) |
 | Understanding required durable evidence and legacy migration | [Durable recovery](durable-recovery.md) |
 | Assessing remote plaintext buffer protection | [Transport memory](transport-memory.md) |
 | Interpreting status during a storage stall | [Observation freshness](observability.md) |

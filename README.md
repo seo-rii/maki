@@ -32,7 +32,8 @@ provided.
 - Provider contract validation, retry budgets, circuit breakers, and failover.
 - Versioned plaintext read cache with zeroization on eviction.
 - Offline format checking and deterministic crash simulation.
-- Privilege-separated attach, detach, mount, and growth operations.
+- Privilege-separated attach, detach, recovery and growth operations, with a
+  repeatable read-only storage identity check before workload starts.
 
 ## Project status
 
@@ -98,10 +99,12 @@ remaining release gates.
 The current [R3 readiness record](docs/production-readiness-review-2026-09-08.md)
 supersedes the historical remaining-work lists above. MAKI-020 now has required
 mirrored acknowledgement evidence: `fb3da46` passed 812 workspace tests,
-nine release gates, and Linux/Windows CI. Follow-up changes are tracked
-separately. Volume recovery streams segments and retains the latest record per
-unit; distinct-unit, overlay and metadata memory limits remain open. Neither change
-constitutes production approval.
+nine release gates, and Linux/Windows CI. The later `b3c5103` snapshot passed
+865 workspace tests, the release DB simulation, and Linux/Windows CI; revision-
+specific gate results are recorded separately. Volume recovery streams segments,
+retains the latest record per unit and shares identical internal overlay versions.
+Distinct versions and metadata still need a total memory bound. Production
+approval remains pending.
 
 ## Build
 

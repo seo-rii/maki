@@ -148,10 +148,11 @@ horizon to both proof copies before READY.
 Segment scanning uses fixed 64 KiB scratch and discards checkpoint-covered
 payloads as they are validated. Volume attach retains only the latest record
 per unit, and the deep checker discards each validated payload after counting
-it. The four-unit overwrite regression measures 33,988 bytes of extra heap
+it. With shared overlay storage, the four-unit overwrite regression measures
+21,280 bytes of extra heap
 for recovery and 9,176 bytes for deep checking at both 1 MiB and 64 MiB history.
-Distinct units, different latest/durable versions and segment/allocation metadata still consume
-memory; public all-record APIs retain their return contract. See the
+Distinct units, different latest/durable versions and segment/allocation metadata
+still consume memory; public all-record APIs retain their return contract. See the
 [measurements and limits](durable-recovery.md#cost-and-verification-limits).
 
 The overlay keeps both the latest version and the latest durable version for

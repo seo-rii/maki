@@ -241,6 +241,16 @@ crypto request bodies
 
 The privileged helper is therefore strictly a **storage connection and control-plane component**.
 
+`maki-attach verify` supplies a repeatable read-only workload-start check using
+existing trusted state and root-controlled configuration. Both volume and XFS
+UUIDs must be pinned. It checks the connected backend, complete persisted
+mapping proof, whole read/write XFS mount without nested mounts, and volume
+sentinel; potentially blocking reads are followed by fresh identity checks.
+It does not create state or write-probe files, repair storage, start a DB, or certify
+another mount namespace. A successful `--plan` is only a preview. See
+[the verification contract](docs/storage-recovery.md#checking-storage-before-each-workload-start)
+for privilege, deadline and lifecycle limits.
+
 ---
 
 # 7. Control Plane

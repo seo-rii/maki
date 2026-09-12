@@ -2,7 +2,7 @@
 
 최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace/9 release gates/CI 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 TDD 수정과 단위별 커밋을 이어갔다. 이 기준선은 v2 proof, 복구/검사 메모리, 전송 소유 버퍼, mount 전 검사와 fresh-space admission 변경을 포함한다. 후속 카운터 경계 수정의 검증은 별도로 기록한다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
-**운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 평문 직렬화 복사본, 물리 공간 admission과 replay 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
+**운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 전송 라이브러리의 평문 복사본, 물리 공간 admission과 고유 단위·metadata의 전체 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
 
 ## 검증 기준선
 
@@ -35,7 +35,7 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 | R3-004 이종 endpoint 능력 | 수정·검증 완료 | 원격 intersection 보존 + `27dce14`; 25개 관련 회귀 통과 |
 | R3-005 실제 UUID 및 canary | 수정·검증 완료 | `8e725fc`; 잠긴 실제 UUID/개별 canary/격리 복귀 검증, 5개 회귀 |
 | R3-006 전체 context 검증 | 수정·검증 완료 | 원격 full-context wire 보존 + `dd87466`; 정확한 필드의 명시적 거절만 증거로 인정 |
-| R3-007 명시적 복구 수명주기 | 부분 수정·상위 과제 미완료 | `b06d0f9` 최초 sentinel 이전 실패 정리, `597eb3c` backend 유실 후 기록된 kernel identity로 recover. VG 활성화와 proof 게시 사이 crash 및 workload 재바인딩은 남음 |
+| R3-007 명시적 복구 수명주기 | 부분 수정·상위 과제 미완료 | `b06d0f9` 최초 sentinel 이전 실패 정리, `597eb3c` 기록된 kernel identity로 recover, `b3c5103` 매 workload 시작 전 read-only verify. VG 활성화와 proof 게시 사이 crash 및 workload 재바인딩 통합은 남음 |
 | R3-008 종료 결과/로그 | 지원 foreground 경로 수정·검증 완료 | `dc646ef`; drain 성공/실패 응답, admission 차단·재시도, 실제 rootless nbdkit 오류 로그와 동시 shutdown 회귀. daemonized 로그 경로는 운영 지원 대상으로 승인하지 않음 |
 | R3-009 conformance shape | 수정·검증 완료 | `57ca845`; 빈/추가/잘못된 index/길이 응답 8개 RED→GREEN |
 | R3-010 capability mode | 수정·검증 완료 | `40502a7`; declared만 지원, remote Verified 선언을 Contractual로 표시 |
@@ -184,9 +184,44 @@ MAKI-048 문서 대조에서는 현재 reload를 활성 cache의 `max_bytes`로 
 SPEC production 예시의 인증·context 계약을 packaged 예시와 맞췄다. 자동
 simulation CI와 실제 DB/XFS qualification 목표, 등록된 SecretBuffer의 잠금과
 별도 transport 할당, oneshot의 과거 성공과 현재 mount 신원도 구분했다.
-현재 진행 중인 workload verify 명령은 구현·검증 후 해당 문서와 최종 대조한다.
+후속 workload verify 명령과 수신 응답·overlay 변경도 현재 코드와 운영 문서를
+최종 대조했다. MAKI-048 문서 일관성 항목은 완료했으며, 다른 코드·운영 검증
+항목의 종료나 운영 승인을 뜻하지 않는다.
+
+## 수신 응답·overlay·workload verify 통합 snapshot — b3c5103
+
+`b3c510333da44b73f8b1819a269bd87779a08613`의 커밋된 소스만 추출해 전체
+fmt, workspace/all-targets strict Clippy와 workspace 검사를 완료했다.
+모두 exit 0이고 **865 passed, 0 failed, 10 ignored**다. 같은 snapshot에서
+`phase11_gate_dbsim_full` release 검사도 **1 passed**, exit 0이다. release는
+debug symbols만 비활성화했다. 이 DB 검사는 실제 DB가 아닌 simulation이다.
+PID 812671, 통합 exit 0, 237.68초; 로그:
+`/home/seorii/logs/maki-r3-workload-final-verified-20260912T110413.350690Z.log`.
+[해당 커밋의 Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34690037136)도
+모두 성공했다. overlay의 나머지 관련 release 5개는 아래 `4a0db11` 수정
+기록에서 검증했으며, 전체 release 9개의 최근 실행은 여전히 `fb3da46`이다.
+
+현재 문서 13개의 로컬 파일 링크와 SPEC/packaged production TOML의 의미상
+일치를 확인했다. R3 원본 SHA256도 exit 0이며 미해결 원본 항목은 보존한다.
 
 ## 남은 리뷰 항목과 종료 조건
+
+`9fd8bfe`는 MAKI-015의 provider-owned 수신 응답을 추가 보호한다. 문자열·부분
+JSON·frame 해제 RED 3개(PID 743395, exit 101;
+`/home/seorii/logs/maki-r3-ws-response-secrets-red-20260912T104629.715361Z.log`)와
+guard 이전 UTF-8 거절 RED 1개(PID 770704, exit 101;
+`/home/seorii/logs/maki-r3-ws-response-utf8-red-20260912T105154.621982Z.log`)를
+먼저 확인했다. payload를 UTF-8 검사 전에 소유하고 JSON 문자열·키를 생성
+시점부터 보호한다. 부분 파싱 실패, 중복 필드 교체, stale/cancelled 응답을
+포함하며, 기존 probe 오류의 필드 중복·타입 판정과 wire/API는 유지한다.
+전체 WS 49 passed, exit 0(PID 795568;
+`/home/seorii/logs/maki-r3-ws-response-secrets-verified-green-20260912T105659.088623Z.log`),
+strict Clippy exit 0(PID 798404;
+`/home/seorii/logs/maki-r3-ws-response-secrets-verified-clippy-20260912T105742.787597Z.log`)이다.
+고유 sliced Bytes의 초기화된 원본 전체 capacity 소거도 확인했다. 선택적
+page lock은 노출된 길이를 대상으로 하며 공유 원본, tungstenite 내부 버퍼,
+serde escape scratch와 전체 RSS는 남는다. [소유권 범위](transport-memory.md)를
+전체 transport 보호 완료로 확대하지 않는다.
 
 R3-007/MAKI-006/040의 workload 시작 전 재검증 경로를 추가했다.
 `maki-attach verify`가 없는 CLI RED 1개를 먼저 확인한 뒤 구현했다
@@ -273,7 +308,8 @@ exit 0(PID 608315;
 `/home/seorii/logs/maki-r3-ws-request-secrets-verified-green-20260912T101156.856770Z.log`),
 strict Clippy exit 0(PID 613372;
 `/home/seorii/logs/maki-r3-ws-request-secrets-verified-clippy-20260912T101249.221580Z.log`)이다.
-응답 Value와 library-private scratch/frame copies, 전체 resident budget은 남는다.
+그 후 `9fd8bfe`에서 소유한 응답 tree/frame을 보호했다. library-private
+scratch/frame copies와 전체 resident budget은 남는다.
 
 MAKI-021의 stale free-space admission을 별도로 수정했다. 시계를 전진하지
 않고 여유 공간을 high→low, low→high, unknown→known-low로 바꾸는 RED 3개가
@@ -342,7 +378,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 |---|---|---|
 | MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 및 probe 전후 mapping/backend 검증 완료. PV/VG/LV의 독립 신원 검증은 VG 활성화 전에 끝나지 않음 | 활성화 전 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: 명령 deadline, 기록 기반 recover 및 workload 시작 전 반복 가능한 read-only verify 제공. activation→proof 게시 crash 공백, 실제 workload READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
-| MAKI-015/032 | 부분 수정: WS 요청과 decoded output, gRPC private item의 소유 버퍼 보호 완료. incoming JSON/frame·tonic 등 별도 할당의 수명·잠금과 전체 resident 비용이 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
+| MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키와 gRPC private item 보호 완료. 공유 원본·serde scratch·tungstenite/tonic 등 별도 할당의 수명·잠금과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
 | MAKI-025 | 부분 수정: segment streaming, Volume attach의 단위별 최신 replay 보유, deep checker의 검증 후 payload 폐기로 반복 이력에 따른 payload/pending 증가를 제거. 고유 단위, 서로 다른 latest/durable 버전, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
@@ -358,7 +394,6 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-038 | 전체 I/O 계약: provider stall/error가 NBD/XFS/DB에 미치는 지연·오류·복구 미검증 | 지원 timeout/error 설정에서 외부 DB ACK와 복구 데이터를 대조하고 최악 지연 목표 확인 |
 | MAKI-042/043/044 | 배포·장애 도메인: WAL/temp/log/backup 보호 범위, key/provider/Docker 부팅 순환, 공유 장치·provider 장애가 미확정 | 정확한 배포 경로·의존성·물리 topology를 고정하고 독립 장애와 공유 장애를 구분한 시험 |
 | MAKI-045/046 | 운영·패키징: 현재 버전의 새 호스트 설치/업그레이드 및 key/format을 포함한 전체 복원 증거 부족 | clean-host 권한·도구 버전 확인, DB-native backup과 별도 key/설정에서 복원 후 외부 데이터 대조 |
-| MAKI-048 | 문서 일관성: 수정별 문서는 보강했으나 설정표·운영 절차·검사/CI 참조의 최종 대조가 필요 | 현재 코드·지원 제한·최종 실행 증거와 관련 문서가 일치하는지 확인; 오래된 성공 기록을 최신 승인으로 쓰지 않음 |
 | MAKI-049/050 | 외부 qualification·지원 범위: 현재 revision의 실제 DB·정전·장시간 결과와 DB별 ACK/이미지/topology가 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 외부 ACK/hash 대조와 성능·복원 승인 |
 
 MAKI-004의 명령 제한, MAKI-012/018/023/027/037/047, FUP-014의 Linux 경로 원인은 위 수정 기록으로 추적한다. MAKI-039의 storage 대기 제거는 검증했지만 별도 프로세스 heartbeat나 runtime 격리를 구현한 것은 아니다. 지원 기능과 선택적 성능 개선의 보류는 명시적인 지원 범위 결정으로 관리할 수 있으나, 이 문서에서 그 결정을 이미 승인된 것으로 간주하지 않는다.
