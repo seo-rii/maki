@@ -91,6 +91,14 @@ refusal, not guaranteed availability after arbitrary damage.
 
 ## Cost and verification limits
 
+Recovery rejects a checkpoint, accepted record range, segment index or
+advisory index whose successor cannot be represented, before rewriting
+checkpoint/proof metadata or applying journal repairs. The last usable
+sequence/index (`u64::MAX - 1`) remains readable; exhaustion does not permit
+wraparound or index reuse. A writer refuses an exhausted append or segment
+roll before changing storage, including before sealing the previous segment.
+This is an error-handling bound, not a change to the on-disk encoding.
+
 Proof publication adds preserved/replacement metadata-file syncs and directory
 syncs to journal barriers. The current store uses two complete A/B stores;
 measure FUA/FLUSH tail latency and recovery time on the intended backing before

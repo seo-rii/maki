@@ -370,8 +370,13 @@ impl JournalWriter {
     }
 
     fn roll(&mut self) -> Result<(), CoreError> {
-        self.seal_active()?;
         let index = self.next_segment_index;
+        // Refuse exhaustion before syncing the previous segment or creating
+        // a header whose index could not advance without wrapping/reuse.
+        let next_segment_index = index
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Corrupt("journal segment index exhausted".into()))?;
+        self.seal_active()?;
         let path = layout::journal_segment(index);
         let base_sequence = self.next_sequence;
 
@@ -394,7 +399,7 @@ impl JournalWriter {
 
         match result {
             Ok(file) => {
-                self.next_segment_index += 1;
+                self.next_segment_index = next_segment_index;
                 self.active = Some(ActiveSegment {
                     info: SegmentInfo {
                         index,
@@ -434,6 +439,13 @@ impl JournalWriter {
     /// `durable_sequence` may still have advanced (an automatic roll seals
     /// the previous segment before the failure).
     pub fn append(&mut self, unit_index: u64, payload: &[u8]) -> Result<u64, CoreError> {
+        // MAX is a next-value sentinel, not a writable sequence: publishing
+        // it would break both the writer invariant and durable-proof bounds.
+        // Check before a roll or any append/truncation can mutate storage.
+        let sequence = self.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Corrupt("journal sequence exhausted".into()))?;
         let record_len = 32 + payload.len() as u64;
         let needs_roll = match &self.active {
             None => true,
@@ -442,7 +454,6 @@ impl JournalWriter {
         if needs_roll {
             self.roll()?;
         }
-        let sequence = self.next_sequence;
         let record = JournalRecord {
             sequence,
             unit_index,
@@ -470,7 +481,7 @@ impl JournalWriter {
         active.info.record_count += 1;
         active.info.size = active.write_offset;
         active.unsynced = true;
-        self.next_sequence += 1;
+        self.next_sequence = next_sequence;
         self.appended_sequence = sequence;
         self.sanitize();
         Ok(sequence)

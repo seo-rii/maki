@@ -421,6 +421,12 @@ fn scan_journal_with_proof(
     proof: Option<&DurableProof>,
     mut replay: ReplayRecords,
 ) -> Result<JournalScan, RecoveryError> {
+    // A resumed writer must have a representable next sequence. Validate
+    // even an empty journal here, before recovery persists its checkpoint
+    // or proof; JournalWriter::resume is already past that mutation boundary.
+    let after_checkpoint = checkpoint_sequence.checked_add(1).ok_or_else(|| {
+        RecoveryError::Corrupt("checkpoint sequence has no representable successor".into())
+    })?;
     // V2 never relies solely on this optional advisory lower bound.
     let mark = load_durable_mark(backing)?;
     let required = proof.filter(|proof| proof.durable_sequence > checkpoint_sequence);
@@ -515,7 +521,7 @@ fn scan_journal_with_proof(
 
         // The oldest surviving segment must connect to the checkpoint
         // boundary; a later base means an uncheckpointed segment is gone.
-        if prev_last_seq.is_none() && header.base_sequence > checkpoint_sequence + 1 {
+        if prev_last_seq.is_none() && header.base_sequence > after_checkpoint {
             return Err(RecoveryError::Corrupt(format!(
                 "journal segment {name}: base sequence {} does not bridge from checkpoint {}",
                 header.base_sequence, checkpoint_sequence
@@ -597,6 +603,21 @@ fn scan_journal_with_proof(
             }
         }
 
+        // The exclusive end must fit as well as each record's sequence:
+        // accepting a final record at MAX would leave no next writer value.
+        // Compute the end before subtracting one so even that intermediate
+        // addition cannot wrap in release builds.
+        let record_count = scanned.record_count;
+        let after_segment = header
+            .base_sequence
+            .checked_add(record_count)
+            .ok_or_else(|| {
+                RecoveryError::Corrupt(format!(
+                    "journal segment {name}: sequence range has no representable successor"
+                ))
+            })?;
+        let last = after_segment.saturating_sub(1);
+
         // Cross-segment sequence continuity. Segments fully covered by the
         // checkpoint are deleted by it; a crash can lose some of those
         // unlinks and not others, so a *covered* prefix may have holes.
@@ -606,7 +627,7 @@ fn scan_journal_with_proof(
         if let Some(prev) = prev_last_seq {
             if header.base_sequence != prev + 1 {
                 let hole_is_covered =
-                    prev <= checkpoint_sequence && header.base_sequence <= checkpoint_sequence + 1;
+                    prev <= checkpoint_sequence && header.base_sequence <= after_checkpoint;
                 if !hole_is_covered {
                     return Err(RecoveryError::Corrupt(format!(
                         "journal segment {name}: base sequence {} does not follow {}",
@@ -615,12 +636,6 @@ fn scan_journal_with_proof(
                 }
             }
         }
-        let record_count = scanned.record_count;
-        let last = if record_count > 0 {
-            header.base_sequence + record_count - 1
-        } else {
-            header.base_sequence.saturating_sub(1)
-        };
         prev_last_seq = Some(last);
         max_seq = max_seq.max(last);
 
@@ -653,18 +668,22 @@ fn scan_journal_with_proof(
     // (a checkpoint right after recovery can delete every segment, which
     // used to restart numbering at zero). Continue above both the surviving
     // segments and the mark.
-    let next_segment_index = segments
+    let highest_segment_index = segments
         .iter()
-        .map(|s| s.index + 1)
-        .max()
-        .unwrap_or(0)
-        .max(mark.map(|m| m.segment_index + 1).unwrap_or(0))
-        .max(
+        .map(|s| s.index)
+        .chain(mark.map(|m| m.segment_index))
+        .chain(
             proof
                 .filter(|p| p.durable_sequence > 0)
-                .map(|p| p.segment_index + 1)
-                .unwrap_or(0),
-        );
+                .map(|p| p.segment_index),
+        )
+        .max();
+    let next_segment_index = match highest_segment_index {
+        Some(index) => index.checked_add(1).ok_or_else(|| {
+            RecoveryError::Corrupt("journal segment index has no representable successor".into())
+        })?,
+        None => 0,
+    };
 
     Ok(JournalScan {
         durable_sequence,

@@ -169,6 +169,21 @@ PID 622494; 로그
 
 ## 남은 리뷰 항목과 종료 조건
 
+후속 복구 카운터 검사는 CRC가 유효한 극단값에서 panic/wrap하거나 metadata
+재기록 이후 중단하는 경로를 수정했다. scan/deep_check/Volume::recover의
+RED 6 failed(PID 655635, exit 101;
+`/home/seorii/logs/maki-r3-recovery-counter-red-20260912T102352.443277Z.log`)와
+append/roll의 변이 이후 panic RED 2 failed(PID 660690, exit 101;
+`/home/seorii/logs/maki-r3-recovery-counter-writer-red-20260912T102522.575120Z.log`)를
+먼저 확인했다. checked successor로 변이 전에 거절하며 MAX-1의 정상 읽기와
+마지막 유효 기록을 유지한다. core 회귀는 debug/release 각각 10 passed,
+exit 0: PID 668705, `/home/seorii/logs/maki-r3-recovery-counter-final-debug-20260912T102742.505784Z.log`;
+PID 668966, `/home/seorii/logs/maki-r3-recovery-counter-release-20260912T102742.886460Z.log`.
+이 집중 release 회귀는 debug symbol만 껐다. core all-targets strict Clippy는
+exit 0(PID 669275;
+`/home/seorii/logs/maki-r3-recovery-counter-clippy-20260912T102743.272721Z.log`)이다.
+이 후속 변경은 위 `fb3da46` 전체 snapshot 검증에 포함되지 않는다.
+
 MAKI-015의 WS 요청도 중간 JSON tree/base64 String을 없애고 고정
 `SecretBuffer`에 직접 직렬화했다. 실제 요청의 연결 전 취소·과대 frame RED
 2개(PID 577718, exit 101;
