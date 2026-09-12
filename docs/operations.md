@@ -64,6 +64,14 @@ maki volume inspect /etc/maki/volumes/example.toml
 maki check /etc/maki/volumes/example.toml
 ```
 
+The inspect output includes `maximum units`, `maximum shards`, `full slot span
+bytes`, `allocation map A/B bytes`, and `catalog A/B bytes`. Use them as the
+format-file baseline for a fully allocated volume. They do not include journal
+or checkpoint headroom, filesystem metadata, copy-on-write overhead, or
+database temporary files, and the command does not reserve disk space. Keep
+the configured reserves and independently qualified operational margin beyond
+the reported values.
+
 `volume create` writes the initial superblock, catalog, and backing directories,
 all owner-only (`0700` directories, `0600` files). The command must target an
 empty, reviewed backing location, and the tree must end up owned by the daemon

@@ -643,6 +643,25 @@ Alignment             512
 Slot size            4608
 ```
 
+Maximum fully allocated layout sizes are calculated from the immutable
+geometry with checked arithmetic:
+
+```text
+num_units              = max_virtual_size / crypto_unit_size
+units_per_shard         = shard_logical_size / crypto_unit_size
+num_shards              = ceil(num_units / units_per_shard)
+full_slot_span_bytes    = num_shards * units_per_shard * slot_size
+allocation_map_ab_bytes = num_shards * 2 * (32 + ceil(units_per_shard / 8))
+catalog_ab_bytes        = 2 * (28 + 8 * num_shards)
+```
+
+Geometry creation MUST reject more than 2^24 possible shards, matching the
+supported shard-catalog limit, and any capacity calculation that overflows an
+unsigned 64-bit byte count. `maki volume inspect` reports these five
+maximum-layout values. They exclude journal and checkpoint headroom,
+filesystem metadata and copy-on-write overhead, and application temporary
+space; they are not a physical reservation.
+
 ---
 
 # 15. CryptoProvider Interface

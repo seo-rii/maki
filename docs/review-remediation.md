@@ -857,6 +857,14 @@ The disposable instance and boot disk were deleted; fresh project queries
 found zero name-matched `maki-*` instances and disks. All eight CI runs from
 `1113a26` through `5a3bef6` passed.
 
+Capacity follow-up `5803be8` partially closes MAKI-041's accounting gap. The
+geometry API and `maki volume inspect` now report maximum units and shards,
+full-shard slot span, and both copies of allocation-map and catalog metadata.
+They reject shard counts above the supported catalog limit and `u64` layout
+overflow. The standard 16 TiB geometry has an 18 TiB slot span before journal,
+checkpoint, filesystem, or database overhead. This planning output does not
+reserve physical blocks and does not close MAKI-021's external-consumer race.
+
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Physical checkpoint reservation, complete RSS
 bounds, remaining transport-library copies, checkpoint stalls, actual provider

@@ -334,6 +334,21 @@ On non-Linux hosts nothing is enforced; the status document reports
 alignment, and NBD block sizes jointly define immutable volume geometry. Treat
 geometry or on-disk format changes as migrations, not hot reloads.
 
+`maki volume inspect` reports maximum units and shards, the full slot-file span,
+and the A/B allocation-map and catalog bytes calculated from that geometry. For
+the 16 TiB example with 4 KiB units, 4384-byte maximum ciphertext, 4608-byte
+slots and 64 GiB shards, the full slot span is 18 TiB. Its allocation maps use
+1,073,758,208 bytes across both copies at full allocation; the two full catalog
+copies use 4,152 bytes. The last partial logical shard still contributes a full
+shard file because shard files are created at their complete fixed length.
+
+These values describe format files at maximum allocation. Add journal and
+checkpoint headroom, filesystem allocation and metadata overhead,
+copy-on-write behavior, and database temporary space when sizing the backing
+filesystem. Sparse file lengths do not reserve those blocks. Geometry
+validation rejects a possible shard count above the catalog limit and any
+maximum-layout byte calculation that overflows `u64`.
+
 Set request-count and byte limits together. In particular, size global and
 per-endpoint concurrency below the memory and provider capacity available to a
 single volume. The cache can be resized at runtime; provider identity, backing
