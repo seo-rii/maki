@@ -20,7 +20,7 @@ HTTP example is available at
 | `limits` | Request, byte, queue, batch, and endpoint concurrency bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
 | `cache` | Read-cache mode, size, TTL, locking, and zeroization |
-| `nbd` | Socket and negotiated I/O geometry |
+| `nbd` | Socket, negotiated I/O geometry, and Tokio runtime worker count |
 | `control` | Administrative socket and group |
 | `security` | Core-dump, memory-lock, and secure-swap policy |
 
@@ -82,6 +82,8 @@ schema, geometry, and secret-literal checks it rejects:
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
   `secure-buffers | all | off`;
 - a `backing.root` that is not an absolute path;
+- an `nbd.threads` value outside `1..=256`; the worker count is never
+  silently reduced;
 - NBD I/O sizes that are not powers of two or not ordered
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
@@ -205,6 +207,17 @@ Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
 
 ## NBD request limits
+
+`nbd.threads` sets the number of Tokio runtime worker threads used by the
+plugin. The default is 64, and the supported range is `1..=256`. This is
+not the process's total thread count: nbdkit owns its native callback
+thread pool, and Tokio may also create blocking-operation threads. The
+plugin allows parallel nbdkit callbacks; changing `nbd.threads` does not
+configure nbdkit's callback pool.
+
+Request admission is controlled separately by `limits.max_active_callbacks`
+and `limits.max_plaintext_bytes`. Increasing the runtime worker count does
+not increase those limits or establish a tested throughput guarantee.
 
 The plugin advertises `minimum_io`, `preferred_io`, and `maximum_io` through
 nbdkit's block-size callback. The adapter also rejects read/write requests with

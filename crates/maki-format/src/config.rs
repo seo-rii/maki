@@ -634,6 +634,8 @@ pub struct NbdSection {
     /// [`VolumeConfig::nbd_preferred_io`].
     pub preferred_io: Option<u32>,
     pub maximum_io: ByteSize,
+    /// Tokio runtime worker threads (1..=256), separate from nbdkit's
+    /// native callback threads and the engine's request admission limit.
     pub threads: u32,
     pub connections: u32,
 }
@@ -1372,8 +1374,8 @@ impl VolumeConfig {
         }
 
         let n = &self.nbd;
-        if n.threads == 0 {
-            return Err(invalid("nbd.threads must be positive"));
+        if !(1..=256).contains(&n.threads) {
+            return Err(invalid("nbd.threads must be in 1..=256"));
         }
         if let Some(advertised) = n.device_block_size {
             if advertised != self.volume.device_block_size {

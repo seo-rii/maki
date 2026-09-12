@@ -112,7 +112,7 @@ impl NbdAdapter {
         let config = daemon::parse_and_validate(&raw)
             .map_err(|e| AdapterError::new(EINVAL, e.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(config.nbd.threads.clamp(1, 256) as usize)
+            .worker_threads(config.nbd.threads as usize)
             .enable_all()
             .build()
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
