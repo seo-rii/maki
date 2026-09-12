@@ -15,6 +15,12 @@ fn packaging(path: &str) -> String {
         .unwrap_or_else(|e| panic!("missing packaging file {path}: {e}"))
 }
 
+fn repository_file(path: &str) -> String {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+    std::fs::read_to_string(format!("{root}{path}"))
+        .unwrap_or_else(|e| panic!("missing repository file {path}: {e}"))
+}
+
 // ---------- packaging pins (PRIV-001/002/012/015 + sandbox) ----------
 
 #[test]
@@ -75,6 +81,29 @@ fn helper_unit_is_oneshot_and_separate() {
         !unit.contains("LoadCredential"),
         "privileged helper must not load crypto credentials"
     );
+}
+
+#[test]
+fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
+    let runner = repository_file("scripts/privileged-linux-validation.sh");
+
+    assert!(runner.contains("provider = \"local-aes-gcm-siv\""));
+    assert!(!runner.contains("provider = \"fake\""));
+    for required in [
+        "[lvm_identity]",
+        "pv_uuids = [\"$pv_uuid\"]",
+        "vg_uuid = \"$vg_uuid\"",
+        "lv_uuid = \"$lv_uuid\"",
+        "fs_uuid = \"$fs_uuid\"",
+        "\"$attach_bin\" verify --volume",
+        "--config \"$attach_config_path\"",
+        "nbd-client 3.27.0 or later",
+    ] {
+        assert!(
+            runner.contains(required),
+            "privileged validation must contain {required:?}"
+        );
+    }
 }
 
 // ---------- attach/detach/grow plans ----------
