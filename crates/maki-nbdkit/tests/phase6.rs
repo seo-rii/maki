@@ -288,6 +288,7 @@ supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4104
 [backing]
 root = "{root_str}"
+journal_emergency_reserve_bytes = "0B"
 [control]
 socket = "{control_sock}"
 "#
