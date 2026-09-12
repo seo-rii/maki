@@ -295,7 +295,7 @@ attached, fails closed on Linux, and is reported under `security` in
 | `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` every secret buffer (plaintext, keys, cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
 | `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
-| `require_secure_swap_policy` (default false) | When true, attach is refused unless `/proc/swaps` is readable, parseable, and lists only RAM-only zram devices (`/dev/zramN` whose `backing_dev` is `none`, or a dm-crypt one) or dm-crypt devices. Classification is by device identity, never by name: a swap file called `zram-backup` is a swap file. Set it in production (the shipped example does) |
+| `require_secure_swap_policy` (default false) | Requires readable, parseable `/proc/swaps` and accepts only RAM-only zram or dm-crypt with proven independent physical backing, including zram writeback. NBD ancestors, cycles, and unknown backing are refused. Device identity determines classification; keep the topology fixed while attached. See [swap dependency checks](operations.md#swap-dependency-checks). The shipped production example enables this policy |
 
 Buffers are zeroized before their page-lock ownership is released. Exporting a
 buffer as a plain vector releases that buffer's ownership and transfers the

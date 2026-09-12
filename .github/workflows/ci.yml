@@ -1,7 +1,7 @@
 # CI strategy per SPEC §55.
 # PR: fast, deterministic suites. Nightly: full property/crash/saturation
 # gates. Weekly & release tiers (DB qualification, TLS suite, soak, QEMU
-# power loss) run on dedicated runners — see docs/ci.md.
+# power loss) require dedicated runners — see docs/testing.md.
 
 name: ci
 

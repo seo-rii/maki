@@ -12,6 +12,8 @@ for storage, durability, provider, and security requirements.
 | Understanding the design | [Architecture](architecture.md) |
 | Creating a volume configuration | [Configuration](configuration.md) |
 | Running or recovering a volume | [Operations](operations.md) |
+| Cleaning up a disconnected attachment | [Storage recovery and its limits](storage-recovery.md) |
+| Interpreting status during a storage stall | [Observation freshness](observability.md) |
 | Reviewing test evidence or release readiness | [Testing and qualification](testing.md) |
 | Checking review findings and their fixes | [Review remediation log](review-remediation.md) |
 | Reading the 2026-09-05 project assessment | [Project review](project-review-2026-09-05.md) |
