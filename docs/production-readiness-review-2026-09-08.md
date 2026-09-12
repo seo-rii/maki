@@ -184,6 +184,23 @@ exit 0(PID 669275;
 `/home/seorii/logs/maki-r3-recovery-counter-clippy-20260912T102743.272721Z.log`)이다.
 이 후속 변경은 위 `fb3da46` 전체 snapshot 검증에 포함되지 않는다.
 
+공개 slice journal scanner도 별도 수정했다. 완료된 MAX sequence record와
+손상 payload 뒤 successor 탐색이 overflow하는 RED 3개를 먼저 확인했다
+(PID 680904, exit 101;
+`/home/seorii/logs/maki-r3-format-counter-red-20260912T103111.557613Z.log`).
+표현할 수 없는 다음 sequence는 payload를 결과에 복사하기 전에 거절하며
+MAX-1 prefix와 기존 torn-tail/durable-prefix 판정은 유지한다. format 전체
+debug/release는 각각 131 passed, exit 0(PID 684346/684804;
+`/home/seorii/logs/maki-r3-format-counter-all-debug-20260912T103239.273267Z.log`,
+`/home/seorii/logs/maki-r3-format-counter-all-release-20260912T103239.708019Z.log`)이다.
+집중 release 검사에서는 debug symbols만 끈다(`CARGO_PROFILE_RELEASE_DEBUG=0`).
+format strict Clippy는 exit 0(PID 685140;
+`/home/seorii/logs/maki-r3-format-counter-clippy-20260912T103240.170979Z.log`),
+core counter와 scanner differential/memory 회귀는 21 passed, exit 0
+(PID 688804;
+`/home/seorii/logs/maki-r3-counter-final-combined-debug-20260912T103348.758180Z.log`)이다.
+이 변경도 `fb3da46`의 이전 전체 snapshot 결과와 구분한다.
+
 MAKI-015의 WS 요청도 중간 JSON tree/base64 String을 없애고 고정
 `SecretBuffer`에 직접 직렬화했다. 실제 요청의 연결 전 취소·과대 frame RED
 2개(PID 577718, exit 101;
