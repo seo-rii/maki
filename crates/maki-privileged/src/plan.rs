@@ -162,7 +162,8 @@ impl fmt::Display for PlannedStep {
             PlannedStep::SetBlockSize { device, block_size } => {
                 write!(f, "blockdev --setbsz {block_size} {device}")
             }
-            PlannedStep::LvmActivate { vg_name } => write!(f, "vgchange -ay {vg_name}"),
+            PlannedStep::LvmActivate { vg_name } => write!(f,
+                "preflight all PVs of {vg_name}; activate by verified VG UUID with verified devices and complete mode"),
             PlannedStep::LvmDeactivate { vg_name } => write!(f, "vgchange -an {vg_name}"),
             PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => write!(
                 f,

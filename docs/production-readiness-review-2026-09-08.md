@@ -243,7 +243,37 @@ privileged/attach 전체 122 passed, 1 ignored, exit 0(PID 810317;
 확인했다. [실행 범위](storage-recovery.md#checking-storage-before-each-workload-start)는
 현재 caller namespace의 storage identity다. lock 대기·kernel read의 전체 시간 상한,
 명령 종료 이후 가용성, 다른 container namespace 및 DB 복구를 보장하지 않는다.
-활성화 전 LVM 신원 및 activation→proof crash 공백은 남는다.
+이 시점의 활성화 전 LVM 신원 및 activation→proof crash 공백은 후속 사전 검사와
+아래 잔여 항목에서 구분한다.
+
+MAKI-005의 후속 변경은 NBD 후보의 kernel parent/device/geometry와 독립적인
+PV label 목록을 LVM 전체 VG 보고서에 대조한다. VG 이름만 사용하던 활성화는
+검증한 device 목록, 발견한 VG UUID와 complete mode를 사용한다. 보고서의
+`pv_duplicate=0`만으로 중복 부재를 가정하지 않으며, 별도 후보의 같은 PVID나
+보고서에서 누락된 PV를 거절한다. `blkid` exit 2를 빈 장치의 증거로 취급하지
+않으므로 빈 여분 파티션과 판독·분류 불가 후보는 이번 지원 범위에서 거절한다.
+현재 설정에는 PV/VG/LV UUID pin이 없으므로 독립적인 관리 신원 인증은 아직
+완료되지 않았다. host udev 자동 활성화, 다른 root 작업과의 원자성 및
+activation→proof crash 공백도 남는다. [LVM 사전 검사 제한](storage-recovery.md#checking-lvm-before-activation)을
+실제 운영 토폴로지와 함께 검증해야 하며 이 항목 전체를 완료로 처리하지 않는다.
+
+실제 RED는 외부 PV와 연결 없는 활성화 계획 2개(PID 832344, exit 101;
+`/home/seorii/logs/maki-r3-lvm-preflight-red-20260912T111740.606060Z.log`),
+PV 중첩·device alias·다른 LV UUID·잘못된 UUID 롤백·계획 표시 5개
+(PID 846082, exit 101;
+`/home/seorii/logs/maki-r3-lvm-preflight-boundaries-red-fixed-20260912T112718.080288Z.log`),
+사전 검사 실패 중 나타난 외부 mapping의 롤백 1개(PID 854312, exit 101;
+`/home/seorii/logs/maki-r3-lvm-preflight-early-rollback-red-20260912T112926.771361Z.log`),
+cachevol 사전 거절 2개(PID 856473, exit 101;
+`/home/seorii/logs/maki-r3-lvm-preflight-cachevol-red-20260912T113023.154099Z.log`)다.
+수정 후 helper/CLI 전체 **142 passed, 0 failed, 1 ignored**, exit 0
+(PID 866086;
+`/home/seorii/logs/maki-r3-lvm-preflight-final-packages-20260912T113539.686746Z.log`)과
+두 package all-targets strict Clippy exit 0(PID 866330;
+`/home/seorii/logs/maki-r3-lvm-preflight-final-clippy-20260912T113540.043074Z.log`)을
+확인했다. fmt와 독립 재검토도 통과했다. 정상 내부 UUID suffix, 부분 활성화
+롤백과 kernel parent/range/device/holder 제어를 포함한다. 실제 장치의 LVM
+report/activation이나 DB 검증은 실행하지 않았다.
 
 MAKI-028의 동일 ciphertext 중복 보유를 별도 수정했다. 64×64KiB의 promotion과
 실제 FileBacking checkpoint에서 전체 ciphertext가 재복사되는 RED 2개와
@@ -376,7 +406,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |
 |---|---|---|
-| MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 및 probe 전후 mapping/backend 검증 완료. PV/VG/LV의 독립 신원 검증은 VG 활성화 전에 끝나지 않음 | 활성화 전 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 |
+| MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 검사에 더해, 활성화 전 독립 PV label·전체 VG 목록 대조와 NBD device/발견한 VG UUID 제한을 제공. 관리자가 고정한 PV/VG/LV UUID, host udev 및 외부 root 조정은 남음 | 지원 토폴로지에서 활성화 전 독립 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 및 실제 대상 검증 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: 명령 deadline, 기록 기반 recover 및 workload 시작 전 반복 가능한 read-only verify 제공. activation→proof 게시 crash 공백, 실제 workload READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
 | MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키와 gRPC private item 보호 완료. 공유 원본·serde scratch·tungstenite/tonic 등 별도 할당의 수명·잠금과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |

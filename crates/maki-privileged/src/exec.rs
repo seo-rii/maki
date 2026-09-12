@@ -21,6 +21,9 @@ pub(crate) mod recover;
 #[path = "workload_verify.rs"]
 mod workload_verify;
 
+#[path = "lvm_preflight.rs"]
+mod lvm_preflight;
+
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{
@@ -407,7 +410,9 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             "blockdev",
             &["--setbsz", &block_size.to_string(), device],
         ),
-        PlannedStep::LvmActivate { vg_name } => run(step, "vgchange", &["-ay", vg_name]),
+        PlannedStep::LvmActivate { .. } => Err(identity_error(
+            "LVM activation requires a connected record and verified preflight",
+        )),
         PlannedStep::LvmDeactivate { vg_name } => run(step, "vgchange", &["-an", vg_name]),
         PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => {
             let output = command::capture(
@@ -490,6 +495,43 @@ fn identity_error(message: impl Into<String>) -> ExecError {
 /// System interactions are isolated so tests exercise the same ordering,
 /// record validation, and rollback decisions without touching devices.
 trait System {
+    fn lvm_preflight(
+        &mut self,
+        _record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        Err(identity_error("LVM metadata preflight is unavailable"))
+    }
+    fn activate_lvm(
+        &mut self,
+        _record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+        _attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        Err(identity_error("verified LVM activation is unavailable"))
+    }
+    fn verify_activated_lvm(
+        &self,
+        _record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        Err(io::Error::other(
+            "activated LVM identity cannot be verified",
+        ))
+    }
+    fn verify_rollback_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        self.verify_activated_lvm(record, verified)
+    }
+    fn deactivate_lvm(
+        &mut self,
+        _record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        Err(identity_error("verified LVM rollback is unavailable"))
+    }
     fn recovery_proof(
         &self,
         _record: &BoundDeviceRecord,
@@ -519,6 +561,41 @@ trait System {
 struct LinuxSystem;
 
 impl System for LinuxSystem {
+    fn lvm_preflight(
+        &mut self,
+        record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        lvm_preflight::prepare(record)
+    }
+    fn activate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+        attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        lvm_preflight::activate(record, verified, attempted)
+    }
+    fn verify_activated_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        lvm_preflight::verify_mapping(record, verified, Path::new("/sys/class/block"))
+    }
+    fn verify_rollback_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        lvm_preflight::verify_rollback_mapping(record, verified, Path::new("/sys/class/block"))
+    }
+    fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        lvm_preflight::deactivate(record, verified)
+    }
     fn recovery_proof(
         &self,
         record: &BoundDeviceRecord,
@@ -682,6 +759,7 @@ fn attach_rollback(
     system: &mut impl System,
     rolled_back: &mut usize,
     allow_missing_sentinel: bool,
+    activation: Option<&lvm_preflight::VerifiedLvm>,
 ) -> bool {
     // Each successful step removes one of at most three layers; the bound just
     // guards against an observation that never converges.
@@ -693,6 +771,15 @@ fn attach_rollback(
                 return false;
             }
         };
+        if (observed.mounted || observed.vg_active)
+            && activation
+                .is_none_or(|identity| system.verify_rollback_lvm(record, identity).is_err())
+        {
+            tracing::error!(
+                "maki-attach: rollback halted; upper mapping has no verified activation identity"
+            );
+            return false;
+        }
         // Topology alone cannot prove ownership of a reused NBD device. Check
         // its recorded nonce after each observation, before any upper-layer
         // teardown as well as disconnect. Missing identity permits cleanup
@@ -747,7 +834,12 @@ fn attach_rollback(
             return false;
         };
         let done = matches!(step, PlannedStep::NbdDisconnect { .. });
-        if let Err(e) = system.run_step(&step, None) {
+        let result = if matches!(step, PlannedStep::LvmDeactivate { .. }) {
+            system.deactivate_lvm(record, activation.expect("active VG identity was checked"))
+        } else {
+            system.run_step(&step, None)
+        };
+        if let Err(e) = result {
             tracing::error!("maki-attach: rollback step {step} failed: {e}; stopping");
             return false;
         }
@@ -817,6 +909,10 @@ fn execute_with(
         .steps
         .iter()
         .any(|s| matches!(s, PlannedStep::NbdDisconnect { .. }));
+    if plan.steps.iter().any(|step| matches!(step, PlannedStep::LvmActivate { vg_name }
+        if !connects || plan.attachment.as_ref().is_none_or(|identity| &identity.vg_name != vg_name))) {
+        return Err(identity_error("LVM activation plan is not bound to the attachment identity"));
+    }
     // A grow changes an existing attachment's LVM/XFS in place. It must be
     // held against the same trusted record and serialized under the attach
     // lock as attach/detach, or it could extend an unrelated volume group,
@@ -933,6 +1029,8 @@ fn execute_with(
         record = Some(prepared);
     }
 
+    let mut activation_identity = None;
+    let mut activation_attempted = false;
     for step in &plan.steps {
         if grows {
             // Never let a changed mount/backend slip between lvextend and
@@ -988,8 +1086,12 @@ fn execute_with(
             PlannedStep::LvmActivate { .. } if connects => {
                 let current = record.as_mut().unwrap();
                 verify_connection(current, system).and_then(|()| {
-                    system.run_step(step, None)?;
+                    let verified = system.lvm_preflight(current)?;
                     verify_connection(current, system)?;
+                    activation_identity = Some(verified.clone());
+                    system.activate_lvm(current, &verified, &mut activation_attempted)?;
+                    verify_connection(current, system)?;
+                    system.verify_activated_lvm(current, &verified)?;
                     current.recovery = system.recovery_proof(current)?;
                     verify_connection(current, system)?;
                     state.unwrap().write(current)?;
@@ -1024,6 +1126,9 @@ fn execute_with(
                     plan.steps
                         .iter()
                         .any(|s| matches!(s, PlannedStep::WriteSentinel { .. })),
+                    activation_identity
+                        .as_ref()
+                        .filter(|_| activation_attempted),
                 )
             } else {
                 true

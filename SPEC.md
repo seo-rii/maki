@@ -219,7 +219,8 @@ Responsibilities:
 allocate an NBD device
 connect the NBD device to the Unix socket
 configure device block size
-activate LVM PV/VG/LV
+verify NBD candidates and complete LVM membership
+activate the discovered VG UUID within the verified NBD device list
 mount XFS
 verify mount identity
 grow LVM
@@ -1556,8 +1557,14 @@ TYPE plus the configured `fs_uuid`, when present. It revalidates the NBD
 backend and recorded mapping before and after that bounded probe, then retains
 the post-mount checks above. The current helper permits `fs_uuid` to be omitted
 for compatibility; that does not establish the filesystem UUID match required
-by this production profile. The probe follows LVM activation and does not
-provide activation-time identity proof or automatic container reattachment.
+by this production profile. The filesystem probe follows LVM activation.
+The separate pre-activation check compares independently probed PV labels
+with complete LVM metadata and scopes the helper's activation to verified
+NBD candidates and the discovered VG UUID. It does not authenticate
+administrator-pinned PV/VG/LV UUIDs, coordinate udev or other privileged tools,
+close the activation-to-proof crash gap, or provide automatic container
+reattachment. Its [supported topology and refusal rules](docs/storage-recovery.md#checking-lvm-before-activation)
+also apply.
 
 Example systemd dependency:
 

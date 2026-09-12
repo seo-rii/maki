@@ -18,6 +18,41 @@ struct FilesystemSystem {
 }
 
 impl System for FilesystemSystem {
+    fn lvm_preflight(
+        &mut self,
+        record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        self.inner.lvm_preflight(record)
+    }
+    fn activate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+        attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        self.inner.activate_lvm(record, verified, attempted)
+    }
+    fn verify_activated_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        self.inner.verify_activated_lvm(record, verified)
+    }
+    fn verify_rollback_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        self.inner.verify_rollback_lvm(record, verified)
+    }
+    fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.inner.deactivate_lvm(record, verified)
+    }
     fn recovery_proof(
         &self,
         record: &BoundDeviceRecord,

@@ -240,6 +240,17 @@ Every value is checked before it reaches a system utility: option-like values,
 relative or non-canonical paths, and malformed UUIDs are rejected with exit
 code 2 and no plan is printed.
 
+Before its LVM activation, attach inventories the recorded NBD and its kernel
+partitions, compares independently probed PV identifiers with the complete VG
+report, and limits activation to those devices and the discovered VG UUID.
+It refuses incomplete or foreign membership, duplicate PV labels, existing
+holders, overlapping PV regions, blank or unclassified candidates, shared VGs,
+nonempty VG system IDs, and cachevol layouts. This requires compatible LVM2
+report and scoped activation options.
+The checks do not pin configured PV/VG/LV UUIDs or coordinate host udev and
+other privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
+before using an existing partition layout or host activation policy.
+
 The helper prints an auditable operation plan before execution. Always review
 plan mode first:
 
