@@ -349,3 +349,32 @@ cargo run --locked -p maki -- check path/to/config.toml
 
 Creating a volume writes metadata to the configured backing root. Do not point
 an unreviewed configuration at an existing volume.
+
+## Privileged attachment identity
+
+The root-owned `/etc/maki/attach/<volume>.toml` is separate from the data-plane
+volume configuration. Its template is
+[`packaging/examples/attach.toml`](../packaging/examples/attach.toml). A
+production attachment must pin the filesystem UUID and the LVM identity:
+
+```toml
+fs_uuid = "11111111-2222-3333-4444-555555555555"
+
+[lvm_identity]
+pv_uuids = ["111111-2222-3333-4444-5555-6666-777777"]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"
+```
+
+When `[lvm_identity]` is present, all three fields are required. `pv_uuids`
+must list the complete PV set without duplicates; its order is normalized.
+Attach refuses a missing, additional, malformed or changed PV, VG or configured
+target-LV UUID before activation. The pins are stored in the trusted attachment
+record and rechecked during recovery. Grow and detach also require the current
+configuration, including the pins, to match that record before any mutation.
+
+Omitting the table remains accepted for old configurations and records, but
+does not authenticate the discovered LVM metadata against an administrator's
+expected identity. Do not use that compatibility mode for the production
+profile. Obtain the identifiers from a separately verified host inventory; the
+helper never learns or rewrites them.

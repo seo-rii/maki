@@ -256,7 +256,9 @@ and systemd's [notification protocol](https://github.com/systemd/systemd/blob/v2
 `/etc/maki/attach/<volume>.toml` (template:
 [`packaging/examples/attach.toml`](../packaging/examples/attach.toml)): the Maki
 volume UUID, the mountpoint, VG and LV names, an optional pinned NBD device and
-an optional expected XFS UUID. Command-line flags override individual values.
+an optional expected XFS UUID. The production profile also provides the complete
+PV UUID set, VG UUID and configured target-LV UUID in `[lvm_identity]`.
+Command-line flags override individual values other than those LVM pins.
 Every value is checked before it reaches a system utility: option-like values,
 relative or non-canonical paths, and malformed UUIDs are rejected with exit
 code 2 and no plan is printed.
@@ -268,8 +270,13 @@ It refuses incomplete or foreign membership, duplicate PV labels, existing
 holders, overlapping PV regions, blank or unclassified candidates, shared VGs,
 nonempty VG system IDs, and cachevol layouts. This requires compatible LVM2
 report and scoped activation options.
-The checks do not pin configured PV/VG/LV UUIDs or coordinate host udev and
-other privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
+When `[lvm_identity]` is present, attach additionally requires the observed PV
+set and VG/target-LV UUIDs to equal the administrator pins before activation.
+Those pins become part of the trusted record; recovery rechecks them, and a
+grow or detach whose current configuration omits or changes them is refused
+before mutation. Omitting the table is supported only for compatibility and is
+outside the production profile. The checks do not coordinate host udev or other
+privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
 before using an existing partition layout or host activation policy.
 
 The helper prints an auditable operation plan before execution. Always review
@@ -317,9 +324,10 @@ Attachment records live in `/run/maki-attach/<volume>.nbd`, under a
 `root:root` 0700 directory. Records are bounded, private, single-link regular
 files containing versioned JSON. The helper refuses symlinks, writable
 ancestors, unexpected ownership, and malformed or legacy device-only records.
-An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV, device,
-random connection identifier, and either the pre-activation recovery intent or
-the complete post-activation mapping proof.
+An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV,
+optional administrator LVM pins, device, random connection identifier, and
+either the pre-activation recovery intent or the complete post-activation
+mapping proof.
 
 `maki-attach detach` takes the same lock and compares the requested attachment
 with that record and the live `/sys/block/nbdN/backend` before unmounting or

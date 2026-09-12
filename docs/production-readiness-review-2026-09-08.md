@@ -137,7 +137,9 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 - `b68935d` (R3-007): 검증된 NBD geometry·partition과 LVM metadata를 activation 전에 원자적으로 기록하고, 성공한 activation 뒤 complete mapping proof로 승격한다. 중간 crash의 intent는 mount/unmount/workload 시작 권한을 주지 않으며, backend가 사라진 복구에서 exact UUID/device/topology만 scoped deactivation한다. legacy proof/intent 없는 기록은 계속 fail closed다.
 - `91d406f` (R3-007): recorded backend nonce가 계속 연결된 정상 detach도 recovery intent를 사용한다. 검증된 부분 activation subset만 scoped deactivation하며 changed mapper name/UUID/slave/holder/mount와 알 수 없는 internal LVM UUID suffix는 mutation 전에 거절한다.
 - `223db0c` (MAKI-021/041 일부): fresh free-space admission이 emergency reserve뿐 아니라 해당 write의 모든 journal record와 segment-header footprint까지 요구한다. 조회의 `None`/오류와 reserve 덧셈 overflow는 mutation 전에 ENOSPC로 닫는다. 물리 예약과 checkpoint 완주 공간은 남는다.
-- `d843540`, `44ba589`, `e1f4143` (MAKI-015 일부): HTTP Base64/Base64URL/hex 응답을 첫 출력 byte 전부터 고정 크기 zeroizing owner에 직접 decode하고, response growth 때 교체되는 allocation을 지운다. JSON object key, pointer overwrite/descent와 잘못된 pointer, 부분 per-item/batch request tree도 RAII로 정리한다. page lock, malformed response parser의 내부 allocation, credential 문자열과 외부 library 복사본은 남는다.
+- `d843540`, `44ba589`, `e1f4143` (MAKI-015 일부): HTTP Base64/Base64URL/hex 응답을 첫 출력 byte 전부터 고정 크기 zeroizing owner에 직접 decode하고, response growth 때 교체되는 allocation을 지운다. JSON object key, pointer overwrite/descent와 잘못된 pointer, 부분 per-item/batch request tree도 RAII로 정리한다. page lock, malformed response parser의 내부 allocation과 외부 library 복사본은 남는다.
+- `8419b3d` (MAKI-015 일부): HTTP가 소유한 resolved header/query 값과 결합된 mTLS identity PEM을 정상 drop·구성 오류에서 지운다. key-source credential은 중간 UTF-8 byte vector를 만들지 않고 빌린다. 원본 설정 문자열과 reqwest/hyper/rustls/kernel 복사본은 보장 밖이다.
+- `a2cc5bc` (MAKI-005): 선택적인 `[lvm_identity]`가 전체 PV UUID 집합, VG UUID와 설정 대상 LV UUID를 고정한다. attach는 activation 전에 exact match를 요구하고 recovery는 저장된 핀을 재검증한다. grow/detach는 핀이 바뀌거나 빠진 설정을 mutation 전에 거절한다. 생략 호환 모드는 운영 프로필로 승인하지 않는다.
 - `fce9066` (MAKI-018): dm-crypt 또는 zram writeback 하부에 NBD가 있거나, cycle·판독 오류·알 수 없는 virtual leaf가 있으면 secure swap으로 인정하지 않는다. device-mapper/MD/partition을 거쳐 실제 장치까지 확인하는 fixture 회귀이며, 실제 swap을 변경한 시험은 아니다.
 - `f64f3d8` (MAKI-037): `nbd.threads`를 `1..=256`에서 검증하고 runtime의 숨은 clamp를 제거했다. [설정 계약](configuration.md#nbd-request-limits)은 Tokio worker, native nbdkit callback pool, request admission을 구분한다. 성능 보장은 별도다.
 - `df886a3` (FUP-014): Linux backing이 root와 부모 디렉터리 descriptor를 고정하여 open·rename·remove·list·sync·lock을 수행한다. root 교체·symlink 거절·상위 디렉터리 권한 회귀를 추가했다. Linux 밖의 개발용 경로에 같은 보장을 확대해 주장하지 않는다.
@@ -397,8 +399,13 @@ PV label 목록을 LVM 전체 VG 보고서에 대조한다. VG 이름만 사용�
 `pv_duplicate=0`만으로 중복 부재를 가정하지 않으며, 별도 후보의 같은 PVID나
 보고서에서 누락된 PV를 거절한다. `blkid` exit 2를 빈 장치의 증거로 취급하지
 않으므로 빈 여분 파티션과 판독·분류 불가 후보는 이번 지원 범위에서 거절한다.
-현재 설정에는 PV/VG/LV UUID pin이 없으므로 독립적인 관리 신원 인증은 아직
-완료되지 않았다. host udev 자동 활성화와 다른 root 작업의 원자성은 남는다.
+후속 `a2cc5bc`는 선택적인 `[lvm_identity]`에 전체 PV UUID 집합, VG UUID와
+설정 대상 LV UUID를 모두 요구한다. 독립 label/fullreport 결과가 핀과 정확히
+일치해야 activation하며, 정렬된 핀을 attachment identity에 저장해 recovery가
+다시 검사한다. grow/detach 설정에서 핀이 바뀌거나 빠져도 mutation 전에
+거절한다. 기존 unpinned 설정/기록은 호환을 위해 읽지만 독립 관리 신원 인증이
+아니므로 운영 프로필로 승인하지 않는다. host udev 자동 활성화와 다른 root
+작업의 원자성은 남는다.
 [LVM 사전 검사 제한](storage-recovery.md#checking-lvm-before-activation)을
 실제 운영 토폴로지와 함께 검증해야 하며 이 항목 전체를 완료로 처리하지 않는다.
 
@@ -423,6 +430,15 @@ report/activation이나 DB 검증은 실행하지 않았다.
 이 단위는 `1dd4069d3407f8f7b78dd5f26fe0b380b2b20fb3`로 정상 푸시했다
 (PID 872497, exit 0;
 `/home/seorii/logs/maki-r3-lvm-preflight-push-20260912T113801.079900Z.log`).
+UUID 핀 TDD의 RED는
+`/home/seorii/logs/maki-r3-lvm-identity-pins-red-20260912T161500Z.log`,
+GREEN은
+`/home/seorii/logs/maki-r3-lvm-identity-pins-focused-green-20260912T161900Z.log`다.
+최종 privileged lib 114 passed/1 ignored, 통합 34 passed와 attach 10 passed,
+strict Clippy·fmt가 통과했다
+(`/home/seorii/logs/maki-r3-lvm-identity-pins-full-20260912T162000Z.log`,
+`/home/seorii/logs/maki-r3-lvm-identity-pins-clippy-20260912T162100Z.log`,
+`/home/seorii/logs/maki-r3-lvm-identity-pins-fmt-20260912T162200Z.log`).
 [해당 커밋의 Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34691556494)는
 fmt, strict Clippy, workspace 검사를 모두 통과했다. 이 helper 단위 때문에
 이전 9개 release simulation gate를 반복하지는 않았다.
@@ -547,6 +563,14 @@ release gates는 이 push-triggered run의 실행 대상이 아니며, 앞서 �
 `fb3da46`의 9개 release gate와 이후 범위별 검사를 현재 코드 전체의 새 release
 snapshot으로 확대하지 않는다.
 
+후속 HTTP credential 수명 변경 `8419b3d`의
+[Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34705597735)와,
+그 변경을 포함한 LVM UUID 핀 revision `a2cc5bc`의
+[Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34705758371)도 fmt,
+workspace all-targets strict Clippy와 전체 workspace tests를 통과했다. 두 Linux
+job은 native NBD 도구와 fault-campaign oracle도 실행했다. nightly release gates는
+push run에서 생략되므로 앞서 기록한 release snapshot 범위를 바꾸지 않는다.
+
 MAKI-005의 파일시스템 검사 순서는 별도로 수정했다. 잘못된 UUID 또는
 비-XFS를 mount·sentinel 쓰기 후에야 거절하는 RED 2개를 먼저 확인했다
 (PID 565315, exit 101;
@@ -609,7 +633,17 @@ focused 9 passed, 전체 HTTP 42 passed/3 ignored, strict Clippy가 통과했다
 (`/home/seorii/logs/maki-r3-http-json-green-confirmed-20260912T160813.313621Z.log`,
 `/home/seorii/logs/maki-r3-http-json-all-20260912T160822.872270Z.log`,
 `/home/seorii/logs/maki-r3-http-json-clippy-20260912T160844.302415Z.log`).
-credential/spec 문자열, malformed response를 Value로 반환하기 전 serde_json 내부
+후속 `8419b3d`는 provider/spec가 소유한 resolved header/query 값과 결합된
+mTLS identity PEM을 정상 drop과 provider/config 구성 오류에서 지운다. key-source
+credential을 UTF-8로 확인할 때 중간 byte vector도 만들지 않는다. 세 RED와 focused
+GREEN, 전체 HTTP **46 passed/3 ignored**, strict Clippy가 통과했다
+(`/home/seorii/logs/maki-r3-http-credential-provider-drop-red-20260912.log`,
+`/home/seorii/logs/maki-r3-http-credential-construction-red-20260912.log`,
+`/home/seorii/logs/maki-r3-http-credential-config-red-20260912.log`,
+`/home/seorii/logs/maki-r3-http-credential-focused-green-20260912.log`,
+`/home/seorii/logs/maki-r3-http-credential-all-green-20260912.log`,
+`/home/seorii/logs/maki-r3-http-credential-clippy-green-20260912.log`).
+원본 설정 문자열, malformed response를 Value로 반환하기 전 serde_json 내부
 allocation, page lock과 reqwest/hyper/rustls/kernel 복사본은 보장 밖이다.
 
 gRPC provider가 소유하는 protobuf item도 별도 수정했다. 전체 capacity의
@@ -629,9 +663,9 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |
 |---|---|---|
-| MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 검사에 더해, 활성화 전 독립 PV label·전체 VG 목록 대조와 NBD device/발견한 VG UUID 제한을 제공. 관리자가 고정한 PV/VG/LV UUID, host udev 및 외부 root 조정은 남음 | 지원 토폴로지에서 활성화 전 독립 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 및 실제 대상 검증 |
+| MAKI-005 | 코드 지원 완료·운영 검증 미완료: mount 전 TYPE/configured FS UUID, 활성화 전 독립 PV label·전체 VG 목록, NBD device/발견한 VG UUID 제한에 더해 `[lvm_identity]`의 전체 PV/VG/대상-LV UUID exact match를 제공. 핀은 recovery에서 재검증되고 grow/detach identity에도 포함된다. unpinned 호환 모드, host udev 및 외부 root 조정은 운영 보장 밖 | 운영 구성에 핀을 필수화하고 지원 토폴로지에서 foreign/unknown 대상 변경 0회, 실패·재시도, udev/root 경합을 포함한 실제 대상 검증 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: native 초기 복구·provider 검증 후 READY, 명령 deadline, 기록 기반 recover, workload 시작 전 read-only verify와 activation 전 recovery intent 제공. proof 게시 전 crash의 exact mount-free mapping은 absent-backend recover와 connected detach 모두 scoped cleanup 가능하다. 실제 DB READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 실제 장치 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
-| MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키, gRPC private item과 HTTP 부분 decode, response growth, JSON key·overwrite·부분 request tree 보호 완료. HTTP credential/spec 문자열, malformed response parser allocation, page lock, 공유 원본, reqwest/tungstenite/tonic 등 별도 할당의 수명과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
+| MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키, gRPC private item과 HTTP 부분 decode, response growth, JSON key·overwrite·부분 request tree, resolved header/query 값과 mTLS identity PEM 보호 완료. 원본 설정 문자열, malformed response parser allocation, page lock, 공유 원본, reqwest/tungstenite/tonic 등 별도 할당의 수명과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료. Firecracker guest hard cut 20회와 전체 GCE instance reset 10회에서 필수 proof와 ACK readback은 보존됨. GCE reset은 workload VM memory/kernel cache를 잃었지만 Persistent Disk 서비스와 물리 저장 경로는 살아 있었음. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, 물리 전원 차단, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space가 reserve와 해당 요청의 모든 record/segment-header footprint를 덮어야 하며 unknown/EIO/overflow는 ENOSPC로 닫는다. 새 slot·metadata·checkpoint 완주 공간의 실물 예약은 아님 | 동시 외부 소비까지 포함한 물리 예약과 checkpoint 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
 | MAKI-025 | 부분 수정: segment streaming, 최신 replay 보유, deep checker payload 폐기 완료. 실제 cgroup OOM 후 32MiB 재기동은 일부 시험에서 READY 30초 제한을 넘겼고 192MiB 복구는 성공. 고유 단위·버전·metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한과 원래 자원 예산에서의 복구 시간을 검증. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |

@@ -21,17 +21,25 @@ partial plaintext prefix. Response growth allocates a new guarded owner, copies
 into it, wipes the replaced owner, then swaps. Request JSON trees remain under a
 drop guard until serialization; recursive cleanup drains and wipes object keys
 and values, including pointer replacement and construction errors. The complete
-HTTP package passed 42 tests with three ignored network tests, and the changed
+HTTP package passed 46 tests with three ignored network tests, and the changed
 packages passed scoped all-targets strict Clippy on 2026-09-13.
 
-HTTP payload, body, response and JSON owners use zeroizing vectors or strings,
-not page-locked `SecretBuffer`s. Header/query credential strings resolved from
-the key source and mTLS identity PEM remain plain allocations. A malformed JSON
-response may make serde_json discard partial parser-owned allocations before it
-returns a Value that Maki can guard. Reqwest, hyper, rustls and kernel buffers remain
-library-controlled copies, and admission does not account for the simultaneous
-decoded, encoded and library copies. MAKI-015 and the total-memory work in
-MAKI-032 therefore remain open.
+Resolved header and query values are erased when their operation specification
+is dropped. Header values are guarded while the specification is assembled, so
+a later mapping error also erases values already resolved. Credential bytes are
+validated as UTF-8 by borrowing the key-source buffer rather than copying it to
+an intermediate vector. The combined mTLS certificate/private-key PEM is
+guarded during construction and erased when its TLS specification is dropped,
+including construction and client-builder errors.
+
+HTTP payload, body, response, JSON, credential-value and identity-PEM owners use
+zeroizing vectors or strings, not page-locked `SecretBuffer`s. Plain source
+configuration strings and copies made inside reqwest, hyper, rustls or the
+kernel remain outside this ownership. A malformed JSON response may make
+serde_json discard partial parser-owned allocations before it returns a Value
+that Maki can guard. Admission also does not account for simultaneous decoded,
+encoded and library copies. MAKI-015 and the total-memory work in MAKI-032
+therefore remain open.
 
 ## WebSocket requests
 
