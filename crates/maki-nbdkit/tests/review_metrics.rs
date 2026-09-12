@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use maki_backing::Backing;
 use maki_control::server::ControlBackend;
-use maki_core::engine::{Engine, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
 use maki_crypto::breaker::BreakerConfig;
 use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
@@ -109,7 +109,13 @@ async fn engine(provider: Arc<dyn CryptoProvider>) -> Engine {
     Engine::attach(
         backing as Arc<dyn Backing>,
         provider,
-        EngineOptions::default(),
+        EngineOptions {
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .await
     .unwrap()

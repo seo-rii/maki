@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{Engine, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
 };
@@ -43,6 +43,16 @@ fn adapter_over(backing: &Arc<CrashableBacking>) -> NbdAdapter {
     adapter_with_provider(backing, Arc::new(FakeCryptoProvider::new(UNIT)))
 }
 
+fn simulated_engine_options() -> EngineOptions {
+    EngineOptions {
+        checkpoint: CheckpointPolicy {
+            emergency_reserve_bytes: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 fn adapter_with_provider(
     backing: &Arc<CrashableBacking>,
     provider: Arc<dyn CryptoProvider>,
@@ -59,7 +69,7 @@ fn adapter_with_provider(
         .block_on(Engine::attach(
             backing.clone() as Arc<dyn Backing>,
             provider,
-            EngineOptions::default(),
+            simulated_engine_options(),
         ))
         .unwrap();
     NbdAdapter::from_engine(engine, runtime)

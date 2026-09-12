@@ -6,7 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{Engine, EngineCacheConfig, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineCacheConfig, EngineOptions};
 use maki_core::volume::VolumeOptions;
 use maki_format::geometry::Geometry;
 use maki_format::init;
@@ -47,6 +47,10 @@ async fn engine_with_cache(
         EngineOptions {
             volume: VolumeOptions::default(),
             cache,
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )

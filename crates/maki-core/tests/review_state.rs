@@ -15,7 +15,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{Engine, EngineOptions, EngineState};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions, EngineState};
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
@@ -45,7 +45,13 @@ async fn engine(backing: &Arc<CrashableBacking>) -> Engine {
     Engine::attach(
         backing.clone() as Arc<dyn Backing>,
         Arc::new(FakeCryptoProvider::new(UNIT)),
-        EngineOptions::default(),
+        EngineOptions {
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .await
     .unwrap()

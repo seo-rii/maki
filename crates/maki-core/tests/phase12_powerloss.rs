@@ -15,7 +15,7 @@ use rand::SeedableRng;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{Engine, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
 use maki_format::geometry::Geometry;
 use maki_format::init;
 use maki_format::superblock::Superblock;
@@ -53,7 +53,13 @@ async fn attach(backing: &Arc<CrashableBacking>) -> Engine {
     Engine::attach(
         backing.clone() as Arc<dyn Backing>,
         Arc::new(FakeCryptoProvider::new(UNIT)),
-        EngineOptions::default(),
+        EngineOptions {
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .await
     .unwrap()

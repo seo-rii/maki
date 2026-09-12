@@ -3,7 +3,7 @@
 
 use maki_backing::Backing;
 use maki_control::protocol::{read_response, send_command, Request};
-use maki_core::engine::{Engine, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
 use maki_format::{geometry::Geometry, init, superblock::Superblock};
 use maki_nbdkit::adapter::{NbdAdapter, ESHUTDOWN};
 use maki_test_support::{crash_backing::FaultOp, CrashableBacking, FakeCryptoProvider};
@@ -16,6 +16,16 @@ fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .unwrap()
+}
+
+fn simulated_engine_options() -> EngineOptions {
+    EngineOptions {
+        checkpoint: CheckpointPolicy {
+            emergency_reserve_bytes: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn memory_adapter(backing: &Arc<CrashableBacking>) -> NbdAdapter {
@@ -38,7 +48,7 @@ fn memory_adapter(backing: &Arc<CrashableBacking>) -> NbdAdapter {
         .block_on(Engine::attach(
             backing.clone(),
             Arc::new(FakeCryptoProvider::new(4096)),
-            EngineOptions::default(),
+            simulated_engine_options(),
         ))
         .unwrap();
     NbdAdapter::from_engine(engine, rt)
@@ -198,7 +208,7 @@ fn shutdown_waits_for_the_full_active_callback() {
         .block_on(Engine::attach(
             backing.clone(),
             provider.clone(),
-            EngineOptions::default(),
+            simulated_engine_options(),
         ))
         .unwrap();
     let adapter = Arc::new(NbdAdapter::from_engine(engine, rt));
@@ -243,7 +253,7 @@ fn shutdown_waits_for_the_full_active_callback() {
         .block_on(Engine::attach(
             backing.clone(),
             Arc::new(FakeCryptoProvider::new(4096)),
-            EngineOptions::default(),
+            simulated_engine_options(),
         ))
         .unwrap();
     assert_eq!(rt.block_on(engine.read(0, 4096)).unwrap(), vec![0x73; 4096]);

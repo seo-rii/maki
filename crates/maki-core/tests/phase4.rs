@@ -11,7 +11,7 @@ use rand::{Rng, SeedableRng};
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{AttachError, Engine, EngineOptions};
+use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineOptions};
 use maki_core::volume::VolumeOptions;
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
@@ -56,6 +56,10 @@ async fn attach(backing: &Arc<CrashableBacking>) -> Result<Engine, AttachError> 
         EngineOptions {
             volume: VolumeOptions {
                 journal_segment_size: 1 << 20,
+            },
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
             },
             ..Default::default()
         },

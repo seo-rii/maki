@@ -59,7 +59,7 @@ fn policy() -> CheckpointPolicy {
         journal_high_watermark_bytes: 32 * 1024,
         journal_max_bytes: 64 * 1024,
         max_pending_bytes: 16 * 1024,
-        emergency_reserve_bytes: 1 << 20,
+        emergency_reserve_bytes: 0,
         low_space_checkpoint_bytes: 0,
         interval: Duration::from_secs(30),
     }
@@ -256,7 +256,10 @@ async fn emergency_reserve_refuses_writes_until_space_returns() {
     let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
     let clock = Arc::new(ManualClock::new());
-    let engine = engine(&backing, policy(), Some(clock.clone())).await;
+    backing.set_free_bytes(Some(1 << 30));
+    let mut p = policy();
+    p.emergency_reserve_bytes = 1 << 20;
+    let engine = engine(&backing, p, Some(clock.clone())).await;
     engine.write(off(0), &data(0xAA), true).await.unwrap();
 
     backing.set_free_bytes(Some(4096));

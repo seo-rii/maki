@@ -18,7 +18,8 @@
 //!   low backing free space, and on a time interval; the write path forces a
 //!   journal sync when unsynced bytes exceed their limit, checkpoints inline
 //!   at the hard journal limit, and refuses writes (ENOSPC) when the backing
-//!   is below its emergency reserve or the journal cannot be reclaimed. A
+//!   cannot preserve its emergency reserve after the exact next append or
+//!   the journal cannot be reclaimed. A
 //!   failed reclaim puts the engine in a `Degraded` state that the next
 //!   successful checkpoint clears.
 
@@ -126,8 +127,9 @@ pub struct CheckpointPolicy {
     /// Appended-but-unsynced journal bytes at which the write path forces a
     /// journal sync before appending more.
     pub max_pending_bytes: u64,
-    /// Backing free space below which writes are refused with ENOSPC
-    /// (0 disables). Reads always continue.
+    /// Backing free space preserved after the next journal append. Writes
+    /// are refused with ENOSPC unless known free space covers this reserve
+    /// plus the exact append footprint (0 disables). Reads always continue.
     pub emergency_reserve_bytes: u64,
     /// Backing free space below which the worker checkpoints eagerly to
     /// reclaim journal segments (0 disables).
@@ -845,25 +847,38 @@ impl Engine {
         cts: &[CiphertextUnit],
     ) -> Result<(), CoreError> {
         let policy = &self.inner.policy;
+        let footprint =
+            |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
         if policy.emergency_reserve_bytes > 0 {
             // A recent observation cannot authorize a new write: another
             // filesystem user or an earlier operation may have consumed the
             // space. This remains a threshold check, not a physical reservation.
-            if let Some(free) = self.backing_free_bytes(Duration::ZERO) {
-                if free < policy.emergency_reserve_bytes {
-                    return Err(enospc(format!(
-                        "backing free space {free} below emergency reserve {}",
+            let append_footprint = footprint(volume);
+            let required = policy
+                .emergency_reserve_bytes
+                .checked_add(append_footprint)
+                .ok_or_else(|| {
+                    enospc(format!(
+                        "emergency reserve {} plus journal append footprint {append_footprint} exceeds free-space accounting range",
                         policy.emergency_reserve_bytes
-                    )));
-                }
+                    ))
+                })?;
+            let Some(free) = self.backing_free_bytes(Duration::ZERO) else {
+                return Err(enospc(
+                    "backing free space unavailable while emergency reserve is enabled",
+                ));
+            };
+            if free < required {
+                return Err(enospc(format!(
+                    "backing free space {free} below required {required} bytes (emergency reserve {} + journal append footprint {append_footprint})",
+                    policy.emergency_reserve_bytes
+                )));
             }
         }
         let pending = volume.journal_pending_bytes();
         if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
             volume.flush()?;
         }
-        let footprint =
-            |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
         if volume
             .journal_total_bytes()
             .saturating_add(footprint(volume))

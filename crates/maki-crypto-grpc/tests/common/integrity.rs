@@ -1,6 +1,6 @@
 //! Shared setup within this transport's authenticated integration tests.
 use maki_backing::MemBacking;
-use maki_core::engine::{AttachError, Engine, EngineOptions};
+use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineOptions};
 use maki_crypto::breaker::BreakerConfig;
 use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
@@ -17,6 +17,16 @@ use std::time::Duration;
 pub const UNIT: usize = 512;
 pub const PROFILE: &str = "r3-authenticated-v1";
 pub const REMOTE_SECRET: &str = "SECRET plaintext=PRIVATE\ninjected";
+
+fn simulated_engine_options() -> EngineOptions {
+    EngineOptions {
+        checkpoint: CheckpointPolicy {
+            emergency_reserve_bytes: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 pub fn context() -> CryptoContext {
     CryptoContext {
@@ -123,7 +133,7 @@ pub async fn verify_engine(provider: Arc<dyn CryptoProvider>, wrong_key: Arc<dyn
     let engine = Engine::attach(
         backing.clone(),
         pipeline(provider),
-        EngineOptions::default(),
+        simulated_engine_options(),
     )
     .await
     .unwrap();
@@ -133,7 +143,7 @@ pub async fn verify_engine(provider: Arc<dyn CryptoProvider>, wrong_key: Arc<dyn
     drop(engine);
     assert!(
         matches!(
-            Engine::attach(backing, pipeline(wrong_key), EngineOptions::default()).await,
+            Engine::attach(backing, pipeline(wrong_key), simulated_engine_options()).await,
             Err(AttachError::KeyMismatch(_))
         ),
         "a different remote key must fail the established canary"

@@ -29,7 +29,7 @@ use rand::{Rng, SeedableRng};
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{AttachError, Engine, EngineCacheConfig, EngineOptions};
+use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineCacheConfig, EngineOptions};
 use maki_core::error::CoreError;
 use maki_format::geometry::Geometry;
 use maki_format::init;
@@ -77,6 +77,10 @@ fn cache_options(unit: u32, cache: bool) -> EngineOptions {
             max_bytes: 6 * unit as u64,
             ttl: std::time::Duration::from_secs(3600),
         }),
+        checkpoint: CheckpointPolicy {
+            emergency_reserve_bytes: 0,
+            ..Default::default()
+        },
         ..EngineOptions::default()
     }
 }

@@ -11,12 +11,19 @@ use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
 use maki_core::volume::VolumeOptions;
 use maki_core::CoreError;
 use maki_crypto::Clock;
-use maki_format::{geometry::Geometry, init, superblock::Superblock};
+use maki_format::{
+    geometry::Geometry,
+    init,
+    journal::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE},
+    superblock::Superblock,
+};
 use maki_test_support::fake_provider::FakeCryptoProvider;
 use maki_test_support::{CrashableBacking, ManualClock};
 
 const UNIT: u32 = 1024;
 const RESERVE: u64 = 1 << 20;
+const FIRST_APPEND_FOOTPRINT: u64 =
+    SEGMENT_HEADER_SIZE as u64 + RECORD_HEADER_SIZE as u64 + UNIT as u64 + 8;
 
 #[derive(Default)]
 struct SpaceBacking {
@@ -112,7 +119,7 @@ async fn fixture(reserve: u64) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) 
 fn assert_storage_full(result: Result<(), CoreError>) {
     assert!(
         matches!(result, Err(CoreError::Io(ref error)) if error.kind() == io::ErrorKind::StorageFull),
-        "a fresh known shortage must refuse this write with ENOSPC"
+        "space admission must refuse this write with ENOSPC"
     );
 }
 
@@ -165,12 +172,52 @@ async fn recovered_space_allows_retry_without_clock_advance() {
 }
 
 #[tokio::test]
-async fn newly_known_shortage_replaces_an_unknown_cached_sample() {
-    let (backing, clock, engine) = fixture(RESERVE).await;
-    engine.write(0, &[1; UNIT as usize], false).await.unwrap();
-    backing.storage.set_free_bytes(Some(0));
-    assert_storage_full(engine.write(UNIT as u64, &[2; UNIT as usize], false).await);
+async fn admission_reserves_the_exact_next_journal_append_footprint() {
+    let (backing, _, engine) = fixture(RESERVE).await;
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    backing
+        .storage
+        .set_free_bytes(Some(RESERVE + FIRST_APPEND_FOOTPRINT - 1));
+    assert_storage_full(engine.write(0, &[5; UNIT as usize], false).await);
+    let rejected = engine.monitoring_snapshot().stats;
+    assert_eq!(rejected.appended_sequence, before.appended_sequence);
+    assert_eq!(rejected.durable_sequence, before.durable_sequence);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+
+    backing
+        .storage
+        .set_free_bytes(Some(RESERVE + FIRST_APPEND_FOOTPRINT));
+    engine
+        .write(0, &[6; UNIT as usize], false)
+        .await
+        .expect("exact reserve plus append footprint must be admitted");
     assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+}
+
+#[tokio::test]
+async fn overflowing_reserve_plus_append_footprint_fails_closed() {
+    let (backing, _, engine) = fixture(u64::MAX).await;
+    backing.storage.set_free_bytes(Some(u64::MAX));
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    assert_storage_full(engine.write(0, &[7; UNIT as usize], false).await);
+    let after = engine.monitoring_snapshot().stats;
+    assert_eq!(after.appended_sequence, before.appended_sequence);
+    assert_eq!(after.durable_sequence, before.durable_sequence);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+}
+
+#[tokio::test]
+async fn newly_known_shortage_replaces_a_sufficient_cached_sample() {
+    let (backing, clock, engine) = fixture(RESERVE).await;
+    backing.storage.set_free_bytes(Some(2 * RESERVE));
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(2 * RESERVE));
+    backing.storage.set_free_bytes(Some(0));
+    assert_storage_full(engine.write(0, &[2; UNIT as usize], false).await);
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 0);
     assert_eq!(clock.now(), Duration::ZERO);
 }
 
@@ -193,14 +240,19 @@ async fn statistics_keep_their_cache_and_monitoring_never_refreshes_space() {
 }
 
 #[tokio::test]
-async fn unknown_and_failed_space_queries_keep_the_existing_write_contract() {
+async fn enabled_reserve_fails_closed_when_space_is_unknown_or_query_fails() {
     for fail_query in [false, true] {
         let (backing, _, engine) = fixture(RESERVE).await;
         backing.fail_query.store(fail_query, Ordering::SeqCst);
-        engine.write(0, &[3; UNIT as usize], true).await.unwrap();
+        let before = engine.monitoring_snapshot().stats;
+        let writes = backing.storage.pending_write_count();
+
+        assert_storage_full(engine.write(0, &[3; UNIT as usize], true).await);
         let snapshot = engine.monitoring_snapshot();
         assert_eq!(snapshot.stats.backing_free_bytes, None);
-        assert_eq!(snapshot.stats.appended_sequence, 1);
+        assert_eq!(snapshot.stats.appended_sequence, before.appended_sequence);
+        assert_eq!(snapshot.stats.durable_sequence, before.durable_sequence);
+        assert_eq!(backing.storage.pending_write_count(), writes);
     }
 }
 

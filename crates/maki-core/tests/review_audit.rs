@@ -393,6 +393,10 @@ mod wrong_size {
             EngineOptions {
                 volume: options(),
                 cache: None,
+                checkpoint: maki_core::engine::CheckpointPolicy {
+                    emergency_reserve_bytes: 0,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
