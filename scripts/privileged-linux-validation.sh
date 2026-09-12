@@ -489,7 +489,7 @@ mapfile -t still_missing < <(missing_commands)
 ((${#still_missing[@]} == 0)) ||
     die "missing commands: ${still_missing[*]} (rerun with --install-missing on Debian)"
 [[ "$(fio --version)" =~ ^fio-[0-9] ]] || die "fio resolves to an unexpected executable: $(fio --version)"
-nbd_client_version="$(nbd-client -V 2>&1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+nbd_client_version="$(nbd-client -h 2>&1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n 1 || true)"
 if [[ ! "$nbd_client_version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]] ||
     ((10#${BASH_REMATCH[1]} < 3)) ||
     ((10#${BASH_REMATCH[1]} == 3 && 10#${BASH_REMATCH[2]} < 27)); then
