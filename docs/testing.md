@@ -42,11 +42,13 @@ manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
 power-loss simulations, and real-process tests for all four binaries.
 The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
 before the workspace tests and checks their executables. This runs the native
-startup, negotiation, drain, and ABI regressions instead of relying on optional
+startup, negotiation, drain, process-crash, and ABI regressions instead of relying on optional
 tool availability. Native startup uses disposable files and Unix sockets; it
 does not attach a kernel NBD device or mount a filesystem. On developer hosts
 without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
+The Linux baseline also runs the Python fault-oracle regressions. Actual Docker
+cgroup OOM and freeze campaigns remain an opt-in host qualification step.
 
 The scheduled job runs:
 
@@ -149,13 +151,14 @@ systemd workloads or attach real devices; follow the
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
-| Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs; not 10,000 OS process crashes |
+| Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
 | Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke | Pass on Debian 12/KVM | Guarded privileged run completed on a disposable NBD target |
 | Real databases | Required | Partial | SQLite WAL smoke passed; crash campaigns and other engines remain open |
+| cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | QEMU hard power loss | 300+ cuts | Open | Simulation is not hardware evidence |
 | Mixed workload | 72 hours | Open | Dedicated hardware run not recorded |
 
@@ -164,6 +167,10 @@ The detailed Debian run is preserved in the
 later [privileged Linux validation report](privileged-linux-validation.md)
 records the kernel NBD, LVM, XFS, raw and filesystem fio, privilege, helper, and
 SQLite smoke results.
+The [September 12 fault report](cgroup-fault-validation-2026-09-12.md) records
+the new native process and cgroup executions, external ACK evidence, reproduction
+commands and the unresolved restart limit. The host was Debian, so no WSL
+shutdown was executed.
 
 ## Database qualification
 

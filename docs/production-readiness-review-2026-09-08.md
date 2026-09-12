@@ -1,8 +1,37 @@
 # 운영 준비 검토 및 R3 수정 기록 — 2026-09-08
 
-최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 최신 검사는 LVM 사전 검사와 native 초기 준비 완료 통지를 포함한다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
+최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌과 cgroup 장애 검사를 추가했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
 **운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 전송 라이브러리의 평문 복사본, 물리 공간 admission과 고유 단위·metadata의 전체 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
+
+## 실제 cgroup·프로세스 장애 검사 — 2026-09-12
+
+`0509fe3`에 native nbdkit SIGKILL 회귀 6개를 추가했다. FLUSH/FUA 각각
+3회 재시작, 미ACK 요청 제외, 확정 저널 삭제·절단의 시작 거절을 검사했다.
+외부 oracle의 잘못된 예상값이 Python `-O`에서 통과하는 RED를 확인하고
+검사를 명시적 오류 처리로 수정했다. `PYTHONOPTIMIZE=1`에서 6 passed,
+strict Clippy·서식 검사도 통과했다. 제품 코드를 변경한 단위는 아니다.
+`0509fe3`의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34694167299)도 모두 성공했다.
+
+별도로 `e894ae5`의 정상 release/AES-GCM-SIV 경로를 폐기용 Docker에서
+실행했다. CPU 0.25개 제한의 실제 throttling, 0.5초 freeze/resume,
+SIGKILL 및 32MiB·swap 0의 실제 workload OOM을 확인했다. 세 시나리오의
+확정 데이터 136개 블록씩이 재시작 후 일치했고 deep check도 통과했다.
+최종 캠페인 PID 1102835, exit 0 로그:
+`/home/seorii/logs/maki-r3-cgroup-native-final-evidence-20260912T123818.793378Z.log`.
+검사 도구의 실패 ACK·OOM 오판·최적화 우회·정리·진단 회귀도 13 passed다.
+
+**32MiB 재기동 가능성은 보장하지 못했다.** 22MiB의 압박 쓰기를 완료한
+두 시험은 같은 32MiB로 복구할 때 30초 안에 READY를 내지 못했다.
+21.75MiB를 완료한 마지막 시험은 같은 상한에서 복구했지만 한도에 도달했고,
+192MiB 복구는 성공했다. 고유 단위 replay와 메모리·시간 예산의 과제가
+남아 있다는 실제 증거다. 특정 최소 RAM이나 정상 운영 용량을 도출한 것은
+아니다. 실패와 성공의 원장·종료 상태는 [상세 장애 보고서](cgroup-fault-validation-2026-09-12.md)에 함께 기록했다.
+
+현재 호스트는 WSL이 아닌 Debian이므로 `wsl --shutdown`은 실행하지 않았다.
+커널과 page cache가 살아 있는 과정의 시험이며 실제 정전·kernel NBD/LVM/XFS·
+DB ACK 시험을 대신하지 않는다. MAKI-020의 외부 qualification 및
+MAKI-025/028/049/050은 이 결과만으로 닫지 않으며 원본 리뷰를 보존한다.
 
 ## 검증 기준선
 
@@ -474,7 +503,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키와 gRPC private item 보호 완료. 공유 원본·serde scratch·tungstenite/tonic 등 별도 할당의 수명·잠금과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
-| MAKI-025 | 부분 수정: segment streaming, Volume attach의 단위별 최신 replay 보유, deep checker의 검증 후 payload 폐기로 반복 이력에 따른 payload/pending 증가를 제거. 고유 단위, 서로 다른 latest/durable 버전, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
+| MAKI-025 | 부분 수정: segment streaming, 최신 replay 보유, deep checker payload 폐기 완료. 실제 cgroup OOM 후 32MiB 재기동은 일부 시험에서 READY 30초 제한을 넘겼고 192MiB 복구는 성공. 고유 단위·버전·metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한과 원래 자원 예산에서의 복구 시간을 검증. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
 | MAKI-028 | 부분 수정: 동일한 latest/durable 버전과 내부 checkpoint snapshot은 immutable ciphertext를 공유. 서로 다른 버전·공개 owned snapshot·slot codec·metadata 비용은 남음 | 실제 최대 overlay에서 peak RSS 한도 검증; 두 버전을 합산하는 보수적 논리 budget을 유지하며 전체 메모리 증거로 사용하지 않음 |
 | MAKI-029/030 | 구조·성능: checkpoint의 exclusive lock과 async worker 위 동기 backing I/O가 남음 | 목표 부하의 최악 I/O 정지·runtime 여유를 검증하고 기준 미달 시 작업 격리/잠금 범위 수정. MAKI-039의 snapshot이 이를 해결한 것은 아님 |
 | MAKI-013 | 위협 모델: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음 | replay를 지원 위협 모델에서 제외하는 결정과 제한을 명시하거나 세대 인증·독립 anchor를 구현하고 공격 회귀 실행 |

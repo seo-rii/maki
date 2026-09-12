@@ -43,6 +43,9 @@ jobs:
       # the build reproducible against Cargo.lock (third review).
       - name: workspace tests
         run: cargo test --workspace --locked
+      - name: fault campaign oracle (Linux)
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s scripts -p test_cgroup_validation.py -v
 
   nightly-gates:
     if: github.event_name == 'schedule'
