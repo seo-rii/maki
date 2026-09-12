@@ -84,6 +84,7 @@ struct FakeSystem {
     observation_error: bool,
     observation_error_after: Option<&'static str>,
     process_death_after_activation: bool,
+    scoped_lvm_deactivations: usize,
     backend_fault_after: Option<(&'static str, BackendFault)>,
     backend_fault_on_probe: Option<(usize, BackendFault)>,
     backend_probes: std::cell::Cell<usize>,
@@ -232,6 +233,7 @@ impl System for FakeSystem {
         record: &BoundDeviceRecord,
         _verified: &lvm_preflight::VerifiedLvm,
     ) -> Result<(), ExecError> {
+        self.scoped_lvm_deactivations += 1;
         self.run_step(
             &PlannedStep::LvmDeactivate {
                 vg_name: record.attachment.vg_name.clone(),
@@ -1260,6 +1262,7 @@ impl System for ObservedSystem {
         record: &BoundDeviceRecord,
         _verified: &lvm_preflight::VerifiedLvm,
     ) -> Result<(), ExecError> {
+        self.fake.scoped_lvm_deactivations += 1;
         self.run_step(
             &PlannedStep::LvmDeactivate {
                 vg_name: record.attachment.vg_name.clone(),
@@ -1310,6 +1313,8 @@ impl System for ObservedSystem {
         } else {
             let _ = std::fs::remove_dir_all(dm);
             let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-0"));
+            let _ = std::fs::remove_dir_all(self.sysfs.join("dm-1"));
+            let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-1"));
         }
         result
     }

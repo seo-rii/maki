@@ -721,7 +721,11 @@ fn verify_detach_state(
         }
         None => false,
     };
-    let observed = system.detach_observation(record)?;
+    let observed = if record.recovery_intent.is_some() {
+        system.recovery_observation(record)?
+    } else {
+        system.detach_observation(record)?
+    };
     if !connected && (observed.mounted || observed.vg_active || observed.nbd_in_use) {
         return Err(identity_error(
             "NBD connection is absent but the attachment still has active mounts or mappings",
@@ -1118,6 +1122,23 @@ fn execute_with(
                     state.unwrap().write(current)?;
                     Ok(())
                 })
+            }
+            PlannedStep::LvmDeactivate { .. } if disconnects && !connects => {
+                let current = record.as_ref().unwrap();
+                if let Some(intent) = &current.recovery_intent {
+                    verify_connection(current, system)?;
+                    let observed = system.recovery_observation(current)?;
+                    if observed.mounted || !observed.vg_active {
+                        return Err(identity_error(
+                            "persisted activation intent no longer identifies an active, unmounted mapping",
+                        ));
+                    }
+                    system.verify_rollback_lvm(current, intent.verified())?;
+                    verify_connection(current, system)?;
+                    system.deactivate_lvm(current, intent.verified())
+                } else {
+                    system.run_step(step, None)
+                }
             }
             PlannedStep::VerifyFilesystemIdentity { .. } if connects => {
                 let current = record.as_ref().unwrap();

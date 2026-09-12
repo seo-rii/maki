@@ -19,6 +19,9 @@ use crate::state::BoundDeviceRecord;
 
 const MAX_DEVICES: usize = 64;
 const MAX_REPORT: usize = 64 * 1024;
+const INTERNAL_MAPPING_UUID_SUFFIXES: &[&str] = &[
+    "-real", "-tpool", "-tdata", "-tmeta", "-cdata", "-cmeta", "-cvol", "-pool",
+];
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -684,13 +687,13 @@ fn verify_recovery_devices(
     Ok(())
 }
 
-pub(super) fn verify_recovery_mapping(
+pub(super) fn verify_recovery_rollback_mapping(
     record: &BoundDeviceRecord,
     verified: &VerifiedLvm,
     sysfs: &Path,
 ) -> io::Result<()> {
     verify_recovery_devices(record, verified, sysfs)?;
-    verify_mappings(record, verified, sysfs, true)
+    verify_mappings(record, verified, sysfs, false)
 }
 
 pub(super) fn verify_recovery_device_identity(
@@ -732,16 +735,26 @@ fn verify_mappings(
         }
         let actual_uuid = std::fs::read_to_string(path.join("dm/uuid"))?;
         let actual_uuid = actual_uuid.trim();
-        let owned = verified.lvs.values().any(|id| {
+        let owned = verified.lvs.iter().any(|(lv_name, id)| {
             let base = format!(
                 "LVM-{}{}",
                 verified.vg_uuid.replace('-', ""),
                 id.replace('-', "")
             );
-            actual_uuid == base
+            let uuid_matches = actual_uuid == base
                 || actual_uuid
                     .strip_prefix(&base)
-                    .is_some_and(|suffix| suffix.starts_with('-'))
+                    .is_some_and(|suffix| INTERNAL_MAPPING_UUID_SUFFIXES.contains(&suffix));
+            let lv_name = lv_name
+                .strip_prefix('[')
+                .and_then(|name| name.strip_suffix(']'))
+                .unwrap_or(lv_name);
+            let mapping_name = format!(
+                "{}-{}",
+                record.attachment.vg_name.replace('-', "--"),
+                lv_name.replace('-', "--")
+            );
+            uuid_matches && name.trim() == mapping_name
         });
         if !owned {
             return Err(invalid("activated VG contains an unverified LV UUID"));
@@ -799,7 +812,7 @@ pub(super) fn deactivate_recovery(
     record: &BoundDeviceRecord,
     verified: &VerifiedLvm,
 ) -> Result<(), ExecError> {
-    verify_recovery_mapping(record, verified, Path::new("/sys/class/block"))?;
+    verify_recovery_rollback_mapping(record, verified, Path::new("/sys/class/block"))?;
     for device in &verified.devices {
         if number(Path::new(&device.path))? != device.number {
             return Err(identity_error(

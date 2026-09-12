@@ -218,7 +218,7 @@ pub(super) fn observe(
             }
             lvm_preflight::verify_recovery_device_identity(record, intent.verified(), sysfs)?;
             if observed.vg_active {
-                lvm_preflight::verify_recovery_mapping(record, intent.verified(), sysfs)?;
+                lvm_preflight::verify_recovery_rollback_mapping(record, intent.verified(), sysfs)?;
             } else if observed.nbd_in_use {
                 return Err(invalid(
                     "pre-activation recovery identity has an unexpected holder",

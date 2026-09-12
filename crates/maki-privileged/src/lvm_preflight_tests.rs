@@ -434,6 +434,19 @@ fn known_internal_lvm_layers_are_owned_and_partial_activation_can_be_rolled_back
 }
 
 #[test]
+fn unknown_internal_mapping_uuid_suffix_is_not_owned() {
+    let tree = Tree::new();
+    let verified = check(&fixture()).unwrap();
+    let internal = "111111aaaabbbbccccddddeeeeffffff";
+    tree.mapping(
+        "dm-0",
+        "vg_maki_pg-pool_tdata",
+        &format!("LVM-{}{internal}-foreign", VG.replace('-', "")),
+    );
+    assert!(verify_rollback_mapping(&record(), &verified, &tree.0).is_err());
+}
+
+#[test]
 fn layout_changes_participate_in_fresh_metadata_equality_and_separator_is_fixed() {
     let first = check(&fixture()).unwrap();
     let mut changed = fixture();
