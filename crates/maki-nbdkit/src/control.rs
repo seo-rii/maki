@@ -18,6 +18,7 @@ use maki_crypto::scheduler::SchedulerStats;
 
 pub struct EngineControlBackend {
     engine: Engine,
+    admission: Arc<crate::drain::DrainGate>,
     volume_name: String,
     crypto_stats: Option<Arc<SchedulerStats>>,
     endpoints: Option<Arc<EndpointSet>>,
@@ -27,10 +28,16 @@ impl EngineControlBackend {
     pub fn new(engine: Engine, volume_name: impl Into<String>) -> Self {
         Self {
             engine,
+            admission: Arc::default(),
             volume_name: volume_name.into(),
             crypto_stats: None,
             endpoints: None,
         }
+    }
+
+    pub(crate) fn with_admission(mut self, admission: Arc<crate::drain::DrainGate>) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Attach the batch scheduler's counters (remote providers).
@@ -124,8 +131,11 @@ impl ControlBackend for EngineControlBackend {
     async fn status(&self) -> Value {
         let stats = self.engine.stats().await;
         let (label, _, reason) = state_label(&stats.state);
+        let (io_state, drain_error) = self.admission.status();
         json!({
             "state": label,
+            "io_state": io_state,
+            "drain_error": drain_error,
             "degraded_reason": reason,
             "volume": self.volume_name,
             "size": self.engine.size(),
@@ -227,10 +237,16 @@ impl ControlBackend for EngineControlBackend {
     }
 
     async fn checkpoint(&self) -> Result<u64, String> {
+        let _callback = self.admission.enter().map_err(str::to_owned)?;
         self.engine.checkpoint().await.map_err(|e| e.to_string())
     }
 
+    async fn drain(&self) -> Result<u64, String> {
+        self.admission.drain(&self.engine).await
+    }
+
     async fn reload(&self, section: &str, payload: &Value) -> Result<(), String> {
+        let _callback = self.admission.enter().map_err(str::to_owned)?;
         match section {
             // Hot-reloadable and actually applied (SPEC §20).
             "cache" => {

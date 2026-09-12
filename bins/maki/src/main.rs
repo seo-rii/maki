@@ -1,7 +1,7 @@
 //! `maki` — administrative CLI (SPEC §7).
 //!
 //! Volume lifecycle (`volume create/inspect`, `check`) works everywhere;
-//! runtime commands (`status`, `metrics`, `checkpoint`, `reload`) talk to
+//! runtime commands (`status`, `metrics`, `checkpoint`, `drain`, `reload`) talk to
 //! the daemon control socket (Unix). `attach`/`detach`/`grow` delegate to
 //! the privileged helper.
 
@@ -17,6 +17,7 @@ fn usage() -> ExitCode {
   maki status <config.toml>            daemon status (control socket)
   maki metrics <config.toml>           metrics snapshot (control socket)
   maki checkpoint <config.toml>        graceful checkpoint (control socket)
+  maki drain <config.toml>             close I/O admission, flush and checkpoint
   maki reload <config.toml> <section>  hot config reload (control socket)
   maki attach|detach|grow ...          delegated to maki-attach (privileged)"
     );
@@ -126,6 +127,13 @@ fn main() -> ExitCode {
         ["checkpoint", config] => control(
             config,
             "checkpoint",
+            None,
+            serde_json::Value::Null,
+            timeout.unwrap_or(CHECKPOINT_TIMEOUT),
+        ),
+        ["drain", config] => control(
+            config,
+            "drain",
             None,
             serde_json::Value::Null,
             timeout.unwrap_or(CHECKPOINT_TIMEOUT),

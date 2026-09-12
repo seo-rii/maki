@@ -107,8 +107,17 @@ nbdkit --foreground \
   config=/etc/maki/volumes/example.toml
 ```
 
-The plugin creates its Tokio runtime after nbdkit forks. Clean shutdown flushes
-the engine, checkpoints durable state, and releases the volume lock.
+The plugin creates its Tokio runtime after nbdkit forks. Run it in the foreground,
+including under systemd, and retain stderr in the service journal: attach and
+unload failures are reported there. Background daemonization is not a qualified
+logging mode. Clean shutdown closes I/O admission, waits for admitted callbacks,
+flushes the engine, checkpoints durable state, and releases the volume lock.
+
+After stopping workloads and unmounting their filesystems, use `maki drain` to
+obtain an explicit durability acknowledgement before stopping nbdkit. The
+plugin's unload callback cannot return an error to nbdkit; a zero process exit
+status alone does not acknowledge a successful drain. The packaged service's
+stop path is not a substitute for this administrative check.
 
 ## Rootless userspace smoke test
 
@@ -160,8 +169,25 @@ line limit. The `maki` CLI exposes the supported operations:
 maki status /etc/maki/volumes/example.toml
 maki metrics /etc/maki/volumes/example.toml
 maki checkpoint /etc/maki/volumes/example.toml
+maki drain /etc/maki/volumes/example.toml
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 ```
+
+`drain` permanently closes admission to reads, writes, flushes, checkpoints,
+and reloads for that attachment. It waits for already admitted callbacks,
+including writes still waiting for encryption, then flushes and checkpoints.
+Success returns `checkpoint_sequence`; repeated drains return the same
+acknowledgement. `status` and `metrics` remain available, and the daemon retains
+the volume lock until shutdown. Reattach to resume I/O.
+
+`status` includes `io_state` (`running`, `draining`, `failed`, or `drained`) and
+`drain_error`. A failed drain returns an error to the CLI, preserves the engine
+and volume lock, and keeps admission closed. Correct the storage failure and
+retry `maki drain` while the process is still alive. A timeout is not an
+acknowledgement: inspect status and retry. If the process exits after a failed
+drain, its unload error is logged; the next attach performs recovery. Do not
+treat process cleanup or socket removal as proof that the failed barrier
+succeeded.
 
 `reload cache` needs the new size; it is refused (not silently accepted) on a
 daemon running with `cache.mode = "off"`.
@@ -359,8 +385,8 @@ high-cardinality values as metric labels.
   larger request outright, so the value bounds the memory one request pins.
 - The control socket serves at most 64 sessions at once (further clients wait
   in the listen backlog), closes a session idle for 60 s or a client that does
-  not drain a response within 10 s, and runs one `checkpoint` or `reload` at a
-  time: a concurrent one is answered `busy` and must be retried.
+  not drain a response within 10 s, and runs one `checkpoint`, `reload`, or
+  `drain` at a time: a concurrent one is answered `busy` and must be retried.
 - `maki-attach detach` compares the request with the trusted attach record
   under the attach lock and refuses one the record does not back (a different
   device, mountpoint, VG or LV, a re-attached volume, a live backend with

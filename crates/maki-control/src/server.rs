@@ -3,7 +3,7 @@
 //! Sessions are bounded (third review, F10): a fixed number are served at
 //! once (the rest wait in the listen backlog), an idle session is closed
 //! after a timeout, a client that does not drain its response is
-//! disconnected, and mutating verbs (`checkpoint`, `reload`) run one at a
+//! disconnected, and mutating verbs (`checkpoint`, `reload`, `drain`) run one at a
 //! time — a second one is refused as busy instead of queueing behind the
 //! first, so `status` and `metrics` are never buried under a pile of
 //! administrative requests.
@@ -58,7 +58,7 @@ impl SerializedBackend {
     }
 
     fn busy() -> String {
-        "busy: another checkpoint or reload is in progress; retry later".to_string()
+        "busy: another administrative mutation is in progress; retry later".to_string()
     }
 }
 
@@ -77,6 +77,11 @@ impl ControlBackend for SerializedBackend {
         self.inner.checkpoint().await
     }
 
+    async fn drain(&self) -> Result<u64, String> {
+        let _slot = self.gate.try_acquire().map_err(|_| Self::busy())?;
+        self.inner.drain().await
+    }
+
     async fn reload(&self, section: &str, payload: &Value) -> Result<(), String> {
         let _slot = self.gate.try_acquire().map_err(|_| Self::busy())?;
         self.inner.reload(section, payload).await
@@ -89,6 +94,11 @@ pub trait ControlBackend: Send + Sync + 'static {
     async fn status(&self) -> Value;
     async fn metrics(&self) -> Value;
     async fn checkpoint(&self) -> Result<u64, String>;
+    /// Close I/O admission, wait for callbacks, flush and checkpoint. A
+    /// successful sequence acknowledges drain; the control socket stays live.
+    async fn drain(&self) -> Result<u64, String> {
+        Err("drain is unsupported by this backend".to_owned())
+    }
     /// Hot reload of a reloadable section (SPEC §20): endpoints,
     /// credentials, timeouts, retry, circuit-breaker, semaphores, batch,
     /// cache.
@@ -112,6 +122,10 @@ async fn handle(backend: &Arc<dyn ControlBackend>, request: Request) -> Value {
         "status" => json!({"ok": true, "data": backend.status().await}),
         "metrics" => json!({"ok": true, "data": backend.metrics().await}),
         "checkpoint" => match backend.checkpoint().await {
+            Ok(seq) => json!({"ok": true, "data": {"checkpoint_sequence": seq}}),
+            Err(e) => json!({"ok": false, "error": e}),
+        },
+        "drain" => match backend.drain().await {
             Ok(seq) => json!({"ok": true, "data": {"checkpoint_sequence": seq}}),
             Err(e) => json!({"ok": false, "error": e}),
         },
