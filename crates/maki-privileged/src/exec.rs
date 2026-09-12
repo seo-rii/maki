@@ -380,6 +380,14 @@ pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> MountObservation {
     observe(mountpoint, nbd_device, true)
 }
 
+/// The upstream netlink API names a target as `nbdN`; `/dev/nbdN` is used by
+/// block-device tools but is rejected by nbd-client's netlink parser.
+fn nbd_client_target(device: &str) -> Result<String, ExecError> {
+    nbd_index(device)
+        .map(|index| format!("nbd{index}"))
+        .ok_or_else(|| identity_error("invalid NBD device for nbd-client"))
+}
+
 fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecError> {
     match step {
         PlannedStep::ModprobeNbd => run(step, "modprobe", &["nbd"]),
@@ -389,6 +397,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             block_size,
         } => {
             let bs = block_size.to_string();
+            let target = nbd_client_target(device)?;
             let identifier =
                 connection_id.ok_or_else(|| identity_error("missing connect identifier"))?;
             run(
@@ -397,7 +406,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
                 &[
                     "-unix",
                     socket,
-                    device,
+                    &target,
                     "-b",
                     &bs,
                     "-identifier",
@@ -467,7 +476,10 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             Ok(())
         }
         PlannedStep::Umount { mountpoint } => run(step, "umount", &[mountpoint.as_str()]),
-        PlannedStep::NbdDisconnect { device } => run(step, "nbd-client", &["-d", device]),
+        PlannedStep::NbdDisconnect { device } => {
+            let target = nbd_client_target(device)?;
+            run(step, "nbd-client", &["-d", &target])
+        }
         PlannedStep::LvExtend {
             vg_name,
             lv_name,

@@ -20,7 +20,7 @@ fn attach_plan_prints_ordered_steps_without_executing() {
     assert!(text.contains("# attach volume v1"), "{text}");
     assert!(text.contains("modprobe nbd"), "{text}");
     assert!(
-        text.contains("nbd-client -unix /run/maki/v1/nbd.sock /dev/nbd<auto>"),
+        text.contains("nbd-client -unix /run/maki/v1/nbd.sock nbd<auto>"),
         "{text}"
     );
     assert!(text.contains("/srv/v1"), "{text}");

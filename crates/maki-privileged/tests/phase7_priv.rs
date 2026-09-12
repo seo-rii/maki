@@ -102,6 +102,9 @@ fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
         "control_runtime_dir_candidate=\"/run/maki-control/$volume_name\"",
         "control_socket_path=\"$control_runtime_dir/control.sock\"",
         "rmdir \"$control_runtime_dir\"",
+        "nbd_target=\"$(basename \"$device\")\"",
+        "nbd-client -unix \"$socket_path\" \"$nbd_target\"",
+        "nbd-client -d \"$nbd_target\"",
     ] {
         assert!(
             runner.contains(required),

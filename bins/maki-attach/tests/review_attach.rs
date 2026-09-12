@@ -81,7 +81,7 @@ fn attach_config_drives_the_plan() {
     assert!(out.status.success(), "{}", text(&out));
     let plan = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        plan.contains("nbd-client -unix /run/maki/v/nbd.sock /dev/nbd5 -b 512"),
+        plan.contains("nbd-client -unix /run/maki/v/nbd.sock nbd5 -b 512"),
         "{plan}"
     );
     assert!(plan.contains("/mnt/v"), "{plan}");

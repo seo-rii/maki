@@ -114,6 +114,8 @@ done
 [[ "$device" =~ ^/dev/nbd([0-9]+)$ ]] ||
     die "--device must be an explicit /dev/nbdN path"
 readonly nbd_index=$((10#${BASH_REMATCH[1]}))
+nbd_target="$(basename "$device")"
+readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
 required_commands=(
@@ -273,7 +275,7 @@ disconnect_test_nbd() {
     if [[ "$nbd_connected" == true ]] ||
         { [[ "$nbd_connection_attempted" == true ]] && nbd_has_pid; }; then
         log "cleanup: disconnecting $device"
-        if sudo -n nbd-client -d "$device"; then
+        if sudo -n nbd-client -d "$nbd_target"; then
             nbd_connected=false
             return 0
         fi
@@ -310,7 +312,7 @@ cleanup() {
     if [[ "$vg_created" == true || "$pv_created" == true ]]; then
         if ! nbd_has_pid && [[ -n "$nbdkit_pid" ]] && kill -0 "$nbdkit_pid" 2>/dev/null; then
             log "cleanup: reconnecting $device to remove disposable LVM metadata"
-            if sudo -n nbd-client -unix "$socket_path" "$device" -b 4096; then
+            if sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096; then
                 nbd_connected=true
             else
                 log "cleanup warning: could not reconnect $device for LVM cleanup"
@@ -709,7 +711,7 @@ pass "$device exists and is unused"
 
 log "attaching the disposable export to $device"
 nbd_connection_attempted=true
-sudo -n nbd-client -unix "$socket_path" "$device" -b 4096
+sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096
 nbd_connected=true
 for _ in $(seq 1 100); do
     attached_size="$(sudo -n blockdev --getsize64 "$device" 2>/dev/null || printf '0')"
@@ -720,7 +722,7 @@ done
     die "$device size is ${attached_size:-unknown}, expected $VIRTUAL_SIZE_BYTES"
 pass "kernel NBD attach and 512 MiB geometry"
 
-if nbd-client -d "$device" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
+if nbd-client -d "$nbd_target" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
     nbd_connected=false
     die "the unprivileged invoking user unexpectedly disconnected $device"
 fi
@@ -756,7 +758,7 @@ done
 [[ "$fs_uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
     die "filesystem inventory returned an invalid UUID"
 sudo -n vgchange -an "$vg_name"
-sudo -n nbd-client -d "$device"
+sudo -n nbd-client -d "$nbd_target"
 nbd_connected=false
 pass "LVM physical/volume/logical volume and XFS creation"
 
@@ -857,7 +859,7 @@ sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
 pass "repeated maki-attach cleanup is idempotent"
 
 log "removing the disposable LVM metadata"
-sudo -n nbd-client -unix "$socket_path" "$device" -b 4096
+sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096
 nbd_connected=true
 sudo -n vgchange -ay "$vg_name"
 sudo -n lvremove --yes --force "/dev/$vg_name/$lv_name"
@@ -865,7 +867,7 @@ sudo -n vgremove --yes --force "$vg_name"
 sudo -n pvremove --yes --force "$device"
 vg_created=false
 pv_created=false
-sudo -n nbd-client -d "$device"
+sudo -n nbd-client -d "$nbd_target"
 nbd_connected=false
 pass "disposable LVM state removed"
 

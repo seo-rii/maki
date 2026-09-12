@@ -172,7 +172,11 @@ impl fmt::Display for PlannedStep {
                 socket,
                 device,
                 block_size,
-            } => write!(f, "nbd-client -unix {socket} {device} -b {block_size}"),
+            } => write!(
+                f,
+                "nbd-client -unix {socket} {} -b {block_size}",
+                device.strip_prefix("/dev/").unwrap_or(device)
+            ),
             PlannedStep::SetBlockSize { device, block_size } => {
                 write!(f, "blockdev --setbsz {block_size} {device}")
             }
@@ -212,7 +216,11 @@ impl fmt::Display for PlannedStep {
                 fs_uuid.as_deref().unwrap_or("unpinned")
             ),
             PlannedStep::Umount { mountpoint } => write!(f, "umount {mountpoint}"),
-            PlannedStep::NbdDisconnect { device } => write!(f, "nbd-client -d {device}"),
+            PlannedStep::NbdDisconnect { device } => write!(
+                f,
+                "nbd-client -d {}",
+                device.strip_prefix("/dev/").unwrap_or(device)
+            ),
             PlannedStep::LvExtend {
                 vg_name,
                 lv_name,

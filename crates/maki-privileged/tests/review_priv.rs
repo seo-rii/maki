@@ -226,12 +226,12 @@ fn attach_plan_binds_the_allocated_device_everywhere() {
     assert!(!plan.needs_device_allocation());
     let rendered = plan.to_string();
     assert!(!rendered.contains("<auto>"), "{rendered}");
-    assert!(rendered.contains("nbd-client -unix /run/maki/pg/nbd.sock /dev/nbd3 -b 4096"));
+    assert!(rendered.contains("nbd-client -unix /run/maki/pg/nbd.sock nbd3 -b 4096"));
     assert!(rendered.contains("blockdev --setbsz 4096 /dev/nbd3"));
     assert!(rendered.contains("nbd /dev/nbd3)"), "{rendered}");
     let mut detach = plan_detach(&request());
     detach.bind_device("/dev/nbd3");
-    assert!(detach.to_string().contains("nbd-client -d /dev/nbd3"));
+    assert!(detach.to_string().contains("nbd-client -d nbd3"));
 }
 
 #[test]

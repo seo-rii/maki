@@ -69,6 +69,13 @@ lv_uuid = 'hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn'
     .unwrap()
 }
 
+#[test]
+fn nbd_client_netlink_target_is_the_validated_kernel_name() {
+    assert_eq!(nbd_client_target("/dev/nbd15").unwrap(), "nbd15");
+    assert!(nbd_client_target("nbd15").is_err());
+    assert!(nbd_client_target("/dev/sda").is_err());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BackendFault {
     Foreign,
