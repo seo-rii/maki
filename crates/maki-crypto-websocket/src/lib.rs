@@ -26,9 +26,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use response::Value;
 #[cfg(test)]
 use serde_json::json;
-use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -40,6 +40,7 @@ use maki_crypto::{
 };
 
 mod request;
+mod response;
 
 #[derive(Clone)]
 pub struct WsProviderSpec {
@@ -161,26 +162,6 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
     CryptoError::Retryable(msg.to_string())
 }
 
-// Value silently overwrites duplicate object keys. Before an error
-// frame can prove a negative self-test, deserialize its security-relevant
-// fields as structs, whose derived visitors reject duplicate fields. The
-// success path keeps its existing configurable payload parsing.
-#[derive(serde::Deserialize)]
-struct ProbeErrorEnvelope {
-    #[serde(rename = "id")]
-    _id: u64,
-    #[serde(rename = "error")]
-    _error: ProbeErrorFields,
-}
-
-#[derive(serde::Deserialize)]
-struct ProbeErrorFields {
-    #[serde(rename = "class")]
-    _class: String,
-    #[serde(rename = "reason")]
-    _reason: String,
-}
-
 impl WsCryptoProvider {
     pub fn new(spec: WsProviderSpec) -> Self {
         Self {
@@ -245,8 +226,12 @@ impl WsCryptoProvider {
             loop {
                 match source.next().await {
                     Some(Ok(msg)) => {
-                        let Ok(text) = msg.into_text() else { continue };
-                        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        let Some(frame) = response::own_message(msg) else {
+                            continue;
+                        };
+                        let text =
+                            std::str::from_utf8(frame.expose()).expect("WebSocket text is UTF-8");
+                        let Ok(value) = response::parse(text) else {
                             tracing::warn!("websocket: unparseable frame dropped");
                             continue;
                         };
@@ -254,10 +239,12 @@ impl WsCryptoProvider {
                             continue;
                         };
                         let frame = if matches!(
-                            value.pointer("/error/class").and_then(Value::as_str),
+                            value
+                                .get("error")
+                                .and_then(|error| error.get("class"))
+                                .and_then(Value::as_str),
                             Some("integrity" | "unsupported-context")
-                        ) && serde_json::from_str::<ProbeErrorEnvelope>(&text)
-                            .is_err()
+                        ) && !value.valid_probe_envelope()
                         {
                             Err(CryptoError::Contract(
                                 "remote crypto provider returned an invalid probe error envelope"
@@ -570,3 +557,7 @@ mod decoded_response_tests;
 #[cfg(test)]
 #[path = "request_secret_tests.rs"]
 mod request_secret_tests;
+
+#[cfg(test)]
+#[path = "response_secret_tests.rs"]
+mod response_secret_tests;

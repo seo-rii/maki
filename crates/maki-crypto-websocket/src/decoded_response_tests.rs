@@ -15,6 +15,8 @@ const FILL: u8 = 0xA5;
 pub(super) struct Inspection {
     address: usize,
     sizes: [usize; 2],
+    plain_allocations: bool,
+    initialized_len: Option<usize>,
     pub(super) allocated: usize,
     pub(super) freed: usize,
     pub(super) all_zero: bool,
@@ -27,13 +29,26 @@ thread_local! {
 
 struct InspectDecodedAllocation;
 
-// SAFETY: all operations delegate to System. Only alloc_zeroed allocations of
-// the selected secret-buffer sizes are registered, so every inspected byte was
-// initialized. Inspection occurs before System.dealloc, never after freeing.
+// SAFETY: all operations delegate to System. Observed allocations are either
+// initialized in alloc_zeroed or explicitly registered with a live byte slice.
+// Only that initialized range is read before System.dealloc, never after freeing.
 // The observer is thread-local and performs no allocation itself.
 unsafe impl GlobalAlloc for InspectDecodedAllocation {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
+        let selected = INSPECTION
+            .try_with(|cell| {
+                cell.get().is_some_and(|inspection| {
+                    inspection.plain_allocations && inspection.sizes.contains(&layout.size())
+                })
+            })
+            .unwrap_or(false);
+        if selected {
+            // Initialize the complete new allocation before Rust constructs
+            // its String, permitting a defined pre-deallocation observation.
+            unsafe { self.alloc_zeroed(layout) }
+        } else {
+            unsafe { System.alloc(layout) }
+        }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -56,9 +71,10 @@ unsafe impl GlobalAlloc for InspectDecodedAllocation {
         let _ = INSPECTION.try_with(|cell| {
             if let Some(mut inspection) = cell.get() {
                 if inspection.address == pointer as usize {
-                    // SAFETY: this exact allocation came from alloc_zeroed,
-                    // remains live, and layout describes its entire capacity.
-                    let bytes = unsafe { std::slice::from_raw_parts(pointer, layout.size()) };
+                    // SAFETY: this allocation remains live. Its registered byte
+                    // slice, or its full zero-initialized capacity, is readable.
+                    let initialized = inspection.initialized_len.unwrap_or(layout.size());
+                    let bytes = unsafe { std::slice::from_raw_parts(pointer, initialized) };
                     inspection.all_zero &= bytes.iter().all(|byte| *byte == 0);
                     inspection.plaintext_prefix |= bytes.iter().take(64).all(|byte| *byte == FILL);
                     inspection.freed += 1;
@@ -96,6 +112,28 @@ impl Watch {
 
     pub(super) fn finish(self) -> Inspection {
         INSPECTION.with(|cell| cell.replace(None).unwrap())
+    }
+
+    pub(super) fn plain_sizes(sizes: [usize; 2]) -> Self {
+        let watch = Self::sizes(sizes);
+        INSPECTION.with(|cell| {
+            let mut inspection = cell.get().unwrap();
+            inspection.plain_allocations = true;
+            cell.set(Some(inspection));
+        });
+        watch
+    }
+
+    pub(super) fn initialized(bytes: &[u8]) -> Self {
+        let watch = Self::sizes([0, 0]);
+        INSPECTION.with(|cell| {
+            let mut inspection = cell.get().unwrap();
+            inspection.address = bytes.as_ptr() as usize;
+            inspection.initialized_len = Some(bytes.len());
+            inspection.allocated = 1;
+            cell.set(Some(inspection));
+        });
+        watch
     }
 }
 
@@ -155,6 +193,7 @@ fn later_item_failure_wipes_previously_decoded_plaintext() {
             {"unit": 1, "data": first},
             later,
         ]});
+        let response = response::parse(&response.to_string()).unwrap();
         let watch = Watch::start();
         let result = provider.parse_response(&response, &[(1, &[]), (2, &[])]);
         let inspection = watch.finish();
@@ -178,6 +217,7 @@ fn invalid_base64_wipes_bytes_decoded_before_the_error() {
         .is_err());
     assert_eq!(&partial[..64], &[FILL; 64]);
     let response = json!({"items": [{"unit": 1, "data": encoded}]});
+    let response = response::parse(&response.to_string()).unwrap();
     let watch = Watch::start();
     let result = provider.parse_response(&response, &[(1, &[])]);
     let inspection = watch.finish();
@@ -209,6 +249,7 @@ fn valid_standard_padding_preserves_exact_payload_bytes_and_lengths() {
     for len in [0, 1, 2, 3, 4, 63, 64, 255, 256, 257, 258] {
         let expected: Vec<u8> = (0..len).map(|index| index as u8).collect();
         let response = json!({"items": [{"unit": 1, "data": b64(&expected)}]});
+        let response = response::parse(&response.to_string()).unwrap();
         let result = provider.parse_response(&response, &[(1, &[])]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].bytes(), expected, "decoded length {len}");
@@ -226,6 +267,7 @@ fn invalid_standard_alphabet_padding_and_trailing_bits_still_fail() {
             .decode(encoded)
             .is_err());
         let response = json!({"items": [{"unit": 1, "data": encoded}]});
+        let response = response::parse(&response.to_string()).unwrap();
         assert!(
             matches!(
                 provider.parse_response(&response, &[(1, &[])]),
