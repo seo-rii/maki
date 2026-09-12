@@ -19,8 +19,8 @@ Related: [qualification tiers](testing.md),
 - Product source: `e894ae57fea294966bcb7ec84593732c55cbc220` (latest product
   change `2a3f023`). Normal release binaries were built without fake-provider;
   `CARGO_PROFILE_RELEASE_DEBUG=0` disabled symbols, not optimization or runtime checks.
-- The Docker image contains the native nbdkit plugin and CLI, with a real local
-  AES-GCM-SIV provider and a disposable key. Image ID:
+- The Docker image contains Debian's nbdkit `1.42.3-1`, the native plugin and
+  CLI, with a real local AES-GCM-SIV provider and a disposable key. Image ID:
   `sha256:3e7783ad7858b6b9b80c61203d7f1b4a5b2786174af9a8f0d61fcf0080474e85`.
 - Each case creates a private 128 MiB logical volume. Containers run as the
   invoking UID with no network, no capabilities, no new privileges, a read-only
@@ -81,6 +81,12 @@ pressure progress, immutable image selection, timeout cleanup and startup
 metrics. Linux CI runs these oracle tests and the native regression. The Docker
 campaign remains opt-in and is not silently treated as a CI pass.
 
+The complete harness commit `8123f9d` passed
+[Linux and Windows CI](https://github.com/seo-rii/maki/actions/runs/34694557732):
+formatting, strict Clippy and workspace tests, plus the 13 fault-oracle tests
+on Linux. The expensive scheduled release gates were not rerun for these test
+and documentation changes.
+
 ## Evidence
 
 All long-running commands used private background logs; their final exit status
@@ -109,7 +115,8 @@ subsequent 192 MiB recovery passed (launcher PID 1091005, exit 0, 41.74 s,
 `/home/seorii/logs/maki-r3-cgroup-native-campaign-verified-20260912T123607.929264Z.log`).
 That earlier runner had not yet collected the current cgroup before READY, so
 its startup-memory samples are explicitly unavailable; they must not be used
-as memory measurements. The first timeout trial ended with campaign exit 1
+as memory measurements. The first timeout trial's pressure count is in
+`/home/seorii/logs/maki-cgroup-native-20260912-final/results.json`; it ended with campaign exit 1
 (PID 1070487,
 `/home/seorii/logs/maki-r3-cgroup-native-campaign-final-20260912T123339.152084Z.log`).
 
