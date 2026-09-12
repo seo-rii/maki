@@ -7,6 +7,11 @@ scenario only; it does not certify production operation or physical power-loss
 durability.** The L1 Linux host, its page cache and Google Cloud storage remained
 running throughout.
 
+The later [whole GCE instance reset campaign](gce-reset-validation-2026-09-13.md)
+removed the workload VM's RAM, kernel, and page cache and is the stronger
+cloud-reset result. This report remains useful evidence for the independently
+reproducible Firecracker guest boundary and retains its original limits.
+
 Related: [qualification tiers](testing.md),
 [native process and cgroup evidence](cgroup-fault-validation-2026-09-12.md),
 [durable recovery contract](durable-recovery.md),

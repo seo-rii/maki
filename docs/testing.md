@@ -47,9 +47,9 @@ tool availability. Native startup uses disposable files and Unix sockets; it
 does not attach a kernel NBD device or mount a filesystem. On developer hosts
 without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
-The Linux baseline also runs the Python cgroup and Firecracker fault-oracle
-regressions. Actual Docker cgroup and KVM/Firecracker campaigns remain opt-in
-host qualification steps.
+The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
+fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
+campaigns remain opt-in host qualification steps.
 
 The scheduled job runs:
 
@@ -161,6 +161,7 @@ systemd workloads or attach real devices; follow the
 | Real databases | Required | Partial | SQLite WAL smoke passed; crash campaigns and other engines remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
+| GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
 | QEMU hard power loss | 300+ cuts | Open | Simulation is not hardware evidence |
 | Mixed workload | 72 hours | Open | Dedicated hardware run not recorded |
 
@@ -176,6 +177,9 @@ shutdown was executed.
 The [Firecracker report](firecracker-validation-2026-09-12.md) records the
 separate guest-kernel/page-cache loss campaign, its host-fsynced ACK ledger,
 image hashes, cold-boot readbacks, and the boundary at the surviving L1 host.
+The [GCE reset report](gce-reset-validation-2026-09-13.md) records the later
+whole-workload-VM hard reset campaign, stable resource identities, shutdown
+witness, Cloud Audit Log entries, authenticated readbacks, and cloud cleanup.
 
 ## Database qualification
 
@@ -226,6 +230,15 @@ expected hashes. This removes the guest kernel and guest page cache from the
 next recovery attempt. It does not cut power to the L1 kernel or persistent
 disk and therefore is not physical power-loss evidence.
 
+The opt-in GCE reset controller runs outside the disposable workload VM. It
+fsyncs each validated ACK to its own ledger, then invokes only
+`gcloud compute instances reset`. It requires the old SSH session to die and a
+globally new boot ID to appear. The guest systemd `ExecStop` witness must
+remain absent.
+This removes the workload VM's RAM, kernel, and page cache, while the Persistent
+Disk service and physical storage path stay operational. It is whole-VM reset
+evidence rather than physical power-loss evidence.
+
 QEMU qualification uses a guest on a dedicated virtual disk, an external
 host-side acknowledgement ledger, randomized `virsh destroy` cuts, offline
 checking after reboot, and at least 300 successful recovery cycles. Bare-metal
@@ -243,7 +256,9 @@ WSL is suitable for Linux syscall integration but not for power-loss claims.
 - Vendor endpoint conformance with production mapping and credentials.
 - Credential rotation and TLS certificate rotation.
 - Real SQLite and PostgreSQL workloads before broader database qualification.
-- QEMU and bare-metal power cuts with an independent acknowledgement ledger.
+- Repeat GCE reset qualification on the selected deployment image and storage
+  class; run QEMU and bare-metal power cuts with an independent acknowledgement
+  ledger for the stronger storage-failure tiers.
 - Long-duration (24 CPU-hour-per-target) `cargo-fuzz` corpus runs (the
   targets exist in `fuzz/`; only short smoke runs have been done) and
   long-duration provider and mixed-I/O soaks.
