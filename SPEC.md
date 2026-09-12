@@ -1155,8 +1155,10 @@ write would exceed journal_max_bytes                 (inline, before the append)
 
 A write that would exceed `journal_max_bytes` after an inline checkpoint, or
 whose fresh backing-space observation does not cover
-`journal_emergency_reserve_bytes` plus the exact projected journal footprint of
-that write, MUST fail with ENOSPC; reads continue. An unavailable or failed
+`journal_emergency_reserve_bytes` plus `checkpoint_reserve_bytes` and the exact
+projected journal footprint of that write, MUST fail with ENOSPC; reads
+continue. This admission check is enabled when
+`journal_emergency_reserve_bytes` is nonzero. An unavailable or failed
 free-space query
 MUST fail write admission while that reserve is enabled. A failed checkpoint
 MUST be visible as a degraded volume state until a later checkpoint succeeds.

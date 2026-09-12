@@ -18,8 +18,8 @@
 //!   low backing free space, and on a time interval; the write path forces a
 //!   journal sync when unsynced bytes exceed their limit, checkpoints inline
 //!   at the hard journal limit, and refuses writes (ENOSPC) when the backing
-//!   cannot preserve its emergency reserve after the exact next append or
-//!   the journal cannot be reclaimed. A
+//!   cannot preserve its emergency reserve and configured checkpoint headroom
+//!   after the exact next append or the journal cannot be reclaimed. A
 //!   failed reclaim puts the engine in a `Degraded` state that the next
 //!   successful checkpoint clears.
 

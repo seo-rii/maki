@@ -191,8 +191,9 @@ the journal crosses a size watermark, when backing free space drops below the
 checkpoint reserve, and on a time interval (syncing unsynced records first). The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims
 inline at the hard journal limit, and refuses writes with ENOSPC unless fresh
-backing space covers the emergency reserve plus the projected record bytes and
-all segment headers created by that write, or when the journal cannot be
+backing space covers the emergency reserve, configured checkpoint headroom,
+projected record bytes, and all segment headers created by that write, or when
+the journal cannot be
 reclaimed. A
 failed reclaim marks the engine degraded until a later checkpoint succeeds; the
 [remediation log](review-remediation.md#bounded-journal) lists the exact rules.

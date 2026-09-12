@@ -579,11 +579,13 @@ high-cardinality values as metric labels.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.
 - Writes fail with ENOSPC unless fresh backing free space covers
-  `backing.journal_emergency_reserve_bytes` plus the projected record and
+  `backing.journal_emergency_reserve_bytes`,
+  `backing.checkpoint_reserve_bytes`, and the projected record and
   segment-header footprint of the write, or when that write would exceed
   `backing.journal_max_bytes` even after an inline checkpoint. An unavailable
   or failed free-space query also fails closed while the emergency reserve is
-  enabled. Admission
+  enabled. A zero emergency reserve disables this admission check while the
+  checkpoint reserve still controls the worker. Admission
   refreshes the observation; it does not reserve physical storage. A reserve-only
   refusal leaves existing data readable and does not
   by itself set a checkpoint error or change the engine state. A failed

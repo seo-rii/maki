@@ -1,4 +1,5 @@
-//! MAKI-021: a prior free-space sample cannot authorize a later write.
+//! MAKI-021: a prior free-space sample cannot authorize a later write, and an
+//! admitted append preserves configured emergency and checkpoint headroom.
 //! This is threshold enforcement, not physical allocation reservation.
 
 use std::io;

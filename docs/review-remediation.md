@@ -774,8 +774,8 @@ daemon derives from configuration:
 | `journal_high_watermark_bytes` | `backing.journal_max_bytes / 2` | Write path wakes the worker once journal bytes on disk reach it; the worker checkpoints. |
 | `journal_max_bytes` | `backing.journal_max_bytes` | Hard limit. A write that would cross it first syncs the journal and checkpoints inline (under the volume lock); if the journal still cannot fit the write, it fails with ENOSPC. |
 | `max_pending_bytes` | `limits.max_journal_pending_bytes` | Appended-but-unsynced bytes; the write path forces a journal sync before exceeding it. |
-| `emergency_reserve_bytes` | `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC unless a fresh observation covers this reserve plus the projected record/segment-header footprint of that write; unknown/error also fails closed. Reads continue. |
-| `low_space_checkpoint_bytes` | `backing.checkpoint_reserve_bytes` | The worker checkpoints eagerly while free space is below it. |
+| `emergency_reserve_bytes` | `backing.journal_emergency_reserve_bytes` | Enables write-admission space checks; unknown/error fails closed and reads continue. |
+| `low_space_checkpoint_bytes` | `backing.checkpoint_reserve_bytes` | While admission is enabled, its value is preserved as headroom after the exact next record/segment-header footprint; the worker also checkpoints eagerly below it. |
 | `interval` | 30 s (engine default) | The worker syncs pending records and checkpoints at least this often while anything is unapplied. |
 
 The worker holds only a weak reference to the engine and exits when the
