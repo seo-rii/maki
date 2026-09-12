@@ -99,6 +99,9 @@ fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
         "\"$attach_bin\" cleanup --volume",
         "--config \"$attach_config_path\"",
         "nbd-client 3.27.0 or later",
+        "control_runtime_dir_candidate=\"/run/maki-control/$volume_name\"",
+        "control_socket_path=\"$control_runtime_dir/control.sock\"",
+        "rmdir \"$control_runtime_dir\"",
     ] {
         assert!(
             runner.contains(required),

@@ -219,6 +219,9 @@ printf 'state=running\npid=%s\n' "$$" >"$status_path"
 work_dir=""
 runtime_dir=""
 runtime_parent_created=false
+control_runtime_dir=""
+control_runtime_parent_created=false
+control_socket_path=""
 attach_config_dir=""
 attach_config_path=""
 nbdkit_pid=""
@@ -370,6 +373,26 @@ cleanup() {
     if [[ "$runtime_parent_created" == true && ! -e "$runtime_dir" ]]; then
         if ! sudo -n rmdir /run/maki; then
             log "cleanup warning: could not remove test-created /run/maki"
+            cleanup_rc=1
+        fi
+    fi
+
+    if [[ "$cleanup_safe" == true && -n "$control_runtime_dir" && "$control_runtime_dir" == /run/maki-control/privval-* ]]; then
+        if [[ -S "$control_socket_path" && "$control_socket_path" == "$control_runtime_dir/control.sock" ]]; then
+            log "cleanup: deleting stale test control socket $control_socket_path"
+            unlink "$control_socket_path" || cleanup_rc=1
+        elif [[ -e "$control_socket_path" ]]; then
+            log "cleanup warning: refusing unexpected control runtime entry $control_socket_path"
+            cleanup_rc=1
+        fi
+        if ! sudo -n rmdir "$control_runtime_dir"; then
+            log "cleanup warning: could not remove test control runtime directory $control_runtime_dir"
+            cleanup_rc=1
+        fi
+    fi
+    if [[ "$control_runtime_parent_created" == true && ! -e "$control_runtime_dir" ]]; then
+        if ! sudo -n rmdir /run/maki-control; then
+            log "cleanup warning: could not remove test-created /run/maki-control"
             cleanup_rc=1
         fi
     fi
@@ -548,6 +571,20 @@ sudo -n install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" "$runtime_dir_candidate
 runtime_dir="$runtime_dir_candidate"
 socket_path="$runtime_dir/nbd.sock"
 
+if [[ -L /run/maki-control ]]; then
+    die "/run/maki-control is a symlink; refusing to use it"
+fi
+if [[ ! -d /run/maki-control ]]; then
+    sudo -n install -d -m 0755 /run/maki-control
+    control_runtime_parent_created=true
+fi
+control_runtime_dir_candidate="/run/maki-control/$volume_name"
+[[ ! -e "$control_runtime_dir_candidate" ]] ||
+    die "control runtime collision: $control_runtime_dir_candidate"
+sudo -n install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" "$control_runtime_dir_candidate"
+control_runtime_dir="$control_runtime_dir_candidate"
+control_socket_path="$control_runtime_dir/control.sock"
+
 config_path="$run_dir/volume.toml"
 key_path="$work_dir/local-aes-gcm-siv.key"
 dd if=/dev/urandom of="$key_path" bs=32 count=1 status=none
@@ -585,6 +622,9 @@ minimum_io = 4096
 preferred_io = 4096
 maximum_io = "1MiB"
 connections = 1
+
+[control]
+socket = "$control_socket_path"
 EOF
 
 "$maki_bin" volume create "$config_path"
