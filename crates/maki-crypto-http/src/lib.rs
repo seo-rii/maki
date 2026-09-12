@@ -21,6 +21,9 @@ use maki_crypto::{
     PlaintextUnit, SecretBuffer,
 };
 
+#[cfg(test)]
+mod sensitive_tests;
+
 /// Bytes wiped when dropped: every copy of plaintext this crate makes on
 /// the way to and from the wire (third review, F09) — payload copies, the
 /// serialized request body, the response body, and decoded payloads.
@@ -88,28 +91,80 @@ impl PayloadEncoding {
         }
     }
 
-    pub fn decode(&self, s: &str) -> Result<Vec<u8>, CryptoError> {
+    pub fn decode(&self, s: &str) -> Result<Sensitive, CryptoError> {
         let bad = |e: String| CryptoError::Contract(format!("payload decode failed: {e}"));
-        match self {
-            Self::Base64 => base64::engine::general_purpose::STANDARD
-                .decode(s)
-                .map_err(|e| bad(e.to_string())),
-            Self::Base64Url => base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(s)
-                .map_err(|e| bad(e.to_string())),
+        let bytes = s.as_bytes();
+        let decoded_len = match self {
+            Self::Base64 => {
+                if !bytes.len().is_multiple_of(4) {
+                    return Err(bad("invalid base64 length".to_string()));
+                }
+                let padding =
+                    usize::from(bytes.ends_with(b"=")) + usize::from(bytes.ends_with(b"=="));
+                (bytes.len() / 4)
+                    .checked_mul(3)
+                    .and_then(|length| length.checked_sub(padding))
+                    .ok_or_else(|| bad("invalid base64 padding".to_string()))?
+            }
+            Self::Base64Url => {
+                let remainder = bytes.len() % 4;
+                if remainder == 1 {
+                    return Err(bad("invalid base64url length".to_string()));
+                }
+                (bytes.len() / 4)
+                    .checked_mul(3)
+                    .and_then(|length| {
+                        length.checked_add(match remainder {
+                            2 => 1,
+                            3 => 2,
+                            _ => 0,
+                        })
+                    })
+                    .ok_or_else(|| bad("decoded payload length overflow".to_string()))?
+            }
             Self::HexLower | Self::HexUpper => {
-                if !s.len().is_multiple_of(2) {
+                if !bytes.len().is_multiple_of(2) {
                     return Err(bad("odd hex length".to_string()));
                 }
-                (0..s.len())
-                    .step_by(2)
-                    .map(|i| {
-                        u8::from_str_radix(s.get(i..i + 2).unwrap_or(""), 16)
-                            .map_err(|e| bad(e.to_string()))
-                    })
-                    .collect()
+                bytes.len() / 2
+            }
+        };
+        // Own the zeroization guard before writing the first decoded byte.
+        // A malformed symbol near the end must wipe the partial plaintext,
+        // and a fixed-size allocation cannot abandon plaintext while growing.
+        let mut decoded = Zeroizing::new(vec![0u8; decoded_len]);
+        match self {
+            Self::Base64 => {
+                let written = base64::engine::general_purpose::STANDARD
+                    .decode_slice(s, &mut decoded)
+                    .map_err(|e| bad(e.to_string()))?;
+                if written != decoded_len {
+                    return Err(bad("decoded payload length mismatch".to_string()));
+                }
+            }
+            Self::Base64Url => {
+                let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode_slice(s, &mut decoded)
+                    .map_err(|e| bad(e.to_string()))?;
+                if written != decoded_len {
+                    return Err(bad("decoded payload length mismatch".to_string()));
+                }
+            }
+            Self::HexLower | Self::HexUpper => {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    b'A'..=b'F' => Some(byte - b'A' + 10),
+                    _ => None,
+                };
+                for (index, pair) in bytes.chunks_exact(2).enumerate() {
+                    let high = digit(pair[0]).ok_or_else(|| bad("invalid hex digit".into()))?;
+                    let low = digit(pair[1]).ok_or_else(|| bad("invalid hex digit".into()))?;
+                    decoded[index] = high << 4 | low;
+                }
             }
         }
+        Ok(decoded)
     }
 }
 
@@ -473,7 +528,7 @@ impl HttpCryptoProvider {
                         .ok_or_else(|| {
                             CryptoError::Contract(format!("response missing string at {path:?}"))
                         })?;
-                    op.response.encoding.decode(data).map(Zeroizing::new)
+                    op.response.encoding.decode(data)
                 })();
                 zeroize_json(&mut value);
                 result
@@ -592,7 +647,7 @@ impl HttpCryptoProvider {
             .ok_or_else(|| {
                 CryptoError::Contract(format!("batch element {i} missing payload string"))
             })?;
-            out.push(Zeroizing::new(op.response.encoding.decode(data)?));
+            out.push(op.response.encoding.decode(data)?);
         }
         Ok(out)
     }
