@@ -113,6 +113,20 @@ fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
     }
 }
 
+#[test]
+fn privileged_validation_reads_the_root_owned_config_as_root_for_planning() {
+    let runner = repository_file("scripts/privileged-linux-validation.sh");
+    let output = runner
+        .find(">\"$run_dir/maki-attach-plan.txt\"")
+        .expect("privileged validation must preserve the attach plan");
+    let invocation = &runner[output.saturating_sub(300)..output];
+
+    assert!(
+        invocation.contains("sudo -n env PATH=\"$PATH\" \"$attach_bin\" attach"),
+        "the root-owned 0600 attach config must be planned through the root helper boundary"
+    );
+}
+
 // ---------- attach/detach/grow plans ----------
 
 fn request() -> AttachRequest {

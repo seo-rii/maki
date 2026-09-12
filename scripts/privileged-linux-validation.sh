@@ -785,7 +785,8 @@ lv_uuid = "$lv_uuid"
 EOF
 sudo -n install -m 0600 -o root -g root "$run_dir/attach.toml" "$attach_config_path"
 
-"$attach_bin" attach --volume "$volume_name" --config "$attach_config_path" --plan \
+sudo -n env PATH="$PATH" "$attach_bin" attach --volume "$volume_name" \
+    --config "$attach_config_path" --plan \
     >"$run_dir/maki-attach-plan.txt"
 
 log "running the real maki-attach helper"
