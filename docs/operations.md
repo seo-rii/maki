@@ -42,9 +42,11 @@ nm -D --defined-only target/release/libmaki_nbdkit.so |
   grep -Eq '[[:space:]]T[[:space:]]plugin_init$'
 ```
 
-The exported structure uses the validated nbdkit API-v2 prefix. FLUSH is
-available, FUA is emulated by nbdkit, and native TRIM, write-zeroes, block-size
-negotiation, and multi-connection callbacks are not exported.
+The exported structure uses the validated nbdkit API-v2 prefix. FLUSH and
+native FUA reach the engine, and the block-size callback advertises the
+configured I/O limits. TRIM and multi-connection are disabled. The plugin
+does not provide a native write-zeroes callback; nbdkit emulates zeroing with
+ordinary writes.
 
 ## Volume lifecycle
 
