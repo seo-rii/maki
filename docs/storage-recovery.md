@@ -20,6 +20,20 @@ mutation and preserves the record. Use explicit `detach` for planned connected
 maintenance and explicit `recover` when diagnosing a known disconnected
 attachment.
 
+When nbdkit dies but its kernel NBD client remains connected, `cleanup` may use
+the completed post-activation proof after normal `vgchange -an` exits nonzero.
+This fallback accepts only a single target mapping: the original proof and the
+current kernel inventory must each contain the same one top-level DM target,
+with exact name, UUID, major/minor and slave edge, no mount or foreign holder,
+open count zero, and the same backend nonce immediately before mutation. It
+issues one plain `dmsetup remove`, rechecks mapping and holder absence, and then
+disconnects NBD. It does not run after a command timeout or other I/O error and
+never uses force, deferred removal, or retry options.
+
+This path belongs only to convergent `cleanup`. Explicit `detach` and `recover`,
+pre-activation intent, multi-LV/internal thin/cache/RAID mappings, open targets,
+or changed identity remain fail closed with the trusted record intact.
+
 Before recovery, stop database writers and their supervisors, prevent automatic
 restarts, and stop containers that use the volume. Run recovery from the host
 mount namespace used by attach. Remove workload bind mounts in their own
@@ -203,6 +217,9 @@ temporary-file, or log locations outside the configured root are not covered.
 The subprocess probe has an internal bound, but waiting for the attach lock has
 no internal deadline and a kernel filesystem read can still hang after backend
 failure; the gate does not promise an overall completion deadline.
+Because the gate is based on kernel identity and topology, it can still pass
+immediately after nbdkit dies while the kernel NBD connection remains present.
+Treat daemon supervision and an application I/O/health check as separate gates.
 
 ## Packaged workload lifecycle
 
@@ -236,11 +253,14 @@ default `rprivate` propagation, different container IDs and creation times,
 SQLite rows advancing from one to two with `integrity_check=ok`, and zero
 container starts on a plain directory.
 
-These lifecycle runs used fixture daemon/attach/verify steps and loop-backed
-XFS; the real cleanup call covered its no-record path. The current revision's
-real kernel NBD/LVM/XFS run separately passed attach, trusted verify, cleanup,
-and idempotent cleanup. These are complementary checks, not one end-to-end
-kernel-storage crash and database-durability campaign.
+Those packaged lifecycle runs used fixture daemon/attach/verify steps and
+loop-backed XFS. A later `8bf0e94` campaign combined actual Maki nbdkit, kernel
+NBD, pinned single-PV LVM/XFS, trusted attach/verify/cleanup, and two distinct
+default-`rprivate` Docker containers around nbdkit `SIGKILL`. The connected
+kernel mapping was removed through the proof-scoped fallback, reattach passed,
+and the new container recovered all 32 rows in the independently fsynced ACK
+ledger with `integrity_check=ok`. The installed packaged systemd graph was not
+part of that combined run.
 
 ## Remaining recovery limits
 
@@ -254,10 +274,9 @@ kernel-storage crash and database-durability campaign.
   manual LVM, mount, or NBD changes made by other privileged processes. Stop
   those operations before cleanup; namespace and concurrent root intervention
   are outside the helper's ownership guarantee.
-- Foreign, partial-mapping, and command-failure cleanup cases use production
-  metadata observers with synthetic kernel metadata and injected outcomes. The
-  current revision also passed a clean real kernel NBD/LVM/XFS attach, verify,
-  cleanup, and second cleanup, plus the separate systemd and Docker lifecycle
-  checks above. No single campaign has yet combined an actual Maki daemon,
-  kernel storage crash, container restart, and external database ACK oracle.
-  Power loss and a production topology remain separate qualification gates.
+- Foreign, partial-mapping, and most command-failure cleanup cases use
+  production metadata observers with synthetic kernel metadata and injected
+  outcomes. The actual single-target nbdkit-death path passed the combined
+  kernel NBD/LVM/XFS and Docker ACK campaign above. Multi-mapping fallback,
+  packaged systemd integration, whole-VM or physical power loss, repeated
+  crashes, and a production topology remain separate qualification gates.

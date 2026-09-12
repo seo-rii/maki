@@ -12,10 +12,11 @@ Maki is designed around four constraints:
 - the long-running data plane runs without root privileges.
 
 > [!WARNING]
-> Maki is not yet production-qualified. The userspace nbdkit path and simulated
-> durability suites pass, and one Debian kernel-NBD/XFS smoke run is recorded.
-> Forced-crash, broader database, vendor-provider, and hardware power-loss
-> qualification remain open.
+> Maki is not yet production-qualified. One Debian 12 GCE campaign recovered
+> 32 externally acknowledged SQLite rows after an actual nbdkit `SIGKILL`,
+> trusted kernel-NBD/LVM/XFS cleanup, and reattach. Installed systemd recovery,
+> broader databases and providers, repeated crashes, soak, and physical
+> power-loss qualification remain open.
 
 **Volume compatibility:** new volumes require superblock envelope v2 and
 mirrored durable proofs. Older binaries reject v2, and this build refuses
@@ -45,9 +46,9 @@ provided.
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
 | HTTP transport TLS and loopback chaos handling | Validated in automated tests |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
-| Kernel `/dev/nbd`, LVM, XFS, and fio path | Historical Debian 12/KVM smoke; current preflight and workload verification still require target-host qualification |
-| Real database and vendor-provider workloads | SQLite smoke passed; broader qualification open |
-| QEMU and bare-metal power-loss testing | Not qualified |
+| Kernel `/dev/nbd`, LVM, XFS, and fio path | Clean and single nbdkit-crash recovery passed on one pinned single-PV/LV Debian 12 GCE topology; target-host and multi-mapping qualification remain |
+| Real database and vendor-provider workloads | One SQLite external-ACK crash campaign passed with the local provider; broader databases and remote-provider faults remain open |
+| VM and physical power-loss testing | Firecracker VMM loss and GCE hard reset campaigns passed their scoped checks; physical power loss remains open |
 | 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
 | 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; five findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark, S-04/S-05 recovery under out-of-order sector persistence) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
 | 2026-09-03 second audit (core, crypto, operations) | 27 confirmed findings fixed with regression tests, among them recovery accepting never-synced page-cache bytes after a process restart, HTTP redirects re-sending plaintext, the root helper following symlinks in the mount root, and detach disconnecting the wrong NBD device; see the [remediation log](docs/review-remediation.md#second-audit-2026-09-03-core-crypto-layer-operational-layers) |

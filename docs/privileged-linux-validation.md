@@ -119,9 +119,58 @@ If nbdkit does not exit after normal termination, the runner deliberately does
 not escalate to `SIGKILL`; it fails and preserves the backing tree so an
 operator can inspect the live process safely.
 
-## Debian 12 GCE validation result — 2026-09-13
+## Combined Debian 12 GCE crash result — 2026-09-13
 
-The current suite passed all 22 checks with exit code 0 at revision
+Revision `8bf0e941bd3501b972850240fb1050fbc2a90c0b` passed 29 checks on a
+disposable `n2-standard-4` host using the Debian image, kernel, and native tool
+versions listed in the safe-run result below. A one-use qualification harness
+extended the tracked runner with an actual nbdkit crash and Docker SQLite ACK
+oracle; it did not change the tracked runner's non-crashing contract. The
+[Linux and Windows CI run](https://github.com/seo-rii/maki/actions/runs/34712284092)
+for the same revision also passed.
+
+The run attached a 512 MiB local AES-GCM-SIV export through kernel NBD to a
+single-PV, single-LV LVM/XFS filesystem with all administrator UUID pins. A
+new `rprivate` Docker container committed 32 acknowledged rows using SQLite
+WAL and `synchronous=FULL`; the external ACK ledger and its directory were
+fsynced outside the Maki filesystem. The actual nbdkit PID then received
+`SIGKILL` and returned wait status 137. The kernel connection remained connected
+after server death, and the read-only identity gate returned success because it
+checks kernel identity and mount topology rather than data-path liveness.
+
+`maki-attach cleanup` first received a nonzero result from LVM against the dead
+server, then used the completed recovery proof to remove the exact closed
+device-mapper target and disconnect NBD. After a new nbdkit process started,
+the helper reattached and verified the same storage. A distinct `rprivate`
+Docker container recovered all 32 acknowledged rows byte-for-byte against the
+external ledger and reported `integrity_check=ok`. Final cleanup, a second
+idempotent cleanup, disposable LVM removal, clean nbdkit shutdown, and offline
+`maki check` all passed.
+
+The direct device-mapper fallback is deliberately limited to one recorded
+target mapping whose current name, UUID, major/minor, dependency, open count,
+mount state, and NBD connection identifier match the proof. It uses one plain
+`dmsetup remove`, without force, deferred removal, or retry flags. Multi-LV and
+internal thin/cache/RAID mappings, open targets, changed topology, an unknown
+holder, command timeout, or backend identity change fail closed and preserve
+the trusted record.
+
+The complete evidence archive and its SHA-256 manifest are under
+`/home/seorii/logs/maki-gcp-combined-20260913-evidence`. Before deletion the
+guest had no NBD connection, holder, mount, Maki device-mapper target, nbdkit
+process, test container, or test LV. The instance and auto-delete boot disk
+were deleted; fresh project queries returned zero `maki-*` instances and disks,
+and an exact disk lookup returned 404.
+
+This is one abrupt userspace-server failure in one local-provider, single-LV
+topology. It does not combine the installed packaged systemd recovery graph,
+does not test a whole-VM or physical power cut at the same time as the database,
+and does not qualify multi-LV/internal mappings, remote providers, other
+databases, repeated crash cycles, or long-duration load.
+
+## Safe Debian 12 GCE validation result — 2026-09-13
+
+The safe suite passed all 22 checks with exit code 0 at revision
 `5a3bef69aa4980c6783e177c44e6e0b5b7f286f0`; its
 [Linux and Windows CI run](https://github.com/seo-rii/maki/actions/runs/34707982492)
 also passed. The disposable target was a GCE `n2-standard-4` using

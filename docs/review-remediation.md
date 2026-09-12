@@ -840,25 +840,45 @@ that the review bundle also tracks.
 | R3-004 endpoint capabilities | Closed | Preserved per-endpoint intersection plus `27dce14`; heterogeneous endpoint regressions pass |
 | R3-005 UUID/canary identity | Closed | `8e725fc`; locked actual UUID, per-endpoint canary, and quarantine recovery tests |
 | R3-006 full context | Closed | `dd87466`; only exact context-field refusal is accepted as capability evidence |
-| R3-007 recovery lifecycle | Product path closed; end-to-end qualification remains | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; focused regression, current clean kernel NBD/LVM/XFS attach/verify/cleanup, actual systemd ordering, and Docker rebind/plain-directory gates pass separately |
+| R3-007 recovery lifecycle | Product path closed; one combined crash qualification passed | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; `8bf0e94` combined an actual nbdkit crash, connected kernel NBD/LVM/XFS cleanup and reattach, and recovery of 32 external-ACK SQLite rows in a fresh Docker container. Installed systemd, multi-mapping, repeated-crash, and production-topology qualification remain |
 | R3-008 shutdown result/logging | Closed for supported foreground mode | `dc646ef`; explicit drain result, admission closure, retry, subprocess logging, and concurrent shutdown tests |
 | R3-009 response shape | Closed | `57ca845`; empty, extra, wrong-index, and wrong-length responses fail without panic |
 | R3-010 capability mode | Closed | `40502a7`; only declared mode is accepted and remote declarations are contractual |
 
-The current privileged run at `5a3bef6` used nbd-client 3.27.1 and passed 22
-checks on a disposable Debian 12 GCE host: real kernel NBD, single-PV LVM/XFS
-with all UUID pins, attach, verify, two cleanup calls, fio, SQLite WAL, and an
-offline check. The actual systemd transaction used fixture daemon/attach/
-verify/workload components but proved stop, cleanup-success restart, cleanup-
-failure hold, and per-start gate ordering. A separate Docker run observed
-default `rprivate` propagation, distinct container IDs and creation times,
-SQLite rows 1→2 with `integrity_check=ok`, and zero container starts on a plain
-directory. The Docker run used loop-backed XFS and a custom UUID gate, so it is
-not an end-to-end Maki storage-crash durability result.
+The earlier safe privileged run at `5a3bef6` used nbd-client 3.27.1 and passed
+22 checks on a disposable Debian 12 GCE host: real kernel NBD, single-PV
+LVM/XFS with all UUID pins, attach, verify, two cleanup calls, fio, SQLite WAL,
+and an offline check. The actual systemd transaction used fixture daemon,
+attach, verify, and workload components but proved stop, cleanup-success
+restart, cleanup-failure hold, and per-start gate ordering. A separate Docker
+run observed default `rprivate` propagation, distinct container IDs and
+creation times, SQLite rows 1→2 with `integrity_check=ok`, and zero container
+starts on a plain directory. Those two runs did not combine the Maki storage
+stack and installed controller.
 
-The disposable instance and boot disk were deleted; fresh project queries
-found zero name-matched `maki-*` instances and disks. All eight CI runs from
-`1113a26` through `5a3bef6` passed.
+Revision `8bf0e941bd3501b972850240fb1050fbc2a90c0b` then passed 29 checks in one
+combined campaign. A default-`rprivate` Docker container committed 32 SQLite
+WAL `synchronous=FULL` rows individually and recorded each ACK in an external
+fsynced ledger. The actual nbdkit process exited 137 after `SIGKILL`; kernel NBD
+remained connected, and `maki-attach verify` still succeeded because it checks
+storage identity and topology rather than server liveness. Cleanup used the
+completed proof to remove the one exact closed mapping after normal `vgchange`
+failed, disconnected NBD, and reattached after nbdkit restart. A distinct
+container recovered all 32 ACK rows exactly and returned
+`integrity_check=ok`. Final cleanup, its idempotent replay, and the offline
+check passed.
+
+The proof fallback is limited to cleanup of one exact top-level target mapping;
+it rejects explicit detach/recover, pre-activation intent, multi-LV/internal or
+open/changed mappings, backend identity changes, and command timeouts. The
+combined campaign did not execute the installed systemd controller or cover a
+remote provider, whole-VM/physical power loss, another database, repeated
+crashes, or soak load.
+
+The disposable instances and their auto-delete boot disks were deleted. The
+last fresh project queries found zero name-matched `maki-*` instances and disks,
+and the combined disk's exact lookup returned 404. All 16 CI runs from
+`1113a26` through `8bf0e94` passed.
 
 Capacity follow-up `5803be8` partially closes MAKI-041's accounting gap. The
 geometry API and `maki volume inspect` now report maximum units and shards,

@@ -357,6 +357,23 @@ recovery path. A foreign or unreadable backend fails before mutation and keeps
 the record. Re-run cleanup after a partial successful effect; each selected
 path re-observes storage identity before its next change.
 
+If a dead nbdkit server leaves its recorded kernel connection present, only
+`cleanup` has a narrow fallback for the resulting LVM read failure. It first
+runs the normal `vgchange -an`; only an exited command with a nonzero status may
+continue. The completed post-activation proof must contain one recorded target
+mapping and no other DM layer. The current mapping must still match its name,
+UUID, major/minor, slave edge and backend nonce, have no mount or foreign holder,
+and report open count zero through `dmsetup info`. Cleanup then issues one plain
+`dmsetup remove` for that exact name, rechecks that the mapping and holder are
+gone, and only then disconnects NBD. It never uses force, deferred removal, or
+retry flags.
+
+Explicit `detach` and `recover`, a pre-activation intent, multi-LV/internal
+thin/cache/RAID mappings, open or changed targets, backend changes, and command
+timeouts do not enter this fallback. They retain the trusted record and require
+operator diagnosis. This limit keeps direct device-mapper mutation within the
+single-LV topology qualified on the disposable GCE host.
+
 Detach retries observe current mountinfo and sysfs state before each step.
 An already completed unmount or VG deactivation is skipped. A remaining mount
 must identify the expected LV device, XFS root, and volume sentinel, and active
@@ -404,6 +421,13 @@ systemd service whose namespace exposes the configured mount, install the
 example `packaging/examples/maki-workload.service.d/10-maki.conf`, replace `pg`
 with the volume name, and adapt it below the real workload unit. Its essential
 contract is:
+
+The gate proves current kernel identity, mapping and mount topology; it does not
+perform data I/O or test nbdkit process liveness. In the qualified crash run it
+still returned success immediately after nbdkit was killed because the kernel
+NBD connection and mapping remained. The lifecycle must react to daemon failure
+and complete cleanup/restart rather than treating `verify` alone as a health
+probe.
 
 ```ini
 [Unit]
