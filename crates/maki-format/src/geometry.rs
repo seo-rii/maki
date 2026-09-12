@@ -18,6 +18,18 @@ pub struct Geometry {
     pub shard_logical_size: u64,
 }
 
+/// Upper bounds for the slot files and fixed-format A/B metadata when every
+/// unit in a volume has been allocated. Filesystem metadata, journal and
+/// checkpoint headroom, and application temporary space are separate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityPlan {
+    pub num_units: u64,
+    pub num_shards: u64,
+    pub full_slot_span_bytes: u64,
+    pub allocation_map_ab_bytes: u64,
+    pub catalog_ab_bytes: u64,
+}
+
 fn is_pow2(v: u64) -> bool {
     v != 0 && (v & (v - 1)) == 0
 }
@@ -121,6 +133,7 @@ impl Geometry {
                 u32::MAX
             )));
         }
+        geometry.capacity_plan()?;
 
         Ok(geometry)
     }
@@ -135,6 +148,49 @@ impl Geometry {
 
     pub fn num_shards(&self) -> u64 {
         self.num_units().div_ceil(self.units_per_shard())
+    }
+
+    pub fn capacity_plan(&self) -> Result<CapacityPlan, FormatError> {
+        let num_units = self.num_units();
+        let num_shards = self.num_shards();
+        if num_shards > crate::catalog::MAX_SHARDS {
+            return Err(FormatError::Invalid(format!(
+                "num_shards {num_shards} exceeds the shard catalog limit {}",
+                crate::catalog::MAX_SHARDS
+            )));
+        }
+
+        let shard_slot_bytes = self
+            .units_per_shard()
+            .checked_mul(self.slot_size)
+            .ok_or_else(|| FormatError::Overflow("shard physical size".to_string()))?;
+        let full_slot_span_bytes = num_shards
+            .checked_mul(shard_slot_bytes)
+            .ok_or_else(|| FormatError::Overflow("full slot span".to_string()))?;
+
+        let allocation_copy_bytes = crate::allocation::ENCODED_FIXED_BYTES
+            .checked_add(self.units_per_shard().div_ceil(8))
+            .ok_or_else(|| FormatError::Overflow("allocation map size".to_string()))?;
+        let allocation_map_ab_bytes = num_shards
+            .checked_mul(2)
+            .and_then(|copies| copies.checked_mul(allocation_copy_bytes))
+            .ok_or_else(|| FormatError::Overflow("allocation map A/B bytes".to_string()))?;
+
+        let catalog_copy_bytes = num_shards
+            .checked_mul(8)
+            .and_then(|entries| entries.checked_add(crate::catalog::ENCODED_FIXED_BYTES))
+            .ok_or_else(|| FormatError::Overflow("shard catalog size".to_string()))?;
+        let catalog_ab_bytes = catalog_copy_bytes
+            .checked_mul(2)
+            .ok_or_else(|| FormatError::Overflow("shard catalog A/B bytes".to_string()))?;
+
+        Ok(CapacityPlan {
+            num_units,
+            num_shards,
+            full_slot_span_bytes,
+            allocation_map_ab_bytes,
+            catalog_ab_bytes,
+        })
     }
 
     /// (shard index, unit index within the shard)

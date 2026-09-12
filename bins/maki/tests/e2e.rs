@@ -98,6 +98,14 @@ fn volume_lifecycle_create_inspect_check() {
     assert!(text.contains("e2evol"), "{text}");
     assert!(text.contains("local-aes-gcm-siv"), "{text}");
     assert!(text.contains("generation"), "{text}");
+    assert!(text.contains("maximum units:             256"), "{text}");
+    assert!(text.contains("maximum shards:            16"), "{text}");
+    assert!(
+        text.contains("full slot span bytes:      1179648"),
+        "{text}"
+    );
+    assert!(text.contains("allocation map A/B bytes: 1088"), "{text}");
+    assert!(text.contains("catalog A/B bytes:        312"), "{text}");
 
     let out = maki(&["check", &vol.config_path], Some(key));
     assert!(out.status.success(), "check failed: {}", stderr(&out));

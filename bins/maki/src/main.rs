@@ -211,6 +211,12 @@ fn inspect(config: &str) -> Result<(), String> {
     println!("unit size:     {}", sb.geometry.crypto_unit_size);
     println!("slot size:     {}", sb.geometry.slot_size);
     println!("generation:    {}", sb.generation);
+    let plan = sb.geometry.capacity_plan().map_err(|e| e.to_string())?;
+    println!("maximum units:             {}", plan.num_units);
+    println!("maximum shards:            {}", plan.num_shards);
+    println!("full slot span bytes:      {}", plan.full_slot_span_bytes);
+    println!("allocation map A/B bytes: {}", plan.allocation_map_ab_bytes);
+    println!("catalog A/B bytes:        {}", plan.catalog_ab_bytes);
     Ok(())
 }
 
