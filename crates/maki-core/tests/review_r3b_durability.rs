@@ -14,8 +14,9 @@
 //! dirty writes are lost) during the workload; acknowledged data must still
 //! obey the oracle and a failed write may surface but never a foreign value.
 
-// The process-global failpoint lock is held across the whole body of the
-// deterministic tests (single-threaded runtime, like `review_audit2.rs`).
+// Every test holds the process-global failpoint lock for its whole body:
+// even a sweep that installs no global fault can consume another test's
+// injection. Worker tasks remain concurrent within each workload.
 #![allow(clippy::await_holding_lock)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -370,6 +371,7 @@ async fn sweep_verbose(
 
 #[tokio::test]
 async fn random_workloads_survive_power_loss_and_restart_cycles() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..120u64 {
         sweep(seed, 4, 0).await;
     }
@@ -377,6 +379,7 @@ async fn random_workloads_survive_power_loss_and_restart_cycles() {
 
 #[tokio::test]
 async fn random_workloads_with_sync_failures_never_show_foreign_data() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..80u64 {
         sweep(seed, 4, 150).await;
     }
@@ -386,6 +389,7 @@ async fn random_workloads_with_sync_failures_never_show_foreign_data() {
 /// restart's recovery must have made what it accepted durable.
 #[tokio::test]
 async fn restart_followed_by_power_loss_keeps_recovered_state() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..80u64 {
         let mut rng = StdRng::seed_from_u64(seed);
         let backing = Arc::new(CrashableBacking::new().with_tearing(128));
@@ -427,6 +431,7 @@ async fn restart_followed_by_power_loss_keeps_recovered_state() {
 #[tokio::test]
 #[ignore = "release gate: long randomized durability sweep"]
 async fn phase_r3b_durability_gate_full() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..1500u64 {
         sweep(seed, 6, 0).await;
     }
@@ -764,6 +769,7 @@ async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_partial_unit_workloads_survive_power_loss_and_restart() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..24u64 {
         concurrent_sweep(seed, 3, false).await;
     }
@@ -772,6 +778,7 @@ async fn concurrent_partial_unit_workloads_survive_power_loss_and_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "release gate: long concurrent partial-unit durability sweep"]
 async fn phase_r3b_concurrent_gate_full() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..300u64 {
         concurrent_sweep(seed, 4, false).await;
     }
@@ -787,6 +794,7 @@ async fn phase_r3b_concurrent_gate_full() {
 
 #[tokio::test]
 async fn random_workloads_with_a_plaintext_cache_survive_power_loss_and_restart() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..60u64 {
         sweep_cached(seed, 4, 0).await;
     }
@@ -794,6 +802,7 @@ async fn random_workloads_with_a_plaintext_cache_survive_power_loss_and_restart(
 
 #[tokio::test]
 async fn random_workloads_with_a_plaintext_cache_and_sync_failures_never_show_foreign_data() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..40u64 {
         sweep_cached(seed, 4, 150).await;
     }
@@ -801,6 +810,7 @@ async fn random_workloads_with_a_plaintext_cache_and_sync_failures_never_show_fo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_partial_unit_workloads_with_a_plaintext_cache() {
+    let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..12u64 {
         concurrent_sweep(seed, 3, true).await;
     }
