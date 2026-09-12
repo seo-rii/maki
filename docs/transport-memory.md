@@ -6,6 +6,33 @@ The `secure-buffers` setting covers registered buffers, and does not prove that
 every transport allocation is locked or erased. Logical request budgets also
 do not measure total resident memory.
 
+## HTTP decoded payloads
+
+HTTP response payloads are decoded into an exactly sized
+`Zeroizing<Vec<u8>>`. The guard exists before the first Base64, Base64URL, or
+hex byte is written, and the fixed allocation cannot reallocate while decoding.
+A malformed symbol therefore erases partial output before returning the error;
+successful extraction moves the same guard into the provider result. Dropping a
+partly built batch also erases payloads decoded before a later item fails.
+
+Focused allocation regressions observe the selected output immediately before
+deallocation and show that malformed Base64 and hex inputs no longer release a
+partial plaintext prefix. Response growth allocates a new guarded owner, copies
+into it, wipes the replaced owner, then swaps. Request JSON trees remain under a
+drop guard until serialization; recursive cleanup drains and wipes object keys
+and values, including pointer replacement and construction errors. The complete
+HTTP package passed 42 tests with three ignored network tests, and the changed
+packages passed scoped all-targets strict Clippy on 2026-09-13.
+
+HTTP payload, body, response and JSON owners use zeroizing vectors or strings,
+not page-locked `SecretBuffer`s. Header/query credential strings resolved from
+the key source and mTLS identity PEM remain plain allocations. A malformed JSON
+response may make serde_json discard partial parser-owned allocations before it
+returns a Value that Maki can guard. Reqwest, hyper, rustls and kernel buffers remain
+library-controlled copies, and admission does not account for the simultaneous
+decoded, encoded and library copies. MAKI-015 and the total-memory work in
+MAKI-032 therefore remain open.
+
 ## WebSocket requests
 
 Request serialization borrows input units and streams base64 and JSON directly

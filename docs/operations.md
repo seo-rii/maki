@@ -318,7 +318,8 @@ Attachment records live in `/run/maki-attach/<volume>.nbd`, under a
 files containing versioned JSON. The helper refuses symlinks, writable
 ancestors, unexpected ownership, and malformed or legacy device-only records.
 An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV, device,
-and random connection identifier.
+random connection identifier, and either the pre-activation recovery intent or
+the complete post-activation mapping proof.
 
 `maki-attach detach` takes the same lock and compares the requested attachment
 with that record and the live `/sys/block/nbdN/backend` before unmounting or
@@ -333,6 +334,14 @@ VG mappings must use the recorded NBD device. A different mount or backend,
 unreadable observations, remaining device holders (including partition
 holders), and direct mounts of the NBD device or its partitions block unsafe
 deactivation or disconnect.
+
+If attach stopped after verified activation but before publishing the complete
+mapping proof, normal detach may use the saved recovery intent only while its
+backend nonce remains connected. It refuses any mount and any changed device,
+partition, mapper name, UUID, dependency or holder. A verified partial mapping
+subset can be deactivated with the recorded device list and VG UUID; an unknown
+internal LVM UUID suffix is not treated as owned. The intent never authorizes an
+unmount or workload access.
 
 If disconnect succeeded but the process stopped before retiring its record,
 a retry may remove that record without running device commands only after
@@ -505,11 +514,14 @@ high-cardinality values as metric labels.
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.
-- Writes fail with ENOSPC when backing free space is below
-  `backing.journal_emergency_reserve_bytes`, or when the journal has reached
-  `backing.journal_max_bytes` and an inline checkpoint could not reclaim it.
-  Admission refreshes the free-space observation; it does not reserve physical
-  storage. A reserve-only refusal leaves existing data readable and does not
+- Writes fail with ENOSPC unless fresh backing free space covers
+  `backing.journal_emergency_reserve_bytes` plus the projected record and
+  segment-header footprint of the write, or when that write would exceed
+  `backing.journal_max_bytes` even after an inline checkpoint. An unavailable
+  or failed free-space query also fails closed while the emergency reserve is
+  enabled. Admission
+  refreshes the observation; it does not reserve physical storage. A reserve-only
+  refusal leaves existing data readable and does not
   by itself set a checkpoint error or change the engine state. A failed
   checkpoint reports `state: degraded` with its error, cleared by a successful
   checkpoint; the worker retries on its interval and writes retry necessary

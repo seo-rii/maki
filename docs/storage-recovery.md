@@ -26,13 +26,25 @@ helper unmounts only the expected complete XFS mount, then deactivates only the
 recorded VG, re-observing between steps. Another mount of any recorded device,
 an unexpected holder, or changed block-device identity stops cleanup.
 
-The root-controlled attach record contains the NBD device number and the
-activated mappings' device numbers, mapper names, LVM UUIDs, and slave edges.
-Attach publishes this proof atomically after activation, while its backend
-identifier still matches, and checks it again before mounting. Recovery checks
-the kernel metadata against that proof; it does not open the sentinel or any
-other file on the disconnected filesystem. Topologies over the bounded record
-or inventory limits are rejected during attach.
+Before activation, the root-controlled attach record stores a recovery intent
+containing the verified NBD device numbers and geometry, partition set, PV
+labels, VG/LV UUIDs and admitted layouts. Attach publishes the complete mapping
+proof atomically after activation, while its backend identifier still matches,
+and removes the intent in the same record update. The proof adds mapper device
+numbers, names, UUIDs and slave edges and is checked again before mounting.
+
+If the helper exits between activation and proof publication, ordinary detach
+may consume the intent while the recorded backend nonce remains connected;
+`recover` may consume it only while that backend remains absent. Both paths
+require the exact NBD geometry and partition set, only preflight-verified mapper
+names, UUIDs and dependency edges, no unexpected holder, and no mount of the
+candidate devices. A partial activation is accepted only when every observed
+LV and internal mapping is a verified subset; an unknown mapping name or LVM
+UUID suffix is refused. The LVM command is restricted to the recorded device
+list and VG UUID. The intent never authorizes an unmount, mount, filesystem
+access, or workload start. A record with neither the proof nor the new intent
+retains the legacy fail-closed behavior. Topologies over the bounded record or
+inventory limits are rejected.
 
 ## Checking LVM before activation
 
@@ -84,7 +96,6 @@ The attach lock does not coordinate other privileged tools or udev activation
 triggered by NBD connection. Device identity and metadata can change after an
 observation; neither external root races nor automatic udev activation are
 made safe by this check. Qualify the host's activation policy separately.
-The activation-to-proof crash gap below also remains.
 
 Failed-attach rollback uses the same preflight identities before any mount or
 VG teardown, and limits VG deactivation to the validated UUID and devices.
@@ -100,8 +111,9 @@ sentinel creation or the read/write probe can run. Backend and recorded
 mapping identities are checked before and after the block probe and again
 before mount. The existing post-mount identity checks remain in place.
 Omitting `fs_uuid` checks the filesystem type without independently pinning
-its identity. This check occurs after LVM activation and does not close the
-activation-to-proof crash gap described below.
+its identity. This check occurs after LVM activation. A failure before the
+complete mapping proof is published leaves only the narrower recovery intent,
+which permits deactivation but never permits mounting the selected LV.
 
 A cleanup command can fail after its effect took place. On any failure, keep
 the original attach record and investigate the reported condition. Re-running
@@ -159,23 +171,23 @@ identity are checked again after both potentially blocking reads.
 Verification does not initialize a sentinel, run a write probe, repair storage,
 change the attach record, or start a database. A configured first-attach
 `init_sentinel` option does not change that behavior. Existing records lacking
-the post-activation proof remain insufficient; this command does not close the
-activation-to-proof crash gap. A successful result is a current storage check,
-not proof of database recovery, successful future writes, other namespaces, or
-continued availability after the command exits. Separate WAL, temporary-file,
-or log locations outside the configured root are not covered. The subprocess
-probe has an internal bound, but waiting for the attach lock has no internal
-deadline and a kernel filesystem read can still hang after backend failure;
-the gate does not promise an overall completion deadline.
+the post-activation proof remain insufficient, including records that contain
+only a pre-activation recovery intent. A successful result is a current storage
+check, not proof of database recovery, successful future writes, other
+namespaces, or continued availability after the command exits. Separate WAL,
+temporary-file, or log locations outside the configured root are not covered.
+The subprocess probe has an internal bound, but waiting for the attach lock has
+no internal deadline and a kernel filesystem read can still hang after backend
+failure; the gate does not promise an overall completion deadline.
 
 ## Remaining recovery limits
 
-- A process or host failure between VG activation and publication of its
-  identity proof leaves an active mapping without sufficient durable evidence.
-  Recovery deliberately refuses that cleanup. The same restriction applies to
-  older attach records without a proof when any upper layer remains active.
-  This path needs independently verified manual recovery; automatic recovery
-  from every attach crash stage is not yet supported.
+- A pre-activation intent permits only exact, mount-free mapping cleanup. Any
+  foreign UUID, changed device number or geometry, changed partition set,
+  unexpected holder, mounted upper layer, unreadable observation, or replaced
+  backend stops cleanup and preserves the record. Older records without either
+  a proof or intent still require independently verified manual recovery when
+  an upper layer remains active.
 - The attach lock serializes Maki helper operations. It does not coordinate
   manual LVM, mount, or NBD changes made by other privileged processes. Stop
   those operations before cleanup; namespace and concurrent root intervention

@@ -252,18 +252,21 @@ outside the configured constraints fail cleanly.
 |---|---|
 | `backing.journal_segment_size` | Size at which the journal writer starts a new segment (at least 4096 bytes) |
 | `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
-| `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC while backing free space is below it |
+| `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC unless fresh free space covers this reserve plus the projected record and segment-header footprint of the write |
 | `backing.checkpoint_reserve_bytes` | The worker checkpoints eagerly while backing free space is below it |
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; the write path forces a journal sync before exceeding it |
 
-Free space is read with `statvfs` on Unix hosts. Where it cannot be read, the
-free-space rules do not apply and `maki_backing_free_bytes` is null.
+Free space is read with `statvfs` on Unix hosts. When the emergency reserve is
+enabled, an unavailable or failed query fails write admission with ENOSPC;
+`maki_backing_free_bytes` is null until a usable observation is available.
 
 When the emergency reserve is enabled, every write admission refreshes free
-space while holding the volume write lock. It does not reuse the statistics
-cache, so space lost or restored between consecutive writes is observed even
-within the same second. Status and metrics still read cached observations;
-they never initiate this filesystem query.
+space while holding the volume write lock. It requires enough space for the
+configured reserve after all record bytes and segment headers created by that
+request. It does not reuse the statistics cache, so space lost or restored
+between consecutive writes is observed even within the same second. Status and
+metrics still read cached observations; they never initiate this filesystem
+query.
 
 These thresholds are not physical reservations. The journal limit counts
 record bytes and segment headers, while checkpointing must also write slots,
