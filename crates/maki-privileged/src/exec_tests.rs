@@ -91,6 +91,7 @@ struct FakeSystem {
     backends: HashMap<String, String>,
     steps: Vec<&'static str>,
     fail_at: Option<&'static str>,
+    nonzero_at: Option<&'static str>,
     readiness_failure: bool,
     replace_on_failure: bool,
     replace_after_deactivate: bool,
@@ -280,6 +281,13 @@ impl System for FakeSystem {
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.steps.push(step.kind());
+        if self.nonzero_at == Some(step.kind()) {
+            return Err(ExecError::StepFailed {
+                step: step.to_string(),
+                status: Some(5),
+                stderr: "external command output omitted".into(),
+            });
+        }
         if self.fail_at == Some(step.kind()) {
             if self.replace_on_failure {
                 self.backends
@@ -1405,6 +1413,14 @@ impl System for ObservedSystem {
             },
             None,
         )
+    }
+    fn deactivate_lvm_from_proof(&mut self, record: &BoundDeviceRecord) -> Result<(), ExecError> {
+        verify_connection(record, self)?;
+        self.fake.steps.push("dm-proof-deactivate");
+        self.fake.vg_active = false;
+        let _ = std::fs::remove_dir_all(self.sysfs.join("dm-0"));
+        let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-0"));
+        Ok(())
     }
     fn recovery_proof(
         &self,

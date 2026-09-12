@@ -295,6 +295,95 @@ fn recovery_rejects_a_live_backend_without_cleanup() {
 }
 
 #[test]
+fn cleanup_falls_back_to_recorded_mappings_when_lvm_cannot_read_a_dead_server() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.nonzero_at = Some("lvm-deactivate");
+
+    let result = cleanup_with(&plan_detach(&req), &state, &mut system);
+
+    assert!(
+        result.is_ok(),
+        "trusted cleanup stranded a mapping after the server died: {result:?}"
+    );
+    assert_eq!(
+        system.fake.steps,
+        [
+            "umount",
+            "lvm-deactivate",
+            "dm-proof-deactivate",
+            "nbd-disconnect"
+        ]
+    );
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_does_not_fallback_when_lvm_did_not_return_a_nonzero_status() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.fail_at = Some("lvm-deactivate");
+
+    assert!(cleanup_with(&plan_detach(&req), &state, &mut system).is_err());
+
+    assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+#[test]
+fn cleanup_rechecks_the_backend_before_proof_scoped_deactivation() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.nonzero_at = Some("lvm-deactivate");
+    system.fake.backend_fault_after = Some(("lvm-deactivate", BackendFault::Foreign));
+
+    assert!(cleanup_with(&plan_detach(&req), &state, &mut system).is_err());
+
+    assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
+    assert!(
+        system.fake.vg_active,
+        "mapping changed after backend replacement"
+    );
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+#[test]
+fn connected_cleanup_rejects_a_mapping_changed_since_the_recovery_proof() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    std::fs::write(
+        system.sysfs.join("dm-0/dm/uuid"),
+        "LVM-1111112222333344445555666677778888889999aaaabbbbccccddddeeeeeeee\n",
+    )
+    .unwrap();
+
+    let result = cleanup_with(&plan_detach(&req), &state, &mut system);
+
+    assert!(result.is_err(), "cleanup accepted a replaced LVM mapping");
+    assert!(
+        system.fake.steps.is_empty(),
+        "cleanup mutated changed storage"
+    );
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+#[test]
 fn recovery_checks_backend_absence_around_every_observation() {
     for probe in 1..=6 {
         for fault in [BackendFault::Foreign, BackendFault::Unreadable] {

@@ -553,6 +553,11 @@ trait System {
             "verified LVM recovery deactivation is unavailable",
         ))
     }
+    fn deactivate_lvm_from_proof(&mut self, _record: &BoundDeviceRecord) -> Result<(), ExecError> {
+        Err(identity_error(
+            "proof-scoped device-mapper deactivation is unavailable",
+        ))
+    }
     fn recovery_proof(
         &self,
         _record: &BoundDeviceRecord,
@@ -623,6 +628,9 @@ impl System for LinuxSystem {
         verified: &lvm_preflight::VerifiedLvm,
     ) -> Result<(), ExecError> {
         lvm_preflight::deactivate_recovery(record, verified)
+    }
+    fn deactivate_lvm_from_proof(&mut self, record: &BoundDeviceRecord) -> Result<(), ExecError> {
+        recover::deactivate_connected_from_proof(record)
     }
     fn recovery_proof(
         &self,
@@ -733,7 +741,7 @@ fn verify_detach_state(
         }
         None => false,
     };
-    let observed = if record.recovery_intent.is_some() {
+    let observed = if record.recovery.is_some() || record.recovery_intent.is_some() {
         system.recovery_observation(record)?
     } else {
         system.detach_observation(record)?
@@ -931,6 +939,15 @@ fn execute_with(
     plan: &Plan,
     state: Option<&TrustedState>,
     system: &mut impl System,
+) -> Result<(), ExecError> {
+    execute_with_options(plan, state, system, false)
+}
+
+fn execute_with_options(
+    plan: &Plan,
+    state: Option<&TrustedState>,
+    system: &mut impl System,
+    allow_proof_deactivation: bool,
 ) -> Result<(), ExecError> {
     let mut plan = plan.clone();
     let connects = plan
@@ -1149,7 +1166,18 @@ fn execute_with(
                     verify_connection(current, system)?;
                     system.deactivate_lvm(current, intent.verified())
                 } else {
-                    system.run_step(step, None)
+                    match system.run_step(step, None) {
+                        Err(error @ ExecError::StepFailed { .. })
+                            if allow_proof_deactivation && current.recovery.is_some() =>
+                        {
+                            system.deactivate_lvm_from_proof(current).map_err(|fallback| {
+                                identity_error(format!(
+                                    "LVM deactivation returned {error}; proof-scoped device-mapper deactivation failed: {fallback}"
+                                ))
+                            })
+                        }
+                        result => result,
+                    }
                 }
             }
             PlannedStep::VerifyFilesystemIdentity { .. } if connects => {
@@ -1265,7 +1293,7 @@ fn cleanup_with(
     };
     match system.backend(&record.device)? {
         Some(connection_id) if connection_id == record.connection_id => {
-            execute_with(plan, Some(state), system)
+            execute_with_options(plan, Some(state), system, true)
         }
         None => recover_with(plan, state, system),
         Some(_) => Err(identity_error(
