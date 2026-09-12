@@ -362,6 +362,7 @@ pub fn scan_journal(
             body_len,
             first_sequence: header.base_sequence,
             durable_len,
+            required_boundary: None,
             geometry: &superblock.geometry,
             checkpoint_sequence,
             name: &name,

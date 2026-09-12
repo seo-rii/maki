@@ -69,6 +69,9 @@ pub(super) struct SegmentScanner<'a> {
     pub body_len: u64,
     pub first_sequence: u64,
     pub durable_len: u64,
+    /// A durable proof requires this CRC/geometry-valid sequence to end at
+    /// exactly this body-relative byte offset (excluding the segment header).
+    pub required_boundary: Option<(u64, u64)>,
     pub geometry: &'a Geometry,
     pub checkpoint_sequence: u64,
     pub name: &'a str,
@@ -85,6 +88,7 @@ impl SegmentScanner<'_> {
         let mut position = 0u64;
         let mut record_count = 0u64;
         let mut read_end = 0u64;
+        let mut required_boundary_seen = false;
 
         let outcome = loop {
             if position == self.body_len {
@@ -215,6 +219,19 @@ impl SegmentScanner<'_> {
                     self.geometry.max_ciphertext_size,
                 )));
             }
+            if let Some((sequence, end)) = self.required_boundary {
+                if header.sequence == sequence {
+                    let actual_end = position + record_len;
+                    if actual_end != end {
+                        return Err(RecoveryError::Corrupt(format!(
+                            "journal segment {}: required durable record {sequence} ends at body \
+                             byte {actual_end}, proof requires {end}",
+                            self.name,
+                        )));
+                    }
+                    required_boundary_seen = true;
+                }
+            }
             if let Some(payload) = payload {
                 replay.push(JournalRecord {
                     sequence: header.sequence,
@@ -238,6 +255,13 @@ impl SegmentScanner<'_> {
                 SEGMENT_HEADER_SIZE as u64 + read_end..SEGMENT_HEADER_SIZE as u64 + self.body_len,
             )?;
         }
+        if let Some((sequence, end)) = self.required_boundary.filter(|_| !required_boundary_seen) {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment {}: required durable record {sequence} ending at body byte \
+                 {end} was not found",
+                self.name,
+            )));
+        }
 
         Ok(SegmentBodyScan {
             record_count,
@@ -253,6 +277,7 @@ mod tests {
     use std::io;
 
     use super::*;
+    use maki_backing::{Backing, MemBacking};
     use maki_format::journal::{encode_record, SegmentHeader};
     use uuid::Uuid;
 
@@ -330,6 +355,7 @@ mod tests {
             body_len: body.len() as u64,
             first_sequence: 1,
             durable_len: 0,
+            required_boundary: None,
             geometry: &geometry,
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
@@ -339,5 +365,144 @@ mod tests {
             matches!(result, Err(RecoveryError::Io(_))),
             "a torn-tail decision must not bypass unreadable remaining bytes"
         );
+    }
+
+    fn boundary_record(sequence: u64) -> Vec<u8> {
+        encode_record(&JournalRecord {
+            sequence,
+            unit_index: sequence - 1,
+            payload: vec![sequence as u8; 512],
+        })
+    }
+
+    fn scan_required_boundary(
+        body: &[u8],
+        required_boundary: Option<(u64, u64)>,
+    ) -> Result<SegmentBodyScan, RecoveryError> {
+        let header: [u8; SEGMENT_HEADER_SIZE] = SegmentHeader {
+            segment_index: 0,
+            volume_uuid: Uuid::nil(),
+            base_sequence: 1,
+        }
+        .encode()
+        .try_into()
+        .unwrap();
+        let backing = MemBacking::new();
+        let file = backing.open("segment", true).unwrap();
+        file.write_at(0, &header).unwrap();
+        file.write_at(SEGMENT_HEADER_SIZE as u64, body).unwrap();
+        let geometry = Geometry::compute(512, 512, 512, 512, 1 << 20, 1 << 16).unwrap();
+        SegmentScanner {
+            file: file.as_ref(),
+            header: &header,
+            body_len: body.len() as u64,
+            first_sequence: 1,
+            durable_len: 0,
+            required_boundary,
+            geometry: &geometry,
+            checkpoint_sequence: 0,
+            name: "seg-0000000000000000",
+        }
+        .scan(&mut Vec::new())
+    }
+
+    #[test]
+    fn required_boundary_accepts_the_exact_valid_record_end() {
+        let body: Vec<u8> = (1..=2).flat_map(boundary_record).collect();
+        let scan = scan_required_boundary(&body, Some((2, body.len() as u64))).unwrap();
+        assert_eq!(scan.outcome, ScanOutcome::Clean);
+        assert_eq!(scan.record_count, 2);
+        assert_eq!(scan.valid_body_bytes, body.len() as u64);
+    }
+
+    #[test]
+    fn required_boundary_rejects_a_valid_record_at_the_wrong_offset() {
+        let body: Vec<u8> = (1..=2).flat_map(boundary_record).collect();
+        for offset in [
+            0,
+            boundary_record(1).len() as u64,
+            body.len() as u64 - 1,
+            body.len() as u64 + 1,
+        ] {
+            assert!(
+                matches!(
+                    scan_required_boundary(&body, Some((2, offset))),
+                    Err(RecoveryError::Corrupt(_))
+                ),
+                "CRC-valid sequence 2 must end at the required body byte {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_boundary_rejects_truncation_at_a_previous_record_boundary() {
+        let first = boundary_record(1);
+        assert!(
+            matches!(
+                scan_required_boundary(&first, Some((2, (first.len() * 2) as u64))),
+                Err(RecoveryError::Corrupt(_))
+            ),
+            "a clean older prefix cannot satisfy a required newer durable record"
+        );
+    }
+
+    #[test]
+    fn required_boundary_rejects_a_missing_sequence_even_with_a_clean_file_end() {
+        let body: Vec<u8> = (1..=2).flat_map(boundary_record).collect();
+        assert!(
+            matches!(
+                scan_required_boundary(&body, Some((3, body.len() as u64))),
+                Err(RecoveryError::Corrupt(_))
+            ),
+            "an exact byte count does not prove that sequence 3 exists"
+        );
+    }
+
+    #[test]
+    fn required_boundary_rejects_a_torn_zeroed_or_crc_invalid_required_record() {
+        let original: Vec<u8> = (1..=2).flat_map(boundary_record).collect();
+        let record_len = boundary_record(1).len();
+        for kind in ["truncated", "zeroed", "crc"] {
+            let mut body = original.clone();
+            match kind {
+                "truncated" => body.truncate(record_len + RECORD_HEADER_SIZE + 7),
+                "zeroed" => body[record_len..].fill(0),
+                _ => body[record_len + RECORD_HEADER_SIZE] ^= 1,
+            }
+            assert!(
+                matches!(
+                    scan_required_boundary(&body, Some((2, original.len() as u64))),
+                    Err(RecoveryError::Corrupt(_))
+                ),
+                "{kind} must not erase the required durable record"
+            );
+        }
+    }
+
+    #[test]
+    fn required_boundary_still_checks_the_required_records_geometry() {
+        let mut body = boundary_record(1);
+        body.extend(encode_record(&JournalRecord {
+            sequence: 2,
+            unit_index: u64::MAX,
+            payload: vec![2; 512],
+        }));
+        assert!(matches!(
+            scan_required_boundary(&body, Some((2, body.len() as u64))),
+            Err(RecoveryError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn required_boundary_allows_an_unacknowledged_torn_suffix_after_its_record() {
+        let mut body = boundary_record(1);
+        let end = body.len() as u64;
+        body.extend_from_slice(&boundary_record(2)[..43]);
+        let scan = scan_required_boundary(&body, Some((1, end))).unwrap();
+        assert_eq!(scan.outcome, ScanOutcome::TornTail { at: end as usize });
+        assert_eq!(scan.record_count, 1);
+        let unbounded = scan_required_boundary(&body, None).unwrap();
+        assert_eq!(scan.outcome, unbounded.outcome);
+        assert_eq!(scan.fingerprint, unbounded.fingerprint);
     }
 }
