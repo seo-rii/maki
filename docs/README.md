@@ -17,6 +17,7 @@ for storage, durability, provider, and security requirements.
 | Replacing credentials or changing an encryption key | [Credential rotation and key migration](key-rotation.md) |
 | Reviewing test evidence or release readiness | [Testing and qualification](testing.md) |
 | Checking review findings and their fixes | [Review remediation log](review-remediation.md) |
+| Following the R3 fixes and remaining operating limits | [R3 readiness review](production-readiness-review-2026-09-08.md) |
 | Reading the 2026-09-05 project assessment | [Project review](project-review-2026-09-05.md) |
 | Implementing protocol or format changes | [Technical specification](../SPEC.md) |
 
