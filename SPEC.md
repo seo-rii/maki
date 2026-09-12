@@ -452,7 +452,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=180
 
 User=maki
 Group=maki
@@ -485,6 +487,18 @@ ReadWritePaths=/run/maki-control/%i
 ```
 
 The exact sandbox options MUST be finalized after compatibility testing with nbdkit and all required shared libraries.
+
+The native plugin initializes its adapter in `after_fork`, so recovery,
+configured provider validation, and control socket binding precede the first
+NBD client. It sends `READY=1` from nbdkit's main process only after those
+steps succeed. Initialization or configured notification failure fails startup.
+Manual runs without `NOTIFY_SOCKET` perform the same initialization without
+notifying a service manager. The startup timeout needs qualification for the
+deployment's recovery size and provider latency.
+
+Initial data-plane readiness is separate from the helper's verified XFS mount,
+the fresh `maki-attach verify` workload gate, and database recovery. It does not
+provide continuous health monitoring or container reattachment.
 
 ---
 

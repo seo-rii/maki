@@ -8,7 +8,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# The native plugin initializes after fork and sends READY only after recovery,
+# provider verification and control binding. Ordered attach jobs wait for it.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=180
 
 User=maki
 Group=maki

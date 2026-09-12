@@ -106,8 +106,9 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    maki status /etc/maki/volumes/example.toml
    ```
 
-   `Type=simple` service startup is not readiness evidence. Require an attached
-   engine with `data.observability.volume_snapshot: "current"`,
+   The packaged `Type=notify` service waits for initial recovery, provider
+   checks, and control binding. Recheck current status after it starts:
+   require an attached engine with `data.observability.volume_snapshot: "current"`,
    `data.state: "ready"`, and `data.io_state: "running"`.
    For a remote provider, require every intended peer in
    `data.crypto.endpoints` to have `validated: true`, `rejected: false`, and a

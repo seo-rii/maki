@@ -206,6 +206,34 @@ PID 812671, 통합 exit 0, 237.68초; 로그:
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-006의 native 초기 준비 상태를 별도로 수정했다. 첫 NBD `open`에
+의존하던 adapter 초기화를 nbdkit의 `after_fork`로 옮겨, 복구·설정된 provider
+검증·control bind를 끝낸 후에만 같은 프로세스가 `READY=1`을 보낸다.
+서비스의 `Type=notify`와 `NotifyAccess=main`은 기존 attach 의존 순서가
+이 신호를 기다리게 하며, 시작 대기에는 180초 기본 상한을 둔다. 준비 실패나
+지정된 통지 경로의 실패는 시작 실패다. 통지 환경변수가 없는 수동 실행도
+첫 client 전에 초기화한다. [초기 준비 상태의 범위](operations.md#data-plane-readiness)는
+NBD data plane이며, XFS mount·workload별 storage verify·DB 복구·지속적인
+건강 상태를 대신하지 않는다. 실제 서비스 배포와 운영 대상 검증은 남는다.
+
+실제 nbdkit에서 첫 client 없이 READY가 없고 잘못된 설정·복구도 실패 종료하지
+않는 RED 3개를 먼저 확인했다(PID 889560, exit 101;
+`/home/seorii/logs/maki-r3-native-startup-red-fixed-20260912T114327.477856Z.log`).
+abstract 주소 최대 길이 RED 1개(PID 899887, exit 101;
+`/home/seorii/logs/maki-r3-native-ready-abstract-red-20260912T115002.305199Z.log`)도
+구현 수정 전에 확인했다. 최종 lib·ABI·협상·drain·startup 집중 검사는
+**42 passed, 0 failed**, exit 0(PID 905148;
+`/home/seorii/logs/maki-r3-native-startup-final-focused-20260912T115140.410937Z.log`)이며,
+설치된 nbdkit 1.32.5로 native startup 9개를 실제 실행했다. 같은 명시 타깃의
+strict Clippy도 exit 0(PID 905392;
+`/home/seorii/logs/maki-r3-native-startup-final-clippy-focused-20260912T115140.767678Z.log`)이다.
+경로/abstract 주소, 통지 생략·실패, control bind 실패, 첫 client 후 중복 READY
+부재를 검증했다. 패키지 서비스와 Linux CI 도구 설치 계약도 각각 실제 RED 1개
+(PID 883207, 904471; exit 101) 후 **4 passed**, exit 0으로 확인했다(PID 908134;
+`/home/seorii/logs/maki-r3-native-ready-ci-green-20260912T115323.737822Z.log`).
+Linux CI는 native 도구를 설치·확인하고 workspace 검사를 실행한다. 개발 환경의
+도구 미설치 skip을 native 실행 성공으로 취급하지 않는다.
+
 `9fd8bfe`는 MAKI-015의 provider-owned 수신 응답을 추가 보호한다. 문자열·부분
 JSON·frame 해제 RED 3개(PID 743395, exit 101;
 `/home/seorii/logs/maki-r3-ws-response-secrets-red-20260912T104629.715361Z.log`)와
@@ -414,7 +442,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |
 |---|---|---|
 | MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 검사에 더해, 활성화 전 독립 PV label·전체 VG 목록 대조와 NBD device/발견한 VG UUID 제한을 제공. 관리자가 고정한 PV/VG/LV UUID, host udev 및 외부 root 조정은 남음 | 지원 토폴로지에서 활성화 전 독립 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 및 실제 대상 검증 |
-| R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: 명령 deadline, 기록 기반 recover 및 workload 시작 전 반복 가능한 read-only verify 제공. activation→proof 게시 crash 공백, 실제 workload READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
+| R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: native 초기 복구·provider 검증 후 READY, 명령 deadline, 기록 기반 recover 및 workload 시작 전 반복 가능한 read-only verify 제공. activation→proof 게시 crash 공백, 실제 DB READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
 | MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키와 gRPC private item 보호 완료. 공유 원본·serde scratch·tungstenite/tonic 등 별도 할당의 수명·잠금과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |

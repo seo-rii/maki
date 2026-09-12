@@ -11,6 +11,7 @@ use maki_nbdkit::daemon::control_socket_path;
 const UNIT: &str = include_str!("../../../packaging/systemd/maki@.service");
 const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/maki.conf");
 const CONFIG: &str = include_str!("../../../packaging/examples/postgres-prod.toml");
+const CI: &str = include_str!("../../../.github/workflows/ci.yml");
 
 fn directive<'a>(source: &'a str, name: &str) -> &'a str {
     source
@@ -93,6 +94,47 @@ fn control_default_and_packaged_example_use_the_admin_runtime_tree() {
         control_socket_path(&config),
         "/tmp/rootless-maki-control.sock"
     );
+}
+
+#[test]
+fn service_start_waits_for_the_main_process_readiness_with_a_deadline() {
+    assert_eq!(
+        directive(UNIT, "Type"),
+        "notify",
+        "ordered attach must wait for recovery, provider validation, and control bind"
+    );
+    assert_eq!(directive(UNIT, "NotifyAccess"), "main");
+    let seconds: u64 = directive(UNIT, "TimeoutStartSec").parse().unwrap();
+    assert!(seconds > 0, "startup cannot wait indefinitely for READY");
+    assert!(UNIT.lines().any(|line| line.trim() == "--foreground \\"));
+}
+
+#[test]
+fn linux_pr_installs_native_test_tools_before_running_workspace_tests() {
+    // Native tests may skip on developer machines without nbdkit. CI must
+    // supply and check the tools, so a green Linux run exercises startup.
+    let pr = CI.split("  nightly-gates:").next().unwrap();
+    let install = pr
+        .find("sudo apt-get install")
+        .expect("Linux PR needs native tools");
+    let tests = pr.find("run: cargo test --workspace").unwrap();
+    assert!(install < tests);
+    assert!(pr[..install].contains("if: runner.os == 'Linux'"));
+    let setup = &pr[install..tests];
+    for package in ["nbdkit", "nbdkit-plugin-dev", "libnbd-bin"] {
+        assert!(setup
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .any(|word| word == package));
+    }
+    for command in ["nbdkit --version", "nbdinfo --version", "nbdcopy --version"] {
+        assert!(
+            setup.contains(command),
+            "native prerequisite is not checked: {command}"
+        );
+    }
 }
 
 #[test]

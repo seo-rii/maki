@@ -589,6 +589,12 @@ not silently dropped; none is a data-durability defect.
   references a `docs/ci.md` and weekly/release tiers the uploaded workflow does
   not implement. These are availability/accuracy items, not correctness bugs.
 
+Later update: [native startup readiness](operations.md#data-plane-readiness)
+now initializes the adapter once in `after_fork`, before any client opens it.
+This supersedes the cold-open initialization finding above. The other bullets
+describe that review's snapshot; consult the [current remediation status](production-readiness-review-2026-09-08.md)
+for their subsequent fixes and remaining limits.
+
 ## Comprehensive review (2026-09-07): MAKI-001–050
 
 A 50-item review (`maki-review-2026-09-07`) spanning the privileged lifecycle,

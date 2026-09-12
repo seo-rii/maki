@@ -231,6 +231,25 @@ daemon running with `cache.mode = "off"`.
 Attach, detach, mount, unmount, NBD, and growth verbs are deliberately absent
 from the control socket.
 
+## Data-plane readiness
+
+The packaged data-plane service uses `Type=notify`. The native plugin opens
+the configured volume in nbdkit's `after_fork` callback, before the first NBD
+client, and sends `READY=1` after recovery, the configured provider checks, and
+control socket binding succeed. `maki-attach@` therefore waits for this initial
+data-plane readiness through its existing `Requires=` and `After=` ordering.
+An initialization or notification failure fails startup. The unit has a
+180-second startup deadline; qualify and override that value for the expected
+recovery size and provider latency. The packaged foreground process is the
+notification sender. Manual runs without `NOTIFY_SOCKET` still initialize
+before accepting clients, without sending a service notification.
+
+This notification does not certify XFS attachment, database recovery, or
+continued health. Mount readiness still requires successful attach, and every
+workload start needs the fresh [storage identity gate](storage-recovery.md#checking-storage-before-each-workload-start).
+The lifecycle follows nbdkit's [after-fork callback contract](https://libguestfs.org/nbdkit-plugin.3.html#Callback-lifecycle)
+and systemd's [notification protocol](https://github.com/systemd/systemd/blob/v252/man/sd_notify.xml#L370).
+
 ## Privileged helper
 
 `maki-attach` reads its parameters from the root-owned

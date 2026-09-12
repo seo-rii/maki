@@ -40,6 +40,13 @@ The baseline workspace suite includes unit tests, parser mutation smokes,
 golden format vectors, provider conformance, transport chaos, failpoints,
 manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
 power-loss simulations, and real-process tests for all four binaries.
+The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
+before the workspace tests and checks their executables. This runs the native
+startup, negotiation, drain, and ABI regressions instead of relying on optional
+tool availability. Native startup uses disposable files and Unix sockets; it
+does not attach a kernel NBD device or mount a filesystem. On developer hosts
+without nbdkit, native cases explicitly report that they were skipped; such a
+run is not native execution evidence.
 
 The scheduled job runs:
 

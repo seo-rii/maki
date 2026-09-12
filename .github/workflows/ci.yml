@@ -28,6 +28,15 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: native NBD test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin
+          nbdkit --version
+          nbdinfo --version
+          nbdcopy --version
+          test -f /usr/include/nbdkit-plugin.h
       # SPEC §55 PR tier: unit, property smoke, codec, fake crypto, journal
       # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
       # smoke — all part of the default workspace suite. `--locked` keeps

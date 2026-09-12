@@ -6,9 +6,9 @@
 //!   populate; `_struct_size` includes the block_size callback so clients
 //!   can negotiate the configured limits. Other optional callbacks stay
 //!   NULL (multi-conn OFF, zero emulated via pwrite, trim absent).
-//! - The tokio runtime is created lazily at first `open`, which happens
-//!   after nbdkit forks — equivalent to the `after_fork` hook without
-//!   depending on newer struct fields.
+//! - `after_fork` initializes recovery, provider verification and the control
+//!   listener before announcing readiness. `open` only uses this adapter;
+//!   it never starts a runtime or retries a failed startup.
 //! - MUST be layout-verified against the distribution's nbdkit-plugin.h in
 //!   Linux qualification before production use (see docs/testing.md).
 
@@ -20,6 +20,9 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::adapter::NbdAdapter;
+
+#[path = "startup.rs"]
+mod startup;
 
 /// Values from `nbdkit-common.h` / `nbdkit-plugin.h` the shim depends on.
 /// `tests/review_abi.rs` compiles a C probe against the installed header
@@ -38,22 +41,27 @@ const API_VERSION: c_int = NBDKIT_API_VERSION;
 
 static CONFIG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static ADAPTER: OnceLock<NbdAdapter> = OnceLock::new();
+static STARTUP: startup::Startup = startup::Startup::new();
 
 fn adapter() -> Option<&'static NbdAdapter> {
-    if let Some(a) = ADAPTER.get() {
-        return Some(a);
-    }
-    let path = CONFIG_PATH.lock().clone()?;
-    match NbdAdapter::open_config(&path) {
-        Ok(a) => {
-            let _ = ADAPTER.set(a);
-            ADAPTER.get()
-        }
-        Err(e) => {
-            eprintln!("maki-nbdkit: attach failed: {e}");
-            None
-        }
-    }
+    STARTUP.ready().then(|| ADAPTER.get()).flatten()
+}
+
+unsafe extern "C" fn after_fork() -> c_int {
+    // run catches initialization panics and records failure permanently, so
+    // neither unwinding nor duplicate initialization can cross this ABI.
+    STARTUP.run(|| {
+        let path = CONFIG_PATH.lock().clone().ok_or("missing config path")?;
+        let adapter = NbdAdapter::open_config(&path).map_err(|error| error.to_string())?;
+        ADAPTER
+            .set(adapter)
+            .map_err(|_| "adapter already initialized")?;
+        // Publication precedes notification. If notification fails, open
+        // remains disabled and unload can still shut down the stored adapter.
+        startup::notify_ready(std::env::var_os("NOTIFY_SOCKET").as_deref())
+            .map_err(|error| format!("readiness notification: {error}"))?;
+        Ok(())
+    })
 }
 
 unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
@@ -317,7 +325,7 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     can_fast_zero: None,
     preconnect: None,
     get_ready: None,
-    after_fork: None,
+    after_fork: Some(after_fork),
     list_exports: None,
     default_export: None,
     export_description: None,
