@@ -33,6 +33,29 @@ SIGKILL 및 32MiB·swap 0의 실제 workload OOM을 확인했다. 세 시나리�
 DB ACK 시험을 대신하지 않는다. MAKI-020의 외부 qualification 및
 MAKI-025/028/049/050은 이 결과만으로 닫지 않으며 원본 리뷰를 보존한다.
 
+## Firecracker guest 강제 종료 검사 — 2026-09-12
+
+GCP의 폐기용 N2 인스턴스에서 중첩 KVM으로 Firecracker v1.16.1을 실행했다.
+게스트는 공식 Firecracker CI의 Linux 6.18.44 커널, 읽기 전용 rootfs와
+`Writeback`/`Sync`로 명시한 별도 data 이미지를 사용했다. release Maki와
+실제 AES-GCM-SIV nbdkit plugin이 8개 shard에 16개 4KiB 단위를 기록했다.
+L1의 독립 원장은 완전한 guest ACK만 `fsync`한 다음 해당 Firecracker
+process group을 `SIGKILL`하고 `-9` 종료를 회수했다.
+
+2회 smoke에 이어 새 data 이미지로 20회를 실행했다. FLUSH 10회와 FUA
+10회 모두 ACK 뒤 강제 종료됐고, 같은 UUID의 image를 사용하는 각 다음
+부팅에서 최신 16개 단위가 모두 인증된 읽기와 독립 SHA-256 대조를 통과했다.
+합계는 ACK 320개와 cold-boot readback 320개다. 마지막 hard cut 뒤 offline
+deep check도 durable sequence 320, journal 20 segment/320 record를 확인하고
+통과했다. 상세한 해시·실패 시행·재현 범위는
+[Firecracker 보고서](firecracker-validation-2026-09-12.md)에 기록한다.
+
+이 검사는 L2 guest RAM과 guest kernel/page cache를 잃는 실제 VM 경계를
+추가했다. L1 kernel/page cache와 GCP Persistent Disk는 계속 동작했으므로
+물리 정전, storage controller cache 소실, kernel NBD/LVM/XFS 또는 실제 DB
+commit 보존을 증명하지 않는다. 따라서 운영 승인 보류와 MAKI-020/049/050의
+종료 조건은 유지하며 원본 리뷰도 삭제하지 않는다.
+
 ## 검증 기준선
 
 커밋된 파일만 `git archive`로 분리하여 Rust 1.94.0, 저장소 Cargo.lock으로 검사했다. 기존 미추적 실험 파일은 포함하지 않았다.
@@ -501,7 +524,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 검사에 더해, 활성화 전 독립 PV label·전체 VG 목록 대조와 NBD device/발견한 VG UUID 제한을 제공. 관리자가 고정한 PV/VG/LV UUID, host udev 및 외부 root 조정은 남음 | 지원 토폴로지에서 활성화 전 독립 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 및 실제 대상 검증 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: native 초기 복구·provider 검증 후 READY, 명령 deadline, 기록 기반 recover 및 workload 시작 전 반복 가능한 read-only verify 제공. activation→proof 게시 crash 공백, 실제 DB READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
 | MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키와 gRPC private item 보호 완료. 공유 원본·serde scratch·tungstenite/tonic 등 별도 할당의 수명·잠금과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
-| MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
+| MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료. 실제 Firecracker guest hard cut 20회에서 필수 proof와 ACK readback은 보존됐으나 L1과 저장장치 cache는 살아 있었음. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, L1/물리 전원 차단, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
 | MAKI-025 | 부분 수정: segment streaming, 최신 replay 보유, deep checker payload 폐기 완료. 실제 cgroup OOM 후 32MiB 재기동은 일부 시험에서 READY 30초 제한을 넘겼고 192MiB 복구는 성공. 고유 단위·버전·metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한과 원래 자원 예산에서의 복구 시간을 검증. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
 | MAKI-028 | 부분 수정: 동일한 latest/durable 버전과 내부 checkpoint snapshot은 immutable ciphertext를 공유. 서로 다른 버전·공개 owned snapshot·slot codec·metadata 비용은 남음 | 실제 최대 overlay에서 peak RSS 한도 검증; 두 버전을 합산하는 보수적 논리 budget을 유지하며 전체 메모리 증거로 사용하지 않음 |
@@ -516,12 +539,12 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-038 | 전체 I/O 계약: provider stall/error가 NBD/XFS/DB에 미치는 지연·오류·복구 미검증 | 지원 timeout/error 설정에서 외부 DB ACK와 복구 데이터를 대조하고 최악 지연 목표 확인 |
 | MAKI-042/043/044 | 배포·장애 도메인: WAL/temp/log/backup 보호 범위, key/provider/Docker 부팅 순환, 공유 장치·provider 장애가 미확정 | 정확한 배포 경로·의존성·물리 topology를 고정하고 독립 장애와 공유 장애를 구분한 시험 |
 | MAKI-045/046 | 운영·패키징: 현재 버전의 새 호스트 설치/업그레이드 및 key/format을 포함한 전체 복원 증거 부족 | clean-host 권한·도구 버전 확인, DB-native backup과 별도 key/설정에서 복원 후 외부 데이터 대조 |
-| MAKI-049/050 | 외부 qualification·지원 범위: 현재 revision의 실제 DB·정전·장시간 결과와 DB별 ACK/이미지/topology가 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 외부 ACK/hash 대조와 성능·복원 승인 |
+| MAKI-049/050 | 외부 qualification·지원 범위: 고정 버전·digest의 Firecracker guest hard cut와 외부 ACK/hash 대조는 20회 통과. 실제 DB, L1/물리 정전, 장시간 결과와 DB별 이미지/topology는 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 실제 DB ACK/hash 대조와 성능·복원 승인 |
 
 MAKI-004의 명령 제한, MAKI-012/018/023/027/037/047, FUP-014의 Linux 경로 원인은 위 수정 기록으로 추적한다. MAKI-039의 storage 대기 제거는 검증했지만 별도 프로세스 heartbeat나 runtime 격리를 구현한 것은 아니다. 지원 기능과 선택적 성능 개선의 보류는 명시적인 지원 범위 결정으로 관리할 수 있으나, 이 문서에서 그 결정을 이미 승인된 것으로 간주하지 않는다.
 
 ## 운영 승인 조건
 
-먼저 위 코드·복구 과제를 수정하거나 검증 가능한 지원 범위로 결정해야 한다. 그다음 현재 revision의 실제 kernel NBD/LVM/XFS 및 서비스 재시작 검증, DB 외부 ACK 대조, 새 호스트 백업 복원, 정전과 장시간 부하 시험이 필요하다. rootless nbdkit 시험은 실제 native plugin 경로의 증거지만 kernel NBD/LVM/XFS/DB 정전 시험의 대체가 아니다. 과거 Debian smoke 역시 현재 helper 변경을 인증하지 않는다. 대상 VM/DB 이미지/용량과 지연·복구 목표는 아직 확정되지 않았다.
+먼저 위 코드·복구 과제를 수정하거나 검증 가능한 지원 범위로 결정해야 한다. 그다음 현재 revision의 실제 kernel NBD/LVM/XFS 및 서비스 재시작 검증, DB 외부 ACK 대조, 새 호스트 백업 복원, L1 또는 물리 정전과 장시간 부하 시험이 필요하다. rootless nbdkit과 Firecracker 시험은 실제 native plugin 및 guest crash 경로의 증거지만 kernel NBD/LVM/XFS/DB 정전 시험의 대체가 아니다. 과거 Debian smoke 역시 현재 helper 변경을 인증하지 않는다. 대상 VM/DB 이미지/용량과 지연·복구 목표는 아직 확정되지 않았다.
 
 초기 검증 프로파일은 고정 Linux 도구 버전, 단일 인증 provider, 단일 disposable volume/DB부터 시작할 수 있다. 다중 원격 서버의 실제 볼륨별 검증과 실패 전환 회귀는 수정했지만 목표 운영 topology 승인을 뜻하지 않는다. [검사와 qualification 절차](testing.md), [저장소 복구 제한](storage-recovery.md), 로컬 리뷰의 `05-release-plan.md` 승인 계획을 함께 적용한다. 외부에서 복원할 수 없는 유일한 원본 저장소로의 운영은 승인하지 않는다.

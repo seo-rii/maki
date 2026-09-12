@@ -47,8 +47,9 @@ tool availability. Native startup uses disposable files and Unix sockets; it
 does not attach a kernel NBD device or mount a filesystem. On developer hosts
 without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
-The Linux baseline also runs the Python fault-oracle regressions. Actual Docker
-cgroup OOM and freeze campaigns remain an opt-in host qualification step.
+The Linux baseline also runs the Python cgroup and Firecracker fault-oracle
+regressions. Actual Docker cgroup and KVM/Firecracker campaigns remain opt-in
+host qualification steps.
 
 The scheduled job runs:
 
@@ -159,6 +160,7 @@ systemd workloads or attach real devices; follow the
 | Kernel NBD, LVM, XFS, and fio | Functional smoke | Pass on Debian 12/KVM | Guarded privileged run completed on a disposable NBD target |
 | Real databases | Required | Partial | SQLite WAL smoke passed; crash campaigns and other engines remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
+| Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
 | QEMU hard power loss | 300+ cuts | Open | Simulation is not hardware evidence |
 | Mixed workload | 72 hours | Open | Dedicated hardware run not recorded |
 
@@ -171,6 +173,9 @@ The [September 12 fault report](cgroup-fault-validation-2026-09-12.md) records
 the new native process and cgroup executions, external ACK evidence, reproduction
 commands and the unresolved restart limit. The host was Debian, so no WSL
 shutdown was executed.
+The [Firecracker report](firecracker-validation-2026-09-12.md) records the
+separate guest-kernel/page-cache loss campaign, its host-fsynced ACK ledger,
+image hashes, cold-boot readbacks, and the boundary at the surviving L1 host.
 
 ## Database qualification
 
@@ -210,6 +215,16 @@ WRITE A with FUA succeeds; crash
 available but is not enabled in the main power-loss gate. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
+
+The opt-in Firecracker runner boots the same writable data image after each
+VMM `SIGKILL`. Its virtio data drive explicitly uses Firecracker `Writeback`
+cache semantics and synchronous host I/O, while the root filesystem remains
+read-only. A guest running the release Maki nbdkit plugin alternates FLUSH and
+FUA. Only complete guest ACK frames are fsynced into the L1 ledger, and the
+next boot reads and hashes the acknowledged units without receiving their
+expected hashes. This removes the guest kernel and guest page cache from the
+next recovery attempt. It does not cut power to the L1 kernel or persistent
+disk and therefore is not physical power-loss evidence.
 
 QEMU qualification uses a guest on a dedicated virtual disk, an external
 host-side acknowledgement ledger, randomized `virsh destroy` cuts, offline
