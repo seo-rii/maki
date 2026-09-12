@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use maki_crypto::{BatchCapability, Capability, CryptoCapabilities, CryptoContext};
+use maki_crypto_local::keysource::MapKeySource;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -139,11 +140,11 @@ fn sensitive_string() -> String {
 fn assert_sensitive_allocations_wiped(inspection: Inspection, minimum: usize) {
     assert_eq!(
         inspection.plaintext_deallocations, 0,
-        "sensitive JSON allocation was freed without zeroization: {inspection:?}"
+        "sensitive allocation was freed without zeroization: {inspection:?}"
     );
     assert!(
         inspection.zeroized >= minimum,
-        "expected at least {minimum} wiped JSON allocation(s): {inspection:?}"
+        "expected at least {minimum} wiped sensitive allocation(s): {inspection:?}"
     );
 }
 
@@ -309,6 +310,152 @@ fn test_provider(op: &OpSpec) -> HttpCryptoProvider {
             tls: None,
         },
     }
+}
+
+fn sensitive_credentials_spec(tls: Option<super::TlsSpec>) -> HttpProviderSpec {
+    let op = OpSpec {
+        method: "POST".to_string(),
+        path: "/unused".to_string(),
+        headers: vec![("authorization".to_string(), sensitive_string())],
+        query: vec![("api_key".to_string(), sensitive_string())],
+        body: BodySpec::Raw,
+        response: RespSpec {
+            kind: RespKind::Raw,
+            data_path: None,
+            encoding: PayloadEncoding::Base64,
+            items_path: None,
+            item_index_path: None,
+        },
+    };
+    HttpProviderSpec {
+        base_url: "http://127.0.0.1:1".to_string(),
+        encrypt: op.clone(),
+        decrypt: op,
+        capabilities: CryptoCapabilities {
+            provider_id: "credential-wipe-test".to_string(),
+            crypto_compatibility_id: "credential-wipe-test".to_string(),
+            supported_plaintext_sizes: vec![1],
+            max_ciphertext_size: 1,
+            stateless: true,
+            retry_safe: false,
+            batch: BatchCapability::default(),
+            integrity: Capability::Absent,
+            context_binding: Capability::Absent,
+            replay_protection: Capability::Absent,
+        },
+        timeout: Duration::from_millis(1),
+        max_response_bytes: 1,
+        tls,
+    }
+}
+
+#[test]
+fn provider_drop_erases_owned_header_and_query_values() {
+    let spec = sensitive_credentials_spec(None);
+
+    begin_inspection();
+    let provider = HttpCryptoProvider::new(spec).unwrap();
+    drop(provider);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 4);
+}
+
+#[test]
+fn provider_construction_error_erases_owned_credentials() {
+    let spec = sensitive_credentials_spec(Some(super::TlsSpec {
+        ca_pem: None,
+        // Keep this outside the watched allocation size. reqwest's parser may
+        // make transport-owned copies that this crate cannot erase.
+        identity_pem: Some(b"invalid client identity".to_vec()),
+    }));
+
+    begin_inspection();
+    let result = HttpCryptoProvider::new(spec);
+    assert!(result.is_err(), "invalid client identity was accepted");
+    drop(result);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 4);
+}
+
+#[test]
+fn tls_spec_drop_erases_identity_pem() {
+    let tls = super::TlsSpec {
+        ca_pem: None,
+        identity_pem: Some(vec![JSON_FILL; PAYLOAD_LEN]),
+    };
+
+    begin_inspection();
+    drop(tls);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn config_error_erases_a_resolved_credential_header() {
+    let mut config = maki_format::config::parse_config(
+        r#"
+config_schema_version = 1
+[volume]
+name = "credential-wipe-test"
+max_virtual_size = "1MiB"
+device_block_size = 512
+crypto_unit_size = 512
+shard_logical_size = "64KiB"
+[crypto]
+provider = "remote-http"
+crypto_compatibility_id = "credential-wipe-test"
+[crypto.capabilities]
+supported_plaintext_sizes = [512]
+max_ciphertext_size = 512
+[[crypto.http.endpoint]]
+name = "primary"
+url = "https://crypto.internal"
+[crypto.http.encrypt]
+method = "POST"
+path = "/encrypt"
+[crypto.http.encrypt.headers]
+Authorization = { source = "credential", name = "token", format = "{}" }
+[crypto.http.encrypt.body]
+type = "json"
+[crypto.http.encrypt.body.fields]
+"/data" = { source = "payload", encoding = "base64" }
+[crypto.http.decrypt]
+method = "POST"
+path = "/decrypt"
+[backing]
+root = "/tmp/unused"
+"#,
+    )
+    .unwrap();
+    config
+        .crypto
+        .http
+        .as_mut()
+        .unwrap()
+        .encrypt
+        .as_mut()
+        .unwrap()
+        .body
+        .as_mut()
+        .unwrap()
+        .fields
+        .get_mut("/data")
+        .unwrap()
+        .source = "invalid-after-credential-resolution".to_string();
+    let mut keys = MapKeySource::new();
+    keys.insert("token", vec![JSON_FILL; PAYLOAD_LEN]);
+
+    begin_inspection();
+    let result = HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys);
+    assert!(result.is_err(), "invalid field source was accepted");
+    drop(result);
+    let inspection = finish_inspection();
+
+    // The KeySource result and the resolved header allocation must both wipe.
+    assert_sensitive_allocations_wiped(inspection, 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

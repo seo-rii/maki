@@ -302,6 +302,19 @@ pub struct OpSpec {
     pub response: RespSpec,
 }
 
+fn zeroize_pair_values(pairs: &mut [(String, String)]) {
+    for (_, value) in pairs {
+        value.zeroize();
+    }
+}
+
+impl Drop for OpSpec {
+    fn drop(&mut self) {
+        zeroize_pair_values(&mut self.headers);
+        zeroize_pair_values(&mut self.query);
+    }
+}
+
 /// Header and query *values* are resolved credentials: never printed
 /// (C-11). Names stay visible for diagnostics.
 impl std::fmt::Debug for OpSpec {
@@ -329,6 +342,14 @@ pub struct TlsSpec {
     pub ca_pem: Option<Vec<u8>>,
     /// PEM client certificate + key for mTLS.
     pub identity_pem: Option<Vec<u8>>,
+}
+
+impl Drop for TlsSpec {
+    fn drop(&mut self) {
+        if let Some(identity) = &mut self.identity_pem {
+            identity.zeroize();
+        }
+    }
 }
 
 /// The identity PEM carries the client's private key: never printed.
@@ -375,6 +396,40 @@ impl std::fmt::Debug for HttpCryptoProvider {
 
 fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
+}
+
+/// Own header values while an operation specification is being assembled.
+/// Parsing a later field can fail before `OpSpec` takes over the wipe duty.
+#[derive(Default)]
+struct PendingHeaders(Vec<(String, String)>);
+
+impl PendingHeaders {
+    fn take(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for PendingHeaders {
+    fn drop(&mut self) {
+        zeroize_pair_values(&mut self.0);
+    }
+}
+
+/// Own a combined client certificate/private-key PEM before `TlsSpec` is
+/// complete. Once private-key bytes are appended, every early return must
+/// erase them.
+struct PendingIdentityPem(Vec<u8>);
+
+impl PendingIdentityPem {
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for PendingIdentityPem {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 /// Decode one JSON Pointer reference token (RFC 6901 §4): `~1` is `/` and
@@ -754,13 +809,13 @@ impl HttpCryptoProvider {
             .as_ref()
             .ok_or_else(|| fatal("missing [crypto.http] section"))?;
         let build_op = |op_cfg: &maki_format::config::HttpOpConfig| -> Result<OpSpec, CryptoError> {
-            let mut headers = Vec::new();
+            let mut headers = PendingHeaders::default();
             for (name, value) in &op_cfg.headers {
                 let resolved = match value {
                     HeaderValue::Literal(v) => v.clone(),
                     HeaderValue::Credential(cred) => {
                         let secret = keys.load(&cred.name)?;
-                        let text = String::from_utf8(secret.expose().to_vec())
+                        let text = std::str::from_utf8(secret.expose())
                             .map_err(|_| fatal("credential is not valid UTF-8"))?;
                         match &cred.format {
                             Some(template) => template.replace("{}", text.trim()),
@@ -768,7 +823,7 @@ impl HttpCryptoProvider {
                         }
                     }
                 };
-                headers.push((name.clone(), resolved));
+                headers.0.push((name.clone(), resolved));
             }
             let body = match &op_cfg.body {
                 None => BodySpec::Raw,
@@ -816,7 +871,7 @@ impl HttpCryptoProvider {
             Ok(OpSpec {
                 method: op_cfg.method.clone(),
                 path: op_cfg.path.clone(),
-                headers,
+                headers: headers.take(),
                 query: op_cfg
                     .query
                     .iter()
@@ -883,17 +938,17 @@ impl HttpCryptoProvider {
                 };
                 let identity_pem = match &t.client_cert_file {
                     Some(path) => {
-                        let mut pem = read("client_cert_file", path)?;
+                        let mut pem = PendingIdentityPem(read("client_cert_file", path)?);
                         if let Some(key) = &t.client_key {
                             // Private key from its credential source, appended
                             // to the certificate PEM for the client identity.
                             let secret = keys.load(&key.name)?;
-                            if !pem.ends_with(b"\n") {
-                                pem.push(b'\n');
+                            if !pem.0.ends_with(b"\n") {
+                                pem.0.push(b'\n');
                             }
-                            pem.extend_from_slice(secret.expose());
+                            pem.0.extend_from_slice(secret.expose());
                         }
-                        Some(pem)
+                        Some(pem.take())
                     }
                     None => {
                         if t.client_key.is_some() {
