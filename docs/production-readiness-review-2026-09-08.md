@@ -141,6 +141,17 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-015의 WebSocket decoded-output 단위는 별도로 완료했다. 부분 base64
+디코딩 오류와 뒤 항목 거절에서 해제 직전 평문 잔존을 확인한 RED 2개를
+먼저 실행했다(PID 505010, exit 101;
+`/home/seorii/logs/maki-r3-ws-decoded-secrets-red-20260912T095528.092317Z.log`).
+출력 처음부터 `SecretBuffer`로 소유한 뒤 전체 WebSocket 28 passed, exit 0
+(PID 514438; `/home/seorii/logs/maki-r3-ws-decoded-secrets-green-20260912T095638.444940Z.log`),
+strict Clippy exit 0(PID 517699;
+`/home/seorii/logs/maki-r3-ws-decoded-secrets-clippy-20260912T095733.902307Z.log`)을
+확인했다. JSON/base64 문자열과 transport 내부 복사본은 이 수정의 범위가
+아니다. [소유권과 남은 범위](transport-memory.md)를 별도로 명시한다.
+
 로컬 리뷰의 `01-prior-50-status.md`(MAKI-001–050)와 `02-followup-15-status.md`(FUP-001–015)의 번호를 유지한다. R3-001–006/009/010의 수정은 MAKI-001/009/010/011과 FUP-001/007/009/010/011/013의 해당 원인을 포함한다. grow는 MAKI-002/003과 FUP-003, 지원 foreground drain은 MAKI-008과 FUP-005의 해당 원인을 포함한다. MAKI-016/017/026 및 FUP-002/006/008/012/015의 이전 수정은 유지하며, 최종 snapshot 실행 여부는 위 절에서 별도로 기록한다.
 
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |

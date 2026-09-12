@@ -267,7 +267,10 @@ separate privileged `lvextend` and `xfs_growfs` operation.
   runtime layout lets `maki-admin` reach it through a separate directory tree
   while keeping the NBD runtime tree restricted to the daemon's group.
 - Privileged storage operations are isolated in `maki-attach`.
-- Keys and plaintext use redacted, zeroizing buffers and must not be logged.
+- Keys and plaintext must not be logged. `SecretBuffer` owners are redacted
+  and zeroized; remote serialization also creates allocations with separate
+  lifetimes. See [transport memory protection](transport-memory.md) for the
+  verified ownership boundaries and remaining copies.
 - Optional buffer page locks have shared ownership: buffers on the same page
   keep it locked until the final owner releases it. Drop zeroizes before
   releasing ownership; `into_vec` transfers zeroization to the caller and

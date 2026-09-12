@@ -393,7 +393,7 @@ impl WsCryptoProvider {
         op: &str,
         context: &CryptoContext,
         items: &[(u64, &[u8])],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let mut last_err = None;
         let attempts = if self.spec.capabilities.retry_safe {
             2
@@ -429,7 +429,7 @@ impl WsCryptoProvider {
         &self,
         response: &Value,
         requested: &[(u64, &[u8])],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let expected = requested.len();
         if let Some(error) = response.get("error") {
             // The remote error *message* is untrusted and may reflect secrets
@@ -499,9 +499,32 @@ impl WsCryptoProvider {
                     .get("data")
                     .and_then(|d| d.as_str())
                     .ok_or_else(|| CryptoError::Contract("item missing data".to_string()))?;
-                base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|e| CryptoError::Contract(format!("bad base64: {e}")))
+                // STANDARD requires complete four-byte groups, including
+                // canonical padding. Divide before multiplying so the exact
+                // output length cannot overflow. A nonempty group yields
+                // three bytes before subtracting at most two padding bytes.
+                let bytes = data.as_bytes();
+                if !bytes.len().is_multiple_of(4) {
+                    return Err(CryptoError::Contract(
+                        "bad base64: invalid encoded length".into(),
+                    ));
+                }
+                let padding =
+                    usize::from(bytes.ends_with(b"=")) + usize::from(bytes.ends_with(b"=="));
+                let decoded_len = bytes.len() / 4 * 3 - padding;
+                // Own the zeroization/page-lock guard before the first
+                // decoded byte. A late decoder failure wipes partial output;
+                // a later item failure also wipes all earlier decoded items.
+                let mut decoded = SecretBuffer::zeroed(decoded_len);
+                let written = base64::engine::general_purpose::STANDARD
+                    .decode_slice(data, decoded.expose_mut())
+                    .map_err(|e| CryptoError::Contract(format!("bad base64: {e}")))?;
+                if written != decoded_len {
+                    return Err(CryptoError::Contract(
+                        "bad base64: decoded length mismatch".into(),
+                    ));
+                }
+                Ok(decoded)
             })
             .collect()
     }
@@ -528,7 +551,7 @@ impl CryptoProvider for WsCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| CiphertextUnit {
                 unit_index: item.unit_index,
-                data,
+                data: data.into_vec(),
             })
             .collect())
     }
@@ -548,8 +571,12 @@ impl CryptoProvider for WsCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| PlaintextUnit {
                 unit_index: item.unit_index,
-                data: SecretBuffer::from_vec(data),
+                data,
             })
             .collect())
     }
 }
+
+#[cfg(test)]
+#[path = "decoded_response_tests.rs"]
+mod decoded_response_tests;
