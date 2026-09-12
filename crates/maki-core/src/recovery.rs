@@ -29,16 +29,14 @@
 //! offline deep checker reuses it verbatim, so "what recovery would do" and
 //! "what the checker reports" can never drift apart.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use maki_format::journal::{
-    max_segment_file_size, scan_segment_bounded, DurableMark, JournalRecord, ScanOutcome,
-    SegmentHeader, DURABLE_MARK_SIZE, SEGMENT_HEADER_SIZE,
+    max_segment_file_size, DurableMark, JournalRecord, ScanOutcome, SegmentHeader,
+    DURABLE_MARK_SIZE, SEGMENT_HEADER_SIZE,
 };
 use maki_format::layout;
 use maki_format::superblock::Superblock;
@@ -46,6 +44,10 @@ use maki_format::FormatError;
 
 use crate::journal::{rewrite_verified_range, SegmentInfo};
 use crate::store::SlotStore;
+
+#[path = "recovery_scan.rs"]
+mod scan;
+use scan::{range_is_zero, SegmentScanner};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
@@ -231,6 +233,10 @@ pub fn load_checkpoint_state(backing: &Arc<dyn Backing>) -> Result<CheckpointSta
 
 /// Read-only journal scan: verifies every segment, decides the repairs a
 /// recovery would apply, and collects the records newer than the checkpoint.
+/// Segment validation uses fixed read scratch and at most one bounded payload
+/// candidate; checkpoint-covered payloads are discarded immediately. The replay
+/// result still retains all uncovered payloads and is not a total recovery-memory
+/// bound (MAKI-025 remains partially addressed).
 pub fn scan_journal(
     backing: &Arc<dyn Backing>,
     superblock: &Superblock,
@@ -297,14 +303,14 @@ pub fn scan_journal(
             )));
         }
 
-        let mut image = vec![0u8; len as usize];
-        file.read_at(0, &mut image)?;
-        let header = match SegmentHeader::decode(&image[..SEGMENT_HEADER_SIZE]) {
+        let mut header_bytes = [0u8; SEGMENT_HEADER_SIZE];
+        file.read_at(0, &mut header_bytes)?;
+        let header = match SegmentHeader::decode(&header_bytes) {
             Ok(h) => h,
             Err(e) => {
                 // A never-written (zero-filled) final segment is a creation
                 // crash; anything else with a full-sized header is damage.
-                if is_last && marked_durable.is_none() && image.iter().all(|b| *b == 0) {
+                if is_last && marked_durable.is_none() && range_is_zero(file.as_ref(), 0..len)? {
                     repairs.push(JournalRepair::Discard { path });
                     continue;
                 }
@@ -334,7 +340,7 @@ pub fn scan_journal(
             )));
         }
 
-        let body = &image[SEGMENT_HEADER_SIZE..];
+        let body_len = len - SEGMENT_HEADER_SIZE as u64;
         // Non-final segments were fdatasync'd in full before their
         // successor was created; the final one is durable up to the mark.
         // Without a mark for it (the mark's plain write was lost in the
@@ -344,18 +350,26 @@ pub fn scan_journal(
         // records persist in any order, and an intact record after a torn
         // one is a normal crash state (M-007, S-04).
         let durable_len = if is_last {
-            Some(
-                marked_durable
-                    .map(|d| (d as usize).saturating_sub(SEGMENT_HEADER_SIZE))
-                    .unwrap_or(0),
-            )
+            marked_durable
+                .map(|d| d.saturating_sub(SEGMENT_HEADER_SIZE as u64))
+                .unwrap_or(0)
         } else {
-            Some(body.len())
+            body_len
         };
-        let (records, outcome) = scan_segment_bounded(body, header.base_sequence, durable_len);
+        let scanned = SegmentScanner {
+            file: file.as_ref(),
+            header: &header_bytes,
+            body_len,
+            first_sequence: header.base_sequence,
+            durable_len,
+            geometry: &superblock.geometry,
+            checkpoint_sequence,
+            name: &name,
+        }
+        .scan(&mut replay)?;
 
         let mut size = len;
-        match outcome {
+        match scanned.outcome {
             ScanOutcome::Clean => {
                 // A clean scan may still end in a zero-filled tail (a torn
                 // unsynced record whose sectors never arrived). It is
@@ -364,9 +378,8 @@ pub fn scan_journal(
                 // segment is durable in full — the same zeros would then be
                 // corruption. Normalize the final segment to exactly its
                 // records so no sealed segment ever carries a zero tail.
-                let records_end: usize = records.iter().map(|r| 32 + r.payload.len()).sum();
-                if is_last && records_end < body.len() {
-                    size = SEGMENT_HEADER_SIZE as u64 + records_end as u64;
+                if is_last && scanned.valid_body_bytes < body_len {
+                    size = SEGMENT_HEADER_SIZE as u64 + scanned.valid_body_bytes;
                     repairs.push(JournalRepair::Truncate {
                         path: path.clone(),
                         len: size,
@@ -411,7 +424,7 @@ pub fn scan_journal(
                 }
             }
         }
-        let record_count = records.len() as u64;
+        let record_count = scanned.record_count;
         let last = if record_count > 0 {
             header.base_sequence + record_count - 1
         } else {
@@ -419,33 +432,6 @@ pub fn scan_journal(
         };
         prev_last_seq = Some(last);
         max_seq = max_seq.max(last);
-
-        for record in records {
-            // A CRC-valid record can still be nonsense for *this* volume
-            // (forged, or a journal from another geometry): replaying it
-            // would create an out-of-range shard or an oversized slot that
-            // the next open rejects. Refuse it here instead.
-            if record.unit_index >= superblock.geometry.num_units() {
-                return Err(RecoveryError::Corrupt(format!(
-                    "journal segment {name}: record {} names unit {} beyond the device ({} units)",
-                    record.sequence,
-                    record.unit_index,
-                    superblock.geometry.num_units()
-                )));
-            }
-            if record.payload.len() > superblock.geometry.max_ciphertext_size as usize {
-                return Err(RecoveryError::Corrupt(format!(
-                    "journal segment {name}: record {} payload of {} bytes exceeds the volume's \
-                     maximum ciphertext size {}",
-                    record.sequence,
-                    record.payload.len(),
-                    superblock.geometry.max_ciphertext_size
-                )));
-            }
-            if record.sequence > checkpoint_sequence {
-                replay.push(record);
-            }
-        }
 
         segments.push(SegmentInfo {
             index,
@@ -456,12 +442,10 @@ pub fn scan_journal(
         // This fingerprint is ephemeral, never written to the disk format.
         // CRC32 over CRC-protected headers would have a constant residue
         // and fail to bind their contents, so use a different hash here.
-        let mut fingerprint = DefaultHasher::new();
-        fingerprint.write(&image[..size as usize]);
         verified_prefixes.push(VerifiedPrefix {
             path,
             len: size,
-            fingerprint: fingerprint.finish(),
+            fingerprint: scanned.fingerprint,
         });
     }
 
