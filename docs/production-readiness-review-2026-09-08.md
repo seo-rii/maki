@@ -120,6 +120,13 @@ MAKI-020은 위 RED를 출발점으로, 양쪽 proof의 게시와 보존, 실패
 
 한쪽 proof가 사라지거나 오래되거나 손상되어도 다른 쪽에 현재 proof가 남으면 required horizon은 낮아지지 않는다. 둘 다 없거나 유효하지 않으면 빈 볼륨도 거절한다. CRC 위조나 양쪽 proof와 backing 전체의 유효한 과거 상태로의 동시 rollback은 막지 않으며 A/B 파일은 독립 물리 장애 도메인이 아니다. 추가 metadata/directory sync의 실제 FUA/FLUSH 지연과 지원 손상 모델의 운영 대상 검증이 남는다. 아래 잔여 항목은 로컬 테스트 통과만으로 자동 해결되지 않는다.
 
+실제 Volume 복구의 최신 replay 보유 단위는 별도로 core 174 passed, 0 failed,
+6 ignored 및 strict Clippy exit 0을 확인했다. 로그
+`/home/seorii/logs/maki-r3-latest-replay-verified-core-20260912T094305.274290Z.log`,
+PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 heap peak는
+두 경우 모두 33,988 bytes였다. 이 후속 수정은 `1bc0ab5` 검증 snapshot에
+포함되지 않으며 별도 최종 검사로 추적한다.
+
 ## 남은 리뷰 항목과 종료 조건
 
 로컬 리뷰의 `01-prior-50-status.md`(MAKI-001–050)와 `02-followup-15-status.md`(FUP-001–015)의 번호를 유지한다. R3-001–006/009/010의 수정은 MAKI-001/009/010/011과 FUP-001/007/009/010/011/013의 해당 원인을 포함한다. grow는 MAKI-002/003과 FUP-003, 지원 foreground drain은 MAKI-008과 FUP-005의 해당 원인을 포함한다. MAKI-016/017/026 및 FUP-002/006/008/012/015의 이전 수정은 유지하며, 최종 snapshot 실행 여부는 위 절에서 별도로 기록한다.
@@ -131,7 +138,7 @@ MAKI-020은 위 RED를 출발점으로, 양쪽 proof의 게시와 보존, 실패
 | MAKI-015/032 | 코드: 논리·암호문 budget 수정은 완료했으나 WS/gRPC 직렬화와 codec의 일반 평문 복사본 수명·전체 resident 비용이 남음 | 성공·오류·취소마다 소유 버퍼 정리와 peak resident 상한을 검증하고 전송 계층의 남는 보장 범위를 명시 |
 | MAKI-020 | v2 코드·집중 회귀 구현 완료, 전체 검사·운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 새 통합 커밋 전체 gates와 지원 복합 fault qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 코드·용량: free-space threshold는 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약이 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
-| MAKI-025 | 부분 수정: `133d36d`의 streaming으로 covered-segment 추가 heap peak는 135,397,624→488바이트; 64KiB stack scratch 별도. replay payload는 여전히 누적되며 전체 RSS 상한 없음 | replay까지 bounded streaming 또는 검증된 hard memory admission을 적용해 목표 journal 크기에서 OOM 없이 복구·명시 거절하고 peak RSS 검증 |
+| MAKI-025 | 부분 수정: segment streaming과 실제 Volume attach의 단위별 최신 replay 보유로 반복 overwrite 이력의 payload/pending 인덱스 증가를 제거. 고유 단위, overlay 두 사본, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
 | MAKI-028 | 자원 구조: latest/durable/checkpoint overlay의 ciphertext 중복이 남음 | 실제 최대 overlay에서 peak RSS 한도 검증, 필요 시 보관 구조 수정; 논리 budget 통과를 전체 메모리 증거로 사용하지 않음 |
 | MAKI-029/030 | 구조·성능: checkpoint의 exclusive lock과 async worker 위 동기 backing I/O가 남음 | 목표 부하의 최악 I/O 정지·runtime 여유를 검증하고 기준 미달 시 작업 격리/잠금 범위 수정. MAKI-039의 snapshot이 이를 해결한 것은 아님 |
 | MAKI-013 | 위협 모델: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음 | replay를 지원 위협 모델에서 제외하는 결정과 제한을 명시하거나 세대 인증·독립 anchor를 구현하고 공격 회귀 실행 |

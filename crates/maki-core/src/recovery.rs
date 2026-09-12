@@ -29,6 +29,7 @@
 //! offline deep checker reuses it verbatim, so "what recovery would do" and
 //! "what the checker reports" can never drift apart.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
@@ -115,9 +116,63 @@ struct VerifiedPrefix {
     fingerprint: u64,
 }
 
+/// The public scan/recovery APIs expose every uncovered record. Volume attach
+/// needs only the latest version of each unit: all surviving records become
+/// durable before the overlay is exposed. Select retention independently of
+/// validation so superseded records still undergo every durability check.
+enum ReplayRecords {
+    All(Vec<JournalRecord>),
+    Latest(BTreeMap<u64, JournalRecord>),
+}
+
+impl ReplayRecords {
+    fn push(&mut self, record: JournalRecord) {
+        match self {
+            Self::All(records) => records.push(record),
+            Self::Latest(records) => {
+                records.insert(record.unit_index, record);
+            }
+        }
+    }
+
+    fn into_records(self) -> Vec<JournalRecord> {
+        match self {
+            Self::All(records) => records,
+            Self::Latest(records) => {
+                let mut records: Vec<_> = records.into_values().collect();
+                records.sort_unstable_by_key(|record| record.sequence);
+                records
+            }
+        }
+    }
+}
+
 /// Recover a volume. `segment_size` is the writer's effective segment size;
 /// it bounds how large any segment file may legitimately be.
 pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovered, RecoveryError> {
+    recover_with_replay(backing, segment_size, ReplayRecords::All(Vec::new()))
+}
+
+/// Attach retains only the latest uncovered record per unit, bounding history
+/// retention independently of overwrite count. Unique units, the eventual
+/// overlay's two versions, and segment/allocation metadata still consume memory;
+/// this is not a fixed total recovery-memory bound (MAKI-025 remains partial).
+pub(crate) fn recover_latest(
+    backing: &Arc<dyn Backing>,
+    segment_size: u64,
+) -> Result<Recovered, RecoveryError> {
+    recover_with_replay(
+        backing,
+        segment_size,
+        ReplayRecords::Latest(BTreeMap::new()),
+    )
+}
+
+fn recover_with_replay(
+    backing: &Arc<dyn Backing>,
+    segment_size: u64,
+    replay: ReplayRecords,
+) -> Result<Recovered, RecoveryError> {
     // 1. exclusive volume lock
     let lock = acquire_lock(backing)?;
 
@@ -146,6 +201,7 @@ pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovere
         checkpoint_state.checkpoint_sequence,
         segment_size,
         Some(&durable_proof),
+        replay,
     )?;
     // The selected checkpoint state gates which journal segments a later
     // checkpoint may reclaim (`allow_covered_holes_below`, `delete_covered`).
@@ -293,6 +349,7 @@ pub fn scan_journal(
         checkpoint_sequence,
         segment_size,
         proof.as_ref(),
+        ReplayRecords::All(Vec::new()),
     )
 }
 
@@ -302,6 +359,7 @@ fn scan_journal_with_proof(
     checkpoint_sequence: u64,
     segment_size: u64,
     proof: Option<&DurableProof>,
+    mut replay: ReplayRecords,
 ) -> Result<JournalScan, RecoveryError> {
     // V2 never relies solely on this optional advisory lower bound.
     let mark = load_durable_mark(backing)?;
@@ -317,7 +375,6 @@ fn scan_journal_with_proof(
 
     let max_file_size = max_segment_file_size(segment_size);
     let mut segments: Vec<SegmentInfo> = Vec::new();
-    let mut replay: Vec<JournalRecord> = Vec::new();
     let mut repairs: Vec<JournalRepair> = Vec::new();
     let mut prev_last_seq: Option<u64> = None;
     let mut max_seq: u64 = 0;
@@ -437,7 +494,7 @@ fn scan_journal_with_proof(
             checkpoint_sequence,
             name: &name,
         }
-        .scan(&mut replay)?;
+        .scan(|record| replay.push(record))?;
         if required.is_some_and(|p| p.segment_index == index) {
             required_seen = true;
         }
@@ -553,7 +610,7 @@ fn scan_journal_with_proof(
         durable_sequence,
         next_segment_index,
         segments,
-        replay,
+        replay: replay.into_records(),
         repairs,
         mark: final_mark,
         verified_prefixes,

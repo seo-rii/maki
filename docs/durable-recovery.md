@@ -96,11 +96,30 @@ syncs to journal barriers. The current store uses two complete A/B stores;
 measure FUA/FLUSH tail latency and recovery time on the intended backing before
 choosing a production configuration.
 
-Journal scanning now streams segment contents. The covered-segment fixture
-used for MAKI-025 reduced additional heap peak from 135,397,624 bytes to 488
-bytes; fixed 64 KiB stack scratch is accounted separately. This fixture does
-not bound whole-engine RSS: replay payloads, overlay versions, bitmaps, and
-other metadata remain separate memory costs.
+Journal scanning streams segment contents. Volume attach additionally retains
+only the latest validated record per unit, so repeated overwrites do not retain
+all historical payloads or fill the overlay's pending-promotion index. Every
+record still undergoes sequence, CRC, geometry and required-boundary checks;
+a damaged superseded record cannot be skipped.
+
+The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
+
+| Measured heap peak | 1 MiB history | 64 MiB history |
+|---|---:|---:|
+| Volume recovery before latest-record retention, four overwritten units | 1,060,000 bytes | 67,765,408 bytes |
+| Volume recovery with latest-record retention, the same four units | 33,988 bytes | 33,988 bytes |
+| Checkpoint-covered public scan, including v2 metadata loading | 8,260 bytes | 8,260 bytes |
+
+These are allocations made by the measured recovery thread, not process RSS or
+filesystem cache. Fixed stack scratch is separate. The earlier 488-byte
+covered-scan result in `133d36d` predates v2 envelope/proof loading and is a
+historical intermediate result.
+
+MAKI-025 remains partial. Distinct units, the overlay's latest/durable copies,
+segment metadata, shard catalogs and allocation maps still consume memory.
+The public `scan_journal` and `recovery::recover` APIs retain their all-record
+return contract; the deep checker still uses that public scan. No new arbitrary
+RAM refusal limit has been applied to existing readable volumes.
 
 The MAKI-020 codec/store and focused integration regressions pass locally.
 They are not a current full release-gate, actual DB, or hardware power-loss

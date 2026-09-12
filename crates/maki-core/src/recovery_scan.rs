@@ -80,8 +80,11 @@ pub(super) struct SegmentScanner<'a> {
 impl SegmentScanner<'_> {
     /// Only uncovered, CRC-valid, geometry-valid payloads are retained. A
     /// covered record or an invalid geometry candidate uses fixed scratch;
-    /// the returned replay collection remains a separate memory consumer.
-    pub fn scan(self, replay: &mut Vec<JournalRecord>) -> Result<SegmentBodyScan, RecoveryError> {
+    /// the caller controls whether superseded records remain in memory.
+    pub fn scan(
+        self,
+        mut accept: impl FnMut(JournalRecord),
+    ) -> Result<SegmentBodyScan, RecoveryError> {
         let mut fingerprint = DefaultHasher::new();
         fingerprint.write(self.header);
         let mut scratch = [0u8; READ_CHUNK];
@@ -233,7 +236,7 @@ impl SegmentScanner<'_> {
                 }
             }
             if let Some(payload) = payload {
-                replay.push(JournalRecord {
+                accept(JournalRecord {
                     sequence: header.sequence,
                     unit_index: header.unit,
                     payload,
@@ -360,7 +363,7 @@ mod tests {
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
         }
-        .scan(&mut Vec::new());
+        .scan(|_| {});
         assert!(
             matches!(result, Err(RecoveryError::Io(_))),
             "a torn-tail decision must not bypass unreadable remaining bytes"
@@ -403,7 +406,7 @@ mod tests {
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
         }
-        .scan(&mut Vec::new())
+        .scan(|_| {})
     }
 
     #[test]

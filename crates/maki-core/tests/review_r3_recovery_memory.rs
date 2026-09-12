@@ -1,6 +1,6 @@
-//! MAKI-025 (partial): segment scan scratch must not grow with journal size.
-//! The uncheckpointed replay result and the eventual overlay are separate,
-//! still-unbounded consumers; these tests isolate checkpoint-covered input.
+//! MAKI-025 (partial): fixed segment scratch and latest-record retention on
+//! volume attach. Unique units, overlay copies, segment/allocation metadata,
+//! and the public all-record scan API still have separate memory costs.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use maki_backing::{Backing, FileBacking};
 use maki_core::recovery::{scan_journal, JournalRepair, RecoveryError};
 use maki_core::volume::{Volume, VolumeOptions};
+use maki_format::durable_proof::DurableProofStore;
 use maki_format::geometry::Geometry;
 use maki_format::journal::{
     encode_record, scan_segment_bounded, DurableMark, JournalRecord, ScanOutcome, SegmentHeader,
@@ -178,6 +179,155 @@ fn checkpoint_covered_segments_use_bounded_scan_memory() {
         large.peak <= 512 * 1024 && large.peak <= small.peak + 64 * 1024,
         "covered records must be discarded during scanning: small={small:?}, large={large:?}"
     );
+}
+
+fn overwrite_fixture(records: u64) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.segment(&[], None);
+    let file = fixture
+        .backing
+        .open(&layout::journal_segment(0), false)
+        .unwrap();
+    let mut position = SEGMENT_HEADER_SIZE as u64;
+    for sequence in 1..=records {
+        let bytes = encode_record(&JournalRecord {
+            sequence,
+            unit_index: (sequence - 1) % 4,
+            payload: vec![sequence as u8; 4096],
+        });
+        file.write_at(position, &bytes).unwrap();
+        position += bytes.len() as u64;
+    }
+    file.sync_data().unwrap();
+    fixture.backing.sync_dir(layout::JOURNAL_DIR).unwrap();
+    let mut proof =
+        DurableProofStore::load(fixture.backing.as_ref(), fixture.superblock.volume_uuid).unwrap();
+    proof.durable_sequence = records;
+    proof.segment_index = 0;
+    proof.durable_size = position;
+    DurableProofStore::advance(fixture.backing.as_ref(), &mut proof).unwrap();
+    fixture
+}
+
+fn overwrite_recovery_allocations(records: u64) -> Allocations {
+    let fixture = overwrite_fixture(records);
+    // Measure the entire attach-level recovery, including overlay rebuilding
+    // and promotion. Fixtures and assertions allocate outside this interval.
+    ALLOCATIONS.with(|cell| cell.set(Some(Allocations::default())));
+    let result = Volume::recover(fixture.backing.clone(), VolumeOptions::default());
+    let stats = ALLOCATIONS.with(|cell| cell.replace(None).unwrap());
+    let volume = result.unwrap();
+    assert_eq!(volume.journal_durable_sequence(), records);
+    assert_eq!(volume.overlay_len(), 4);
+    assert_eq!(volume.overlay_bytes(), 2 * 4 * 4096);
+    for unit in 0..4 {
+        let latest = records - ((records - 1 - unit) % 4);
+        assert_eq!(
+            volume.read_ct(unit).unwrap().unwrap(),
+            (latest, vec![latest as u8; 4096])
+        );
+    }
+    stats
+}
+
+#[test]
+fn repeated_overwrites_use_memory_for_latest_units_during_full_recovery() {
+    let small = overwrite_recovery_allocations(256);
+    let large = overwrite_recovery_allocations(16_384);
+    eprintln!("overwrite recovery allocations: small={small:?}, large={large:?}");
+    assert!(
+        large.largest <= 128 * 1024,
+        "recovery must not retain all record descriptors: small={small:?}, large={large:?}"
+    );
+    assert!(
+        large.peak <= 512 * 1024 && large.peak <= small.peak + 64 * 1024,
+        "replay and promotion must retain latest units, not history: small={small:?}, large={large:?}"
+    );
+}
+
+#[test]
+fn superseded_durable_record_damage_is_still_rejected() {
+    let fixture = overwrite_fixture(12);
+    let file = fixture
+        .backing
+        .open(&layout::journal_segment(0), false)
+        .unwrap();
+    // Sequence 1 has already been overwritten twice. Its bytes still belong
+    // to the required durable prefix, even without the optional mark.
+    file.write_at((SEGMENT_HEADER_SIZE + 32) as u64, &[0x80])
+        .unwrap();
+    file.sync_data().unwrap();
+    let result = Volume::recover(fixture.backing.clone(), VolumeOptions::default());
+    let error = match result {
+        Err(RecoveryError::Corrupt(error)) => error,
+        Err(error) => panic!("expected durable corruption, got {error}"),
+        Ok(_) => panic!("superseded durable damage was accepted"),
+    };
+    // Scanning stops at the damaged old record, so the required-boundary
+    // check refuses the scan before its requested H=12 can be reached.
+    assert!(error.contains("required durable record 12"), "{error}");
+}
+
+#[test]
+fn public_scan_preserves_all_superseded_records_in_sequence_order() {
+    let fixture = overwrite_fixture(12);
+    let scan = scan_journal(&fixture.backing, &fixture.superblock, 0, 256 << 20).unwrap();
+    assert_eq!(scan.replay.len(), 12);
+    for (index, record) in scan.replay.iter().enumerate() {
+        let sequence = index as u64 + 1;
+        assert_eq!(record.sequence, sequence);
+        assert_eq!(record.unit_index, (sequence - 1) % 4);
+        assert_eq!(record.payload, vec![sequence as u8; 4096]);
+    }
+    let recovered = maki_core::recovery::recover(&fixture.backing, 256 << 20).unwrap();
+    assert_eq!(recovered.replay, scan.replay);
+}
+
+#[test]
+fn latest_replay_spans_segments_and_checkpoints_the_latest_versions() {
+    let fixture = Fixture::new();
+    let options = VolumeOptions {
+        journal_segment_size: 4096,
+    };
+    let mut volume = Volume::recover(fixture.backing.clone(), options.clone()).unwrap();
+    for sequence in 1..=24 {
+        assert_eq!(
+            volume
+                .write_ct((sequence - 1) % 4, &[sequence as u8; 512], false)
+                .unwrap(),
+            sequence
+        );
+        if sequence == 8 {
+            volume.flush().unwrap();
+            assert_eq!(volume.checkpoint().unwrap(), 8);
+        }
+    }
+    volume.flush().unwrap();
+    assert!(volume.journal_segment_count() > 1);
+    drop(volume);
+
+    let mut volume = Volume::recover(fixture.backing.clone(), options.clone()).unwrap();
+    assert_eq!(volume.checkpoint_sequence(), 8);
+    assert_eq!(volume.journal_durable_sequence(), 24);
+    assert_eq!(volume.overlay_len(), 4);
+    for unit in 0..4 {
+        assert_eq!(
+            volume.read_ct(unit).unwrap().unwrap(),
+            (21 + unit, vec![(21 + unit) as u8; 512])
+        );
+    }
+    assert_eq!(volume.checkpoint().unwrap(), 24);
+    drop(volume);
+
+    let volume = Volume::recover(fixture.backing.clone(), options).unwrap();
+    assert_eq!(volume.checkpoint_sequence(), 24);
+    assert_eq!(volume.overlay_len(), 0);
+    for unit in 0..4 {
+        assert_eq!(
+            volume.read_ct(unit).unwrap().unwrap(),
+            (21 + unit, vec![(21 + unit) as u8; 512])
+        );
+    }
 }
 
 #[test]

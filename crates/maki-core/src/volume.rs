@@ -22,7 +22,7 @@ use crate::error::CoreError;
 use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
-use crate::recovery::{recover, Recovered, RecoveryError};
+use crate::recovery::{recover_latest, Recovered, RecoveryError};
 use crate::store::{SlotRead, SlotStore};
 
 #[derive(Debug, Clone)]
@@ -66,7 +66,7 @@ impl Volume {
             next_segment_index,
             segments,
             replay,
-        } = recover(&backing, segment_size)?;
+        } = recover_latest(&backing, segment_size)?;
 
         let mut journal = JournalWriter::resume(
             backing.clone(),
@@ -80,6 +80,8 @@ impl Volume {
         journal.allow_covered_holes_below(checkpoint_state.checkpoint_sequence);
 
         // Rebuild overlay: everything in the surviving journal is durable.
+        // Recovery retained only the latest record per unit, so this also
+        // bounds the pending-promotion index by unique units, not overwrites.
         let mut overlay = Overlay::new();
         for record in replay {
             overlay.publish(record.unit_index, record.sequence, record.payload);
