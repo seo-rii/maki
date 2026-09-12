@@ -152,6 +152,19 @@ strict Clippy exit 0(PID 517699;
 확인했다. JSON/base64 문자열과 transport 내부 복사본은 이 수정의 범위가
 아니다. [소유권과 남은 범위](transport-memory.md)를 별도로 명시한다.
 
+gRPC provider가 소유하는 protobuf item도 별도 수정했다. 전체 capacity의
+Drop/clear/중복 필드 교체, parent에 추가되기 전 부분 decode 실패, 실제
+tonic 인코딩과 취소를 검사했다. 최초 RED 8 failed(PID 496466, exit 101;
+`/home/seorii/logs/maki-r3-grpc-owned-red-20260912T095252.107877Z.log`)와
+추가 tonic RED 3 failed(PID 502329, exit 101;
+`/home/seorii/logs/maki-r3-grpc-owned-tonic-red-20260912T095441.855915Z.log`)를
+확인한 뒤 구현했다. 전체 gRPC는 31 passed, exit 0(PID 525372;
+`/home/seorii/logs/maki-r3-grpc-owned-all-tests-20260912T095838.241230Z.log`),
+strict Clippy도 exit 0(PID 533205;
+`/home/seorii/logs/maki-r3-grpc-owned-clippy-20260912T095936.047726Z.log`)이다.
+공개 protobuf API와 wire는 유지한다. item의 zeroization을 tonic 내부
+buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
+
 로컬 리뷰의 `01-prior-50-status.md`(MAKI-001–050)와 `02-followup-15-status.md`(FUP-001–015)의 번호를 유지한다. R3-001–006/009/010의 수정은 MAKI-001/009/010/011과 FUP-001/007/009/010/011/013의 해당 원인을 포함한다. grow는 MAKI-002/003과 FUP-003, 지원 foreground drain은 MAKI-008과 FUP-005의 해당 원인을 포함한다. MAKI-016/017/026 및 FUP-002/006/008/012/015의 이전 수정은 유지하며, 최종 snapshot 실행 여부는 위 절에서 별도로 기록한다.
 
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |

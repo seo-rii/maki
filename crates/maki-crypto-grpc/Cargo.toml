@@ -14,6 +14,7 @@ tracing.workspace = true
 uuid.workspace = true
 tonic = "0.12"
 prost = "0.13"
+zeroize.workspace = true
 
 [dev-dependencies]
 maki-backing.workspace = true

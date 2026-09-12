@@ -6,6 +6,9 @@
 //! Responses echo `unit_index`, giving native reorder detection. Message
 //! sizes are bounded in both directions. Dynamic descriptor loading
 //! (arbitrary message shapes) is not supported; see docs/configuration.md.
+//!
+//! The provider's private wire items erase their owned data on drop and field
+//! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 
 use std::time::Duration;
 
@@ -18,6 +21,12 @@ use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
     PlaintextUnit, SecretBuffer,
 };
+
+mod protected;
+use protected::{WireItem, WireRequest, WireResponse};
+
+#[cfg(test)]
+mod protected_tests;
 
 // ---------------------------------------------------------------- messages
 
@@ -181,7 +190,7 @@ impl GrpcCryptoProvider {
         })
     }
 
-    fn request_bytes(items: &[CryptoItem]) -> usize {
+    fn request_bytes(items: &[WireItem]) -> usize {
         items.iter().map(|i| i.data.len() + 16).sum::<usize>() + 64
     }
 
@@ -189,8 +198,8 @@ impl GrpcCryptoProvider {
         &self,
         path: PathAndQuery,
         context: &CryptoContext,
-        items: Vec<CryptoItem>,
-    ) -> Result<Vec<CryptoItem>, CryptoError> {
+        items: Vec<WireItem>,
+    ) -> Result<Vec<WireItem>, CryptoError> {
         if Self::request_bytes(&items) > self.spec.max_message_bytes {
             return Err(CryptoError::NonRetryableRequest(format!(
                 "request exceeds message-size limit {}",
@@ -198,7 +207,7 @@ impl GrpcCryptoProvider {
             )));
         }
         let expected: Vec<u64> = items.iter().map(|i| i.unit_index).collect();
-        let message = CryptoBatchRequest {
+        let message = WireRequest {
             volume_id: context.volume_uuid.to_string(),
             compatibility_id: context.crypto_compatibility_id.clone(),
             items,
@@ -219,7 +228,7 @@ impl GrpcCryptoProvider {
             request.metadata_mut().insert(key, value);
         }
 
-        let codec: tonic::codec::ProstCodec<CryptoBatchRequest, CryptoBatchResponse> =
+        let codec: tonic::codec::ProstCodec<WireRequest, WireResponse> =
             tonic::codec::ProstCodec::default();
 
         // `Channel::timeout` bounds the connection, not the whole exchange:
@@ -277,9 +286,9 @@ impl CryptoProvider for GrpcCryptoProvider {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let wire: Vec<CryptoItem> = items
+        let wire: Vec<WireItem> = items
             .iter()
-            .map(|i| CryptoItem {
+            .map(|i| WireItem {
                 unit_index: i.unit_index,
                 data: i.data.expose().to_vec(),
             })
@@ -287,9 +296,9 @@ impl CryptoProvider for GrpcCryptoProvider {
         let out = self.call(self.encrypt_path.clone(), context, wire).await?;
         Ok(out
             .into_iter()
-            .map(|i| CiphertextUnit {
+            .map(|mut i| CiphertextUnit {
                 unit_index: i.unit_index,
-                data: i.data,
+                data: std::mem::take(&mut i.data),
             })
             .collect())
     }
@@ -299,9 +308,9 @@ impl CryptoProvider for GrpcCryptoProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let wire: Vec<CryptoItem> = items
+        let wire: Vec<WireItem> = items
             .iter()
-            .map(|i| CryptoItem {
+            .map(|i| WireItem {
                 unit_index: i.unit_index,
                 data: i.data.clone(),
             })
@@ -309,9 +318,9 @@ impl CryptoProvider for GrpcCryptoProvider {
         let out = self.call(self.decrypt_path.clone(), context, wire).await?;
         Ok(out
             .into_iter()
-            .map(|i| PlaintextUnit {
+            .map(|mut i| PlaintextUnit {
                 unit_index: i.unit_index,
-                data: SecretBuffer::from_vec(i.data),
+                data: SecretBuffer::from_vec(std::mem::take(&mut i.data)),
             })
             .collect())
     }

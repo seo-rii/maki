@@ -27,3 +27,30 @@ alphabet and trailing bits. These tests do not inspect freed memory or claim
 to observe library-private copies. The complete WebSocket package passed
 28 tests and all-targets strict Clippy on 2026-09-12; exact logs are recorded
 in the [readiness review](production-readiness-review-2026-09-08.md).
+
+## gRPC provider-owned messages
+
+The provider uses private protobuf items that erase their full data capacity
+on Drop, `Message::clear`, and replacement of the singular bytes field. The
+replacement path erases the old allocation before validating or reserving
+space for new data, and copies directly from the decoder input. Each child
+owns this protection even when decoding fails before it joins its parent.
+
+Request size rejection, response count/unit rejection, and cancellation also
+drop these owners. Successful decryption transfers the allocation into
+`SecretBuffer` without copying; successful encryption transfers ciphertext
+to the caller. Private Debug output redacts bytes. Public `CryptoItem`,
+`CryptoBatchRequest`, and `CryptoBatchResponse` retain their existing API and
+wire encoding; external callers using those public structs are responsible
+for their own allocation lifetime.
+
+The private item is a zeroizing vector, not a page-locked `SecretBuffer`
+until a successful decrypt transfers it. Tonic's encoded/decoded buffers and
+HTTP/TLS buffers remain separate allocations. These changes do not establish
+complete transport zeroization, page locking, or a total resident-memory cap.
+
+Fourteen focused regressions cover full-capacity deallocation, duplicate and
+malformed fields, partial nested decoding, public wire compatibility, actual
+tonic encoding and cancellation before encoding or while awaiting trailers,
+and real loopback RPC rejection/success. The complete gRPC package passed
+31 tests and all-targets strict Clippy on 2026-09-12.
