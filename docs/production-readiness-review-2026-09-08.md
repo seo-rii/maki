@@ -141,6 +141,19 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-005의 파일시스템 검사 순서는 별도로 수정했다. 잘못된 UUID 또는
+비-XFS를 mount·sentinel 쓰기 후에야 거절하는 RED 2개를 먼저 확인했다
+(PID 565315, exit 101;
+`/home/seorii/logs/maki-r3-premount-filesystem-red-20260912T100414.261832Z.log`).
+bounded `blkid --probe`로 TYPE과 설정된 UUID를 mount 전에 검사하고 probe
+전후 backend/mapping을 다시 검증한다. 집중 회귀 7개와 privileged/attach
+전체 106 passed, 1 ignored, exit 0(PID 584793;
+`/home/seorii/logs/maki-r3-premount-filesystem-full-20260912T100820.432850Z.log`),
+strict Clippy exit 0(PID 585042;
+`/home/seorii/logs/maki-r3-premount-filesystem-clippy-20260912T100820.806650Z.log`)을
+확인했다. 실제 kernel/DB 시험, 활성화 전 LVM 신원 검증과 activation→proof
+crash 공백은 해결하지 않았다. `fs_uuid` 생략은 기존대로 허용하며 TYPE만 검사한다.
+
 MAKI-025의 deep checker도 전체 replay payload 보유를 제거했다. 1 MiB/64 MiB
 저널에서 추가 heap peak가 각각 1,060,242/67,765,650 bytes로 늘어나는 RED를
 확인했다(PID 567161, exit 101;

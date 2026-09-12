@@ -34,6 +34,17 @@ the kernel metadata against that proof; it does not open the sentinel or any
 other file on the disconnected filesystem. Topologies over the bounded record
 or inventory limits are rejected during attach.
 
+After activation and before mounting, attach runs a bounded, uncached
+`blkid --probe` on the selected LV. It requires XFS and, when configured,
+the exact `fs_uuid`. A missing pinned UUID, unexpected filesystem type,
+failed probe or ambiguous response refuses mount before filesystem recovery,
+sentinel creation or the read/write probe can run. Backend and recorded
+mapping identities are checked before and after the block probe and again
+before mount. The existing post-mount identity checks remain in place.
+Omitting `fs_uuid` checks the filesystem type without independently pinning
+its identity. This check occurs after LVM activation and does not close the
+activation-to-proof crash gap described below.
+
 A cleanup command can fail after its effect took place. On any failure, keep
 the original attach record and investigate the reported condition. Re-running
 the same recovery command observes the remaining layers and resumes cleanup;

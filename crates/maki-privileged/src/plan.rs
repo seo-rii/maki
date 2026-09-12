@@ -68,6 +68,12 @@ pub enum PlannedStep {
     LvmDeactivate {
         vg_name: String,
     },
+    /// Probe the activated LV before mount can perform filesystem recovery.
+    /// XFS is always required; an optional configured UUID pins its identity.
+    VerifyFilesystemIdentity {
+        device: String,
+        fs_uuid: Option<String>,
+    },
     MountXfs {
         device: String,
         mountpoint: String,
@@ -114,6 +120,7 @@ impl PlannedStep {
             PlannedStep::SetBlockSize { .. } => "set-block-size",
             PlannedStep::LvmActivate { .. } => "lvm-activate",
             PlannedStep::LvmDeactivate { .. } => "lvm-deactivate",
+            PlannedStep::VerifyFilesystemIdentity { .. } => "verify-filesystem-identity",
             PlannedStep::MountXfs { .. } => "mount-xfs",
             PlannedStep::VerifyMountDevice { .. } => "verify-mount-device",
             PlannedStep::WriteSentinel { .. } => "write-sentinel",
@@ -157,6 +164,11 @@ impl fmt::Display for PlannedStep {
             }
             PlannedStep::LvmActivate { vg_name } => write!(f, "vgchange -ay {vg_name}"),
             PlannedStep::LvmDeactivate { vg_name } => write!(f, "vgchange -an {vg_name}"),
+            PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => write!(
+                f,
+                "verify XFS identity on {device} before mount (fs uuid {})",
+                fs_uuid.as_deref().unwrap_or("unpinned")
+            ),
             PlannedStep::MountXfs { device, mountpoint } => {
                 write!(f, "mount -t xfs -o noatime {device} {mountpoint}")
             }
@@ -304,6 +316,10 @@ pub fn plan_attach(request: &AttachRequest) -> Plan {
         },
         PlannedStep::LvmActivate {
             vg_name: request.vg_name.clone(),
+        },
+        PlannedStep::VerifyFilesystemIdentity {
+            device: format!("/dev/{}/{}", request.vg_name, request.lv_name),
+            fs_uuid: request.fs_uuid.clone(),
         },
         PlannedStep::MountXfs {
             device: format!("/dev/{}/{}", request.vg_name, request.lv_name),

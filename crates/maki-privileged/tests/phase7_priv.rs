@@ -105,6 +105,7 @@ fn attach_plan_has_expected_step_order() {
             "nbd-connect",
             "set-block-size",
             "lvm-activate",
+            "verify-filesystem-identity",
             "mount-xfs",
             "verify-mount-device",
             "verify-mount-identity",

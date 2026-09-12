@@ -25,7 +25,8 @@ use crate::probe::{
 };
 use crate::state::{BoundDeviceRecord, TrustedState};
 use crate::verify::{
-    verify_mount_device, verify_mount_identity, MountExpectation, MountObservation,
+    verify_filesystem_identity, verify_mount_device, verify_mount_identity, MountExpectation,
+    MountObservation,
 };
 
 /// Serializes attach helpers system-wide (device allocation + connect).
@@ -168,6 +169,49 @@ fn blkid_uuid(device: &str) -> Option<String> {
     } else {
         Some(uuid)
     }
+}
+
+/// Treat probe failure and ambiguous/malformed output as unavailable evidence.
+/// Low-level blkid probing bypasses its cache; successful process exit alone
+/// does not establish the requested TYPE or UUID tags.
+fn verify_filesystem_probe(
+    expected_uuid: Option<&str>,
+    output: &std::process::Output,
+) -> Result<(), ExecError> {
+    if !output.status.success() {
+        return Err(ExecError::StepFailed {
+            step: "verify-filesystem-identity".into(),
+            status: output.status.code(),
+            stderr: "filesystem probe failed or returned ambiguous evidence".into(),
+        });
+    }
+    let invalid = || ExecError::Step {
+        step: "verify-filesystem-identity".into(),
+        message: "filesystem probe returned invalid identity evidence".into(),
+    };
+    if output.stdout.len() > command::Policy::PROBE.max_output_bytes {
+        return Err(invalid());
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| invalid())?;
+    let mut filesystem_type = None;
+    let mut filesystem_uuid = None;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let (key, value) = line.split_once('=').ok_or_else(invalid)?;
+        if key.is_empty() || value.is_empty() || line.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        let field = match key {
+            "TYPE" => &mut filesystem_type,
+            "UUID" => &mut filesystem_uuid,
+            // DEVNAME and other informational tags do not select the device.
+            _ => continue,
+        };
+        if field.replace(value).is_some() {
+            return Err(invalid());
+        }
+    }
+    verify_filesystem_identity(expected_uuid, filesystem_type, filesystem_uuid)?;
+    Ok(())
 }
 
 /// Longest sentinel the helper reads: a UUID plus slack. Anything larger
@@ -362,6 +406,22 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
         ),
         PlannedStep::LvmActivate { vg_name } => run(step, "vgchange", &["-ay", vg_name]),
         PlannedStep::LvmDeactivate { vg_name } => run(step, "vgchange", &["-an", vg_name]),
+        PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => {
+            let output = command::capture(
+                Command::new("blkid").args([
+                    "--probe",
+                    "--output",
+                    "export",
+                    "--match-tag",
+                    "TYPE",
+                    "--match-tag",
+                    "UUID",
+                    device,
+                ]),
+                command::Policy::PROBE,
+            )?;
+            verify_filesystem_probe(fs_uuid.as_deref(), &output)
+        }
         PlannedStep::MountXfs { device, mountpoint } => run(
             step,
             "mount",
@@ -532,6 +592,22 @@ fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result
             "{} no longer has the recorded attachment identity; refusing to disconnect",
             record.device,
         )));
+    }
+    Ok(())
+}
+
+/// The connected, recorded mapping must still be unmounted before a block
+/// probe or mount uses it. Repeat after probing, since probing can block.
+fn verify_mount_target(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
+    verify_connection(record, system)?;
+    if record.recovery.is_some() {
+        let observed = system.recovery_observation(record)?;
+        if observed.mounted || !observed.vg_active {
+            return Err(identity_error(
+                "mount target or mapping changed after recording recovery identity",
+            ));
+        }
+        verify_connection(record, system)?;
     }
     Ok(())
 }
@@ -917,20 +993,16 @@ fn execute_with(
                     Ok(())
                 })
             }
-            PlannedStep::MountXfs { .. } if connects => {
+            PlannedStep::VerifyFilesystemIdentity { .. } if connects => {
                 let current = record.as_ref().unwrap();
-                verify_connection(current, system).and_then(|()| {
-                    if current.recovery.is_some() {
-                        let observed = system.recovery_observation(current)?;
-                        if observed.mounted || !observed.vg_active {
-                            return Err(identity_error(
-                                "mount target or mapping changed after recording recovery identity",
-                            ));
-                        }
-                        verify_connection(current, system)?;
-                    }
-                    system.run_step(step, None)
+                verify_mount_target(current, system).and_then(|()| {
+                    system.run_step(step, None)?;
+                    verify_mount_target(current, system)
                 })
+            }
+            PlannedStep::MountXfs { .. } if connects => {
+                verify_mount_target(record.as_ref().unwrap(), system)
+                    .and_then(|()| system.run_step(step, None))
             }
             other => system.run_step(other, None),
         };

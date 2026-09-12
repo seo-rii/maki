@@ -73,27 +73,41 @@ pub fn verify_mount_device(
     Ok(())
 }
 
+/// Shared by the pre-mount block probe and the post-mount verification.
+pub fn verify_filesystem_identity(
+    expected_fs_uuid: Option<&str>,
+    filesystem_type: Option<&str>,
+    filesystem_uuid: Option<&str>,
+) -> Result<(), MountVerifyError> {
+    match filesystem_type {
+        Some("xfs") => {}
+        other => {
+            return Err(MountVerifyError(format!(
+                "filesystem type {other:?} is not XFS"
+            )));
+        }
+    }
+    if let Some(expected_fs_uuid) = expected_fs_uuid {
+        if filesystem_uuid != Some(expected_fs_uuid) {
+            return Err(MountVerifyError(format!(
+                "filesystem UUID mismatch: {:?} != expected {:?}",
+                filesystem_uuid, expected_fs_uuid
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_mount_identity(
     expected: &MountExpectation,
     observed: &MountObservation,
 ) -> Result<(), MountVerifyError> {
     verify_mount_device(&expected.nbd_device, observed)?;
-    match observed.fstype.as_deref() {
-        Some("xfs") => {}
-        other => {
-            return Err(MountVerifyError(format!(
-                "filesystem type {other:?} is not XFS"
-            )))
-        }
-    }
-    if let Some(expected_fs_uuid) = &expected.fs_uuid {
-        if observed.fs_uuid.as_ref() != Some(expected_fs_uuid) {
-            return Err(MountVerifyError(format!(
-                "filesystem UUID mismatch: {:?} != expected {:?}",
-                observed.fs_uuid, expected_fs_uuid
-            )));
-        }
-    }
+    verify_filesystem_identity(
+        expected.fs_uuid.as_deref(),
+        observed.fstype.as_deref(),
+        observed.fs_uuid.as_deref(),
+    )?;
     match &observed.sentinel_volume_uuid {
         Some(uuid) if *uuid == expected.volume_uuid => {}
         other => {

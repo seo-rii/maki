@@ -181,6 +181,7 @@ fn init_sentinel_adds_a_write_step_before_verification() {
             "nbd-connect",
             "set-block-size",
             "lvm-activate",
+            "verify-filesystem-identity",
             "mount-xfs",
             // F02: the device check runs before anything touches the
             // filesystem, sentinel included.
@@ -195,7 +196,12 @@ fn init_sentinel_adds_a_write_step_before_verification() {
 fn rollback_reverses_the_executed_prefix() {
     let plan = plan_attach(&request());
     // Failure at verify: everything before it ran.
-    let executed: Vec<PlannedStep> = plan.steps[..5].to_vec();
+    let executed: Vec<PlannedStep> = plan
+        .steps
+        .iter()
+        .take_while(|step| !matches!(step, PlannedStep::VerifyMountDevice { .. }))
+        .cloned()
+        .collect();
     let rollback = rollback_steps(&executed);
     let kinds: Vec<&str> = rollback.iter().map(|s| s.kind()).collect();
     assert_eq!(kinds, ["umount", "lvm-deactivate", "nbd-disconnect"]);

@@ -1190,3 +1190,6 @@ fn growth_rechecks_ownership_between_lv_and_filesystem_changes() {
 
 #[path = "recover_tests.rs"]
 mod recover_tests;
+
+#[path = "filesystem_tests.rs"]
+mod filesystem_tests;
