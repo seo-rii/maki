@@ -153,3 +153,56 @@ fn record_names_cannot_escape_the_open_directory() {
         assert!(state.write(&entry).is_err(), "{name}");
     }
 }
+
+#[test]
+fn verification_never_creates_a_missing_state_directory_or_lock() {
+    let fixture = Fixture::new();
+    let owner = fixture.0.metadata().unwrap().uid();
+    assert!(TrustedState::open_existing_beneath(
+        File::open(&fixture.0).unwrap(),
+        Path::new("missing"),
+        owner,
+    )
+    .is_err());
+    assert!(!fixture.0.join("missing").exists());
+    let state = fixture.state().unwrap();
+    assert!(state.lock_existing().is_err());
+    assert!(!fixture.0.join("state/attach.lock").exists());
+    drop(state.lock().unwrap());
+    assert!(state.lock_existing().is_ok());
+}
+
+#[test]
+fn verify_config_loading_pins_trusted_descriptors_and_bounds_content() {
+    let fixture = Fixture::new();
+    let owner = fixture.0.metadata().unwrap().uid();
+    let config = fixture.0.join("volume.toml");
+    std::fs::write(&config, "volume_uuid = 'test'\n").unwrap();
+    let load = || {
+        read_config_beneath(
+            File::open(&fixture.0).unwrap(),
+            Path::new("volume.toml"),
+            owner,
+        )
+    };
+    assert_eq!(load().unwrap(), "volume_uuid = 'test'\n");
+    assert!(read_config_beneath(
+        File::open(&fixture.0).unwrap(),
+        Path::new("volume.toml"),
+        owner.wrapping_add(1)
+    )
+    .is_err());
+    let linked = fixture.0.join("linked");
+    std::fs::hard_link(&config, &linked).unwrap();
+    assert!(load().is_err());
+    std::fs::remove_file(linked).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(load().is_err());
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&config, vec![b'x'; CONFIG_MAX_BYTES as usize + 1]).unwrap();
+    assert!(load().is_err());
+    std::fs::remove_file(&config).unwrap();
+    symlink("missing", &config).unwrap();
+    assert!(load().is_err());
+    assert!(!fixture.0.join("missing").exists());
+}

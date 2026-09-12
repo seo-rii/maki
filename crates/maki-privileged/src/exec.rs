@@ -18,6 +18,9 @@ mod command;
 #[path = "recover.rs"]
 pub(crate) mod recover;
 
+#[path = "workload_verify.rs"]
+mod workload_verify;
+
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, SENTINEL_FILE};
 use crate::probe::{
@@ -1066,6 +1069,12 @@ mod command_tests;
 pub fn recover(plan: &Plan) -> Result<(), ExecError> {
     let lock = lock_attach()?;
     recover_with(plan, &lock.state, &mut LinuxSystem)
+}
+
+/// Check the current caller namespace's complete attachment before starting
+/// a workload. Uses existing trusted state and config only, without repairs.
+pub fn verify(volume: &str, config_path: &str) -> Result<(), ExecError> {
+    workload_verify::execute(volume, config_path)
 }
 
 fn recover_with(

@@ -20,6 +20,7 @@ fn usage() -> ExitCode {
                      [--uuid <volume-uuid>] [--fs-uuid <xfs-uuid>] [--init-sentinel] [--plan]
   maki-attach detach --volume <v> [...]
   maki-attach recover --volume <v> [...] (disconnected storage only; stop workloads first)
+  maki-attach verify --volume <v> [--config <attach.toml>] [--plan]
   maki-attach grow   --volume <v> --size-bytes <n> [...]
 
 Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
@@ -66,6 +67,53 @@ fn main() -> ExitCode {
     }
 
     let config_path = flag(&args, "--config").unwrap_or_else(|| config::default_path(&volume));
+    if verb == "verify" {
+        // Workload gates use only the root-controlled config. An argument
+        // cannot replace its filesystem pin or any stored attachment identity.
+        let mut seen = std::collections::HashSet::new();
+        let mut flags = args.iter().skip(1);
+        while let Some(argument) = flags.next() {
+            if !seen.insert(argument.as_str())
+                || match argument.as_str() {
+                    "--volume" | "--config" => flags.next().is_none(),
+                    "--plan" => false,
+                    _ => true,
+                }
+            {
+                eprintln!("error: verify accepts only --volume, --config and --plan; identity overrides are forbidden");
+                return ExitCode::from(2);
+            }
+        }
+        if let Err(error) = config::check_abs_path("config", &config_path) {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+        if plan_only {
+            println!("# verify volume {volume}: PLAN ONLY; no live evidence has been checked");
+            println!("Require trusted config {config_path} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.");
+            println!("Check the connected backend identifier, complete persisted mapping proof and complete read/write XFS mount in this namespace.");
+            println!("Read the pinned XFS UUID and volume sentinel; recheck kernel identity around reads. No write probe or repair.");
+            return ExitCode::SUCCESS;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return match maki_privileged::exec::verify(&volume, &config_path) {
+                Ok(()) => {
+                    println!("verified current storage attachment for volume {volume}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("verification requires Linux");
+            return ExitCode::from(3);
+        }
+    }
     let attach_config =
         if flag(&args, "--config").is_some() || std::path::Path::new(&config_path).exists() {
             match config::load(&config_path) {

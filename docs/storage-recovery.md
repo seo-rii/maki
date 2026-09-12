@@ -53,6 +53,63 @@ cleanup removes the record only after the backend is absent and the mount,
 VG mappings, and NBD users are all gone. A further invocation reports that no
 trusted attachment remains. Do not remove a retained record to bypass refusal.
 
+## Checking storage before each workload start
+
+Run the repeatable gate as root, using the same host mount namespace and
+root-controlled configuration as attach:
+
+```sh
+maki-attach verify --volume pg --config /etc/maki/attach/pg.toml --plan
+sudo maki-attach verify --volume pg --config /etc/maki/attach/pg.toml
+```
+
+`--plan` prints the required checks only. It does not read the configuration
+or inspect a live attachment, and its successful exit is not verification
+evidence. Use the second command, without `--plan`, for a workload start gate.
+The helper must run with root privileges; an ordinary `User=postgres` service
+cannot access the trusted attach lock and record merely by adding an
+`ExecStartPre` command. Arrange the privileged gate explicitly in the workload's
+service configuration, and refuse workload startup when it fails.
+
+Execution requires both `volume_uuid` and `fs_uuid` in the configuration.
+Pin `fs_uuid` from independently verified filesystem identity; the gate never
+learns or updates that pin. It accepts only `--volume`, `--config` and `--plan`;
+identity overrides such as `--uuid`, `--fs-uuid`, `--mountpoint`, and
+`--nbd-device` are rejected. Existing attach, detach, grow and recover command
+interfaces retain their prior configuration and override behavior.
+
+The gate opens the existing root-controlled state directory and attach lock
+without creating them. Under that lock it opens the configuration through
+verified directory descriptors and refuses symlinks, untrusted ownership,
+group/other write access, shared config files, or oversized content. The
+configuration's attachment identity and optional fixed NBD device must match
+the existing record. A missing record or persisted mapping proof fails closed.
+
+Success requires the recorded backend identifier to remain connected, every
+persisted mapping identity and dependency to match, and the expected complete
+XFS filesystem to be mounted read/write in the caller's namespace. Missing,
+stacked, subtree, or additional mounts of recorded devices refuse the gate.
+Any nested mount below the configured root is also rejected, including a
+foreign filesystem hiding a database data directory. A similarly named sibling
+path is unrelated; when the configured root is `/`, every other mount is nested.
+The filesystem probe reads an already opened and device-verified LV descriptor
+with uncached `blkid --probe`, then checks the configured XFS UUID. The bounded
+sentinel read uses held descriptors, refuses links and non-regular files, checks
+the mounted device, and suppresses access-time updates. Backend and mapping
+identity are checked again after both potentially blocking reads.
+
+Verification does not initialize a sentinel, run a write probe, repair storage,
+change the attach record, or start a database. A configured first-attach
+`init_sentinel` option does not change that behavior. Existing records lacking
+the post-activation proof remain insufficient; this command does not close the
+activation-to-proof crash gap. A successful result is a current storage check,
+not proof of database recovery, successful future writes, other namespaces, or
+continued availability after the command exits. Separate WAL, temporary-file,
+or log locations outside the configured root are not covered. The subprocess
+probe has an internal bound, but waiting for the attach lock has no internal
+deadline and a kernel filesystem read can still hang after backend failure;
+the gate does not promise an overall completion deadline.
+
 ## Remaining recovery limits
 
 - A process or host failure between VG activation and publication of its

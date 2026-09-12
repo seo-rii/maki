@@ -326,9 +326,35 @@ start job also fails. Every workload start also needs a fresh mount/backend
 identity check, including container restarts that bypass that dependency start
 job. Execution without a volume UUID is refused.
 
+Use `maki-attach verify --volume <volume>` as the repeatable, read-only storage
+gate. It requires root privileges, an existing trusted attachment record and
+both UUIDs pinned in the root-controlled attach configuration. Do not pass
+`--plan` to a workload gate: that option only prints a preview. For a host
+systemd service whose namespace exposes the configured mount, the relevant
+drop-in can include:
+
+```ini
+[Unit]
+Requires=maki-attach@pg.service
+After=maki-attach@pg.service
+
+[Service]
+ExecStartPre=!/usr/bin/maki-attach verify --volume pg
+```
+
+The `!` keeps the helper's root user/group credentials while retaining the
+service's other restrictions, including its filesystem view. The gate must
+still be able to read the trusted configuration/state and probe the verified LV
+under those restrictions. Keep the configuration root-controlled; this is not
+a generic sudo grant. A failed check prevents that start. Qualify the service's
+actual mount namespace and sandbox on the target host. A host check cannot establish which
+filesystem an existing container's bind mount exposes; stop and recreate those
+bindings through the workload recovery procedure. See the
+[gate's checks and limits](storage-recovery.md#checking-storage-before-each-workload-start).
+
 > [!CAUTION]
-> Removing `--plan` executes NBD, LVM, mount, or filesystem-growth commands on
-> Linux.
+> For attach, detach, recover and grow, removing `--plan` executes the planned
+> storage changes on Linux. The separate `verify` command performs observations.
 
 The helper has no crypto dependencies and must not receive provider credentials.
 

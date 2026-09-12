@@ -188,6 +188,28 @@ simulation CI와 실제 DB/XFS qualification 목표, 등록된 SecretBuffer의 �
 
 ## 남은 리뷰 항목과 종료 조건
 
+R3-007/MAKI-006/040의 workload 시작 전 재검증 경로를 추가했다.
+`maki-attach verify`가 없는 CLI RED 1개를 먼저 확인한 뒤 구현했다
+(exit 101;
+`/home/seorii/logs/maki-r3-workload-verify-cli-red-20260912T104400.824084Z.log`).
+기존 root 상태와 잠금을 생성 없이 열고, root 관리 설정의 volume/fs UUID,
+connected nonce, 저장된 전체 mapping proof, rw whole-XFS mount와 sentinel을
+검사한다. LV fd를 고정한 blkid 및 bounded/no-follow sentinel 읽기 후 신원을
+다시 확인한다. identity override와 proof 없는 기록은 거절한다. 파일 생성,
+write probe, 복구나 DB 시작은 하지 않으며 `--plan`은 검증 증거가 아니다.
+하위 foreign mount가 DB 경로를 가리는 두 RED도 추가로 확인했다(exit 101;
+`/home/seorii/logs/maki-r3-workload-submount-red-20260912T110038.894367Z.log`).
+verify에서만 경로 구성요소 기준으로 모든 descendant mount를 거절하며,
+공백·백슬래시 escape, root 행 전후 순서, `/` 경계와 sibling 제어를 검증했다.
+privileged/attach 전체 122 passed, 1 ignored, exit 0(PID 810317;
+`/home/seorii/logs/maki-r3-workload-submount-final-all-20260912T110156.606393Z.log`),
+두 package all-targets strict Clippy exit 0(PID 810561;
+`/home/seorii/logs/maki-r3-workload-submount-final-clippy-20260912T110157.024822Z.log`)을
+확인했다. [실행 범위](storage-recovery.md#checking-storage-before-each-workload-start)는
+현재 caller namespace의 storage identity다. lock 대기·kernel read의 전체 시간 상한,
+명령 종료 이후 가용성, 다른 container namespace 및 DB 복구를 보장하지 않는다.
+활성화 전 LVM 신원 및 activation→proof crash 공백은 남는다.
+
 MAKI-028의 동일 ciphertext 중복 보유를 별도 수정했다. 64×64KiB의 promotion과
 실제 FileBacking checkpoint에서 전체 ciphertext가 재복사되는 RED 2개와
 기존 버전/API 제어 2개의 통과를 먼저 확인했다(PID 758308, exit 101;
@@ -319,7 +341,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |
 |---|---|---|
 | MAKI-005 | 부분 수정: mount 전 TYPE/configured UUID 및 probe 전후 mapping/backend 검증 완료. PV/VG/LV의 독립 신원 검증은 VG 활성화 전에 끝나지 않음 | 활성화 전 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 |
-| R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 코드·수명주기: 명령 deadline과 기록 기반 recover는 추가됐지만 activation→proof 게시 crash 공백, 실제 READY, 다른 mount namespace와 workload restart 우회가 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
+| R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: 명령 deadline, 기록 기반 recover 및 workload 시작 전 반복 가능한 read-only verify 제공. activation→proof 게시 crash 공백, 실제 workload READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
 | MAKI-015/032 | 부분 수정: WS 요청과 decoded output, gRPC private item의 소유 버퍼 보호 완료. incoming JSON/frame·tonic 등 별도 할당의 수명·잠금과 전체 resident 비용이 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space threshold 검증 완료. 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약은 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |

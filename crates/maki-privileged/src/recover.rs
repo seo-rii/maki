@@ -208,6 +208,66 @@ pub(super) fn observe(
     Ok(observed)
 }
 
+/// Exact mount snapshot for a repeatable workload-start gate. Cleanup may
+/// tolerate absent proof nodes; this observer requires every node to remain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifiedMount {
+    pub device: (u32, u32),
+    mountinfo: String,
+}
+
+pub(super) fn observe_complete(
+    record: &BoundDeviceRecord,
+    mounts: &str,
+    sysfs: &Path,
+) -> io::Result<VerifiedMount> {
+    let proof = record
+        .recovery
+        .as_ref()
+        .ok_or_else(|| invalid("attachment has no persisted mapping proof"))?;
+    let observed = observe(record, mounts, sysfs)?;
+    if !observed.mounted || !observed.vg_active || !proof.mount_permitted {
+        return Err(invalid("attachment is not a complete mounted XFS volume"));
+    }
+    if inventory(record, sysfs)? != proof.nodes {
+        return Err(invalid("persisted mapping proof is incomplete or changed"));
+    }
+    let mut verified_mount = None;
+    for line in mounts.lines() {
+        let (left, right) = line
+            .split_once(" - ")
+            .ok_or_else(|| invalid("incomplete mountinfo"))?;
+        let fields: Vec<_> = left.split_whitespace().collect();
+        let filesystem: Vec<_> = right.split_whitespace().collect();
+        if fields.len() < 6 || filesystem.len() < 3 {
+            return Err(invalid("incomplete mountinfo"));
+        }
+        let mounted_path = crate::probe::unescape(fields[4]);
+        if mounted_path != record.attachment.mountpoint {
+            // A foreign filesystem below the dedicated volume can hide data
+            // paths even while its root and sentinel are correct. Compare
+            // decoded path components, including when the configured root is
+            // '/', rather than rejecting unrelated names with the same prefix.
+            if Path::new(&mounted_path).starts_with(&record.attachment.mountpoint) {
+                return Err(invalid("workload volume contains a nested mount"));
+            }
+            continue;
+        }
+        // Kernel-only evidence of rw mounting, not a claim that writes or
+        // database recovery would succeed; the gate performs no write probe.
+        if !fields[5].split(',').any(|option| option == "rw")
+            || !filesystem[2].split(',').any(|option| option == "rw")
+        {
+            return Err(invalid("workload mount is read-only"));
+        }
+        verified_mount = Some(VerifiedMount {
+            device: device_number(fields[2])?,
+            mountinfo: line.into(),
+        });
+    }
+    verified_mount.ok_or_else(|| invalid("workload mount is missing"))
+}
+
 fn absent_backend(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
     match system.backend(&record.device)? {
         None => Ok(()),

@@ -1193,3 +1193,6 @@ mod recover_tests;
 
 #[path = "filesystem_tests.rs"]
 mod filesystem_tests;
+
+#[path = "workload_verify_tests.rs"]
+mod workload_verify_tests;

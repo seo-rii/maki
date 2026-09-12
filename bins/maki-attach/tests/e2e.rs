@@ -135,3 +135,51 @@ fn recovery_plan_only_lists_conditional_disconnected_storage_cleanup() {
     );
     assert!(!plan.contains("systemctl"), "{plan}");
 }
+
+#[test]
+fn verify_plan_describes_the_workload_gate_without_claiming_live_evidence() {
+    let out = run(&["verify", "--volume", "v1", "--plan"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("verify volume v1"), "{text}");
+    assert!(text.contains("PLAN ONLY"), "{text}");
+    for evidence in [
+        "trusted config",
+        "backend identifier",
+        "persisted mapping proof",
+        "XFS UUID",
+        "sentinel",
+    ] {
+        assert!(text.contains(evidence), "missing {evidence}: {text}");
+    }
+    for mutation in ["vgchange", "nbd-client", "mount -", "umount", "systemctl"] {
+        assert!(!text.contains(mutation), "{text}");
+    }
+}
+
+#[test]
+fn verify_rejects_identity_overrides_unknown_flags_and_duplicate_options() {
+    for extra in [
+        vec!["--fs-uuid", "11111111-2222-4333-8444-555555555555"],
+        vec!["--uuid", "11111111-2222-4333-8444-555555555555"],
+        vec!["--nbd-device", "/dev/nbd3"],
+        vec!["--mountpoint", "/srv/other"],
+        vec!["--init-sentinel"],
+        vec!["--unknown"],
+        vec!["--volume", "other"],
+        vec!["--plan"],
+    ] {
+        let mut arguments = vec!["verify", "--volume", "v1", "--plan"];
+        arguments.extend(extra);
+        let out = run(&arguments);
+        assert_eq!(out.status.code(), Some(2), "{arguments:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "rejected input must not print successful verification"
+        );
+    }
+}
