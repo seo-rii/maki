@@ -6,6 +6,7 @@
 Description=Maki encrypted volume %i
 After=network-online.target
 Wants=network-online.target
+PartOf=maki-workload@%i.target
 OnFailure=maki-recover@%i.service
 OnFailureJobMode=replace-irreversibly
 # Bound automatic recovery loops when daemon startup cannot succeed.

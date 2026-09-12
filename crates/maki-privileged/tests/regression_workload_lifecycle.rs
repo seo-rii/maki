@@ -43,6 +43,11 @@ fn daemon_failure_enters_the_single_recovery_path() {
         "StartLimitIntervalSec=300"
     ));
     assert!(has_directive(&daemon, "[Unit]", "StartLimitBurst=3"));
+    assert!(has_directive(
+        &daemon,
+        "[Unit]",
+        "PartOf=maki-workload@%i.target"
+    ));
     assert!(
         !daemon
             .lines()
