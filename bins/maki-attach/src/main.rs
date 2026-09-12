@@ -20,6 +20,7 @@ fn usage() -> ExitCode {
                      [--uuid <volume-uuid>] [--fs-uuid <xfs-uuid>] [--init-sentinel] [--plan]
   maki-attach detach --volume <v> [...]
   maki-attach recover --volume <v> [...] (disconnected storage only; stop workloads first)
+  maki-attach cleanup --volume <v> [...] (record-driven detach or recovery; stop workloads first)
   maki-attach verify --volume <v> [--config <attach.toml>] [--plan]
   maki-attach grow   --volume <v> --size-bytes <n> [...]
 
@@ -148,7 +149,7 @@ fn main() -> ExitCode {
 
     let plan = match verb.as_str() {
         "attach" => plan_attach(&request),
-        "detach" | "recover" => plan_detach(&request),
+        "detach" | "recover" | "cleanup" => plan_detach(&request),
         "grow" => {
             if args.iter().any(|arg| arg == "--add-bytes") {
                 eprintln!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
@@ -181,6 +182,16 @@ fn main() -> ExitCode {
         for (index, step) in plan.steps.iter().take(2).enumerate() {
             println!("{}. {step} (only if still present)", index + 1);
         }
+    } else if verb == "cleanup" {
+        println!("# cleanup volume {}; no trusted record is success; owned connected backend follows detach; known absent backend follows recovery; foreign or unreadable backend is preserved", request.volume);
+        for (index, step) in plan.steps.iter().enumerate() {
+            let condition = if index < 2 {
+                "only if still present in the selected detach or recovery path"
+            } else {
+                "only for the owned connected backend detach path"
+            };
+            println!("{}. {step} ({condition})", index + 1);
+        }
     } else {
         print!("{plan}");
     }
@@ -190,10 +201,10 @@ fn main() -> ExitCode {
 
     #[cfg(target_os = "linux")]
     {
-        let result = if verb == "recover" {
-            maki_privileged::exec::recover(&plan)
-        } else {
-            maki_privileged::exec::execute(&plan)
+        let result = match verb.as_str() {
+            "recover" => maki_privileged::exec::recover(&plan),
+            "cleanup" => maki_privileged::exec::cleanup(&plan),
+            _ => maki_privileged::exec::execute(&plan),
         };
         match result {
             Ok(()) => ExitCode::SUCCESS,

@@ -137,6 +137,30 @@ fn recovery_plan_only_lists_conditional_disconnected_storage_cleanup() {
 }
 
 #[test]
+fn cleanup_plan_describes_idempotent_record_driven_storage_cleanup() {
+    let out = run(&["cleanup", "--volume", "v1", "--plan"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan = String::from_utf8_lossy(&out.stdout);
+    for contract in [
+        "cleanup volume v1",
+        "no trusted record is success",
+        "owned connected backend follows detach",
+        "known absent backend follows recovery",
+        "foreign or unreadable backend is preserved",
+    ] {
+        assert!(plan.contains(contract), "missing {contract}: {plan}");
+    }
+    assert!(plan.contains("umount /srv/v1"), "{plan}");
+    assert!(plan.contains("vgchange -an"), "{plan}");
+    assert!(plan.contains("nbd-client -d"), "{plan}");
+    assert!(!plan.contains("systemctl"), "{plan}");
+}
+
+#[test]
 fn verify_plan_describes_the_workload_gate_without_claiming_live_evidence() {
     let out = run(&["verify", "--volume", "v1", "--plan"]);
     assert!(

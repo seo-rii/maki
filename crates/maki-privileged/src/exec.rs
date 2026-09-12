@@ -1218,6 +1218,17 @@ pub fn recover(plan: &Plan) -> Result<(), ExecError> {
     recover_with(plan, &lock.state, &mut LinuxSystem)
 }
 
+/// Converge trusted storage state under the attach lock.
+///
+/// An absent record is already clean. A record whose backend still has the
+/// recorded connection identity follows the regular detach path; an absent
+/// backend follows disconnected recovery. Foreign and unreadable backends
+/// fail closed before either path can mutate storage.
+pub fn cleanup(plan: &Plan) -> Result<(), ExecError> {
+    let lock = lock_attach()?;
+    cleanup_with(plan, &lock.state, &mut LinuxSystem)
+}
+
 /// Check the current caller namespace's complete attachment before starting
 /// a workload. Uses existing trusted state and config only, without repairs.
 pub fn verify(volume: &str, config_path: &str) -> Result<(), ExecError> {
@@ -1230,4 +1241,23 @@ fn recover_with(
     system: &mut impl System,
 ) -> Result<(), ExecError> {
     recover::execute(plan, state, system)
+}
+
+fn cleanup_with(
+    plan: &Plan,
+    state: &TrustedState,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    let Some(record) = state.read(&plan.volume)? else {
+        return Ok(());
+    };
+    match system.backend(&record.device)? {
+        Some(connection_id) if connection_id == record.connection_id => {
+            execute_with(plan, Some(state), system)
+        }
+        None => recover_with(plan, state, system),
+        Some(_) => Err(identity_error(
+            "recorded NBD device has a foreign backend; refusing cleanup",
+        )),
+    }
 }

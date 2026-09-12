@@ -436,6 +436,72 @@ fn new_auto_and_fixed_attachments_record_and_verify_the_kernel_identifier() {
 }
 
 #[test]
+fn cleanup_is_idempotent_when_no_trusted_record_exists() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = FakeSystem::default();
+
+    cleanup_with(&plan_detach(&request()), &state, &mut system).unwrap();
+
+    assert!(system.steps.is_empty());
+    assert_eq!(system.backend_probes.get(), 0);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_dispatches_an_owned_connection_to_detach() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let request = request();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+    system.backend_probes.set(0);
+
+    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+
+    assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let request = request();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+    system.backends.clear();
+    system.backend_probes.set(0);
+
+    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+
+    assert_eq!(system.steps, ["umount", "lvm-deactivate"]);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_preserves_state_for_foreign_or_unreadable_connections() {
+    for fault in [BackendFault::Foreign, BackendFault::Unreadable] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.backend_probes.set(0);
+        system.backend_fault_on_probe = Some((1, fault));
+
+        assert!(cleanup_with(&plan_detach(&request), &state, &mut system).is_err());
+
+        assert!(system.steps.is_empty(), "{fault:?}");
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{fault:?}");
+    }
+}
+
+#[test]
 fn missing_or_mismatched_identity_refuses_detach_before_any_command() {
     let fixture = Fixture::new();
     let state = fixture.state();
