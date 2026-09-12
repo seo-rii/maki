@@ -222,6 +222,8 @@ checks; this Linux confinement guarantee does not apply to them.
 
 ## NBD request limits
 
+`nbd.connections` must be `1`; multi-connection operation is disabled.
+
 `nbd.threads` sets the number of Tokio runtime worker threads used by the
 plugin. The default is 64, and the supported range is `1..=256`. This is
 not the process's total thread count: nbdkit owns its native callback
@@ -308,7 +310,7 @@ attached, fails closed on Linux, and is reported under `security` in
 |---|---|
 | `disable_core_dump` (default true) | `prctl(PR_SET_DUMPABLE, 0)` and `RLIMIT_CORE = 0`, verified after the call |
 | `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
-| `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` every secret buffer (plaintext, keys, cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported |
+| `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` registered `SecretBuffer` allocations (including plaintext, keys and cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported. Separate transport allocations are described in [buffer lifetime limits](transport-memory.md) |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
 | `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
 | `require_secure_swap_policy` (default false) | Requires readable, parseable `/proc/swaps` and accepts only RAM-only zram or dm-crypt with proven independent physical backing, including zram writeback. NBD ancestors, cycles, and unknown backing are refused. Device identity determines classification; keep the topology fixed while attached. See [swap dependency checks](operations.md#swap-dependency-checks). The shipped production example enables this policy |

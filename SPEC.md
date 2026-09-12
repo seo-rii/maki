@@ -843,13 +843,8 @@ Requires daemon restart and self-test:
 ```text
 HTTP body mapping
 response mapping
-gRPC descriptor
+gRPC service method paths (the message schema is fixed)
 protocol adapter configuration
-```
-
-Hot-reloadable:
-
-```text
 endpoints
 credentials
 timeouts
@@ -857,8 +852,13 @@ retry settings
 circuit-breaker settings
 semaphore limits
 batch sizing
-LRU cache size
 ```
+
+The current runtime reload supports only `cache.max_bytes`, while
+`cache.mode = "read"`. It requires an integer byte count and refuses the change
+when the cache is disabled. Endpoint, credential, timeout, retry,
+circuit-breaker, semaphore, and batch reload requests explicitly report that
+the change was not applied; use the restart and self-test procedure above.
 
 ---
 
@@ -1806,6 +1806,15 @@ valid power-loss evidence.
 
 # 55. CI Strategy
 
+The checked-in workflow runs the pull-request suite on Linux and Windows.
+Scheduled nightly jobs run the seven named release phase gates, the plugin
+build/ABI check, and fake-provider refusal. The DB gate is a simulated commit
+ledger; it does not run SQLite, PostgreSQL or a kernel XFS stack. The broader
+tiers below are qualification targets. Continued fuzzing, systemd sandbox,
+real DB/XFS, weekly and release qualification require separate runners and
+recorded results; a green push or nightly run does not certify those targets.
+See [the testing guide](docs/testing.md) for the implemented commands and limits.
+
 ## Pull Request
 
 ```text
@@ -1920,8 +1929,11 @@ max_ciphertext_size = 4384
 stateless = true
 retry_safe = true
 
-integrity = "none"
-context_binding = "none"
+# Required authenticated provider contract; failed probes must be fixed at
+# the provider rather than bypassed by lowering these declarations.
+integrity = "contractual"
+context_binding = "contractual"
+# Authentication alone does not prevent replay of older valid ciphertext.
 replay_protection = "none"
 
 [[crypto.http.endpoint]]

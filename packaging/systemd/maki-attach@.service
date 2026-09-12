@@ -6,8 +6,10 @@
 # Attach parameters (volume UUID, mountpoint, VG/LV, optional fixed NBD
 # device, optional expected XFS UUID) come from the root-owned
 # /etc/maki/attach/%i.toml (see packaging/examples/attach.toml). The unit
-# stays active only while the mount identity check has passed: services
-# that need the secure mount must Requires= and After= this unit.
+# becomes active after the mount identity check passes. RemainAfterExit
+# retains that historical success; it does not continuously verify the mount.
+# Services need Requires= and After= plus a fresh identity check before each
+# workload start, including restarts outside systemd's dependency start job.
 
 [Unit]
 Description=Maki attach helper for volume %i

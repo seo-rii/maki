@@ -139,7 +139,7 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 이 커밋의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34686934432)도
 모두 성공했다. 나머지 3개 release gate의 최근 실행은 `1bc0ab5` 기준이다.
 
-## 최신 전체 snapshot 검증 — fb3da46
+## 전체 workspace 및 release snapshot 검증 — fb3da46
 
 커밋된 소스만 추출한 `fb3da461d5d399b13e87c90fd3b951045b5bb29b`에서
 아래 검사를 완료했다. 이전 snapshot의 성공을 재사용한 결과가 아니다.
@@ -166,6 +166,25 @@ PID 622494; 로그
 이는 해당 advisory DB와 Cargo.lock 대조 결과이며 알려지지 않은 취약점이나
 배포 환경의 안전성을 증명하지 않는다. 원본 R3 리뷰의 SHA256 검사는 통과했고
 미해결 항목이 있으므로 원본을 계속 보존한다.
+
+## 카운터 수정 후 전체 snapshot 검증 — 55ef3ec
+
+`f77daae`의 core recovery/writer와 `55ef3ec`의 공개 format scanner 수정을
+포함한 커밋 소스 `55ef3ec43214242b3b257b33a083aaf307dcb10f`에서 fmt,
+workspace/all-targets strict Clippy, 전체 workspace 검사를 다시 완료했다.
+모두 exit 0이며 workspace는 **830 passed, 0 failed, 10 ignored**다.
+PID 703634, 통합 exit 0, 162.88초; 로그:
+`/home/seorii/logs/maki-r3-counter-final-verified-20260912T103936.029151Z.log`.
+[해당 커밋의 Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34689007382)도
+모두 성공했다. 이 snapshot에서는 전체 release gate 9개를 반복하지 않았다.
+변경한 counter 경로의 release 회귀와 format 전체 release 131개는 아래
+수정별 기록대로 통과했으며, 전체 release 9개의 최근 결과는 위 `fb3da46`이다.
+
+MAKI-048 문서 대조에서는 현재 reload를 활성 cache의 `max_bytes`로 한정하고,
+SPEC production 예시의 인증·context 계약을 packaged 예시와 맞췄다. 자동
+simulation CI와 실제 DB/XFS qualification 목표, 등록된 SecretBuffer의 잠금과
+별도 transport 할당, oneshot의 과거 성공과 현재 mount 신원도 구분했다.
+현재 진행 중인 workload verify 명령은 구현·검증 후 해당 문서와 최종 대조한다.
 
 ## 남은 리뷰 항목과 종료 조건
 

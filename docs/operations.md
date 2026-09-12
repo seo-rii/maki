@@ -316,12 +316,15 @@ An unsupported client or unverifiable connection fails closed. Qualify the
 updated helper on the intended Linux target before deployment; older privileged
 validation reports do not cover this connection-identity protocol.
 
-`maki-attach@<volume>.service` therefore stays active only after the identity
-check passed. Services that need the secure mount must declare
+`maki-attach@<volume>.service` becomes active after the identity check passes.
+Its `RemainAfterExit=yes` retains that past result even if the mount later
+disappears; the service state is not a live readiness check. Services that
+need the secure mount must declare
 `Requires=maki-attach@<volume>.service` and `After=` it. `AssertPathExists`
 makes a missing attach configuration fail startup, so the dependent service's
-start job also fails. Execution without a volume UUID is
-refused.
+start job also fails. Every workload start also needs a fresh mount/backend
+identity check, including container restarts that bypass that dependency start
+job. Execution without a volume UUID is refused.
 
 > [!CAUTION]
 > Removing `--plan` executes NBD, LVM, mount, or filesystem-growth commands on
