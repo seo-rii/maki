@@ -5,6 +5,21 @@ the NBD backend has disappeared. It never disconnects an active NBD backend,
 starts a database, repairs a filesystem, or declares database recovery complete.
 Use normal `detach` while the recorded backend is still connected.
 
+The packaged services call the convergent selector instead of choosing those
+paths themselves:
+
+```sh
+maki-attach cleanup --volume pg --config /etc/maki/attach/pg.toml --plan
+sudo maki-attach cleanup --volume pg --config /etc/maki/attach/pg.toml
+```
+
+Under one attach lock, `cleanup` treats a missing trusted record as success,
+routes a matching connected backend through detach, and routes a known absent
+backend through recovery. A foreign or unreadable backend fails without
+mutation and preserves the record. Use explicit `detach` for planned connected
+maintenance and explicit `recover` when diagnosing a known disconnected
+attachment.
+
 Before recovery, stop database writers and their supervisors, prevent automatic
 restarts, and stop containers that use the volume. Run recovery from the host
 mount namespace used by attach. Remove workload bind mounts in their own
@@ -189,6 +204,44 @@ The subprocess probe has an internal bound, but waiting for the attach lock has
 no internal deadline and a kernel filesystem read can still hang after backend
 failure; the gate does not promise an overall completion deadline.
 
+## Packaged workload lifecycle
+
+Install the workload drop-in from
+`packaging/examples/maki-workload.service.d/10-maki.conf`, adapt its volume and
+service names, enable the workload, and enable
+`maki-workload@<volume>.target`. Enable the target instead of the daemon or
+attach units directly. The target requires attachment, and each registered
+workload binds to that attachment, belongs to the target, conflicts with
+recovery, and runs the privileged read-only verify gate before every start.
+
+A daemon failure triggers `maki-recover@<volume>.service`. Its conflict and
+ordering first stop registered workloads, the attach unit, and the daemon. It
+then runs convergent cleanup. `OnSuccess=` starts a fresh lifecycle only after
+cleanup succeeds; a cleanup failure leaves the workload stopped. Retry loops
+are bounded by the daemon start limit and the recovery job timeout. The target
+stop path runs attach cleanup before the daemon stops.
+
+The graph controls only workloads registered in the target. Disable other
+supervisors and Docker restart policies that could start the application
+outside it. A host remount is not assumed to update an existing Docker bind
+mount; stop and recreate the container, then report workload start success only
+after database recovery and health checks complete.
+
+On a disposable Debian 12 GCE host, actual systemd transactions stopped a
+fixture workload, ran attach stop and recovery cleanup, and started new daemon
+and workload processes (`43687` to `43714`, and `43692` to `43719`). Cleanup
+failure did not restart the workload, and a per-start verify failure produced
+zero workload `ExecStart` calls. A separate Docker/XFS/SQLite run observed
+default `rprivate` propagation, different container IDs and creation times,
+SQLite rows advancing from one to two with `integrity_check=ok`, and zero
+container starts on a plain directory.
+
+These lifecycle runs used fixture daemon/attach/verify steps and loop-backed
+XFS; the real cleanup call covered its no-record path. The current revision's
+real kernel NBD/LVM/XFS run separately passed attach, trusted verify, cleanup,
+and idempotent cleanup. These are complementary checks, not one end-to-end
+kernel-storage crash and database-durability campaign.
+
 ## Remaining recovery limits
 
 - A pre-activation intent permits only exact, mount-free mapping cleanup. Any
@@ -201,8 +254,10 @@ failure; the gate does not promise an overall completion deadline.
   manual LVM, mount, or NBD changes made by other privileged processes. Stop
   those operations before cleanup; namespace and concurrent root intervention
   are outside the helper's ownership guarantee.
-- The storage cleanup tests use production metadata observers with synthetic
-  kernel metadata and injected command outcomes. They do not qualify a real
-  kernel NBD/XFS/LVM crash, container restart ordering, database recovery, power
-  loss, or a production topology. Keep workload restart gated on separately
-  verified storage attachment and database recovery procedures.
+- Foreign, partial-mapping, and command-failure cleanup cases use production
+  metadata observers with synthetic kernel metadata and injected outcomes. The
+  current revision also passed a clean real kernel NBD/LVM/XFS attach, verify,
+  cleanup, and second cleanup, plus the separate systemd and Docker lifecycle
+  checks above. No single campaign has yet combined an actual Maki daemon,
+  kernel storage crash, container restart, and external database ACK oracle.
+  Power loss and a production topology remain separate qualification gates.

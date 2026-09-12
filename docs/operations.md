@@ -34,6 +34,12 @@ On Debian-family systems the relevant packages are `nbdkit`,
 `nbdkit-plugin-dev`, `libnbd-bin`, and `fio`. Package and service installation
 remain distribution-specific.
 
+Privileged attachment additionally requires nbd-client 3.27.0 or later built
+with netlink and backend-identifier support. The helper validates `/dev/nbdN`
+as the configured block path and supplies `nbdN` to netlink nbd-client
+connect/disconnect commands. Debian 12's stock nbd-client 3.24 does not satisfy
+this requirement.
+
 ## Build the plugin
 
 ```bash
@@ -335,6 +341,14 @@ deactivating a VG. It verifies the backend again immediately before disconnect,
 including rollback. Missing records or mismatched identities refuse execution;
 an explicit `--nbd-device` cannot bypass this check.
 
+`maki-attach cleanup --volume <volume>` is the idempotent selector used by the
+packaged service lifecycle. Under the same single attach lock, no trusted
+record is already clean and succeeds without probing the backend. A matching
+connected backend follows the detach path; a known absent backend follows the
+recovery path. A foreign or unreadable backend fails before mutation and keeps
+the record. Re-run cleanup after a partial successful effect; each selected
+path re-observes storage identity before its next change.
+
 Detach retries observe current mountinfo and sysfs state before each step.
 An already completed unmount or VG deactivation is skipped. A remaining mount
 must identify the expected LV device, XFS root, and volume sentinel, and active
@@ -367,28 +381,34 @@ validation reports do not cover this connection-identity protocol.
 
 `maki-attach@<volume>.service` becomes active after the identity check passes.
 Its `RemainAfterExit=yes` retains that past result even if the mount later
-disappears; the service state is not a live readiness check. Services that
-need the secure mount must declare
-`Requires=maki-attach@<volume>.service` and `After=` it. `AssertPathExists`
-makes a missing attach configuration fail startup, so the dependent service's
-start job also fails. Every workload start also needs a fresh mount/backend
-identity check, including container restarts that bypass that dependency start
-job. Execution without a volume UUID is refused.
+disappears; the service state is not a live readiness check. The packaged
+`maki-workload@<volume>.target` requires the attach unit, while the attach unit
+binds to the daemon. `AssertPathExists` makes a missing attach configuration
+fail startup. Every registered workload start also needs a fresh mount/backend
+identity check, including container recreation. Execution without a volume
+UUID is refused.
 
 Use `maki-attach verify --volume <volume>` as the repeatable, read-only storage
 gate. It requires root privileges, an existing trusted attachment record and
 both UUIDs pinned in the root-controlled attach configuration. Do not pass
 `--plan` to a workload gate: that option only prints a preview. For a host
-systemd service whose namespace exposes the configured mount, the relevant
-drop-in can include:
+systemd service whose namespace exposes the configured mount, install the
+example `packaging/examples/maki-workload.service.d/10-maki.conf`, replace `pg`
+with the volume name, and adapt it below the real workload unit. Its essential
+contract is:
 
 ```ini
 [Unit]
-Requires=maki-attach@pg.service
+BindsTo=maki-attach@pg.service
 After=maki-attach@pg.service
+PartOf=maki-workload@pg.target
+Conflicts=maki-recover@pg.service
 
 [Service]
 ExecStartPre=!/usr/bin/maki-attach verify --volume pg
+
+[Install]
+RequiredBy=maki-workload@pg.target
 ```
 
 The `!` keeps the helper's root user/group credentials while retaining the
@@ -400,6 +420,28 @@ actual mount namespace and sandbox on the target host. A host check cannot estab
 filesystem an existing container's bind mount exposes; stop and recreate those
 bindings through the workload recovery procedure. See the
 [gate's checks and limits](storage-recovery.md#checking-storage-before-each-workload-start).
+
+Enable the workload so its `RequiredBy=` link is installed, then enable and
+start the lifecycle target:
+
+```bash
+systemctl enable your-workload.service
+systemctl enable --now maki-workload@pg.target
+```
+
+Do not enable `maki@pg.service` or `maki-attach@pg.service` directly. A daemon
+failure triggers `maki-recover@pg.service`, which stops the target's registered
+workloads, attachment, and daemon. Only a successful cleanup activates the
+target again; the workload's privileged `ExecStartPre` gate then rechecks the
+new attachment. Configure the workload so its start succeeds only after its
+own database recovery and health gate is complete.
+
+For Docker, put container creation and removal in the registered workload unit
+and disable an independent `restart: always` path that could bypass the target.
+Docker bind mounts are `rprivate` by default, so a host remount does not make an
+old container safe; the lifecycle must stop and create the container again.
+For planned shutdown, obtain a successful `maki drain` acknowledgement first,
+then stop `maki-workload@pg.target`.
 
 > [!CAUTION]
 > For attach, detach, recover and grow, removing `--plan` executes the planned
@@ -417,11 +459,20 @@ The data-plane unit runs as `maki`, has an empty capability set, disables core
 dumps, uses `NoNewPrivileges`, and receives crypto credentials. The attach unit
 is a separate privileged oneshot service without credentials.
 
+The recovery template uses `OnSuccess=`, which requires systemd 249 or later.
+This version boundary is recorded in the
+[upstream v249 unit documentation](https://github.com/systemd/systemd/blob/v249/man/systemd.unit.xml).
+
 Before production use, verify the installed units on the target distribution:
 
 ```bash
 systemd-analyze security maki@example.service
-systemd-analyze verify maki@example.service maki-attach@example.service
+systemd-analyze verify \
+  maki@example.service \
+  maki-attach@example.service \
+  maki-recover@example.service \
+  maki-workload@example.target \
+  your-workload.service
 ```
 
 Also verify socket ACLs, effective capabilities, core-dump policy, duplicate
@@ -435,13 +486,18 @@ path. Apply the package changes during a planned maintenance window:
 1. Stop dependent workloads and detach existing volumes **using the old
    helper before replacing it**. Do not copy legacy
    `/run/maki/attach/<volume>.nbd` files into the new helper directory.
-2. Install the updated helper, units, and tmpfiles rules, and ensure the
-   nbd-client and kernel requirements above are satisfied.
+2. Disable old direct enablement of `maki@<volume>` and
+   `maki-attach@<volume>`. Install the updated helper, daemon, attach, recover,
+   and workload-target units plus tmpfiles rules, and ensure the nbd-client,
+   systemd, and kernel requirements above are satisfied.
 3. Update explicit `control.socket` values to
    `/run/maki-control/<volume>/control.sock`, or provision an equivalent custom
    path whose ancestors permit the configured control group to traverse it.
-4. Reattach and verify the trusted record, mount identity, administrator control
-   access, and NBD socket isolation before starting workloads.
+4. Install the workload drop-in, enable the workload to create its
+   `RequiredBy=maki-workload@<volume>.target` link, and enable the lifecycle
+   target. Reattach through that target and verify the trusted record, mount
+   identity, administrator control access, NBD socket isolation, and workload
+   start gate.
 
 If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning

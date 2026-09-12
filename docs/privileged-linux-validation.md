@@ -26,7 +26,9 @@ The automated run checks:
 - denial of an NBD disconnect ioctl to the invoking unprivileged user;
 - raw-device fio with CRC32C verification and periodic `fsync`;
 - disposable LVM and XFS creation;
-- the real `maki-attach` attach and detach paths;
+- the real `maki-attach` attach, read-only verify, and convergent cleanup paths,
+  including a second idempotent cleanup;
+- root-owned mode-`0600` attach configuration and exact PV/VG/LV UUID pins;
 - unprivileged fio through the mounted XFS filesystem; and
 - a SQLite WAL checkpoint with `synchronous=FULL` and `integrity_check`.
 
@@ -36,6 +38,14 @@ units. Those scenarios need an isolated destructive-test host and are outside
 this safe runner.
 
 ## Run
+
+The current helper requires nbd-client 3.27.0 or later built with netlink and
+backend-identifier support. Debian 12's stock nbd-client 3.24 is too old, and
+`--install-missing` does not replace an already installed old client. Build or
+install a qualified version before running the suite; a source build also needs
+`autoconf-archive`. The configured block-device path remains `/dev/nbd15`.
+Internally, current netlink nbd-client commands receive the kernel name
+`nbd15`, while block tools continue to receive `/dev/nbd15`.
 
 Use a high-numbered, dedicated NBD device. The following command installs the
 missing Debian packages, caches sudo authorization interactively, and then
@@ -77,6 +87,11 @@ artifacts within it. A stable symlink points to the newest run:
 ├── fio-raw.json
 ├── fio-xfs.json
 ├── sqlite.txt
+├── maki-attach-plan.txt
+├── maki-verify-before-workload.txt
+├── maki-verify-after-workload.txt
+├── maki-cleanup.txt
+├── maki-cleanup-idempotent.txt
 └── maki-check.txt
 ```
 
@@ -97,12 +112,40 @@ The exit trap attempts, in order, to unmount the test filesystem, deactivate
 the uniquely named test VG, disconnect only the NBD connection created by the
 run, terminate nbdkit normally with `SIGTERM`, remove the unique `/run/maki`
 child directory, and delete only the `mktemp` work tree.
+It also removes the per-volume `/run/maki-control` directory and the temporary
+root-owned attach configuration created by the run.
 
 If nbdkit does not exit after normal termination, the runner deliberately does
 not escalate to `SIGKILL`; it fails and preserves the backing tree so an
 operator can inspect the live process safely.
 
-## Debian 12 validation result — 2026-09-02
+## Debian 12 GCE validation result — 2026-09-13
+
+The current suite passed all 22 checks with exit code 0 at revision
+`5a3bef69aa4980c6783e177c44e6e0b5b7f286f0`; its
+[Linux and Windows CI run](https://github.com/seo-rii/maki/actions/runs/34707982492)
+also passed. The disposable target was a GCE `n2-standard-4` using
+`debian-12-bookworm-v20260908`, Linux `6.1.0-53-cloud-amd64`, Rust 1.98.1,
+nbd-client 3.27.1 (source revision
+`f96f7fca3b37f4254c26c95f5c6c9dae70e030a1`), nbdkit 1.32.5, LVM 2.03.16,
+XFS tools 6.1.0, fio 3.33, and SQLite 3.40.1.
+
+The 512 MiB `/dev/nbd15` run passed rootless nbdkit isolation, exact kernel NBD
+geometry, raw CRC32C fio, a single-PV LVM/XFS topology with all administrator
+UUID pins, the real attach and verify paths, unprivileged XFS fio, SQLite WAL
+with `synchronous=FULL`, a full checkpoint and `integrity_check=ok`, the real
+cleanup path, a second no-record cleanup, clean daemon shutdown, and the
+offline Maki check. Cleanup removed the LVM metadata and runtime artifacts.
+The instance and its auto-delete boot disk were then deleted; fresh project
+queries returned zero `maki-*` instances and zero `maki-*` disks.
+
+This is a non-crashing smoke test with one local AES-GCM-SIV provider. nbdkit
+ran through `setpriv`; the run did not exercise the installed `maki@.service`
+sandbox or a persistent `maki` account. It does not prove database ACK survival
+through a storage crash, real NBD/LVM/XFS recovery inside the packaged systemd
+lifecycle, remote-provider behavior, or long-duration operation.
+
+## Historical Debian 12 validation result — 2026-09-02
 
 The safe privileged suite passed on a Debian 12 KVM host at revision
 `0c4a44a4d2e4ae5f468afad28e49e6fa945a23ea` with Linux

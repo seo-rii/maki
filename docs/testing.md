@@ -132,6 +132,9 @@ packaged configuration without installing services or creating users.
 | Partial journal writes (BUG-020) | `maki-core/tests/review_journal_retry.rs`: a BackingFile that writes a prefix then returns EIO, shorter retries, roll/FLUSH without retry, cleanup failure, and recovery after sealing the segment |
 | Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO, retry and process recovery followed by power loss, changes after the scan, valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer |
 | gRPC authentication evidence (TEST-002) | `maki-nbdkit/tests/phase9_daemon.rs`: attach without metadata must fail after the server actually rejects it with Unauthenticated; valid metadata roundtrips with no authentication rejection, independently of which deadline's error text wins |
+| Convergent privileged cleanup (R3-007) | `maki-privileged/src/exec_tests.rs` and `maki-attach/tests/e2e.rs`: no record succeeds without probing, an owned connected backend selects detach, an absent backend selects recovery, and a foreign or unreadable backend preserves the record and causes no mutation |
+| Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
+| Current privileged runner contract | `regression_nbd_client_version_probe.rs` and `phase7_priv.rs`: a 3.27.1 help banner with nonzero exit is accepted, netlink receives `nbdN`, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice |
 
 The native NBD negotiation case requires Linux, `nbdkit`, and `nbdinfo` from
 libnbd. It uses Cargo's cdylib and an isolated child process with a private Unix
@@ -143,11 +146,14 @@ userspace ABI and negotiation, without operating a kernel NBD device.
 
 ## Current qualification status
 
-The September helper changes require new target-host qualification with
-nbd-client netlink/backend identity support. The historical privileged Linux
-reports below cover earlier code. The current regression suite does not start
-systemd workloads or attach real devices; follow the
-[runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
+The current helper at `5a3bef6` passed a disposable Debian 12 GCE run with
+nbd-client 3.27.1, kernel NBD, LVM, XFS, all administrator UUID pins, real
+attach/verify/cleanup, fio, and SQLite. The default CI lifecycle regressions
+check unit contracts without installing services. Separate GCE runs exercised
+actual systemd transactions and Docker recreation, but their daemon/attach/
+verify steps were fixtures. No one campaign has yet combined an actual Maki
+daemon, kernel storage crash, packaged recovery, and a database ACK oracle.
+Follow the [runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
 
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
@@ -157,8 +163,10 @@ systemd workloads or attach real devices; follow the
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
 | Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
-| Kernel NBD, LVM, XFS, and fio | Functional smoke | Pass on Debian 12/KVM | Guarded privileged run completed on a disposable NBD target |
-| Real databases | Required | Partial | SQLite WAL smoke passed; crash campaigns and other engines remain open |
+| Kernel NBD, LVM, XFS, and fio | Functional smoke | Pass on Debian 12 GCE | Current `5a3bef6` guarded run completed 22 checks with nbd-client 3.27.1 on a disposable `/dev/nbd15` |
+| Packaged systemd lifecycle | Functional ordering and failure gates | Partial on Debian 12 GCE | Actual PID 1 transactions recreated fixture daemon/workload processes, withheld restart after cleanup failure, and blocked workload `ExecStart` after verify failure; actual Maki storage crash was not combined |
+| Docker bind lifecycle | Functional rebind and start gate | Partial on Debian 12 GCE | Default `rprivate` bind, distinct container IDs/times, loop-XFS SQLite rows 1→2 with `integrity_check=ok`, and zero container starts on a plain directory; storage attach/verify were fixtures |
+| Real databases | Required | Partial | Current SQLite WAL `synchronous=FULL` smoke passed on real attached XFS and a separate Docker recreation smoke passed; crash ACK campaigns and other engines remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
 | GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
@@ -169,7 +177,10 @@ The detailed Debian run is preserved in the
 [rootless Linux validation report](native-linux-validation-2026-09-02.md). The
 later [privileged Linux validation report](privileged-linux-validation.md)
 records the kernel NBD, LVM, XFS, raw and filesystem fio, privilege, helper, and
-SQLite smoke results.
+SQLite smoke results, including the current GCE run and its limits. The same
+disposable host ran the actual systemd transaction and Docker lifecycle checks;
+the instance and boot disk were deleted afterward, and fresh name-scoped
+queries found no remaining `maki-*` resources.
 The [September 12 fault report](cgroup-fault-validation-2026-09-12.md) records
 the new native process and cgroup executions, external ACK evidence, reproduction
 commands and the unresolved restart limit. The host was Debian, so no WSL
@@ -253,6 +264,8 @@ WSL is suitable for Linux syscall integration but not for power-loss claims.
   supported target distribution.
 - Effective capability, ACL, core-dump, mount, and service-restart checks under
   installed systemd units.
+- Run the actual Maki daemon, kernel NBD/LVM/XFS, packaged systemd recovery, and
+  DB/container ACK oracle together in one crash/recovery campaign.
 - Vendor endpoint conformance with production mapping and credentials.
 - Credential rotation and TLS certificate rotation.
 - Real SQLite and PostgreSQL workloads before broader database qualification.
