@@ -97,9 +97,10 @@ remaining release gates.
 
 The current [R3 readiness record](docs/production-readiness-review-2026-09-08.md)
 supersedes the historical remaining-work lists above. MAKI-020 now has required
-mirrored acknowledgement evidence and focused local regressions; whole-version
-validation remains pending. MAKI-025's segment scanner now streams, while
-replay payload and overlay memory remain unresolved limits. Neither change
+mirrored acknowledgement evidence: `1bc0ab5` passed 768 workspace tests,
+nine release gates, and Linux/Windows CI. Follow-up changes are tracked
+separately. Volume recovery streams segments and retains the latest record per
+unit; distinct-unit, overlay and metadata memory limits remain open. Neither change
 constitutes production approval.
 
 ## Build

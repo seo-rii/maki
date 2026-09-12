@@ -121,9 +121,11 @@ The public `scan_journal` and `recovery::recover` APIs retain their all-record
 return contract; the deep checker still uses that public scan. No new arbitrary
 RAM refusal limit has been applied to existing readable volumes.
 
-The MAKI-020 codec/store and focused integration regressions pass locally.
-They are not a current full release-gate, actual DB, or hardware power-loss
-qualification. See the [readiness record](production-readiness-review-2026-09-08.md)
-for exact revisions and completed versus pending validation, and
+The MAKI-020 integration in `1bc0ab5` passed 768 workspace tests (10 ignored),
+all nine selected release gates, and Linux/Windows CI. The subsequent latest-
+record retention change is tracked separately. These results do not establish
+actual DB or hardware power-loss qualification. See the
+[readiness record](production-readiness-review-2026-09-08.md) for exact revisions
+and completed versus pending validation, and
 [storage recovery](storage-recovery.md) for the separate NBD/LVM/mount cleanup
 limitations.

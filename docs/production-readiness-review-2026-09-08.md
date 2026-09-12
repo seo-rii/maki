@@ -1,8 +1,8 @@
 # 운영 준비 검토 및 R3 수정 기록 — 2026-09-08
 
-최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace/release/CI 기준선은 `466056d`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 TDD 수정과 단위별 커밋을 이어갔다. 그 기준선 이후 복구 streaming과 v2 필수 durable proof를 추가했다. 아래 수정별 로컬 검증과 완료된 과거 snapshot 검증, 새 변경의 전체 검증 대기를 구분한다.
+최초 검토 기준은 `9911cf7`, 가장 최근에 완료한 전체 workspace/9 release gates/CI 기준선은 `1bc0ab5`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 TDD 수정과 단위별 커밋을 이어갔다. 후속 복구 메모리 변경 `972399d`도 core 전체·관련 release gate 6개·Linux/Windows CI를 통과했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
-**운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 평문 직렬화 복사본, 물리 공간 admission과 replay 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책은 구현하고 로컬 회귀를 통과했지만 새 포맷의 전체 검사와 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
+**운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. 자동 복구의 중간 상태, 평문 직렬화 복사본, 물리 공간 admission과 replay 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
 
 ## 검증 기준선
 
@@ -59,7 +59,7 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 - `7a2bf94` (MAKI-024의 문서 범위): [deep check 설명](operations.md)을 저장 구조·CRC 검사로 한정했다. AEAD, 복구 후 논리 읽기 또는 DB 의미 일관성 검사를 새로 구현한 변경은 아니다.
 - `466056d`: Unix 전용 control 생성 경로의 `with_admission`을 `cfg(unix)`로 제한해 Windows strict Clippy의 dead-code 오류를 수정했다. 변경 후 해당 snapshot의 전체 검사와 Linux·Windows CI가 통과했다.
 - `133d36d` (MAKI-025 일부): checkpoint에 포함된 journal segment를 streaming으로 검사한다. 해당 fixture의 추가 heap peak는 135,397,624바이트에서 488바이트로 줄었으며 고정 64KiB stack scratch는 별도다. replay payload와 overlay 전체 메모리에는 아직 상한이 없다.
-- `f7312c6`, `f643005`, `e14a018` 및 후속 통합 변경 (MAKI-020): 새 볼륨은 superblock envelope v2와 64바이트 `journal/durable-proof.a/b`를 요구한다. journal sync와 양쪽 proof 게시가 성공해야 ACK와 공개 durable sequence가 전진한다. recovery는 복구 메타데이터를 고치기 전에 required horizon의 연속성과 정확한 record end를 검증하며, 받아들인 tail의 양쪽 proof를 게시한 뒤 READY가 된다. [보장 범위와 호환성](durable-recovery.md)에 v1 writable 거절, 읽기 전용 검사 경고, 자동 in-place 이전 부재, 양쪽 유효 rollback에 대한 비보장을 명시했다. 새 변경의 전체 snapshot 검증은 아래 대기 상태로 관리한다.
+- `f7312c6`, `f643005`, `e14a018` 및 후속 통합 변경 (MAKI-020): 새 볼륨은 superblock envelope v2와 64바이트 `journal/durable-proof.a/b`를 요구한다. journal sync와 양쪽 proof 게시가 성공해야 ACK와 공개 durable sequence가 전진한다. recovery는 복구 메타데이터를 고치기 전에 required horizon의 연속성과 정확한 record end를 검증하며, 받아들인 tail의 양쪽 proof를 게시한 뒤 READY가 된다. [보장 범위와 호환성](durable-recovery.md)에 v1 writable 거절, 읽기 전용 검사 경고, 자동 in-place 이전 부재, 양쪽 유효 rollback에 대한 비보장을 명시했다. 통합 커밋 `1bc0ab5`의 전체 snapshot 검증 결과는 아래에 기록했다.
 
 완료 검증 로그 (각 exit 0):
 
@@ -102,9 +102,9 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 
 MAKI-020의 필수 proof 및 MAKI-025의 streaming 수정은 위 `466056d` snapshot에 포함되지 않는다. 처음에는 FUA 2회 성공 뒤 tail payload에 지속 손상을 넣고 mark를 없애거나 유효한 과거 mark로 되돌리면 당시 복구가 성공하는 두 조건을 재현했다(2 failed, exit 101; `/home/seorii/logs/maki-r3-durable-proof-both-red-20260912T085855.114585Z.log`). 정상 정전만으로 COMMIT이 유실됐다는 뜻은 아니다. 추가 Pro 설계 검토는 모델 선택 단계에서 실패하여 결과를 받지 못했다.
 
-## v2 필수 proof 변경 — 전체 snapshot 검증 대기
+## v2 필수 proof 변경 — 1bc0ab5 검증 완료
 
-MAKI-020은 위 RED를 출발점으로, 양쪽 proof의 게시와 보존, 실패 후 verified redirty 재시도, 복합 손상 거절, legacy 호환성, required horizon 검사 이전의 metadata 변경 방지를 구현했다. 아래 로컬 검증은 통합 변경의 전체 workspace/release/CI 결과를 대신하지 않는다.
+MAKI-020은 위 RED를 출발점으로, 양쪽 proof의 게시와 보존, 실패 후 verified redirty 재시도, 복합 손상 거절, legacy 호환성, required horizon 검사 이전의 metadata 변경 방지를 구현했다. 집중 회귀 이후 `1bc0ab5`의 커밋된 파일만 추출한 snapshot에서 아래 전체 검증을 완료했다. 후속 변경의 검증은 별도로 기록한다.
 
 | 검사 | 완료 상태와 증거 |
 |---|---|
@@ -114,9 +114,16 @@ MAKI-020은 위 RED를 출발점으로, 양쪽 proof의 게시와 보존, 실패
 | 후속 core/format 전체 | 291 passed, 6 ignored, 0 failed, exit 0. `/home/seorii/logs/maki-r3-proof-verified-core-format-20260912T092844.123321Z.log` |
 | 후속 core/format strict Clippy | exit 0. `/home/seorii/logs/maki-r3-proof-verified-clippy-20260912T092844.500283Z.log` |
 | 두 번째 proof 게시 실패 회귀 | 2 passed, exit 0. `/home/seorii/logs/maki-r3-proof-second-barriers-final-tests-20260912T093357.710061Z.log` |
-| 새 통합 커밋의 전체 workspace/fmt/strict Clippy | **대기** — 커밋된 파일만 추출한 새 snapshot의 commit, 명령, 종료 코드, 로그를 기록해야 함 |
-| 새 통합 커밋의 지정 release gate 9개 | **대기** — 이전 `466056d`의 9개 통과를 새 포맷 결과로 재사용하지 않음 |
-| 새 통합 커밋의 Linux·Windows CI | **대기** — push 후 해당 commit의 완료된 run 결과 필요 |
+| `1bc0ab5` 전체 workspace/fmt/strict Clippy | workspace **768 passed, 0 failed, 10 ignored**, exit 0; fmt와 `--workspace --all-targets -- -D warnings`도 exit 0 |
+| `1bc0ab5` 지정 release gate 9개 | **9 passed, 0 failed, 0 ignored**, exit 0. 새 형식으로 기존 7개 및 R3B durability/concurrent gate를 실행 |
+| `1bc0ab5` Linux·Windows CI | 모두 성공, [CI run](https://github.com/seo-rii/maki/actions/runs/34686364092) |
+
+전체 검증 PID 411370, 통합 종료 코드 0, 745.41초. 로그
+`/home/seorii/logs/maki-r3-proof-snapshot-verified-20260912T093747.794339Z.log`.
+workspace는 `cargo test --workspace --locked -j 2`, release는 같은 snapshot에서
+`--release -- --ignored`와 위 9개 gate 이름을 지정했다. 일반 suite의 ignored
+10개를 성공으로 합산하지 않았다. 이 결과에는 `972399d`의 최신 replay 보유
+변경이 포함되지 않는다.
 
 한쪽 proof가 사라지거나 오래되거나 손상되어도 다른 쪽에 현재 proof가 남으면 required horizon은 낮아지지 않는다. 둘 다 없거나 유효하지 않으면 빈 볼륨도 거절한다. CRC 위조나 양쪽 proof와 backing 전체의 유효한 과거 상태로의 동시 rollback은 막지 않으며 A/B 파일은 독립 물리 장애 도메인이 아니다. 추가 metadata/directory sync의 실제 FUA/FLUSH 지연과 지원 손상 모델의 운영 대상 검증이 남는다. 아래 잔여 항목은 로컬 테스트 통과만으로 자동 해결되지 않는다.
 
@@ -125,7 +132,12 @@ MAKI-020은 위 RED를 출발점으로, 양쪽 proof의 게시와 보존, 실패
 `/home/seorii/logs/maki-r3-latest-replay-verified-core-20260912T094305.274290Z.log`,
 PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 heap peak는
 두 경우 모두 33,988 bytes였다. 이 후속 수정은 `1bc0ab5` 검증 snapshot에
-포함되지 않으며 별도 최종 검사로 추적한다.
+포함되지 않는다. `972399d`의 커밋된 snapshot에서 관련 core release gate
+6개(phase3/4/11/12, R3B durability/concurrent)를 추가 실행해 6 passed,
+0 failed, 0 ignored를 확인했다. PID 498676, exit 0, 260.98초; 로그
+`/home/seorii/logs/maki-r3-replay-release-verified-20260912T095315.996795Z.log`.
+이 커밋의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/34686934432)도
+모두 성공했다. 나머지 3개 release gate의 최근 실행은 `1bc0ab5` 기준이다.
 
 ## 남은 리뷰 항목과 종료 조건
 
@@ -136,7 +148,7 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 | MAKI-005 | 코드: 전체 PV/VG/LV·filesystem 신원 증명이 VG 활성화 전에 끝나지 않음 | 활성화 전 신원 검증과 foreign/unknown 대상 변경 0회를 보여 주는 실패·재시도 회귀 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 코드·수명주기: 명령 deadline과 기록 기반 recover는 추가됐지만 activation→proof 게시 crash 공백, 실제 READY, 다른 mount namespace와 workload restart 우회가 남음 | 모든 attach/cleanup 중간 상태의 안전한 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
 | MAKI-015/032 | 코드: 논리·암호문 budget 수정은 완료했으나 WS/gRPC 직렬화와 codec의 일반 평문 복사본 수명·전체 resident 비용이 남음 | 성공·오류·취소마다 소유 버퍼 정리와 peak resident 상한을 검증하고 전송 계층의 남는 보장 범위를 명시 |
-| MAKI-020 | v2 코드·집중 회귀 구현 완료, 전체 검사·운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 새 통합 커밋 전체 gates와 지원 복합 fault qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
+| MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료, 운영 검증 대기: 필수 mirrored proof가 확정 이력의 경계를 요구하며 증거 부족 시 거절. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 코드·용량: free-space threshold는 진행 중 journal·새 slot·checkpoint 완주 공간의 실물 예약이 아님 | 동시 요청까지 포함한 공간 admission/예약과 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
 | MAKI-025 | 부분 수정: segment streaming과 실제 Volume attach의 단위별 최신 replay 보유로 반복 overwrite 이력의 payload/pending 인덱스 증가를 제거. 고유 단위, overlay 두 사본, segment/bitmap metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한을 검증하고 고유 단위가 많은 journal도 안전하게 복구. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
 | MAKI-028 | 자원 구조: latest/durable/checkpoint overlay의 ciphertext 중복이 남음 | 실제 최대 overlay에서 peak RSS 한도 검증, 필요 시 보관 구조 수정; 논리 budget 통과를 전체 메모리 증거로 사용하지 않음 |
