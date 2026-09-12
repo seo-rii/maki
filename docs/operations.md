@@ -65,9 +65,15 @@ Without `--deep` the check covers the superblock, shard catalog, allocation-map
 sizes, and file presence only. `--deep` additionally verifies both checkpoint
 state copies, the key canary, the durable mark, every journal segment exactly
 as recovery would scan it (reporting the repairs recovery would make), and
-every allocated slot exactly as the engine would read it. A volume that holds
-data is only known good after a deep check passes. `--deep` takes the volume
-lock and refuses to run while a daemon is attached; when checking a backing
+every allocated slot's stored structure and checksums. A successful deep check
+does not decrypt data, authenticate its ciphertext, establish freshness, or
+prove filesystem or database consistency. Canary checking here validates its
+stored structure and volume identity; actual key verification happens at
+attach. Combine these checks with provider authentication and application
+recovery/backup verification before accepting recovered data.
+
+`--deep` takes the volume lock and refuses to run while a daemon is attached;
+when checking a backing
 root directly, pass `--journal-segment-size` if the volume uses a non-default
 size.
 
