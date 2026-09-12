@@ -47,6 +47,42 @@ fn body_from(bytes: Sensitive) -> reqwest::Body {
     reqwest::Body::from(bytes::Bytes::from_owner(WipedOnDrop(bytes)))
 }
 
+fn append_response_chunk(
+    out: &mut Sensitive,
+    chunk: &[u8],
+    limit: usize,
+) -> Result<(), CryptoError> {
+    let length = out
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| CryptoError::NonRetryableRequest("response size overflow".into()))?;
+    if length > limit {
+        return Err(CryptoError::NonRetryableRequest(format!(
+            "response exceeds limit {limit}"
+        )));
+    }
+    if length <= out.capacity() {
+        out.extend_from_slice(chunk);
+        return Ok(());
+    }
+
+    // Vec growth copies before releasing its previous allocation, without
+    // giving its owner a chance to wipe that allocation. Move through a new
+    // fixed-capacity guard and erase the replaced owner explicitly instead.
+    let capacity = out.capacity().saturating_mul(2).max(length).min(limit);
+    let mut grown = Zeroizing::new(Vec::new());
+    grown.try_reserve_exact(capacity).map_err(|_| {
+        CryptoError::NonRetryableRequest(format!(
+            "response of {length} bytes cannot be held within limit {limit}"
+        ))
+    })?;
+    grown.extend_from_slice(out);
+    grown.extend_from_slice(chunk);
+    out.zeroize();
+    *out = grown;
+    Ok(())
+}
+
 /// Wipe every string in a JSON document in place. Payload encodings are
 /// reversible, so an encoded payload is plaintext; the document is wiped
 /// as soon as it has been serialized (request) or read (response).
@@ -499,13 +535,7 @@ impl HttpCryptoProvider {
         let mut out = Zeroizing::new(Vec::new());
         let mut response = response;
         while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
-            out.extend_from_slice(&chunk);
-            if out.len() > self.spec.max_response_bytes {
-                return Err(CryptoError::NonRetryableRequest(format!(
-                    "response exceeds limit {}",
-                    self.spec.max_response_bytes
-                )));
-            }
+            append_response_chunk(&mut out, &chunk, self.spec.max_response_bytes)?;
         }
         Ok(out)
     }

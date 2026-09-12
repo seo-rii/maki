@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use super::PayloadEncoding;
+use super::{append_response_chunk, PayloadEncoding};
 
 const PAYLOAD_LEN: usize = 257;
 const FILL: u8 = 0xa5;
@@ -150,4 +150,28 @@ fn malformed_hex_erases_partial_decoded_output() {
 
     let inspection = inspect_rejected_decode(PayloadEncoding::HexLower, &encoded);
     assert_partial_output_wiped(inspection);
+}
+
+#[test]
+fn response_growth_erases_the_replaced_plaintext_allocation() {
+    INSPECTION.with(|cell| {
+        let previous = cell.replace(Inspection {
+            enabled: true,
+            ..Inspection::default()
+        });
+        assert!(!previous.enabled, "nested response allocation inspection");
+    });
+
+    let mut response = zeroize::Zeroizing::new(Vec::with_capacity(PAYLOAD_LEN));
+    response.extend_from_slice(&[FILL; PAYLOAD_LEN]);
+    append_response_chunk(&mut response, &[FILL], PAYLOAD_LEN + 1).unwrap();
+    drop(response);
+
+    let inspection = INSPECTION.with(|cell| {
+        let inspection = cell.get();
+        cell.set(Inspection::default());
+        inspection
+    });
+    assert_eq!(inspection.plaintext_deallocations, 0, "{inspection:?}");
+    assert!(inspection.zeroized >= 2, "{inspection:?}");
 }
