@@ -790,8 +790,12 @@ returns the engine to `Ready`. The control socket reports the state in
 
 ## On-disk additions
 
-All additions are new files; no existing structure changed, so the format
-version stays at 1. Volumes created before these changes lack these files:
+This section records the intermediate v1 state at the time of that remediation.
+At that point the additions were new files and the format version remained 1.
+The current release instead requires the v2 superblock envelope and dual
+durable-proof records described in [Durable recovery](durable-recovery.md);
+that later contract supersedes the current-tense v1 statements below. Volumes
+created before the intermediate changes lacked these files:
 
 - `canary.{a,b}`: established on the next attach as described above.
 
@@ -818,3 +822,44 @@ Validation: `review_r3_context` supplements the upstream `review_r3b_selftest`
 with matching-field, wrong-field/generic-error, and inconclusive-probe tests.
 Each transport's `review_integrity` covers exact field tokens and malformed
 signals as well as the authenticated engine pipeline using the full context.
+
+## R3 final status and lifecycle qualification (2026-09-13)
+
+The direct R3-001–010 causes are closed in product paths and focused tests.
+This table distinguishes that closure from broader production qualification
+that the review bundle also tracks.
+
+| R3 item | Final direct-finding status | Evidence |
+|---|---|---|
+| R3-001 wire integrity | Closed | `3703683`; authenticated ciphertext reaches the engine and wire mappings preserve integrity, schema, and timeout classes |
+| R3-002 rollback ownership | Closed | `c834ff5`; foreign or unreadable backend identity stops teardown and preserves trusted state |
+| R3-003 request budgets | Closed | `4449a74`; logical, ciphertext, and RPC boundaries reject oversized requests before mutation |
+| R3-004 endpoint capabilities | Closed | Preserved per-endpoint intersection plus `27dce14`; heterogeneous endpoint regressions pass |
+| R3-005 UUID/canary identity | Closed | `8e725fc`; locked actual UUID, per-endpoint canary, and quarantine recovery tests |
+| R3-006 full context | Closed | `dd87466`; only exact context-field refusal is accepted as capability evidence |
+| R3-007 recovery lifecycle | Product path closed; end-to-end qualification remains | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; focused regression, current clean kernel NBD/LVM/XFS attach/verify/cleanup, actual systemd ordering, and Docker rebind/plain-directory gates pass separately |
+| R3-008 shutdown result/logging | Closed for supported foreground mode | `dc646ef`; explicit drain result, admission closure, retry, subprocess logging, and concurrent shutdown tests |
+| R3-009 response shape | Closed | `57ca845`; empty, extra, wrong-index, and wrong-length responses fail without panic |
+| R3-010 capability mode | Closed | `40502a7`; only declared mode is accepted and remote declarations are contractual |
+
+The current privileged run at `5a3bef6` used nbd-client 3.27.1 and passed 22
+checks on a disposable Debian 12 GCE host: real kernel NBD, single-PV LVM/XFS
+with all UUID pins, attach, verify, two cleanup calls, fio, SQLite WAL, and an
+offline check. The actual systemd transaction used fixture daemon/attach/
+verify/workload components but proved stop, cleanup-success restart, cleanup-
+failure hold, and per-start gate ordering. A separate Docker run observed
+default `rprivate` propagation, distinct container IDs and creation times,
+SQLite rows 1→2 with `integrity_check=ok`, and zero container starts on a plain
+directory. The Docker run used loop-backed XFS and a custom UUID gate, so it is
+not an end-to-end Maki storage-crash durability result.
+
+The disposable instance and boot disk were deleted; fresh project queries
+found zero name-matched `maki-*` instances and disks. All eight CI runs from
+`1113a26` through `5a3bef6` passed.
+
+The supplied R3 directory is retained because it also contains the inherited
+MAKI/FUP production checklist. Physical checkpoint reservation, complete RSS
+bounds, remaining transport-library copies, checkpoint stalls, actual provider
+faults through a database, replay policy, key migration, fresh-host restore,
+other database engines, physical power loss, and long-duration load remain
+open. Direct R3 closure must not be read as general production approval.

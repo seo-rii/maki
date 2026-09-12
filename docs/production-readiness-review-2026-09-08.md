@@ -1,8 +1,8 @@
 # 운영 준비 검토 및 R3 수정 기록 — 2026-09-08
 
-최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌, cgroup 장애, Firecracker guest 종료와 전체 GCE 인스턴스 reset 검사를 추가했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
+최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌, cgroup 장애, Firecracker guest 종료와 전체 GCE 인스턴스 reset 검사를 추가했고, 현재 privileged 및 lifecycle 검증 기준은 `5a3bef6`이다. `1113a26`부터 `5a3bef6`까지의 8개 CI도 모두 성공했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
-**운영 승인은 보류한다.** 외부 시험 대상만 부족한 상태가 아니다. DB/container까지 묶는 복구 controller, 전송 라이브러리의 평문 복사본, 물리 공간 admission과 고유 단위·metadata의 전체 메모리에 코드 과제가 남아 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. 로컬에 제공된 `maki-review-r3-2026-09-08/` 원본은 모든 항목의 해결과 검증이 끝날 때까지 보존한다.
+**운영 승인은 보류한다.** packaged recovery controller와 workload gate는 구현됐지만 실제 Maki kernel storage crash와 DB/container ACK를 한 번에 묶는 검증은 남아 있다. 전송 라이브러리의 평문 복사본, 물리 공간 admission과 고유 단위·metadata의 전체 메모리에도 코드·검증 과제가 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
 
 ## 실제 cgroup·프로세스 장애 검사 — 2026-09-12
 
@@ -89,6 +89,48 @@ NBD/LVM/XFS, 실제 DB, remote provider, 장시간 부하나 물리 정전은 �
 project 조회에서 인스턴스 0개, 디스크 0개를 확인했고 삭제 전후 JSON과
 43개 증거 파일의 검증된 SHA-256 manifest를 로컬 private 로그에 보존했다.
 
+## 현재 privileged·systemd·Docker 수명주기 검사 — 2026-09-13
+
+`5a3bef69aa4980c6783e177c44e6e0b5b7f286f0`을 별도 GCE
+`n2-standard-4`, `debian-12-bookworm-v20260908`, Linux
+`6.1.0-53-cloud-amd64`에서 검사했다. nbd-client 3.27.1, nbdkit 1.32.5,
+LVM 2.03.16, XFS tools 6.1.0, fio 3.33, SQLite 3.40.1을 사용했다. 실제
+512 MiB `/dev/nbd15`에서 rootless nbdkit, kernel NBD, raw CRC32C fio,
+단일-PV LVM/XFS와 전체 PV/VG/LV UUID pin, 실제 attach/verify/cleanup,
+두 번째 멱등 cleanup, XFS fio, SQLite WAL `synchronous=FULL` checkpoint와
+`integrity_check=ok`, clean daemon shutdown 및 offline Maki check까지
+22개 검사가 exit 0으로 통과했다. 증거는
+`/home/seorii/logs/maki-gcp-privileged-20260913-evidence/maki-privileged-success.tgz`에
+보존한다.
+
+같은 호스트의 실제 systemd PID 1 transaction은 daemon failure 뒤 fixture
+workload `43692`를 멈추고 attach stop과 cleanup을 마친 뒤 새 daemon
+`43687→43714`, workload `43692→43719`를 시작했다. cleanup/config 실패에는
+workload를 다시 시작하지 않았고, per-start verify 실패에서는 workload
+`ExecStart`가 0회였다. `systemd-analyze verify`에도 unit cycle이나 syntax
+오류가 없었다. daemon, attach-start, verify와 workload는 fixture였고 실제
+`maki-attach cleanup`은 no-record 성공과 invalid-config 실패 경로를 실행했다.
+
+별도 Docker 검사는 `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`와
+loop-backed XFS를 사용했다. Docker의 기본 `rprivate` bind를 확인했고
+container ID가 `bcf202…`에서 `e570ae…`로, 생성 시각과 PID도 바뀌었다.
+SQLite 행은 1개에서 2개로 이어졌고 양쪽 container와 host 검사에서
+`integrity_check=ok`였다. XFS가 아닌 일반 디렉터리에서는 container
+`ExecStart`가 0회였다. `/proc` mount namespace token은 이전 container가
+사라진 뒤 두 실행에서 같은 `mnt:[4026532341]` 값으로 재사용됐으므로,
+token 차이를 새 container의 합격 조건으로 사용하지 않았다.
+
+Docker 시험은 fixture daemon/attach와 custom `findmnt` UUID gate를 썼으며
+real cleanup은 no-record 경로였다. 실제 Maki daemon, kernel NBD/LVM 및
+trusted `maki-attach verify`를 같은 crash/restart transaction에 넣지 않았다.
+따라서 위 두 수명주기 시험은 current helper의 실제 clean storage smoke를
+보완하지만 DB 내구성 또는 전체 storage recovery의 종단간 인증은 아니다.
+성공·검증기 실패 시행과 SHA-256은 같은 private evidence directory에 남겼다.
+
+검사 뒤 privileged 인스턴스와 auto-delete 50 GiB balanced boot disk를
+삭제했다. 새 project 조회에서 `maki-*` 인스턴스 0개와 디스크 0개를
+확인했고 삭제 및 조회 JSON을 evidence directory에 보존했다.
+
 ## 검증 기준선
 
 커밋된 파일만 `git archive`로 분리하여 Rust 1.94.0, 저장소 Cargo.lock으로 검사했다. 기존 미추적 실험 파일은 포함하지 않았다.
@@ -120,7 +162,7 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 | R3-004 이종 endpoint 능력 | 수정·검증 완료 | 원격 intersection 보존 + `27dce14`; 25개 관련 회귀 통과 |
 | R3-005 실제 UUID 및 canary | 수정·검증 완료 | `8e725fc`; 잠긴 실제 UUID/개별 canary/격리 복귀 검증, 5개 회귀 |
 | R3-006 전체 context 검증 | 수정·검증 완료 | 원격 full-context wire 보존 + `dd87466`; 정확한 필드의 명시적 거절만 증거로 인정 |
-| R3-007 명시적 복구 수명주기 | 코드 공백 수정·상위 통합 미완료 | `b68935d`가 activation 전에 recovery intent를 기록하고 absent-backend recover를 제공한다. `91d406f`는 recorded backend가 연결된 detach에도 exact intent observer/deactivation을 적용하고 changed name/UUID/slave/holder와 알 수 없는 internal UUID suffix를 거절한다. `b3c5103`의 workload 시작 전 read-only verify도 유지한다. 실제 DB READY와 namespace/container 재바인딩 통합은 남음 |
+| R3-007 명시적 복구 수명주기 | 제품 경로·집중 검증 완료, 종단간 qualification 일부 | 기존 intent/recover/verify에 `3fc0404`의 멱등 cleanup selector와 `98a5b0e`/`90843db`의 packaged target/recovery/workload graph를 추가했다. 실제 systemd transaction과 Docker `rprivate` container 재생성, DB integrity 및 일반 디렉터리 start 0회를 확인했다. 실제 Maki kernel stack crash와 DB ACK를 한 transaction에 넣는 운영 qualification은 남음 |
 | R3-008 종료 결과/로그 | 지원 foreground 경로 수정·검증 완료 | `dc646ef`; drain 성공/실패 응답, admission 차단·재시도, 실제 rootless nbdkit 오류 로그와 동시 shutdown 회귀. daemonized 로그 경로는 운영 지원 대상으로 승인하지 않음 |
 | R3-009 conformance shape | 수정·검증 완료 | `57ca845`; 빈/추가/잘못된 index/길이 응답 8개 RED→GREEN |
 | R3-010 capability mode | 수정·검증 완료 | `40502a7`; declared만 지원, remote Verified 선언을 Contractual로 표시 |
@@ -136,6 +178,9 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 - `597eb3c` (R3-007, MAKI-007/040 일부): `maki-attach recover`가 backend 부재와 저장된 장치 번호·LVM UUID·slave 관계를 확인하고 mount/VG를 단계적으로 정리한다. 끊긴 파일시스템의 sentinel을 읽지 않는다. proof 없는 활성 mapping은 거절하며, [복구 제한](storage-recovery.md#remaining-recovery-limits)을 그대로 적용한다.
 - `b68935d` (R3-007): 검증된 NBD geometry·partition과 LVM metadata를 activation 전에 원자적으로 기록하고, 성공한 activation 뒤 complete mapping proof로 승격한다. 중간 crash의 intent는 mount/unmount/workload 시작 권한을 주지 않으며, backend가 사라진 복구에서 exact UUID/device/topology만 scoped deactivation한다. legacy proof/intent 없는 기록은 계속 fail closed다.
 - `91d406f` (R3-007): recorded backend nonce가 계속 연결된 정상 detach도 recovery intent를 사용한다. 검증된 부분 activation subset만 scoped deactivation하며 changed mapper name/UUID/slave/holder/mount와 알 수 없는 internal LVM UUID suffix는 mutation 전에 거절한다.
+- `3fc0404` (R3-007): `maki-attach cleanup`이 하나의 lock 아래 no-record 성공, owned connected backend의 detach, absent backend의 recover를 선택한다. foreign/unreadable backend는 mutation 없이 실패하고 record를 보존한다.
+- `98a5b0e`, `90843db` (R3-007, MAKI-006/007/040): workload target, recovery coordinator와 workload drop-in을 추가했다. daemon failure가 직접 restart로 attachment를 우회하지 않고 등록 workload·attach·daemon을 멈춘 뒤 cleanup 성공에만 새 target을 시작한다. target stop은 attachment cleanup 뒤 daemon을 멈추며 매 workload start가 root read-only verify를 거친다.
+- `1113a26`, `575b2c5`, `d6df001`, `81e7f7f`, `5a3bef6`: nbd-client 3.27.1의 nonzero help banner, real cleanup 두 번, control runtime, netlink의 `nbdN` 이름과 root-owned attach config planning을 회귀로 고정했다. 현재 GCE 22-check privileged 실행과 각 커밋 CI가 통과했다.
 - `223db0c` (MAKI-021/041 일부): fresh free-space admission이 emergency reserve뿐 아니라 해당 write의 모든 journal record와 segment-header footprint까지 요구한다. 조회의 `None`/오류와 reserve 덧셈 overflow는 mutation 전에 ENOSPC로 닫는다. 물리 예약과 checkpoint 완주 공간은 남는다.
 - `d843540`, `44ba589`, `e1f4143` (MAKI-015 일부): HTTP Base64/Base64URL/hex 응답을 첫 출력 byte 전부터 고정 크기 zeroizing owner에 직접 decode하고, response growth 때 교체되는 allocation을 지운다. JSON object key, pointer overwrite/descent와 잘못된 pointer, 부분 per-item/batch request tree도 RAII로 정리한다. page lock, malformed response parser의 내부 allocation과 외부 library 복사본은 남는다.
 - `8419b3d` (MAKI-015 일부): HTTP가 소유한 resolved header/query 값과 결합된 mTLS identity PEM을 정상 drop·구성 오류에서 지운다. key-source credential은 중간 UTF-8 byte vector를 만들지 않고 빌린다. 원본 설정 문자열과 reqwest/hyper/rustls/kernel 복사본은 보장 밖이다.
@@ -663,8 +708,8 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 
 | 남은 ID | 성격과 현재 제한 | 종료 조건 |
 |---|---|---|
-| MAKI-005 | 코드 지원 완료·운영 검증 미완료: mount 전 TYPE/configured FS UUID, 활성화 전 독립 PV label·전체 VG 목록, NBD device/발견한 VG UUID 제한에 더해 `[lvm_identity]`의 전체 PV/VG/대상-LV UUID exact match를 제공. 핀은 recovery에서 재검증되고 grow/detach identity에도 포함된다. unpinned 호환 모드, host udev 및 외부 root 조정은 운영 보장 밖 | 운영 구성에 핀을 필수화하고 지원 토폴로지에서 foreign/unknown 대상 변경 0회, 실패·재시도, udev/root 경합을 포함한 실제 대상 검증 |
-| R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 부분 수정: native 초기 복구·provider 검증 후 READY, 명령 deadline, 기록 기반 recover, workload 시작 전 read-only verify와 activation 전 recovery intent 제공. proof 게시 전 crash의 exact mount-free mapping은 absent-backend recover와 connected detach 모두 scoped cleanup 가능하다. 실제 DB READY와 다른 namespace·재시작 경로의 통합은 남음 | 모든 attach/cleanup 중간 상태의 실제 장치 재시도, 올바른 mount에서만 DB 시작, container 재생성/재바인딩을 포함한 실제 대상 시험 |
+| MAKI-005 | 코드 지원 완료, 좁은 실제 topology 검증 완료: mount 전 TYPE/configured FS UUID와 `[lvm_identity]`의 전체 PV/VG/대상-LV UUID exact match를 제공하고, 한 개의 pinned single-PV GCE topology에서 attach/verify/cleanup을 통과했다. unpinned 호환 모드, host udev 및 외부 root 조정은 운영 보장 밖 | 운영 구성에 핀을 필수화하고 지원 토폴로지에서 foreign/unknown 대상 변경 0회, 실패·재시도, udev/root 경합을 포함한 실제 대상 검증 |
+| R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 제품 경로 구현·분리된 실제 검증 완료: native READY, bounded 명령, intent/recover/verify, convergent cleanup과 packaged lifecycle을 제공한다. 실제 clean NBD/LVM/XFS와 별도 systemd/Docker 재생성·DB gate를 통과했다 | actual Maki daemon과 kernel storage crash, trusted verify, container/DB ACK를 한 campaign에 결합하고 각 실패 단계의 실제 장치 재시도를 확인 |
 | MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키, gRPC private item과 HTTP 부분 decode, response growth, JSON key·overwrite·부분 request tree, resolved header/query 값과 mTLS identity PEM 보호 완료. 원본 설정 문자열, malformed response parser allocation, page lock, 공유 원본, reqwest/tungstenite/tonic 등 별도 할당의 수명과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료. Firecracker guest hard cut 20회와 전체 GCE instance reset 10회에서 필수 proof와 ACK readback은 보존됨. GCE reset은 workload VM memory/kernel cache를 잃었지만 Persistent Disk 서비스와 물리 저장 경로는 살아 있었음. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, 물리 전원 차단, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space가 reserve와 해당 요청의 모든 record/segment-header footprint를 덮어야 하며 unknown/EIO/overflow는 ENOSPC로 닫는다. 새 slot·metadata·checkpoint 완주 공간의 실물 예약은 아님 | 동시 외부 소비까지 포함한 물리 예약과 checkpoint 경계 ENOSPC 회귀, geometry·fill ratio·DB 임시 공간별 물리 용량 계산 |
@@ -681,12 +726,12 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-038 | 전체 I/O 계약: provider stall/error가 NBD/XFS/DB에 미치는 지연·오류·복구 미검증 | 지원 timeout/error 설정에서 외부 DB ACK와 복구 데이터를 대조하고 최악 지연 목표 확인 |
 | MAKI-042/043/044 | 배포·장애 도메인: WAL/temp/log/backup 보호 범위, key/provider/Docker 부팅 순환, 공유 장치·provider 장애가 미확정 | 정확한 배포 경로·의존성·물리 topology를 고정하고 독립 장애와 공유 장애를 구분한 시험 |
 | MAKI-045/046 | 운영·패키징: 현재 버전의 새 호스트 설치/업그레이드 및 key/format을 포함한 전체 복원 증거 부족 | clean-host 권한·도구 버전 확인, DB-native backup과 별도 key/설정에서 복원 후 외부 데이터 대조 |
-| MAKI-049/050 | 외부 qualification·지원 범위: 고정 버전·digest의 Firecracker guest hard cut 20회와 전체 GCE instance reset 10회가 외부 ACK/hash 대조를 통과. 실제 DB, 물리 정전, 장시간 결과와 DB별 이미지/topology는 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 실제 DB ACK/hash 대조와 성능·복원 승인 |
+| MAKI-049/050 | 외부 qualification·지원 범위: 고정 버전·digest의 Firecracker guest hard cut 20회와 전체 GCE instance reset 10회가 외부 ACK/hash 대조를 통과. 현재 SQLite non-crash smoke와 별도 Docker 재생성 smoke도 통과했다. DB ACK crash, 물리 정전, 장시간 결과와 DB별 이미지/topology는 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 실제 DB ACK/hash 대조와 성능·복원 승인 |
 
 MAKI-004의 명령 제한, MAKI-012/018/023/027/037/047, FUP-014의 Linux 경로 원인은 위 수정 기록으로 추적한다. MAKI-039의 storage 대기 제거는 검증했지만 별도 프로세스 heartbeat나 runtime 격리를 구현한 것은 아니다. 지원 기능과 선택적 성능 개선의 보류는 명시적인 지원 범위 결정으로 관리할 수 있으나, 이 문서에서 그 결정을 이미 승인된 것으로 간주하지 않는다.
 
 ## 운영 승인 조건
 
-먼저 위 코드·복구 과제를 수정하거나 검증 가능한 지원 범위로 결정해야 한다. 그다음 현재 revision의 실제 kernel NBD/LVM/XFS 및 서비스 재시작 검증, DB 외부 ACK 대조, 새 호스트 백업 복원, 물리 정전과 장시간 부하 시험이 필요하다. rootless nbdkit, Firecracker와 전체 GCE reset 시험은 실제 native plugin, guest crash 및 workload VM reset 경로의 증거지만 kernel NBD/LVM/XFS/DB 정전 시험의 대체가 아니다. 과거 Debian smoke 역시 현재 helper 변경을 인증하지 않는다. 대상 VM/DB 이미지/용량과 지연·복구 목표는 아직 확정되지 않았다.
+먼저 위 코드·복구 과제를 수정하거나 검증 가능한 지원 범위로 결정해야 한다. 현재 revision의 clean kernel NBD/LVM/XFS smoke와 분리된 service/container 재시작 검증은 완료했다. 다음 단계는 actual Maki stack을 사용한 kernel storage crash/recovery 및 DB 외부 ACK 결합 시험, 새 호스트 백업 복원, 물리 정전과 장시간 부하다. rootless nbdkit, Firecracker와 전체 GCE reset 시험은 실제 native plugin, guest crash 및 workload VM reset 경로의 증거지만 kernel NBD/LVM/XFS/DB 정전 시험의 대체가 아니다. 대상 VM/DB 이미지/용량과 지연·복구 목표는 아직 확정되지 않았다.
 
 초기 검증 프로파일은 고정 Linux 도구 버전, 단일 인증 provider, 단일 disposable volume/DB부터 시작할 수 있다. 다중 원격 서버의 실제 볼륨별 검증과 실패 전환 회귀는 수정했지만 목표 운영 topology 승인을 뜻하지 않는다. [검사와 qualification 절차](testing.md), [저장소 복구 제한](storage-recovery.md), 로컬 리뷰의 `05-release-plan.md` 승인 계획을 함께 적용한다. 외부에서 복원할 수 없는 유일한 원본 저장소로의 운영은 승인하지 않는다.
