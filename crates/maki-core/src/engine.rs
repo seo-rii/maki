@@ -254,8 +254,8 @@ mod unit_lock_tests {
     }
 }
 
-/// How long a free-space reading is reused before the backing is asked
-/// again.
+/// How long statistics may reuse a free-space reading. Write admission
+/// always asks the backing again while holding the exclusive volume lock.
 const FREE_SPACE_CACHE_TTL: Duration = Duration::from_secs(1);
 
 struct EngineInner {
@@ -846,7 +846,10 @@ impl Engine {
     ) -> Result<(), CoreError> {
         let policy = &self.inner.policy;
         if policy.emergency_reserve_bytes > 0 {
-            if let Some(free) = self.backing_free_bytes() {
+            // A recent observation cannot authorize a new write: another
+            // filesystem user or an earlier operation may have consumed the
+            // space. This remains a threshold check, not a physical reservation.
+            if let Some(free) = self.backing_free_bytes(Duration::ZERO) {
                 if free < policy.emergency_reserve_bytes {
                     return Err(enospc(format!(
                         "backing free space {free} below emergency reserve {}",
@@ -883,12 +886,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Cached backing free space (`None` = unknown).
-    fn backing_free_bytes(&self) -> Option<u64> {
+    /// Backing free space (`None` = unknown), allowing samples younger than
+    /// `max_age`. A zero age forces a fresh sample for write admission; stats
+    /// retain their cache and monitoring reads only the published observation.
+    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
         let now = self.inner.clock.now();
         let mut cache = self.inner.free_space.lock();
         if let Some((value, at)) = *cache {
-            if now.saturating_sub(at) < FREE_SPACE_CACHE_TTL {
+            if now.saturating_sub(at) < max_age {
                 return value;
             }
         }
@@ -947,7 +952,7 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let backing_free_bytes = self.backing_free_bytes();
+        let backing_free_bytes = self.backing_free_bytes(FREE_SPACE_CACHE_TTL);
         let volume = self.inner.volume.read().await;
         let snapshot = VolumeSnapshot::new(&volume, self.state(), self.inner.clock.now());
         self.stats_from_snapshot(&snapshot, cache, backing_free_bytes)

@@ -257,6 +257,22 @@ outside the configured constraints fail cleanly.
 Free space is read with `statvfs` on Unix hosts. Where it cannot be read, the
 free-space rules do not apply and `maki_backing_free_bytes` is null.
 
+When the emergency reserve is enabled, every write admission refreshes free
+space while holding the volume write lock. It does not reuse the statistics
+cache, so space lost or restored between consecutive writes is observed even
+within the same second. Status and metrics still read cached observations;
+they never initiate this filesystem query.
+
+These thresholds are not physical reservations. The journal limit counts
+record bytes and segment headers, while checkpointing must also write slots,
+allocation maps and metadata before reclaiming the old journal. Sparse shard
+file lengths do not reserve disk blocks. Filesystem allocation units, metadata,
+copy-on-write and other filesystem users can consume space after the query;
+a successful admission does not guarantee that the write or checkpoint will
+complete without ENOSPC. Include those costs and DB temporary storage in
+capacity qualification instead of equating exported virtual size with backing
+space.
+
 ## Batching and pending bounds
 
 Remote providers are called through a batch scheduler (SPEC §30). Concurrent

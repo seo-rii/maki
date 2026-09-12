@@ -141,6 +141,18 @@ PID 429879. 고정된 네 단위의 1 MiB/64 MiB overwrite 이력을 비교한 h
 
 ## 남은 리뷰 항목과 종료 조건
 
+MAKI-021의 stale free-space admission을 별도로 수정했다. 시계를 전진하지
+않고 여유 공간을 high→low, low→high, unknown→known-low로 바꾸는 RED 3개가
+실패했다(PID 583843, exit 101;
+`/home/seorii/logs/maki-r3-fresh-space-red-20260912T100807.570132Z.log`). 쓰기
+판단에만 새 조회를 강제하며 통계 cache와 unknown/EIO의 기존 계약은 유지한다.
+관련 6개 및 core 전체 182 passed, 6 ignored, exit 0(PID 593921;
+`/home/seorii/logs/maki-r3-fresh-space-all-core-20260912T100939.097861Z.log`),
+strict Clippy exit 0(PID 593322;
+`/home/seorii/logs/maki-r3-fresh-space-clippy-20260912T100931.425712Z.log`)이다.
+조회 이후 외부 공간 소비와 journal/slot/metadata/checkpoint 완주 공간의
+실물 예약은 이 수정으로 보장되지 않는다.
+
 MAKI-005의 파일시스템 검사 순서는 별도로 수정했다. 잘못된 UUID 또는
 비-XFS를 mount·sentinel 쓰기 후에야 거절하는 RED 2개를 먼저 확인했다
 (PID 565315, exit 101;
