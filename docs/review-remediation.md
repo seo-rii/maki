@@ -840,7 +840,7 @@ that the review bundle also tracks.
 | R3-004 endpoint capabilities | Closed | Preserved per-endpoint intersection plus `27dce14`; heterogeneous endpoint regressions pass |
 | R3-005 UUID/canary identity | Closed | `8e725fc`; locked actual UUID, per-endpoint canary, and quarantine recovery tests |
 | R3-006 full context | Closed | `dd87466`; only exact context-field refusal is accepted as capability evidence |
-| R3-007 recovery lifecycle | Product path closed; one combined crash qualification passed | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; `8bf0e94` combined an actual nbdkit crash, connected kernel NBD/LVM/XFS cleanup and reattach, and recovery of 32 external-ACK SQLite rows in a fresh Docker container. Installed systemd, multi-mapping, repeated-crash, and production-topology qualification remain |
+| R3-007 recovery lifecycle | Product path closed; installed combined crash qualification passed | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; `448c0b2` combined the installed graph, actual storage, and SQLite through two automatic nbdkit crashes plus an open-LV cleanup failure/retry, recovering 64 external-ACK rows in four distinct Docker containers. Multi-mapping, foreign-device, package-upgrade, and production-topology qualification remain |
 | R3-008 shutdown result/logging | Closed for supported foreground mode | `dc646ef`; explicit drain result, admission closure, retry, subprocess logging, and concurrent shutdown tests |
 | R3-009 response shape | Closed | `57ca845`; empty, extra, wrong-index, and wrong-length responses fail without panic |
 | R3-010 capability mode | Closed | `40502a7`; only declared mode is accepted and remote declarations are contractual |
@@ -875,10 +875,30 @@ combined campaign did not execute the installed systemd controller or cover a
 remote provider, whole-VM/physical power loss, another database, repeated
 crashes, or soak load.
 
+Revision `448c0b2a46bd748eb473e34405175db9b3cfa102` then installed the shipped
+systemd, sysusers, and tmpfiles artifacts over the actual single-PV/LV stack on
+a new Debian 12 GCE host. Two successive daemon `SIGKILL` events automatically
+recreated the daemon, attachment, per-start verification, and default-`rprivate`
+container while preserving external ACK prefixes of 32 and 48 rows. On a third
+crash, a root-held LV descriptor made both attach stop and recovery cleanup fail
+closed. The workload stayed stopped, the ledger stayed at 48, and NBD, the
+mapping, backend identity, and trusted volume record remained. Closing the
+descriptor and explicitly retrying recovery produced a fourth container and 64
+external-ACK rows. An independent reader matched every SQLite row and payload
+hash with `integrity_check=ok`.
+
+The final drain, target stop, ordered workload/attach/daemon completion, plugin
+unload and offline check passed with no remaining mount, mapping, NBD holder,
+volume record, or container. The result closes the earlier installed-controller
+combination gap for this one local-provider topology. It does not qualify a
+distribution package install or upgrade, multi-LV/internal mapping, foreign
+device replacement, remote providers, another database, fresh-host restore,
+whole-VM loss on this topology, or soak load.
+
 The disposable instances and their auto-delete boot disks were deleted. The
 last fresh project queries found zero name-matched `maki-*` instances and disks,
-and the combined disk's exact lookup returned 404. All 16 CI runs from
-`1113a26` through `8bf0e94` passed.
+and the latest combined disk's exact lookup returned 404. The CI run for
+`448c0b2` passed on Linux and Windows.
 
 Capacity follow-up `5803be8` partially closes MAKI-041's accounting gap. The
 geometry API and `maki volume inspect` now report maximum units and shards,

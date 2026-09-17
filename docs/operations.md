@@ -473,7 +473,30 @@ and disable an independent `restart: always` path that could bypass the target.
 Docker bind mounts are `rprivate` by default, so a host remount does not make an
 old container safe; the lifecycle must stop and create the container again.
 For planned shutdown, obtain a successful `maki drain` acknowledgement first,
-then stop `maki-workload@pg.target`.
+after the application has quiesced and closed its database, then stop
+`maki-workload@pg.target`. Do not stop only the workload or attach unit: the
+`Requires=` and `PartOf=` relationships can deactivate the rest of the graph.
+The target stop orders the workload before attach cleanup and attach cleanup
+before daemon shutdown. The target's own stop job may finish while those
+dependent stop jobs are still deactivating. Wait for every lifecycle unit to
+become inactive before running an offline check, taking a snapshot, or removing
+backing storage:
+
+```bash
+systemctl stop maki-workload@pg.target
+while systemctl is-active --quiet your-workload.service || \
+      systemctl is-active --quiet maki-attach@pg.service || \
+      systemctl is-active --quiet maki@pg.service; do
+    sleep 1
+done
+maki check /etc/maki/volumes/pg.toml
+```
+
+Use a bounded operator timeout around that loop. If it expires, preserve the
+host state for diagnosis rather than forcing NBD, LVM, or device-mapper cleanup.
+The 2026-09-17 combined qualification observed this asynchronous tail directly;
+after all named units became inactive, no mount, mapping, NBD connection,
+trusted volume record, or workload container remained.
 
 > [!CAUTION]
 > For attach, detach, recover and grow, removing `--plan` executes the planned

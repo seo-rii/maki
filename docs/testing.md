@@ -146,15 +146,15 @@ userspace ABI and negotiation, without operating a kernel NBD device.
 
 ## Current qualification status
 
-The current helper at `8bf0e94` passed a disposable Debian 12 GCE campaign with
+The current revision `448c0b2` passed a disposable Debian 12 GCE campaign with
 nbd-client 3.27.1, actual Maki nbdkit, kernel NBD, pinned single-PV LVM/XFS,
-trusted attach/verify/cleanup, and a Docker SQLite external ACK oracle. After
-nbdkit `SIGKILL`, the connected-kernel proof fallback removed the exact mapping,
-reattachment succeeded, and a new container recovered all 32 acknowledged rows.
-The default CI lifecycle regressions check unit contracts without installing
-services. A separate GCE run exercised actual systemd transactions with fixture
-daemon/attach/verify/workload components. The packaged systemd graph and the
-actual crashing Maki storage/database stack have not yet run as one campaign.
+trusted attach/verify/cleanup, and a Docker SQLite external ACK oracle under the
+Installed shipped systemd graph. Two automatic nbdkit `SIGKILL` recoveries
+advanced the fsynced ledger from 16 to 32 and 48 rows. A third crash while a
+root process held the LV open failed cleanup closed without restarting the
+workload; closing the descriptor and explicitly retrying recovery reached 64
+acknowledged rows in a fourth distinct container. An independent container
+matched all 64 rows and reported `integrity_check=ok`.
 Follow the [runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
 
 | Requirement | Target | Status | Evidence |
@@ -165,10 +165,10 @@ Follow the [runtime-layout upgrade procedure](operations.md#upgrading-the-runtim
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
 | Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
-| Kernel NBD, LVM, XFS, and fio | Functional smoke and one server crash | Pass on Debian 12 GCE | `8bf0e94` completed 29 checks with nbd-client 3.27.1 on a disposable `/dev/nbd15`; nbdkit SIGKILL left the kernel connection present, trusted cleanup converged, and reattach passed |
-| Packaged systemd lifecycle | Functional ordering and failure gates | Partial on Debian 12 GCE | Actual PID 1 transactions recreated fixture daemon/workload processes, withheld restart after cleanup failure, and blocked workload `ExecStart` after verify failure; that PID 1 run used fixture storage components |
-| Docker bind lifecycle | Functional rebind and start gate | Partial on Debian 12 GCE | The combined kernel-storage campaign used distinct default-`rprivate` containers before and after nbdkit SIGKILL and recovered all 32 external-ACK rows; the separate systemd/plain-directory gate still used fixtures |
-| Real databases | Required | Partial | SQLite WAL `synchronous=FULL` recovered 32 acknowledged rows after actual nbdkit death and trusted reattach in one single-LV campaign; repeated crashes, PostgreSQL, ClickHouse, MinIO, and application recovery contracts remain open |
+| Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
+| Packaged systemd lifecycle | Functional ordering and failure gates | Pass for one Debian 12 GCE topology | Installed shipped templates recreated the real daemon, attachment, workload, and Docker container twice, withheld restart on open-LV cleanup failure, then recovered on explicit retry |
+| Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
+| Real databases | Required | Partial | SQLite WAL `synchronous=FULL` recovered 64 acknowledged rows through two automatic crashes and one failed-cleanup/retry sequence; PostgreSQL, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
 | GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
@@ -179,11 +179,9 @@ The detailed Debian run is preserved in the
 [rootless Linux validation report](native-linux-validation-2026-09-02.md). The
 later [privileged Linux validation report](privileged-linux-validation.md)
 records the kernel NBD, LVM, XFS, raw and filesystem fio, privilege, helper, and
-SQLite smoke results, including the current GCE runs and their limits. Separate
-disposable hosts ran the systemd/Docker fixture checks and the combined actual
-nbdkit/kernel-storage/Docker ACK campaign. Their instances and disks were
-deleted afterward, and fresh name-scoped queries found no remaining `maki-*`
-resources.
+SQLite results, including the installed-systemd combined campaign and its
+limits. The disposable instances and disks were deleted afterward, and fresh
+name-scoped queries found no remaining `maki-*` resources.
 The [September 12 fault report](cgroup-fault-validation-2026-09-12.md) records
 the new native process and cgroup executions, external ACK evidence, reproduction
 commands and the unresolved restart limit. The host was Debian, so no WSL

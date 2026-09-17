@@ -119,6 +119,62 @@ If nbdkit does not exit after normal termination, the runner deliberately does
 not escalate to `SIGKILL`; it fails and preserves the backing tree so an
 operator can inspect the live process safely.
 
+## Installed systemd combined Debian 12 GCE result — 2026-09-17
+
+Revision `448c0b2a46bd748eb473e34405175db9b3cfa102` passed 12 combined
+checks on a disposable `n2-standard-4` instance using
+`debian-12-bookworm-v20260908`, Linux `6.1.0-53-cloud-amd64`, nbd-client
+3.27.1, nbdkit 1.32.5, LVM 2.03.16, and XFS tools 6.1.0. The same revision's
+[Linux and Windows CI run](https://github.com/seo-rii/maki/actions/runs/34713182759)
+also passed.
+
+The campaign installed the repository's release binaries, nbdkit plugin,
+systemd templates, sysusers file, and tmpfiles file at their shipped paths. PID
+1 resolved the qualified nbd-client, created the `maki` account, loaded a local
+AES-GCM-SIV key through `LoadCredential=`, and started the packaged target,
+daemon, attach, recovery, and per-start verification graph. The daemon ran as
+`maki` with `NoNewPrivs=1`, no effective capabilities, and the packaged
+sandbox. The workload used the pinned
+`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+image and default `rprivate` bind propagation.
+
+The first container committed 16 SQLite WAL rows with `synchronous=FULL`. Two
+successive `systemctl kill --kill-whom=main --signal=KILL` operations each
+made the packaged recovery coordinator stop the old workload, clean the exact
+single-PV/LV kernel attachment, start a new daemon, reattach and verify storage,
+and create a distinct container. The independently fsynced root-owned ledger
+reached 32 and then 48 rows. Daemon PIDs, workload invocation IDs, and container
+IDs changed on both cycles; removed containers did not survive.
+
+A root process then held the exact LV open while a third daemon received
+`SIGKILL`. Both attach stop and recovery cleanup failed closed on the nonzero
+mapping open count. The workload and old container stayed stopped, the ledger
+remained at 48, and the NBD connection, mapping, backend identity, and trusted
+volume record were retained. After the descriptor closed, an explicit recovery
+retry cleaned and recreated the graph and a fourth container advanced the
+ledger to 64. A fifth, independent one-shot container reported
+`integrity_check=ok` and its database rows matched all 64 ledger entries and
+payload hashes exactly.
+
+The final path issued a successful drain after the deterministic workload had
+closed its database, stopped the target, and waited for the workload, attach,
+and daemon jobs to finish. The journal records workload stop before attach
+cleanup and daemon stop, with no plugin unload drain error. Offline `maki check`
+passed. No mount, mapping, NBD connection, holder, volume record, or test
+container remained; the shared root-owned attach lock correctly remained.
+
+Evidence and its manifest are under
+`/home/seorii/logs/maki-systemd-combined-20260917`. The exact instance and its
+auto-delete 50 GiB boot disk were deleted. Their lookups returned not found,
+and fresh project-wide name queries returned zero `maki-*` instances and disks.
+
+This qualifies one short local-provider, single-PV/LV, SQLite campaign using
+installed repository artifacts. It did not exercise a distribution package
+install or upgrade, remote providers, multi-LV/internal mappings, a foreign
+device replacement, PostgreSQL, ClickHouse, MinIO, fresh-host restore, a
+whole-VM cut during this database topology, long soak, or physical power loss.
+Those limits keep the overall production decision at no-go.
+
 ## Combined Debian 12 GCE crash result — 2026-09-13
 
 Revision `8bf0e941bd3501b972850240fb1050fbc2a90c0b` passed 29 checks on a

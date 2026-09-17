@@ -256,11 +256,24 @@ container starts on a plain directory.
 Those packaged lifecycle runs used fixture daemon/attach/verify steps and
 loop-backed XFS. A later `8bf0e94` campaign combined actual Maki nbdkit, kernel
 NBD, pinned single-PV LVM/XFS, trusted attach/verify/cleanup, and two distinct
-default-`rprivate` Docker containers around nbdkit `SIGKILL`. The connected
-kernel mapping was removed through the proof-scoped fallback, reattach passed,
-and the new container recovered all 32 rows in the independently fsynced ACK
-ledger with `integrity_check=ok`. The installed packaged systemd graph was not
-part of that combined run.
+default-`rprivate` Docker containers around one nbdkit `SIGKILL`.
+
+Revision `448c0b2` then ran the installed packaged systemd graph over that real
+stack on a disposable Debian 12 GCE host. Two automatic daemon `SIGKILL`
+recoveries recreated the daemon, attachment, and container while advancing an
+external fsynced SQLite ledger from 16 to 32 and 48 rows. During a third crash,
+a root process held an open LV descriptor. Cleanup refused the open mapping,
+kept the NBD connection and trusted record, removed the workload container, and
+did not advance the ledger. Closing the descriptor and explicitly retrying the
+recovery unit rebuilt the graph and reached 64 rows. An independent container
+matched the complete ledger with `integrity_check=ok`.
+
+For planned shutdown, the qualification workload had closed its database before
+an explicit drain. Stopping the target then stopped the workload, ran attach
+cleanup, and stopped the daemon. The target's own stop job can finish while
+dependent service stop jobs are still deactivating, so the harness waited for
+the workload, attach, daemon, and target units to report `inactive` before the
+offline check and residual-state assertions.
 
 ## Remaining recovery limits
 
@@ -276,7 +289,8 @@ part of that combined run.
   are outside the helper's ownership guarantee.
 - Foreign, partial-mapping, and most command-failure cleanup cases use
   production metadata observers with synthetic kernel metadata and injected
-  outcomes. The actual single-target nbdkit-death path passed the combined
-  kernel NBD/LVM/XFS and Docker ACK campaign above. Multi-mapping fallback,
-  packaged systemd integration, whole-VM or physical power loss, repeated
-  crashes, and a production topology remain separate qualification gates.
+  outcomes. The actual single-target nbdkit-death and open-target refusal paths
+  passed the installed packaged systemd, kernel NBD/LVM/XFS, and Docker ACK
+  campaign above. Multi-mapping fallback, foreign-device replacement,
+  whole-VM or physical power loss on this database topology, long-duration
+  repetition, and a production topology remain separate qualification gates.
