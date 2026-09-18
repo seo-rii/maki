@@ -174,6 +174,14 @@ at 32 rows. All IDs and body hashes matched an external fsynced ledger before
 and after a packaged lifecycle restart. See the
 [remote HTTP provider database validation](remote-provider-db-validation-2026-09-18.md).
 
+Revision `5f50354` then passed a checksummed PostgreSQL 15 campaign on another
+disposable GCE VM. After 16 exact ACK rows, a cgroup-wide postmaster `SIGKILL`
+interrupted four pgbench clients. Automatic WAL recovery produced a distinct
+postmaster, preserved the whole ACK prefix, and passed `pg_amcheck`. The cluster
+advanced to 32 rows, retained them through a packaged Maki lifecycle restart,
+then reached 48 rows. Four `pg_amcheck` runs were clean. See the
+[PostgreSQL process-crash validation](postgresql-crash-validation-2026-09-18.md).
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
@@ -187,7 +195,8 @@ and after a packaged lifecycle restart. See the
 | Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
 | Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
 | Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
-| Real databases | Required | Partial | SQLite WAL `synchronous=FULL` recovered 64 acknowledged rows through two automatic crashes and one failed-cleanup/retry sequence; PostgreSQL, ClickHouse, MinIO, and application recovery contracts remain open |
+| PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for one PostgreSQL 15.19/scale-3 topology | Postmaster SIGKILL interrupted pgbench after 590 transactions; WAL recovery preserved 16 ACK rows, four `pg_amcheck` runs passed, and the cluster retained 32 rows through Maki restart before reaching 48 |
+| Real databases | Required | Partial | SQLite WAL and one short checksummed PostgreSQL 15 profile passed scoped campaigns; production PostgreSQL profiles, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
 | GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
@@ -218,6 +227,10 @@ The [remote-provider database report](remote-provider-db-validation-2026-09-18.m
 records the two authenticated HTTP endpoints, per-endpoint failure, total
 provider outage, SQLite ACK/hash oracle, lifecycle restart, harness correction,
 and deletion of both attempted VMs and disks.
+The [PostgreSQL crash report](postgresql-crash-validation-2026-09-18.md)
+records active durability settings, pgbench interruption, WAL redo, postmaster
+replacement, four logical checks, ACK/hash readback, Maki lifecycle restart,
+and deletion of the disposable VM and disk.
 
 ## Database qualification
 

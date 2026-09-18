@@ -923,6 +923,19 @@ Metrics recorded six failovers and nine retries, and provider journals recorded
 database-through-provider fault observation, while real network/TLS/vendor
 behavior, another DB, concurrent host loss, latency targets and soak remain.
 
+Revision `5f50354` then passed a separate
+[PostgreSQL process-crash campaign](postgresql-crash-validation-2026-09-18.md)
+on a disposable Debian 12 GCE VM. PostgreSQL 15.19 ran with data checksums,
+`fsync`, synchronous commit and full-page writes on the actual packaged Maki,
+kernel NBD/LVM/XFS path. After 16 external ACK rows, a cgroup-wide postmaster
+`SIGKILL` interrupted four pgbench clients after 590 transactions. A distinct
+postmaster performed WAL redo and an end-of-recovery checkpoint, preserved the
+entire ACK/hash prefix, and passed `pg_amcheck`. The cluster advanced to 32
+rows, retained all 32 through a packaged Maki lifecycle restart, then reached
+48 rows. Four `pg_amcheck` runs were clean. This narrows the other-database gap
+for one short PostgreSQL profile; production sizing, backup/restore,
+replication, DB-native migration, concurrent VM/storage loss and soak remain.
+
 The disposable instances and their auto-delete boot disks were deleted. The
 last fresh project queries found zero name-matched `maki-*` instances and disks,
 and the latest combined disk's exact lookup returned 404. The CI run for
@@ -940,6 +953,6 @@ The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Physical checkpoint reservation, complete RSS
 bounds, remaining transport-library copies, checkpoint stalls, actual provider
 faults over a target network/vendor endpoint, replay policy, key migration,
-DB-native or legacy fresh-host migration restore, other database engines,
-physical power loss, and long-duration load remain open. Direct R3 closure
-must not be read as general production approval.
+DB-native or legacy fresh-host migration restore, production database profiles
+and remaining engines, physical power loss, and long-duration load remain open.
+Direct R3 closure must not be read as general production approval.
