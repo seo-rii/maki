@@ -16,11 +16,15 @@ Maki is designed around four constraints:
 > installed shipped systemd graph over actual kernel NBD/LVM/XFS and recovered
 > 64 externally acknowledged SQLite rows. Two automatic nbdkit SIGKILL recoveries
 > plus one fail-closed open-LV cleanup and explicit retry preserved them. Broader
-> databases, remote providers, multi-mapping, DB-native migration restore, soak,
-> and physical power-loss qualification remain open. A separate
+> databases, vendor endpoints and network failure modes, multi-mapping,
+> DB-native migration restore, soak, and physical power-loss qualification
+> remain open. A separate
 > [fresh-host restore validation](docs/fresh-host-restore-validation-2026-09-17.md)
 > recovered an unchanged v2 backing and 32 external-ACK rows on a new VM, then
-> retained 48 rows after new writes and a lifecycle restart.
+> retained 48 rows after new writes and a lifecycle restart. A scoped
+> [remote HTTP provider validation](docs/remote-provider-db-validation-2026-09-18.md)
+> also carried SQLite through single-endpoint failover and a total provider
+> outage with exact ACK and hash recovery.
 
 **Volume compatibility:** new volumes require superblock envelope v2 and
 mirrored durable proofs. Older binaries reject v2, and this build refuses
@@ -48,10 +52,10 @@ provided.
 |---|---|
 | Core engine, format, recovery, and provider contracts | v2 durability baseline passed workspace tests, nine release gates and Linux/Windows CI; subsequent fixes and remaining limits are tracked in the [R3 readiness record](docs/production-readiness-review-2026-09-08.md) |
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
-| HTTP transport TLS and loopback chaos handling | Validated in automated tests |
+| HTTP transport TLS and loopback chaos handling | Validated in automated tests; one loopback two-provider SQLite campaign passed endpoint failover, total-outage stall/resume, and lifecycle restart |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
 | Kernel `/dev/nbd`, LVM, XFS, and fio path | Installed systemd recovery plus two automatic nbdkit-crash cycles and one open-target failure/retry passed on one pinned single-PV/LV Debian 12 GCE topology; target-host and multi-mapping qualification remain |
-| Real database and vendor-provider workloads | SQLite WAL recovered 64 external-ACK rows through the installed lifecycle and an unchanged v2 backing restored 32 rows on a fresh host before extending and restarting at 48; broader databases, DB-native migration, and remote-provider faults remain open |
+| Real database and vendor-provider workloads | SQLite WAL recovered 64 external-ACK rows through the installed lifecycle, an unchanged v2 backing restored 32 rows on a fresh host before extending and restarting at 48, and a synthetic authenticated HTTP provider preserved 32 rows through failover and total outage; broader databases, vendor endpoints, network faults, and DB-native migration remain open |
 | VM and physical power-loss testing | Firecracker VMM loss and GCE hard reset campaigns passed their scoped checks; physical power loss remains open |
 | 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
 | 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; five findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark, S-04/S-05 recovery under out-of-order sector persistence) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |

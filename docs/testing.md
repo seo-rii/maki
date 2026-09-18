@@ -165,6 +165,15 @@ matched all 32 rows, added 16 rows, and matched all 48 after a full lifecycle
 restart. Both final offline checks passed and both VMs and disks were deleted.
 See the [fresh-host restore validation](fresh-host-restore-validation-2026-09-17.md).
 
+Revision `c385c99` then passed a separate remote-provider database campaign on
+one disposable GCE VM. Two authenticated loopback HTTP providers served the
+actual Maki kernel NBD/LVM/XFS path. SQLite committed eight rows with both
+providers, eight with only B, eight with only A, stalled one transaction while
+both were down, resumed that exact transaction after B returned, and finished
+at 32 rows. All IDs and body hashes matched an external fsynced ledger before
+and after a packaged lifecycle restart. See the
+[remote HTTP provider database validation](remote-provider-db-validation-2026-09-18.md).
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
@@ -177,6 +186,7 @@ See the [fresh-host restore validation](fresh-host-restore-validation-2026-09-17
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for one Debian 12 GCE topology | Installed shipped templates recreated the real daemon, attachment, workload, and Docker container twice, withheld restart on open-LV cleanup failure, then recovered on explicit retry |
 | Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
 | Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
+| Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
 | Real databases | Required | Partial | SQLite WAL `synchronous=FULL` recovered 64 acknowledged rows through two automatic crashes and one failed-cleanup/retry sequence; PostgreSQL, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
@@ -204,6 +214,10 @@ witness, Cloud Audit Log entries, authenticated readbacks, and cloud cleanup.
 The [fresh-host restore report](fresh-host-restore-validation-2026-09-17.md)
 records the later graceful export, source deletion, new-host restore, continued
 writes, restart readback, harness corrections and cloud cleanup.
+The [remote-provider database report](remote-provider-db-validation-2026-09-18.md)
+records the two authenticated HTTP endpoints, per-endpoint failure, total
+provider outage, SQLite ACK/hash oracle, lifecycle restart, harness correction,
+and deletion of both attempted VMs and disks.
 
 ## Database qualification
 

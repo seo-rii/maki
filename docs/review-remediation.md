@@ -908,6 +908,21 @@ missing parent-directory mode in the ad hoc runtime tar, and non-idempotent
 `reset-failed` handling. Distribution package install/upgrade, DB-native or
 legacy migration and crash-time capture remain open.
 
+Revision `c385c99` then passed a separate
+[remote HTTP provider database campaign](remote-provider-db-validation-2026-09-18.md)
+on a disposable Debian 12 GCE VM. Two authenticated loopback providers served
+the actual packaged systemd, kernel NBD/LVM/XFS, and SQLite WAL path. Rows 0–7
+used both endpoints, 8–15 used only B after A stopped, and 16–23 used only A
+after B stopped. With both providers down, the next DB writer stayed blocked
+and the fsynced external ledger stayed at 24; restoring B advanced it to
+exactly 25 after a 4,094 ms observed outage. Both providers then returned and
+the database reached 32 exact ACK rows. All row IDs and body hashes plus
+`integrity_check=ok` matched before and after a packaged lifecycle restart.
+Metrics recorded six failovers and nine retries, and provider journals recorded
+21,326 encrypt/decrypt requests across both endpoints. This closes the narrow
+database-through-provider fault observation, while real network/TLS/vendor
+behavior, another DB, concurrent host loss, latency targets and soak remain.
+
 The disposable instances and their auto-delete boot disks were deleted. The
 last fresh project queries found zero name-matched `maki-*` instances and disks,
 and the latest combined disk's exact lookup returned 404. The CI run for
@@ -924,7 +939,7 @@ reserve physical blocks and does not close MAKI-021's external-consumer race.
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Physical checkpoint reservation, complete RSS
 bounds, remaining transport-library copies, checkpoint stalls, actual provider
-faults through a database, replay policy, key migration, DB-native or legacy
-fresh-host migration restore, other database engines, physical power loss, and
-long-duration load remain open. Direct R3 closure must not be read as general
-production approval.
+faults over a target network/vendor endpoint, replay policy, key migration,
+DB-native or legacy fresh-host migration restore, other database engines,
+physical power loss, and long-duration load remain open. Direct R3 closure
+must not be read as general production approval.
