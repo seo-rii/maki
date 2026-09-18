@@ -7,9 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_backing::{Backing, BackingFile, FileBacking, VolumeLock};
+#[cfg(target_os = "linux")]
+use maki_backing::FileBacking;
+use maki_backing::{Backing, BackingFile, VolumeLock};
 use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
-use maki_core::volume::{Volume, VolumeOptions};
+#[cfg(target_os = "linux")]
+use maki_core::volume::Volume;
+use maki_core::volume::VolumeOptions;
 use maki_core::CoreError;
 use maki_crypto::Clock;
 use maki_format::{
