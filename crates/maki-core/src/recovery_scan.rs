@@ -83,7 +83,7 @@ impl SegmentScanner<'_> {
     /// the caller controls whether superseded records remain in memory.
     pub fn scan(
         self,
-        mut accept: impl FnMut(JournalRecord),
+        mut accept: impl FnMut(JournalRecord) -> Result<(), RecoveryError>,
     ) -> Result<SegmentBodyScan, RecoveryError> {
         let mut fingerprint = DefaultHasher::new();
         fingerprint.write(self.header);
@@ -240,7 +240,7 @@ impl SegmentScanner<'_> {
                     sequence: header.sequence,
                     unit_index: header.unit,
                     payload,
-                });
+                })?;
             }
             // Commit only the accepted record. Invalid/zero/torn tails must
             // not enter the prefix later redirtied and acknowledged durable.
@@ -363,7 +363,7 @@ mod tests {
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
         }
-        .scan(|_| {});
+        .scan(|_| Ok(()));
         assert!(
             matches!(result, Err(RecoveryError::Io(_))),
             "a torn-tail decision must not bypass unreadable remaining bytes"
@@ -406,7 +406,7 @@ mod tests {
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
         }
-        .scan(|_| {})
+        .scan(|_| Ok(()))
     }
 
     #[test]

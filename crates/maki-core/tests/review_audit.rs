@@ -103,10 +103,9 @@ fn recovery_fsyncs_page_cache_records_before_a_flush_acknowledges_them() {
     );
 }
 
-/// Same start, no FLUSH: the first write after the restart opens a
-/// successor segment, which makes the resumed segment non-final; if its
-/// page-cache tail was never fsync'd, the power loss tears a non-final
-/// segment and recovery refuses the whole volume.
+/// Same start, no FLUSH: bounded recovery must make the accepted records
+/// durable in slots before reclaiming their segment. A later unsynced write
+/// starts one fresh segment and can disappear without affecting them.
 #[test]
 fn resumed_segment_is_durable_before_a_successor_is_opened() {
     let _guard = failpoints::test_lock();
@@ -117,8 +116,8 @@ fn resumed_segment_is_durable_before_a_successor_is_opened() {
     drop(vol);
 
     let mut vol = recover(&backing).unwrap();
-    vol.write_ct(2, &ct(3), false).unwrap(); // rolls to a new segment
-    assert_eq!(vol.journal_segment_count(), 2);
+    vol.write_ct(2, &ct(3), false).unwrap(); // opens a fresh segment
+    assert_eq!(vol.journal_segment_count(), 1);
     drop(vol);
 
     backing.crash_all_lost();

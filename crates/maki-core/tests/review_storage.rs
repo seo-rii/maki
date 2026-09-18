@@ -621,7 +621,8 @@ fn lost_or_stale_mark_never_turns_a_torn_middle_record_into_corruption() {
 /// then sealed the segment when it opened a successor, and the *next*
 /// recovery, for which the segment was non-final and therefore durable in
 /// full, refused the volume with "zeroed record inside durable prefix".
-/// Recovery must normalize the final segment to exactly its records.
+/// Recovery must normalize the final segment to exactly its records before
+/// bounded replay checkpoints and reclaims it.
 #[test]
 fn zero_tail_of_final_segment_is_truncated_before_it_can_be_sealed() {
     let _guard = failpoints::test_lock();
@@ -640,10 +641,12 @@ fn zero_tail_of_final_segment_is_truncated_before_it_can_be_sealed() {
     let mut vol = recover(&backing).unwrap();
     assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(1));
     assert!(vol.read_ct(1).unwrap().is_none());
-    let len = backing.open(&seg, false).unwrap().len().unwrap();
-    assert_eq!(len, 48 + (32 + CT_LEN) as u64, "zero tail not truncated");
+    assert!(
+        !backing.exists(&seg).unwrap(),
+        "normalized segment not reclaimed"
+    );
 
-    // A new record opens a successor segment and seals the old one.
+    // A new record opens a fresh, higher-index segment.
     vol.write_ct(2, &ct(3), true).unwrap();
     assert_ne!(vol.journal_active_segment_path().unwrap(), seg);
     drop(vol);

@@ -3,7 +3,7 @@
 //! ```text
 //! acquire volume lock → select valid superblock → validate shard catalog
 //! → validate allocation metadata → load checkpoint state → scan journal
-//! → discard/truncate partial tail → rebuild overlay → READY
+//! → discard/truncate partial tail → bounded replay checkpoint → READY
 //! ```
 //! (The provider self-test, crypto-compatibility verification and the key
 //! canary check are the attach layer's final steps, on top of this.)
@@ -29,7 +29,6 @@
 //! offline deep checker uses the same validation with payload retention
 //! disabled; repair decisions and corruption checks remain shared.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
@@ -117,34 +116,26 @@ struct VerifiedPrefix {
 }
 
 /// The public scan/recovery APIs expose every uncovered record. Volume attach
-/// needs only the latest version of each unit: all surviving records become
-/// durable before the overlay is exposed. Select retention independently of
-/// validation so superseded records still undergo every durability check.
+/// discards payloads during validation and reads them again through a bounded
+/// checkpoint batch. Select retention independently of validation so the
+/// public API and attach can share every durability check.
 enum ReplayRecords {
     All(Vec<JournalRecord>),
-    Latest(BTreeMap<u64, JournalRecord>),
     Discard,
 }
 
 impl ReplayRecords {
-    fn push(&mut self, record: JournalRecord) {
+    fn push(&mut self, record: JournalRecord) -> Result<(), RecoveryError> {
         match self {
             Self::All(records) => records.push(record),
-            Self::Latest(records) => {
-                records.insert(record.unit_index, record);
-            }
             Self::Discard => {}
         }
+        Ok(())
     }
 
     fn into_records(self) -> Vec<JournalRecord> {
         match self {
             Self::All(records) => records,
-            Self::Latest(records) => {
-                let mut records: Vec<_> = records.into_values().collect();
-                records.sort_unstable_by_key(|record| record.sequence);
-                records
-            }
             Self::Discard => Vec::new(),
         }
     }
@@ -153,28 +144,25 @@ impl ReplayRecords {
 /// Recover a volume. `segment_size` is the writer's effective segment size;
 /// it bounds how large any segment file may legitimately be.
 pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovered, RecoveryError> {
-    recover_with_replay(backing, segment_size, ReplayRecords::All(Vec::new()))
+    recover_with_replay(backing, segment_size, ReplayRecords::All(Vec::new()), false)
 }
 
-/// Attach retains only the latest uncovered record per unit, bounding history
-/// retention independently of overwrite count. Unique units, the eventual
-/// overlay's two versions, and segment/allocation metadata still consume memory;
-/// this is not a fixed total recovery-memory bound (MAKI-025 remains partial).
-pub(crate) fn recover_latest(
+/// Attach validates without retaining replay payload history, then checkpoints
+/// the accepted records through a fixed-size working set before exposing the
+/// volume. Payload memory is bounded independently of journal fill ratio and
+/// distinct unit count.
+pub(crate) fn recover_bounded(
     backing: &Arc<dyn Backing>,
     segment_size: u64,
 ) -> Result<Recovered, RecoveryError> {
-    recover_with_replay(
-        backing,
-        segment_size,
-        ReplayRecords::Latest(BTreeMap::new()),
-    )
+    recover_with_replay(backing, segment_size, ReplayRecords::Discard, true)
 }
 
 fn recover_with_replay(
     backing: &Arc<dyn Backing>,
     segment_size: u64,
     replay: ReplayRecords,
+    checkpoint_replay: bool,
 ) -> Result<Recovered, RecoveryError> {
     // 1. exclusive volume lock
     let lock = acquire_lock(backing)?;
@@ -192,7 +180,7 @@ fn recover_with_replay(
     let mut durable_proof = DurableProofStore::load(backing.as_ref(), superblock.volume_uuid)?;
 
     // 3./4. catalog + allocation metadata
-    let store = SlotStore::open(backing.clone(), superblock.geometry.clone())?;
+    let mut store = SlotStore::open(backing.clone(), superblock.geometry.clone())?;
 
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
@@ -283,6 +271,20 @@ fn recover_with_replay(
     }
     DurableProofStore::advance(backing.as_ref(), &mut durable_proof)?;
 
+    let (checkpoint_state, segments) =
+        if checkpoint_replay && scan.durable_sequence > checkpoint_state.checkpoint_sequence {
+            let checkpoint_state = checkpoint_validated_replay(
+                backing,
+                &superblock,
+                &mut store,
+                &checkpoint_state,
+                &scan,
+            )?;
+            (checkpoint_state, Vec::new())
+        } else {
+            (checkpoint_state, scan.segments)
+        };
+
     Ok(Recovered {
         lock,
         superblock,
@@ -291,9 +293,112 @@ fn recover_with_replay(
         durable_sequence: scan.durable_sequence,
         durable_proof,
         next_segment_index: scan.next_segment_index,
-        segments: scan.segments,
+        segments,
         replay: scan.replay,
     })
+}
+
+const REPLAY_BATCH_BYTES: usize = 1 << 20;
+
+fn checkpoint_validated_replay(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+    store: &mut SlotStore,
+    checkpoint_state: &CheckpointState,
+    scan: &JournalScan,
+) -> Result<CheckpointState, RecoveryError> {
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    for segment in &scan.segments {
+        let path = layout::journal_segment(segment.index);
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        let file = backing.open(&path, false)?;
+        let mut header = [0u8; SEGMENT_HEADER_SIZE];
+        file.read_at(0, &mut header)?;
+        let decoded = SegmentHeader::decode(&header).map_err(|error| {
+            RecoveryError::Corrupt(format!(
+                "journal segment {name} changed after validation: {error}"
+            ))
+        })?;
+        if decoded.segment_index != segment.index
+            || decoded.base_sequence != segment.base_sequence
+            || decoded.volume_uuid != superblock.volume_uuid
+        {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment {name} changed after validation"
+            )));
+        }
+        let body_len = segment
+            .size
+            .checked_sub(SEGMENT_HEADER_SIZE as u64)
+            .ok_or_else(|| {
+                RecoveryError::Corrupt(format!("journal segment {name} is too short"))
+            })?;
+        let replayed = SegmentScanner {
+            file: file.as_ref(),
+            header: &header,
+            body_len,
+            first_sequence: segment.base_sequence,
+            durable_len: body_len,
+            required_boundary: None,
+            geometry: &superblock.geometry,
+            checkpoint_sequence: checkpoint_state.checkpoint_sequence,
+            name,
+        }
+        .scan(|record| {
+            if !batch.is_empty()
+                && batch_bytes.saturating_add(record.payload.len()) > REPLAY_BATCH_BYTES
+            {
+                apply_replay_batch(store, &mut batch)?;
+                batch_bytes = 0;
+            }
+            batch_bytes = batch_bytes.saturating_add(record.payload.len());
+            batch.push(record);
+            Ok(())
+        })?;
+        if replayed.record_count != segment.record_count
+            || replayed.valid_body_bytes != body_len
+            || !matches!(replayed.outcome, ScanOutcome::Clean)
+        {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment {name} changed after validation"
+            )));
+        }
+    }
+    apply_replay_batch(store, &mut batch)?;
+
+    let mut new_state = checkpoint_state.clone();
+    new_state.checkpoint_sequence = scan.durable_sequence;
+    AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B).store(backing.as_ref(), &mut new_state)?;
+    backing.sync_dir(layout::CHECKPOINT_DIR)?;
+
+    for segment in &scan.segments {
+        backing.remove(&layout::journal_segment(segment.index))?;
+    }
+    backing.sync_dir(layout::JOURNAL_DIR)?;
+    Ok(new_state)
+}
+
+fn apply_replay_batch(
+    store: &mut SlotStore,
+    records: &mut Vec<JournalRecord>,
+) -> Result<(), RecoveryError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    for record in records.iter() {
+        store.write_slot(record.unit_index, record.sequence, &record.payload)?;
+    }
+    for shard in store.shards_of_units(records.iter().map(|record| &record.unit_index)) {
+        store.sync_shard_data(shard)?;
+    }
+    for record in records.iter() {
+        store.mark_allocated(record.unit_index)?;
+    }
+    store.persist_allocations()?;
+    records.clear();
+    Ok(())
 }
 
 /// The exclusive volume lock (`VOLUME_ALREADY_ATTACHED` when held).

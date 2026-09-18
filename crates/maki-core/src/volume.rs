@@ -22,7 +22,7 @@ use crate::error::CoreError;
 use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
-use crate::recovery::{recover_latest, Recovered, RecoveryError};
+use crate::recovery::{recover_bounded, Recovered, RecoveryError};
 use crate::store::{SlotRead, SlotStore};
 
 #[derive(Debug, Clone)]
@@ -66,7 +66,7 @@ impl Volume {
             next_segment_index,
             segments,
             replay,
-        } = recover_latest(&backing, segment_size)?;
+        } = recover_bounded(&backing, segment_size)?;
 
         let mut journal = JournalWriter::resume(
             backing.clone(),
@@ -79,9 +79,10 @@ impl Volume {
         );
         journal.allow_covered_holes_below(checkpoint_state.checkpoint_sequence);
 
-        // Rebuild overlay: everything in the surviving journal is durable.
-        // Recovery retained only the latest record per unit, so this also
-        // bounds the pending-promotion index by unique units, not overwrites.
+        // Bounded recovery checkpoints every surviving record before it
+        // returns, so attach normally receives an empty replay. Keep this
+        // construction for the public/full-replay recovery contract and as
+        // a defensive invariant if another recovery mode is added.
         let mut overlay = Overlay::new();
         for record in replay {
             overlay.publish(record.unit_index, record.sequence, record.payload);

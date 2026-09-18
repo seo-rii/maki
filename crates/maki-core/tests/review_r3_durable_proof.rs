@@ -321,29 +321,25 @@ fn losing_both_required_proofs_is_not_a_pristine_volume() {
 }
 
 #[test]
-fn recovered_tail_is_proved_before_the_next_restart() {
+fn recovered_tail_is_proved_and_checkpointed_before_the_next_restart() {
     let backing = Arc::new(CrashableBacking::new());
     let options = initialize(backing.as_ref());
     let mut volume = Volume::recover(backing.clone(), options.clone()).unwrap();
     volume.write_ct(0, &[1; 540], false).unwrap();
     let path = volume.journal_active_segment_path().unwrap();
+    let volume_uuid = volume.superblock().volume_uuid;
     drop(volume); // process restart: unacknowledged but valid bytes are visible
     let volume = Volume::recover(backing.clone(), options.clone()).unwrap();
     assert_eq!(volume.journal_durable_sequence(), 1);
+    assert_eq!(volume.checkpoint_sequence(), 1);
+    assert_eq!(volume.read_ct(0).unwrap().unwrap(), (1, vec![1; 540]));
     drop(volume);
-    let file = backing.open(&path, false).unwrap();
-    file.write_at(
-        maki_format::journal::SEGMENT_HEADER_SIZE as u64 + 32,
-        &[0xFE],
-    )
-    .unwrap();
-    file.sync_data().unwrap();
-    backing.remove(layout::JOURNAL_DURABLE_MARK).unwrap();
-    backing.sync_dir("journal").unwrap();
-    assert!(
-        Volume::recover(backing, options).is_err(),
-        "a tail adopted as durable must acquire the required proof before READY"
-    );
+    assert!(!backing.exists(&path).unwrap());
+    let proof =
+        maki_format::durable_proof::DurableProofStore::load(backing.as_ref(), volume_uuid).unwrap();
+    assert_eq!(proof.durable_sequence, 1);
+    let volume = Volume::recover(backing, options).unwrap();
+    assert_eq!(volume.read_ct(0).unwrap().unwrap(), (1, vec![1; 540]));
 }
 
 #[test]
