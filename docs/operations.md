@@ -558,6 +558,39 @@ If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
+### Fresh-host restore of an unchanged v2 backing
+
+Use this procedure only when restoring the same v2 volume UUID, backing data,
+crypto compatibility identity and key. A DB-native or legacy-v1 migration uses
+the separate process in [durable recovery](durable-recovery.md).
+
+1. Stop database writers, close database connections, run `maki drain`, and
+   stop `maki-workload@<volume>.target`. Wait until the workload, attach and
+   daemon units are inactive. Run `maki check` before capture.
+2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
+   Capture the credential through the deployment's secret-backup mechanism,
+   separately from ordinary logs and backups. Record hashes, Maki revision,
+   volume UUID, provider identity, filesystem and LVM identities, tool versions,
+   and an independent database transaction or content ledger.
+3. On the fresh host, install the same qualified runtime and packaged systemd,
+   sysusers and tmpfiles artifacts. Recreate package directory modes explicitly;
+   in particular `/usr/lib/maki` must be traversable by the `maki` service.
+   Run sysusers before restoring ownership because a dynamic service UID may
+   differ from the source host.
+4. Restore the backing as `maki:maki`, the volume config as `root:maki 0640`,
+   the attach config as `root:root 0600`, and the credential as
+   `root:root 0400`. Recreate the configured mountpoint, then run `maki volume
+   inspect` and the offline check before starting the target.
+5. Start the workload target, run `maki-attach verify`, and compare logical DB
+   contents and database integrity with the independent ledger. Perform a
+   planned drain and restart, then repeat the comparison before accepting the
+   restored host.
+
+The [2026-09-17 qualification](fresh-host-restore-validation-2026-09-17.md)
+passed this flow for one graceful local-provider, single-PV/LV, SQLite backing.
+It was an ad hoc artifact install, so package upgrades, DB-native migration,
+other databases and crash-time backup behavior remain separate qualifications.
+
 ## Growth and cache reload
 
 Maki allocates backing shards lazily within the configured virtual capacity.

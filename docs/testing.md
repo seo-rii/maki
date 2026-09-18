@@ -157,6 +157,14 @@ acknowledged rows in a fourth distinct container. An independent container
 matched all 64 rows and reported `integrity_check=ok`.
 Follow the [runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
 
+Revision `ece7e39` then passed a separate two-host restore campaign. A source
+VM wrote 32 SQLite WAL rows and a fsynced external ledger, drained and exported
+the unchanged v2 backing, configuration, attach identity and credential, and
+was deleted with its boot disk. A newly created VM restored the artifacts,
+matched all 32 rows, added 16 rows, and matched all 48 after a full lifecycle
+restart. Both final offline checks passed and both VMs and disks were deleted.
+See the [fresh-host restore validation](fresh-host-restore-validation-2026-09-17.md).
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
@@ -168,6 +176,7 @@ Follow the [runtime-layout upgrade procedure](operations.md#upgrading-the-runtim
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for one Debian 12 GCE topology | Installed shipped templates recreated the real daemon, attachment, workload, and Docker container twice, withheld restart on open-LV cleanup failure, then recovered on explicit retry |
 | Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
+| Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
 | Real databases | Required | Partial | SQLite WAL `synchronous=FULL` recovered 64 acknowledged rows through two automatic crashes and one failed-cleanup/retry sequence; PostgreSQL, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
@@ -192,6 +201,9 @@ image hashes, cold-boot readbacks, and the boundary at the surviving L1 host.
 The [GCE reset report](gce-reset-validation-2026-09-13.md) records the later
 whole-workload-VM hard reset campaign, stable resource identities, shutdown
 witness, Cloud Audit Log entries, authenticated readbacks, and cloud cleanup.
+The [fresh-host restore report](fresh-host-restore-validation-2026-09-17.md)
+records the later graceful export, source deletion, new-host restore, continued
+writes, restart readback, harness corrections and cloud cleanup.
 
 ## Database qualification
 
@@ -270,6 +282,9 @@ WSL is suitable for Linux syscall integration but not for power-loss claims.
 - Vendor endpoint conformance with production mapping and credentials.
 - Credential rotation and TLS certificate rotation.
 - Real SQLite and PostgreSQL workloads before broader database qualification.
+- Repeat the unchanged-backing fresh-host restore on each supported package and
+  distribution, and separately exercise DB-native backup or logical migration
+  with credentials protected outside the general backup.
 - Repeat GCE reset qualification on the selected deployment image and storage
   class; run QEMU and bare-metal power cuts with an independent acknowledgement
   ledger for the stronger storage-failure tiers.

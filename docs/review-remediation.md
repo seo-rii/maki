@@ -892,8 +892,21 @@ unload and offline check passed with no remaining mount, mapping, NBD holder,
 volume record, or container. The result closes the earlier installed-controller
 combination gap for this one local-provider topology. It does not qualify a
 distribution package install or upgrade, multi-LV/internal mapping, foreign
-device replacement, remote providers, another database, fresh-host restore,
+device replacement, remote providers, another database, DB-native migration,
 whole-VM loss on this topology, or soak load.
+
+Revision `ece7e39` then passed a separate
+[fresh-host backing restore](fresh-host-restore-validation-2026-09-17.md).
+A source GCE VM wrote and externally acknowledged 32 SQLite rows, drained,
+passed the offline check and exported the unchanged v2 backing, configuration,
+attach identity and credential. That VM and disk were deleted before a distinct
+target VM restored the artifacts, matched all 32 rows, advanced to 48 and
+matched all 48 again after a lifecycle restart. Both SQLite integrity checks,
+final drain, offline check and cloud cleanup passed. Three retained harness
+failures occurred before the product path: a `sudo` home-directory mismatch, a
+missing parent-directory mode in the ad hoc runtime tar, and non-idempotent
+`reset-failed` handling. Distribution package install/upgrade, DB-native or
+legacy migration and crash-time capture remain open.
 
 The disposable instances and their auto-delete boot disks were deleted. The
 last fresh project queries found zero name-matched `maki-*` instances and disks,
@@ -911,6 +924,7 @@ reserve physical blocks and does not close MAKI-021's external-consumer race.
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Physical checkpoint reservation, complete RSS
 bounds, remaining transport-library copies, checkpoint stalls, actual provider
-faults through a database, replay policy, key migration, fresh-host restore,
-other database engines, physical power loss, and long-duration load remain
-open. Direct R3 closure must not be read as general production approval.
+faults through a database, replay policy, key migration, DB-native or legacy
+fresh-host migration restore, other database engines, physical power loss, and
+long-duration load remain open. Direct R3 closure must not be read as general
+production approval.
