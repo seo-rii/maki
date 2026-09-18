@@ -960,6 +960,16 @@ all-targets passed 204 tests with 6 ignored, and strict Clippy passed. This is
 not full-volume preallocation: untouched slots, filesystem/COW overhead, and
 database temporary space remain deployment-capacity inputs.
 
+The later [GCE physical reservation campaign](physical-reservation-validation-2026-09-18.md)
+exercised that path on ext4 over a separate standard Persistent Disk. A
+4,608-byte slot owned 8,192 allocated bytes before the first FUA ACK, and both
+allocation-map copies owned blocks. After consuming all 9,910,247,424 initially
+free bytes, the next FUA returned ENOSPC while sequence 1, the journal hashes,
+and slot allocation stayed unchanged. Releasing the space allowed sequence 2;
+restart readback, deep check, and unmounted `e2fsck` passed. This qualifies one
+Linux filesystem and storage class, not full-volume capacity or physical power
+loss.
+
 Bounded recovery follow-up `733833c` removes the attach-time map of retained
 latest ciphertext. Recovery validates and repairs the full journal first, then
 replays it through a 1 MiB batch into durable checkpoint slots. Controlled

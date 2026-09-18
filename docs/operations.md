@@ -674,8 +674,15 @@ high-cardinality values as metric labels.
   or failed free-space query also fails closed while the emergency reserve is
   enabled. A zero emergency reserve disables this admission check while the
   checkpoint reserve still controls the worker. Admission
-  refreshes the observation; it does not reserve physical storage. A reserve-only
-  refusal leaves existing data readable and does not
+  refreshes the observation; that threshold check alone does not reserve
+  storage. After admission, the Linux file backing uses `posix_fallocate` for
+  the exact journal range and physical checkpoint-completion space before it
+  publishes the record. A scoped ext4/GCE Persistent Disk campaign verified
+  allocation before FUA acknowledgement and an ENOSPC refusal with no sequence
+  or journal change; see the
+  [physical reservation report](physical-reservation-validation-2026-09-18.md).
+  This does not preallocate untouched slots or cover non-Linux backing behavior.
+  A reserve-only refusal leaves existing data readable and does not
   by itself set a checkpoint error or change the engine state. A failed
   checkpoint reports `state: degraded` with its error, cleared by a successful
   checkpoint; the worker retries on its interval and writes retry necessary

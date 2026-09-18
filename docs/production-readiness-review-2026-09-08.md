@@ -1,8 +1,8 @@
 # 운영 준비 검토 및 R3 수정 기록 — 2026-09-08
 
-최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌, cgroup 장애, Firecracker guest 종료와 전체 GCE 인스턴스 reset 검사를 추가했고, privileged 및 lifecycle crash 검증 기준은 `448c0b2`, 최신 remote-provider/SQLite qualification 기준은 `c385c99`이다. `c385c99`의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/35291481488)도 모두 성공했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
+최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌, cgroup 장애, Firecracker guest 종료와 전체 GCE 인스턴스 reset 검사를 추가했고, privileged 및 lifecycle crash 검증 기준은 `448c0b2`, remote-provider/SQLite qualification 기준은 `c385c99`이다. 최신 패키지 수정 `3cac300`의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/35356803628)도 모두 성공했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
-**운영 승인은 보류한다.** 실제 Maki nbdkit, kernel NBD/LVM/XFS, trusted cleanup/reattach, 설치된 packaged recovery controller와 Docker SQLite 외부 ACK를 한 단일-PV/LV 캠페인에 결합하고 두 번의 자동 crash와 한 번의 cleanup 실패·재시도를 통과했다. 별도의 두 GCE 호스트에서 제한된 fresh-host backing 복원도 통과해 source의 32개 ACK 행을 새 host에서 대조하고, 16개를 추가한 뒤 lifecycle 재시작 후 48개를 다시 대조했다. 두 인증 loopback HTTP provider와 SQLite를 결합한 별도 캠페인도 개별 endpoint failover, 전체 provider 중단의 무-ACK stall과 복구 후 정확한 진행, 32개 행의 restart readback을 통과했다. checksummed PostgreSQL 15도 pgbench 중 postmaster SIGKILL 뒤 WAL 복구와 네 번의 `pg_amcheck`, 48개 ACK 및 Maki lifecycle restart를 통과했다. `733833c`는 recovery payload replay를 1 MiB batch로 제한했고 실제 32 MiB cgroup에서 21.5 MiB tail과 136 ACK를 복구했으나 전체 RSS peak는 상한에 닿았다. 그러나 전송 라이브러리의 남은 평문 복사본, metadata/runtime을 포함한 전체 RSS 최소 규격, multi-mapping과 foreign-device 경계, 실제 network/TLS/vendor provider, production PostgreSQL과 다른 DB profile, DB-native·legacy migration, 장시간 부하와 물리 전원 손실에는 코드·검증 과제가 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
+**운영 승인은 보류한다.** 실제 Maki nbdkit, kernel NBD/LVM/XFS, trusted cleanup/reattach, 설치된 packaged recovery controller와 Docker SQLite 외부 ACK를 한 단일-PV/LV 캠페인에 결합하고 두 번의 자동 crash와 한 번의 cleanup 실패·재시도를 통과했다. 별도의 두 GCE 호스트에서 제한된 fresh-host backing 복원도 통과해 source의 32개 ACK 행을 새 host에서 대조하고, 16개를 추가한 뒤 lifecycle 재시작 후 48개를 다시 대조했다. 두 인증 loopback HTTP provider와 SQLite를 결합한 별도 캠페인도 개별 endpoint failover, 전체 provider 중단의 무-ACK stall과 복구 후 정확한 진행, 32개 행의 restart readback을 통과했다. checksummed PostgreSQL 15도 pgbench 중 postmaster SIGKILL 뒤 WAL 복구와 네 번의 `pg_amcheck`, 48개 ACK 및 Maki lifecycle restart를 통과했다. `733833c`는 recovery payload replay를 1 MiB batch로 제한했고 실제 32 MiB cgroup에서 21.5 MiB tail과 136 ACK를 복구했으나 전체 RSS peak는 상한에 닿았다. 별도 ext4/GCE Persistent Disk 캠페인은 첫 FUA 전에 checkpoint slot과 A/B metadata의 실제 block allocation을 확인하고, 가용 공간 0에서 다음 FUA가 sequence와 journal을 바꾸지 않은 채 ENOSPC로 닫힌 뒤 retry·restart·deep check를 통과했다. 그러나 전송 라이브러리의 남은 평문 복사본, metadata/runtime을 포함한 전체 RSS 최소 규격, multi-mapping과 foreign-device 경계, 실제 network/TLS/vendor provider, production PostgreSQL과 다른 DB profile, DB-native·legacy migration, 장시간 부하와 물리 전원 손실에는 코드·검증 과제가 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
 
 ## 실제 cgroup·프로세스 장애 검사 — 2026-09-12
 
@@ -200,6 +200,27 @@ single-PV/LV, SQLite campaign이다. distribution package install/upgrade,
 multi-LV/internal mapping, foreign device replacement, remote provider, 다른
 DB, fresh-host restore, 이 topology의 whole-VM crash, soak와 물리 전원 손실은
 포함하지 않는다.
+
+## 실제 물리 공간 예약 검사 — 2026-09-18
+
+`3cac300`의 release Maki를 새 Debian 12 GCE `e2-standard-2`에서 빌드하고,
+별도 10 GiB standard Persistent Disk를 ext4로 포맷했다. 첫 4 KiB FUA가
+성공했을 때 4,608-byte slot의 sparse shard file은 이미 8,192 physical
+bytes를 소유했고 allocation map A/B도 각각 4,096 bytes를 소유했다.
+
+다른 파일로 ordinary-user 가용 공간 9,910,247,424 bytes를 모두 소진한 뒤
+다음 FUA는 `No space left on device`로 실패했다. 실패 전후 appended/durable
+sequence는 1, journal length와 SHA-256, slot allocated block 수는 모두
+같았다. filler를 지워 같은 write를 다시 실행하자 sequence 2로 성공했고,
+nbdkit 재시작 뒤 두 payload hash가 일치했다. deep check는 allocated slot 2,
+invalid 0으로 통과했고 unmount 뒤 `e2fsck -fn`도 통과했다. 상세 결과는
+[물리 예약 보고서](physical-reservation-validation-2026-09-18.md)에 기록했다.
+
+VM, auto-delete boot disk와 별도 data disk는 모두 삭제했고 정확한 재조회와
+`maki-physical-*` 조회에서 남은 리소스가 없었다. 이 결과는 Linux ext4와
+해당 GCE storage class의 짧은 두-slot 검사다. untouched slot, DB 임시 공간,
+다른 filesystem/COW/quota/thin provisioning과 물리 전원 손실은 포함하지
+않는다.
 
 ## 검증 기준선
 

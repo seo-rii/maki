@@ -205,6 +205,7 @@ then reached 48 rows. Four `pg_amcheck` runs were clean. See the
 | PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for one PostgreSQL 15.19/scale-3 topology | Postmaster SIGKILL interrupted pgbench after 590 transactions; WAL recovery preserved 16 ACK rows, four `pg_amcheck` runs passed, and the cluster retained 32 rows through Maki restart before reaching 48 |
 | Real databases | Required | Partial | SQLite WAL and one short checksummed PostgreSQL 15 profile passed scoped campaigns; production PostgreSQL profiles, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Recovery at 32 MiB varied by trial; 192 MiB succeeded |
+| Physical checkpoint-space reservation | Linux filesystem ENOSPC before ACK | Pass on one Debian 12/ext4/GCE PD topology | A 4,608-byte slot owned 8,192 allocated bytes before FUA ACK; with zero free bytes, the next FUA returned ENOSPC without changing sequence, journal bytes, or slot allocation, then retried and survived restart |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
 | GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
 | QEMU hard power loss | 300+ cuts | Open | Simulation is not hardware evidence |
@@ -238,6 +239,10 @@ The [PostgreSQL crash report](postgresql-crash-validation-2026-09-18.md)
 records active durability settings, pgbench interruption, WAL redo, postmaster
 replacement, four logical checks, ACK/hash readback, Maki lifecycle restart,
 and deletion of the disposable VM and disk.
+The [physical reservation report](physical-reservation-validation-2026-09-18.md)
+records real ext4 block allocation before FUA acknowledgement, a zero-free-space
+ENOSPC refusal with unchanged journal state, retry, restart readback, offline
+checking, and deletion of the disposable VM and separate data disk.
 
 ## Database qualification
 
