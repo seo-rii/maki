@@ -137,6 +137,13 @@ def normalize_timestamps(root, epoch):
         os.utime(path, (epoch, epoch), follow_symlinks=False)
 
 
+def normalize_directory_permissions(root):
+    root.chmod(0o755)
+    for path in root.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o755)
+
+
 def main():
     args = parse_args()
     epoch = validate(args)
@@ -146,6 +153,7 @@ def main():
         package_root.mkdir(mode=0o755)
         (package_root / "DEBIAN").mkdir(mode=0o755)
         create_tree(package_root, args)
+        normalize_directory_permissions(package_root)
         normalize_timestamps(package_root, epoch)
         temporary_output = pathlib.Path(temporary) / "maki.deb"
         subprocess.run(

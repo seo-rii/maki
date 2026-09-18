@@ -23,7 +23,7 @@ class DebianPackageTests(unittest.TestCase):
             path.write_bytes((f"artifact:{name}\n").encode())
             path.chmod(0o755)
 
-    def build(self, name="maki.deb", version="0.1.0+test1"):
+    def build(self, name="maki.deb", version="0.1.0+test1", umask=None):
         output = self.work / name
         environment = os.environ.copy()
         environment["SOURCE_DATE_EPOCH"] = "1789689600"
@@ -45,6 +45,7 @@ class DebianPackageTests(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
+            preexec_fn=(lambda: os.umask(umask)) if umask is not None else None,
         )
         return output
 
@@ -127,6 +128,14 @@ class DebianPackageTests(unittest.TestCase):
         )
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("maki-check", failed.stderr)
+
+    def test_build_succeeds_with_restrictive_caller_umask(self):
+        package = self.build(umask=0o077)
+        root, control = self.extract(package, "restrictive-umask")
+
+        for directory in [root, control, *root.rglob("*"), *control.rglob("*")]:
+            if directory.is_dir():
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
 
 
 if __name__ == "__main__":
