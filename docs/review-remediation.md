@@ -949,9 +949,20 @@ overflow. The standard 16 TiB geometry has an 18 TiB slot span before journal,
 checkpoint, filesystem, or database overhead. This planning output does not
 reserve physical blocks and does not close MAKI-021's external-consumer race.
 
+Physical reservation follow-up `ced2bda` closes that race for accepted Maki
+writes on Linux. The write path uses `posix_fallocate` for the exact journal
+range and full checkpoint slot before appending, and creates and syncs both
+allocation-map copies plus the catalog entry before a new shard can receive a
+journal record. Injected slot and journal ENOSPC leave the sequence unchanged
+and retry successfully. A real-filesystem regression verifies allocated slot
+blocks and both metadata copies before the first record is accepted. Core
+all-targets passed 204 tests with 6 ignored, and strict Clippy passed. This is
+not full-volume preallocation: untouched slots, filesystem/COW overhead, and
+database temporary space remain deployment-capacity inputs.
+
 The supplied R3 directory is retained because it also contains the inherited
-MAKI/FUP production checklist. Physical checkpoint reservation, complete RSS
-bounds, remaining transport-library copies, checkpoint stalls, actual provider
+MAKI/FUP production checklist. Complete RSS bounds, remaining transport-library
+copies, checkpoint stalls, actual provider
 faults over a target network/vendor endpoint, replay policy, key migration,
 DB-native or legacy fresh-host migration restore, production database profiles
 and remaining engines, physical power loss, and long-duration load remain open.

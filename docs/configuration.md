@@ -270,13 +270,20 @@ the emergency reserve to zero retains the explicit admission opt-out; the
 checkpoint threshold still controls the worker. Status and metrics read cached
 observations and never initiate this filesystem query.
 
-These thresholds are not physical reservations. The journal limit counts
-record bytes and segment headers, while checkpointing must also write slots,
-allocation maps and metadata before reclaiming the old journal. Sparse shard
-file lengths do not reserve disk blocks. Filesystem allocation units, metadata,
-copy-on-write and other filesystem users can consume space after the query;
-a successful admission does not guarantee that the write or checkpoint will
-complete without ENOSPC. Include those costs and DB temporary storage in
+The thresholds do not reserve the volume's entire maximum layout. On Linux,
+each write additionally uses `posix_fallocate` for its exact journal range and
+the complete destination slot before the journal accepts the record. A new
+shard also has both allocation-map copies and its catalog entry created and
+synced first. An unrelated filesystem consumer therefore cannot take the
+already allocated journal or slot blocks before checkpoint completes. A
+reservation failure returns ENOSPC without consuming a journal sequence and is
+retryable.
+
+Untouched slots remain sparse and unreserved. Filesystem directory metadata,
+copy-on-write amplification, snapshots, journal/checkpoint headroom beyond the
+exact admitted ranges, and application or database temporary space still need
+deployment capacity. Non-Linux development backings extend the file but do not
+claim the Linux physical-allocation guarantee. Include the remaining costs in
 capacity qualification instead of equating exported virtual size with backing
 space.
 

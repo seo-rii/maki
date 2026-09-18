@@ -660,7 +660,12 @@ supported shard-catalog limit, and any capacity calculation that overflows an
 unsigned 64-bit byte count. `maki volume inspect` reports these five
 maximum-layout values. They exclude journal and checkpoint headroom,
 filesystem metadata and copy-on-write overhead, and application temporary
-space; they are not a physical reservation.
+space; they are not a full-volume physical reservation. Before accepting a
+journal record, a Linux backing MUST physically allocate the exact journal
+range and the record's complete checkpoint slot. Both allocation-map copies
+and the catalog entry of a newly touched shard MUST already be durable. A
+failed reservation MUST NOT consume a sequence or append the record. Untouched
+slots MAY remain sparse.
 
 ---
 
