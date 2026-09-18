@@ -48,25 +48,26 @@ fn failed_allocation_checkpoint_retry_survives_crash_and_recovers_all_durable_un
         allocation
             .side_generations::<AllocationMap>(backing.as_ref())
             .unwrap(),
-        (Some(1), Some(2))
+        (Some(3), Some(2))
     );
 
     backing.set_fault_hook(Some(Arc::new(|op| match op {
-        FaultOp::SyncData { path } if *path == layout::shard_alloc_a(0) => {
+        FaultOp::SyncData { path } if *path == layout::shard_alloc_b(0) => {
             Some(io::Error::other("allocation target sync failed"))
         }
         _ => None,
     })));
     assert!(volume.checkpoint().is_err());
-    // The failed sync leaves generation 3 visible in the page cache on side
-    // A, but the preserve-first rule (BUG-001) has already made side B's
-    // durable generation 2 safe; the retry can target side A again without
+    // Both files were created before the first journal ACK. The failed sync
+    // leaves generation 4 visible in the page cache on side B, but the
+    // preserve-first rule (BUG-001) has already made side A's durable
+    // generation 3 safe; the retry can target side B again without
     // ever overwriting the last durable copy.
     assert_eq!(
         allocation
             .side_generations::<AllocationMap>(backing.as_ref())
             .unwrap(),
-        (Some(3), Some(2))
+        (Some(3), Some(4))
     );
     backing.set_fault_hook(Some(Arc::new(|op| match op {
         FaultOp::SyncData { path }

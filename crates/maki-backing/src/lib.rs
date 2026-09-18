@@ -34,6 +34,22 @@ pub trait BackingFile: Send + Sync {
 
     fn set_len(&self, len: u64) -> io::Result<()>;
 
+    /// Reserve physical storage for a byte range before the caller publishes
+    /// work that will later depend on writing it. Real Linux files override
+    /// this with `posix_fallocate`, whose successful return guarantees that
+    /// later writes to the range do not fail for lack of filesystem space.
+    /// In-memory and test backings model the reservation by extending the
+    /// file; fault injection can therefore exercise the same ordering.
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        if self.len()? < end {
+            self.set_len(end)?;
+        }
+        Ok(())
+    }
+
     fn len(&self) -> io::Result<u64>;
 
     fn is_empty(&self) -> io::Result<bool> {

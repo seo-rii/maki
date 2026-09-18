@@ -209,6 +209,23 @@ impl Volume {
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
+        // Preserve the writer's exhaustion boundary: no storage mutation is
+        // allowed once the next sequence cannot advance.
+        if self.journal.next_sequence() == u64::MAX {
+            return Err(CoreError::Corrupt("journal sequence exhausted".into()));
+        }
+        if ciphertext.len() > self.superblock.geometry.max_ciphertext_size as usize {
+            return Err(CoreError::Corrupt(format!(
+                "ciphertext {} exceeds max {}",
+                ciphertext.len(),
+                self.superblock.geometry.max_ciphertext_size
+            )));
+        }
+        // Reserve the checkpoint destination before the journal makes this
+        // version visible or durable. This closes the free-space sample race
+        // for slot data: an admitted record always has physical completion
+        // space even if another filesystem user consumes every free byte.
+        self.store.reserve_slot(unit)?;
         let appended = self.journal.append(unit, ciphertext);
         // An automatic roll inside `append` may have advanced the durable
         // boundary (even when the append itself failed). Promote *before*

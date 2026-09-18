@@ -11,6 +11,7 @@ use maki_core::volume::VolumeOptions;
 use maki_format::geometry::Geometry;
 use maki_format::init;
 use maki_format::superblock::Superblock;
+use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::failpoints;
 use maki_test_support::fake_provider::FakeCryptoProvider;
 use maki_test_support::CrashableBacking;
@@ -275,14 +276,11 @@ async fn growth_during_workload_creates_shards_consistently() {
     }
 }
 
-/// Crash during growth: a failure mid shard-creation (data file created but
-/// catalog not yet committed) must recover to a consistent volume with no
-/// data loss for durable writes.
-// Failpoints are process-global, so this guard intentionally spans awaits.
-#[allow(clippy::await_holding_lock)]
+/// Crash during growth: physical slot reservation and shard metadata must
+/// complete before the journal accepts a write. A failure mid shard creation
+/// is retryable and cannot leave a falsely durable journal record.
 #[tokio::test]
 async fn crash_during_shard_creation_recovers() {
-    let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine_with_cache(&backing, provider, None).await;
@@ -294,22 +292,27 @@ async fn crash_during_shard_creation_recovers() {
         .unwrap();
     engine.checkpoint().await.unwrap();
 
-    // Write into a fresh shard, FUA (durable in journal), then make the
-    // checkpoint fail at the catalog-commit boundary and crash.
+    // A fresh shard must be created and physically reserved before the FUA
+    // record can enter the journal. Fail its catalog commit and crash.
     let far = 100 * UNIT as u64; // shard 12
-    engine
-        .write(far, &vec![0x02; UNIT as usize], true)
-        .await
-        .unwrap();
-    let fp = failpoints::set(
-        "store.catalog_store",
-        failpoints::FailpointAction::IoError(
-            io::ErrorKind::Other,
-            "crash during growth".to_string(),
-        ),
+    backing.set_fault_hook(Some(Arc::new(|operation| match operation {
+        FaultOp::WriteAt { path, .. }
+            if *path == maki_format::layout::SHARD_CATALOG_A
+                || *path == maki_format::layout::SHARD_CATALOG_B =>
+        {
+            Some(io::Error::other("crash during growth"))
+        }
+        _ => None,
+    })));
+    assert!(
+        engine
+            .write(far, &vec![0x02; UNIT as usize], true)
+            .await
+            .is_err(),
+        "reservation must fail before the journal append"
     );
-    assert!(engine.checkpoint().await.is_err(), "checkpoint must fail");
-    drop(fp);
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+    backing.set_fault_hook(None);
     drop(engine);
     backing.crash_all_lost();
 
@@ -321,10 +324,13 @@ async fn crash_during_shard_creation_recovers() {
     );
     assert_eq!(
         engine.read(far, UNIT as usize).await.unwrap(),
-        vec![0x02; UNIT as usize],
-        "FUA write must survive interrupted growth (journal is authoritative)"
+        vec![0; UNIT as usize]
     );
-    // And the retried checkpoint completes.
+    // The same write can reserve, append, and checkpoint after restart.
+    engine
+        .write(far, &vec![0x02; UNIT as usize], true)
+        .await
+        .unwrap();
     engine.checkpoint().await.unwrap();
     drop(engine);
     backing.crash_all_lost();

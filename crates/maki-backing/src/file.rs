@@ -6,6 +6,8 @@ use std::fs::File;
 #[cfg(not(target_os = "linux"))]
 use std::fs::OpenOptions;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(any(not(target_os = "linux"), test))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -116,6 +118,41 @@ impl BackingFile for RealFile {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
+    }
+
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        let _end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let offset = i64::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "allocation offset exceeds off_t",
+                )
+            })?;
+            let len = i64::try_from(len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "allocation length exceeds off_t",
+                )
+            })?;
+            // SAFETY: the descriptor stays open for the call and both
+            // non-negative ranges were checked to fit `off_t`.
+            let error = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, len) };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if self.len()? < _end {
+                self.set_len(_end)?;
+            }
+            Ok(())
+        }
     }
 
     fn len(&self) -> io::Result<u64> {

@@ -40,6 +40,7 @@ use maki_format::catalog::ShardCatalog;
 use maki_format::geometry::Geometry;
 use maki_format::layout;
 use maki_format::slot::SlotHeader;
+use maki_format::FormatError;
 
 use crate::error::CoreError;
 use crate::fp;
@@ -263,6 +264,34 @@ impl SlotStore {
         self.shards.len()
     }
 
+    /// Make the complete on-disk slot range available before its journal
+    /// record can be accepted. A successful Linux reservation uses
+    /// `posix_fallocate`, so a later checkpoint cannot lose its completion
+    /// space to an unrelated filesystem consumer.
+    pub fn reserve_slot(&mut self, unit: u64) -> Result<(), CoreError> {
+        if unit >= self.geometry.num_units() {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit} beyond the device ({} units)",
+                self.geometry.num_units()
+            )));
+        }
+        let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
+        if let Err(error) = self.ensure_shard(shard_idx) {
+            // Metadata codecs wrap their underlying I/O. At this live write
+            // boundary callers need the storage error class (ENOSPC/EIO),
+            // not a format classification for otherwise valid metadata.
+            return Err(match error {
+                CoreError::Format(FormatError::Io(error)) => CoreError::Io(error),
+                error => error,
+            });
+        }
+        let shard = self.shards.get(&shard_idx).unwrap();
+        shard
+            .data
+            .allocate_range(self.geometry.slot_offset(in_shard), self.geometry.slot_size)?;
+        Ok(())
+    }
+
     /// Every allocated unit, in ascending order (offline check input).
     ///
     /// Allocation maps stay borrowed while unit IDs are streamed. Traversal
@@ -310,12 +339,15 @@ impl SlotStore {
         let physical = self.geometry.units_per_shard() * self.geometry.slot_size;
         data.set_len(physical)?;
         data.sync_data()?;
-        // 2. empty allocation map, synced
+        // 2. Both empty allocation-map copies, synced. Checkpoint alternates
+        // between them, so publishing a journal record before the second
+        // file exists would leave checkpoint completion exposed to ENOSPC.
         let alloc_ab = AbStore::new(
             layout::shard_alloc_a(shard_idx),
             layout::shard_alloc_b(shard_idx),
         );
         let mut alloc = AllocationMap::new(self.geometry.units_per_shard());
+        alloc_ab.store(self.backing.as_ref(), &mut alloc)?;
         alloc_ab.store(self.backing.as_ref(), &mut alloc)?;
         // 3. dirents durable before the catalog names the shard. The commit
         //    below publishes the whole in-memory catalog, so a shard adopted

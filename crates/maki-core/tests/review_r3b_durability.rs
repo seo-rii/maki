@@ -444,15 +444,9 @@ async fn phase_r3b_durability_gate_full() {
     }
 }
 
-/// Minimised from `random_workloads_with_sync_failures_never_show_foreign_data`
-/// seed 3. An orphan shard data file (its allocation map's first sync
-/// failed, then power was lost) is adopted at open with an in-memory empty
-/// map. Creating *another* shard afterwards commits the in-memory catalog —
-/// which now names the adopted shard — before the adopted shard's map has
-/// ever reached disk. If the checkpoint then fails before allocation
-/// persistence and power is lost, the catalog names a shard with no
-/// allocation copy and every later attach is refused (K-03's residual: the
-/// order was fixed in `persist_allocations` but not in `ensure_shard`).
+/// A failed pre-journal reservation can leave an orphan shard file. Creating
+/// another shard must never catalog that orphan without an allocation copy,
+/// and the rejected write must remain absent after power loss.
 #[tokio::test]
 async fn adopted_shard_is_never_cataloged_by_another_shards_creation() {
     let _serial = maki_test_support::failpoints::test_lock();
@@ -471,22 +465,22 @@ async fn adopted_shard_is_never_cataloged_by_another_shards_creation() {
         }
         _ => None,
     })));
-    engine.write(off(16), &image(16, 1), false).await.unwrap();
-    engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine
+        .write(off(16), &image(16, 1), false)
+        .await
+        .unwrap_err();
     // A lower shard's creation in the next attempt syncs the data
     // directory, making shard 2's data-file dirent durable; shard 2's map
     // still fails.
     engine.write(off(8), &image(8, 1), false).await.unwrap();
     engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine.checkpoint().await.unwrap();
     backing.set_fault_hook(None);
     drop(engine);
     backing.crash_all_lost();
 
-    // Recovery adopts the orphan. A write to a new, higher shard makes the
-    // next checkpoint create shard 3, whose catalog commit names shard 2
-    // too; allocation persistence then fails before shard 2's map exists.
+    // Recovery adopts any surviving orphan. A write to a new, higher shard
+    // may publish a new catalog, but only after adopted maps are durable.
     let engine = attach(&backing).await;
     engine.write(off(24), &image(24, 2), false).await.unwrap();
     engine.flush().await.unwrap();
@@ -505,20 +499,21 @@ async fn adopted_shard_is_never_cataloged_by_another_shards_creation() {
     let engine = try_attach(&backing)
         .await
         .unwrap_or_else(|e| panic!("attach refused after an interrupted shard creation: {e}"));
-    for (unit, stamp) in [(0u64, 1u32), (8, 1), (16, 1), (24, 2)] {
+    for (unit, stamp) in [(0u64, 1u32), (8, 1), (24, 2)] {
         assert_eq!(
             engine.read(off(unit), UNIT as usize).await.unwrap(),
             image(unit, stamp),
             "unit {unit}"
         );
     }
+    assert_eq!(
+        engine.read(off(16), UNIT as usize).await.unwrap(),
+        vec![0; UNIT as usize]
+    );
 }
 
-/// Minimised from the same sweep, seed 12. The orphan's allocation map is
-/// *readable* after a plain restart (its sync failed, the page cache kept
-/// the bytes — K-01), so open loaded it as if it were on disk and nothing
-/// ever re-stored it; the next catalog commit named the shard, and the power
-/// loss that followed dropped the only copy.
+/// The same orphan rule holds across a plain restart where a failed map sync
+/// can remain readable from page cache until the next catalog publication.
 #[tokio::test]
 async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
     let _serial = maki_test_support::failpoints::test_lock();
@@ -534,12 +529,13 @@ async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
         }
         _ => None,
     })));
-    engine.write(off(40), &image(40, 1), false).await.unwrap();
-    engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine
+        .write(off(40), &image(40, 1), false)
+        .await
+        .unwrap_err();
     engine.write(off(8), &image(8, 1), false).await.unwrap();
     engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine.checkpoint().await.unwrap();
     backing.set_fault_hook(None);
 
     // Restart, not power loss: shard 5's volatile map is still readable.
@@ -562,13 +558,17 @@ async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
     let engine = try_attach(&backing)
         .await
         .unwrap_or_else(|e| panic!("attach refused after a restart adopted an orphan: {e}"));
-    for (unit, stamp) in [(0u64, 1u32), (8, 1), (16, 2), (40, 1)] {
+    for (unit, stamp) in [(0u64, 1u32), (8, 1), (16, 2)] {
         assert_eq!(
             engine.read(off(unit), UNIT as usize).await.unwrap(),
             image(unit, stamp),
             "unit {unit}"
         );
     }
+    assert_eq!(
+        engine.read(off(40), UNIT as usize).await.unwrap(),
+        vec![0; UNIT as usize]
+    );
 }
 
 // ---------------------------------------------------------------------------

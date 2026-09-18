@@ -384,6 +384,7 @@ impl JournalWriter {
             fp("journal.segment.create")?;
             let file = self.backing.open(&path, true)?;
             file.set_len(0)?;
+            file.allocate_range(0, SEGMENT_HEADER_SIZE as u64)?;
             let header = SegmentHeader {
                 segment_index: index,
                 volume_uuid: self.volume_uuid,
@@ -467,6 +468,13 @@ impl JournalWriter {
             fp("journal.tail.truncate")?;
             active.file.set_len(active.write_offset)?;
         }
+        // The accepted logical end must never outrun physical filesystem
+        // allocation. Keep cleanup armed while allocation/write may have
+        // extended the file; only a fully written record clears it.
+        active.needs_tail_cleanup = true;
+        active
+            .file
+            .allocate_range(active.write_offset, bytes.len() as u64)?;
         fp("journal.append.write")?;
         if let Err(error) = active.file.write_at(active.write_offset, &bytes) {
             // The write may have persisted a prefix: the file can now be
@@ -481,6 +489,7 @@ impl JournalWriter {
         active.info.record_count += 1;
         active.info.size = active.write_offset;
         active.unsynced = true;
+        active.needs_tail_cleanup = false;
         self.next_sequence = next_sequence;
         self.appended_sequence = sequence;
         self.sanitize();

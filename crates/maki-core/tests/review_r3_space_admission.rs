@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_backing::{Backing, BackingFile, VolumeLock};
+use maki_backing::{Backing, BackingFile, FileBacking, VolumeLock};
 use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
-use maki_core::volume::VolumeOptions;
+use maki_core::volume::{Volume, VolumeOptions};
 use maki_core::CoreError;
 use maki_crypto::Clock;
 use maki_format::{
@@ -18,6 +18,7 @@ use maki_format::{
     journal::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE},
     superblock::Superblock,
 };
+use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::fake_provider::FakeCryptoProvider;
 use maki_test_support::{CrashableBacking, ManualClock};
 
@@ -316,4 +317,116 @@ async fn disabled_reserve_skips_the_admission_space_query() {
     engine.write(0, &[4; UNIT as usize], true).await.unwrap();
     assert_eq!(backing.queries.load(Ordering::SeqCst), 0);
     assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+}
+
+#[tokio::test]
+async fn checkpoint_slot_reservation_failure_precedes_journal_append() {
+    let (backing, _, engine) = fixture(0).await;
+    backing
+        .storage
+        .set_fault_hook(Some(Arc::new(|operation| match operation {
+            FaultOp::SetLen { path, .. } if path.starts_with("data/shard-") => {
+                Some(io::Error::from(io::ErrorKind::StorageFull))
+            }
+            _ => None,
+        })));
+
+    assert_storage_full(engine.write(0, &[0x91; UNIT as usize], false).await);
+    let stats = engine.monitoring_snapshot().stats;
+    assert_eq!(stats.appended_sequence, 0);
+    assert_eq!(stats.durable_sequence, 0);
+    assert!(backing
+        .storage
+        .list("journal")
+        .unwrap()
+        .iter()
+        .all(|name| !name.starts_with("seg-")));
+
+    backing.storage.set_fault_hook(None);
+    engine
+        .write(0, &[0x92; UNIT as usize], true)
+        .await
+        .expect("a released reservation failure must be retryable");
+    assert_eq!(engine.monitoring_snapshot().stats.durable_sequence, 1);
+}
+
+#[tokio::test]
+async fn journal_range_reservation_failure_does_not_consume_a_sequence() {
+    let (backing, _, engine) = fixture(0).await;
+    engine.write(0, &[0x81; UNIT as usize], true).await.unwrap();
+    let before = engine.monitoring_snapshot().stats;
+    backing
+        .storage
+        .set_fault_hook(Some(Arc::new(|operation| match operation {
+            FaultOp::SetLen { path, len }
+                if path.starts_with("journal/seg-")
+                    && *len
+                        > (SEGMENT_HEADER_SIZE + RECORD_HEADER_SIZE + UNIT as usize + 8) as u64 =>
+            {
+                Some(io::Error::from(io::ErrorKind::StorageFull))
+            }
+            _ => None,
+        })));
+
+    assert_storage_full(
+        engine
+            .write(UNIT as u64, &[0x82; UNIT as usize], false)
+            .await,
+    );
+    let failed = engine.monitoring_snapshot().stats;
+    assert_eq!(failed.appended_sequence, before.appended_sequence);
+    assert_eq!(failed.durable_sequence, before.durable_sequence);
+
+    backing.storage.set_fault_hook(None);
+    engine
+        .write(UNIT as u64, &[0x83; UNIT as usize], true)
+        .await
+        .expect("journal allocation failure must leave the same sequence retryable");
+    assert_eq!(engine.monitoring_snapshot().stats.durable_sequence, 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_file_checkpoint_slot_has_physical_blocks_before_journal_ack() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn Backing> = Arc::new(FileBacking::new(directory.path()).unwrap());
+    let geometry =
+        Geometry::compute(512, UNIT, 512, UNIT, 16 * UNIT as u64, 8 * UNIT as u64).unwrap();
+    init::create_volume(
+        backing.as_ref(),
+        Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::from_u128(0x215042),
+            provider_type: "fake".into(),
+            crypto_compatibility_id: "physical-reservation".into(),
+            key_identity: "k".into(),
+            geometry: geometry.clone(),
+            format_version: 1,
+            created_unix: 0,
+        },
+    )
+    .unwrap();
+    let mut volume = Volume::recover(backing, VolumeOptions::default()).unwrap();
+
+    volume.write_ct(0, &[0xa7; UNIT as usize], false).unwrap();
+
+    let shard = std::fs::metadata(directory.path().join(maki_format::layout::shard_data(0)))
+        .expect("the future checkpoint slot must exist before the journal write is accepted");
+    assert_eq!(shard.len(), geometry.units_per_shard() * geometry.slot_size);
+    assert!(
+        shard.blocks() * 512 >= geometry.slot_size,
+        "the first slot range must own physical filesystem blocks before ACK"
+    );
+    for allocation in [
+        maki_format::layout::shard_alloc_a(0),
+        maki_format::layout::shard_alloc_b(0),
+    ] {
+        let metadata = std::fs::metadata(directory.path().join(&allocation)).unwrap_or_else(|_| {
+            panic!("both allocation-map copies must exist before ACK: {allocation}")
+        });
+        assert!(metadata.len() > 0 && metadata.blocks() > 0, "{allocation}");
+    }
+    assert_eq!(volume.journal_appended_sequence(), 1);
 }
