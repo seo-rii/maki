@@ -175,9 +175,11 @@ identity before cleanup and never use a global prune or kill command.
 
 Memory figures from cgroup accounting include charged cache and kernel memory;
 they are not a process RSS bound. The OOM workload deliberately exceeded its
-memory cap. Recovery at 192 MiB does not prove bounded recovery for every
-journal or a production sizing recommendation. Distinct-unit replay memory and
-restart latency remain open (MAKI-025/028).
+memory cap. In this original campaign, recovery at 192 MiB did not prove a
+bound for distinct-unit replay or a production sizing recommendation. The
+2026-09-18 follow-up below bounds attach replay payloads, while total runtime,
+metadata, provider and cache memory plus restart latency remain qualification
+inputs (MAKI-025/028).
 
 The host kernel and page cache survived every SIGKILL, container OOM and pause.
 These cases cannot show which writes would survive loss of the host or device
@@ -196,3 +198,35 @@ Resource semantics and the distinction between OOM, SIGKILL and graceful stop:
 [Docker resource limits](https://docs.docker.com/engine/containers/resource_constraints/),
 [Docker kill](https://docs.docker.com/reference/cli/docker/container/kill/),
 [Docker stop](https://docs.docker.com/reference/cli/docker/container/stop/).
+
+## Bounded-replay follow-up — 2026-09-18
+
+Revision `733833c` replaced attach-time retention of every latest ciphertext
+with a second validated journal scan and a 1 MiB replay batch. The same three
+Docker cases passed with image
+`sha256:fdb24012f01fcc78348c8dfe03ae2f07050ba3e37e4f1f2745f49d4d3074faf8`.
+The release binaries were:
+
+- `maki`: `2bd84777939ff9b26c22d6bf58e2ba2e4556d26c7a861f248a05c7cd646def64`
+- `libmaki_nbdkit.so`: `da6ca88fa2104fb55b3f9abe396c507d021578bc7953da2f804f92d52e9b64fe`
+
+The OOM target completed 86 of 87 attempted 256 KiB pressure writes (21.5 MiB)
+before Docker reported `OOMKilled=true`, exit 137. Restart with 32 MiB
+`memory.max` and swap disabled reached READY and matched all 136 externally
+acknowledged units. Its cgroup recorded `memory.current=20,549,632`,
+`memory.peak=33,554,432`, 124 `max` events, and zero recovery `oom` or
+`oom_kill` events. A separate 192 MiB recovery also matched all ACKs and peaked
+at 9,449,472 bytes. The offline check found proof and checkpoint sequence 6620,
+zero journal segments, 5,668 allocated slots and zero invalid units.
+
+The peak touched the exact 32 MiB cap. This run therefore proves one bounded-
+replay scenario and preserves the external ACK oracle; it does not qualify
+32 MiB as an operational minimum. Total cgroup memory includes runtime,
+metadata, provider and charged cache costs outside the 1 MiB replay batch.
+Artifacts are under
+`/home/seorii/logs/maki-bounded-recovery-cgroup-20260918/`; the launcher log is
+`/home/seorii/logs/maki-bounded-recovery-cgroup-20260918T024900Z.log` (exit 0).
+The release build and image-build logs are
+`/home/seorii/logs/maki-bounded-recovery-release-20260918T024500Z.log` and
+`/home/seorii/logs/maki-bounded-recovery-image-build-20260918T024800Z.log`,
+both exit 0. All campaign containers were removed.

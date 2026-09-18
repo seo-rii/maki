@@ -104,11 +104,15 @@ syncs to journal barriers. The current store uses two complete A/B stores;
 measure FUA/FLUSH tail latency and recovery time on the intended backing before
 choosing a production configuration.
 
-Journal scanning streams segment contents. Volume attach additionally retains
-only the latest validated record per unit, so repeated overwrites do not retain
-all historical payloads or fill the overlay's pending-promotion index. Every
-record still undergoes sequence, CRC, geometry and required-boundary checks;
-a damaged superseded record cannot be skipped.
+Journal scanning streams segment contents. Volume attach first validates the
+complete accepted journal while discarding replay payloads. After durable
+prefix rewrite, proof publication and metadata repair, it scans the journal a
+second time and applies accepted records to checkpoint slots through a
+ciphertext batch capped at 1 MiB. Shard data and allocation metadata are
+synchronized before checkpoint state advances, and covered segments are
+removed only afterward. A crash anywhere in that replay can retry from the
+still-durable journal. Every record still undergoes sequence, CRC, geometry and
+required-boundary checks; a damaged superseded record cannot be skipped.
 
 The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
 
@@ -139,14 +143,17 @@ fell from 4,262,528 to 66,688 bytes; its per-slot encoding allocation remains.
 These are controlled thread-local heap measurements, not total resident memory
 or a new maximum supported overlay size.
 
-MAKI-025/028 remain partial. Distinct units and latest/durable versions,
-segment metadata, shard catalogs and allocation maps still consume memory.
-The public `scan_journal` and `recovery::recover` APIs retain their all-record
-return contract. The deep checker uses the same validation with immediate
-payload disposal, retaining at most one bounded candidate payload plus segment
-metadata for the journal report. It still checks every record and reports the
-same counts, corruption and repair decisions; it does not apply repairs. No
-new arbitrary RAM refusal limit has been applied to existing readable volumes.
+Revision `733833c` removes the attach-time replay payload set: controlled
+real-file recovery peaked at 1,079,060 bytes for 4,096 distinct 4 KiB records,
+and at 1,068,272 bytes for 16,384 overwrites, while advancing the checkpoint
+and pruning every covered segment. A crash injected while syncing replayed
+slot data refused attach; the next recovery reproduced the exact state from
+the journal. These measurements bound the replay payload batch, not the total
+process. Segment metadata, shard catalogs, allocation maps, runtime/provider
+state and filesystem cache still consume memory. The public `scan_journal` and
+`recovery::recover` APIs retain their all-record return contract. The deep
+checker continues to discard payloads immediately and does not apply repairs.
+No arbitrary RAM refusal limit has been applied to existing readable volumes.
 
 The MAKI-020 integration in `1bc0ab5` passed 768 workspace tests (10 ignored),
 all nine selected release gates, and Linux/Windows CI. The subsequent latest-

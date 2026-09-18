@@ -960,6 +960,17 @@ all-targets passed 204 tests with 6 ignored, and strict Clippy passed. This is
 not full-volume preallocation: untouched slots, filesystem/COW overhead, and
 database temporary space remain deployment-capacity inputs.
 
+Bounded recovery follow-up `733833c` removes the attach-time map of retained
+latest ciphertext. Recovery validates and repairs the full journal first, then
+replays it through a 1 MiB batch into durable checkpoint slots. Controlled
+tests held the measured replay peak near 1.1 MiB for 4,096 distinct records and
+16,384 overwrites, and a slot-sync crash retried from the preserved journal.
+The actual Docker cgroup campaign then recovered a 21.5 MiB pressure tail at a
+32 MiB cap and matched 136 external ACK units, but touched the cap exactly.
+This closes payload retention proportional to distinct units; metadata,
+runtime/provider allocations, filesystem cache and a production RSS minimum
+remain target-specific qualification inputs.
+
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Complete RSS bounds, remaining transport-library
 copies, checkpoint stalls, actual provider

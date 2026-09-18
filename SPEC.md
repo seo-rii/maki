@@ -1216,7 +1216,9 @@ and durably publish the accepted horizon to both required proof copies
 accepts may stay unsynced once the writer resumes, including pages
 whose dirty bits were cleared by failed writeback)
  ↓
-rebuild overlay
+scan the validated journal again and replay accepted records through a
+bounded ciphertext batch into checkpoint slots; sync shard data and
+allocation metadata, advance checkpoint state, then prune covered segments
  ↓
 run provider self-test
  ↓
@@ -1241,9 +1243,14 @@ unsynced sectors may persist out of order. Recovery MUST rewrite, verify and
 sync accepted prefixes, then publish both proofs before READY. It MUST NOT
 lower the horizon to make a damaged volume attach.
 
-The scanner streams segment data and discards covered payloads, but replay and
-overlay memory remain separate costs. No whole-recovery RSS bound or current
-hardware/DB power-loss qualification is implied by that implementation.
+The first scan streams segment data and retains no replay payloads. After all
+durability checks and repairs succeed, a second scan replays accepted records
+through a ciphertext batch capped at 1 MiB and advances the checkpoint before
+READY. A crash during that replay leaves the durable journal available for an
+idempotent retry. Shard catalogs, allocation maps, runtime state, provider
+buffers and filesystem cache remain separate memory costs. This establishes a
+payload replay bound, not a whole-process RSS limit or hardware/DB power-loss
+qualification.
 
 Key canary: on the first attach of a pristine volume, Maki encrypts a fixed,
 volume-bound plaintext at a reserved unit index and stores it A/B-replicated

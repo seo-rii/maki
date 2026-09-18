@@ -51,6 +51,13 @@ The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
 fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
 campaigns remain opt-in host qualification steps.
 
+The 2026-09-18 bounded-replay follow-up at revision `733833c` reran the Docker
+cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
+136 external ACK units intact, then passed the 192 MiB recovery and offline
+deep check. Because `memory.peak` reached the exact 32 MiB cap, this is a
+scenario result rather than a minimum-memory recommendation. See the
+[cgroup evidence](cgroup-fault-validation-2026-09-12.md#bounded-replay-follow-up--2026-09-18).
+
 The scheduled job runs:
 
 | Test identifier | Workload |

@@ -2,7 +2,7 @@
 
 최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌, cgroup 장애, Firecracker guest 종료와 전체 GCE 인스턴스 reset 검사를 추가했고, privileged 및 lifecycle crash 검증 기준은 `448c0b2`, 최신 remote-provider/SQLite qualification 기준은 `c385c99`이다. `c385c99`의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/35291481488)도 모두 성공했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
-**운영 승인은 보류한다.** 실제 Maki nbdkit, kernel NBD/LVM/XFS, trusted cleanup/reattach, 설치된 packaged recovery controller와 Docker SQLite 외부 ACK를 한 단일-PV/LV 캠페인에 결합하고 두 번의 자동 crash와 한 번의 cleanup 실패·재시도를 통과했다. 별도의 두 GCE 호스트에서 제한된 fresh-host backing 복원도 통과해 source의 32개 ACK 행을 새 host에서 대조하고, 16개를 추가한 뒤 lifecycle 재시작 후 48개를 다시 대조했다. 두 인증 loopback HTTP provider와 SQLite를 결합한 별도 캠페인도 개별 endpoint failover, 전체 provider 중단의 무-ACK stall과 복구 후 정확한 진행, 32개 행의 restart readback을 통과했다. checksummed PostgreSQL 15도 pgbench 중 postmaster SIGKILL 뒤 WAL 복구와 네 번의 `pg_amcheck`, 48개 ACK 및 Maki lifecycle restart를 통과했다. 그러나 전송 라이브러리의 남은 평문 복사본, 물리 공간 admission, 고유 단위·metadata의 전체 복구 메모리, multi-mapping과 foreign-device 경계, 실제 network/TLS/vendor provider, production PostgreSQL과 다른 DB profile, DB-native·legacy migration, 장시간 부하와 물리 전원 손실에는 코드·검증 과제가 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
+**운영 승인은 보류한다.** 실제 Maki nbdkit, kernel NBD/LVM/XFS, trusted cleanup/reattach, 설치된 packaged recovery controller와 Docker SQLite 외부 ACK를 한 단일-PV/LV 캠페인에 결합하고 두 번의 자동 crash와 한 번의 cleanup 실패·재시도를 통과했다. 별도의 두 GCE 호스트에서 제한된 fresh-host backing 복원도 통과해 source의 32개 ACK 행을 새 host에서 대조하고, 16개를 추가한 뒤 lifecycle 재시작 후 48개를 다시 대조했다. 두 인증 loopback HTTP provider와 SQLite를 결합한 별도 캠페인도 개별 endpoint failover, 전체 provider 중단의 무-ACK stall과 복구 후 정확한 진행, 32개 행의 restart readback을 통과했다. checksummed PostgreSQL 15도 pgbench 중 postmaster SIGKILL 뒤 WAL 복구와 네 번의 `pg_amcheck`, 48개 ACK 및 Maki lifecycle restart를 통과했다. `733833c`는 recovery payload replay를 1 MiB batch로 제한했고 실제 32 MiB cgroup에서 21.5 MiB tail과 136 ACK를 복구했으나 전체 RSS peak는 상한에 닿았다. 그러나 전송 라이브러리의 남은 평문 복사본, metadata/runtime을 포함한 전체 RSS 최소 규격, multi-mapping과 foreign-device 경계, 실제 network/TLS/vendor provider, production PostgreSQL과 다른 DB profile, DB-native·legacy migration, 장시간 부하와 물리 전원 손실에는 코드·검증 과제가 있다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
 
 ## 실제 cgroup·프로세스 장애 검사 — 2026-09-12
 
@@ -24,9 +24,14 @@ SIGKILL 및 32MiB·swap 0의 실제 workload OOM을 확인했다. 세 시나리�
 **32MiB 재기동 가능성은 보장하지 못했다.** 22MiB의 압박 쓰기를 완료한
 두 시험은 같은 32MiB로 복구할 때 30초 안에 READY를 내지 못했다.
 21.75MiB를 완료한 마지막 시험은 같은 상한에서 복구했지만 한도에 도달했고,
-192MiB 복구는 성공했다. 고유 단위 replay와 메모리·시간 예산의 과제가
-남아 있다는 실제 증거다. 특정 최소 RAM이나 정상 운영 용량을 도출한 것은
+192MiB 복구는 성공했다. 당시 구현에서 고유 단위 replay와 메모리·시간 예산의
+과제가 남아 있다는 실제 증거였다. 특정 최소 RAM이나 정상 운영 용량을 도출한 것은
 아니다. 실패와 성공의 원장·종료 상태는 [상세 장애 보고서](cgroup-fault-validation-2026-09-12.md)에 함께 기록했다.
+
+후속 `733833c`는 attach replay를 1 MiB batch로 바꾸었고 2026-09-18
+재실행에서 21.5MiB tail을 같은 32MiB cap으로 복구해 ACK 136개를 대조했다.
+다만 `memory.peak`가 cap에 정확히 닿았으므로 전체 RSS 여유나 최소 RAM은
+여전히 대상 환경별로 검증해야 한다.
 
 현재 호스트는 WSL이 아닌 Debian이므로 `wsl --shutdown`은 실행하지 않았다.
 커널과 page cache가 살아 있는 과정의 시험이며 실제 정전·kernel NBD/LVM/XFS·
@@ -250,6 +255,7 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 - `223db0c` (MAKI-021/041 일부): fresh free-space admission이 emergency reserve뿐 아니라 해당 write의 모든 journal record와 segment-header footprint까지 요구한다. 조회의 `None`/오류와 reserve 덧셈 overflow는 mutation 전에 ENOSPC로 닫는다. 물리 예약과 checkpoint 완주 공간은 남는다.
 - `19ece6f` (MAKI-021/041 일부): emergency admission이 켜진 write는 configured checkpoint headroom도 append 뒤 남겨야 한다. 경계 미만, headroom 합산 overflow, emergency=0 opt-out을 RED→GREEN으로 고정했다. RED 3 failed는 `/home/seorii/logs/maki-checkpoint-headroom-red-20260913.log`, 최종 focused 3 passed와 core all-targets 201 passed/6 ignored, strict Clippy는 각각 `/home/seorii/logs/maki-checkpoint-headroom-final-focused-20260913.log`, `/home/seorii/logs/maki-checkpoint-headroom-core-all-final-20260913.log`, `/home/seorii/logs/maki-checkpoint-headroom-clippy-20260913.log`다. 이것은 관측 threshold이며 물리 allocation 선점은 아니다.
 - `ced2bda` (MAKI-021/041): Linux write admission이 exact journal range와 해당 checkpoint slot 전체를 `posix_fallocate`로 먼저 확보하고, 새 shard의 allocation map A/B와 catalog를 journal append 전에 생성·동기화한다. slot/journal 예약 ENOSPC는 sequence를 소비하지 않고 재시도 가능하며, 실제 파일 회귀는 첫 ACK 전에 slot의 allocated block과 두 metadata copy를 확인한다. core all-targets 204 passed/6 ignored와 strict Clippy가 통과했다. untouched slot의 full-volume 선점, filesystem/COW overhead와 DB 임시 공간은 포함하지 않는다.
+- `733833c` (MAKI-025): 복구가 journal 전체를 검증·수선한 뒤 1 MiB ciphertext batch로 다시 scan하여 checkpoint slot에 반영한다. 4,096 distinct record와 16,384 overwrite의 측정 peak는 약 1.1 MiB였고 replay 중 slot sync crash는 journal을 보존해 재시도됐다. 실제 cgroup은 21.5 MiB pressure tail을 32 MiB에서 복구하고 외부 ACK 136개를 대조했지만 `memory.peak`가 상한에 닿아 전체 RSS 최소 규격은 확정하지 않았다.
 - `5803be8` (MAKI-041 일부): geometry가 maximum unit/shard, full-shard slot span, 모든 shard의 allocation map A/B와 catalog A/B 크기를 checked arithmetic으로 계산하고 `maki volume inspect`가 표시한다. 지원 catalog 상한인 2^24 shard를 넘거나 전체 span이 `u64`을 넘는 geometry는 생성·decode 전에 거절한다. 16TiB 표준 예제의 slot span은 18TiB, allocation map A/B는 1,073,758,208 bytes다. format 및 CLI 전체와 strict Clippy가 통과했다. 이 수치는 physical reservation, journal/checkpoint peak, filesystem overhead 또는 DB 임시 공간을 포함하지 않는다.
 - `d843540`, `44ba589`, `e1f4143` (MAKI-015 일부): HTTP Base64/Base64URL/hex 응답을 첫 출력 byte 전부터 고정 크기 zeroizing owner에 직접 decode하고, response growth 때 교체되는 allocation을 지운다. JSON object key, pointer overwrite/descent와 잘못된 pointer, 부분 per-item/batch request tree도 RAII로 정리한다. page lock, malformed response parser의 내부 allocation과 외부 library 복사본은 남는다.
 - `8419b3d` (MAKI-015 일부): HTTP가 소유한 resolved header/query 값과 결합된 mTLS identity PEM을 정상 drop·구성 오류에서 지운다. key-source credential은 중간 UTF-8 byte vector를 만들지 않고 빌린다. 원본 설정 문자열과 reqwest/hyper/rustls/kernel 복사본은 보장 밖이다.
@@ -709,7 +715,9 @@ MAKI-025의 deep checker도 전체 replay payload 보유를 제거했다. 1 MiB/
 `/home/seorii/logs/maki-r3-deep-scan-memory-final-20260912T100741.192029Z.log`),
 관련 strict Clippy exit 0(PID 580858;
 `/home/seorii/logs/maki-r3-deep-scan-memory-clippy-20260912T100741.568824Z.log`).
-공개 all-record API와 실제 attach의 고유 단위·overlay/metadata 메모리는 남는다.
+이 시점에는 공개 all-record API와 실제 attach의 고유 단위·overlay/metadata
+메모리가 남았다. 후속 `733833c`가 attach payload를 1 MiB batch로 바꿨고,
+공개 API와 metadata/runtime/provider/cache 비용은 계속 별도다.
 
 MAKI-015의 WebSocket decoded-output 단위는 별도로 완료했다. 부분 base64
 디코딩 오류와 뒤 항목 거절에서 해제 직전 평문 잔존을 확인한 RED 2개를
@@ -781,8 +789,8 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 제품 경로와 한 실제 installed-graph 결합 검증 완료: `448c0b2`에서 native READY, bounded 명령, intent/recover/verify, 두 자동 SIGKILL cleanup/reattach, open-LV cleanup 실패 차단, 명시적 재시도와 Docker ACK 64개 복구를 수행했다 | 다중-LV/internal mapping, foreign device 변경, 설치·업그레이드, 실패 단계별 실제 장치 재시도와 운영 topology를 검증 |
 | MAKI-015/032 | 부분 수정: WS 요청·decoded output·소유 수신 frame/JSON 문자열·키, gRPC private item과 HTTP 부분 decode, response growth, JSON key·overwrite·부분 request tree, resolved header/query 값과 mTLS identity PEM 보호 완료. 원본 설정 문자열, malformed response parser allocation, page lock, 공유 원본, reqwest/tungstenite/tonic 등 별도 할당의 수명과 전체 resident 비용은 남음 | 남은 소유/라이브러리 버퍼의 성공·오류·취소 수명과 실제 peak resident 상한을 검증. [전송 보호 범위](transport-memory.md)를 전체 메모리 소거·잠금으로 확대하지 않음 |
 | MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료. Firecracker guest hard cut 20회와 전체 GCE instance reset 10회에서 필수 proof와 ACK readback은 보존됨. GCE reset은 workload VM memory/kernel cache를 잃었지만 Persistent Disk 서비스와 물리 저장 경로는 살아 있었음. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, 물리 전원 차단, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
-| MAKI-021/041 | 부분 수정: 매 쓰기의 fresh free-space가 emergency reserve, configured checkpoint headroom과 해당 요청의 모든 record/segment-header footprint를 덮어야 하며 unknown/EIO/overflow는 ENOSPC로 닫는다. `5803be8`은 최대 unit/shard, full slot span, allocation/catalog A/B bytes를 검사·표시하고 표현 불가능한 geometry를 거절한다. 새 slot·metadata·checkpoint 완주 공간의 실물 예약은 아님 | 동시 외부 소비까지 포함한 물리 예약과 checkpoint 경계 ENOSPC 회귀, 실제 fill ratio·filesystem overhead·DB 임시 공간별 배포 용량 검증 |
-| MAKI-025 | 부분 수정: segment streaming, 최신 replay 보유, deep checker payload 폐기 완료. 실제 cgroup OOM 후 32MiB 재기동은 일부 시험에서 READY 30초 제한을 넘겼고 192MiB 복구는 성공. 고유 단위·버전·metadata 및 공개 전체 기록 API의 메모리는 남음 | 전체 working set의 메모리 상한과 원래 자원 예산에서의 복구 시간을 검증. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 heap 결과를 전체 RSS 상한으로 해석하지 않음 |
+| MAKI-021/041 | `ced2bda`에서 accepted Linux write의 exact journal range와 전체 checkpoint slot을 `posix_fallocate`하고 새 shard allocation/catalog A/B를 append 전에 동기화한다. ENOSPC는 sequence를 소비하지 않고 재시도된다. `5803be8`은 최대 layout을 검사·표시한다. untouched slot의 전체-volume 선점과 filesystem/COW/DB 공간은 별도다 | 실제 fill ratio·filesystem overhead·quota·DB 임시 공간별 배포 용량을 검증하고, 지원 filesystem에서 reservation 의미를 qualification |
+| MAKI-025 | `733833c`에서 attach recovery payload를 1 MiB batch로 replay하고 checkpoint 뒤 journal을 회수한다. 4,096 distinct/16,384 overwrite 회귀가 약 1.1 MiB measured peak를 유지했고 replay crash 재시도가 통과했다. 실제 cgroup OOM 뒤 21.5MiB tail은 32MiB 재기동에서 ACK 136개를 복구했지만 peak가 cap에 닿았다. metadata/runtime/provider/cache 및 공개 전체 기록 API 메모리는 남음 | 전체 working set의 RSS 여유와 원래 자원 예산에서의 복구 시간을 최대 catalog/fill ratio로 검증. [측정 범위](durable-recovery.md#cost-and-verification-limits)의 batch/heap 결과를 전체 RSS 상한으로 해석하지 않음 |
 | MAKI-028 | 부분 수정: 동일한 latest/durable 버전과 내부 checkpoint snapshot은 immutable ciphertext를 공유. 서로 다른 버전·공개 owned snapshot·slot codec·metadata 비용은 남음 | 실제 최대 overlay에서 peak RSS 한도 검증; 두 버전을 합산하는 보수적 논리 budget을 유지하며 전체 메모리 증거로 사용하지 않음 |
 | MAKI-029/030 | 구조·성능: checkpoint의 exclusive lock과 async worker 위 동기 backing I/O가 남음 | 목표 부하의 최악 I/O 정지·runtime 여유를 검증하고 기준 미달 시 작업 격리/잠금 범위 수정. MAKI-039의 snapshot이 이를 해결한 것은 아님 |
 | MAKI-013 | 위협 모델: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음 | replay를 지원 위협 모델에서 제외하는 결정과 제한을 명시하거나 세대 인증·독립 anchor를 구현하고 공격 회귀 실행 |
