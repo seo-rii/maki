@@ -1000,9 +1000,16 @@ This closes payload retention proportional to distinct units; metadata,
 runtime/provider allocations, filesystem cache and a production RSS minimum
 remain target-specific qualification inputs.
 
+A later [constrained recovery RSS campaign](recovery-rss-validation-2026-09-19.md)
+ran two fresh 48 MiB and two fresh 64 MiB post-OOM recoveries. All four matched
+136 ACK units and passed deep checking; the maximum observed nbdkit `VmHWM` was
+11,415,552 bytes. Both 64 MiB runs stayed below the cgroup cap with zero max
+events, while both 48 MiB runs touched the cap. This supplies a scoped process
+RSS high-water observation and cgroup sizing result, not a universal bound.
+
 The supplied R3 directory is retained because it also contains the inherited
-MAKI/FUP production checklist. Complete RSS bounds, remaining transport-library
-copies, checkpoint stalls, actual provider
+MAKI/FUP production checklist. Universal and target-profile RSS bounds,
+remaining transport-library copies, checkpoint stalls, actual provider
 faults over a target network/vendor endpoint, replay policy, key migration,
 broader and live database migration, production database profiles and remaining
 engines, physical power loss, and long-duration load remain open.

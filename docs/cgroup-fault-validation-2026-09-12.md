@@ -230,3 +230,10 @@ The release build and image-build logs are
 `/home/seorii/logs/maki-bounded-recovery-release-20260918T024500Z.log` and
 `/home/seorii/logs/maki-bounded-recovery-image-build-20260918T024800Z.log`,
 both exit 0. All campaign containers were removed.
+
+A later [constrained recovery RSS campaign](recovery-rss-validation-2026-09-19.md)
+repeated the post-OOM recovery twice at 48 MiB and twice at 64 MiB while also
+capturing the nbdkit process `VmHWM`. All four recovered 136 ACK units and
+passed deep checking. The 48 MiB runs touched their cap, while the 64 MiB runs
+peaked below it with no max event. The report preserves the exact process and
+cgroup measurements and their profile-specific limits.

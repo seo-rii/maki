@@ -123,10 +123,13 @@ nine release gates, and Linux/Windows CI. The later `b3c5103` snapshot passed
 LVM preflight and native startup readiness and passed 901 workspace tests,
 formatting, strict Clippy, and Linux/Windows CI. Linux CI now installs the native
 NBD test tools before its workspace run. Revision-specific gate results are
-recorded separately. Volume recovery streams segments,
-retains the latest record per unit and shares identical internal overlay versions.
-Distinct versions and metadata still need a total memory bound. Production
-approval remains pending.
+recorded separately. Volume recovery streams segments and replays accepted
+records through a fixed 1 MiB payload batch. A scoped
+[constrained recovery RSS campaign](docs/recovery-rss-validation-2026-09-19.md)
+recovered four independent OOM tails at 48/64 MiB caps; the largest observed
+nbdkit `VmHWM` was 11,415,552 bytes. Metadata, providers, caches and other
+deployment profiles still need their own total-memory bound. Production approval
+remains pending.
 
 ## Build
 
@@ -163,6 +166,7 @@ Review the configuration and use a disposable backing directory before running
 | [Testing and qualification](docs/testing.md) | CI, fault testing, database tests, power loss, and release status |
 | [Privileged Linux validation](docs/privileged-linux-validation.md) | Reproducible kernel NBD, LVM, XFS, fio, privilege, and SQLite run |
 | [Package, topology, and migration validation](docs/package-topology-migration-validation-2026-09-19.md) | Debian install/upgrade, multi-mapping and foreign-backend refusal, and SQLite native/legacy migration |
+| [Constrained recovery RSS validation](docs/recovery-rss-validation-2026-09-19.md) | Repeated 48/64 MiB cgroup recovery and measured nbdkit resident high-water marks |
 | [Technical specification](SPEC.md) | Normative storage and security requirements |
 
 ## Repository layout

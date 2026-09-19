@@ -22,6 +22,7 @@ for storage, durability, provider, and security requirements.
 | Checking review findings and their fixes | [Review remediation log](review-remediation.md) |
 | Following the R3 fixes and remaining operating limits | [R3 readiness review](production-readiness-review-2026-09-08.md) |
 | Reviewing package, topology, and migration evidence | [Package, topology, and migration validation](package-topology-migration-validation-2026-09-19.md) |
+| Reviewing constrained recovery memory evidence | [Constrained recovery RSS validation](recovery-rss-validation-2026-09-19.md) |
 | Reading the 2026-09-05 project assessment | [Project review](project-review-2026-09-05.md) |
 | Implementing protocol or format changes | [Technical specification](../SPEC.md) |
 
