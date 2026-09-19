@@ -248,6 +248,12 @@ to distinguish an early socket inode from readiness and an outer operation
 deadline from an explicit TLS error. See the
 [server CA and endpoint rotation validation](server-ca-endpoint-rotation-validation-2026-09-19.md).
 
+For unattended repetition of the existing DB model, persistence, concurrency,
+space-admission and recovery-allocation tests, see the
+[background storage runner](background-storage-validation.md). It freezes inputs,
+records status and exit codes, and supports cancellation. Repeated fixed-seed
+model runs do not replace real-DB or physical-power qualification.
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
