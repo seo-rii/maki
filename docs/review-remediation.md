@@ -840,7 +840,7 @@ that the review bundle also tracks.
 | R3-004 endpoint capabilities | Closed | Preserved per-endpoint intersection plus `27dce14`; heterogeneous endpoint regressions pass |
 | R3-005 UUID/canary identity | Closed | `8e725fc`; locked actual UUID, per-endpoint canary, and quarantine recovery tests |
 | R3-006 full context | Closed | `dd87466`; only exact context-field refusal is accepted as capability evidence |
-| R3-007 recovery lifecycle | Product path closed; installed combined crash qualification passed | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; `448c0b2` combined the installed graph, actual storage, and SQLite through two automatic nbdkit crashes plus an open-LV cleanup failure/retry, recovering 64 external-ACK rows in four distinct Docker containers. Multi-mapping, foreign-device, package-upgrade, and production-topology qualification remain |
+| R3-007 recovery lifecycle | Product path closed; installed crash and scoped topology qualification passed | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; `448c0b2` combined the installed graph, actual storage, and SQLite through two automatic nbdkit crashes plus an open-LV cleanup failure/retry. The `3cac300` package campaign additionally refused a dead-backend two-LV fallback and a same-NBD foreign backend before mutation. Nested/internal mappings, partitions, holders, hot replacement and production topology remain |
 | R3-008 shutdown result/logging | Closed for supported foreground mode | `dc646ef`; explicit drain result, admission closure, retry, subprocess logging, and concurrent shutdown tests |
 | R3-009 response shape | Closed | `57ca845`; empty, extra, wrong-index, and wrong-length responses fail without panic |
 | R3-010 capability mode | Closed | `40502a7`; only declared mode is accepted and remote declarations are contractual |
@@ -895,7 +895,7 @@ distribution package install or upgrade, multi-LV/internal mapping, foreign
 device replacement, remote providers, another database, DB-native migration,
 whole-VM loss on this topology, or soak load.
 
-Revision `ece7e39` then passed a separate
+At that point, revision `ece7e39` passed a separate
 [fresh-host backing restore](fresh-host-restore-validation-2026-09-17.md).
 A source GCE VM wrote and externally acknowledged 32 SQLite rows, drained,
 passed the offline check and exported the unchanged v2 backing, configuration,
@@ -935,6 +935,25 @@ rows, retained all 32 through a packaged Maki lifecycle restart, then reached
 48 rows. Four `pg_amcheck` runs were clean. This narrows the other-database gap
 for one short PostgreSQL profile; production sizing, backup/restore,
 replication, DB-native migration, concurrent VM/storage loss and soak remain.
+
+Revision `3cac300` then passed a separate
+[package, topology, and migration campaign](package-topology-migration-validation-2026-09-19.md)
+on one disposable Debian 12 GCE VM. A generated pre-upgrade package cleanly
+installed and ran two simultaneous pinned NBD/LVM/XFS volumes, including a
+sidecar LV. The generated current package preserved every config and token hash,
+did not auto-start a volume, and reattached both SQLite databases with unchanged
+logical hashes. A corrupt native restore failed before clean retry. A matching
+old reader backed up a clean legacy-v1 volume; the current writer refused the
+unchanged v1 superblocks, and the backup restored exactly into fresh v2.
+
+After a daemon `SIGKILL`, packaged recovery preserved both top-level mappings
+and the trusted proof when proof-scoped fallback refused the ambiguous topology.
+Cleanup also preserved a same-number foreign NBD backend and trusted record.
+Explicit cleanup then converged, both offline deep checks reported zero invalid
+slots, and exact instance/disk lookups plus prefix queries proved cloud cleanup.
+This closes those scoped package, multi-mapping, foreign-backend and SQLite
+migration observations. Signed repositories, rollback, nested device stacks,
+live backup/cutover and other databases remain open.
 
 The disposable instances and their auto-delete boot disks were deleted. The
 last fresh project queries found zero name-matched `maki-*` instances and disks,
@@ -985,6 +1004,6 @@ The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Complete RSS bounds, remaining transport-library
 copies, checkpoint stalls, actual provider
 faults over a target network/vendor endpoint, replay policy, key migration,
-DB-native or legacy fresh-host migration restore, production database profiles
-and remaining engines, physical power loss, and long-duration load remain open.
+broader and live database migration, production database profiles and remaining
+engines, physical power loss, and long-duration load remain open.
 Direct R3 closure must not be read as general production approval.

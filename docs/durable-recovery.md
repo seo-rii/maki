@@ -36,6 +36,13 @@ For existing data, prepare an explicit migration:
 
 No command in this build performs those migration steps automatically.
 
+The [2026-09-19 package and migration qualification](package-topology-migration-validation-2026-09-19.md)
+exercised this procedure for one cleanly drained envelope-v1 SQLite source. The
+matching old reader produced a native backup, the current writable path refused
+the unchanged v1 superblocks, and restoring into a fresh v2 volume matched the
+source logical hash. That result does not certify an ambiguous v1 tail, a live
+snapshot, another database engine or production cutover.
+
 ## Required horizon and acknowledgement ordering
 
 Each proof is a fixed 64-byte CRC-protected record containing its generation,

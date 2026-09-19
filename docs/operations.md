@@ -558,6 +558,14 @@ If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
+The [2026-09-19 package qualification](package-topology-migration-validation-2026-09-19.md)
+installed a generated pre-upgrade Debian package on a clean Debian 12 VM,
+detached two live volumes using that helper, upgraded to the current generated
+package without auto-start, and reattached both with unchanged configuration,
+credential and logical SQLite hashes. This covers one direct `dpkg -i` path;
+signed repositories, downgrade and maintainer-script rollback remain separate
+release checks.
+
 ### Fresh-host restore of an unchanged v2 backing
 
 Use this procedure only when restoring the same v2 volume UUID, backing data,
@@ -588,8 +596,11 @@ the separate process in [durable recovery](durable-recovery.md).
 
 The [2026-09-17 qualification](fresh-host-restore-validation-2026-09-17.md)
 passed this flow for one graceful local-provider, single-PV/LV, SQLite backing.
-It was an ad hoc artifact install, so package upgrades, DB-native migration,
-other databases and crash-time backup behavior remain separate qualifications.
+It was an ad hoc artifact install. A later
+[package and migration campaign](package-topology-migration-validation-2026-09-19.md)
+qualified one generated Debian package upgrade plus stopped-source SQLite
+DB-native and legacy-v1 backup/restore. Other distributions, databases,
+live/crash-time backup and production cutover remain separate qualifications.
 
 ## Growth and cache reload
 

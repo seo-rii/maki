@@ -189,6 +189,16 @@ advanced to 32 rows, retained them through a packaged Maki lifecycle restart,
 then reached 48 rows. Four `pg_amcheck` runs were clean. See the
 [PostgreSQL process-crash validation](postgresql-crash-validation-2026-09-18.md).
 
+Revision `3cac300` then passed a generated Debian package, topology, and
+migration campaign. A clean pre-upgrade package install ran two simultaneous
+kernel NBD/LVM/XFS volumes, including a second LV mapping, before the current
+package upgrade preserved configuration, credentials and both SQLite hashes.
+A corrupt DB-native restore was rejected before retry, a clean legacy-v1
+old-reader backup restored exactly into v2 while the current writer refused the
+unchanged v1 metadata, and multi-mapping plus foreign-backend cleanup both
+failed closed before mutation. See the
+[package, topology, and migration validation](package-topology-migration-validation-2026-09-19.md).
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
@@ -199,6 +209,9 @@ then reached 48 rows. Four `pg_amcheck` runs were clean. See the
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for one Debian 12 GCE topology | Installed shipped templates recreated the real daemon, attachment, workload, and Docker container twice, withheld restart on open-LV cleanup failure, then recovered on explicit retry |
+| Debian package install and upgrade | Clean install, stopped-volume upgrade, and exact reattach | Pass for one generated-package Debian 12 profile | Pre-upgrade and current packages preserved volume/attach configs, all token hashes and two SQLite logical hashes, did not auto-start volumes, and reattached both after upgrade |
+| Multi-mapping and foreign-backend refusal | Refuse ambiguous fallback and changed backend identity before mutation | Pass for one two-LV and one same-NBD foreign-backend topology | Packaged recovery preserved both mappings and proof after daemon death; cleanup preserved a foreign backend identifier and trusted record until explicit disconnect |
+| DB-native and legacy-v1 migration | Reject corrupt restore; old-reader backup into a fresh v2 volume | Pass for stopped-source SQLite profiles | Corrupt native restore failed before clean retry; current writer refused byte-stable v1 superblocks and the old-reader backup restored with the exact logical hash |
 | Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
 | Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
 | Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
@@ -243,6 +256,11 @@ The [physical reservation report](physical-reservation-validation-2026-09-18.md)
 records real ext4 block allocation before FUA acknowledgement, a zero-free-space
 ENOSPC refusal with unchanged journal state, retry, restart readback, offline
 checking, and deletion of the disposable VM and separate data disk.
+The [package, topology, and migration report](package-topology-migration-validation-2026-09-19.md)
+records clean install and upgrade, simultaneous volumes with a sidecar LV,
+fail-closed multi-mapping and foreign-backend cleanup, SQLite DB-native and
+legacy-v1 migration, final deep checks, and deletion of the disposable VM and
+disk.
 
 ## Database qualification
 
