@@ -31,7 +31,11 @@ Maki is designed around four constraints:
 > lifecycle restart. A scoped
 > [package, topology, and migration validation](docs/package-topology-migration-validation-2026-09-19.md)
 > also passed a Debian package upgrade, SQLite native and legacy-v1 migration,
-> and multi-mapping and foreign-backend fail-closed qualification on one VM.
+> and multi-mapping and foreign-backend fail-closed qualification on one VM. A
+> [cross-host TLS provider validation](docs/cross-host-tls-provider-validation-2026-09-19.md)
+> then passed mTLS and bearer refusal controls, two-host failover, total-outage
+> stall/resume, and restart readback over private VPC addresses. Commercial
+> vendor behavior remains unqualified.
 
 **Volume compatibility:** new volumes require superblock envelope v2 and
 mirrored durable proofs. Older binaries reject v2, and this build refuses
@@ -59,11 +63,11 @@ provided.
 |---|---|
 | Core engine, format, recovery, and provider contracts | v2 durability baseline passed workspace tests, nine release gates and Linux/Windows CI; subsequent fixes and remaining limits are tracked in the [R3 readiness record](docs/production-readiness-review-2026-09-08.md) |
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
-| HTTP transport TLS and loopback chaos handling | Validated in automated tests; one loopback two-provider SQLite campaign passed endpoint failover, total-outage stall/resume, and lifecycle restart |
+| HTTP transport TLS and provider fault handling | Automated tests plus one cross-host VPC campaign passed TLS 1.2/1.3 mTLS, bearer refusal, two-provider failover, total-outage stall/resume, and lifecycle restart |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
 | Kernel `/dev/nbd`, LVM, XFS, and fio path | Installed systemd recovery plus two automatic nbdkit-crash cycles and one open-target failure/retry passed on one pinned single-PV/LV Debian 12 GCE topology; a second campaign proved fail-closed two-LV and same-NBD foreign-backend boundaries; other target topologies remain |
 | Debian package and migration path | Clean install and generated-package upgrade preserved two attached-volume DB hashes, configs and credentials; one SQLite DB-native restore and one old-reader legacy-v1 backup into v2 passed |
-| Real database and vendor-provider workloads | SQLite WAL passed installed-lifecycle, fresh-host, DB-native/legacy migration, and synthetic remote-provider campaigns; checksummed PostgreSQL 15 recovered after postmaster SIGKILL, passed four `pg_amcheck` runs, and retained 48 ACK rows through a Maki restart; production DB profiles, other engines, vendor endpoints, network faults, and broader migration profiles remain open |
+| Real database and vendor-provider workloads | SQLite WAL passed installed-lifecycle, fresh-host, DB-native/legacy migration, loopback-provider, and cross-host TLS reference-provider campaigns; checksummed PostgreSQL 15 recovered after postmaster SIGKILL, passed four `pg_amcheck` runs, and retained 48 ACK rows through a Maki restart; production DB profiles, other engines, commercial vendor endpoints and their network behavior, and broader migration profiles remain open |
 | VM and physical power-loss testing | Firecracker VMM loss and GCE hard reset campaigns passed their scoped checks; physical power loss remains open |
 | 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
 | 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; five findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark, S-04/S-05 recovery under out-of-order sector persistence) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
@@ -167,6 +171,7 @@ Review the configuration and use a disposable backing directory before running
 | [Privileged Linux validation](docs/privileged-linux-validation.md) | Reproducible kernel NBD, LVM, XFS, fio, privilege, and SQLite run |
 | [Package, topology, and migration validation](docs/package-topology-migration-validation-2026-09-19.md) | Debian install/upgrade, multi-mapping and foreign-backend refusal, and SQLite native/legacy migration |
 | [Constrained recovery RSS validation](docs/recovery-rss-validation-2026-09-19.md) | Repeated 48/64 MiB cgroup recovery and measured nbdkit resident high-water marks |
+| [Cross-host TLS reference-provider validation](docs/cross-host-tls-provider-validation-2026-09-19.md) | Private-VPC TLS 1.2/1.3, mTLS and bearer controls, host failover, outage resume, and SQLite restart readback |
 | [Technical specification](SPEC.md) | Normative storage and security requirements |
 
 ## Repository layout

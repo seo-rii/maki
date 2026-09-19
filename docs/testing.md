@@ -195,6 +195,17 @@ at 32 rows. All IDs and body hashes matched an external fsynced ledger before
 and after a packaged lifecycle restart. See the
 [remote HTTP provider database validation](remote-provider-db-validation-2026-09-18.md).
 
+Revision `47058d2` then passed a separate three-host HTTPS campaign. A client
+used private VPC addresses to reach two nginx-terminated reference providers,
+explicitly proved TLS 1.2 and TLS 1.3 with the expected mTLS identity, and
+required a bearer credential. Wrong-CA, missing-client-certificate and
+wrong-bearer attachments failed before socket publication. Provider A and B
+were stopped separately while writes continued; with both down, the ledger
+stayed at 24 until B returned. The run reached 32 exact ACK rows, retained them
+through a Maki restart, passed deep checking with zero invalid slots, and
+deleted all three VMs. See the
+[cross-host TLS reference-provider validation](cross-host-tls-provider-validation-2026-09-19.md).
+
 Revision `5f50354` then passed a checksummed PostgreSQL 15 campaign on another
 disposable GCE VM. After 16 exact ACK rows, a cgroup-wide postmaster `SIGKILL`
 interrupted four pgbench clients. Automatic WAL recovery produced a distinct
@@ -229,6 +240,7 @@ failed closed before mutation. See the
 | Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
 | Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
 | Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
+| Cross-host HTTPS reference provider | TLS/mTLS/auth refusal, host failover, and total-provider outage | Pass for one three-host private-VPC/SQLite topology | TLS 1.2 and 1.3 health gates recorded the client subject; wrong CA, absent client identity and wrong bearer failed closed; 32 ACK rows survived provider-VM stop/start and Maki restart |
 | PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for one PostgreSQL 15.19/scale-3 topology | Postmaster SIGKILL interrupted pgbench after 590 transactions; WAL recovery preserved 16 ACK rows, four `pg_amcheck` runs passed, and the cluster retained 32 rows through Maki restart before reaching 48 |
 | Real databases | Required | Partial | SQLite WAL and one short checksummed PostgreSQL 15 profile passed scoped campaigns; production PostgreSQL profiles, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Four later constrained recoveries passed at 48/64 MiB; process `VmHWM` stayed at or below 11,415,552 bytes, while only 64 MiB avoided cgroup max events |
@@ -262,6 +274,10 @@ The [remote-provider database report](remote-provider-db-validation-2026-09-18.m
 records the two authenticated HTTP endpoints, per-endpoint failure, total
 provider outage, SQLite ACK/hash oracle, lifecycle restart, harness correction,
 and deletion of both attempted VMs and disks.
+The [cross-host TLS reference-provider report](cross-host-tls-provider-validation-2026-09-19.md)
+records private-VPC TLS 1.2/1.3, mTLS and bearer controls, provider-host
+stop/start, SQLite ACK/hash readback, final deep checking, immutable harness
+inputs, and deletion of all three VMs and disks.
 The [PostgreSQL crash report](postgresql-crash-validation-2026-09-18.md)
 records active durability settings, pgbench interruption, WAL redo, postmaster
 replacement, four logical checks, ACK/hash readback, Maki lifecycle restart,

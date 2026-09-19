@@ -1007,10 +1007,22 @@ ran two fresh 48 MiB and two fresh 64 MiB post-OOM recoveries. All four matched
 events, while both 48 MiB runs touched the cap. This supplies a scoped process
 RSS high-water observation and cgroup sizing result, not a universal bound.
 
+Revision `47058d2` then passed a separate
+[cross-host TLS reference-provider campaign](cross-host-tls-provider-validation-2026-09-19.md).
+Two GCE provider hosts required mTLS and a bearer credential over private VPC
+addresses. Explicit TLS 1.2 and TLS 1.3 health gates passed; wrong CA, absent
+client identity and wrong bearer all refused the actual NBD attach before
+socket publication. Provider-VM stop/start exercised each endpoint alone and
+both absent, after which SQLite reached 32 exact external ACK rows and retained
+them through a Maki restart. The final deep check had zero invalid slots and all
+three VMs and disks were deleted. This closes the scoped cross-host HTTPS
+reference-provider observation, while commercial vendor behavior, target
+network faults and rotation remain open.
+
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Universal and target-profile RSS bounds,
 remaining transport-library copies, checkpoint stalls, actual provider
-faults over a target network/vendor endpoint, replay policy, key migration,
+faults over a commercial vendor and target network, replay policy, key migration,
 broader and live database migration, production database profiles and remaining
 engines, physical power loss, and long-duration load remain open.
 Direct R3 closure must not be read as general production approval.
