@@ -25,6 +25,7 @@ for storage, durability, provider, and security requirements.
 | Reviewing constrained recovery memory evidence | [Constrained recovery RSS validation](recovery-rss-validation-2026-09-19.md) |
 | Reviewing cross-host HTTPS, mTLS, and provider-fault evidence | [Cross-host TLS reference-provider validation](cross-host-tls-provider-validation-2026-09-19.md) |
 | Reviewing stopped credential rotation and new-key migration evidence | [Credential rotation and key migration validation](credential-rotation-key-migration-validation-2026-09-19.md) |
+| Reviewing server CA and endpoint-address rotation evidence | [Server CA and endpoint rotation validation](server-ca-endpoint-rotation-validation-2026-09-19.md) |
 | Reading the 2026-09-05 project assessment | [Project review](project-review-2026-09-05.md) |
 | Implementing protocol or format changes | [Technical specification](../SPEC.md) |
 

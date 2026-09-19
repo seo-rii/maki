@@ -37,8 +37,11 @@ Maki is designed around four constraints:
 > stall/resume, and restart readback over private VPC addresses. A subsequent
 > [credential rotation and key migration validation](docs/credential-rotation-key-migration-validation-2026-09-19.md)
 > passed a stopped bearer/mTLS-client rotation and a SQLite DB-native restore
-> from a K1 volume into a distinct K2 volume. Server-certificate rotation and
-> commercial vendor behavior remain unqualified.
+> from a K1 volume into a distinct K2 volume. A further
+> [server CA and endpoint rotation validation](docs/server-ca-endpoint-rotation-validation-2026-09-19.md)
+> passed stopped private-CA overlap/removal, server-certificate refusal controls,
+> and same-key endpoint-address replacement with 48 ACK rows. Commercial vendor
+> and target deployment behavior remain unqualified.
 
 **Volume compatibility:** new volumes require superblock envelope v2 and
 mirrored durable proofs. Older binaries reject v2, and this build refuses
@@ -66,7 +69,7 @@ provided.
 |---|---|
 | Core engine, format, recovery, and provider contracts | v2 durability baseline passed workspace tests, nine release gates and Linux/Windows CI; subsequent fixes and remaining limits are tracked in the [R3 readiness record](docs/production-readiness-review-2026-09-08.md) |
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
-| HTTP transport TLS and provider fault handling | Automated tests plus cross-host VPC campaigns passed TLS 1.2/1.3 mTLS, bearer refusal, two-provider failover, total-outage stall/resume, lifecycle restart, and stopped bearer/mTLS-client credential rotation; server-certificate rotation and commercial vendors remain open |
+| HTTP transport TLS and provider fault handling | Automated tests plus cross-host VPC campaigns passed TLS 1.2/1.3 mTLS, bearer refusal, two-provider failover, total-outage stall/resume, lifecycle restart, stopped bearer/mTLS-client rotation, private server-CA overlap/removal, and same-key endpoint-address replacement; commercial vendors and target deployment behavior remain open |
 | WebSocket and gRPC transports | Implemented; TLS currently fails closed |
 | Kernel `/dev/nbd`, LVM, XFS, and fio path | Installed systemd recovery plus two automatic nbdkit-crash cycles and one open-target failure/retry passed on one pinned single-PV/LV Debian 12 GCE topology; a second campaign proved fail-closed two-LV and same-NBD foreign-backend boundaries; other target topologies remain |
 | Debian package and migration path | Clean install and generated-package upgrade preserved two attached-volume DB hashes, configs and credentials; SQLite DB-native restore passed both a same-key package campaign and a distinct K1-to-K2 three-host migration, and one old-reader legacy-v1 backup into v2 passed |
@@ -176,6 +179,7 @@ Review the configuration and use a disposable backing directory before running
 | [Constrained recovery RSS validation](docs/recovery-rss-validation-2026-09-19.md) | Repeated 48/64 MiB cgroup recovery and measured nbdkit resident high-water marks |
 | [Cross-host TLS reference-provider validation](docs/cross-host-tls-provider-validation-2026-09-19.md) | Private-VPC TLS 1.2/1.3, mTLS and bearer controls, host failover, outage resume, and SQLite restart readback |
 | [Credential rotation and key migration validation](docs/credential-rotation-key-migration-validation-2026-09-19.md) | Stopped bearer/mTLS-client rotation, distinct provider keys and volumes, wrong-key canary refusal, and SQLite DB-native cutover |
+| [Server CA and endpoint rotation validation](docs/server-ca-endpoint-rotation-validation-2026-09-19.md) | Private-CA trust overlap and removal, server-certificate refusal controls, and same-key endpoint-address replacement |
 | [Technical specification](SPEC.md) | Normative storage and security requirements |
 
 ## Repository layout

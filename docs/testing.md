@@ -236,6 +236,18 @@ Both volumes passed final deep checking with zero invalid slots, and all three
 VMs and disks were deleted. See the
 [credential rotation and key migration validation](credential-rotation-key-migration-validation-2026-09-19.md).
 
+Revision `da89ae3` then passed a four-host stopped server-CA and endpoint
+rotation campaign. Mixed old/new server leaves worked with overlapping private
+roots; both peers then moved to the new CA before old trust was removed.
+Correct-root HTTP 204 and wrong-root curl 60 controls accompanied failed actual
+NBD negotiations in both trust directions. Replacing A's address with C's
+distinct IP while A's nginx listener was stopped preserved the key/profile,
+volume identity, superblock/canary hashes, and exact SQLite data. C/B reached
+48 ACK rows through another restart. The negative oracle was corrected in TDD
+to distinguish an early socket inode from readiness and an outer operation
+deadline from an explicit TLS error. See the
+[server CA and endpoint rotation validation](server-ca-endpoint-rotation-validation-2026-09-19.md).
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
@@ -254,6 +266,7 @@ VMs and disks were deleted. See the
 | Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
 | Cross-host HTTPS reference provider | TLS/mTLS/auth refusal, host failover, and total-provider outage | Pass for one three-host private-VPC/SQLite topology | TLS 1.2 and 1.3 health gates recorded the client subject; wrong CA, absent client identity and wrong bearer failed closed; 32 ACK rows survived provider-VM stop/start and Maki restart |
 | Stopped credentials and new-key migration | Replace bearer and mTLS client identity without changing the existing key; restore into a distinct provider key/volume | Pass for one three-host private-VPC/reference-provider/SQLite topology | Old bearer and client identity were refused, both peers validated the replacements, existing superblock/canary hashes matched, K1/K2 fingerprints and volume UUIDs differed, a wrong-key canary kept those hashes unchanged, and 24 ACK rows survived DB-native restore and restart |
+| Server CA and endpoint-address rotation | Overlap private roots, replace leaves, remove old trust, then replace an address with the same key/profile | Pass for one four-host private-VPC/reference-provider/SQLite topology | Both wrong-trust directions refused real NBD negotiation; A/B changed to C/B with A's listener stopped; both peers validated, superblock/canary hashes matched across each attach, and 48 ACK rows survived restart |
 | PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for one PostgreSQL 15.19/scale-3 topology | Postmaster SIGKILL interrupted pgbench after 590 transactions; WAL recovery preserved 16 ACK rows, four `pg_amcheck` runs passed, and the cluster retained 32 rows through Maki restart before reaching 48 |
 | Real databases | Required | Partial | SQLite WAL and one short checksummed PostgreSQL 15 profile passed scoped campaigns; production PostgreSQL profiles, ClickHouse, MinIO, and application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Four later constrained recoveries passed at 48/64 MiB; process `VmHWM` stayed at or below 11,415,552 bytes, while only 64 MiB avoided cgroup max events |
@@ -310,6 +323,13 @@ unchanged existing-volume superblock/canary hashes, distinct provider-key
 fingerprints and volume UUIDs, wrong-key canary refusal, DB-native cutover and
 restart readback, final deep checks, immutable harness inputs, and deletion of
 all three VMs and disks.
+
+The [server CA and endpoint rotation report](server-ca-endpoint-rotation-validation-2026-09-19.md)
+records private-CA overlap/removal, fresh server-leaf fingerprints, paired trust
+controls and actual NBD refusal, same-key replacement on a distinct provider IP,
+unchanged volume identity, and 48-row restart readback. It also preserves the
+two invalid harness attempts and their corrections. It does not qualify hot
+reload, public-CA revocation, or C-only availability while B remains configured.
 
 ## Database qualification
 
@@ -386,9 +406,10 @@ WSL is suitable for Linux syscall integration but not for power-loss claims.
 - Run the actual Maki daemon, kernel NBD/LVM/XFS, packaged systemd recovery, and
   DB/container ACK oracle together in one crash/recovery campaign.
 - Vendor endpoint conformance with production mapping and credentials.
-- Repeat bearer and mTLS client credential rotation against the selected
-  commercial vendor and target network; separately qualify same-key/profile
-  endpoint-address replacement and server-certificate/server-CA rotation.
+- Repeat the scoped bearer/mTLS-client, server-certificate/private-CA, and
+  same-key/profile endpoint-address rotation procedures against the selected
+  commercial vendor and target network, including shared-client coordination,
+  rollback, and failures at each transition.
 - Real SQLite and PostgreSQL workloads before broader database qualification.
 - Repeat the unchanged-backing fresh-host restore on each supported package and
   distribution, and separately exercise DB-native backup or logical migration

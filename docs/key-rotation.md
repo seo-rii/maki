@@ -11,7 +11,7 @@ Changing the actual encryption key requires a new volume and a data migration.
 Maki has no in-place re-encryption command or mixed-key epoch support.
 
 This procedure describes the current implementation and the steps exercised by
-one scoped reference-provider qualification. It is not a general production
+scoped reference-provider qualifications. It is not a general production
 approval. Use a maintenance window and the deployment's tested database backup,
 shutdown, mount, and restart procedures. The commands below use the packaged
 `example` service instance; substitute the existing instance and its
@@ -22,6 +22,7 @@ configuration paths. Do not run storage commands against an unreviewed target.
 | Change | Required procedure |
 | --- | --- |
 | Bearer token, client authentication credential, or credential source reference that retains access to exactly the same key/profile | Stop and detach the workload, acknowledge drain, stop the daemon, update credentials, and reattach with verification. |
+| Server certificate or private server CA with the same key/profile | Use separate stopped stages for overlapping trust, server-chain replacement, and old-root removal; verify fresh handshakes and every configured peer at each stage. |
 | Endpoint address that serves the same key/profile | The same stopped procedure, with verification of every configured peer against the existing volume. Preserve the required transport security and capability contract. |
 | Actual key bytes or provider-side key version, algorithm, incompatible ciphertext encoding/context binding, or provider identity | Create a separate volume and restore a database-native backup into it. |
 | Immutable volume geometry or on-disk format | A separately planned volume migration. |
@@ -53,8 +54,8 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    For mTLS client rotation, prepare the new client certificate/private key and
    update every provider peer's trusted client CA before starting the new Maki
    process. Keep server-certificate and server-CA rotation as a separate change:
-   it changes the trust material Maki uses to authenticate the server and was
-   not covered by the qualification below. Record non-secret certificate
+   it changes the trust material Maki uses to authenticate the server. Follow
+   the separate sequence below. Record non-secret certificate
    subjects, issuers, serials, and fingerprints for both sides of the change.
 
 2. Stop database writers and their supervisors, and prevent automatic restarts.
@@ -150,6 +151,58 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    authentication credential only after this evidence is accepted. Preserve
    access to the encryption key for retained backups and the existing volume.
 
+## Rotate server certificates and a private server CA
+
+Keep the encryption key/profile, bearer token, and mTLS client identity fixed
+while qualifying this change. Record each endpoint's expected hostname or IP
+SAN and non-secret old/new server and CA fingerprints. Prepare a PEM bundle
+containing the old and new private roots for the configured `ca_file`.
+If providers are shared, distribute overlapping trust to every affected client
+before replacing a server certificate and coordinate their maintenance windows.
+
+Use the stopped sequence above for each stage: stop writers, detach, acknowledge
+drain, stop the daemon, change inputs, and restart with full peer, mount, and
+database verification. This implementation reads the CA file at construction;
+changing it does not reload a running connection pool.
+
+1. Install the overlapping old/new trust bundle while the client is stopped.
+   A peer may then change to a new-CA server certificate while another retains
+   its old-CA certificate. After restart, require both peers to validate against
+   the existing volume. Record fresh TLS handshakes and exact leaf fingerprints
+   as well as the actual daemon's peer status and database readback.
+2. During another stopped window, move the remaining peers to new-CA server
+   certificates. Verify all peers and the database again with overlapping
+   trust. For a replacement chain independent of the old root, a probe using
+   only the old private root should now refuse the new-CA server, while the
+   same listener succeeds with the correct root. Cross-signed or alternate
+   chains need their own expected trust results.
+3. Only after every intended peer has switched, stop again and replace the
+   bundle with the new private root. Validate every peer, reattach, and verify
+   the database before resuming writers. Where a controlled old-certificate
+   listener is available, confirm that it remains reachable with old trust but
+   is refused with new-only trust. Isolate an intentional attach refusal from
+   the packaged production unit and its automatic recovery handler.
+
+Removing this private root from `ca_file` is not certificate revocation and
+does not remove built-in public roots. Qualify the deployment's actual chain,
+DNS/IP names, proxy, trust policy, and rollback procedure separately. Retain
+old trust or certificates for rollback only when the security policy permits.
+
+## Replace an endpoint address with the same key
+
+Provision the replacement with the exact existing encryption key/profile and
+a valid server identity for its new address. Preserve the volume UUID and
+immutable configuration. During the stopped sequence, change the endpoint URL
+and relevant trust inputs, then restart and require every configured peer to
+validate against the existing canary. Confirm the trusted mount, read the
+pre-change database contents, permit new writes, and repeat restart readback.
+
+Use an explicit test to distinguish replacement validation from surviving-peer
+availability. Keeping one old peer in the new configuration can prove that the
+replacement passes attach checks, but does not prove it can serve the complete
+workload alone. Record whether the retired listener, backend, or entire VM was
+stopped; test independent failover and full-provider loss separately.
+
 ## Roll back a credential change
 
 Keep writers stopped if the new credential or any peer fails validation. If a
@@ -210,9 +263,17 @@ fingerprints, wrong-key
 canary refusal with unchanged superblock/canary hashes, 24-row restart
 readback, and zero invalid slots on both volumes.
 
-That campaign did not rotate endpoint addresses, server certificates or a
-server CA and did not use a commercial provider. Provider credential overlap,
-key retention, target network behavior, actual mount/container restart
-ordering, rollback after the new database accepts writes, and failure at each
-transition still require deployment-specific execution evidence. This runbook
-does not close those qualification requirements.
+The separate [four-host server-CA and endpoint campaign](server-ca-endpoint-rotation-validation-2026-09-19.md)
+then exercised old/new private-CA overlap, sequential server-leaf replacement,
+old-root removal, and A/B-to-C/B address replacement with A's old listener
+stopped. Both trust-direction negative controls refused actual NBD negotiation,
+all configured peers validated on each restart, and 48 exact ACK rows survived.
+It retained the encryption key/profile, client credentials, and volume identity.
+
+These campaigns did not use a commercial provider. Provider credential overlap,
+key retention, target network behavior, shared-client coordination, actual
+mount/container restart ordering, rollback after the new database accepts
+writes, and failure at each transition still require deployment-specific
+execution evidence. Trust removal does not qualify CA revocation, and the C/B
+configuration does not establish C-only workload availability. This runbook
+does not close those remaining requirements.

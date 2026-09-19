@@ -1029,9 +1029,22 @@ an isolated K1 wrong-key canary was refused with unchanged superblock/canary
 hashes, and 24 ACK rows survived a full restart. Both retained volumes had zero
 invalid slots and all resources were deleted. This closes the tested
 reference-provider client-credential and stopped K1-to-K2 migration profile.
-Same-key/profile endpoint-address replacement, server-certificate and server-CA
-rotation, commercial vendors, target networks, key retirement and production
+Commercial vendors, target networks, key retirement and production
 cutover/rollback remain open.
+
+Revision `da89ae3` then passed a four-host
+[server CA and endpoint-address campaign](server-ca-endpoint-rotation-validation-2026-09-19.md).
+Stopped transitions exercised mixed old/new server certificates with overlapping
+private roots, new-only trust, and wrong-trust NBD refusal in both directions.
+A/B changed to distinct-IP C/B with A's nginx listener stopped and the encryption
+key/profile, client credentials and volume identity unchanged. Both configured
+peers validated at each restart, superblock/canary hashes matched across each
+attach, and all 48 exact ACK rows survived. This qualifies that stopped
+reference-provider path, not C-only service, hot reload, CA revocation or a
+commercial deployment. The harness corrected two false failures in TDD: socket
+existence was mistaken for readiness, then an outer operation-deadline error
+was mistaken for an unrelated failure. Prior reports now describe the verified
+startup-refusal boundary accurately.
 
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Universal and target-profile RSS bounds,
