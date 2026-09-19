@@ -263,6 +263,18 @@ socket = "/case/control.sock"
                 result[name] = (cgroup / name).read_text().strip()
             except OSError as error:
                 result[name] = f"unavailable: {error.__class__.__name__}"
+        try:
+            process_status = pathlib.Path(f"/proc/{state['Pid']}/status").read_text().splitlines()
+            wanted = {"VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem"}
+            for line in process_status:
+                name, separator, value = line.partition(":")
+                if separator and name in wanted:
+                    fields = value.split()
+                    ensure(len(fields) == 2 and fields[1] == "kB",
+                           f"unexpected {name} process status value")
+                    result[f"process.{name}.bytes"] = int(fields[0]) * 1024
+        except OSError as error:
+            result["process.status"] = f"unavailable: {error.__class__.__name__}"
         return result
 
     def client_command(self, mode, rounds=1):
@@ -303,11 +315,11 @@ socket = "/case/control.sock"
         self.identifier = None
 
 
-def constrained_recovery(target):
-    """Report availability at the original cap without relaxing durability."""
+def constrained_recovery(target, memory="32m"):
+    """Report availability at the requested cap without relaxing durability."""
     try:
         try:
-            target.start(memory="32m")
+            target.start(memory=memory)
         except TimeoutError:
             result = {"ready": False, "outcome": "startup-timeout", "deadline_seconds": 30,
                       "resources": target.stats(), "state_before_cleanup": target.state()}
@@ -385,7 +397,8 @@ def campaign(args):
                 if scenario == "memory-oom":
                     # A safe recovery result is separate from availability at
                     # the original cap. Preserve both outcomes explicitly.
-                    record["recovery_at_32m"] = constrained_recovery(target)
+                    memory = f"{args.recovery_memory_mib}m"
+                    record[f"recovery_at_{memory}"] = constrained_recovery(target, memory=memory)
                 target.start()
                 record["recovery"] = target.client("verify")
                 record["recovery_resources"] = target.stats()
@@ -408,6 +421,8 @@ def main():
     parser.add_argument("--image", help="existing local image; the runner never pulls")
     parser.add_argument("--output", type=pathlib.Path, help="new private artifact directory; parent must exist")
     parser.add_argument("--rounds", type=int, default=8)
+    parser.add_argument("--recovery-memory-mib", type=int, default=32,
+                        help="memory and swap cap for the post-OOM constrained recovery")
     parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--socket", help=argparse.SUPPRESS)
     parser.add_argument("--ledger", type=pathlib.Path, help=argparse.SUPPRESS)
@@ -415,6 +430,8 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.rounds <= 64:
         parser.error("--rounds must be 1..64")
+    if not 32 <= args.recovery_memory_mib <= 4096:
+        parser.error("--recovery-memory-mib must be 32..4096")
     if args.client:
         client_main(args)
     else:

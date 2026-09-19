@@ -129,6 +129,15 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target.kill.assert_called_once_with()
         target.remove.assert_called_once_with()
 
+    def test_constrained_recovery_uses_requested_memory_cap(self):
+        target = mock.Mock()
+        target.start.side_effect = TimeoutError("no READY")
+        target.state.return_value = {"Running": True, "OOMKilled": False}
+        target.stats.return_value = {"memory.max": "67108864"}
+        result = campaign.constrained_recovery(target, memory="64m")
+        self.assertFalse(result["ready"])
+        target.start.assert_called_once_with(memory="64m")
+
     def test_unrelated_startup_failure_is_not_qualified_as_oom(self):
         target = mock.Mock()
         target.start.side_effect = RuntimeError("invalid config")
@@ -145,12 +154,17 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         def read(path):
             if str(path) == "/proc/1234/cgroup":
                 return "0::/current-container\n"
+            if str(path) == "/proc/1234/status":
+                return "Name:\tnbdkit\nVmHWM:\t12345 kB\nVmRSS:\t8192 kB\nRssAnon:\t4096 kB\nRssFile:\t4096 kB\nRssShmem:\t0 kB\n"
             if str(path) == "/sys/fs/cgroup/current-container/memory.max":
                 return "33554432\n"
             return "0"
 
         with mock.patch.object(pathlib.Path, "read_text", autospec=True, side_effect=read):
-            self.assertEqual(target.stats()["memory.max"], "33554432")
+            stats = target.stats()
+            self.assertEqual(stats["memory.max"], "33554432")
+            self.assertEqual(stats["process.VmHWM.bytes"], 12345 * 1024)
+            self.assertEqual(stats["process.VmRSS.bytes"], 8192 * 1024)
 
 
 if __name__ == "__main__":
