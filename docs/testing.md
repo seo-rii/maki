@@ -199,7 +199,7 @@ Revision `47058d2` then passed a separate three-host HTTPS campaign. A client
 used private VPC addresses to reach two nginx-terminated reference providers,
 explicitly proved TLS 1.2 and TLS 1.3 with the expected mTLS identity, and
 required a bearer credential. Wrong-CA, missing-client-certificate and
-wrong-bearer attachments failed before socket publication. Provider A and B
+wrong-bearer attachments failed before daemon readiness. Provider A and B
 were stopped separately while writes continued; with both down, the ledger
 stayed at 24 until B returned. The run reached 32 exact ACK rows, retained them
 through a Maki restart, passed deep checking with zero invalid slots, and

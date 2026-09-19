@@ -64,9 +64,15 @@ attachments with deliberately invalid transport credentials:
 
 | Control | Required result |
 |---|---|
-| Wrong CA | Provider verification refused startup before socket publication |
-| No client certificate | Provider verification refused startup before socket publication |
-| Wrong bearer credential | Provider verification refused startup before socket publication |
+| Wrong CA | Provider verification refused startup before daemon readiness |
+| No client certificate | Provider verification refused startup before daemon readiness |
+| Wrong bearer credential | Provider verification refused startup before daemon readiness |
+
+These results establish startup refusal. They do not establish that no Unix
+socket inode existed: nbdkit can bind it before Maki's `after_fork` checks.
+The [nbdkit callback lifecycle](https://libguestfs.org/nbdkit-plugin.3.html#Callback-lifecycle)
+places client serving after `after_fork` succeeds; socket existence alone is
+not a readiness check.
 
 Each refusal occurred before a key canary or journal record was published. The
 positive health probes pinned TLS 1.2 on A and TLS 1.3 on B; their access-log

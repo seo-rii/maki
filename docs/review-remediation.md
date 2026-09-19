@@ -1011,8 +1011,8 @@ Revision `47058d2` then passed a separate
 [cross-host TLS reference-provider campaign](cross-host-tls-provider-validation-2026-09-19.md).
 Two GCE provider hosts required mTLS and a bearer credential over private VPC
 addresses. Explicit TLS 1.2 and TLS 1.3 health gates passed; wrong CA, absent
-client identity and wrong bearer all refused the actual NBD attach before
-socket publication. Provider-VM stop/start exercised each endpoint alone and
+client identity and wrong bearer all refused startup before
+daemon readiness. Provider-VM stop/start exercised each endpoint alone and
 both absent, after which SQLite reached 32 exact external ACK rows and retained
 them through a Maki restart. The final deep check had zero invalid slots and all
 three VMs and disks were deleted. This closes the scoped cross-host HTTPS

@@ -90,7 +90,7 @@ provider profile `rotation-key-v2`, and K2 endpoint set were then created.
 
 After K2 initialized the new volume, an isolated transient nbdkit attempted the
 same volume with K1 served under the K2 profile. This wrong-key canary failed
-before publishing an NBD socket with an explicit authentication-tag/canary
+before daemon readiness with an explicit authentication-tag/canary
 error. Both superblock and canary copies had identical hashes before and after
 the refusal. The production service was not used for this intentional failure,
 so its configured recovery coordinator could not race the negative control.
