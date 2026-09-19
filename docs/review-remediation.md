@@ -1016,8 +1016,22 @@ socket publication. Provider-VM stop/start exercised each endpoint alone and
 both absent, after which SQLite reached 32 exact external ACK rows and retained
 them through a Maki restart. The final deep check had zero invalid slots and all
 three VMs and disks were deleted. This closes the scoped cross-host HTTPS
-reference-provider observation, while commercial vendor behavior, target
-network faults and rotation remain open.
+reference-provider observation, while commercial vendor behavior and target
+network faults remain open.
+
+Revision `bdb9113` then passed a separate
+[credential rotation and key migration campaign](credential-rotation-key-migration-validation-2026-09-19.md)
+on the same three-host class of topology. A stopped K1 volume rejected its old
+bearer and mTLS client identity after rotation, validated the replacement
+identity on both peers, preserved its superblock/canary hashes, and reached 16
+external ACK rows. A SQLite DB-native backup restored into a distinct K2 volume;
+an isolated K1 wrong-key canary was refused with unchanged superblock/canary
+hashes, and 24 ACK rows survived a full restart. Both retained volumes had zero
+invalid slots and all resources were deleted. This closes the tested
+reference-provider client-credential and stopped K1-to-K2 migration profile.
+Same-key/profile endpoint-address replacement, server-certificate and server-CA
+rotation, commercial vendors, target networks, key retirement and production
+cutover/rollback remain open.
 
 The supplied R3 directory is retained because it also contains the inherited
 MAKI/FUP production checklist. Universal and target-profile RSS bounds,

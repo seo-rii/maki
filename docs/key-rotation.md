@@ -10,10 +10,11 @@ the provider still uses the same encryption key and cryptographic profile.
 Changing the actual encryption key requires a new volume and a data migration.
 Maki has no in-place re-encryption command or mixed-key epoch support.
 
-This procedure describes the current implementation, not a completed production
-qualification. Use a maintenance window and the deployment's tested database
-backup, shutdown, mount, and restart procedures. The commands below use the
-packaged `example` service instance; substitute the existing instance and its
+This procedure describes the current implementation and the steps exercised by
+one scoped reference-provider qualification. It is not a general production
+approval. Use a maintenance window and the deployment's tested database backup,
+shutdown, mount, and restart procedures. The commands below use the packaged
+`example` service instance; substitute the existing instance and its
 configuration paths. Do not run storage commands against an unreviewed target.
 
 ## What can change
@@ -48,6 +49,13 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    credential. Retain the old configuration and a tested database-native
    backup. Record the volume UUID, provider/profile, peer names, and non-secret
    credential version references in the change record.
+
+   For mTLS client rotation, prepare the new client certificate/private key and
+   update every provider peer's trusted client CA before starting the new Maki
+   process. Keep server-certificate and server-CA rotation as a separate change:
+   it changes the trust material Maki uses to authenticate the server and was
+   not covered by the qualification below. Record non-secret certificate
+   subjects, issuers, serials, and fingerprints for both sides of the change.
 
 2. Stop database writers and their supervisors, and prevent automatic restarts.
    Stop containers and release their bind mounts in each relevant mount
@@ -192,8 +200,19 @@ mount identity, database recovery/read checks, and a rollback rehearsal. An
 offline `maki check <config.toml> --deep` checks stored structure and checksums; it does not
 decrypt or authenticate the database and cannot replace those checks.
 
-The repository tests cover rejection and canary behavior, not a completed
-rotation of a production provider or a database cutover. Provider credential
-overlap, key retention, actual mount/container restart ordering, backup restore,
-and failure at each transition still require deployment-specific execution
-evidence. This runbook does not close those qualification requirements.
+The [2026-09-19 three-host qualification](credential-rotation-key-migration-validation-2026-09-19.md)
+exercised this stopped sequence with bearer and mTLS client credentials, two
+reference-provider hosts, actual kernel NBD/LVM/XFS, trusted attach/verify,
+SQLite external acknowledgements, and a DB-native restore into a distinct K2
+volume. It also proved old-credential refusal, unchanged superblock/canary
+hashes across the authentication change, provider-side distinct key
+fingerprints, wrong-key
+canary refusal with unchanged superblock/canary hashes, 24-row restart
+readback, and zero invalid slots on both volumes.
+
+That campaign did not rotate endpoint addresses, server certificates or a
+server CA and did not use a commercial provider. Provider credential overlap,
+key retention, target network behavior, actual mount/container restart
+ordering, rollback after the new database accepts writes, and failure at each
+transition still require deployment-specific execution evidence. This runbook
+does not close those qualification requirements.
