@@ -67,6 +67,13 @@ profile and does not define a universal deployment minimum.
 
 The scheduled job runs:
 
+Linux PR, push, and scheduled CI installs the pinned `cargo-audit 0.22.1` and
+runs `cargo audit --deny warnings`. A known vulnerability, unmaintained or
+unsound advisory, or yanked crate therefore fails the job against the fetched
+RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
+from affected 0.23.43 to 0.23.45 after `RUSTSEC-2026-0285`; the focused HTTP/TLS
+package suite and a fresh warning-denying audit passed locally.
+
 | Test identifier | Workload |
 |---|---|
 | `phase0_gate_full` | 10,000 seeded durability-model sequences |

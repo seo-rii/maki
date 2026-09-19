@@ -24,6 +24,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: install pinned RustSec auditor (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: RustSec dependency audit (Linux)
+        if: runner.os == 'Linux'
+        run: cargo audit --deny warnings
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
