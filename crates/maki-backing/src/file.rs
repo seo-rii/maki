@@ -155,6 +155,60 @@ impl BackingFile for RealFile {
         }
     }
 
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hole-punch overflow"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let offset = i64::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hole-punch offset exceeds off_t",
+                )
+            })?;
+            let len = i64::try_from(len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hole-punch length exceeds off_t",
+                )
+            })?;
+            i64::try_from(end).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "hole-punch end exceeds off_t")
+            })?;
+            loop {
+                // SAFETY: the descriptor stays open for the call and the
+                // validated range is non-negative and representable by off_t.
+                let result = unsafe {
+                    libc::fallocate(
+                        self.file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset,
+                        len,
+                    )
+                };
+                if result == 0 {
+                    return Ok(());
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = end;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hole punching is not supported on this platform",
+            ))
+        }
+    }
+
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }

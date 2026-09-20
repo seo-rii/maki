@@ -50,6 +50,16 @@ pub trait BackingFile: Send + Sync {
         Ok(())
     }
 
+    /// Replace an existing byte range with zeroes while allowing the backing
+    /// store to release its physical storage. The file length is unchanged,
+    /// and the change is volatile until `sync_data` succeeds.
+    fn punch_hole(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hole punching is not supported by this backing",
+        ))
+    }
+
     fn len(&self) -> io::Result<u64>;
 
     fn is_empty(&self) -> io::Result<bool> {

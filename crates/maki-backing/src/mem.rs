@@ -71,6 +71,23 @@ impl BackingFile for MemFile {
         Ok(())
     }
 
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| bad_offset("hole-punch overflow"))?;
+        let mut data = self.data.lock();
+        if offset >= data.len() as u64 {
+            return Ok(());
+        }
+        let start = usize::try_from(offset).map_err(bad_offset)?;
+        let end = usize::try_from(end.min(data.len() as u64)).map_err(bad_offset)?;
+        data[start..end].fill(0);
+        Ok(())
+    }
+
     fn len(&self) -> io::Result<u64> {
         Ok(self.data.lock().len() as u64)
     }
