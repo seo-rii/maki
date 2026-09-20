@@ -103,6 +103,20 @@ async fn settle() {
     }
 }
 
+async fn wait_checkpoint(engine: &Engine, sequence: u64) -> maki_core::engine::EngineStats {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = engine.stats().await;
+            if s.checkpoint_sequence == sequence {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background checkpoint did not complete")
+}
+
 // ---------- hard limit ----------
 
 /// Sustained overwrites, no FUA, no explicit FLUSH or checkpoint: the
@@ -171,17 +185,7 @@ async fn worker_checkpoints_when_watermark_is_crossed() {
     for i in 0..n {
         engine.write(off(i % UNITS), &data(1), true).await.unwrap();
     }
-    let s = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let s = engine.stats().await;
-            if s.checkpoint_sequence == n {
-                break s;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("watermark checkpoint did not complete");
+    let s = wait_checkpoint(&engine, n).await;
     assert!(s.checkpoints_total >= 1, "worker did not checkpoint: {s:?}");
     assert!(s.journal_total_bytes < p.journal_high_watermark_bytes);
     assert_eq!(s.checkpoint_sequence, s.durable_sequence);
@@ -201,8 +205,7 @@ async fn worker_checkpoints_on_interval_and_syncs_pending_records() {
     assert_eq!(before.durable_sequence, 0, "not synced yet");
 
     clock.advance(Duration::from_secs(31));
-    settle().await;
-    let after = engine.stats().await;
+    let after = wait_checkpoint(&engine, 1).await;
     assert_eq!(after.durable_sequence, 1, "interval pass syncs the tail");
     assert_eq!(after.checkpoint_sequence, 1, "and applies it");
     assert_eq!(after.checkpoints_total, 1);

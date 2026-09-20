@@ -163,10 +163,16 @@ The volume promotes the overlay after every journal operation and *before* publi
 version of the same unit; checkpointing re-derives the checkpointable set from
 the journal's own boundary rather than trusting earlier promotions.
 
-Checkpointing writes slots, synchronizes data, writes allocation metadata and
-fsyncs the data directory before clearing any dirty flag, commits checkpoint
-state, and only then deletes covered journal segments. A checkpoint that fails
-part-way leaves every incomplete step marked for the retry.
+Checkpointing captures a fixed durable horizon and shared overlay versions under
+the volume lock, then releases that lock while writing and synchronizing slot
+data. The live overlay remains readable, and new journal writes can proceed,
+including writes to the same unit or a new shard. A separate checkpoint gate
+serializes this whole sequence. Publication reacquires the volume lock, updates
+the current allocation metadata, fsyncs the data directory before clearing any
+dirty flag, commits the captured checkpoint horizon, and only then deletes
+covered journal segments and retires overlay versions through that horizon.
+Newer versions remain pending for a later checkpoint. A checkpoint that fails
+part-way retains the journal and incomplete steps needed for retry.
 
 Engine reads, journal writes, FLUSH, checkpoint data/metadata work, recovery in
 `Engine::attach`, and free-space queries run on Tokio's blocking pool. Storage
@@ -174,9 +180,12 @@ locks are acquired asynchronously before dispatch. A dispatched read or write
 keeps its admission charge, and a write keeps its unit locks, until the storage
 operation finishes even if its caller is cancelled. Slow storage therefore does
 not monopolize a Tokio worker or let a later write overtake an unfinished write
-to the same unit. Checkpointing still holds the exclusive volume lock throughout
-its persistence sequence; this scheduling change does not shorten that critical
-section. Clean adapter shutdown also signals and joins the checkpoint worker,
+to the same unit. Checkpoint slot writes and shard syncs run outside the exclusive
+volume lock; preparation and metadata publication still hold it. Cancelling a
+checkpoint caller leaves its owned task running through publication or failure,
+so another checkpoint cannot overtake its data writes. Inline journal reclaim
+uses the same gate and repeats capacity admission after reclaim. Clean adapter
+shutdown also signals and joins the checkpoint worker,
 including an already dispatched free-space query, before releasing the volume.
 Attach-time key-canary metadata I/O remains synchronous.
 

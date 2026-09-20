@@ -23,7 +23,7 @@ use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
 use crate::recovery::{recover_bounded, Recovered, RecoveryError};
-use crate::store::{SlotRead, SlotStore};
+use crate::store::{CheckpointSlotPlan, SlotRead, SlotStore};
 
 #[derive(Debug, Clone)]
 pub struct VolumeOptions {
@@ -47,6 +47,33 @@ pub struct Volume {
     overlay: Overlay,
     ck_ab: AbStore,
     ck_state: CheckpointState,
+}
+
+/// A fixed checkpoint horizon whose slot destinations have been captured
+/// under the volume lock. Its fields are private so only `Volume` can finish
+/// a plan it prepared.
+pub(crate) struct PreparedCheckpoint {
+    base_checkpoint: u64,
+    horizon: u64,
+    items: Vec<(u64, Arc<crate::overlay::OverlayVersion>)>,
+    slots: CheckpointSlotPlan,
+}
+
+pub(crate) struct CompletedCheckpoint(PreparedCheckpoint);
+
+impl PreparedCheckpoint {
+    /// Write and sync only immutable slot data. Allocation metadata,
+    /// checkpoint state, journal reclamation, and overlay retirement remain
+    /// for `Volume::finish_checkpoint` under the volume lock.
+    pub(crate) fn execute(self) -> Result<CompletedCheckpoint, CoreError> {
+        for (index, (_, version)) in self.items.iter().enumerate() {
+            fp("checkpoint.slot_write")?;
+            self.slots
+                .write(index, version.sequence, &version.ciphertext)?;
+        }
+        self.slots.sync_shards()?;
+        Ok(CompletedCheckpoint(self))
+    }
 }
 
 impl Volume {
@@ -280,17 +307,62 @@ impl Volume {
     /// Checkpoint (SPEC §26). Consumes only durable journal records;
     /// `checkpoint_sequence <= durable_sequence` always.
     pub fn checkpoint(&mut self) -> Result<u64, CoreError> {
+        let prepared = self.prepare_checkpoint()?;
+        let completed = prepared.execute()?;
+        self.finish_checkpoint(completed)
+    }
+
+    /// Capture a fixed durable horizon and immutable slot-I/O targets. The
+    /// caller may execute the returned plan without holding the volume lock;
+    /// publication is deferred until `finish_checkpoint`.
+    pub(crate) fn prepare_checkpoint(&mut self) -> Result<PreparedCheckpoint, CoreError> {
         let durable = self.journal.durable_sequence();
         // Never rely on callers having promoted after the last boundary
         // move: the checkpointable set is derived here, from the journal's
         // own durable boundary.
         self.overlay.promote(durable);
-        if durable <= self.ck_state.checkpoint_sequence {
+        let base_checkpoint = self.ck_state.checkpoint_sequence;
+        let items = if durable <= base_checkpoint {
+            Vec::new()
+        } else {
+            self.overlay.collect_durable_shared(durable)
+        };
+        let slots = self
+            .store
+            .checkpoint_slot_plan(items.iter().map(|(unit, _)| *unit))?;
+        Ok(PreparedCheckpoint {
+            base_checkpoint,
+            horizon: durable.max(base_checkpoint),
+            items,
+            slots,
+        })
+    }
+
+    /// Publish a completed fixed-horizon slot plan. The checkpoint gate in
+    /// the engine ensures plans do not overlap; the base check also refuses
+    /// accidental stale-plan publication by another in-crate caller.
+    pub(crate) fn finish_checkpoint(
+        &mut self,
+        completed: CompletedCheckpoint,
+    ) -> Result<u64, CoreError> {
+        let PreparedCheckpoint {
+            base_checkpoint,
+            horizon,
+            items,
+            slots: _,
+        } = completed.0;
+        if self.ck_state.checkpoint_sequence != base_checkpoint {
+            return Err(CoreError::Durability(format!(
+                "stale checkpoint plan based at {base_checkpoint}, current checkpoint is {}",
+                self.ck_state.checkpoint_sequence
+            )));
+        }
+        if horizon <= base_checkpoint {
             // Nothing new is durable; still retire anything a previously
             // interrupted checkpoint applied but could not clean up, and
             // persist metadata the store repaired at open (an adopted shard
             // or an allocation map rebuilt from slot headers).
-            self.overlay.retire(self.ck_state.checkpoint_sequence);
+            self.overlay.retire(base_checkpoint);
             if self.store.has_pending_repairs() {
                 self.store.persist_allocations()?;
             }
@@ -298,29 +370,12 @@ impl Volume {
             // their deletion failed (state was stored first) or was lost in
             // a crash. Reclaim them, or the journal stays at its limit and
             // every write fails with ENOSPC while nothing is "new" (K-02).
-            if self
-                .journal
-                .delete_covered(self.ck_state.checkpoint_sequence)?
-                > 0
-            {
+            if self.journal.delete_covered(base_checkpoint)? > 0 {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
             }
             self.sanitize();
-            return Ok(self.ck_state.checkpoint_sequence);
-        }
-        let items = self.overlay.collect_durable_shared(durable);
-
-        // 1. write main slots
-        for (unit, version) in &items {
-            fp("checkpoint.slot_write")?;
-            self.store
-                .write_slot(*unit, version.sequence, &version.ciphertext)?;
-        }
-        // 2. fdatasync affected data shards
-        for shard in self.store.shards_of_units(items.iter().map(|(u, _)| u)) {
-            fp("checkpoint.shard_sync")?;
-            self.store.sync_shard_data(shard)?;
+            return Ok(base_checkpoint);
         }
         // 3. update + sync allocation metadata
         for (unit, _) in &items {
@@ -331,19 +386,19 @@ impl Volume {
         //    the durable store succeeds)
         fp("checkpoint.state_store")?;
         let mut new_state = self.ck_state.clone();
-        new_state.checkpoint_sequence = durable;
+        new_state.checkpoint_sequence = horizon;
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
         // 5. delete completed journal segments
-        self.journal.delete_covered(durable)?;
+        self.journal.delete_covered(horizon)?;
         // 6. fsync journal directory
         fp("checkpoint.dirsync")?;
         self.backing.sync_dir(layout::JOURNAL_DIR)?;
 
-        self.overlay.retire(durable);
+        self.overlay.retire(horizon);
         self.sanitize();
-        Ok(durable)
+        Ok(horizon)
     }
 
     /// Cross-component invariants (SPEC §12, §26): the checkpoint never

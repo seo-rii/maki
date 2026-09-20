@@ -189,9 +189,18 @@ impl Fixture {
 
 #[test]
 fn status_and_metrics_report_cached_sequences_while_drain_sync_is_stuck() {
+    check_drain_monitoring(false);
+}
+
+#[test]
+fn status_and_metrics_report_current_sequences_during_checkpoint_data_sync() {
+    check_drain_monitoring(true);
+}
+
+fn check_drain_monitoring(fua: bool) {
     let fixture = Fixture::new();
     runtime()
-        .block_on(fixture.engine.write(0, &[0x51; 4096], true))
+        .block_on(fixture.engine.write(0, &[0x51; 4096], fua))
         .unwrap();
     let release = fixture.backing.sync.arm();
     let control = fixture.control.clone();
@@ -206,28 +215,33 @@ fn status_and_metrics_report_cached_sequences_while_drain_sync_is_stuck() {
     monitor.join().unwrap();
     let (status, metrics) = during.expect("monitoring waited for blocked drain storage I/O");
     assert_eq!(status["io_state"], "draining", "{status}");
-    assert_eq!(
-        status["state"], "busy",
-        "must not claim a stuck volume is ready: {status}"
-    );
     assert_eq!(status["last_observed_state"], "ready");
-    assert_eq!(status["observability"]["volume_snapshot"], "cached");
-    assert!(
-        status["observability"]["volume_snapshot_age_ms"]
-            .as_u64()
-            .unwrap()
-            >= 2000
-    );
-    assert_eq!(
-        status["durable_sequence"], 1,
-        "cached data must come from a completed write"
-    );
-    assert_eq!(metrics["maki_journal_durable_sequence"], 1);
-    assert_eq!(metrics["maki_volume_busy"], 1);
-    assert!(
-        metrics["maki_volume_state"].is_null(),
-        "busy must not be a ready gauge"
-    );
+    if fua {
+        // FLUSH is already satisfied, so the gate pauses checkpoint shard
+        // sync. That phase leaves volume readable with a current snapshot.
+        assert_eq!(status["state"], "ready");
+        assert_eq!(status["observability"]["volume_snapshot"], "current");
+        assert_eq!(status["observability"]["volume_snapshot_age_ms"], 0);
+        assert_eq!(metrics["maki_volume_busy"], 0);
+        assert_eq!(metrics["maki_volume_state"], 1);
+    } else {
+        // An unsynced write instead stalls the journal FLUSH, which still
+        // holds volume exclusively. Monitoring must use its cached snapshot.
+        assert_eq!(status["state"], "busy", "{status}");
+        assert_eq!(status["observability"]["volume_snapshot"], "cached");
+        assert!(
+            status["observability"]["volume_snapshot_age_ms"]
+                .as_u64()
+                .unwrap()
+                >= 2000
+        );
+        assert_eq!(metrics["maki_volume_busy"], 1);
+        assert!(metrics["maki_volume_state"].is_null());
+    }
+    let durable = u64::from(fua);
+    assert_eq!(status["durable_sequence"], durable);
+    assert_eq!(metrics["maki_journal_durable_sequence"], durable);
+    assert_eq!(status["checkpoint_sequence"], 0);
     let after = runtime().block_on(fixture.control.status());
     assert_eq!(after["state"], "ready");
     assert_eq!(after["io_state"], "drained");

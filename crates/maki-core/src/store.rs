@@ -63,6 +63,58 @@ struct Shard {
     map_stored: bool,
 }
 
+pub(crate) struct CheckpointSlotTarget {
+    unit: u64,
+    offset: u64,
+    data: Arc<dyn BackingFile>,
+}
+
+pub(crate) struct CheckpointSlotPlan {
+    targets: Vec<CheckpointSlotTarget>,
+    shards: Vec<Arc<dyn BackingFile>>,
+    max_ciphertext_size: usize,
+}
+
+impl CheckpointSlotPlan {
+    pub(crate) fn write(
+        &self,
+        index: usize,
+        write_sequence: u64,
+        ciphertext: &[u8],
+    ) -> Result<(), CoreError> {
+        if ciphertext.len() > self.max_ciphertext_size {
+            return Err(CoreError::Corrupt(format!(
+                "ciphertext {} exceeds max {}",
+                ciphertext.len(),
+                self.max_ciphertext_size
+            )));
+        }
+        let target = self.targets.get(index).ok_or_else(|| {
+            CoreError::Corrupt("checkpoint slot plan does not match its snapshot".into())
+        })?;
+        let header = SlotHeader {
+            unit_index: target.unit,
+            write_sequence,
+            ciphertext_len: ciphertext.len() as u32,
+            flags: 0,
+            ciphertext_crc: crc32fast::hash(ciphertext),
+        };
+        let mut buf = Vec::with_capacity(64 + ciphertext.len());
+        buf.extend_from_slice(&header.encode());
+        buf.extend_from_slice(ciphertext);
+        target.data.write_at(target.offset, &buf)?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_shards(&self) -> Result<(), CoreError> {
+        for shard in &self.shards {
+            fp("checkpoint.shard_sync")?;
+            shard.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
 pub struct SlotStore {
     backing: Arc<dyn Backing>,
     geometry: Geometry,
@@ -126,6 +178,39 @@ fn probe_shard(geometry: &Geometry, shard: &Shard, shard_idx: u64) -> Result<Vec
 }
 
 impl SlotStore {
+    /// Capture immutable positional-I/O targets for already reserved units.
+    /// A journal record is never published before `reserve_slot`, so a
+    /// missing shard here is an internal/on-disk contradiction rather than
+    /// an opportunity to create metadata outside the volume lock.
+    pub(crate) fn checkpoint_slot_plan(
+        &self,
+        units: impl IntoIterator<Item = u64>,
+    ) -> Result<CheckpointSlotPlan, CoreError> {
+        let mut targets = Vec::new();
+        let mut shard_files = std::collections::BTreeMap::new();
+        for unit in units {
+            let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
+            let shard = self.shards.get(&shard_idx).ok_or_else(|| {
+                CoreError::Corrupt(format!(
+                    "checkpoint unit {unit} has no reserved shard {shard_idx}"
+                ))
+            })?;
+            targets.push(CheckpointSlotTarget {
+                unit,
+                offset: self.geometry.slot_offset(in_shard),
+                data: shard.data.clone(),
+            });
+            shard_files
+                .entry(shard_idx)
+                .or_insert_with(|| shard.data.clone());
+        }
+        Ok(CheckpointSlotPlan {
+            targets,
+            shards: shard_files.into_values().collect(),
+            max_ciphertext_size: self.geometry.max_ciphertext_size as usize,
+        })
+    }
+
     /// Open the store, loading catalog and validating every cataloged
     /// shard's allocation metadata (SPEC §27 "validate allocation metadata").
     /// Data files the catalog copy does not list are adopted (see module
