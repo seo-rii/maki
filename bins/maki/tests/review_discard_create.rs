@@ -32,10 +32,17 @@ key = {{ source = "env", name = "discard-create-key" }}
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
 [backing]
-root = "{}"
+root = {}
 "#,
-        root.display()
+        serde_json::to_string(root.to_str().unwrap()).unwrap()
     )
+}
+
+#[test]
+fn fixture_preserves_windows_path_separators() {
+    let root = std::path::Path::new(r"C:\Users\maki\volume");
+    let parsed = maki_format::config::parse_config(&config(root)).unwrap();
+    assert_eq!(parsed.backing.root, root.to_str().unwrap());
 }
 
 fn field<'a>(output: &'a str, name: &str) -> &'a str {

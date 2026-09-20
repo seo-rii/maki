@@ -19,7 +19,7 @@ crypto_compatibility_id = "test-profile-v1"
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4104
 [backing]
-root = "{}"
+root = {}
 journal_emergency_reserve_bytes = "0B"
 [nbd]
 minimum_io = 4096
@@ -27,11 +27,20 @@ preferred_io = 4096
 maximum_io = "8KiB"
 threads = 2
 [control]
-socket = "{}"
+socket = {}
 "#,
-        root.display(),
-        socket.display()
+        serde_json::to_string(root.to_str().unwrap()).unwrap(),
+        serde_json::to_string(socket.to_str().unwrap()).unwrap()
     )
+}
+
+#[test]
+fn fixture_preserves_windows_path_separators() {
+    let root = std::path::Path::new(r"C:\Users\maki\volume");
+    let socket = std::path::Path::new(r"C:\Users\maki\control.sock");
+    let parsed = maki_format::config::parse_config(&config(root, socket)).unwrap();
+    assert_eq!(parsed.backing.root, root.to_str().unwrap());
+    assert_eq!(parsed.control.socket.as_deref(), socket.to_str());
 }
 
 struct Fixture {
