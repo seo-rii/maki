@@ -193,6 +193,49 @@ class HostContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.host.validate_ready(invalid, ready["fs_uuid"])
 
+    def test_discard_profile_requires_trim_and_an_independent_complete_manifest(self):
+        ready = {"event": "ready", "provider": "local-aes-gcm-siv", "can_flush": True,
+                 "can_fua": True, "can_trim": True,
+                 "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
+                 "witness_service": "active", "graceful_stop_witness": "absent"}
+        self.host.validate_ready(ready, None, "v3-discard")
+        invalid = dict(ready, can_trim=False)
+        with self.assertRaisesRegex(ValueError, "TRIM"):
+            self.host.validate_ready(invalid, None, "v3-discard")
+
+        expected = self.host.expected_discard_manifest(0)
+        self.assertEqual(expected["trim"], [
+            {"offset": 0, "length": 4096},
+            {"offset": 4096, "length": 4096},
+        ])
+        self.assertNotEqual(expected["write"][0]["sha256"],
+                            expected["rewrite"]["sha256"])
+        final = {row["offset"]: row for row in expected["final"]}
+        self.assertEqual(final[4096]["sha256"], self.host.ZERO_SHA256)
+        self.assertEqual(final[0], expected["rewrite"])
+        event = {"event": "ack", "command": "discard-0", "cycle": 0,
+                 "mode": "flush", "profile": "v3-discard", "boot_id": self.boot_id,
+                 "manifest": expected}
+        self.host.validate_ack(event, 0, "v3-discard")
+        for field in ("write", "trim", "rewrite", "final"):
+            invalid = json.loads(json.dumps(event))
+            invalid["manifest"][field] = []
+            with self.assertRaises(ValueError):
+                self.host.validate_ack(invalid, 0, "v3-discard")
+
+        self.host.record_ack(self.ledger, event, 0, "v3-discard")
+        self.assertEqual(self.host.load_ledger(self.ledger, "v3-discard"), event)
+
+    def test_discard_profile_is_explicitly_forwarded_to_guest(self):
+        args = types.SimpleNamespace(
+            gcloud="gcloud", project="test-project", zone="asia-northeast3-a",
+            instance="maki-reset-test", guest_agent="/opt/maki/gcp-reset-guest.py",
+            guest_config="/mnt/maki-data/config.toml", guest_plugin="/opt/maki/libmaki_nbdkit.so",
+            connect_timeout=9, profile="v3-discard",
+        )
+        command = self.host.ssh_command(args, self.token, 0, False)
+        self.assertIn("--profile v3-discard", command[command.index("--command") + 1])
+
     def test_reset_requires_running_same_resources_after_exit_zero(self):
         args = types.SimpleNamespace(timeout=30)
         baseline = {"instance_id": "101"}
@@ -310,7 +353,52 @@ class GuestContracts(unittest.TestCase):
         client = object.__new__(self.guest.Nbd)
         client.can_flush = True
         client.can_fua = True
-        self.assertEqual(self.guest.capabilities(client), {"can_flush": True, "can_fua": True})
+        client.can_trim = True
+        self.assertEqual(self.guest.capabilities(client), {
+            "can_flush": True, "can_fua": True
+        })
+        self.assertEqual(self.guest.capabilities(client, "v3-discard"), {
+            "can_flush": True, "can_fua": True, "can_trim": True
+        })
+
+    def test_discard_manifest_matches_host_oracle_and_barriers_every_operation(self):
+        for cycle, mode in ((0, "flush"), (1, "fua")):
+            client = mock.Mock()
+            manifest = self.guest.discard_barrier(client, cycle, mode)
+            self.assertEqual(manifest, self.host.expected_discard_manifest(cycle))
+            self.assertEqual(client.write.call_count, 17)
+            self.assertEqual(client.trim.call_args_list, [
+                mock.call(0, 4096, fua=mode == "fua"),
+                mock.call(4096, 4096, fua=mode == "fua"),
+            ])
+            self.assertEqual(client.flush.call_count, 3 * int(mode == "flush"))
+            first = client.write.call_args_list[0]
+            rewrite = client.write.call_args_list[-1]
+            self.assertEqual(first.args[0], 0)
+            self.assertEqual(rewrite.args[0], 0)
+            self.assertNotEqual(first.args[1], rewrite.args[1])
+
+    def test_failed_trim_or_rewrite_barrier_does_not_complete(self):
+        for method, failure_call in (("trim", 1), ("write", 17), ("flush", 2)):
+            client = mock.Mock()
+            getattr(client, method).side_effect = [None] * (failure_call - 1) + [RuntimeError("failed")]
+            with self.assertRaises(RuntimeError):
+                self.guest.discard_barrier(client, 0, "flush")
+
+    def test_discard_readback_reports_rewrite_and_persistent_zero(self):
+        events = []
+        client = mock.Mock()
+        expected = self.host.expected_discard_manifest(1)["final"]
+        blocks = {row["offset"]: bytes(4096) if row["offset"] == 4096
+                  else self.guest.discard_final_block(1, row["offset"])
+                  for row in expected}
+        client.read.side_effect = blocks.__getitem__
+        args = argparse.Namespace(cycle=2, verify_only=True, profile="v3-discard")
+        self.guest.execute_cycle(args, client,
+                                 lambda event, **fields: events.append((event, fields)))
+        self.assertEqual(events[0][0], "readback")
+        self.assertEqual(events[0][1]["manifest"], expected)
+        self.assertEqual(events[1], ("verified", {"generation": 1, "count": 16}))
 
     def test_active_shutdown_witness_and_absent_ledger_are_required(self):
         path = pathlib.Path("/mnt/maki-data/graceful-stop.jsonl")

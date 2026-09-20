@@ -53,6 +53,20 @@ def payload(cycle, index):
     return hashlib.sha256(f"maki-gcp-reset-v1:{cycle}:{index}".encode()).digest() * 128
 
 
+def rewrite_payload(cycle):
+    mode_for_cycle(cycle)
+    return hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{cycle}".encode()).digest() * 128
+
+
+def discard_final_block(cycle, offset):
+    index = index_for_offset(offset)
+    if offset == 0:
+        return rewrite_payload(cycle)
+    if offset == 4096:
+        return bytes(4096)
+    return payload(cycle, index)
+
+
 def manifest(cycle, blocks=None):
     rows = []
     for index in range(16):
@@ -73,8 +87,10 @@ class Nbd:
             "create": (handle, []), "get_error": (ctypes.c_char_p, []),
             "connect_unix": (ctypes.c_int, [handle, ctypes.c_char_p]),
             "can_fua": (ctypes.c_int, [handle]), "can_flush": (ctypes.c_int, [handle]),
+            "can_trim": (ctypes.c_int, [handle]),
             "pwrite": (ctypes.c_int, [handle, pointer, size, offset, flags]),
             "pread": (ctypes.c_int, [handle, pointer, size, offset, flags]),
+            "trim": (ctypes.c_int, [handle, size, offset, flags]),
             "flush": (ctypes.c_int, [handle, flags]), "close": (None, [handle]),
         }
         for name, (result, arguments) in signatures.items():
@@ -85,6 +101,7 @@ class Nbd:
         self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(socket_path)))
         self.can_fua = self.lib.nbd_can_fua(self.handle) == 1
         self.can_flush = self.lib.nbd_can_flush(self.handle) == 1
+        self.can_trim = self.lib.nbd_can_trim(self.handle) == 1
         ensure(self.can_fua, "native FUA unavailable")
         ensure(self.can_flush, "FLUSH unavailable")
 
@@ -100,6 +117,9 @@ class Nbd:
         buffer = ctypes.create_string_buffer(4096)
         self.check(self.lib.nbd_pread(self.handle, buffer, 4096, offset, 0))
         return buffer.raw
+
+    def trim(self, offset, length, fua=False):
+        self.check(self.lib.nbd_trim(self.handle, length, offset, int(fua)))
 
     def flush(self):
         self.check(self.lib.nbd_flush(self.handle, 0))
@@ -124,8 +144,30 @@ def barrier(client, cycle, mode):
     return records
 
 
-def capabilities(client):
-    return {"can_flush": client.can_flush is True, "can_fua": client.can_fua is True}
+def discard_barrier(client, cycle, mode):
+    ensure(mode == mode_for_cycle(cycle), "wrong durability barrier")
+    writes = barrier(client, cycle, mode)
+    trims = [{"offset": 0, "length": 4096}, {"offset": 4096, "length": 4096}]
+    for row in trims:
+        client.trim(row["offset"], row["length"], fua=mode == "fua")
+    if mode == "flush":
+        client.flush()
+    block = rewrite_payload(cycle)
+    client.write(0, block, fua=mode == "fua")
+    if mode == "flush":
+        client.flush()
+    rewrite = {"offset": 0, "length": 4096,
+               "sha256": hashlib.sha256(block).hexdigest()}
+    final = manifest(cycle, [discard_final_block(cycle, offset_for_index(index))
+                             for index in range(16)])
+    return {"write": writes, "trim": trims, "rewrite": rewrite, "final": final}
+
+
+def capabilities(client, profile="v2"):
+    result = {"can_flush": client.can_flush is True, "can_fua": client.can_fua is True}
+    if profile == "v3-discard":
+        result["can_trim"] = client.can_trim is True
+    return result
 
 
 def run_output(command, timeout=10):
@@ -157,17 +199,25 @@ def wait_for_reset():
 
 
 def execute_cycle(args, client, emit):
+    profile = getattr(args, "profile", "v2")
     if args.cycle:
         generation = args.cycle - 1
         blocks = [client.read(offset_for_index(index)) for index in range(16)]
-        emit("readback", generation=generation, records=manifest(generation, blocks))
+        field = {"manifest": manifest(generation, blocks)} if profile == "v3-discard" \
+            else {"records": manifest(generation, blocks)}
+        emit("readback", generation=generation, **field)
         emit("verified", generation=generation, count=16)
     if args.verify_only:
         ensure(args.cycle > 0, "verify-only requires a prior generation")
         return
     mode = mode_for_cycle(args.cycle)
-    records = barrier(client, args.cycle, mode)
-    emit("ack", command=f"write-{args.cycle}", mode=mode, records=records)
+    if profile == "v3-discard":
+        result = discard_barrier(client, args.cycle, mode)
+        emit("ack", command=f"discard-{args.cycle}", mode=mode,
+             profile=profile, manifest=result)
+    else:
+        records = barrier(client, args.cycle, mode)
+        emit("ack", command=f"write-{args.cycle}", mode=mode, records=records)
     wait_for_reset()
 
 
@@ -229,6 +279,7 @@ def main():
     parser.add_argument("--nbdkit", default="nbdkit")
     parser.add_argument("--ready-timeout", type=float, default=90)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--profile", choices=("v2", "v3-discard"), default="v2")
     args = parser.parse_args()
     ensure(re.fullmatch(r"[0-9a-f]{32}", args.token) is not None, "invalid token")
     mode_for_cycle(args.cycle)
@@ -257,7 +308,7 @@ def main():
     try:
         child, log, socket_path = run_nbdkit(args, runtime)
         client = Nbd(socket_path)
-        features = capabilities(client)
+        features = capabilities(client, args.profile)
         emit("ready", provider="local-aes-gcm-siv", config=str(config),
              kernel=os.uname().release, fs_uuid=fs_uuid, **features, **witness)
         execute_cycle(args, client, emit)

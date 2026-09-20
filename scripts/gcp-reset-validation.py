@@ -27,6 +27,7 @@ PREFIX = b"MAKI_GCP_RESET_V1 "
 MAX_FRAME = 16384
 MAX_OUTPUT = 8 << 20
 BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+ZERO_SHA256 = hashlib.sha256(bytes(4096)).hexdigest()
 
 
 def mode_for_cycle(cycle):
@@ -44,6 +45,20 @@ def expected_records(cycle):
         records.append({"offset": offset, "length": 4096,
                         "sha256": hashlib.sha256(block).hexdigest()})
     return records
+
+
+def expected_discard_manifest(cycle):
+    writes = expected_records(cycle)
+    rewrite_block = hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{cycle}".encode()).digest() * 128
+    rewrite = {"offset": 0, "length": 4096,
+               "sha256": hashlib.sha256(rewrite_block).hexdigest()}
+    final = [dict(row) for row in writes]
+    final[0] = rewrite
+    final[8] = {"offset": 4096, "length": 4096, "sha256": ZERO_SHA256}
+    return {"write": writes,
+            "trim": [{"offset": 0, "length": 4096},
+                     {"offset": 4096, "length": 4096}],
+            "rewrite": rewrite, "final": final}
 
 
 def validate_boot_id(value):
@@ -67,11 +82,13 @@ def require_unique_boot(seen, current):
     seen.add(current)
 
 
-def validate_ready(ready, expected_fs_uuid):
+def validate_ready(ready, expected_fs_uuid, profile="v2"):
     if (not isinstance(ready, dict) or ready.get("event") != "ready"
             or ready.get("provider") != "local-aes-gcm-siv"
             or ready.get("can_flush") is not True or ready.get("can_fua") is not True):
         raise ValueError("guest did not prove native provider FLUSH and FUA support")
+    if profile == "v3-discard" and ready.get("can_trim") is not True:
+        raise ValueError("guest did not prove native TRIM support")
     if (ready.get("witness_service") != "active"
             or ready.get("graceful_stop_witness") != "absent"):
         raise ValueError("graceful shutdown witness invalidated hard-reset evidence")
@@ -107,21 +124,27 @@ def validate_records(records, expected):
         raise ValueError("record manifest mismatch, missing, reordered, or duplicated")
 
 
-def validate_ack(event, cycle):
+def validate_ack(event, cycle, profile="v2"):
     if not isinstance(event, dict):
         raise ValueError("ACK must be an object")
     validate_boot_id(event.get("boot_id"))
-    if (event.get("event") != "ack" or event.get("command") != f"write-{cycle}"
+    command = f"discard-{cycle}" if profile == "v3-discard" else f"write-{cycle}"
+    if (event.get("event") != "ack" or event.get("command") != command
             or type(event.get("cycle")) is not int or event["cycle"] != cycle
             or event.get("mode") != mode_for_cycle(cycle)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
-    validate_records(event.get("records"), expected_records(cycle))
+    if profile == "v3-discard":
+        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle):
+            raise ValueError("discard manifest mismatch, missing, reordered, or duplicated")
+    else:
+        validate_records(event.get("records"), expected_records(cycle))
 
 
-def record_ack(ledger, event, cycle):
-    validate_ack(event, cycle)
-    record = {key: event[key] for key in
-              ("event", "command", "cycle", "mode", "boot_id", "records")}
+def record_ack(ledger, event, cycle, profile="v2"):
+    validate_ack(event, cycle, profile)
+    keys = ("event", "command", "cycle", "mode", "boot_id", "profile", "manifest") \
+        if profile == "v3-discard" else ("event", "command", "cycle", "mode", "boot_id", "records")
+    record = {key: event[key] for key in keys}
     descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
@@ -134,7 +157,7 @@ def record_ack(ledger, event, cycle):
         os.close(parent)
 
 
-def load_ledger(ledger):
+def load_ledger(ledger, profile="v2"):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ACK ledger")
     raw = ledger.read_text(encoding="utf-8")
@@ -147,7 +170,7 @@ def load_ledger(ledger):
             event = json.loads(line)
         except json.JSONDecodeError as error:
             raise ValueError("invalid ACK ledger") from error
-        validate_ack(event, cycle)
+        validate_ack(event, cycle, profile)
         require_unique_boot(seen_boots, event["boot_id"])
         latest = event
     return latest
@@ -258,6 +281,9 @@ def ssh_command(args, token, cycle, verify_only):
     guest = ["sudo", "-n", getattr(args, "guest_python", "python3"), args.guest_agent,
              "--token", token, "--cycle", str(cycle), "--config", args.guest_config,
              "--plugin", args.guest_plugin]
+    profile = getattr(args, "profile", "v2")
+    if profile != "v2":
+        guest.extend(["--profile", profile])
     if verify_only:
         guest.append("--verify-only")
     return [args.gcloud, "compute", "ssh", args.instance,
@@ -436,7 +462,7 @@ def campaign(args):
     result = {"passed": False, "fault_scope": "whole GCE instance reset",
               "instance": args.instance, "project": args.project, "zone": args.zone,
               "data_disk": args.data_disk, "resource_identity": baseline,
-              "cycles": args.cycles, "token": token, "boots": []}
+              "cycles": args.cycles, "profile": args.profile, "token": token, "boots": []}
     seen_boots = set()
     fs_uuid = None
     try:
@@ -449,7 +475,7 @@ def campaign(args):
             entry["ready"] = ready
             current_boot = ready["boot_id"]
             require_unique_boot(seen_boots, current_boot)
-            fs_uuid = validate_ready(ready, fs_uuid)
+            fs_uuid = validate_ready(ready, fs_uuid, args.profile)
             current_resources = resource_identity(args, args.timeout)
             validate_resource_identity(baseline, current_resources)
             try:
@@ -457,8 +483,10 @@ def campaign(args):
                     readback = process.expect("readback", args.timeout)
                     if readback.get("generation") != cycle - 1:
                         raise ValueError("guest read back the wrong generation")
-                    expected = expected_records(cycle - 1)
-                    verify_readbacks(expected, readback.get("records"))
+                    expected = (expected_discard_manifest(cycle - 1)["final"]
+                                if args.profile == "v3-discard" else expected_records(cycle - 1))
+                    actual = readback.get("manifest") if args.profile == "v3-discard" else readback.get("records")
+                    verify_readbacks(expected, actual)
                     verified = process.expect("verified", args.timeout)
                     if verified.get("generation") != cycle - 1 or verified.get("count") != 16:
                         raise ValueError("incomplete readback verification")
@@ -470,14 +498,14 @@ def campaign(args):
                     ack = process.expect("ack", args.timeout)
                     if ack["boot_id"] != current_boot:
                         raise ValueError("ACK boot identity changed")
-                    record_ack(ledger, ack, cycle)
+                    record_ack(ledger, ack, cycle, args.profile)
                     entry["acked_units"] = 16
                     entry["mode"] = mode_for_cycle(cycle)
                     entry["reset_ssh_status"] = cut_instance(args, process, baseline)
             finally:
                 process.close()
             save_json(args.output / "results.json", result)
-        latest = load_ledger(ledger)
+        latest = load_ledger(ledger, args.profile)
         if latest["cycle"] != args.cycles - 1:
             raise ValueError("ACK ledger did not cover every reset cycle")
         result["offline_deep_check"] = run_offline_check(args, args.timeout)
@@ -501,6 +529,7 @@ def main():
     parser.add_argument("--data-disk", required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--cycles", type=int, default=4)
+    parser.add_argument("--profile", choices=("v2", "v3-discard"), default="v2")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--connect-timeout", type=int, default=10)
     parser.add_argument("--gcloud", default="gcloud")
