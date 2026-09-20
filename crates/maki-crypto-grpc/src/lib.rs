@@ -290,15 +290,15 @@ impl CryptoProvider for GrpcCryptoProvider {
             .iter()
             .map(|i| WireItem {
                 unit_index: i.unit_index,
-                data: i.data.expose().to_vec(),
+                data: i.data.duplicate(),
             })
             .collect();
         let out = self.call(self.encrypt_path.clone(), context, wire).await?;
         Ok(out
             .into_iter()
-            .map(|mut i| CiphertextUnit {
+            .map(|i| CiphertextUnit {
                 unit_index: i.unit_index,
-                data: std::mem::take(&mut i.data),
+                data: i.data.into_vec(),
             })
             .collect())
     }
@@ -312,15 +312,15 @@ impl CryptoProvider for GrpcCryptoProvider {
             .iter()
             .map(|i| WireItem {
                 unit_index: i.unit_index,
-                data: i.data.clone(),
+                data: SecretBuffer::from_slice(&i.data),
             })
             .collect();
         let out = self.call(self.decrypt_path.clone(), context, wire).await?;
         Ok(out
             .into_iter()
-            .map(|mut i| PlaintextUnit {
+            .map(|i| PlaintextUnit {
                 unit_index: i.unit_index,
-                data: SecretBuffer::from_vec(std::mem::take(&mut i.data)),
+                data: i.data,
             })
             .collect())
     }

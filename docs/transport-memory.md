@@ -131,8 +131,9 @@ WebSocket package passed 49 tests and all-targets strict Clippy on 2026-09-12.
 
 ## gRPC provider-owned messages
 
-The provider uses private protobuf items that erase their full data capacity
-on Drop, `Message::clear`, and replacement of the singular bytes field. The
+The provider uses private protobuf items backed by `SecretBuffer` that erase
+their full data capacity on Drop, `Message::clear`, and replacement of the
+singular bytes field. The
 replacement path erases the old allocation before validating or reserving
 space for new data, and copies directly from the decoder input. Each child
 owns this protection even when decoding fails before it joins its parent.
@@ -145,13 +146,18 @@ to the caller. Private Debug output redacts bytes. Public `CryptoItem`,
 wire encoding; external callers using those public structs are responsible
 for their own allocation lifetime.
 
-The private item is a zeroizing vector, not a page-locked `SecretBuffer`
-until a successful decrypt transfers it. Tonic's encoded/decoded buffers and
-HTTP/TLS buffers remain separate allocations. These changes do not establish
-complete transport zeroization, page locking, or a total resident-memory cap.
+The private item is page-lock-capable before its first decoded byte is written,
+and retains that owner through rejection, cancellation and successful transfer.
+Tonic's encoded/decoded buffers and HTTP/TLS buffers remain separate allocations.
+These changes do not establish complete transport zeroization, page locking, or
+a total resident-memory cap.
 
 Fourteen focused regressions cover full-capacity deallocation, duplicate and
 malformed fields, partial nested decoding, public wire compatibility, actual
 tonic encoding and cancellation before encoding or while awaiting trailers,
 and real loopback RPC rejection/success. The complete gRPC package passed
 31 tests and all-targets strict Clippy on 2026-09-12.
+
+The 2026-09-20 page-lock ownership follow-up passed all 32 gRPC package tests
+and strict all-target Clippy in isolation from the separate TLS feature.
+Evidence: `~/logs/maki-grpc-memory-20260920T085835Z/` (`exit.status` 0).

@@ -76,7 +76,7 @@ fn watched_item() -> WireItem {
     WATCHED.store(data.as_ptr() as usize, Ordering::SeqCst);
     WireItem {
         unit_index: 7,
-        data,
+        data: SecretBuffer::from_vec(data),
     }
 }
 
@@ -123,7 +123,6 @@ fn message_clear_erases_before_a_later_reallocation() {
     item.clear();
     assert!(item.data.is_empty());
     assert_eq!(item.unit_index, 0);
-    item.data.reserve(2048);
     assert_zeroized();
 }
 
@@ -139,7 +138,7 @@ fn duplicate_bytes_field_erases_old_allocation_before_growing() {
     item.merge(Bytes::from(replacement)).unwrap();
     assert_zeroized();
     assert_eq!(item.unit_index, 9);
-    assert!(item.data.iter().all(|byte| *byte == 0x35));
+    assert!(item.data.expose().iter().all(|byte| *byte == 0x35));
     assert_eq!(item.data.len(), 2048);
 }
 
@@ -150,7 +149,6 @@ fn malformed_replacement_erases_the_previous_bytes_field() {
     for malformed in [&[0x12, 0x80][..], &[0x12, 10, 1][..], &[0x10, 1][..]] {
         let mut item = watched_item();
         assert!(item.merge(malformed).is_err());
-        item.data.reserve(2048);
         assert_zeroized();
     }
 }
@@ -177,7 +175,7 @@ fn protected_messages_preserve_the_public_wire_encoding() {
     let frozen = [0x08, 0xac, 0x02, 0x12, 0x03, 0x00, 0x7f, 0xff];
     let item = WireItem::decode(&frozen[..]).unwrap();
     assert_eq!(item.unit_index, 300);
-    assert_eq!(item.data, [0x00, 0x7f, 0xff]);
+    assert_eq!(item.data.expose(), [0x00, 0x7f, 0xff]);
     assert_eq!(item.encode_to_vec(), frozen);
     assert_eq!(item.encoded_len(), frozen.len());
 
@@ -251,11 +249,27 @@ fn partial_nested_decode_failure_erases_the_item_before_parent_push() {
 }
 
 #[test]
+fn decoded_provider_payload_uses_secret_buffer_page_locking() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    maki_crypto::secret::set_page_locking(true);
+    let encoded = super::CryptoItem {
+        unit_index: 7,
+        data: vec![0xC7; 8209],
+    }
+    .encode_to_vec();
+    let item = WireItem::decode(encoded.as_slice()).unwrap();
+    assert!(item.data.is_page_locked());
+    assert!(item.data.expose().iter().all(|byte| *byte == 0xC7));
+    drop(item);
+    maki_crypto::secret::set_page_locking(false);
+}
+
+#[test]
 fn successful_transfer_keeps_allocation_until_secret_buffer_drop() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut item = watched_item();
-    let address = item.data.as_ptr();
-    let secret = SecretBuffer::from_vec(std::mem::take(&mut item.data));
+    let address = item.data.expose().as_ptr();
+    let secret = std::mem::replace(&mut item.data, SecretBuffer::zeroed(0));
     drop(item);
     assert!(!RELEASED.load(Ordering::SeqCst));
     assert_eq!(secret.expose().as_ptr(), address);

@@ -5,21 +5,23 @@
 //! before adding it to a request/response. A parent-only Drop misses that child.
 //! Tonic's encoding, decoding and HTTP/TLS buffers remain separate allocations.
 
+use maki_crypto::SecretBuffer;
 use prost::bytes::{Buf, BufMut};
 use prost::encoding::{self, DecodeContext, WireType};
 use prost::{DecodeError, Message};
-use zeroize::Zeroize;
 
-#[derive(Default, PartialEq)]
+#[derive(PartialEq)]
 pub(super) struct WireItem {
     pub(super) unit_index: u64,
-    pub(super) data: Vec<u8>,
+    pub(super) data: SecretBuffer,
 }
 
-impl Drop for WireItem {
-    fn drop(&mut self) {
-        // Vec::zeroize also erases initialized data in spare capacity.
-        self.data.zeroize();
+impl Default for WireItem {
+    fn default() -> Self {
+        Self {
+            unit_index: 0,
+            data: SecretBuffer::zeroed(0),
+        }
     }
 }
 
@@ -39,7 +41,9 @@ impl Message for WireItem {
             encoding::uint64::encode(1, &self.unit_index, buf);
         }
         if !self.data.is_empty() {
-            encoding::bytes::encode(2, &self.data, buf);
+            encoding::encode_key(2, WireType::LengthDelimited, buf);
+            encoding::encode_varint(self.data.len() as u64, buf);
+            buf.put_slice(self.data.expose());
         }
     }
 
@@ -56,17 +60,17 @@ impl Message for WireItem {
                 // A repeated singular bytes field replaces its prior value.
                 // Erase BEFORE validation or growth: a bad replacement also
                 // retires the old secret, and realloc must never abandon it.
-                self.data.zeroize();
+                self.data = SecretBuffer::zeroed(0);
                 encoding::check_wire_type(WireType::LengthDelimited, wire_type)?;
                 let len = encoding::decode_varint(buf)?;
                 if len > buf.remaining() as u64 {
                     return Err(DecodeError::new("buffer underflow"));
                 }
                 // The comparison bounds the conversion by an existing usize.
-                self.data.resize(len as usize, 0);
+                self.data = SecretBuffer::zeroed(len as usize);
                 // Do not use bytes::merge's intermediate copy_to_bytes: a
                 // generic Buf may allocate an unprotected temporary there.
-                buf.copy_to_slice(&mut self.data);
+                buf.copy_to_slice(self.data.expose_mut());
                 Ok(())
             }
             _ => encoding::skip_field(wire_type, tag, buf, ctx),
@@ -83,13 +87,15 @@ impl Message for WireItem {
             + if self.data.is_empty() {
                 0
             } else {
-                encoding::bytes::encoded_len(2, &self.data)
+                encoding::key_len(2)
+                    + encoding::encoded_len_varint(self.data.len() as u64)
+                    + self.data.len()
             }
     }
 
     fn clear(&mut self) {
         self.unit_index = 0;
-        self.data.zeroize();
+        self.data = SecretBuffer::zeroed(0);
     }
 }
 
