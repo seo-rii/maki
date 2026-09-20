@@ -267,6 +267,7 @@ struct EngineInner {
     provider: CheckedProvider,
     context: CryptoContext,
     geometry: Geometry,
+    supports_discard: bool,
     unit_locks: UnitLocks,
     /// Provider batch contract (SPEC §16): calls are chunked to fit.
     batch_max_items: usize,
@@ -405,6 +406,7 @@ impl Engine {
         options: EngineOptions,
     ) -> Result<Self, AttachError> {
         let backing = volume.backing().clone();
+        let supports_discard = volume.supports_discard();
         let superblock = volume.superblock().clone();
         let geometry = superblock.geometry.clone();
 
@@ -486,6 +488,7 @@ impl Engine {
             provider,
             context,
             geometry,
+            supports_discard,
             unit_locks: UnitLocks::new(),
             batch_max_items,
             batch_max_bytes,
@@ -573,6 +576,11 @@ impl Engine {
 
     pub fn geometry(&self) -> &Geometry {
         &self.inner.geometry
+    }
+
+    /// Discard is available only on explicitly created v3 volumes.
+    pub fn can_trim(&self) -> bool {
+        self.inner.supports_discard
     }
 
     /// Current operational state. A journal whose last sync failed and has
@@ -830,8 +838,49 @@ impl Engine {
                 bad.data.len()
             ))));
         }
-        let incoming: u64 = cts.iter().map(record_len).sum();
+        self.publish_ciphertexts(cts, fua, admission, guards).await
+    }
 
+    /// Discard complete crypto units covered by the range. Partial edge
+    /// units are left untouched, as permitted for the NBD discard hint.
+    /// Logical zeroes become durable through the usual FLUSH/FUA protocol;
+    /// physical space is reclaimed during a later checkpoint if supported.
+    pub async fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
+        self.check_range(offset, len)?;
+        if !self.can_trim() {
+            return Err(CoreError::Invalid(
+                "discard requires a volume created with --discard".into(),
+            ));
+        }
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(offset, len))
+                .await?,
+        );
+        let unit_size = self.unit_size();
+        let first = offset.div_ceil(unit_size);
+        let end = (offset + len as u64) / unit_size;
+        if first >= end {
+            return if fua { self.flush().await } else { Ok(()) };
+        }
+        let guards = Arc::new(self.inner.unit_locks.lock_range(first, end - 1).await);
+        let cts = (first..end)
+            .map(|unit_index| CiphertextUnit {
+                unit_index,
+                data: Vec::new(),
+            })
+            .collect();
+        self.publish_ciphertexts(cts, fua, admission, guards).await
+    }
+
+    async fn publish_ciphertexts(
+        &self,
+        cts: Vec<CiphertextUnit>,
+        fua: bool,
+        admission: Arc<maki_crypto::flow::DualPermit>,
+        guards: Arc<Vec<OwnedMutexGuard<()>>>,
+    ) -> Result<(), CoreError> {
         // Own the orchestration as well as each storage operation. Inline
         // reclaim releases the volume lock while applying checkpoint data;
         // cancelling the caller must not release its write/admission guards.
@@ -847,8 +896,7 @@ impl Engine {
                 let io_guards = _guards.clone();
                 let written = storage_task(move || {
                     let (_admission, _guards) = (io_admission, io_guards);
-                    let outcome =
-                        io_engine.journal_request(&mut volume, incoming, &io_cts, fua, reclaimed);
+                    let outcome = io_engine.journal_request(&mut volume, &io_cts, fua, reclaimed);
                     io_engine.inner.note_journal(&volume);
                     if matches!(outcome, Ok(true))
                         && volume.journal_total_bytes()
@@ -876,16 +924,36 @@ impl Engine {
     fn journal_request(
         &self,
         volume: &mut Volume,
-        incoming: u64,
         cts: &[CiphertextUnit],
         fua: bool,
         reclaimed: bool,
     ) -> Result<bool, CoreError> {
-        if !self.admit_journal(volume, incoming, cts, reclaimed)? {
+        // Already-zero trim hints must not reserve storage or consume journal
+        // capacity. All records in a request are either writes or tombstones.
+        let mut filtered = Vec::new();
+        let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
+            for ct in cts {
+                if volume.read_ct(ct.unit_index)?.is_some() {
+                    filtered.push(CiphertextUnit {
+                        unit_index: ct.unit_index,
+                        data: Vec::new(),
+                    });
+                }
+            }
+            filtered.as_slice()
+        } else {
+            cts
+        };
+        let incoming = cts.iter().map(record_len).sum();
+        if !cts.is_empty() && !self.admit_journal(volume, incoming, cts, reclaimed)? {
             return Ok(false);
         }
         for ct in cts {
-            volume.write_ct(ct.unit_index, &ct.data, false)?;
+            if ct.data.is_empty() {
+                volume.discard_ct(ct.unit_index, false)?;
+            } else {
+                volume.write_ct(ct.unit_index, &ct.data, false)?;
+            }
             // Any cached plaintext of an older version is now dead. The
             // version key alone already prevents stale reads; this frees
             // the space eagerly.

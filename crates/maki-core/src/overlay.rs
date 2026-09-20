@@ -61,6 +61,14 @@ impl Overlay {
         self.units.keys().next().copied()
     }
 
+    /// Lowest unit whose latest version carries ciphertext rather than a v3
+    /// discard tombstone.
+    pub(crate) fn first_nonempty_unit(&self) -> Option<u64> {
+        self.units
+            .iter()
+            .find_map(|(unit, entry)| (!entry.latest.ciphertext.is_empty()).then_some(*unit))
+    }
+
     /// (oldest, newest) latest-version sequence across all units. O(units).
     pub fn sequence_bounds(&self) -> Option<(u64, u64)> {
         self.units
@@ -308,5 +316,13 @@ mod tests {
         assert_eq!(old[0].1.ciphertext, vec![0xa1; 512]);
         assert_eq!(latest[0].1.sequence, 2);
         assert_eq!(latest[0].1.ciphertext, vec![0xb2; 512]);
+    }
+
+    #[test]
+    fn first_nonempty_skips_an_earlier_tombstone() {
+        let mut overlay = Overlay::new();
+        overlay.publish(1, 1, Vec::new());
+        overlay.publish(3, 2, vec![7; 8]);
+        assert_eq!(overlay.first_nonempty_unit(), Some(3));
     }
 }

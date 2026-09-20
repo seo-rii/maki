@@ -21,6 +21,8 @@ pub const SUPERBLOCK_SIZE: usize = 4096;
 pub const SUPERBLOCK_MAGIC: &[u8; 8] = b"MAKISB01";
 pub const SUPERBLOCK_VERSION: u32 = 1;
 pub const SUPERBLOCK_VERSION_V2: u32 = 2;
+/// Envelope selecting durable proof plus per-shard discard metadata semantics.
+pub const SUPERBLOCK_VERSION_V3: u32 = 3;
 /// On-disk length cap for the superblock's string fields; config validation
 /// enforces it so `encode` can never be handed an over-long value.
 pub const MAX_STR: usize = 128;
@@ -87,7 +89,10 @@ impl Superblock {
         let mut r = Reader::new(payload);
         let _magic = r.take(8)?;
         let version = r.u32()?;
-        if !matches!(version, SUPERBLOCK_VERSION | SUPERBLOCK_VERSION_V2) {
+        if !matches!(
+            version,
+            SUPERBLOCK_VERSION | SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+        ) {
             return Err(FormatError::Unsupported(format!(
                 "superblock version {version}"
             )));
@@ -151,7 +156,7 @@ impl VolumeSuperblock {
         assert!(
             matches!(
                 self.metadata_version,
-                SUPERBLOCK_VERSION | SUPERBLOCK_VERSION_V2
+                SUPERBLOCK_VERSION | SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
             ),
             "unsupported metadata envelope for encoding"
         );
@@ -213,7 +218,10 @@ fn read_volume_copy(
             }
             let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
             if &header[..8] == SUPERBLOCK_MAGIC
-                && !matches!(version, SUPERBLOCK_VERSION | SUPERBLOCK_VERSION_V2)
+                && !matches!(
+                    version,
+                    SUPERBLOCK_VERSION | SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+                )
             {
                 // The future layout's checksum location is unknown. Refusing
                 // its recognizable header is safer than downgrading policy.

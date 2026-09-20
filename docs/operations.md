@@ -50,7 +50,10 @@ nm -D --defined-only target/release/libmaki_nbdkit.so |
 
 The exported structure uses the validated nbdkit API-v2 prefix. FLUSH and
 native FUA reach the engine, and the block-size callback advertises the
-configured I/O limits. TRIM and multi-connection are disabled. The plugin
+configured I/O limits. TRIM is available for new volumes explicitly created with
+`--discard`; ordinary v2 volumes retain their existing behavior. Multi-connection
+is disabled. See [space reclamation](space-reclamation.md) for format selection,
+partial-unit behavior and checkpoint ordering. The plugin
 does not provide a native write-zeroes callback; nbdkit emulates zeroing with
 ordinary writes.
 
@@ -65,7 +68,9 @@ maki check /etc/maki/volumes/example.toml
 ```
 
 The inspect output includes `maximum units`, `maximum shards`, `full slot span
-bytes`, `allocation map A/B bytes`, and `catalog A/B bytes`. Use them as the
+bytes`, `allocation map A/B bytes`, `discard map A/B bytes`, and `catalog A/B bytes`.
+The discard-map estimate is zero for v2 and equals the allocation-map estimate
+for v3. Use them as the
 format-file baseline for a fully allocated volume. They do not include journal
 or checkpoint headroom, filesystem metadata, copy-on-write overhead, or
 database temporary files, and the command does not reserve disk space. Keep

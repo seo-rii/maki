@@ -103,6 +103,12 @@ verified data migration; there is no automatic in-place upgrade.
 
 ## Recovery and checkpointing
 
+New volumes can explicitly select metadata envelope v3 for discard support.
+V2 creation remains the default. V3 adds replicated discard bitmaps and journal
+tombstones, preserving the crypto context and required durable proofs. The
+[space reclamation protocol](space-reclamation.md) specifies logical zero reads,
+bitmap publication, physical hole punching and replay ordering.
+
 Recovery acquires the volume lock, checks the superblock envelope and required
 proof, validates allocation state, loads checkpoint state, scans journal segments,
 and rebuilds the in-memory overlay from records newer than the checkpoint. It

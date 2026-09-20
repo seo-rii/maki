@@ -10,6 +10,7 @@ use crate::error::FormatError;
 use crate::layout;
 use crate::superblock::{
     load_volume_superblock, Superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V2,
+    SUPERBLOCK_VERSION_V3,
 };
 
 /// Create a new volume in an empty backing root. Everything created here is
@@ -17,7 +18,23 @@ use crate::superblock::{
 /// creation leaves a valid volume.
 pub fn create_volume(
     backing: &dyn Backing,
+    superblock: Superblock,
+) -> Result<Superblock, FormatError> {
+    create_volume_with_metadata_version(backing, superblock, SUPERBLOCK_VERSION_V2)
+}
+
+/// Create a new volume whose v3 envelope opts into per-shard discard metadata.
+pub fn create_volume_with_discard(
+    backing: &dyn Backing,
+    superblock: Superblock,
+) -> Result<Superblock, FormatError> {
+    create_volume_with_metadata_version(backing, superblock, SUPERBLOCK_VERSION_V3)
+}
+
+fn create_volume_with_metadata_version(
+    backing: &dyn Backing,
     mut superblock: Superblock,
+    metadata_version: u32,
 ) -> Result<Superblock, FormatError> {
     if backing.exists(layout::SUPERBLOCK_A)? || backing.exists(layout::SUPERBLOCK_B)? {
         return Err(FormatError::AlreadyExists(
@@ -48,7 +65,7 @@ pub fn create_volume(
     let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
     let mut envelope = VolumeSuperblock {
         superblock,
-        metadata_version: SUPERBLOCK_VERSION_V2,
+        metadata_version,
     };
     sb_ab.store(backing, &mut envelope)?; // side A, gen 1
     sb_ab.store(backing, &mut envelope)?; // side B, gen 2

@@ -37,10 +37,12 @@ use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_ST
 use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
     max_segment_file_size, DurableMark, JournalRecord, ScanOutcome, SegmentHeader,
-    DURABLE_MARK_SIZE, SEGMENT_HEADER_SIZE,
+    DURABLE_MARK_SIZE, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE,
 };
 use maki_format::layout;
-use maki_format::superblock::{load_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2};
+use maki_format::superblock::{
+    load_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
+};
 use maki_format::FormatError;
 
 use crate::journal::{rewrite_verified_range, SegmentInfo};
@@ -169,7 +171,10 @@ fn recover_with_replay(
 
     // 2. superblock
     let envelope = load_volume_superblock(backing.as_ref())?;
-    if envelope.metadata_version != SUPERBLOCK_VERSION_V2 {
+    if !matches!(
+        envelope.metadata_version,
+        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+    ) {
         return Err(RecoveryError::Format(FormatError::Unsupported(
             "legacy v1 volume requires an explicit migration; writable recovery refuses it without changing recovery metadata".into(),
         )));
@@ -285,6 +290,12 @@ fn recover_with_replay(
             (checkpoint_state, scan.segments)
         };
 
+    // Valid discard copies may still contain different generations after a
+    // failed two-copy publication. Replay selected the authoritative logical
+    // value when necessary; restabilize it into both sides even when there
+    // was no replay before exposing the volume or pruning later journal.
+    store.persist_discards()?;
+
     Ok(Recovered {
         lock,
         superblock,
@@ -307,6 +318,8 @@ fn checkpoint_validated_replay(
     checkpoint_state: &CheckpointState,
     scan: &JournalScan,
 ) -> Result<CheckpointState, RecoveryError> {
+    let allow_discard =
+        load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
 
@@ -347,13 +360,12 @@ fn checkpoint_validated_replay(
             name,
         }
         .scan(|record| {
-            if !batch.is_empty()
-                && batch_bytes.saturating_add(record.payload.len()) > REPLAY_BATCH_BYTES
-            {
-                apply_replay_batch(store, &mut batch)?;
+            let record_bytes = RECORD_HEADER_SIZE.saturating_add(record.payload.len());
+            if !batch.is_empty() && batch_bytes.saturating_add(record_bytes) > REPLAY_BATCH_BYTES {
+                apply_replay_batch(store, &mut batch, allow_discard)?;
                 batch_bytes = 0;
             }
-            batch_bytes = batch_bytes.saturating_add(record.payload.len());
+            batch_bytes = batch_bytes.saturating_add(record_bytes);
             batch.push(record);
             Ok(())
         })?;
@@ -366,7 +378,7 @@ fn checkpoint_validated_replay(
             )));
         }
     }
-    apply_replay_batch(store, &mut batch)?;
+    apply_replay_batch(store, &mut batch, allow_discard)?;
 
     let mut new_state = checkpoint_state.clone();
     new_state.checkpoint_sequence = scan.durable_sequence;
@@ -383,18 +395,35 @@ fn checkpoint_validated_replay(
 fn apply_replay_batch(
     store: &mut SlotStore,
     records: &mut Vec<JournalRecord>,
+    allow_discard: bool,
 ) -> Result<(), RecoveryError> {
     if records.is_empty() {
         return Ok(());
     }
-    for record in records.iter() {
+    for record in records
+        .iter()
+        .filter(|record| !allow_discard || !record.payload.is_empty())
+    {
         store.write_slot(record.unit_index, record.sequence, &record.payload)?;
     }
-    for shard in store.shards_of_units(records.iter().map(|record| &record.unit_index)) {
+    for shard in store.shards_of_units(
+        records
+            .iter()
+            .filter(|record| !allow_discard || !record.payload.is_empty())
+            .map(|record| &record.unit_index),
+    ) {
         store.sync_shard_data(shard)?;
     }
     for record in records.iter() {
-        store.mark_allocated(record.unit_index)?;
+        if !allow_discard || !record.payload.is_empty() {
+            store.mark_allocated(record.unit_index)?;
+        }
+    }
+    if allow_discard {
+        for record in records.iter() {
+            store.set_discarded(record.unit_index, record.payload.is_empty())?;
+        }
+        store.persist_discards()?;
     }
     store.persist_allocations()?;
     records.clear();
@@ -500,7 +529,10 @@ fn scan_journal_with_replay(
             "journal scan superblock identity mismatch".into(),
         ));
     }
-    let proof = if envelope.metadata_version == SUPERBLOCK_VERSION_V2 {
+    let proof = if matches!(
+        envelope.metadata_version,
+        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+    ) {
         Some(DurableProofStore::load(
             backing.as_ref(),
             superblock.volume_uuid,

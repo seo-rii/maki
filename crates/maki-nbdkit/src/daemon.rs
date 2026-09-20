@@ -747,6 +747,16 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
 /// `maki volume create`: initialize the on-disk layout for a configured
 /// volume.
 pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
+    create_volume_from_config(raw, false)
+}
+
+/// Initialize a new v3 volume with discard support. Existing volumes are
+/// refused by the format initializer; this never upgrades an attached volume.
+pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
+    create_volume_from_config(raw, true)
+}
+
+fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, DaemonError> {
     let config = parse_and_validate(raw)?;
     let backing = build_backing(&config)?;
     let geometry = config.geometry()?;
@@ -768,7 +778,11 @@ pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonErro
             .map(|d| d.as_secs())
             .unwrap_or(0),
     };
-    Ok(init::create_volume(backing.as_ref(), superblock)?)
+    Ok(if discard {
+        init::create_volume_with_discard(backing.as_ref(), superblock)?
+    } else {
+        init::create_volume(backing.as_ref(), superblock)?
+    })
 }
 
 /// The per-volume control socket path (SPEC §7): `control.socket`, or

@@ -2,9 +2,9 @@
 //!
 //! - Every entry point catches panics: nothing ever unwinds across the FFI
 //!   boundary; a panic maps to EIO and the adapter stays usable.
-//! - Capability surface per SPEC §48: FLUSH + FUA supported; trim, write-
-//!   zeroes, and multi-connection disabled (nbdkit emulates zeroes via
-//!   pwrite).
+//! - Capability surface per SPEC §48: FLUSH + FUA supported; TRIM enabled
+//!   only for opt-in v3 volumes; native write-zeroes and multi-connection
+//!   disabled (nbdkit emulates zeroes via pwrite).
 //! - The NBD I/O limits are advertised through the plugin's `block_size`
 //!   callback *and* enforced here: negotiation is advisory, so a request
 //!   outside the configured minimum/maximum, misaligned, or past the end of
@@ -233,7 +233,10 @@ impl NbdAdapter {
     }
 
     pub fn can_trim(&self) -> bool {
-        false
+        self.state
+            .read()
+            .as_ref()
+            .is_some_and(|s| s.engine.can_trim())
     }
 
     pub fn can_write_zeroes(&self) -> bool {
@@ -307,6 +310,15 @@ impl NbdAdapter {
             .enter()
             .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
         self.run(move |engine| Box::pin(async move { engine.flush().await }))
+    }
+
+    pub fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
+        self.validate_request(offset, len)?;
+        self.run(move |engine| Box::pin(async move { engine.trim(offset, len, fua).await }))
     }
 
     pub fn checkpoint(&self) -> Result<u64, AdapterError> {

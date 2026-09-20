@@ -92,6 +92,32 @@ when the header is installed there, and skips with a message otherwise.
 
 ## Test model
 
+### Opt-in discard validation
+
+The v3 discard feature uses new volumes created with `--discard`; v2 behavior
+remains unchanged. The focused suites are:
+
+```bash
+cargo test --locked -p maki-format --test review_discard_format
+cargo test --locked -p maki-core --test review_discard_storage --test review_discard_engine --test review_discard_physical --test review_discard_crash
+cargo test --locked -p maki-nbdkit --test review_discard -- --nocapture
+cargo test --locked -p maki --test review_discard_create
+```
+
+The physical test measures allocated filesystem blocks for 126 adjacent
+discarded slots between two retained neighbors, then checks reopening and
+rewriting. It reports a skip if the filesystem does not support hole punching.
+The crash matrix covers both discard-bit transitions, all four map data-sync
+and three directory-sync boundaries, same-process retry, recovery with readable
+failed-sync bytes, subsequent simulated power loss, and A/B fallback. It also
+checks partial punch failure, unsupported punching, repeated FUA discard, and
+ordered replay across multiple bounded batches.
+
+On Linux, the native test uses actual nbdkit and Python `ctypes` with
+`libnbd.so.0` to negotiate and issue FUA TRIM, check zero readback, and rewrite
+the range. It does not require `nbdsh`, a kernel NBD attachment, or a mount.
+See [space reclamation](space-reclamation.md) for supported semantics and limits.
+
 `maki-test-support` provides the reusable verification environment:
 
 | Component | Purpose |

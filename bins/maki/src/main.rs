@@ -11,7 +11,7 @@ use std::time::Duration;
 fn usage() -> ExitCode {
     eprintln!(
         "usage:
-  maki volume create <config.toml>     initialize a volume's backing layout
+  maki volume create <config.toml> [--discard]  initialize a volume (opt-in v3 discard)
   maki volume inspect <config.toml>    print volume metadata
   maki check <config.toml> [--deep]    offline format check (--deep: journal, checkpoint, slots)
   maki status <config.toml>            daemon status (control socket)
@@ -64,12 +64,17 @@ fn main() -> ExitCode {
     };
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match argv.as_slice() {
-        ["volume", "create", config] => {
+        ["volume", "create", config] | ["volume", "create", config, "--discard"] => {
             let raw = match std::fs::read_to_string(config) {
                 Ok(raw) => raw,
                 Err(e) => return fail(format!("{config}: {e}")),
             };
-            match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
+            let created = if argv.len() == 4 {
+                maki_nbdkit::daemon::create_volume_with_discard_from_config_str(&raw)
+            } else {
+                maki_nbdkit::daemon::create_volume_from_config_str(&raw)
+            };
+            match created {
                 Ok(sb) => {
                     println!(
                         "created volume {} (uuid {}, {} bytes virtual, slot size {})",
@@ -202,7 +207,9 @@ fn fail(message: String) -> ExitCode {
 fn inspect(config: &str) -> Result<(), String> {
     let cfg = read_config(config)?;
     let backing = maki_nbdkit::daemon::build_backing(&cfg).map_err(|e| e.to_string())?;
-    let sb = maki_format::init::load_superblock(backing.as_ref()).map_err(|e| e.to_string())?;
+    let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
+        .map_err(|e| e.to_string())?;
+    let sb = envelope.superblock;
     println!("volume:        {}", cfg.volume.name);
     println!("uuid:          {}", sb.volume_uuid);
     println!("provider:      {}", sb.provider_type);
@@ -211,11 +218,20 @@ fn inspect(config: &str) -> Result<(), String> {
     println!("unit size:     {}", sb.geometry.crypto_unit_size);
     println!("slot size:     {}", sb.geometry.slot_size);
     println!("generation:    {}", sb.generation);
+    println!("metadata envelope: {}", envelope.metadata_version);
     let plan = sb.geometry.capacity_plan().map_err(|e| e.to_string())?;
     println!("maximum units:             {}", plan.num_units);
     println!("maximum shards:            {}", plan.num_shards);
     println!("full slot span bytes:      {}", plan.full_slot_span_bytes);
     println!("allocation map A/B bytes: {}", plan.allocation_map_ab_bytes);
+    println!(
+        "discard map A/B bytes:    {}",
+        if envelope.metadata_version == maki_format::superblock::SUPERBLOCK_VERSION_V3 {
+            plan.allocation_map_ab_bytes
+        } else {
+            0
+        }
+    );
     println!("catalog A/B bytes:        {}", plan.catalog_ab_bytes);
     Ok(())
 }

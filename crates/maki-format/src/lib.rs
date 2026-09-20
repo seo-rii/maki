@@ -50,6 +50,14 @@ pub mod layout {
         format!("{DATA_DIR}/shard-{shard:08x}.alloc.b")
     }
 
+    pub fn shard_discard_a(shard: u64) -> String {
+        format!("{DATA_DIR}/shard-{shard:08x}.discard.a")
+    }
+
+    pub fn shard_discard_b(shard: u64) -> String {
+        format!("{DATA_DIR}/shard-{shard:08x}.discard.b")
+    }
+
     pub fn journal_segment(index: u64) -> String {
         format!("{JOURNAL_DIR}/seg-{index:016x}")
     }

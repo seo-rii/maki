@@ -83,7 +83,7 @@ fn mixed_valid_envelope_versions_refuse_loading_in_both_orders() {
 
 #[test]
 fn a_crc_valid_unknown_version_cannot_be_hidden_by_an_older_copy() {
-    for (a, b) in [(1, 3), (3, 1)] {
+    for (a, b) in [(1, 4), (4, 1)] {
         let backing = MemBacking::new();
         write_copy(&backing, layout::SUPERBLOCK_A, &superblock(), a);
         let mut newest = superblock();
@@ -106,7 +106,7 @@ fn a_future_envelope_with_a_different_size_cannot_fall_back_to_v2() {
             let backing = MemBacking::new();
             write_copy(&backing, layout::SUPERBLOCK_A, &superblock(), 2);
             write_copy(&backing, layout::SUPERBLOCK_B, &superblock(), 2);
-            let mut bytes = envelope_version(superblock().encode(), 3);
+            let mut bytes = envelope_version(superblock().encode(), 4);
             bytes.resize(length, 0);
             if length >= 16 {
                 let crc = crc32fast::hash(&bytes[..length - 4]);

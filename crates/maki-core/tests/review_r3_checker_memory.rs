@@ -66,6 +66,22 @@ fn store_with_maps(units_per_shard: u64, shards: &[(u64, AllocationMap)]) -> Slo
         units_per_shard * 512,
     )
     .unwrap();
+    // SlotStore selects allocation/discard semantics from the volume envelope.
+    // Keep this enumeration-only fixture explicitly on the default v2 format.
+    maki_format::init::create_volume(
+        backing.as_ref(),
+        maki_format::superblock::Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::from_u128(0x23),
+            provider_type: "test".into(),
+            crypto_compatibility_id: "checker-memory".into(),
+            key_identity: "k".into(),
+            geometry: geometry.clone(),
+            format_version: 1,
+            created_unix: 0,
+        },
+    )
+    .unwrap();
     let mut catalog = ShardCatalog::new();
     for (shard, map) in shards {
         catalog.insert(*shard);

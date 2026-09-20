@@ -10,7 +10,7 @@ use crate::catalog::ShardCatalog;
 use crate::durable_proof::DurableProofStore;
 use crate::error::FormatError;
 use crate::layout;
-use crate::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V2};
+use crate::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3};
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -39,7 +39,10 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         }
     };
     let superblock = envelope.superblock;
-    if envelope.metadata_version == SUPERBLOCK_VERSION_V2 {
+    if matches!(
+        envelope.metadata_version,
+        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+    ) {
         match DurableProofStore::load(backing, superblock.volume_uuid) {
             Ok(proof) => report.info.push(format!(
                 "required durable proof: sequence {}",
@@ -90,6 +93,32 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
                         map.units(),
                         geometry.units_per_shard()
                     ));
+                }
+            }
+        }
+        if envelope.metadata_version == SUPERBLOCK_VERSION_V3 {
+            let discard_ab = AbStore::new(
+                layout::shard_discard_a(shard),
+                layout::shard_discard_b(shard),
+            );
+            let sides = discard_ab.side_generations::<AllocationMap>(backing)?;
+            match discard_ab.load::<AllocationMap>(backing)? {
+                None => report
+                    .errors
+                    .push(format!("shard {shard}: no valid discard map")),
+                Some(map) => {
+                    if map.units() != geometry.units_per_shard() {
+                        report.errors.push(format!(
+                            "shard {shard}: discard map covers {} units, geometry says {}",
+                            map.units(),
+                            geometry.units_per_shard()
+                        ));
+                    }
+                    if matches!(sides, (Some(_), None) | (None, Some(_))) {
+                        report.warnings.push(format!(
+                            "shard {shard}: discard map has one valid copy; using fallback"
+                        ));
+                    }
                 }
             }
         }

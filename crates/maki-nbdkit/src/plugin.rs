@@ -5,7 +5,8 @@
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
 //!   populate; `_struct_size` includes the block_size callback so clients
 //!   can negotiate the configured limits. Other optional callbacks stay
-//!   NULL (multi-conn OFF, zero emulated via pwrite, trim absent).
+//!   NULL (multi-conn OFF, zero emulated via pwrite). TRIM is advertised
+//!   per connection only for opt-in v3 volumes.
 //! - `after_fork` initializes recovery, provider verification and the control
 //!   listener before announcing readiness. `open` only uses this adapter;
 //!   it never starts a runtime or retries a failed startup.
@@ -127,8 +128,9 @@ unsafe extern "C" fn is_rotational(_h: *mut c_void) -> c_int {
     0
 }
 
-unsafe extern "C" fn can_trim(_h: *mut c_void) -> c_int {
-    0
+unsafe extern "C" fn can_trim(handle: *mut c_void) -> c_int {
+    let adapter = unsafe { &*(handle as *const NbdAdapter) };
+    c_int::from(adapter.can_trim())
 }
 
 unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
@@ -203,6 +205,17 @@ unsafe extern "C" fn flush_v2(handle: *mut c_void, _flags: u32) -> c_int {
         Ok(()) => 0,
         Err(e) => {
             set_errno(e.errno);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn trim_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
+    let adapter = unsafe { &*(handle as *const NbdAdapter) };
+    match adapter.trim(offset, count as usize, flags & NBDKIT_FLAG_FUA != 0) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error.errno);
             -1
         }
     }
@@ -313,7 +326,7 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     pread: Some(pread_v2),
     pwrite: Some(pwrite_v2),
     flush: Some(flush_v2),
-    trim: None,
+    trim: Some(trim_v2),
     zero: None,
     magic_config_key: std::ptr::null(),
     can_multi_conn: None,
