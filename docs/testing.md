@@ -312,20 +312,25 @@ finished on 2026-09-20 with 100/100 rounds, 500 successful suite invocations,
 source/binary hashes were verified. Repeated fixed-seed model runs do not
 replace real-DB, physical-power or long-duration parser qualification.
 
-A new extended campaign started at 2026-09-20 11:18:48 UTC from `f5bde3e`:
-100 rounds, eight suites, maximum six hours, PID 1485542. Its result is pending.
-The private run directory is `~/logs/maki-storage-20260920T111848Z-5111c6/`;
-`status.json` records progress and terminal exit code, `results.jsonl` records
-each completed suite, and `supervisor.log` retains controller diagnostics.
-Inspect or cancel without restarting the job:
+A second extended campaign from `f5bde3e` ran from 2026-09-20 11:18:48 UTC to
+17:04:40 UTC (2026-09-21 02:04:40 KST). It completed 100/100 rounds across all
+eight suites: 800 successful suite executions and 4,800 passing test invocations
+in 20,751.6 seconds, with supervisor exit 0. The private run directory is
+`~/logs/maki-storage-20260920T111848Z-5111c6/`; `status.json`, the 800-row
+`results.jsonl` ledger, frozen source and binary hashes, and per-suite logs retain
+the evidence. The fixed-seed/model and simulated power-loss coverage does not
+replace a real database, physical power loss, or production qualification.
+Inspect the completed result without restarting it:
 
 ```bash
 python3 -B scripts/storage-repeat-validation.py status --run-dir ~/logs/maki-storage-20260920T111848Z-5111c6
-python3 -B scripts/storage-repeat-validation.py cancel --run-dir ~/logs/maki-storage-20260920T111848Z-5111c6
 ```
 
 The separate [v3 GCE reset campaign](gce-discard-reset-validation-2026-09-20.md)
-uses the normal release build and automatically deletes its disposable resources.
+passed ten whole-instance resets with 160 verified units and a zero-invalid-slot
+offline deep check, then deleted its disposable resources. It used native NBD
+with the local provider; it was not a production database or physical Persistent
+Disk power-loss campaign.
 
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|

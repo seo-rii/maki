@@ -821,7 +821,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-013 | 위협 모델 제한 유지: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음. [독립 witness와 인증 root 설계](rollback-protection-design.md)를 문서화했고 구현은 하지 않음 | 별도 실패 도메인의 단조 witness, writer fencing, 이전 root를 보존하는 저장 형식과 명시적 restore epoch를 구현·검증하거나 이 제한을 유지 |
 | MAKI-014 | 구현·로컬 통합 검증 완료: HTTP 외에 WSS/gRPC TLS 및 mTLS, CA/hostname 검증, credential 기반 client key, 실제 daemon attach·쓰기/읽기·종료를 지원. TLS 설정과 평문 URL 조합을 거절 | 로컬 provider 및 daemon 인증서 회귀 통과. 실제 vendor·대상 network·장시간 DB profile의 WSS/gRPC qualification은 별도이며 과거 HTTP VPC 캠페인을 전용하지 않음 |
 | MAKI-019 | 범위 한정 통과: `f20bb61` 절차에 이어 `bdb9113`의 [세 호스트 캠페인](credential-rotation-key-migration-validation-2026-09-19.md)이 stopped bearer/mTLS-client 교체, old credential 거절, superblock/canary hash 불변, 두 peer 재검증, 서로 다른 provider key fingerprint와 volume UUID, wrong-key canary 거절, K1→K2 SQLite DB-native restore와 24 ACK restart readback을 통과했다. `da89ae3`의 [네 호스트 캠페인](server-ca-endpoint-rotation-validation-2026-09-19.md)은 stopped server-CA overlap/removal, 두 wrong-trust 거절, 동일 key/profile의 distinct-IP 교체와 48 ACK restart readback도 통과했다 | Commercial vendor와 대상 network에서 client/server credential·CA·endpoint 교체를 반복하고, 공유 client 영향과 cross-sign/revocation 정책, key retirement, 새 volume write 이후 rollback과 production DB cutover를 검증 |
-| MAKI-022 | 구현·로컬 검증 완료: `8f7606f`의 `--discard` 새 v3 볼륨만 durable TRIM을 제공. 기본 v2 의미 유지. ext4 실제 blocks 감소, 이웃·재쓰기, A/B sync 실패·restart·fallback, 실제 nbdkit/libnbd 및 전체 workspace 통과. 후속 구현은 replay 종료 뒤 빠진 물리 회수를 최대 4,096개 슬롯 위치씩 checkpoint/worker에서 재시도 | [공간 회수 제한](space-reclamation.md) 유지: 부분 crypto unit 미회수, 지원 filesystem 필요, punch batch 중 volume lock 유지. v3 외부 VM 전원/DB 및 대상 fill-ratio qualification은 별도 |
+| MAKI-022 | 구현·로컬 검증 완료: `8f7606f`의 `--discard` 새 v3 볼륨만 durable TRIM을 제공. 기본 v2 의미 유지. ext4 실제 blocks 감소, 이웃·재쓰기, A/B sync 실패·restart·fallback, 실제 nbdkit/libnbd 및 전체 workspace 통과. 후속 구현은 replay 종료 뒤 빠진 물리 회수를 최대 4,096개 슬롯 위치씩 checkpoint/worker에서 재시도. `fe259e3`의 별도 v3 GCE 캠페인은 native NBD에서 10회 whole-instance reset, 11개 boot, ACK unit 160개 대조와 final deep check의 invalid slot 0을 통과했고 리소스를 삭제했다 | [공간 회수 제한](space-reclamation.md) 유지: 부분 crypto unit 미회수, 지원 filesystem 필요, punch batch 중 volume lock 유지. 이 GCE 실행은 local provider의 128 MiB 볼륨이며 production DB, 물리 Persistent Disk 전원 차단, 대상 fill-ratio qualification은 별도 |
 | MAKI-024 | 검증 범위: 문서 과장은 수정했으나 deep check는 AEAD/논리 읽기/DB 검사가 아님 | 각 검사 범위를 분리하고 암호 검증·복구 후 데이터·DB 의미 검증의 필요한 도구와 실행 증거 확보 |
 | MAKI-031/033/034/035 | 성능·확장: 순차 batch, 작은 syscall, 신규 할당 bitmap 전체 쓰기, 상주 bitmap/fallback scan | 고정 용량·fill ratio에서 tail latency·RSS·복구 시간·쓰기 증폭 기준을 충족하거나 해당 병목 수정 |
 | MAKI-036 | 선택적 성능 개선: FUA group commit 미구현 자체는 데이터 무결성 결함이 아님 | FUA 의미를 유지한 목표 성능 충족 여부로 구현 필요성을 결정; 미구현을 근거 없이 P0로 올리지 않음 |
@@ -878,4 +878,20 @@ reclaim 회귀를 추가하고 각 실행의 Cargo target을 분리했다.
 Python 장애 검증 61 passed, Debian 패키징 3 passed를 기록했다.
 `cargo audit --deny warnings`, fmt, workspace all-target strict Clippy도 통과했다.
 로그는 `~/logs/maki-followup-final-20260920T094155Z/test.log`, 종료 코드는 0이다.
-이 실행은 아래에서 별도로 준비하는 GCP v3 시험 결과를 포함하지 않는다.
+이 통합 snapshot 실행은 별도 GCP v3 결과를 포함하지 않는다. 이후 `f5bde3e`
+고정 source의 extended background storage 실행은 100/100 rounds, 8개 suite의
+800회 실행과 4,800 passed, supervisor exit 0으로 2026-09-20 17:04:40 UTC에
+끝났다. 별도 `fe259e3` GCE v3 native-NBD 캠페인은 10회 instance reset과 11개
+boot에서 ACK unit 160개를 대조하고 proof/checkpoint sequence 190, 8 shards,
+15 allocated / 0 invalid slots의 offline deep check를 통과했다. instance/disk
+정리 배열과 이후 exact-name 재조회도 비어 있었다. 두 실행은 production 승인,
+real DB 검증 또는 물리 Persistent Disk 전원 손실 증거가 아니다.
+
+후속 CI `f71ce01`의 Windows 실패는 non-Unix에서 page lock 성공을 전제한
+gRPC 보호 회귀의 platform 기대값 문제로 확인했으며, 이 문서 시점에는 수정 CI
+재실행이 완료되지 않았다. 따라서 위 campaign 결과를 최신 Linux·Windows CI
+성공 주장으로 확대하지 않는다.
+`6b86bef`는 성공한 잠금 또는 실패 횟수 증가를 검사하도록 테스트를 수정했다.
+잠금 한도 0으로 기존 실패를 재현한 뒤 전체 gRPC 37개와 같은 제한의 재검사
+1개, strict Clippy 및 fmt를 통과했다. 근거는
+`~/logs/maki-grpc-lock-green-20260920T215727Z/` (`exit.status` 0)이다.

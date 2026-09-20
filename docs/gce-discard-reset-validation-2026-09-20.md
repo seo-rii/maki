@@ -1,8 +1,8 @@
 # GCE discard/reset validation — 2026-09-20
 
-This document defines the opt-in `v3-discard` GCE hard-reset campaign. An
-unattended campaign was launched on 2026-09-20; its result and cleanup are still
-pending. The existing default `v2` write/readback campaign remains unchanged.
+This document records the completed opt-in `v3-discard` GCE hard-reset campaign.
+The unattended campaign passed on 2026-09-20 and its disposable resources were
+deleted. The existing default `v2` write/readback campaign remains unchanged.
 
 ## Qualification target
 
@@ -76,12 +76,12 @@ Both normal and optimized Python passed all 66 fault-oracle regressions before
 launch. The combined product snapshot passed 1,057 Rust tests, strict dependency
 audit, formatting, and workspace all-target Clippy.
 
-## Background run handoff
+## Completed campaign
 
 The fixed product revision is `fe259e3` and harness revision is `f5bde3e`.
 The normal release build completed with exit 0 under
 `~/logs/maki-v3-release-20260920T111425Z/`.
-The independent controller PID is 1485278 and its private run directory is
+The independent controller used PID 1485278 and its private run directory is
 `~/logs/maki-gce-v3-20260920T1118Z/`.
 
 The launcher selects one Debian 12 `e2-standard-2` VM with a 20 GiB boot disk
@@ -93,17 +93,27 @@ fixed two-hour termination time requests instance deletion even if the
 controller is interrupted. See the official
 [VM runtime limit](https://docs.cloud.google.com/compute/docs/instances/limit-vm-runtime).
 
-The launcher saves phase progress in `status.json`, terminal exit code in
+The launcher saved phase progress in `status.json`, terminal exit code in
 `exit.status`, and private command logs beside `supervisor.log`. It collects
 setup diagnostics and volume metadata before deletion, then verifies exact
 empty instance and disk queries. A campaign pass is only reported if the
 controller's ACK/readback/deep-check result passes and cleanup is confirmed.
+This run reported `passed` with exit 0 at 2026-09-20 11:27:29 UTC. Ten resets
+produced eleven distinct boot IDs and all 160 acknowledged units were verified.
+The final offline deep check found required proof and checkpoint sequence 190,
+eight shards, 15 allocated slots, and zero invalid slots. The preserved external
+ACK ledger contains ten complete generation records. Cleanup completed with
+empty exact-name instance and disk queries; a later scoped `gcloud` recheck also
+found neither generated name.
+The 160 checks are ten generations of the same sixteen addresses, including
+the persistent zero block and the rewritten block, rather than 160 distinct
+addresses. The 190 journal operations comprise 170 writes and 20 trims.
 
 ```bash
 cat ~/logs/maki-gce-v3-20260920T1118Z/status.json
 test ! -f ~/logs/maki-gce-v3-20260920T1118Z/exit.status || cat ~/logs/maki-gce-v3-20260920T1118Z/exit.status
 ```
 
-The volume is 128 MiB, uses eight 16 MiB logical ranges and the real local
+The volume was 128 MiB, used eight 16 MiB logical ranges and the real local
 AES-GCM-SIV provider. This is a native userspace NBD reset test; it does not
 mount a production database or power-cycle the physical Persistent Disk service.

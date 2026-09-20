@@ -1,8 +1,9 @@
 # Discard and space reclamation
 
-Status: implemented with local regression qualification on 2026-09-20. The
-default v2 format is unchanged. The new v3 mode has not yet repeated the external
-VM power-off and database campaigns previously run for v2.
+Status: implemented with local regression qualification and a scoped external
+GCE whole-instance-reset campaign on 2026-09-20. The default v2 format is
+unchanged. V3 has not run the database campaigns previously run for v2, and the
+GCE reset did not power-cycle the physical Persistent Disk service.
 
 ## Selecting the volume format
 
@@ -116,6 +117,18 @@ test executed through nbdkit and `libnbd.so.0` without skipping: it negotiated
 TRIM, issued FUA write and trim, read zeroes, rewrote the range, and shut down.
 Evidence: `~/logs/maki-discard-workspace-20260920T083655Z/` (`exit.status` 0);
 the separately captured native run is `~/logs/maki-discard-native.ELD0mC.log`.
+
+The frozen `f5bde3e` extended background campaign then completed 100 rounds of
+eight storage suites, including discard crash, model, and reclamation retry:
+800 suite executions and 4,800 passing tests, exit 0. Evidence is retained under
+`~/logs/maki-storage-20260920T111848Z-5111c6/`. Separately, product revision
+`fe259e3` passed ten GCE whole-instance resets through native NBD and the local
+AES-GCM-SIV provider. Eleven boots verified 160 acknowledged units; the final
+offline deep check reported proof/checkpoint sequence 190, eight shards, 15
+allocated slots, and zero invalid slots. Exact-name instance and disk cleanup
+queries were empty. See the [GCE v3 report](gce-discard-reset-validation-2026-09-20.md).
+These runs do not establish production approval, real-database recovery, or
+physical Persistent Disk power-loss behavior.
 
 The post-recovery retry follow-up first reproduced four failing regressions
 and a real-file run that retained all 1,160 allocated blocks. The implementation
