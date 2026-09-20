@@ -251,17 +251,27 @@ fn partial_nested_decode_failure_erases_the_item_before_parent_push() {
 #[test]
 fn decoded_provider_payload_uses_secret_buffer_page_locking() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    maki_crypto::secret::set_page_locking(true);
+    let previous = maki_crypto::secret::page_locking_enabled();
     let encoded = super::CryptoItem {
         unit_index: 7,
         data: vec![0xC7; 8209],
     }
     .encode_to_vec();
-    let item = WireItem::decode(encoded.as_slice()).unwrap();
-    assert!(item.data.is_page_locked());
-    assert!(item.data.expose().iter().all(|byte| *byte == 0xC7));
-    drop(item);
     maki_crypto::secret::set_page_locking(false);
+    let unlocked = WireItem::decode(encoded.as_slice()).unwrap();
+    maki_crypto::secret::set_page_locking(previous);
+    assert!(!unlocked.data.is_page_locked());
+    drop(unlocked);
+
+    maki_crypto::secret::set_page_locking(true);
+    let failures = maki_crypto::secret::page_lock_failures();
+    let item = WireItem::decode(encoded.as_slice()).unwrap();
+    maki_crypto::secret::set_page_locking(previous);
+    // SecretBuffer locking is best-effort: non-Unix platforms and hosts
+    // with an exhausted memlock limit report failed attempts instead. The
+    // decoder must preserve that policy and its accounting on either path.
+    assert!(item.data.is_page_locked() || maki_crypto::secret::page_lock_failures() > failures);
+    assert!(item.data.expose().iter().all(|byte| *byte == 0xC7));
 }
 
 #[test]
