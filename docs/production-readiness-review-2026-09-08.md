@@ -821,7 +821,7 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 | MAKI-013 | 위협 모델 제한 유지: AEAD는 같은 unit의 과거 유효 ciphertext나 전체 snapshot rollback을 막지 않음. [독립 witness와 인증 root 설계](rollback-protection-design.md)를 문서화했고 구현은 하지 않음 | 별도 실패 도메인의 단조 witness, writer fencing, 이전 root를 보존하는 저장 형식과 명시적 restore epoch를 구현·검증하거나 이 제한을 유지 |
 | MAKI-014 | 구현·로컬 통합 검증 완료: HTTP 외에 WSS/gRPC TLS 및 mTLS, CA/hostname 검증, credential 기반 client key, 실제 daemon attach·쓰기/읽기·종료를 지원. TLS 설정과 평문 URL 조합을 거절 | 로컬 provider 및 daemon 인증서 회귀 통과. 실제 vendor·대상 network·장시간 DB profile의 WSS/gRPC qualification은 별도이며 과거 HTTP VPC 캠페인을 전용하지 않음 |
 | MAKI-019 | 범위 한정 통과: `f20bb61` 절차에 이어 `bdb9113`의 [세 호스트 캠페인](credential-rotation-key-migration-validation-2026-09-19.md)이 stopped bearer/mTLS-client 교체, old credential 거절, superblock/canary hash 불변, 두 peer 재검증, 서로 다른 provider key fingerprint와 volume UUID, wrong-key canary 거절, K1→K2 SQLite DB-native restore와 24 ACK restart readback을 통과했다. `da89ae3`의 [네 호스트 캠페인](server-ca-endpoint-rotation-validation-2026-09-19.md)은 stopped server-CA overlap/removal, 두 wrong-trust 거절, 동일 key/profile의 distinct-IP 교체와 48 ACK restart readback도 통과했다 | Commercial vendor와 대상 network에서 client/server credential·CA·endpoint 교체를 반복하고, 공유 client 영향과 cross-sign/revocation 정책, key retirement, 새 volume write 이후 rollback과 production DB cutover를 검증 |
-| MAKI-022 | 구현·로컬 검증 완료: `8f7606f`의 `--discard` 새 v3 볼륨만 durable TRIM을 제공. 기본 v2 의미 유지. ext4 실제 blocks 감소, 이웃·재쓰기, A/B sync 실패·restart·fallback, 실제 nbdkit/libnbd 및 전체 workspace 통과 | [공간 회수 제한](space-reclamation.md) 유지: 부분 crypto unit 미회수, 지원 filesystem 필요, 복구 중 미실행한 punch 자동 재시도 없음. v3 외부 VM 전원/DB 및 대상 fill-ratio qualification은 별도 |
+| MAKI-022 | 구현·로컬 검증 완료: `8f7606f`의 `--discard` 새 v3 볼륨만 durable TRIM을 제공. 기본 v2 의미 유지. ext4 실제 blocks 감소, 이웃·재쓰기, A/B sync 실패·restart·fallback, 실제 nbdkit/libnbd 및 전체 workspace 통과. 후속 구현은 replay 종료 뒤 빠진 물리 회수를 최대 4,096개 슬롯 위치씩 checkpoint/worker에서 재시도 | [공간 회수 제한](space-reclamation.md) 유지: 부분 crypto unit 미회수, 지원 filesystem 필요, punch batch 중 volume lock 유지. v3 외부 VM 전원/DB 및 대상 fill-ratio qualification은 별도 |
 | MAKI-024 | 검증 범위: 문서 과장은 수정했으나 deep check는 AEAD/논리 읽기/DB 검사가 아님 | 각 검사 범위를 분리하고 암호 검증·복구 후 데이터·DB 의미 검증의 필요한 도구와 실행 증거 확보 |
 | MAKI-031/033/034/035 | 성능·확장: 순차 batch, 작은 syscall, 신규 할당 bitmap 전체 쓰기, 상주 bitmap/fallback scan | 고정 용량·fill ratio에서 tail latency·RSS·복구 시간·쓰기 증폭 기준을 충족하거나 해당 병목 수정 |
 | MAKI-036 | 선택적 성능 개선: FUA group commit 미구현 자체는 데이터 무결성 결함이 아님 | FUA 의미를 유지한 목표 성능 충족 여부로 구현 필요성을 결정; 미구현을 근거 없이 P0로 올리지 않음 |
@@ -860,3 +860,22 @@ production DB의 용량/지연 목표, library-private 메모리 복사본, 넓�
 물리 전원 장애와 장시간 workload는 위 표의 남은 경계로 유지한다. 새 v3 discard와
 WSS/gRPC를 기존 v2/HTTP 외부 캠페인이 이미 검증했다고 해석하지 않는다.
 모든 리뷰 항목이 종료되지 않았으므로 원본 R3 리뷰 폴더도 보존한다.
+
+### 2026-09-20 후속 재시도 및 의존성 검증
+
+`267cb3e`는 전체 replay가 끝난 뒤 남은 v3 discard 공간을 checkpoint당 최대
+4,096개 슬롯 위치씩 재시도한다. 새 journal 기록이 없어도 background worker가
+진행하며, 새 overlay 예약은 건너뛰고 실패한 punch/sync는 같은 위치에서 재시도한다.
+실제 파일의 재시작 후 회수 회귀와 기존 회수 회귀가 모두 통과했다.
+
+TLS 커밋 뒤 CI `35501638723`은 유지보수가 중단된 `rustls-pemfile`에 대한
+RUSTSEC-2025-0134 경고로 실패했다. `6c5f2dc`는 tonic 0.13과
+`rustls::pki_types::PemObject`로 이 의존성을 제거했고, 경고 제외 없이 엄격한
+감사를 통과했다. `9631acc`는 백그라운드 반복 시험에 v3 discard의 crash/model/
+reclaim 회귀를 추가하고 각 실행의 Cargo target을 분리했다.
+
+통합 고정 snapshot은 workspace 1,057 passed / 0 failed / 10 ignored,
+Python 장애 검증 61 passed, Debian 패키징 3 passed를 기록했다.
+`cargo audit --deny warnings`, fmt, workspace all-target strict Clippy도 통과했다.
+로그는 `~/logs/maki-followup-final-20260920T094155Z/test.log`, 종료 코드는 0이다.
+이 실행은 아래에서 별도로 준비하는 GCP v3 시험 결과를 포함하지 않는다.
