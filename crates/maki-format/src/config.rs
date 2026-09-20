@@ -736,6 +736,15 @@ impl VolumeConfig {
                 refs.push(key);
             }
         }
+        if let Some(key) = self
+            .crypto
+            .websocket
+            .as_ref()
+            .and_then(|ws| ws.tls.as_ref())
+            .and_then(|tls| tls.client_key.as_ref())
+        {
+            refs.push(key);
+        }
         refs
     }
 
@@ -1039,7 +1048,7 @@ fn validate_endpoints(
     endpoints: &[EndpointConfig],
     plaintext_scheme: &str,
     tls_scheme: &str,
-    tls_available: bool,
+    has_tls_options: bool,
 ) -> Result<(), ConfigError> {
     if endpoints.is_empty() {
         return Err(invalid(format!(
@@ -1060,15 +1069,12 @@ fn validate_endpoints(
             )));
         }
         let (scheme, host) = parse_endpoint_url(&endpoint.url)?;
-        if scheme == tls_scheme {
-            if !tls_available {
+        if scheme == plaintext_scheme {
+            if has_tls_options {
                 return Err(invalid(format!(
-                    "endpoint {:?}: TLS ({tls_scheme}://) for the {transport} transport is not \
-                     compiled into this build; use remote-http for TLS",
-                    endpoint.url
+                    "[crypto.{transport}.tls] requires an encrypted endpoint ({tls_scheme}://)"
                 )));
             }
-        } else if scheme == plaintext_scheme {
             if !is_loopback_host(&host) {
                 return Err(invalid(format!(
                     "endpoint {:?}: plaintext {plaintext_scheme}:// is only allowed to loopback \
@@ -1077,7 +1083,7 @@ fn validate_endpoints(
                     endpoint.url
                 )));
             }
-        } else {
+        } else if scheme != tls_scheme {
             return Err(invalid(format!(
                 "endpoint {:?}: scheme must be {plaintext_scheme} or {tls_scheme}",
                 endpoint.url
@@ -1113,6 +1119,13 @@ fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
                 "[crypto.{section}.tls] client_key requires client_cert_file"
             )));
         }
+    }
+    // HTTP also accepts a combined identity PEM. The newer transports take
+    // the certificate and credential-resolved private key as separate inputs.
+    if section != "http" && tls.client_cert_file.is_some() && tls.client_key.is_none() {
+        return Err(invalid(format!(
+            "[crypto.{section}.tls] client_cert_file requires client_key"
+        )));
     }
     Ok(())
 }
@@ -1509,7 +1522,7 @@ impl VolumeConfig {
                     .http
                     .as_ref()
                     .ok_or_else(|| invalid("provider \"remote-http\" requires [crypto.http]"))?;
-                validate_endpoints("http", &http.endpoint, "http", "https", true)?;
+                validate_endpoints("http", &http.endpoint, "http", "https", http.tls.is_some())?;
                 let encrypt = http.encrypt.as_ref().ok_or_else(|| {
                     invalid("provider \"remote-http\" requires [crypto.http.encrypt]")
                 })?;
@@ -1566,13 +1579,10 @@ impl VolumeConfig {
                 let ws = crypto.websocket.as_ref().ok_or_else(|| {
                     invalid("provider \"remote-websocket\" requires [crypto.websocket]")
                 })?;
-                if ws.tls.is_some() {
-                    return Err(invalid(
-                        "[crypto.websocket.tls]: TLS for the websocket transport is not compiled \
-                         into this build; use remote-http for TLS",
-                    ));
+                if let Some(tls) = &ws.tls {
+                    validate_tls("websocket", tls)?;
                 }
-                validate_endpoints("websocket", &ws.endpoint, "ws", "wss", false)?;
+                validate_endpoints("websocket", &ws.endpoint, "ws", "wss", ws.tls.is_some())?;
                 let frame = ws
                     .max_frame_bytes
                     .map(|b| b.0)
@@ -1608,13 +1618,10 @@ impl VolumeConfig {
                     .grpc
                     .as_ref()
                     .ok_or_else(|| invalid("provider \"remote-grpc\" requires [crypto.grpc]"))?;
-                if grpc.tls.is_some() {
-                    return Err(invalid(
-                        "[crypto.grpc.tls]: TLS for the grpc transport is not compiled into this \
-                         build; use remote-http for TLS",
-                    ));
+                if let Some(tls) = &grpc.tls {
+                    validate_tls("grpc", tls)?;
                 }
-                validate_endpoints("grpc", &grpc.endpoint, "http", "https", false)?;
+                validate_endpoints("grpc", &grpc.endpoint, "http", "https", grpc.tls.is_some())?;
                 for (name, value) in &grpc.metadata {
                     if name.trim().is_empty() {
                         return Err(invalid("[crypto.grpc.metadata] empty key"));

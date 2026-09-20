@@ -15,8 +15,8 @@ HTTP example is available at
 | `volume` | Name, maximum virtual size, block size, crypto unit size, and shard size |
 | `crypto` | Provider selection, compatibility identity, availability policy, and capabilities |
 | `crypto.http` | HTTP endpoints, request/response mapping, credentials, and TLS |
-| `crypto.websocket` | WebSocket endpoints, timeout, and frame-size limit |
-| `crypto.grpc` | gRPC endpoints, method paths, metadata, and message-size limit |
+| `crypto.websocket` | WebSocket endpoints, TLS, timeout, and frame-size limit |
+| `crypto.grpc` | gRPC endpoints, TLS, method paths, metadata, and message-size limit |
 | `limits` | Request, byte, queue, batch, and endpoint concurrency bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
 | `cache` | Read-cache mode, size, TTL, locking, and zeroization |
@@ -34,17 +34,41 @@ Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
 | `local-aes-gcm-siv` | Local | Authenticated and context-bound | Not applicable |
 | `local-aes-xts` | Local | No authenticated integrity | Not applicable |
 | `remote-http` | HTTP | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
-| `remote-websocket` | WebSocket | Declared by provider contract | `wss://` currently rejected |
-| `remote-grpc` | gRPC | Declared by provider contract | TLS endpoints currently rejected |
+| `remote-websocket` | WebSocket | Declared by provider contract | WSS, custom CA, and mTLS supported |
+| `remote-grpc` | gRPC | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
 | `fake` | In-process test provider | Test-only | Refused unless built with `--features fake-provider` |
 
 The `fake` provider is not compiled into a default build; `maki volume create`
 and attach reject it at validation time. Enable the `fake-provider` feature of
 `maki-nbdkit` only for development and benchmark builds.
 
-WebSocket and gRPC fail closed when TLS is configured. Use `remote-http` when a
-remote production deployment requires TLS until those transports gain rustls
-support.
+All three remote transports verify server certificates and the hostname in the
+endpoint URL. The TLS section is optional when system/default trust is enough.
+A custom `ca_file` adds trust; it does not disable the built-in roots. There is
+no certificate-verification bypass setting.
+
+For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
+
+```toml
+[[crypto.websocket.endpoint]]
+name = "primary"
+url = "wss://crypto.example:8443"
+
+[crypto.websocket.tls]
+ca_file = "/etc/maki/crypto-ca.pem"
+client_cert_file = "/etc/maki/client-cert.pem"
+client_key = { source = "credential", name = "crypto-client-key" }
+```
+
+For gRPC, use `crypto.grpc.endpoint`, an `https://` URL and `crypto.grpc.tls`
+with the same fields. WebSocket and gRPC require `client_cert_file` and
+`client_key` together; the private key is loaded through the existing credential
+router. Omit both for server-only TLS. HTTP also retains support for a combined
+certificate/private-key PEM in `client_cert_file`.
+
+These transports have local certificate, hostname, mTLS and actual daemon I/O
+regressions. The cross-host reference-provider campaigns documented separately
+used HTTP; they do not qualify a commercial WSS/gRPC service or deployment.
 
 ## Capability declarations and checks
 
@@ -101,10 +125,9 @@ schema, geometry, and secret-literal checks it rejects:
   names, or with a scheme the transport does not speak;
 - **plaintext transports to non-loopback hosts**: `http://`, `ws://`, and gRPC
   `http://` endpoints are accepted only for `localhost`, `127.0.0.0/8`, and
-  `::1`. Block data must not cross the network unencrypted; use `https://` or a
-  local tunnel. `wss://`, gRPC `https://`, and `[crypto.websocket.tls]` /
-  `[crypto.grpc.tls]` are refused because those transports have no TLS support
-  in this build;
+  `::1`. Use `https://` or `wss://` for remote endpoints. An explicit TLS section
+  requires encrypted URLs for every endpoint in that transport, including
+  loopback, so TLS options cannot be silently ignored;
 - HTTP batch layouts (`body.items_path`) whose response mapping lacks
   `items_path` or `item_index_path`: every batch element must echo its unit
   index so reordered, dropped, or duplicated results are detected;
@@ -114,9 +137,10 @@ schema, geometry, and secret-literal checks it rejects:
 - the `keyring` credential source, which this build does not implement, and
   the same credential name declared with different sources.
 
-The HTTP provider additionally refuses to start when a CA or client certificate
-file cannot be read or parsed, and reads `client_key` from its credential source
-to complete the client identity.
+The providers additionally refuse unreadable or invalid TLS material at
+construction or handshake, and read `client_key` from its credential source to
+complete the client identity. Certificate and hostname failures prevent
+successful attachment; they do not trigger a plaintext fallback.
 
 ## Compatibility identity
 

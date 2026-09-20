@@ -120,6 +120,7 @@ async fn provider(url: &str, timeout: Duration) -> WsCryptoProvider {
         capabilities: capabilities().await,
         timeout,
         max_frame_bytes: 1 << 20,
+        tls: None,
     })
 }
 

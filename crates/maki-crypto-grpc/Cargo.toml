@@ -12,9 +12,8 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls-native-roots"] }
 prost = "0.13"
-zeroize.workspace = true
 
 [dev-dependencies]
 maki-backing.workspace = true
@@ -22,3 +21,5 @@ maki-core.workspace = true
 maki-format.workspace = true
 maki-crypto-local.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+rcgen.workspace = true
+rustls.workspace = true

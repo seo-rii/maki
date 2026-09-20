@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::metadata::{MetadataKey, MetadataValue};
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
@@ -27,6 +27,8 @@ use protected::{WireItem, WireRequest, WireResponse};
 
 #[cfg(test)]
 mod protected_tests;
+#[cfg(test)]
+mod tls_tests;
 
 // ---------------------------------------------------------------- messages
 
@@ -118,7 +120,6 @@ pub fn class_of_code(code: tonic::Code) -> ErrorClass {
 
 // ---------------------------------------------------------------- provider
 
-#[derive(Clone)]
 pub struct GrpcProviderSpec {
     /// e.g. `http://crypto.internal:7000` (or https with TLS config).
     pub url: String,
@@ -130,6 +131,64 @@ pub struct GrpcProviderSpec {
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_message_bytes: usize,
+}
+
+impl Clone for GrpcProviderSpec {
+    fn clone(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            encrypt_path: self.encrypt_path.clone(),
+            decrypt_path: self.decrypt_path.clone(),
+            metadata: self.metadata.clone(),
+            capabilities: self.capabilities.clone(),
+            timeout: self.timeout,
+            max_message_bytes: self.max_message_bytes,
+        }
+    }
+}
+
+/// Client certificate and private key used for mutual TLS.
+pub struct GrpcClientIdentity {
+    pub certificate_pem: Vec<u8>,
+    pub private_key_pem: SecretBuffer,
+}
+
+impl Clone for GrpcClientIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificate_pem: self.certificate_pem.clone(),
+            private_key_pem: self.private_key_pem.duplicate(),
+        }
+    }
+}
+
+impl std::fmt::Debug for GrpcClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcClientIdentity")
+            .field("certificate_pem", &"<redacted>")
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Verified TLS configuration. Native platform roots remain enabled when a
+/// custom CA is supplied; the custom CA augments rather than replaces them.
+#[derive(Clone, Default)]
+pub struct GrpcTlsConfig {
+    pub ca_certificate_pem: Option<Vec<u8>>,
+    pub client_identity: Option<GrpcClientIdentity>,
+}
+
+impl std::fmt::Debug for GrpcTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcTlsConfig")
+            .field(
+                "ca_certificate_pem",
+                &self.ca_certificate_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("client_identity", &self.client_identity)
+            .finish()
+    }
 }
 
 /// Metadata values are resolved credentials: never printed (C-11).
@@ -163,10 +222,80 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 impl GrpcCryptoProvider {
     pub fn new(spec: GrpcProviderSpec) -> Result<Self, CryptoError> {
-        let channel = Channel::from_shared(spec.url.clone())
-            .map_err(|e| fatal(format!("bad endpoint url: {e}")))?
+        Self::build(spec, None)
+    }
+
+    pub fn new_with_tls(spec: GrpcProviderSpec, tls: GrpcTlsConfig) -> Result<Self, CryptoError> {
+        Self::build(spec, Some(tls))
+    }
+
+    fn build(spec: GrpcProviderSpec, tls: Option<GrpcTlsConfig>) -> Result<Self, CryptoError> {
+        let mut endpoint = Channel::from_shared(spec.url.clone())
+            .map_err(|e| fatal(format!("bad endpoint url: {e}")))?;
+        match (endpoint.uri().scheme_str(), tls) {
+            (Some("http"), None) => {
+                let host = endpoint
+                    .uri()
+                    .host()
+                    .ok_or_else(|| fatal("gRPC endpoint URL has no host"))?;
+                if !is_loopback_host(host) {
+                    return Err(fatal(
+                        "plaintext gRPC endpoints are permitted only on loopback",
+                    ));
+                }
+            }
+            (Some("http"), Some(_)) => {
+                return Err(fatal(
+                    "TLS configuration cannot be used with an http endpoint",
+                ));
+            }
+            (Some("https"), None) => {
+                return Err(fatal("https endpoint requires explicit TLS configuration"));
+            }
+            (Some("https"), Some(tls)) => {
+                let mut config = ClientTlsConfig::new().with_native_roots();
+                if let Some(ca) = tls.ca_certificate_pem {
+                    if ca.is_empty() {
+                        return Err(fatal("custom TLS CA certificate is empty"));
+                    }
+                    config = config.ca_certificate(Certificate::from_pem(ca));
+                }
+                if let Some(identity) = tls.client_identity {
+                    if identity.certificate_pem.is_empty() || identity.private_key_pem.is_empty() {
+                        return Err(fatal(
+                            "mTLS client certificate and private key must both be non-empty",
+                        ));
+                    }
+                    config = config.identity(Identity::from_pem(
+                        identity.certificate_pem,
+                        identity.private_key_pem.expose(),
+                    ));
+                }
+                endpoint = endpoint
+                    .tls_config(config)
+                    .map_err(|e| fatal(format!("invalid TLS configuration: {e}")))?;
+            }
+            (Some(scheme), _) => {
+                return Err(fatal(format!(
+                    "unsupported gRPC endpoint scheme {scheme:?}"
+                )));
+            }
+            (None, _) => return Err(fatal("gRPC endpoint URL has no scheme")),
+        }
+        let channel = endpoint
             .timeout(spec.timeout)
             .connect_timeout(spec.timeout)
             .connect_lazy();

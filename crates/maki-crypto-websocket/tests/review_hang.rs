@@ -59,6 +59,7 @@ fn provider(addr: SocketAddr, timeout: Duration) -> WsCryptoProvider {
         capabilities: caps(),
         timeout,
         max_frame_bytes: 1 << 20,
+        tls: None,
     })
 }
 
@@ -149,6 +150,7 @@ fn spec_debug_output_is_redacted() {
         capabilities: caps(),
         timeout: Duration::from_secs(1),
         max_frame_bytes: 1 << 20,
+        tls: None,
     };
     let text = format!("{spec:?}");
     assert!(

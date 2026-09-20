@@ -164,6 +164,7 @@ pub(super) fn provider() -> WsCryptoProvider {
         },
         timeout: Duration::from_secs(1),
         max_frame_bytes: 4096,
+        tls: None,
     })
 }
 

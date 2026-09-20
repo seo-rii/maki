@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
@@ -42,12 +43,50 @@ use maki_crypto::{
 mod request;
 mod response;
 
+/// TLS trust and optional mutual-TLS identity for a `wss://` endpoint.
+///
+/// The configured CA augments the platform and public roots. Client
+/// certificate and key must be provided together. The key uses the protected
+/// secret owner and is never included in debug output.
+#[derive(Clone, Default)]
+pub struct WsTlsOptions {
+    pub ca_pem: Option<Vec<u8>>,
+    pub client_cert_pem: Option<Vec<u8>>,
+    pub client_key_pem: Option<Arc<SecretBuffer>>,
+}
+
+impl std::fmt::Debug for WsTlsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsTlsOptions")
+            .field(
+                "ca_pem",
+                &self
+                    .ca_pem
+                    .as_ref()
+                    .map(|value| format!("{} bytes", value.len())),
+            )
+            .field(
+                "client_cert_pem",
+                &self
+                    .client_cert_pem
+                    .as_ref()
+                    .map(|value| format!("{} bytes", value.len())),
+            )
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct WsProviderSpec {
     pub url: String,
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_frame_bytes: usize,
+    pub tls: Option<WsTlsOptions>,
 }
 
 /// A URL may carry userinfo or a token query: print scheme and host only
@@ -71,6 +110,7 @@ impl std::fmt::Debug for WsProviderSpec {
             .field("capabilities", &self.capabilities)
             .field("timeout", &self.timeout)
             .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -143,6 +183,7 @@ impl Drop for MarkDeadOnDrop {
 
 pub struct WsCryptoProvider {
     spec: WsProviderSpec,
+    tls_connector: Result<Option<Connector>, String>,
     connection: AsyncMutex<Option<Connection>>,
     pending: Pending,
     next_id: AtomicU64,
@@ -164,14 +205,94 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
 
 impl WsCryptoProvider {
     pub fn new(spec: WsProviderSpec) -> Self {
+        let tls_connector = Self::build_tls_connector(&spec);
         Self {
             spec,
+            tls_connector,
             connection: AsyncMutex::new(None),
             pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             generation: AtomicU64::new(0),
             dead_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Construct a provider after validating its TLS configuration.
+    pub fn new_checked(spec: WsProviderSpec) -> Result<Self, CryptoError> {
+        let tls_connector = Self::build_tls_connector(&spec).map_err(CryptoError::ProviderFatal)?;
+        Ok(Self {
+            spec,
+            tls_connector: Ok(tls_connector),
+            connection: AsyncMutex::new(None),
+            pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            generation: AtomicU64::new(0),
+            dead_generation: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    fn build_tls_connector(spec: &WsProviderSpec) -> Result<Option<Connector>, String> {
+        let is_wss = spec
+            .url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("wss"));
+        if spec.tls.is_some() && !is_wss {
+            return Err("websocket TLS options require a wss:// URL".into());
+        }
+        if !is_wss {
+            return Ok(None);
+        }
+        let Some(tls) = &spec.tls else {
+            // tokio-tungstenite builds its verified rustls connector from the
+            // enabled system and public root sets.
+            return Ok(None);
+        };
+        if tls.client_cert_pem.is_some() != tls.client_key_pem.is_some() {
+            return Err("client certificate and private key must be configured together".into());
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        roots.add_parsable_certificates(native.certs);
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(ca_pem) = &tls.ca_pem {
+            let mut reader = std::io::BufReader::new(ca_pem.as_slice());
+            let certificates = rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("bad CA certificate: {error}"))?;
+            if certificates.is_empty() {
+                return Err("bad CA certificate: PEM contains no certificates".into());
+            }
+            let (added, _) = roots.add_parsable_certificates(certificates);
+            if added == 0 {
+                return Err("bad CA certificate: no valid certificates found".into());
+            }
+        }
+
+        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        let config = match (&tls.client_cert_pem, &tls.client_key_pem) {
+            (Some(cert_pem), Some(key_pem)) => {
+                let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
+                let certificates = rustls_pemfile::certs(&mut cert_reader)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("bad client certificate: {error}"))?;
+                if certificates.is_empty() {
+                    return Err("bad client certificate: PEM contains no certificates".into());
+                }
+                let mut key_reader = std::io::BufReader::new(key_pem.expose());
+                let key = rustls_pemfile::private_key(&mut key_reader)
+                    .map_err(|error| format!("bad client private key: {error}"))?
+                    .ok_or_else(|| {
+                        "bad client private key: PEM contains no private key".to_string()
+                    })?;
+                builder
+                    .with_client_auth_cert(certificates, key)
+                    .map_err(|error| format!("bad client identity: {error}"))?
+            }
+            (None, None) => builder.with_no_client_auth(),
+            _ => unreachable!("certificate/key pairing checked above"),
+        };
+        Ok(Some(Connector::Rustls(Arc::new(config))))
     }
 
     /// Fail only the requests owned by the retiring connection generation.
@@ -190,6 +311,11 @@ impl WsCryptoProvider {
     }
 
     async fn connect(&self) -> Result<Connection, CryptoError> {
+        let connector = self
+            .tls_connector
+            .as_ref()
+            .map_err(|message| CryptoError::ProviderFatal(message.clone()))?
+            .clone();
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
@@ -198,7 +324,12 @@ impl WsCryptoProvider {
         // mutex forever, and with it every request on this provider (C-05).
         let (ws, _response) = tokio::time::timeout(
             self.spec.timeout,
-            tokio_tungstenite::connect_async_with_config(&self.spec.url, Some(config), false),
+            tokio_tungstenite::connect_async_tls_with_config(
+                &self.spec.url,
+                Some(config),
+                false,
+                connector,
+            ),
         )
         .await
         .map_err(|_| retryable("websocket connect timeout"))?
