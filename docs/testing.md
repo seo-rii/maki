@@ -118,6 +118,29 @@ On Linux, the native test uses actual nbdkit and Python `ctypes` with
 the range. It does not require `nbdsh`, a kernel NBD attachment, or a mount.
 See [space reclamation](space-reclamation.md) for supported semantics and limits.
 
+### Encrypted transport validation
+
+`maki-crypto-websocket/tests/wss_tls.rs` and
+`maki-crypto-grpc/src/tls_tests.rs` run local TLS/mTLS peers, verify trust and
+hostname rejection, and preserve the transport request contracts. The WSS suite
+also uses a TLS-1.2-only peer and checks the exact upgrade URI.
+`maki-nbdkit/tests/review_wss_tls_daemon.rs` and
+`review_grpc_tls_daemon.rs` connect the configured provider through real daemon
+construction, attach self-test/canary, adapter write/read and shutdown. The gRPC
+daemon fixture additionally rejects wrong CA, hostname and missing mTLS identity.
+
+These fixtures validate local integration. Earlier cross-host provider and
+database campaigns used HTTP; WSS/gRPC commercial services, target-network
+behavior and long-running database workloads still need separate qualification.
+
+The combined 2026-09-20 implementation passed `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+`cargo test --workspace --locked`: 1,051 passing test invocations, zero failures
+and ten ignored tests. This run used an immutable source snapshot and a private
+`CARGO_TARGET_DIR`; evidence is in
+`~/logs/maki-tls-final-20260920T090302Z/` (`exit.status` 0, `test.log`).
+The ignored long-running and external-service gates were not part of this run.
+
 `maki-test-support` provides the reusable verification environment:
 
 | Component | Purpose |

@@ -43,10 +43,12 @@ Maki is designed around four constraints:
 > and same-key endpoint-address replacement with 48 ACK rows. Commercial vendor
 > and target deployment behavior remain unqualified.
 
-**Volume compatibility:** new volumes require superblock envelope v2 and
-mirrored durable proofs. Older binaries reject v2, and this build refuses
-writable recovery of legacy v1 volumes. The crypto AAD format version is
-unchanged. Read [durable recovery and migration](docs/durable-recovery.md)
+**Volume compatibility:** new volumes default to superblock envelope v2 and
+mirrored durable proofs. `maki volume create <config> --discard` explicitly
+selects v3 for new volumes with [TRIM and space reclamation](docs/space-reclamation.md).
+Older binaries reject unsupported envelopes, and this build refuses writable
+recovery of legacy v1 volumes. The crypto AAD format version is unchanged.
+Read [durable recovery and migration](docs/durable-recovery.md)
 before replacing an existing installation; no automatic in-place upgrade is
 provided.
 
@@ -55,6 +57,8 @@ provided.
 - Crash-safe ciphertext journal, checkpointing, and A/B metadata.
 - Local AES-256-GCM-SIV and AES-256-XTS providers.
 - Configurable HTTP, WebSocket, and gRPC crypto transports.
+- Verified HTTPS/WSS/gRPC TLS and optional mutual TLS.
+- Opt-in durable TRIM for new v3 volumes, with Linux backing-space reclamation.
 - Provider contract validation, retry budgets, circuit breakers, and failover.
 - Versioned plaintext read cache with zeroization on eviction.
 - Offline format checking and deterministic crash simulation.
@@ -70,7 +74,7 @@ provided.
 | Core engine, format, recovery, and provider contracts | v2 durability baseline passed workspace tests, nine release gates and Linux/Windows CI; subsequent fixes and remaining limits are tracked in the [R3 readiness record](docs/production-readiness-review-2026-09-08.md) |
 | nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
 | HTTP transport TLS and provider fault handling | Automated tests plus cross-host VPC campaigns passed TLS 1.2/1.3 mTLS, bearer refusal, two-provider failover, total-outage stall/resume, lifecycle restart, stopped bearer/mTLS-client rotation, private server-CA overlap/removal, and same-key endpoint-address replacement; commercial vendors and target deployment behavior remain open |
-| WebSocket and gRPC transports | Implemented; TLS currently fails closed |
+| WebSocket and gRPC transports | Verified TLS/mTLS and local daemon I/O tests pass; external vendor and deployment qualification remain open |
 | Kernel `/dev/nbd`, LVM, XFS, and fio path | Installed systemd recovery plus two automatic nbdkit-crash cycles and one open-target failure/retry passed on one pinned single-PV/LV Debian 12 GCE topology; a second campaign proved fail-closed two-LV and same-NBD foreign-backend boundaries; other target topologies remain |
 | Debian package and migration path | Clean install and generated-package upgrade preserved two attached-volume DB hashes, configs and credentials; SQLite DB-native restore passed both a same-key package campaign and a distinct K1-to-K2 three-host migration, and one old-reader legacy-v1 backup into v2 passed |
 | Real database and vendor-provider workloads | SQLite WAL passed installed-lifecycle, fresh-host, DB-native/legacy migration, loopback-provider, and cross-host TLS reference-provider campaigns; checksummed PostgreSQL 15 recovered after postmaster SIGKILL, passed four `pg_amcheck` runs, and retained 48 ACK rows through a Maki restart; production DB profiles, other engines, commercial vendor endpoints and their network behavior, and broader migration profiles remain open |

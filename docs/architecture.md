@@ -272,6 +272,11 @@ connection replacement, and provider drop retire that generation, cancel its
 task, release its socket, and fail its pending requests without disturbing a
 successor connection.
 
+All remote transports support verified TLS and optional client certificate
+authentication. WSS and gRPC configuration resolves client keys through the
+same credential router as HTTP. Explicit TLS settings cannot be applied to a
+plaintext endpoint, and certificate failures never downgrade the connection.
+
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
 jitter retry. Retry budgets, circuit breakers, endpoint limits, and global byte
@@ -313,6 +318,10 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 - Repeated credential names must declare the same source throughout a volume
   configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.
+- Whole-image and same-unit historical rollback remain outside the current
+  freshness guarantee. The [rollback protection proposal](rollback-protection-design.md)
+  describes an independent witness and retained authenticated generations;
+  those mechanisms are not implemented.
 
 See [Configuration](configuration.md), [Operations](operations.md), and the
 [technical specification](../SPEC.md) for detailed contracts.
