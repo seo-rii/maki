@@ -93,6 +93,34 @@ and the Debian package suite passed three. Both exited 0; logs are under
 (supervisor PID 1278408). These package checks use fixture artifacts and do not
 repeat the earlier real-host package upgrade campaign.
 
-A subsequent 100-round run is intended for background execution. Starting it
-does not establish success; consult its own terminal status and logs before
-recording any additional qualification result.
+## Completed 100-round execution, 2026-09-20
+
+The background run at `9fec035e92d1ea96ae9fa66f93e1fb3561d70684` completed
+**100/100 rounds**, with **500 successful suite invocations and 3,600 passing
+test invocations**. The supervisor exited **0** after 9,874.2 seconds
+(2 hours, 44 minutes, 34 seconds). It started at 2026-09-19 23:38:56 KST and
+finished at **2026-09-20 02:23:30 KST**. No suite failed, timed out, or omitted
+an enumerated test. The CI run for this revision also
+[passed](https://github.com/seo-rii/maki/actions/runs/35449380444).
+
+| Suite | Completed invocations | Passing test invocations |
+| --- | ---: | ---: |
+| `phase11_dbsim` | 100 | 300 |
+| `phase12_powerloss` | 100 | 400 |
+| `review_stress` | 100 | 200 |
+| `review_r3_space_admission` | 100 | 1,400 |
+| `review_r3_recovery_memory` | 100 | 1,300 |
+
+The private evidence directory is
+`/home/seorii/logs/maki-storage-20260919T143856Z-b26167`; supervisor PID 1285310
+has exited. `status.json` contains the final exit code, `results.jsonl` the
+500 per-suite outcomes, and `round-*.log` their output. A subsequent audit
+confirmed every expected round/suite pair appears exactly once, every outcome
+has exit 0 and the enumerated pass count, and the source archive and all five
+binary hashes still match their recorded manifests.
+
+This closes the requested repeated model-regression run only. It repeats the
+existing fixed seeds, starts a new process per suite and retains the scope
+limits above. It does not establish real-DB sustained-load, physical-power,
+or 24 CPU-hour-per-target parser qualification; the parser campaign has not
+been launched.

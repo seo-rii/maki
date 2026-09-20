@@ -251,8 +251,11 @@ deadline from an explicit TLS error. See the
 For unattended repetition of the existing DB model, persistence, concurrency,
 space-admission and recovery-allocation tests, see the
 [background storage runner](background-storage-validation.md). It freezes inputs,
-records status and exit codes, and supports cancellation. Repeated fixed-seed
-model runs do not replace real-DB or physical-power qualification.
+records status and exit codes, and supports cancellation. The run at `9fec035`
+finished on 2026-09-20 with 100/100 rounds, 500 successful suite invocations,
+3,600 passing test invocations and supervisor exit 0; its result ledger and
+source/binary hashes were verified. Repeated fixed-seed model runs do not
+replace real-DB, physical-power or long-duration parser qualification.
 
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
