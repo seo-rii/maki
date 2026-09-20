@@ -6,15 +6,13 @@ use std::cell::Cell;
 
 use std::time::Duration;
 
-use maki_crypto::{BatchCapability, Capability, CryptoCapabilities, CryptoContext};
-use maki_crypto_local::keysource::MapKeySource;
-use serde_json::{json, Value};
-use zeroize::Zeroizing;
-
 use super::{
     append_response_chunk, pointer_set, zeroize_json, BodySpec, FieldSource, HttpCryptoProvider,
-    HttpProviderSpec, OpSpec, PayloadEncoding, RespKind, RespSpec, Sensitive,
+    HttpProviderSpec, OpSpec, PayloadEncoding, RespKind, RespSpec,
 };
+use maki_crypto::{BatchCapability, Capability, CryptoCapabilities, CryptoContext, SecretBuffer};
+use maki_crypto_local::keysource::MapKeySource;
+use serde_json::{json, Value};
 
 const PAYLOAD_LEN: usize = 257;
 const FILL: u8 = 0xa5;
@@ -192,14 +190,29 @@ fn malformed_hex_erases_partial_decoded_output() {
 fn response_growth_erases_the_replaced_plaintext_allocation() {
     begin_inspection();
 
-    let mut response = zeroize::Zeroizing::new(Vec::with_capacity(PAYLOAD_LEN));
-    response.extend_from_slice(&[FILL; PAYLOAD_LEN]);
+    let mut response = SecretBuffer::with_capacity(PAYLOAD_LEN).unwrap();
+    response
+        .try_extend_from_slice(&[FILL; PAYLOAD_LEN])
+        .unwrap();
     append_response_chunk(&mut response, &[FILL], PAYLOAD_LEN + 1).unwrap();
     drop(response);
 
     let inspection = finish_inspection();
     assert_eq!(inspection.plaintext_deallocations, 0, "{inspection:?}");
     assert!(inspection.zeroized >= 2, "{inspection:?}");
+}
+
+#[test]
+fn response_owner_is_page_lock_capable_before_plaintext_is_written() {
+    use maki_crypto::secret::{page_lock_failures, set_page_locking};
+
+    set_page_locking(true);
+    let before = page_lock_failures();
+    let mut response = super::new_response_buffer(PAYLOAD_LEN).unwrap();
+    assert!(response.is_page_locked() || page_lock_failures() > before);
+    append_response_chunk(&mut response, &[FILL; PAYLOAD_LEN], PAYLOAD_LEN).unwrap();
+    assert_eq!(response.expose(), &[FILL; PAYLOAD_LEN]);
+    set_page_locking(false);
 }
 
 #[test]
@@ -470,7 +483,7 @@ async fn per_item_build_error_erases_the_partial_request_tree() {
     });
     let provider = test_provider(&op);
     let context = test_context();
-    let items: Vec<(u64, Sensitive)> = vec![(0, Zeroizing::new(vec![0]))];
+    let items = vec![(0, SecretBuffer::from_slice(&[0]))];
 
     begin_inspection();
     let result = provider.run_per_item(&op, &context, &items).await;
@@ -490,8 +503,10 @@ async fn batch_build_error_erases_all_completed_item_trees() {
     });
     let provider = test_provider(&op);
     let context = test_context();
-    let items: Vec<(u64, Sensitive)> =
-        vec![(0, Zeroizing::new(vec![0])), (1, Zeroizing::new(vec![0]))];
+    let items = vec![
+        (0, SecretBuffer::from_slice(&[0])),
+        (1, SecretBuffer::from_slice(&[0])),
+    ];
 
     begin_inspection();
     let result = provider

@@ -9,7 +9,7 @@ do not measure total resident memory.
 ## HTTP decoded payloads
 
 HTTP response payloads are decoded into an exactly sized
-`Zeroizing<Vec<u8>>`. The guard exists before the first Base64, Base64URL, or
+`SecretBuffer`. The guard exists before the first Base64, Base64URL, or
 hex byte is written, and the fixed allocation cannot reallocate while decoding.
 A malformed symbol therefore erases partial output before returning the error;
 successful extraction moves the same guard into the provider result. Dropping a
@@ -32,14 +32,29 @@ an intermediate vector. The combined mTLS certificate/private-key PEM is
 guarded during construction and erased when its TLS specification is dropped,
 including construction and client-builder errors.
 
-HTTP payload, body, response, JSON, credential-value and identity-PEM owners use
-zeroizing vectors or strings, not page-locked `SecretBuffer`s. Plain source
+Maki-owned payloads, serialized request bodies, streamed response buffers and
+decoded outputs use page-lock-capable `SecretBuffer`s. Fixed-capacity allocation
+locks the whole allocation before plaintext is appended, when locking is
+enabled and succeeds. Response growth acquires a new guarded allocation before
+copying, then erases and releases the old owner. `Bytes::from_owner` retains the
+request-body guard until the last HTTP body clone is released. Raw decryption
+responses transfer their owner directly to the caller.
+
+JSON trees, credential-value strings and combined identity PEMs still have
+zeroizing ownership without per-allocation page locks. Plain source
 configuration strings and copies made inside reqwest, hyper, rustls or the
 kernel remain outside this ownership. A malformed JSON response may make
 serde_json discard partial parser-owned allocations before it returns a Value
 that Maki can guard. Admission also does not account for simultaneous decoded,
 encoded and library copies. MAKI-015 and the total-memory work in MAKI-032
 therefore remain open.
+
+The 2026-09-20 follow-up passed the complete `maki-crypto` and
+`maki-crypto-http` suites (175 passing invocations, two ignored) and strict
+all-target Clippy. Linux page-lifetime tests verify that spare-capacity pages
+remain locked, that shared-page owners retain their locks, and that memory is
+erased before deallocation. Evidence:
+`~/logs/maki-http-memory-20260920T084013Z/` (`exit.status` 0).
 
 ## WebSocket requests
 
@@ -105,7 +120,7 @@ in type-error messages. JSON syntax, recursion and frame limits are unchanged.
 Allocation tests inspect initialized bytes immediately before deallocation,
 including unique sliced payloads whose original prefix and suffix become
 spare capacity. Drop erases the adopted vector's full capacity. Optional page
-locking covers its exposed byte range, not every page of spare capacity.
+locking covers the entire allocation, including pages of spare capacity.
 Shared source owners, tungstenite read/framing buffers and serde's private
 escape-decoding scratch retain library-controlled lifetimes. The response
 tree's container/number storage and many small values also remain outside any

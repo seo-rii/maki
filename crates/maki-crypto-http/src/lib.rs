@@ -32,23 +32,22 @@ mod sensitive_tests;
 /// what covers them.
 pub type Sensitive = Zeroizing<Vec<u8>>;
 
-/// A request body wiped once reqwest has released it: `Bytes::from_owner`
-/// keeps the zeroizing vector alive while any clone of the body exists and
-/// drops (wipes) it afterwards, instead of copying it into a plain buffer.
-struct WipedOnDrop(Sensitive);
+/// A request body kept page-lock-capable until reqwest releases its last
+/// clone. `Bytes::from_owner` avoids a provider-side body copy.
+struct LockedBody(SecretBuffer);
 
-impl AsRef<[u8]> for WipedOnDrop {
+impl AsRef<[u8]> for LockedBody {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self.0.expose()
     }
 }
 
-fn body_from(bytes: Sensitive) -> reqwest::Body {
-    reqwest::Body::from(bytes::Bytes::from_owner(WipedOnDrop(bytes)))
+fn body_from(bytes: SecretBuffer) -> reqwest::Body {
+    reqwest::Body::from(bytes::Bytes::from_owner(LockedBody(bytes)))
 }
 
 fn append_response_chunk(
-    out: &mut Sensitive,
+    out: &mut SecretBuffer,
     chunk: &[u8],
     limit: usize,
 ) -> Result<(), CryptoError> {
@@ -62,7 +61,8 @@ fn append_response_chunk(
         )));
     }
     if length <= out.capacity() {
-        out.extend_from_slice(chunk);
+        out.try_extend_from_slice(chunk)
+            .expect("capacity was checked");
         return Ok(());
     }
 
@@ -70,17 +70,25 @@ fn append_response_chunk(
     // giving its owner a chance to wipe that allocation. Move through a new
     // fixed-capacity guard and erase the replaced owner explicitly instead.
     let capacity = out.capacity().saturating_mul(2).max(length).min(limit);
-    let mut grown = Zeroizing::new(Vec::new());
-    grown.try_reserve_exact(capacity).map_err(|_| {
+    let mut grown = SecretBuffer::with_capacity(capacity).map_err(|_| {
         CryptoError::NonRetryableRequest(format!(
             "response of {length} bytes cannot be held within limit {limit}"
         ))
     })?;
-    grown.extend_from_slice(out);
-    grown.extend_from_slice(chunk);
-    out.zeroize();
+    grown
+        .try_extend_from_slice(out.expose())
+        .and_then(|()| grown.try_extend_from_slice(chunk))
+        .expect("new response capacity was checked");
     *out = grown;
     Ok(())
+}
+
+fn new_response_buffer(limit: usize) -> Result<SecretBuffer, CryptoError> {
+    SecretBuffer::with_capacity(limit.min(8192)).map_err(|_| {
+        CryptoError::NonRetryableRequest(format!(
+            "response buffer cannot be allocated within limit {limit}"
+        ))
+    })
 }
 
 /// Wipe every string in a JSON document in place. Payload encodings are
@@ -156,6 +164,10 @@ impl PayloadEncoding {
     }
 
     pub fn decode(&self, s: &str) -> Result<Sensitive, CryptoError> {
+        Ok(Zeroizing::new(self.decode_secret(s)?.into_vec()))
+    }
+
+    fn decode_secret(&self, s: &str) -> Result<SecretBuffer, CryptoError> {
         let bad = |e: String| CryptoError::Contract(format!("payload decode failed: {e}"));
         let bytes = s.as_bytes();
         let decoded_len = match self {
@@ -196,11 +208,11 @@ impl PayloadEncoding {
         // Own the zeroization guard before writing the first decoded byte.
         // A malformed symbol near the end must wipe the partial plaintext,
         // and a fixed-size allocation cannot abandon plaintext while growing.
-        let mut decoded = Zeroizing::new(vec![0u8; decoded_len]);
+        let mut decoded = SecretBuffer::zeroed(decoded_len);
         match self {
             Self::Base64 => {
                 let written = base64::engine::general_purpose::STANDARD
-                    .decode_slice(s, &mut decoded)
+                    .decode_slice(s, decoded.expose_mut())
                     .map_err(|e| bad(e.to_string()))?;
                 if written != decoded_len {
                     return Err(bad("decoded payload length mismatch".to_string()));
@@ -208,7 +220,7 @@ impl PayloadEncoding {
             }
             Self::Base64Url => {
                 let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode_slice(s, &mut decoded)
+                    .decode_slice(s, decoded.expose_mut())
                     .map_err(|e| bad(e.to_string()))?;
                 if written != decoded_len {
                     return Err(bad("decoded payload length mismatch".to_string()));
@@ -224,7 +236,7 @@ impl PayloadEncoding {
                 for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
                     let high = digit(pair[0]).ok_or_else(|| bad("invalid hex digit".into()))?;
                     let low = digit(pair[1]).ok_or_else(|| bad("invalid hex digit".into()))?;
-                    decoded[index] = high << 4 | low;
+                    decoded.expose_mut()[index] = high << 4 | low;
                 }
             }
         }
@@ -592,7 +604,7 @@ impl HttpCryptoProvider {
         op: &OpSpec,
         body: reqwest::Body,
         json: bool,
-    ) -> Result<Sensitive, CryptoError> {
+    ) -> Result<SecretBuffer, CryptoError> {
         let method = reqwest::Method::from_bytes(op.method.as_bytes())
             .map_err(|_| fatal(format!("bad method {:?}", op.method)))?;
         let url = format!("{}{}", self.spec.base_url, op.path);
@@ -621,7 +633,7 @@ impl HttpCryptoProvider {
             }
         }
         // Stream with a hard cap regardless of the declared length.
-        let mut out = Zeroizing::new(Vec::new());
+        let mut out = new_response_buffer(self.spec.max_response_bytes)?;
         let mut response = response;
         while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
             append_response_chunk(&mut out, &chunk, self.spec.max_response_bytes)?;
@@ -629,11 +641,11 @@ impl HttpCryptoProvider {
         Ok(out)
     }
 
-    fn parse_single(&self, op: &OpSpec, body: &[u8]) -> Result<Sensitive, CryptoError> {
+    fn parse_single(&self, op: &OpSpec, body: SecretBuffer) -> Result<SecretBuffer, CryptoError> {
         match op.response.kind {
-            RespKind::Raw => Ok(Zeroizing::new(body.to_vec())),
+            RespKind::Raw => Ok(body),
             RespKind::Json => {
-                let mut value: Value = serde_json::from_slice(body)
+                let mut value: Value = serde_json::from_slice(body.expose())
                     .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
                 let result = (|| {
                     let path = op
@@ -647,7 +659,7 @@ impl HttpCryptoProvider {
                         .ok_or_else(|| {
                             CryptoError::Contract(format!("response missing string at {path:?}"))
                         })?;
-                    op.response.encoding.decode(data)
+                    op.response.encoding.decode_secret(data)
                 })();
                 zeroize_json(&mut value);
                 result
@@ -656,10 +668,46 @@ impl HttpCryptoProvider {
     }
 
     /// Serialize a request document and wipe it.
-    fn encode_and_wipe(root: &mut Value) -> Sensitive {
-        let encoded = Zeroizing::new(serde_json::to_vec(root).expect("JSON value serializes"));
+    fn encode_and_wipe(root: &mut Value) -> Result<SecretBuffer, CryptoError> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("serialized request size overflow"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct GuardedWriter<'a>(&'a mut SecretBuffer);
+        impl std::io::Write for GuardedWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .try_extend_from_slice(bytes)
+                    .map_err(|_| std::io::Error::other("serialized request size changed"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, &*root)
+            .map_err(|e| CryptoError::NonRetryableRequest(format!("request encode failed: {e}")))?;
+        let mut encoded = SecretBuffer::with_capacity(count.0).map_err(|_| {
+            CryptoError::NonRetryableRequest(format!(
+                "serialized request of {} bytes cannot be allocated",
+                count.0
+            ))
+        })?;
+        serde_json::to_writer(GuardedWriter(&mut encoded), &*root)
+            .map_err(|e| CryptoError::NonRetryableRequest(format!("request encode failed: {e}")))?;
         zeroize_json(root);
-        encoded
+        Ok(encoded)
     }
 
     /// One request per item.
@@ -667,23 +715,29 @@ impl HttpCryptoProvider {
         &self,
         op: &OpSpec,
         context: &CryptoContext,
-        items: &[(u64, Sensitive)],
-    ) -> Result<Vec<Sensitive>, CryptoError> {
+        items: &[(u64, SecretBuffer)],
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let mut out = Vec::with_capacity(items.len());
         for (batch_index, (unit_index, payload)) in items.iter().enumerate() {
             let (body, json): (reqwest::Body, bool) = match &op.body {
-                BodySpec::Raw => (body_from(payload.clone()), false),
+                BodySpec::Raw => (body_from(payload.duplicate()), false),
                 BodySpec::Json { fields, .. } => {
                     let mut root = WipedJson::new(Value::Object(serde_json::Map::new()));
                     for (pointer, source) in fields {
-                        let v = Self::scalar(source, context, *unit_index, batch_index, payload);
+                        let v = Self::scalar(
+                            source,
+                            context,
+                            *unit_index,
+                            batch_index,
+                            payload.expose(),
+                        );
                         pointer_set(&mut root.0, pointer, v)?;
                     }
-                    (body_from(Self::encode_and_wipe(&mut root.0)), true)
+                    (body_from(Self::encode_and_wipe(&mut root.0)?), true)
                 }
             };
             let response = self.send(op, body, json).await?;
-            out.push(self.parse_single(op, &response)?);
+            out.push(self.parse_single(op, response)?);
         }
         Ok(out)
     }
@@ -693,11 +747,11 @@ impl HttpCryptoProvider {
         &self,
         op: &OpSpec,
         context: &CryptoContext,
-        items: &[(u64, Sensitive)],
+        items: &[(u64, SecretBuffer)],
         items_path: &str,
         fields: &[(String, FieldSource)],
         item_fields: &[(String, FieldSource)],
-    ) -> Result<Vec<Sensitive>, CryptoError> {
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let mut root = WipedJson::new(Value::Object(serde_json::Map::new()));
         for (pointer, source) in fields {
             let v = Self::scalar(source, context, 0, 0, &[]);
@@ -707,7 +761,7 @@ impl HttpCryptoProvider {
         for (batch_index, (unit_index, payload)) in items.iter().enumerate() {
             let mut element = WipedJson::new(Value::Object(serde_json::Map::new()));
             for (pointer, source) in item_fields {
-                let v = Self::scalar(source, context, *unit_index, batch_index, payload);
+                let v = Self::scalar(source, context, *unit_index, batch_index, payload.expose());
                 pointer_set(&mut element.0, pointer, v)?;
             }
             array
@@ -719,9 +773,9 @@ impl HttpCryptoProvider {
         pointer_set(&mut root.0, items_path, array.take())?;
 
         let response = self
-            .send(op, body_from(Self::encode_and_wipe(&mut root.0)), true)
+            .send(op, body_from(Self::encode_and_wipe(&mut root.0)?), true)
             .await?;
-        let mut value: Value = serde_json::from_slice(&response)
+        let mut value: Value = serde_json::from_slice(response.expose())
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
         let result = Self::extract_batch(op, &value, items);
         zeroize_json(&mut value);
@@ -732,8 +786,8 @@ impl HttpCryptoProvider {
     fn extract_batch(
         op: &OpSpec,
         value: &Value,
-        items: &[(u64, Sensitive)],
-    ) -> Result<Vec<Sensitive>, CryptoError> {
+        items: &[(u64, SecretBuffer)],
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let resp_items_path = op
             .response
             .items_path
@@ -770,7 +824,7 @@ impl HttpCryptoProvider {
             .ok_or_else(|| {
                 CryptoError::Contract(format!("batch element {i} missing payload string"))
             })?;
-            out.push(op.response.encoding.decode(data)?);
+            out.push(op.response.encoding.decode_secret(data)?);
         }
         Ok(out)
     }
@@ -779,8 +833,8 @@ impl HttpCryptoProvider {
         &self,
         op: &OpSpec,
         context: &CryptoContext,
-        items: &[(u64, Sensitive)],
-    ) -> Result<Vec<Sensitive>, CryptoError> {
+        items: &[(u64, SecretBuffer)],
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         match &op.body {
             BodySpec::Json {
                 fields,
@@ -992,9 +1046,9 @@ impl CryptoProvider for HttpCryptoProvider {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let payloads: Vec<(u64, Sensitive)> = items
+        let payloads: Vec<(u64, SecretBuffer)> = items
             .iter()
-            .map(|i| (i.unit_index, Zeroizing::new(i.data.expose().to_vec())))
+            .map(|i| (i.unit_index, i.data.duplicate()))
             .collect();
         let results = self.run_op(&self.spec.encrypt, context, &payloads).await?;
         Ok(results
@@ -1002,7 +1056,7 @@ impl CryptoProvider for HttpCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| CiphertextUnit {
                 unit_index: item.unit_index,
-                data: data.to_vec(),
+                data: data.into_vec(),
             })
             .collect())
     }
@@ -1012,9 +1066,9 @@ impl CryptoProvider for HttpCryptoProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let payloads: Vec<(u64, Sensitive)> = items
+        let payloads: Vec<(u64, SecretBuffer)> = items
             .iter()
-            .map(|i| (i.unit_index, Zeroizing::new(i.data.clone())))
+            .map(|i| (i.unit_index, SecretBuffer::from_slice(&i.data)))
             .collect();
         let results = self.run_op(&self.spec.decrypt, context, &payloads).await?;
         Ok(results
@@ -1022,7 +1076,7 @@ impl CryptoProvider for HttpCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| PlaintextUnit {
                 unit_index: item.unit_index,
-                data: SecretBuffer::from_slice(&data),
+                data,
             })
             .collect())
     }

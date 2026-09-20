@@ -126,6 +126,22 @@ fn zeroization_case() {
     );
 }
 
+fn spare_capacity_lock_case() {
+    // Use several pages so locking only the one initialized byte cannot make
+    // the final spare-capacity page appear locked by alignment coincidence.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mut bytes = Vec::with_capacity(page_size * 3);
+    bytes.push(0xA5);
+    let buffer = SecretBuffer::from_vec(bytes);
+    assert!(buffer.is_page_locked(), "this regression requires mlock");
+    let allocation_start = buffer.expose().as_ptr() as usize;
+    assert!(kernel_page_locked(allocation_start));
+    assert!(
+        kernel_page_locked(allocation_start + buffer.capacity() - 1),
+        "spare capacity escaped the page lock"
+    );
+}
+
 fn locking_failure_case() {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -156,6 +172,7 @@ fn secret_page_lifetimes() {
             "into_vec" => shared_page_case(true, false),
             "duplicate" => shared_page_case(false, true),
             "zeroize" => zeroization_case(),
+            "spare_capacity_lock" => spare_capacity_lock_case(),
             "locking_failure" => locking_failure_case(),
             _ => panic!("unknown case"),
         }
@@ -168,6 +185,7 @@ fn secret_page_lifetimes() {
         "into_vec",
         "duplicate",
         "zeroize",
+        "spare_capacity_lock",
         "locking_failure",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
