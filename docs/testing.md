@@ -312,6 +312,21 @@ finished on 2026-09-20 with 100/100 rounds, 500 successful suite invocations,
 source/binary hashes were verified. Repeated fixed-seed model runs do not
 replace real-DB, physical-power or long-duration parser qualification.
 
+A new extended campaign started at 2026-09-20 11:18:48 UTC from `f5bde3e`:
+100 rounds, eight suites, maximum six hours, PID 1485542. Its result is pending.
+The private run directory is `~/logs/maki-storage-20260920T111848Z-5111c6/`;
+`status.json` records progress and terminal exit code, `results.jsonl` records
+each completed suite, and `supervisor.log` retains controller diagnostics.
+Inspect or cancel without restarting the job:
+
+```bash
+python3 -B scripts/storage-repeat-validation.py status --run-dir ~/logs/maki-storage-20260920T111848Z-5111c6
+python3 -B scripts/storage-repeat-validation.py cancel --run-dir ~/logs/maki-storage-20260920T111848Z-5111c6
+```
+
+The separate [v3 GCE reset campaign](gce-discard-reset-validation-2026-09-20.md)
+uses the normal release build and automatically deletes its disposable resources.
+
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |

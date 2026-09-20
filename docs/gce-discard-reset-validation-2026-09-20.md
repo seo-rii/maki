@@ -1,10 +1,8 @@
 # GCE discard/reset validation — 2026-09-20
 
-This document defines the opt-in `v3-discard` GCE hard-reset campaign. The
-campaign has not yet been run. Results, artifact hashes, resource identities,
-and cleanup evidence must be added only after the disposable resources have
-been exercised and deleted. The existing default `v2` write/readback campaign
-remains unchanged.
+This document defines the opt-in `v3-discard` GCE hard-reset campaign. An
+unattended campaign was launched on 2026-09-20; its result and cleanup are still
+pending. The existing default `v2` write/readback campaign remains unchanged.
 
 ## Qualification target
 
@@ -74,3 +72,38 @@ python3 -B -m unittest scripts.test_gcp_reset_validation -v
 PYTHONOPTIMIZE=1 python3 -B -m unittest scripts.test_gcp_reset_validation -v
 ```
 
+Both normal and optimized Python passed all 66 fault-oracle regressions before
+launch. The combined product snapshot passed 1,057 Rust tests, strict dependency
+audit, formatting, and workspace all-target Clippy.
+
+## Background run handoff
+
+The fixed product revision is `fe259e3` and harness revision is `f5bde3e`.
+The normal release build completed with exit 0 under
+`~/logs/maki-v3-release-20260920T111425Z/`.
+The independent controller PID is 1485278 and its private run directory is
+`~/logs/maki-gce-v3-20260920T1118Z/`.
+
+The launcher selects one Debian 12 `e2-standard-2` VM with a 20 GiB boot disk
+and separate 20 GiB ext4 data disk in project `hancomac`, zone
+`asia-northeast3-a`. Its generated names are `maki-v3-reset-b03ff94591` and
+`maki-v3-reset-b03ff94591-data`. No service account or scopes are attached.
+Both disks are auto-delete. In addition to the launcher's final cleanup, a
+fixed two-hour termination time requests instance deletion even if the
+controller is interrupted. See the official
+[VM runtime limit](https://docs.cloud.google.com/compute/docs/instances/limit-vm-runtime).
+
+The launcher saves phase progress in `status.json`, terminal exit code in
+`exit.status`, and private command logs beside `supervisor.log`. It collects
+setup diagnostics and volume metadata before deletion, then verifies exact
+empty instance and disk queries. A campaign pass is only reported if the
+controller's ACK/readback/deep-check result passes and cleanup is confirmed.
+
+```bash
+cat ~/logs/maki-gce-v3-20260920T1118Z/status.json
+test ! -f ~/logs/maki-gce-v3-20260920T1118Z/exit.status || cat ~/logs/maki-gce-v3-20260920T1118Z/exit.status
+```
+
+The volume is 128 MiB, uses eight 16 MiB logical ranges and the real local
+AES-GCM-SIV provider. This is a native userspace NBD reset test; it does not
+mount a production database or power-cycle the physical Persistent Disk service.
