@@ -3,8 +3,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -18,6 +20,38 @@ class BackgroundStorageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def test_each_started_campaign_uses_its_own_target_directory(self):
+        def completed(command, **_kwargs):
+            if command[:2] == ["git", "archive"]:
+                output = next(value for value in command if value.startswith("--output="))
+                Path(output.split("=", 1)[1]).write_bytes(b"frozen source")
+            return subprocess.CompletedProcess(command, 0)
+
+        process = mock.Mock(pid=os.getpid())
+        args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
+        with mock.patch.object(self.runner.Path, "home", return_value=self.root), \
+                mock.patch.object(
+                    self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)
+                ), \
+                mock.patch.object(self.runner.subprocess, "run", side_effect=completed), \
+                mock.patch.object(
+                    self.runner.subprocess,
+                    "check_output",
+                    side_effect=["revision-one\n", "rustc fixture\n", "cargo fixture\n",
+                                 "revision-two\n", "rustc fixture\n", "cargo fixture\n"],
+                ), \
+                mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
+            self.runner.start(args)
+            first = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
+            self.runner.start(args)
+            second = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
+
+        first_config = json.loads((Path(first["run_dir"]) / "config.json").read_text())
+        second_config = json.loads((Path(second["run_dir"]) / "config.json").read_text())
+        self.assertEqual(Path(first_config["target_dir"]), Path(first["run_dir"]) / "target")
+        self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
+        self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
 
     def test_only_complete_nonempty_test_results_are_accepted(self):
         valid = "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.2s"

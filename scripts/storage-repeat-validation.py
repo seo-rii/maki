@@ -16,7 +16,9 @@ import uuid
 
 
 SUITES = ("phase11_dbsim", "phase12_powerloss", "review_stress",
-          "review_r3_space_admission", "review_r3_recovery_memory")
+          "review_r3_space_admission", "review_r3_recovery_memory",
+          "review_discard_crash", "review_discard_model",
+          "review_discard_reclaim_retry")
 TERMINAL = {"passed", "failed", "cancelled", "incomplete"}
 
 
@@ -203,6 +205,8 @@ def start(args):
     directory.mkdir(mode=0o700)
     source = directory / "source"
     source.mkdir(mode=0o700)
+    target = directory / "target"
+    target.mkdir(mode=0o700)
     archive = directory / "source.tar"
     subprocess.run(["git", "archive", "--format=tar", f"--output={archive}", revision], cwd=repo, check=True)
     subprocess.run(["tar", "-xf", str(archive), "-C", str(source)], check=True)
@@ -210,7 +214,7 @@ def start(args):
     shutil.copyfile(__file__, runner)
     runner.chmod(0o400)
     save_json(directory / "config.json", {
-        "revision": revision, "source": str(source), "target_dir": str(repo / "target"),
+        "revision": revision, "source": str(source), "target_dir": str(target),
         "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
         "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
