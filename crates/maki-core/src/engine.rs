@@ -1264,7 +1264,7 @@ impl EngineInner {
     /// the backing is low on space, or the interval elapsed with work
     /// pending (unsynced records are synced first so they can be applied).
     async fn worker_pass(self: &Arc<Self>) {
-        let (total, appended, checkpointed, durable, covered) = {
+        let (total, appended, checkpointed, durable, covered, reclaim) = {
             let v = self.volume.read().await;
             (
                 v.journal_total_bytes(),
@@ -1272,13 +1272,14 @@ impl EngineInner {
                 v.checkpoint_sequence(),
                 v.journal_durable_sequence(),
                 v.journal_covered_segment_count(),
+                v.has_pending_reclamation(),
             )
         };
-        if appended <= checkpointed && covered == 0 {
+        if appended <= checkpointed && covered == 0 && !reclaim {
             return; // nothing to apply and nothing to reclaim
         }
         let by_size = total >= self.policy.journal_high_watermark_bytes;
-        let by_space = if self.policy.low_space_checkpoint_bytes > 0 {
+        let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
             let backing = self.backing.clone();
             storage_task(move || backing.free_bytes())
                 .await
@@ -1298,7 +1299,7 @@ impl EngineInner {
             .now()
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
-        if !(by_size || by_space || by_time) {
+        if !(by_size || by_space || by_time || reclaim) {
             return;
         }
         if by_time && durable < appended {
@@ -1321,6 +1322,11 @@ impl EngineInner {
         if !self.checkpoint_stop.load(Ordering::SeqCst) {
             if let Err(e) = self.checkpoint().await {
                 tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+            } else if self.volume.read().await.has_pending_reclamation() {
+                // Drain another bounded batch without sleeping an entire
+                // checkpoint interval. Each pass releases the volume lock;
+                // failures wait for the regular interval before retrying.
+                self.checkpoint_notify.notify_one();
             }
         }
     }

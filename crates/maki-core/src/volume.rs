@@ -92,7 +92,7 @@ impl Volume {
         let Recovered {
             lock,
             superblock,
-            store,
+            mut store,
             checkpoint_state,
             durable_sequence,
             durable_proof,
@@ -121,6 +121,8 @@ impl Volume {
             overlay.publish(record.unit_index, record.sequence, record.payload);
         }
         overlay.promote(durable_sequence);
+
+        store.schedule_reclamation();
 
         let volume = Self {
             backing,
@@ -218,6 +220,10 @@ impl Volume {
 
     pub fn supports_discard(&self) -> bool {
         self.store.supports_discard()
+    }
+
+    pub(crate) fn has_pending_reclamation(&self) -> bool {
+        self.store.has_pending_reclamation()
     }
 
     /// True when no write has ever been acknowledged or applied: no
@@ -449,6 +455,8 @@ impl Volume {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
             }
+            self.store
+                .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
             self.sanitize();
             return Ok(base_checkpoint);
         }
@@ -492,6 +500,8 @@ impl Volume {
         self.backing.sync_dir(layout::JOURNAL_DIR)?;
 
         self.overlay.retire(horizon);
+        self.store
+            .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
         self.sanitize();
         Ok(horizon)
     }

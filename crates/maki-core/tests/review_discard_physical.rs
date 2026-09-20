@@ -79,3 +79,84 @@ fn contiguous_discard_reclaims_shared_blocks_and_preserves_neighbors() {
     assert!(recovered.read_ct(63).unwrap().is_none());
     assert!(recovered.read_ct(65).unwrap().is_none());
 }
+
+#[test]
+fn recovered_fua_discard_is_physically_reclaimed_by_an_idle_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let backing = Arc::new(FileBacking::new(directory.path()).unwrap());
+    let probe = backing.open("recovery-punch-probe", true).unwrap();
+    probe.write_at(0, &[0x11; 8192]).unwrap();
+    if let Err(error) = probe.punch_hole(0, 8192) {
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            eprintln!("filesystem does not support hole punching: {error}");
+            return;
+        }
+        panic!("hole-punch probe failed: {error}");
+    }
+    drop(probe);
+    backing.remove("recovery-punch-probe").unwrap();
+
+    let geometry = Geometry::compute(512, 4096, 512, 4104, 1 << 20, 1 << 20).unwrap();
+    init::create_volume_with_discard(
+        backing.as_ref(),
+        Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::from_u128(0xdec1a2),
+            provider_type: "test".into(),
+            crypto_compatibility_id: "opaque".into(),
+            key_identity: "k".into(),
+            geometry,
+            format_version: 1,
+            created_unix: 0,
+        },
+    )
+    .unwrap();
+    let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+    for unit in 0..128 {
+        volume.write_ct(unit, &[0x81; 4104], false).unwrap();
+    }
+    volume.flush().unwrap();
+    volume.checkpoint().unwrap();
+
+    let path = directory.path().join(layout::shard_data(0));
+    let before = std::fs::metadata(&path).unwrap();
+    for unit in 1..126 {
+        volume.discard_ct(unit, false).unwrap();
+    }
+    volume.discard_ct(126, true).unwrap();
+    volume.flush().unwrap();
+    drop(volume);
+
+    let mut recovered = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+    for unit in 1..127 {
+        assert!(recovered.read_ct(unit).unwrap().is_none());
+    }
+    for unit in [0, 127] {
+        assert_eq!(
+            recovered.read_ct(unit).unwrap().unwrap().1,
+            vec![0x81; 4104]
+        );
+    }
+
+    recovered.checkpoint().unwrap();
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert!(
+        after.blocks() < before.blocks() / 4,
+        "recovery preserved logical discards but idle checkpoint retained {} of {} allocated blocks",
+        after.blocks(),
+        before.blocks()
+    );
+
+    recovered.write_ct(64, &[0x82; 4104], true).unwrap();
+    recovered.checkpoint().unwrap();
+    assert_eq!(recovered.read_ct(64).unwrap().unwrap().1, vec![0x82; 4104]);
+    assert!(recovered.read_ct(63).unwrap().is_none());
+    assert!(recovered.read_ct(65).unwrap().is_none());
+    for unit in [0, 127] {
+        assert_eq!(
+            recovered.read_ct(unit).unwrap().unwrap().1,
+            vec![0x81; 4104]
+        );
+    }
+}

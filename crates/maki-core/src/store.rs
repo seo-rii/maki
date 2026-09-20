@@ -131,6 +131,9 @@ pub struct SlotStore {
     /// Units whose bit was repaired from slot headers at open.
     repaired_units: Vec<u64>,
     discard_enabled: bool,
+    /// A bounded post-recovery scan retries physical release of persisted
+    /// tombstones. No extra per-unit bitmap or payload history is retained.
+    reclaim_cursor: Option<(u64, u64)>,
 }
 
 /// Shard index of a `shard-XXXXXXXX.dat` file name, verified by
@@ -366,6 +369,7 @@ impl SlotStore {
             shards,
             repaired_units,
             discard_enabled,
+            reclaim_cursor: None,
         })
     }
 
@@ -389,6 +393,25 @@ impl SlotStore {
 
     pub(crate) fn supports_discard(&self) -> bool {
         self.discard_enabled
+    }
+
+    pub(crate) fn has_pending_reclamation(&self) -> bool {
+        self.reclaim_cursor.is_some()
+    }
+
+    /// Call only after bounded replay has applied every surviving record.
+    /// A tombstone seen halfway through replay may precede a reserved write.
+    pub(crate) fn schedule_reclamation(&mut self) {
+        self.reclaim_cursor = self
+            .catalog
+            .shard_indices()
+            .find(|idx| {
+                self.shards[idx]
+                    .discard
+                    .as_ref()
+                    .is_some_and(|map| map.set_count() > 0)
+            })
+            .map(|idx| (idx, 0));
     }
 
     pub fn geometry(&self) -> &Geometry {
@@ -717,6 +740,52 @@ impl SlotStore {
         for idx in dirty {
             self.shards.get_mut(&idx).unwrap().dirty_discard = false;
         }
+        Ok(())
+    }
+
+    /// Retry at most 4096 slot positions from one shard per checkpoint.
+    /// The caller must hold the publication lock, stabilize discard metadata,
+    /// and exclude every unit with a newer overlay reservation. Advance only
+    /// after both hole punching and its data sync succeed, so a failure retries
+    /// the same bounded range. Unsupported punching completes the hint.
+    pub(crate) fn retry_reclamation(
+        &mut self,
+        can_punch: impl Fn(u64) -> bool,
+    ) -> Result<(), CoreError> {
+        let Some((idx, start)) = self.reclaim_cursor else {
+            return Ok(());
+        };
+        let shard = &self.shards[&idx];
+        if shard.dirty_discard {
+            return Err(CoreError::Durability(
+                "reclamation requires durable discard metadata".into(),
+            ));
+        }
+        let map = shard
+            .discard
+            .as_ref()
+            .expect("reclaim cursor requires v3 map");
+        let end = start.saturating_add(4096).min(map.units());
+        let base = idx * self.geometry.units_per_shard();
+        let units = (start..end)
+            .filter(|in_shard| map.get(*in_shard))
+            .map(|in_shard| base + in_shard)
+            .filter(|unit| can_punch(*unit));
+        self.punch_slots(units)?;
+        self.reclaim_cursor = if end < map.units() {
+            Some((idx, end))
+        } else {
+            self.catalog
+                .shard_indices()
+                .find(|next| {
+                    *next > idx
+                        && self.shards[next]
+                            .discard
+                            .as_ref()
+                            .is_some_and(|map| map.set_count() > 0)
+                })
+                .map(|next| (next, 0))
+        };
         Ok(())
     }
 
