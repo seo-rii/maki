@@ -165,13 +165,23 @@ async fn worker_checkpoints_when_watermark_is_crossed() {
     let p = policy();
     let engine = engine(&backing, p.clone(), None).await;
 
-    // Enough FUA writes to cross the watermark but stay under the hard cap.
-    let n = p.journal_high_watermark_bytes / RECORD + 2;
+    // Stop at the first crossing. A later write can legitimately land after
+    // the worker has reclaimed the journal and be below the new watermark.
+    let n = p.journal_high_watermark_bytes / RECORD + 1;
     for i in 0..n {
         engine.write(off(i % UNITS), &data(1), true).await.unwrap();
     }
-    settle().await;
-    let s = engine.stats().await;
+    let s = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = engine.stats().await;
+            if s.checkpoint_sequence == n {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("watermark checkpoint did not complete");
     assert!(s.checkpoints_total >= 1, "worker did not checkpoint: {s:?}");
     assert!(s.journal_total_bytes < p.journal_high_watermark_bytes);
     assert_eq!(s.checkpoint_sequence, s.durable_sequence);

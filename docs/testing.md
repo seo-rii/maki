@@ -114,6 +114,7 @@ has a constant residue.
 | Format and parsing | Overflow checks, malformed input, A/B fallback, CRC, torn-tail and middle-corruption classification |
 | Provider contract | Round trips, size/order/index validation, tamper checks, compatibility, and cross-endpoint decrypt |
 | Journal and recovery | Persistence-boundary failpoints, sequence continuity, checkpoint ordering, ENOSPC, and double attach |
+| Storage scheduling | `review_blocking_io.rs`: deliberately stalled reads, writes, FLUSH, checkpoint writes, recovery opens and free-space queries leave a single Tokio worker responsive; cancelling a dispatched write preserves admission and subsequent write order |
 | Block engine | RMW, concurrent access, FUA, FLUSH, provider batching, and differential model tests |
 | Availability | Request and byte bounds, retry budget, jitter, breaker transitions, failover, and permit-leak checks |
 | Transports | HTTP mapping/TLS/chaos, WebSocket reconnect/order/size, and gRPC status/metadata/size |

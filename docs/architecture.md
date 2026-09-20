@@ -168,6 +168,18 @@ fsyncs the data directory before clearing any dirty flag, commits checkpoint
 state, and only then deletes covered journal segments. A checkpoint that fails
 part-way leaves every incomplete step marked for the retry.
 
+Engine reads, journal writes, FLUSH, checkpoint data/metadata work, recovery in
+`Engine::attach`, and free-space queries run on Tokio's blocking pool. Storage
+locks are acquired asynchronously before dispatch. A dispatched read or write
+keeps its admission charge, and a write keeps its unit locks, until the storage
+operation finishes even if its caller is cancelled. Slow storage therefore does
+not monopolize a Tokio worker or let a later write overtake an unfinished write
+to the same unit. Checkpointing still holds the exclusive volume lock throughout
+its persistence sequence; this scheduling change does not shorten that critical
+section. Clean adapter shutdown also signals and joins the checkpoint worker,
+including an already dispatched free-space query, before releasing the volume.
+Attach-time key-canary metadata I/O remains synchronous.
+
 Proof replicas share the backing filesystem. Their CRCs do not provide
 authenticity or an external freshness anchor against coordinated valid rollback.
 Additional proof-file and directory syncs need target-system latency measurement;

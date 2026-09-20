@@ -350,7 +350,11 @@ impl NbdAdapter {
         }
         let state = self.state()?;
         self.runtime
-            .block_on(self.admission.drain(&state.engine))
+            .block_on(async {
+                let sequence = self.admission.drain(&state.engine).await?;
+                state.engine.stop_checkpoint_worker().await;
+                Ok::<_, String>(sequence)
+            })
             .map_err(|e| AdapterError::new(EIO, e))?;
         drop(state);
         self.stop_control();

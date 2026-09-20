@@ -262,7 +262,7 @@ mod unit_lock_tests {
 const FREE_SPACE_CACHE_TTL: Duration = Duration::from_secs(1);
 
 struct EngineInner {
-    volume: RwLock<Volume>,
+    volume: Arc<RwLock<Volume>>,
     backing: Arc<dyn Backing>,
     provider: CheckedProvider,
     context: CryptoContext,
@@ -281,6 +281,8 @@ struct EngineInner {
     clock: Arc<dyn Clock>,
     /// Wakes the checkpoint worker early (watermark crossed, shutdown).
     checkpoint_notify: Arc<Notify>,
+    checkpoint_stop: AtomicBool,
+    checkpoint_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     state: parking_lot::Mutex<EngineState>,
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
@@ -336,6 +338,7 @@ pub struct LatencySnapshot {
 impl Drop for EngineInner {
     fn drop(&mut self) {
         // Let a sleeping worker observe that the engine is gone.
+        self.checkpoint_stop.store(true, Ordering::SeqCst);
         self.checkpoint_notify.notify_one();
     }
 }
@@ -368,6 +371,16 @@ fn record_len(ct: &CiphertextUnit) -> u64 {
     maki_format::journal::RECORD_HEADER_SIZE as u64 + ct.data.len() as u64
 }
 
+/// Acquire storage/admission guards before dispatch, and move them into this
+/// closure: dropping an async caller cannot cancel a running disk operation.
+async fn storage_task<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, std::io::Error> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| std::io::Error::other(format!("storage worker failed: {error}")))
+}
+
 impl Engine {
     /// Recover the volume, verify the provider (self-test + compatibility +
     /// geometry contract + identity + key canary), start the checkpoint
@@ -377,7 +390,8 @@ impl Engine {
         provider: Arc<dyn CryptoProvider>,
         options: EngineOptions,
     ) -> Result<Self, AttachError> {
-        let volume = Volume::recover(backing, options.volume.clone())?;
+        let volume_options = options.volume.clone();
+        let volume = storage_task(move || Volume::recover(backing, volume_options)).await??;
         Self::attach_recovered(volume, provider, options).await
     }
 
@@ -465,7 +479,7 @@ impl Engine {
         let notify = Arc::new(Notify::new());
         let observed_volume = VolumeSnapshot::new(&volume, EngineState::Ready, clock.now());
         let inner = Arc::new(EngineInner {
-            volume: RwLock::new(volume),
+            volume: Arc::new(RwLock::new(volume)),
             backing,
             provider,
             context,
@@ -492,6 +506,8 @@ impl Engine {
             last_checkpoint_at: parking_lot::Mutex::new(clock.now()),
             clock,
             checkpoint_notify: notify.clone(),
+            checkpoint_stop: AtomicBool::new(false),
+            checkpoint_worker: AsyncMutex::new(None),
             state: parking_lot::Mutex::new(EngineState::Ready),
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
@@ -502,8 +518,22 @@ impl Engine {
             flush_latency: LatencyStats::default(),
             fua_latency: LatencyStats::default(),
         });
-        spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
+        let worker = spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
+        *inner.checkpoint_worker.lock().await = Some(worker);
         Ok(Self { inner })
+    }
+
+    /// Stop the background checkpoint worker and wait for any storage work it
+    /// already dispatched. Repeated and concurrent callers return only after
+    /// the same worker has exited.
+    pub async fn stop_checkpoint_worker(&self) {
+        self.inner.checkpoint_stop.store(true, Ordering::SeqCst);
+        self.inner.checkpoint_notify.notify_one();
+        let mut worker = self.inner.checkpoint_worker.lock().await;
+        if let Some(handle) = worker.as_mut() {
+            let _ = handle.await;
+            worker.take();
+        }
     }
 
     /// Split `count` items with `size_of(i)` bytes each into chunk ranges
@@ -634,25 +664,29 @@ impl Engine {
     /// path; SPEC §36).
     pub async fn read_secret(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
-        let _admission = self
-            .inner
-            .admission
-            .acquire(self.admission_cost(offset, len))
-            .await?;
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(offset, len))
+                .await?,
+        );
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
 
         // Consistent per-unit ciphertext snapshot; cache hits (keyed by the
         // unit's current write sequence, SPEC §29) skip decryption.
-        let mut cached: HashMap<u64, std::sync::Arc<SecretBuffer>> = HashMap::new();
-        let mut cts = Vec::new();
-        let mut seqs: HashMap<u64, u64> = HashMap::new();
-        {
-            let volume = self.inner.volume.read().await;
+        let volume = self.inner.volume.clone().read_owned().await;
+        let inner = self.inner.clone();
+        let io_admission = admission.clone();
+        let (mut cached, cts, seqs) = storage_task(move || {
+            let _admission = io_admission;
+            let mut cached = HashMap::new();
+            let mut cts = Vec::new();
+            let mut seqs = HashMap::new();
             for unit in first..=last {
                 if let Some((seq, data)) = volume.read_ct(unit)? {
-                    if let Some(cache) = &self.inner.cache {
+                    if let Some(cache) = &inner.cache {
                         if let Some(buf) = cache.get(unit, seq) {
                             cached.insert(unit, buf);
                             continue;
@@ -665,7 +699,9 @@ impl Engine {
                     });
                 }
             }
-        }
+            Ok::<_, CoreError>((cached, cts, seqs))
+        })
+        .await??;
         let mut plain = self.decrypt_units(cts).await?;
 
         if let Some(cache) = &self.inner.cache {
@@ -704,27 +740,32 @@ impl Engine {
     /// durable before returning.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
-        let _admission = self
-            .inner
-            .admission
-            .acquire(self.admission_cost(offset, data.len()))
-            .await?;
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(offset, data.len()))
+                .await?,
+        );
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + data.len() as u64 - 1) / unit_size;
 
         // Serialize against other writers/RMW of the same units (SPEC §28).
-        let _guards = self.inner.unit_locks.lock_range(first, last).await;
+        let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
 
         // Build plaintext for each touched unit (RMW for partial coverage).
-        let mut rmw_cts = Vec::new();
-        let mut need_rmw = Vec::new();
-        {
-            let volume = self.inner.volume.read().await;
+        let volume = self.inner.volume.clone().read_owned().await;
+        let io_admission = admission.clone();
+        let io_guards = guards.clone();
+        let data_len = data.len();
+        let (rmw_cts, need_rmw) = storage_task(move || {
+            let (_admission, _guards) = (io_admission, io_guards);
+            let mut rmw_cts = Vec::new();
+            let mut need_rmw = Vec::new();
             for unit in first..=last {
                 let unit_start = unit * unit_size;
                 let full =
-                    offset <= unit_start && offset + data.len() as u64 >= unit_start + unit_size;
+                    offset <= unit_start && offset + data_len as u64 >= unit_start + unit_size;
                 if !full {
                     need_rmw.push(unit);
                     if let Some((_seq, ct)) = volume.read_ct(unit)? {
@@ -735,7 +776,9 @@ impl Engine {
                     }
                 }
             }
-        }
+            Ok::<_, CoreError>((rmw_cts, need_rmw))
+        })
+        .await??;
         let mut existing = self.decrypt_units(rmw_cts).await?;
 
         let mut items = Vec::with_capacity((last - first + 1) as usize);
@@ -787,18 +830,21 @@ impl Engine {
         let incoming: u64 = cts.iter().map(record_len).sum();
 
         // Journal + publish under the exclusive volume lock.
-        {
-            let mut volume = self.inner.volume.write().await;
-            let outcome = self.journal_request(&mut volume, incoming, &cts, fua);
+        let mut volume = self.inner.volume.clone().write_owned().await;
+        let engine = self.clone();
+        storage_task(move || {
+            let (_admission, _guards) = (admission, guards);
+            let outcome = engine.journal_request(&mut volume, incoming, &cts, fua);
             // Whatever happened, the state report must know whether the
             // journal can still be synced.
-            self.inner.note_journal(&volume);
+            engine.inner.note_journal(&volume);
             outcome?;
-            if volume.journal_total_bytes() >= self.inner.policy.journal_high_watermark_bytes {
-                self.inner.checkpoint_notify.notify_one();
+            if volume.journal_total_bytes() >= engine.inner.policy.journal_high_watermark_bytes {
+                engine.inner.checkpoint_notify.notify_one();
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await?
     }
 
     /// Admit, append and publish one request's records; with `fua`, sync
@@ -947,22 +993,30 @@ impl Engine {
     /// FLUSH barrier: everything acknowledged before this call is durable
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
-        let mut volume = self.inner.volume.write().await;
-        let started = self.inner.clock.now();
-        let outcome = volume.flush();
-        self.inner.note_journal(&volume);
-        outcome?;
-        self.inner
-            .flush_latency
-            .record(self.inner.clock.now().saturating_sub(started));
-        Ok(())
+        let mut volume = self.inner.volume.clone().write_owned().await;
+        let inner = self.inner.clone();
+        storage_task(move || {
+            let started = inner.clock.now();
+            let outcome = volume.flush();
+            inner.note_journal(&volume);
+            outcome?;
+            inner
+                .flush_latency
+                .record(inner.clock.now().saturating_sub(started));
+            Ok(())
+        })
+        .await?
     }
 
     pub async fn checkpoint(&self) -> Result<u64, CoreError> {
-        let mut volume = self.inner.volume.write().await;
-        let outcome = self.inner.checkpoint_locked(&mut volume);
-        self.inner.note_journal(&volume);
-        outcome
+        let mut volume = self.inner.volume.clone().write_owned().await;
+        let inner = self.inner.clone();
+        storage_task(move || {
+            let outcome = inner.checkpoint_locked(&mut volume);
+            inner.note_journal(&volume);
+            outcome
+        })
+        .await?
     }
 
     /// Journal/checkpoint/cache observability (metrics inputs, SPEC §40).
@@ -973,7 +1027,11 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let backing_free_bytes = self.backing_free_bytes(FREE_SPACE_CACHE_TTL);
+        let engine = self.clone();
+        let backing_free_bytes =
+            storage_task(move || engine.backing_free_bytes(FREE_SPACE_CACHE_TTL))
+                .await
+                .unwrap_or(None);
         let volume = self.inner.volume.read().await;
         let snapshot = VolumeSnapshot::new(&volume, self.state(), self.inner.clock.now());
         self.stats_from_snapshot(&snapshot, cache, backing_free_bytes)
@@ -1096,7 +1154,7 @@ impl EngineInner {
     /// One worker pass: checkpoint if the journal crossed its watermark,
     /// the backing is low on space, or the interval elapsed with work
     /// pending (unsynced records are synced first so they can be applied).
-    async fn worker_pass(&self) {
+    async fn worker_pass(self: &Arc<Self>) {
         let (total, appended, checkpointed, durable, covered) = {
             let v = self.volume.read().await;
             (
@@ -1111,14 +1169,21 @@ impl EngineInner {
             return; // nothing to apply and nothing to reclaim
         }
         let by_size = total >= self.policy.journal_high_watermark_bytes;
-        let by_space = self.policy.low_space_checkpoint_bytes > 0
-            && self
-                .backing
-                .free_bytes()
+        let by_space = if self.policy.low_space_checkpoint_bytes > 0 {
+            let backing = self.backing.clone();
+            storage_task(move || backing.free_bytes())
+                .await
                 .ok()
+                .and_then(Result::ok)
                 .flatten()
                 .map(|free| free < self.policy.low_space_checkpoint_bytes)
-                .unwrap_or(false);
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if self.checkpoint_stop.load(Ordering::SeqCst) {
+            return;
+        }
         let elapsed = self
             .clock
             .now()
@@ -1127,31 +1192,51 @@ impl EngineInner {
         if !(by_size || by_space || by_time) {
             return;
         }
-        let mut volume = self.volume.write().await;
-        if by_time && durable < appended {
-            let flushed = volume.flush();
-            self.note_journal(&volume);
-            if let Err(e) = flushed {
-                tracing::warn!("checkpoint worker: journal sync failed: {e}");
-                return;
+        let mut volume = self.volume.clone().write_owned().await;
+        if self.checkpoint_stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let inner = self.clone();
+        if let Err(error) = storage_task(move || {
+            if by_time && durable < appended {
+                let flushed = volume.flush();
+                inner.note_journal(&volume);
+                if let Err(e) = flushed {
+                    tracing::warn!("checkpoint worker: journal sync failed: {e}");
+                    return;
+                }
             }
+            if let Err(e) = inner.checkpoint_locked(&mut volume) {
+                tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+            }
+            inner.note_journal(&volume);
+        })
+        .await
+        {
+            tracing::warn!("checkpoint worker: {error}");
         }
-        if let Err(e) = self.checkpoint_locked(&mut volume) {
-            tracing::warn!("checkpoint worker: checkpoint failed: {e}");
-        }
-        self.note_journal(&volume);
     }
 }
 
 /// The background checkpoint worker. Holds only a weak reference so it
 /// exits once the engine is dropped (the engine's drop wakes it).
-fn spawn_checkpoint_worker(weak: Weak<EngineInner>, notify: Arc<Notify>, clock: Arc<dyn Clock>) {
+fn spawn_checkpoint_worker(
+    weak: Weak<EngineInner>,
+    notify: Arc<Notify>,
+    clock: Arc<dyn Clock>,
+) -> tokio::task::JoinHandle<()> {
     let interval = weak
         .upgrade()
         .map(|i| i.policy.interval)
         .unwrap_or(Duration::from_secs(30));
     tokio::spawn(async move {
         loop {
+            if weak
+                .upgrade()
+                .is_none_or(|inner| inner.checkpoint_stop.load(Ordering::SeqCst))
+            {
+                return;
+            }
             let sleep = clock.sleep(interval);
             tokio::select! {
                 _ = sleep => {}
@@ -1160,9 +1245,12 @@ fn spawn_checkpoint_worker(weak: Weak<EngineInner>, notify: Arc<Notify>, clock: 
             let Some(inner) = weak.upgrade() else {
                 return;
             };
+            if inner.checkpoint_stop.load(Ordering::SeqCst) {
+                return;
+            }
             inner.worker_pass().await;
         }
-    });
+    })
 }
 
 /// Key-canary check (SPEC §12, review M-001).
