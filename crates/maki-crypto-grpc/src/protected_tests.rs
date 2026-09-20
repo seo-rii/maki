@@ -279,8 +279,8 @@ fn successful_transfer_keeps_allocation_until_secret_buffer_drop() {
 }
 
 struct HoldRequest;
-impl Service<http::Request<tonic::body::BoxBody>> for HoldRequest {
-    type Response = http::Response<tonic::body::BoxBody>;
+impl Service<http::Request<tonic::body::Body>> for HoldRequest {
+    type Response = http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -288,11 +288,11 @@ impl Service<http::Request<tonic::body::BoxBody>> for HoldRequest {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: http::Request<tonic::body::BoxBody>) -> Self::Future {
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         Box::pin(async move {
             std::future::pending::<()>().await;
             drop(request);
-            Ok(http::Response::new(tonic::body::empty_body()))
+            Ok(http::Response::new(tonic::body::Body::empty()))
         })
     }
 }
@@ -333,10 +333,10 @@ fn tonic_encoding_releases_the_original_owned_item_with_zeroization() {
     assert_zeroized(); // The separate encoded tonic buffer is intentionally not watched.
 }
 
-struct ReplyBody(Option<tonic::body::BoxBody>);
+struct ReplyBody(Option<tonic::body::Body>);
 
-impl Service<http::Request<tonic::body::BoxBody>> for ReplyBody {
-    type Response = http::Response<tonic::body::BoxBody>;
+impl Service<http::Request<tonic::body::Body>> for ReplyBody {
+    type Response = http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
@@ -344,7 +344,7 @@ impl Service<http::Request<tonic::body::BoxBody>> for ReplyBody {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: http::Request<tonic::body::BoxBody>) -> Self::Future {
+    fn call(&mut self, _: http::Request<tonic::body::Body>) -> Self::Future {
         std::future::ready(Ok(http::Response::builder()
             .header("content-type", "application/grpc")
             .body(self.0.take().unwrap())
@@ -368,7 +368,7 @@ fn canceling_tonic_after_decode_before_trailers_erases_the_response_item() {
     let mut server_codec =
         tonic::codec::ProstCodec::<super::CryptoBatchResponse, super::CryptoBatchRequest>::default(
         );
-    let body = tonic::body::boxed(tonic::codec::EncodeBody::new_client(
+    let body = tonic::body::Body::new(tonic::codec::EncodeBody::new_client(
         server_codec.encoder(),
         source,
         None,
@@ -488,7 +488,7 @@ where
     B: tonic::codegen::Body + Send + 'static,
     B::Error: Into<tonic::codegen::StdError> + Send + 'static,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 

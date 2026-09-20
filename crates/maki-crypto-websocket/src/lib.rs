@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use response::Value;
+use rustls::pki_types::pem::PemObject as _;
 #[cfg(test)]
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
@@ -256,8 +257,7 @@ impl WsCryptoProvider {
         roots.add_parsable_certificates(native.certs);
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         if let Some(ca_pem) = &tls.ca_pem {
-            let mut reader = std::io::BufReader::new(ca_pem.as_slice());
-            let certificates = rustls_pemfile::certs(&mut reader)
+            let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| format!("bad CA certificate: {error}"))?;
             if certificates.is_empty() {
@@ -272,19 +272,14 @@ impl WsCryptoProvider {
         let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
         let config = match (&tls.client_cert_pem, &tls.client_key_pem) {
             (Some(cert_pem), Some(key_pem)) => {
-                let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
-                let certificates = rustls_pemfile::certs(&mut cert_reader)
+                let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| format!("bad client certificate: {error}"))?;
                 if certificates.is_empty() {
                     return Err("bad client certificate: PEM contains no certificates".into());
                 }
-                let mut key_reader = std::io::BufReader::new(key_pem.expose());
-                let key = rustls_pemfile::private_key(&mut key_reader)
-                    .map_err(|error| format!("bad client private key: {error}"))?
-                    .ok_or_else(|| {
-                        "bad client private key: PEM contains no private key".to_string()
-                    })?;
+                let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.expose())
+                    .map_err(|error| format!("bad client private key: {error}"))?;
                 builder
                     .with_client_auth_cert(certificates, key)
                     .map_err(|error| format!("bad client identity: {error}"))?

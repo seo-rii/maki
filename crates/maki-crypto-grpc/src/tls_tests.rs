@@ -36,7 +36,7 @@ where
     B: tonic::codegen::Body + Send + 'static,
     B::Error: Into<tonic::codegen::StdError> + Send + 'static,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 

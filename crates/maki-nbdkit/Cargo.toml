@@ -38,7 +38,7 @@ tempfile.workspace = true
 base64.workspace = true
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
-tonic = { version = "0.12", features = ["tls"] }
+tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"
 rcgen.workspace = true
 rustls.workspace = true

@@ -12,7 +12,7 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-tonic = { version = "0.12", features = ["tls-native-roots"] }
+tonic = { version = "0.13", features = ["tls-native-roots"] }
 prost = "0.13"
 
 [dev-dependencies]
