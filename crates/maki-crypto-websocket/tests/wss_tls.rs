@@ -10,6 +10,7 @@ use maki_crypto::{CryptoContext, CryptoProvider, ErrorClass, PlaintextUnit, Secr
 use maki_crypto_websocket::{WsCryptoProvider, WsProviderSpec, WsTlsOptions};
 
 const UNIT: usize = 64;
+const TLS_HOST: &str = "127.0.0.1";
 
 fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -144,13 +145,20 @@ async fn wss_server(
     addr
 }
 
-fn provider(port: u16, tls: Option<WsTlsOptions>) -> WsCryptoProvider {
-    provider_at(port, "/", tls)
+fn provider(addr: std::net::SocketAddr, tls: Option<WsTlsOptions>) -> WsCryptoProvider {
+    provider_at(addr, "/", tls)
 }
 
-fn provider_at(port: u16, path: &str, tls: Option<WsTlsOptions>) -> WsCryptoProvider {
+fn provider_at(
+    addr: std::net::SocketAddr,
+    path: &str,
+    tls: Option<WsTlsOptions>,
+) -> WsCryptoProvider {
     WsCryptoProvider::new(WsProviderSpec {
-        url: format!("wss://localhost:{port}{path}"),
+        // Connect to the exact address the fixture bound. On Windows,
+        // localhost may resolve to ::1 first while this listener is IPv4,
+        // consuming the whole request timeout before trying 127.0.0.1.
+        url: format!("wss://{addr}{path}"),
         capabilities: caps(),
         timeout: Duration::from_secs(2),
         max_frame_bytes: 64 * 1024,
@@ -172,11 +180,11 @@ fn uppercase_wss_scheme_accepts_tls_options() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_ca_and_hostname_verification_allow_wss_roundtrip() {
-    let server = identity("localhost");
+    let server = identity(TLS_HOST);
     let ca_pem = server.cert_pem.clone();
     let addr = wss_server(server, None, "/crypto?profile=wss-v1").await;
     let result = provider_at(
-        addr.port(),
+        addr,
         "/crypto?profile=wss-v1",
         Some(WsTlsOptions {
             ca_pem: Some(ca_pem),
@@ -191,9 +199,9 @@ async fn custom_ca_and_hostname_verification_allow_wss_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_ca_and_wrong_hostname_are_rejected() {
-    let server = identity("localhost");
+    let server = identity(TLS_HOST);
     let addr = wss_server(server, None, "/").await;
-    assert!(provider(addr.port(), None)
+    assert!(provider(addr, None)
         .encrypt_batch(&ctx(), &[pt()])
         .await
         .is_err());
@@ -202,7 +210,7 @@ async fn untrusted_ca_and_wrong_hostname_are_rejected() {
     let ca_pem = server.cert_pem.clone();
     let addr = wss_server(server, None, "/").await;
     assert!(provider(
-        addr.port(),
+        addr,
         Some(WsTlsOptions {
             ca_pem: Some(ca_pem),
             ..Default::default()
@@ -217,11 +225,11 @@ async fn untrusted_ca_and_wrong_hostname_are_rejected() {
 async fn mtls_requires_and_accepts_a_client_certificate_key_pair() {
     let client = identity("maki-client");
     let client_ca = client.cert_der.clone();
-    let server = identity("localhost");
+    let server = identity(TLS_HOST);
     let ca_pem = server.cert_pem.clone();
     let addr = wss_server(server, Some(client_ca), "/").await;
     assert!(provider(
-        addr.port(),
+        addr,
         Some(WsTlsOptions {
             ca_pem: Some(ca_pem.clone()),
             ..Default::default()
@@ -235,7 +243,7 @@ async fn mtls_requires_and_accepts_a_client_certificate_key_pair() {
     let client_key_pem = client.key_der.secret_der().to_vec();
     // DER is deliberately invalid for a PEM-only option.
     let malformed = provider(
-        addr.port(),
+        addr,
         Some(WsTlsOptions {
             ca_pem: Some(ca_pem.clone()),
             client_cert_pem: Some(client_cert_pem.clone()),
@@ -252,7 +260,7 @@ async fn mtls_requires_and_accepts_a_client_certificate_key_pair() {
         client_cert_pem: Some(client.cert_pem),
         client_key_pem: Some(Arc::new(SecretBuffer::from_vec(client.key_pem))),
     };
-    let result = provider(addr.port(), Some(accepted_identity))
+    let result = provider(addr, Some(accepted_identity))
         .encrypt_batch(&ctx(), &[pt()])
         .await
         .unwrap();
@@ -262,7 +270,7 @@ async fn mtls_requires_and_accepts_a_client_certificate_key_pair() {
 #[tokio::test]
 async fn incomplete_identity_and_tls_on_plain_ws_are_configuration_errors() {
     let missing_key = provider(
-        9,
+        "127.0.0.1:9".parse().unwrap(),
         Some(WsTlsOptions {
             client_cert_pem: Some(b"certificate".to_vec()),
             ..Default::default()
