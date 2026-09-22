@@ -4,6 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rand::{rngs::OsRng, TryRngCore};
+use zeroize::Zeroize;
 
 use crate::{
     checked::CheckedProvider, BatchCapability, CiphertextUnit, ContextField, CryptoCapabilities,
@@ -188,7 +189,23 @@ impl CryptoProvider for RandomPrefixProvider {
                 data,
             });
         }
-        self.inner.encrypt_batch(&inner_context, &expanded).await
+        let mut encrypted = self.inner.encrypt_batch(&inner_context, &expanded).await?;
+        if expanded
+            .iter()
+            .zip(&encrypted)
+            .any(|(plain, cipher)| plain.data.expose() == cipher.data)
+        {
+            // A no-op provider would otherwise evade the outer self-test because
+            // prefix || logical plaintext differs from the caller's logical unit.
+            // Scrub any unchanged plaintext returned in the ciphertext buffers.
+            for item in &mut encrypted {
+                item.data.zeroize();
+            }
+            return Err(CryptoError::ProviderFatal(
+                "ciphertext equals expanded plaintext: the inner provider is not encrypting".into(),
+            ));
+        }
+        Ok(encrypted)
     }
 
     async fn decrypt_batch(

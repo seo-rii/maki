@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use maki_crypto::selftest::provider_self_test;
 use maki_crypto::{
     BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError,
     CryptoProvider, PlaintextUnit, RandomPrefixProvider, SecretBuffer,
@@ -26,6 +27,7 @@ struct RecordingProvider {
     calls: Mutex<Vec<Call>>,
     deadline: Option<Duration>,
     encrypt_error: bool,
+    no_op: bool,
     encrypt_shape: Mutex<Option<&'static str>>,
     decrypt_shape: Mutex<Option<&'static str>>,
 }
@@ -52,6 +54,7 @@ impl RecordingProvider {
             calls: Mutex::new(Vec::new()),
             deadline: Some(Duration::from_secs(7)),
             encrypt_error: false,
+            no_op: false,
             encrypt_shape: Mutex::new(None),
             decrypt_shape: Mutex::new(None),
         }
@@ -83,7 +86,12 @@ impl CryptoProvider for RecordingProvider {
             .iter()
             .map(|x| CiphertextUnit {
                 unit_index: x.unit_index,
-                data: x.data.expose().to_vec(),
+                data: x
+                    .data
+                    .expose()
+                    .iter()
+                    .map(|byte| if self.no_op { *byte } else { *byte ^ 0xa5 })
+                    .collect(),
             })
             .collect();
         match self.encrypt_shape.lock().unwrap().take() {
@@ -104,7 +112,12 @@ impl CryptoProvider for RecordingProvider {
             .iter()
             .map(|x| PlaintextUnit {
                 unit_index: x.unit_index,
-                data: SecretBuffer::from_slice(&x.data),
+                data: SecretBuffer::from_vec(
+                    x.data
+                        .iter()
+                        .map(|byte| if self.no_op { *byte } else { *byte ^ 0xa5 })
+                        .collect(),
+                ),
             })
             .collect();
         match self.decrypt_shape.lock().unwrap().take() {
@@ -150,24 +163,27 @@ async fn prefixes_each_item_fresh_and_translates_only_compatibility_id() {
     let wrapper = RandomPrefixProvider::new(inner.clone(), LOGICAL, PREFIX, "outer-v1".into())
         .await
         .unwrap();
-    let first = wrapper
+    wrapper
         .encrypt_batch(&context("outer-v1"), &units())
         .await
         .unwrap();
-    let second = wrapper
+    wrapper
         .encrypt_batch(&context("outer-v1"), &units())
         .await
         .unwrap();
-    assert_ne!(
-        &first[0].data[..PREFIX as usize],
-        &first[1].data[..PREFIX as usize]
-    );
-    assert_ne!(
-        &first[0].data[..PREFIX as usize],
-        &second[0].data[..PREFIX as usize]
-    );
-    assert_eq!(&first[0].data[PREFIX as usize..], &[0x31; LOGICAL as usize]);
     let calls = inner.calls.lock().unwrap();
+    assert_ne!(
+        &calls[0].plaintexts[0][..PREFIX as usize],
+        &calls[0].plaintexts[1][..PREFIX as usize]
+    );
+    assert_ne!(
+        &calls[0].plaintexts[0][..PREFIX as usize],
+        &calls[1].plaintexts[0][..PREFIX as usize]
+    );
+    assert_eq!(
+        &calls[0].plaintexts[0][PREFIX as usize..],
+        &[0x31; LOGICAL as usize]
+    );
     assert_eq!(calls[0].context, context("base-v1"));
     assert_eq!(calls[0].indices, vec![8, 2]);
     assert_eq!(calls[0].plaintexts[1].len(), WIRE as usize);
@@ -411,4 +427,26 @@ async fn forwards_inner_errors_unchanged() {
     assert!(
         matches!(wrapper.encrypt_batch(&context("outer-v1"), &units()).await, Err(CryptoError::Retryable(message)) if message == "again")
     );
+}
+
+#[tokio::test]
+async fn no_op_inner_provider_cannot_hide_behind_random_prefix() {
+    let mut no_op = RecordingProvider::new();
+    no_op.caps.integrity = Capability::Absent;
+    no_op.caps.context_binding = Capability::Absent;
+    no_op.no_op = true;
+    let wrapper = RandomPrefixProvider::new(Arc::new(no_op), LOGICAL, PREFIX, "outer-v1".into())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        provider_self_test(
+            &wrapper,
+            &context("outer-v1"),
+            LOGICAL as usize,
+            "outer-v1"
+        )
+        .await,
+        Err(CryptoError::ProviderFatal(message)) if message.contains("not encrypting")
+    ));
 }
