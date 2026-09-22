@@ -11,6 +11,9 @@ python3 -B scripts/storage-repeat-validation.py start --rounds 1 --max-seconds 1
 # After that passes, leave 100 rounds in the background (six-hour limit).
 python3 -B scripts/storage-repeat-validation.py start --rounds 100 --max-seconds 21600
 
+# Run the experimental rollback backing's four suites (one-hour limit).
+python3 -B scripts/storage-repeat-validation.py start --profile rollback --rounds 100 --max-seconds 3600 --suite-timeout 120
+
 # Read the latest run's state or request cancellation.
 python3 -B scripts/storage-repeat-validation.py status
 python3 -B scripts/storage-repeat-validation.py cancel
@@ -24,8 +27,8 @@ and launching the supervisor. Logs live under a unique `~/logs/maki-storage-*`
 directory. The log root and run directory use mode 0700; logs and JSON records
 are created with mode 0600. Keep that directory to inspect results later.
 
-The five suites run sequentially, including all ignored tests, with one libtest
-thread per suite:
+The default `storage` profile runs eight suites sequentially, including all
+ignored tests, with one libtest thread per suite:
 
 | Suite | Checked behavior |
 | --- | --- |
@@ -34,6 +37,25 @@ thread per suite:
 | `review_stress` | Concurrent readers/writers, checkpoints, recoverable I/O failures, acknowledged data after simulated crashes |
 | `review_r3_space_admission` | Space headroom, reservation failures, retry, one real-file physical block reservation check |
 | `review_r3_recovery_memory` | Recovery allocation regressions for distinct and repeatedly overwritten units |
+| `review_discard_crash` | V3 discard durability through simulated crash boundaries |
+| `review_discard_model` | V3 data/discard state against an independent block model |
+| `review_discard_reclaim_retry` | V3 reclamation failure and retry |
+
+The `rollback` profile selects separate suites for the experimental Linux
+rollback backing. The host needs writable `/dev/shm` on a different filesystem
+from its temporary backing directory; this test witness is deliberately volatile
+and is not an example of production witness provisioning.
+
+| Package / suite | Checked behavior |
+| --- | --- |
+| `maki-backing / rollback_backing` | Manifest/page integrity, witness selection, reservation and durability boundaries |
+| `maki-backing / rollback_model` | 16 fixed seeds × 100 file operations, independent working/durable byte model, unlink/handle lifetime, closed-file space reuse, old-page replay |
+| `maki-core / rollback_protection` | Freshness checks, FUA/recovery, full-capacity checkpoint, concurrent checkpoint/write, v3 discard |
+| `maki-core / rollback_process` | Eight child-process SIGKILL/reopen cycles with a parent-owned acknowledgement oracle, alternating FUA/FLUSH and checkpoint paths |
+
+The process suite retains the host kernel and page cache. It establishes process
+interruption recovery, not physical power-loss durability. Its child helper is a
+no-op when invoked without the parent-provided environment.
 
 Rounds reuse the existing fixed seeds. Thread scheduling can vary, but repetition
 does not enlarge the seed set. Each suite starts a new process, so this is not a
@@ -46,8 +68,9 @@ or physical power loss. Allocation tests do not establish a universal RSS bound.
 The tracked working tree must be clean. `start` archives exact Git HEAD,
 excluding untracked files, and copies its runner into the run directory before
 launching. `config.json` records the source revision, archive/runner hashes and
-compiler versions. The snapshot is compiled offline with `Cargo.lock`, at most
-two build jobs, and the repository's existing target cache. Missing cached
+compiler versions, selected profile and suites. The snapshot is compiled offline
+with `Cargo.lock`, at most two build jobs, and a target directory private to that
+campaign. Missing cached
 dependencies fail the run. Executables are copied into the private directory;
 `binaries.json` records their hashes and enumerated test counts. Do not edit the
 snapshot, copied runner or binaries of a running job.

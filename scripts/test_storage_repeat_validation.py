@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -20,6 +21,47 @@ class BackgroundStorageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def test_rollback_profile_builds_each_required_package_and_freezes_all_suites(self):
+        expected = {
+            "maki-backing": ("rollback_backing", "rollback_model"),
+            "maki-core": ("rollback_protection", "rollback_process"),
+        }
+        calls = []
+
+        def child(command, _cwd, log, _stop, _timeout, **_kwargs):
+            calls.append(command)
+            if command[0] == "cargo":
+                package = command[command.index("-p") + 1]
+                self.assertIn(package, expected)
+                selected = tuple(command[i + 1] for i, arg in enumerate(command) if arg == "--test")
+                self.assertEqual(selected, expected[package])
+                events = []
+                for name in selected:
+                    executable = self.root / (name + "-build")
+                    executable.write_bytes(b"frozen fixture")
+                    events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
+                                              "executable": str(executable)}))
+                log.write_text("\n".join(events))
+            else:
+                log.write_text("fixture: test\n")
+            return {"exit_code": 0, "reason": "exited"}
+
+        config = {"source": str(self.root), "target_dir": str(self.root / "target"),
+                  "profile": "rollback"}
+        with mock.patch.object(self.runner, "run_child", side_effect=child):
+            binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
+        self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
+        manifest = json.loads((self.root / "binaries.json").read_text())
+        self.assertEqual(set(manifest), set(binaries))
+        self.assertTrue(all(value["expected_tests"] == 1 for value in manifest.values()))
+        self.assertEqual(sum(command[0] == "cargo" for command in calls), 2)
+
+    def test_unknown_profile_cannot_silently_run_the_default_suites(self):
+        with mock.patch.object(self.runner, "run_child") as child:
+            with self.assertRaisesRegex(ValueError, "profile"):
+                self.runner.prepare(self.root, {"profile": "typo"}, time.monotonic() + 30)
+            child.assert_not_called()
 
     def test_each_started_campaign_uses_its_own_target_directory(self):
         def completed(command, **_kwargs):
@@ -44,6 +86,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
             self.runner.start(args)
             first = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
+            args.profile = "rollback"
             self.runner.start(args)
             second = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
 
@@ -52,6 +95,12 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(Path(first_config["target_dir"]), Path(first["run_dir"]) / "target")
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
+        self.assertEqual(first_config["profile"], "storage")
+        self.assertEqual(first_config["suites"], list(self.runner.SUITES))
+        self.assertEqual(second_config["profile"], "rollback")
+        self.assertEqual(second_config["suites"], [
+            "rollback_backing", "rollback_model", "rollback_protection", "rollback_process",
+        ])
 
     def test_only_complete_nonempty_test_results_are_accepted(self):
         valid = "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.2s"

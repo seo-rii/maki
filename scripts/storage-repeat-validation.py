@@ -19,7 +19,21 @@ SUITES = ("phase11_dbsim", "phase12_powerloss", "review_stress",
           "review_r3_space_admission", "review_r3_recovery_memory",
           "review_discard_crash", "review_discard_model",
           "review_discard_reclaim_retry")
+PROFILES = {
+    "storage": {"maki-core": SUITES},
+    "rollback": {
+        "maki-backing": ("rollback_backing", "rollback_model"),
+        "maki-core": ("rollback_protection", "rollback_process"),
+    },
+}
 TERMINAL = {"passed", "failed", "cancelled", "incomplete"}
+
+
+def suite_groups(config):
+    profile = config.get("profile", "storage")
+    if profile not in PROFILES:
+        raise ValueError(f"unknown storage test profile: {profile}")
+    return PROFILES[profile]
 
 
 def save_json(path, value):
@@ -88,26 +102,31 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
 
 
 def prepare(directory, config, deadline):
+    groups = suite_groups(config)
     source = Path(config["source"])
     environment = os.environ.copy()
     environment.update(CARGO_TARGET_DIR=config["target_dir"], CARGO_BUILD_JOBS="2")
-    command = ["cargo", "test", "--offline", "--locked", "-p", "maki-core",
-               "--no-run", "--message-format=json"]
-    for suite in SUITES:
-        command.extend(["--test", suite])
-    result = run_child(command, source, directory / "build.log", directory / "STOP",
-                       min(1800, deadline - time.monotonic()), env=environment)
-    if result["exit_code"] != 0 or result["reason"] != "exited":
-        raise RuntimeError(f"build did not complete: {result}")
     executables = {}
-    for line in (directory / "build.log").read_text(errors="replace").splitlines():
-        if not line.startswith("{"):
-            continue
-        event = json.loads(line)
-        name = event.get("target", {}).get("name")
-        if event.get("reason") == "compiler-artifact" and name in SUITES and event.get("executable"):
-            executables[name] = Path(event["executable"])
-    if set(executables) != set(SUITES):
+    suites = [suite for group in groups.values() for suite in group]
+    for package, selected in groups.items():
+        command = ["cargo", "test", "--offline", "--locked", "-p", package,
+                   "--no-run", "--message-format=json"]
+        for suite in selected:
+            command.extend(["--test", suite])
+        log = directory / ("build.log" if len(groups) == 1 else f"build-{package}.log")
+        result = run_child(command, source, log, directory / "STOP",
+                           min(1800, deadline - time.monotonic()), env=environment)
+        if result["exit_code"] != 0 or result["reason"] != "exited":
+            raise RuntimeError(f"{package} build did not complete: {result}")
+        for line in log.read_text(errors="replace").splitlines():
+            if not line.startswith("{"):
+                continue
+            event = json.loads(line)
+            name = event.get("target", {}).get("name")
+            if (event.get("reason") == "compiler-artifact" and name in selected
+                    and event.get("executable")):
+                executables[name] = Path(event["executable"])
+    if set(executables) != set(suites):
         raise RuntimeError("build did not produce every requested test binary")
     binary_dir = directory / "bin"
     binary_dir.mkdir(mode=0o700)
@@ -136,7 +155,8 @@ def worker(directory):
     config = json.loads((directory / "config.json").read_text())
     began = time.monotonic()
     deadline = began + config["max_seconds"]
-    status = {"state": "building", "revision": config["revision"], "pid": os.getpid(),
+    status = {"state": "building", "revision": config["revision"],
+              "profile": config.get("profile", "storage"), "pid": os.getpid(),
               "identity": process_identity(os.getpid()), "completed_rounds": 0,
               "requested_rounds": config["rounds"], "passed_tests": 0,
               "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
@@ -192,6 +212,8 @@ def worker(directory):
 
 
 def start(args):
+    profile = getattr(args, "profile", "storage")
+    groups = suite_groups({"profile": profile})
     repo = Path(__file__).resolve().parents[1]
     subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
@@ -218,7 +240,8 @@ def start(args):
         "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
         "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
-        "suites": SUITES,
+        "profile": profile,
+        "suites": [suite for group in groups.values() for suite in group],
         "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
         "cargo": subprocess.check_output(["cargo", "-V"], text=True).strip(),
     })
@@ -236,6 +259,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("start", "status", "cancel", "_worker"))
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--profile", choices=tuple(PROFILES), default="storage")
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--max-seconds", type=int, default=21600)
     parser.add_argument("--suite-timeout", type=int, default=900)
