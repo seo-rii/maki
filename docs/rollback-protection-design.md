@@ -1,7 +1,11 @@
 # Rollback protection proposal
 
-Status: design recommendation, 2026-09-20. This document does not describe an
-implemented protection. V2 and V3 volumes still cannot detect every restoration
+Status: extended design, updated 2026-09-21. An experimental, bounded
+[local-witness backing](rollback-protection.md) now implements an independent
+authenticated root, retained copy-on-write generations and fail-closed recovery.
+It uses a flat authenticated manifest and an exclusive local writer lock; the
+remote witness, distributed fencing and explicit epoch-restore protocol below
+remain proposals. Default V2/V3 backings still cannot detect every restoration
 of an older, internally valid volume image or ciphertext for the same unit.
 
 ## Recommended boundary
@@ -140,5 +144,6 @@ extents, and explicit backup restoration. The crash oracle must keep its ACK
 ledger and witness outside the tested volume. Test that no acknowledged
 generation disappears and that missing evidence stops readiness.
 
-The next implementation step is a model of the commit/recovery protocol and
-new-format storage design.
+The local implementation's remaining gates are persistent-disk crash campaigns,
+resource/latency qualification and independent witness operational procedures.
+The broader remote and restore protocol above requires separate implementation.

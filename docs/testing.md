@@ -481,6 +481,32 @@ write-cache behavior must be characterized first.
 
 WSL is suitable for Linux syscall integration but not for power-loss claims.
 
+## Experimental rollback backing
+
+The [local-witness format](rollback-protection.md) has separate qualification
+requirements from default v2/v3 storage. Its focused suites are:
+
+```sh
+cargo test -p maki-backing --lib --test rollback_backing
+cargo test -p maki-core --test rollback_protection
+cargo test -p maki-format --test rollback_config
+cargo test -p maki-nbdkit --test rollback_config
+```
+
+Linux storage fixtures place the backing on the normal temporary filesystem and
+the witness under `/dev/shm`, which must have a different device identity. This
+fixture is deliberately not a persistent witness deployment. Tests cover old
+whole-image rejection, page authentication, immutable predecessor retention,
+namespace sync boundaries and open handles, witness failures and reopen
+durability, full-capacity acknowledged-write recovery, cache/overlay freshness,
+concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256 encoding vectors
+cover the witness record, manifest and page domains.
+
+Requalify the new mode on independent persistent disks before production use,
+including hard resets, a separate ACK ledger, maximum metadata/RSS, latency and
+witness storage exhaustion. Earlier GCE/default-format campaigns do not establish
+these results for the new format.
+
 ## External qualification checklist
 
 - Repeat kernel `/dev/nbd`, LVM, XFS, and raw-device fio qualification on each

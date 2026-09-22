@@ -974,6 +974,14 @@ It MUST NOT replace or weaken required v2 evidence. Local CRC records do not
 authenticate metadata, prevent coordinated valid rollback, or provide separate
 physical failure domains.
 
+An optional, experimental outer backing format can anchor the authenticated
+namespace and retained COW pages in an independent trusted local witness.
+`backing.rollback_protection` requires `witness_root` and `capacity`; it is Linux
+only, restricted to new volumes, and does not reinterpret ordinary v2/v3 roots.
+Its bounded capacity, commit protocol and explicit threat model are specified in
+[Rollback-protected backing](docs/rollback-protection.md). This storage option
+does not upgrade the crypto provider's declared replay capability.
+
 Older envelope-v1-only binaries reject v2. Current writable recovery MUST refuse
 v1 before changing recovery metadata; acquiring or creating the advisory lock
 may happen first. Read-only checks MAY inspect v1 with an explicit warning that

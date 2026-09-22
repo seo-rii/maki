@@ -19,6 +19,7 @@ HTTP example is available at
 | `crypto.grpc` | gRPC endpoints, TLS, method paths, metadata, and message-size limit |
 | `limits` | Request, byte, queue, batch, and endpoint concurrency bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
+| `backing.rollback_protection` | Experimental Linux COW format: independent `witness_root` and preallocated logical-page `capacity` (new volumes only) |
 | `cache` | Read-cache mode, size, TTL, locking, and zeroization |
 | `nbd` | Socket, negotiated I/O geometry, and Tokio runtime worker count |
 | `control` | Administrative socket and group |
@@ -26,6 +27,10 @@ HTTP example is available at
 
 Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
 Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
+
+See [Rollback-protected backing](rollback-protection.md) for the witness trust
+boundary, capacity/reserve sizing, creation and systemd access requirements.
+This option is off by default and does not upgrade existing volumes.
 
 ## Providers
 

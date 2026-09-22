@@ -145,6 +145,12 @@ nbdkit `VmHWM` was 11,415,552 bytes. Metadata, providers, caches and other
 deployment profiles still need their own total-memory bound. Production approval
 remains pending.
 
+An experimental [rollback-protected backing](docs/rollback-protection.md) is
+available for new Linux volumes. It anchors authenticated copy-on-write storage
+in a separate trusted witness filesystem; default volume formats retain their
+existing rollback limitation. Capacity, performance and qualification limits
+are documented with the configuration.
+
 ## Build
 
 The Rust workspace builds on Linux, macOS, and Windows. The nbdkit plugin and
