@@ -15,6 +15,9 @@
 pub mod file;
 pub mod mem;
 pub mod path;
+mod rollback;
+pub mod witness;
+pub use rollback::RollbackBacking;
 
 pub use file::FileBacking;
 pub use mem::MemBacking;
@@ -75,6 +78,12 @@ pub trait VolumeLock: Send + Sync {}
 
 /// A confined storage namespace for one volume.
 pub trait Backing: Send + Sync + 'static {
+    /// Validate the independent freshness authority, if this backing has one.
+    /// Callers serving cached data must also check this session guard.
+    fn check_freshness(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Open a file. With `create = true`, creates it (volatile until the
     /// parent directory is synced).
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>>;
