@@ -1,6 +1,6 @@
 # Rollback-protected backing
 
-Status: experimental implementation, 2026-09-21. This is an explicitly selected
+Status: experimental implementation, updated 2026-09-22. This is an explicitly selected
 Linux storage format for new volumes. Default v2/v3 directory backings retain
 their existing rollback limitation. Production qualification of this new format
 is still pending; earlier v2/v3 GCE reset and RSS results do not qualify it.
@@ -125,6 +125,10 @@ lower the witness generation.
 
 V3 discard remains available. Fully punched pages and deleted files reclaim
 internal arena capacity after the corresponding commit and open-handle lifetime.
+After the last handle closes, the next space query or reservation commits a
+manifest without the deleted identity before reporting or reusing its capacity.
+Closing a handle performs no I/O. A pending namespace deletion still retains the
+durable name and its pages; an unsuccessful reclamation commit stops the session.
 Partial-page holes may retain their page reservation. The arena's physical
 allocation is retained, so this mode does not return its fixed footprint to the
 host filesystem. Cross-directory rename and directory removal/rename are not
@@ -157,7 +161,7 @@ Witness fault injection covers temporary write, sync, rename and directory sync.
 These are local functional and injected-failure results, not physical power-cut
 or production deployment evidence.
 
-Final local validation used a frozen source tree based on `f8e6c3d`, with the
+Initial implementation validation used a frozen source tree based on `f8e6c3d`, with the
 complete owned change set recorded by SHA-256 in `source.json`. The run at
 `/home/seorii/logs/maki-rollback-final-20260921T114714Z/` (PID 92491, completed,
 `exit.status = 0`) passed formatting, workspace strict Clippy, **1092 workspace
@@ -165,3 +169,29 @@ tests with 0 failures and 10 ignored**, and `cargo audit --deny warnings`
 (258 dependencies). Its `step-0.log` through `step-3.log` and `status.json`
 preserve the results. This includes the final witness-open durability repair;
 the earlier 1090-test snapshot predates that repair.
+
+Additional validation on 2026-09-22 found a capacity-progress defect: a deleted
+file's reservation could remain counted after its namespace deletion was durable
+and its final handle closed. The replacement-write regression failed with ENOSPC
+before the fix. Reclamation now commits the pruned manifest before a space query
+or reservation succeeds. Six injected cases (space query/reservation ×
+arena/manifest/witness failure) preserve the prior root, stop the session and
+successfully reopen and retry. The file model checks 1,600 operations across 16
+fixed seeds, and eight child-process SIGKILL cycles check acknowledged FUA/FLUSH
+writes and discards with and without checkpoints. These process tests retain the
+host page cache.
+
+The frozen reinforcement run at
+`/home/seorii/logs/maki-rollback-reinforcement-20260922T053032Z/` (PID 99019,
+completed, `exit.status = 0`) passed formatting, workspace strict Clippy,
+**1100 Rust tests with 0 failures and 10 ignored**, and **71 Python tests**.
+`source.json` records base `91df88f` and hashes of all eight overlaid task files;
+the files matched the working tree after validation. The separate
+[CI run for `91df88f`](https://github.com/seo-rii/maki/actions/runs/35690664557)
+passed on both Ubuntu and Windows after fixing the WSS daemon fixture's bound
+address. That CI run predates the new reclamation/model/process changes.
+
+For repeat runs that can be left unattended, use the
+[background runner's rollback profile](background-storage-validation.md).
+Repetition exercises the same fixed seeds with potentially different scheduling;
+it does not extend the persistent-disk qualification claim.

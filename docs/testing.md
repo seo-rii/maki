@@ -487,8 +487,8 @@ The [local-witness format](rollback-protection.md) has separate qualification
 requirements from default v2/v3 storage. Its focused suites are:
 
 ```sh
-cargo test -p maki-backing --lib --test rollback_backing
-cargo test -p maki-core --test rollback_protection
+cargo test -p maki-backing --lib --test rollback_backing --test rollback_model
+cargo test -p maki-core --test rollback_protection --test rollback_process
 cargo test -p maki-format --test rollback_config
 cargo test -p maki-nbdkit --test rollback_config
 ```
@@ -501,6 +501,15 @@ namespace sync boundaries and open handles, witness failures and reopen
 durability, full-capacity acknowledged-write recovery, cache/overlay freshness,
 concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256 encoding vectors
 cover the witness record, manifest and page domains.
+
+The file model adds 1,600 deterministic operations against independent working
+and durable byte images, plus capacity reuse and unlink/handle-lifetime checks.
+The process suite runs eight SIGKILL/reopen cycles, checking every expected
+FUA/FLUSH write and discard against acknowledgements recorded by the parent
+outside the backing. It covers volatile writes after acknowledged operations
+and alternating checkpoint paths; the host page cache remains alive. The
+[background runner](background-storage-validation.md) can repeat these suites
+unattended with `--profile rollback`, preserving exact source and binary hashes.
 
 Requalify the new mode on independent persistent disks before production use,
 including hard resets, a separate ACK ledger, maximum metadata/RSS, latency and
