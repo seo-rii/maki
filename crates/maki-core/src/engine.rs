@@ -612,6 +612,12 @@ impl Engine {
         Ok(())
     }
 
+    async fn check_freshness(&self) -> Result<(), CoreError> {
+        let backing = self.inner.backing.clone();
+        storage_task(move || backing.check_freshness()).await??;
+        Ok(())
+    }
+
     /// Largest read or write [`Engine::read_secret`] / [`Engine::write`]
     /// accept, in bytes.
     pub fn max_request_bytes(&self) -> u64 {
@@ -675,6 +681,7 @@ impl Engine {
     /// path; SPEC §36).
     pub async fn read_secret(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
+        self.check_freshness().await?;
         let admission = Arc::new(
             self.inner
                 .admission
@@ -751,6 +758,7 @@ impl Engine {
     /// durable before returning.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
+        self.check_freshness().await?;
         let admission = Arc::new(
             self.inner
                 .admission
@@ -847,6 +855,7 @@ impl Engine {
     /// physical space is reclaimed during a later checkpoint if supported.
     pub async fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, len)?;
+        self.check_freshness().await?;
         if !self.can_trim() {
             return Err(CoreError::Invalid(
                 "discard requires a volume created with --discard".into(),
@@ -1087,6 +1096,7 @@ impl Engine {
     /// FLUSH barrier: everything acknowledged before this call is durable
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
+        self.check_freshness().await?;
         let mut volume = self.inner.volume.clone().write_owned().await;
         let inner = self.inner.clone();
         storage_task(move || {

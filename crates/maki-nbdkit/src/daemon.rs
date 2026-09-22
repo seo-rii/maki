@@ -1,7 +1,10 @@
 //! Config-driven daemon assembly: backing + provider + engine.
 
+use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use maki_backing::RollbackBacking;
 use maki_backing::{Backing, FileBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
 use maki_core::volume::{Volume, VolumeOptions};
@@ -34,6 +37,12 @@ pub enum DaemonError {
 pub fn parse_and_validate(raw: &str) -> Result<VolumeConfig, ConfigError> {
     let config = parse_config(raw)?;
     config.validate()?;
+    #[cfg(not(target_os = "linux"))]
+    if config.backing.rollback_protection.is_some() {
+        return Err(ConfigError::Invalid(
+            "backing rollback protection is supported only on Linux".to_string(),
+        ));
+    }
     check_provider_available(&config, cfg!(feature = "fake-provider"))?;
     Ok(config)
 }
@@ -56,6 +65,33 @@ pub fn check_provider_available(
 }
 
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    if let Some(rollback) = &config.backing.rollback_protection {
+        #[cfg(target_os = "linux")]
+        {
+            return Ok(Arc::new(RollbackBacking::open(
+                Path::new(&config.backing.root),
+                Path::new(&rollback.witness_root),
+            )?));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = rollback;
+            return Err(DaemonError::Unsupported(
+                "backing rollback protection is supported only on Linux".to_string(),
+            ));
+        }
+    }
+
+    // A protected root is never silently reinterpreted as a plain directory
+    // if its configuration stanza is accidentally removed.
+    if Path::new(&config.backing.root)
+        .join("rollback.format")
+        .try_exists()?
+    {
+        return Err(DaemonError::Unsupported(
+            "protected backing requires [backing.rollback_protection]".to_string(),
+        ));
+    }
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
@@ -795,7 +831,26 @@ pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superbloc
 
 fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, DaemonError> {
     let config = parse_and_validate(raw)?;
-    let backing = build_backing(&config)?;
+    let backing: Arc<dyn Backing> = match &config.backing.rollback_protection {
+        Some(rollback) => {
+            #[cfg(target_os = "linux")]
+            {
+                Arc::new(RollbackBacking::create(
+                    Path::new(&config.backing.root),
+                    Path::new(&rollback.witness_root),
+                    rollback.capacity.0,
+                )?)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = rollback;
+                return Err(DaemonError::Unsupported(
+                    "backing rollback protection is supported only on Linux".to_string(),
+                ));
+            }
+        }
+        None => build_backing(&config)?,
+    };
     let geometry = config.geometry()?;
     let superblock = Superblock {
         generation: 0,

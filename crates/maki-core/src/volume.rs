@@ -222,6 +222,14 @@ impl Volume {
         self.store.supports_discard()
     }
 
+    /// Refuse service when an independent freshness authority no longer
+    /// names this backing session. This must also guard in-memory overlay and
+    /// plaintext-cache paths, which otherwise perform no backing read.
+    pub fn check_freshness(&self) -> Result<(), CoreError> {
+        self.backing.check_freshness()?;
+        Ok(())
+    }
+
     pub(crate) fn has_pending_reclamation(&self) -> bool {
         self.store.has_pending_reclamation()
     }
@@ -258,6 +266,7 @@ impl Volume {
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
+        self.check_freshness()?;
         // Preserve the writer's exhaustion boundary: no storage mutation is
         // allowed once the next sequence cannot advance.
         if self.journal.next_sequence() == u64::MAX {
@@ -305,6 +314,7 @@ impl Volume {
     /// Journal a v3 logical discard without creating or reserving storage for
     /// a unit that is already zero.
     pub fn discard_ct(&mut self, unit: u64, fua: bool) -> Result<u64, CoreError> {
+        self.check_freshness()?;
         if !self.supports_discard() {
             return Err(CoreError::Invalid(
                 "discard requires a v3 discard-enabled volume".into(),
@@ -355,6 +365,7 @@ impl Volume {
 
     /// FLUSH barrier (SPEC §25): everything appended becomes durable.
     pub fn flush(&mut self) -> Result<(), CoreError> {
+        self.check_freshness()?;
         let durable = self.journal.sync()?;
         self.overlay.promote(durable);
         self.sanitize();
@@ -364,6 +375,7 @@ impl Volume {
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
     pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        self.check_freshness()?;
         if let Some(v) = self.overlay.get(unit) {
             if self.supports_discard() && v.ciphertext.is_empty() {
                 return Ok(None);

@@ -564,6 +564,11 @@ impl Default for CircuitBreakerSection {
 #[serde(deny_unknown_fields)]
 pub struct BackingSection {
     pub root: String,
+    /// Optional independent witness store used to detect rollback of the
+    /// primary backing tree. Existing plain volumes are never enrolled by
+    /// opening them with this section present.
+    #[serde(default)]
+    pub rollback_protection: Option<RollbackProtectionSection>,
     #[serde(default = "d_512")]
     pub slot_alignment: u32,
     #[serde(default = "d_seg")]
@@ -574,6 +579,14 @@ pub struct BackingSection {
     pub checkpoint_reserve_bytes: ByteSize,
     #[serde(default = "d_jres")]
     pub journal_emergency_reserve_bytes: ByteSize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackProtectionSection {
+    pub witness_root: String,
+    /// Space reserved for the protected outer backing format at creation.
+    pub capacity: ByteSize,
 }
 
 fn d_512() -> u32 {
@@ -820,6 +833,55 @@ impl VolumeConfig {
             return Err(ConfigError::Invalid(format!(
                 "backing.root {root:?} must be an absolute path"
             )));
+        }
+        if let Some(rollback) = &self.backing.rollback_protection {
+            let witness = rollback.witness_root.as_str();
+            if witness.trim().is_empty()
+                || !(witness.starts_with('/') || std::path::Path::new(witness).is_absolute())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "backing.rollback_protection.witness_root {witness:?} must be an absolute path"
+                )));
+            }
+            let root_path = std::path::Path::new(root);
+            let witness_path = std::path::Path::new(witness);
+            if root_path == witness_path {
+                return Err(ConfigError::Invalid(
+                    "rollback witness and backing root must be distinct".to_string(),
+                ));
+            }
+            if root_path.starts_with(witness_path) || witness_path.starts_with(root_path) {
+                return Err(ConfigError::Invalid(
+                    "rollback witness and backing root must not be nested".to_string(),
+                ));
+            }
+            let capacity = rollback.capacity.0;
+            if capacity == 0 || capacity % 4096 != 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "backing.rollback_protection.capacity {capacity} must be a positive multiple of 4096"
+                )));
+            }
+            if capacity > 1 << 30 {
+                return Err(ConfigError::Invalid(format!(
+                    "backing.rollback_protection.capacity {capacity} must be at most 1GiB"
+                )));
+            }
+            let progress_reserve = self
+                .backing
+                .checkpoint_reserve_bytes
+                .0
+                .checked_add(self.backing.journal_emergency_reserve_bytes.0)
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "backing checkpoint and journal emergency reserves overflow".to_string(),
+                    )
+                })?;
+            if capacity <= progress_reserve {
+                return Err(ConfigError::Invalid(format!(
+                    "backing.rollback_protection.capacity {capacity} must exceed the combined \
+                     checkpoint and journal emergency reserves ({progress_reserve})"
+                )));
+            }
         }
         // These strings are stored in fixed superblock fields.
         let max = crate::superblock::MAX_STR;
