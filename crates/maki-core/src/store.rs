@@ -28,7 +28,18 @@
 //! for checkpointed data. So a data file the catalog does not list is
 //! adopted at open, and a slot whose bit is 0 is probed: a header that
 //! decodes for that unit is served (or, if its body is damaged, reported as
-//! EIO), and only a slot with no valid header reads as zeros.
+//! EIO), and only a slot with an all-zero header reads as zeros — a hole is
+//! never partly written, so any other undecodable header is damage (EIO).
+//!
+//! A data file is created at its physical size and synced before the shard
+//! is used, so a shorter file was truncated (media damage), unless the shard
+//! was never checkpointed into (uncataloged, empty allocation map: creation
+//! never finished, and after a failed sync plus a restart even a full-size
+//! page-cache view proves nothing — the size is re-established before the
+//! shard is written to or cataloged). A truncated file's cleared slots
+//! beyond the end are marked allocated at open, because the next slot write
+//! past the end would zero-fill them and turn the evidence into holes; they
+//! read as EIO until rewritten (`ShortFile`, `prove_data_file`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -51,6 +62,26 @@ pub enum SlotRead {
     Ciphertext { write_sequence: u64, data: Vec<u8> },
 }
 
+/// Why a shard's data file was shorter than its physical size
+/// (`units_per_shard × slot_size`) at open. The file is created at that size
+/// and synced before its first allocation copy is stored (`ensure_shard`), so
+/// it never legitimately ends before a slot once the shard is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortFile {
+    /// Not named by the loaded catalog copy and with an empty allocation
+    /// map: no checkpoint ever wrote into the shard, so its creation never
+    /// finished and nothing proves the file's size durable — the `set_len`
+    /// was lost with the crash (short file), or its sync failed before a
+    /// plain restart and the page cache still shows the full size (K-01).
+    /// No slot holds data, so its holes are holes; the size is
+    /// re-established before the shard is written to or cataloged.
+    Unproven,
+    /// Truncated after creation: media damage. Every cleared slot beyond the
+    /// end was marked allocated at open so it reads as allocated-but-invalid
+    /// (EIO) rather than as a hole once the file grows back.
+    Truncated,
+}
+
 struct Shard {
     alloc: AllocationMap,
     alloc_ab: AbStore,
@@ -60,6 +91,13 @@ struct Shard {
     /// for a shard adopted at open with no valid copy: the catalog must not
     /// name it until `commit_adopted_maps` has stored one (K-03).
     map_stored: bool,
+    /// The data file's physical size is not proven durable (short at open,
+    /// or never checkpointed into). `prove_data_file` re-establishes and
+    /// syncs it before the first slot write into the shard and before the
+    /// shard is cataloged, after persisting the damage marks the extension
+    /// would otherwise erase; a restart before then re-derives the same
+    /// marks from the still-short file.
+    short: Option<ShortFile>,
 }
 
 pub struct SlotStore {
@@ -73,6 +111,9 @@ pub struct SlotStore {
     shards: HashMap<u64, Shard>,
     /// Units whose bit was repaired from slot headers at open.
     repaired_units: Vec<u64>,
+    /// Units marked allocated at open because their slot lay beyond the end
+    /// of a truncated data file (`ShortFile::Truncated`).
+    damaged_units: Vec<u64>,
 }
 
 /// Shard index of a `shard-XXXXXXXX.dat` file name, verified by
@@ -83,27 +124,54 @@ fn parse_shard_data_name(name: &str) -> Option<u64> {
     (layout::shard_data(idx) == format!("{}/{name}", layout::DATA_DIR)).then_some(idx)
 }
 
-/// Header of a slot whose allocation bit is clear, if one decodes for
-/// `unit`. A short file, a hole, or garbage all mean "unwritten".
+/// What the slot of a unit whose allocation bit is clear holds.
+enum Probe {
+    /// An all-zero header (or, in a shard never checkpointed into, a slot
+    /// beyond the end of the file): never written.
+    Unwritten,
+    /// A header for this unit: the allocation copy is behind the slot.
+    Header(SlotHeader),
+    /// Bytes that are neither zero nor a header for this unit. A hole is
+    /// never partly written, so this slot was written and then damaged —
+    /// along with the allocation copy that listed it (SPEC §22). Reading
+    /// it as zeros would turn checkpointed data into a hole.
+    Damaged,
+}
+
+/// Probe the header of a slot whose allocation bit is clear.
 fn probe_header(
     geometry: &Geometry,
     shard: &Shard,
     unit: u64,
     in_shard: u64,
     file_len: u64,
-) -> Result<Option<SlotHeader>, CoreError> {
+) -> Result<Probe, CoreError> {
     let offset = geometry.slot_offset(in_shard);
     if offset + 64 > file_len {
-        return Ok(None);
+        // A shard data file is created at its full sparse size and synced
+        // before it is ever used (`ensure_shard`), so a file that ends
+        // before this slot was truncated: damage, not a hole. The one
+        // exception is a shard whose creation never finished (no slot of
+        // it was ever written). Truncated shards normally never get here:
+        // `open` marks their cleared slots beyond the end allocated.
+        return Ok(if shard.short == Some(ShortFile::Unproven) {
+            Probe::Unwritten
+        } else {
+            Probe::Damaged
+        });
     }
     let mut header_bytes = [0u8; 64];
     shard
         .data
         .read_at(offset, &mut header_bytes)
         .map_err(|e| CoreError::Corrupt(format!("unit {unit}: slot read failed: {e}")))?;
+    if header_bytes.iter().all(|b| *b == 0) {
+        return Ok(Probe::Unwritten);
+    }
     Ok(SlotHeader::decode(&header_bytes)
         .ok()
-        .filter(|h| h.unit_index == unit && h.write_sequence > 0))
+        .filter(|h| h.unit_index == unit && h.write_sequence > 0)
+        .map_or(Probe::Damaged, Probe::Header))
 }
 
 /// Units of `shard` whose bit is clear but whose slot holds a header for
@@ -117,7 +185,11 @@ fn probe_shard(geometry: &Geometry, shard: &Shard, shard_idx: u64) -> Result<Vec
             continue;
         }
         let unit = shard_idx * per_shard + in_shard;
-        if probe_header(geometry, shard, unit, in_shard, len)?.is_some() {
+        // A damaged slot is not marked: its data is unreadable either way,
+        // and a torn first write of a still-journaled unit (the common,
+        // benign cause) is served from the overlay and rewritten by the
+        // next checkpoint. `read_slot` reports it as EIO, never zeros.
+        if let Probe::Header(_) = probe_header(geometry, shard, unit, in_shard, len)? {
             out.push(unit);
         }
     }
@@ -157,6 +229,7 @@ impl SlotStore {
 
         let mut shards = HashMap::new();
         let mut repaired_units: Vec<u64> = Vec::new();
+        let mut damaged_units: Vec<u64> = Vec::new();
         for shard_idx in catalog.shard_indices() {
             if shard_idx >= geometry.num_shards() {
                 return Err(CoreError::Corrupt(format!(
@@ -198,12 +271,68 @@ impl SlotStore {
                 .map_err(|e| {
                     CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
                 })?;
+            // A data file shorter than its physical size (see `ShortFile`).
+            let mut alloc = alloc;
+            let mut dirty_alloc = dirty_alloc;
+            let len = data.len()?;
+            let physical = geometry.units_per_shard() * geometry.slot_size;
+            // Creation finished ⇔ the shard was ever checkpointed into: the
+            // catalog names it (its commit follows the synced full-size
+            // file), or an allocation copy lists a slot (a checkpoint wrote
+            // into it, and the size had been proven before that write). A
+            // leftover empty allocation copy alone proves nothing — an
+            // earlier attempt can leave one behind after its never-dir-synced
+            // data file vanished in the crash. Nor does the observed length:
+            // after a failed sync and a plain restart the page cache shows
+            // the full size that the disk does not have (K-01).
+            let short = if adopted.contains(&shard_idx) && alloc.set_count() == 0 {
+                if len < physical {
+                    tracing::warn!(
+                        shard = shard_idx,
+                        len,
+                        physical,
+                        "uncataloged shard with an empty allocation map and a short data \
+                         file: its creation never finished"
+                    );
+                }
+                Some(ShortFile::Unproven)
+            } else if len >= physical {
+                None
+            } else {
+                // Truncated. A cleared slot beyond the end is indistinguishable
+                // from a checkpointed slot the truncation removed, and the
+                // evidence is about to vanish: the next slot write past the
+                // end grows the file with zeros, after which such a slot has
+                // an all-zero header and would read as an unwritten hole.
+                // Record the damage in the one place that persists — the
+                // allocation map: marked allocated, the slot reads as
+                // allocated-but-invalid (EIO) until it is rewritten.
+                let mut marked = 0u64;
+                for in_shard in 0..alloc.units() {
+                    if !alloc.get(in_shard) && geometry.slot_offset(in_shard) + 64 > len {
+                        alloc.set(in_shard, true);
+                        marked += 1;
+                        damaged_units.push(shard_idx * geometry.units_per_shard() + in_shard);
+                    }
+                }
+                dirty_alloc |= marked > 0;
+                tracing::warn!(
+                    shard = shard_idx,
+                    len,
+                    physical,
+                    marked,
+                    "shard data file truncated below its physical size; unlisted slots \
+                     beyond its end are marked allocated and read as EIO until rewritten"
+                );
+                Some(ShortFile::Truncated)
+            };
             let mut shard = Shard {
                 alloc,
                 alloc_ab,
                 data,
                 dirty_alloc,
                 map_stored,
+                short,
             };
             // With one copy invalid or absent the loaded copy may be the
             // older generation, which does not list the newest slots: audit
@@ -237,7 +366,15 @@ impl SlotStore {
             catalog_dirty,
             shards,
             repaired_units,
+            damaged_units,
         })
+    }
+
+    /// Units whose slot lay beyond the end of a truncated shard data file at
+    /// open and were marked allocated so they read as EIO, never as zeros
+    /// (see `ShortFile::Truncated`). Empty on a healthy volume.
+    pub fn damaged_allocations(&self) -> &[u64] {
+        &self.damaged_units
     }
 
     /// Units whose allocation bit was set from their slot header at open
@@ -338,8 +475,39 @@ impl SlotStore {
                 data,
                 dirty_alloc: false,
                 map_stored: true,
+                short: None,
             },
         );
+        Ok(())
+    }
+
+    /// Make a data file's physical size durable (see `ShortFile`) before
+    /// the first slot write grows it and before the shard is cataloged. The
+    /// `set_len` is issued even when the page cache already shows the full
+    /// size: a failed earlier sync may have dropped it (K-01), and only a
+    /// fresh size change followed by a successful sync proves it. For a
+    /// truncated file the damage marks made at open are stored and
+    /// dir-synced first: the extension zero-fills the slots they stand for,
+    /// and a crash between the two steps would otherwise leave zero headers
+    /// that read as holes.
+    fn prove_data_file(&mut self, shard_idx: u64) -> Result<(), CoreError> {
+        let physical = self.geometry.units_per_shard() * self.geometry.slot_size;
+        let backing = self.backing.clone();
+        let shard = self.shards.get_mut(&shard_idx).unwrap();
+        let Some(short) = shard.short else {
+            return Ok(());
+        };
+        if short == ShortFile::Truncated {
+            fp("store.damage_marks_store")?;
+            shard
+                .alloc_ab
+                .store(backing.as_ref(), &mut shard.alloc)?;
+            backing.sync_dir(layout::DATA_DIR)?;
+        }
+        fp("store.data_size_sync")?;
+        shard.data.set_len(physical)?;
+        shard.data.sync_data()?;
+        shard.short = None;
         Ok(())
     }
 
@@ -358,6 +526,9 @@ impl SlotStore {
             return Ok(());
         }
         for idx in &pending {
+            // The catalog commit that follows also asserts the data file's
+            // size (a cataloged shard's short file is truncation damage).
+            self.prove_data_file(*idx)?;
             fp("store.adopted_alloc_store")?;
             let shard = self.shards.get_mut(idx).unwrap();
             shard
@@ -390,6 +561,7 @@ impl SlotStore {
         }
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         self.ensure_shard(shard_idx)?;
+        self.prove_data_file(shard_idx)?;
         let header = SlotHeader {
             unit_index: unit,
             write_sequence,
@@ -498,8 +670,14 @@ impl SlotStore {
             // (allocation copy behind the data, see module docs).
             let len = shard.data.len()?;
             match probe_header(&self.geometry, shard, unit, in_shard, len)? {
-                None => return Ok(SlotRead::Zero),
-                Some(header) => {
+                Probe::Unwritten => return Ok(SlotRead::Zero),
+                Probe::Damaged => {
+                    return Err(CoreError::Corrupt(format!(
+                        "unit {unit}: unlisted slot holds a damaged header (written, then \
+                         damaged along with its allocation copy)"
+                    )))
+                }
+                Probe::Header(header) => {
                     tracing::warn!(
                         unit,
                         "slot holds data its allocation map copy does not list; serving it"

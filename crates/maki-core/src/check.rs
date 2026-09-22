@@ -187,6 +187,16 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                     repaired.len()
                 ));
             }
+            // Slots beyond the end of a truncated shard data file: counted
+            // above as invalid (they are marked allocated), explained here.
+            let damaged = store.damaged_allocations();
+            if !damaged.is_empty() {
+                report.warnings.push(format!(
+                    "slots: {} unit(s) lie beyond the end of a truncated shard data file \
+                     (marked allocated; they read as EIO until rewritten)",
+                    damaged.len()
+                ));
+            }
         }
         Err(CoreError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("slot store: {e}")),

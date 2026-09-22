@@ -906,7 +906,7 @@ shard absent from catalog
 
 shard exists
 allocation bit = 0
-slot holds no valid header for this unit
+slot header bytes are all zero
 → unwritten zero
 
 allocation bit = 0
@@ -914,6 +914,32 @@ slot holds a valid header for this unit
 → allocation copy is behind the slot: treat as bit = 1
   (served; bit repaired in memory, persisted by the next checkpoint)
 
+allocation bit = 0
+slot header bytes are neither zero nor a valid header for this unit
+→ EIO (a written slot that was damaged, together with the allocation
+  copy that listed it; a hole is never partly written)
+
+allocation bit = 0
+slot lies beyond the end of a data file shorter than its physical size
+(units_per_shard × slot_size)
+→ EIO (the file is created at its full sparse size and synced before
+  any slot is written, so a short file was truncated)
+```
+
+A truncated data file is media damage, and its evidence is volatile: the
+next slot write past the end grows the file with zeros, after which a removed
+slot has an all-zero header and would read as a hole. Open therefore marks
+every cleared slot beyond the end *allocated* (persisted before the file is
+grown back), so it reads as allocated-but-invalid, EIO, until it is
+rewritten. The only legitimately short data file belongs to a shard that was
+never checkpointed into: not named by the loaded catalog copy and with an
+empty allocation map (a stale empty copy from an earlier creation attempt
+proves nothing). Its creation (§27) never finished, so no slot of it holds
+data and its holes stay holes. Nothing proves such a file's size durable —
+not even a full-size page-cache view after a restart (§12 K-01) — so the
+size is set and synced again before the shard is written to or cataloged.
+
+```text
 allocation bit = 1
 slot invalid or missing
 → EIO
