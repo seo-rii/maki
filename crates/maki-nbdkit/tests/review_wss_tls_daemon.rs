@@ -10,6 +10,7 @@ use tokio_rustls::rustls;
 
 const UNIT: usize = 512;
 const XOR: u8 = 0x5a;
+const TLS_HOST: &str = "127.0.0.1";
 
 struct Identity {
     cert_pem: String,
@@ -30,7 +31,7 @@ fn identity(name: &str) -> Identity {
 }
 
 struct WssServer {
-    port: u16,
+    addr: std::net::SocketAddr,
     server_ca_pem: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -39,7 +40,7 @@ struct WssServer {
 impl WssServer {
     fn start(trusted_client: Option<&Identity>) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let server = identity("localhost");
+        let server = identity(TLS_HOST);
         let server_ca_pem = server.cert_pem.clone();
         let builder =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12]);
@@ -67,8 +68,8 @@ impl WssServer {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    ready_tx.send(listener.local_addr().unwrap().port()).unwrap();
+                    let listener = tokio::net::TcpListener::bind((TLS_HOST, 0)).await.unwrap();
+                    ready_tx.send(listener.local_addr().unwrap()).unwrap();
                     loop {
                         let tcp = tokio::select! {
                             _ = &mut shutdown_rx => break,
@@ -107,7 +108,7 @@ impl WssServer {
                 });
         });
         Self {
-            port: ready_rx.recv().unwrap(),
+            addr: ready_rx.recv().unwrap(),
             server_ca_pem,
             shutdown: Some(shutdown),
             thread: Some(thread),
@@ -180,7 +181,7 @@ timeout = "250ms"
 max_frame_bytes = "2MiB"
 [[crypto.websocket.endpoint]]
 name = "local-tls"
-url = "wss://localhost:{port}/crypto"
+url = "wss://{addr}/crypto"
 [crypto.websocket.tls]
 ca_file = "{ca_file}"
 {client_tls}[backing]
@@ -194,7 +195,7 @@ threads = 2
 [control]
 socket = "{socket}"
 "#,
-        port = server.port,
+        addr = server.addr,
     );
     let path = directory.path().join("volume.toml");
     std::fs::write(&path, &raw).unwrap();
@@ -204,6 +205,15 @@ socket = "{socket}"
 fn roundtrip(client: Option<&Identity>) {
     let server = WssServer::start(client);
     let (_directory, raw, path) = config(&server, client);
+    let configured_url = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("url = \"")?.strip_suffix('"'))
+        .unwrap();
+    assert_eq!(
+        configured_url,
+        format!("wss://{}/crypto", server.addr),
+        "fixture endpoint must use the exact address bound by the listener"
+    );
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     let adapter = NbdAdapter::open_config(&path).unwrap();
     let expected = vec![0xa7; UNIT];
