@@ -412,6 +412,34 @@ impl State {
             .collect()
     }
 
+    fn reclaim_closed_files(&mut self) -> io::Result<()> {
+        let mut retained: BTreeSet<u64> = self
+            .committed
+            .entries
+            .values()
+            .chain(self.entries.values())
+            .filter_map(|entry| match entry {
+                Entry::File(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        retained.extend(self.handles.keys());
+        if self
+            .committed
+            .files
+            .keys()
+            .chain(self.files.keys())
+            .any(|id| !retained.contains(id))
+        {
+            // Last-close cannot report commit errors. Defer reclamation until
+            // the next space query or reservation, where errors can propagate.
+            // Publish the pruned manifest before counting or reusing its pages;
+            // a pending unlink still has a committed name and is retained.
+            self.commit(self.committed.clone())?;
+        }
+        Ok(())
+    }
+
     fn commit(&mut self, mut candidate: Manifest) -> io::Result<()> {
         self.check()?;
         candidate.next_id = self.next_id;
@@ -464,6 +492,7 @@ impl State {
         {
             return Err(no_space());
         }
+        self.reclaim_closed_files()?;
         let mut coordinates = self.coordinates();
         coordinates.extend(range.clone().map(|index| (id, index)));
         if coordinates.len() as u64 > self.committed.capacity / PAGE {
@@ -820,6 +849,7 @@ impl Backing for RollbackBacking {
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         let mut state = self.state.lock();
         state.check()?;
+        state.reclaim_closed_files()?;
         Ok(Some(
             state.committed.capacity - state.coordinates().len() as u64 * PAGE,
         ))
@@ -926,6 +956,117 @@ mod tests {
                 .read_at(0, &mut bytes)
                 .unwrap();
             assert_eq!(&bytes, b"old", "{boundary}");
+        }
+    }
+
+    #[test]
+    fn reclamation_failures_preserve_witnessed_pages_until_retry() {
+        for trigger in ["free_bytes", "reservation"] {
+            for boundary in ["arena", "manifest", "witness"] {
+                let root = tempfile::tempdir().unwrap();
+                let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+                let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+                let old = backing.open("old", true).unwrap();
+                old.write_at(0, &[0x44; PAGE as usize]).unwrap();
+                old.sync_data().unwrap();
+                backing.sync_dir("").unwrap();
+                backing.remove("old").unwrap();
+                backing.sync_dir("").unwrap();
+                drop(old);
+
+                let (old_id, committed, coordinates) = {
+                    let state = backing.state.lock();
+                    let old_id = *state.committed.files.keys().next().unwrap();
+                    (
+                        old_id,
+                        state.committed.encode().unwrap(),
+                        state.coordinates(),
+                    )
+                };
+                let mut original_arena = None;
+                let mut blocker = None;
+                let mut saved_manifest = None;
+                match boundary {
+                    "arena" => {
+                        let mut state = backing.state.lock();
+                        let arena = state.arena.clone();
+                        state.arena = Arc::new(FailingSync(arena.clone()));
+                        original_arena = Some(arena);
+                    }
+                    "manifest" => {
+                        let state = backing.state.lock();
+                        let path = root.path().join(MANIFESTS[1 - state.manifest_slot]);
+                        drop(state);
+                        let saved = root.path().join("rollback.manifest.saved");
+                        std::fs::rename(&path, &saved).unwrap();
+                        std::fs::create_dir(&path).unwrap();
+                        blocker = Some(path);
+                        saved_manifest = Some(saved);
+                    }
+                    "witness" => {
+                        let path = witness.path().join("anchor.next");
+                        std::fs::create_dir(&path).unwrap();
+                        blocker = Some(path);
+                    }
+                    _ => unreachable!(),
+                }
+
+                let replacement =
+                    (trigger == "reservation").then(|| backing.open("replacement", true).unwrap());
+                let result = match &replacement {
+                    Some(file) => file.allocate_range(0, PAGE),
+                    None => backing.free_bytes().map(|_| ()),
+                };
+                assert!(
+                    result.is_err(),
+                    "{trigger} unexpectedly survived {boundary}"
+                );
+                assert!(
+                    backing.check_freshness().is_err(),
+                    "{trigger} did not poison the session at {boundary}"
+                );
+                {
+                    let state = backing.state.lock();
+                    assert!(state.poisoned, "{trigger} {boundary}");
+                    assert_eq!(
+                        state.committed.encode().unwrap(),
+                        committed,
+                        "{trigger} {boundary}"
+                    );
+                    assert_eq!(state.coordinates(), coordinates, "{trigger} {boundary}");
+                    assert!(state.files.contains_key(&old_id), "{trigger} {boundary}");
+                }
+
+                if let Some(arena) = original_arena {
+                    backing.state.lock().arena = arena;
+                }
+                if let Some(path) = blocker {
+                    std::fs::remove_dir(&path).unwrap();
+                    if let Some(saved) = saved_manifest {
+                        std::fs::rename(saved, path).unwrap();
+                    }
+                }
+                drop((replacement, backing));
+
+                let reopened = RollbackBacking::open(root.path(), witness.path()).unwrap();
+                assert_eq!(
+                    reopened.state.lock().committed.encode().unwrap(),
+                    committed,
+                    "{trigger} {boundary} reopened a different root"
+                );
+                assert_eq!(reopened.free_bytes().unwrap(), Some(PAGE));
+                let replacement = reopened.open("replacement", true).unwrap();
+                replacement.write_at(0, &[0x55; PAGE as usize]).unwrap();
+                replacement.sync_data().unwrap();
+                reopened.sync_dir("").unwrap();
+                drop((replacement, reopened));
+
+                let reopened = RollbackBacking::open(root.path(), witness.path()).unwrap();
+                let replacement = reopened.open("replacement", false).unwrap();
+                let mut bytes = vec![0; PAGE as usize];
+                replacement.read_at(0, &mut bytes).unwrap();
+                assert_eq!(bytes, vec![0x55; PAGE as usize], "{trigger} {boundary}");
+            }
         }
     }
 
