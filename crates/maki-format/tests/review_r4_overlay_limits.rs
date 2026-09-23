@@ -51,20 +51,33 @@ fn zero_disables_an_overlay_limit_explicitly() {
 }
 
 #[test]
-fn overlay_byte_limit_must_hold_one_maximal_request_twice() {
-    // A request is charged twice at most (latest and durable copy), so the
-    // bound must be at least 2 * max_plaintext_bytes' worth of ciphertext.
-    let cfg = config("max_overlay_bytes = \"200MiB\"");
-    let err = cfg.validate().expect_err("too small for one maximal request");
+fn overlay_byte_limit_must_hold_the_largest_request_twice() {
+    // The largest request is nbd.maximum_io (1 MiB) plus one unit of
+    // misalignment: 257 units of 4384 ciphertext bytes, charged twice
+    // (latest and durable copy) = 2,253,376 bytes.
+    let cfg = config("max_overlay_bytes = \"2MiB\"");
+    let err = cfg.validate().expect_err("too small for the largest request");
     assert!(err.to_string().contains("limits.max_overlay_bytes"), "{err}");
-    config("max_overlay_bytes = \"256MiB\"").validate().unwrap();
+    config("max_overlay_bytes = 2253376").validate().unwrap();
+    config("max_overlay_bytes = 2253375")
+        .validate()
+        .expect_err("one byte short");
 }
 
 #[test]
-fn overlay_entry_limit_must_hold_one_maximal_request() {
-    // 128 MiB / 4 KiB = 32768 units in one maximal request.
-    let cfg = config("max_overlay_entries = 1000");
-    let err = cfg.validate().expect_err("too few entries for one maximal request");
+fn overlay_entry_limit_must_hold_the_largest_request() {
+    let cfg = config("max_overlay_entries = 256");
+    let err = cfg.validate().expect_err("too few entries for the largest request");
     assert!(err.to_string().contains("limits.max_overlay_entries"), "{err}");
-    config("max_overlay_entries = 32769").validate().unwrap();
+    config("max_overlay_entries = 257").validate().unwrap();
+}
+
+#[test]
+fn the_overlay_bound_does_not_constrain_the_admission_budget() {
+    // The admission budget may be far larger than the overlay bound: the
+    // largest single request, not the budget, is what must fit.
+    let mut cfg = config("");
+    cfg.limits.max_plaintext_bytes.0 = (u32::MAX >> 1) as u64;
+    cfg.limits.max_ciphertext_bytes.0 = (u32::MAX >> 1) as u64;
+    cfg.validate().unwrap();
 }

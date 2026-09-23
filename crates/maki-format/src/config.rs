@@ -1388,24 +1388,29 @@ impl VolumeConfig {
             ));
         }
         // Progress guarantee for the overlay bound (R4-005): after an inline
-        // checkpoint the overlay is empty, and the largest admitted request
-        // is charged twice (latest plus durable copy), so it must fit twice.
-        let overlay_needed = l.max_plaintext_bytes.0.saturating_mul(2);
+        // checkpoint the overlay is empty, and the largest single request
+        // (nbd.maximum_io plus one unit of misalignment, as ciphertext) is
+        // charged twice (latest plus durable copy), so it must fit twice.
+        let overlay_units = self
+            .nbd
+            .maximum_io
+            .0
+            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
+            + 1;
+        let overlay_needed = overlay_units
+            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
+            .saturating_mul(2);
         if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
             return Err(invalid(format!(
-                "limits.max_overlay_bytes {} must be at least twice limits.max_plaintext_bytes \
-                 ({overlay_needed}) so one maximal request can always be admitted after an \
-                 inline checkpoint, or 0 to disable the bound",
-                l.max_overlay_bytes.0
+                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
+                 largest request ({overlay_units} units of {} ciphertext bytes) so it can \
+                 always be admitted after an inline checkpoint, or 0 to disable the bound",
+                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
             )));
         }
-        let overlay_units = l
-            .max_plaintext_bytes
-            .0
-            .div_ceil(self.volume.crypto_unit_size.max(1) as u64);
         if l.max_overlay_entries != 0 && l.max_overlay_entries < overlay_units {
             return Err(invalid(format!(
-                "limits.max_overlay_entries {} must be at least {overlay_units} (one maximal \
+                "limits.max_overlay_entries {} must be at least {overlay_units} (the largest \
                  request in crypto units) or 0 to disable the bound",
                 l.max_overlay_entries
             )));
