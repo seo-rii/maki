@@ -486,6 +486,24 @@ write-cache behavior must be characterized first.
 
 WSL is suitable for Linux syscall integration but not for power-loss claims.
 
+## Optional random plaintext prefixes
+
+The [prefix wrapper](random-plaintext-prefix.md) has focused provider, config
+and daemon suites:
+
+```sh
+cargo test -p maki-crypto --test random_prefix
+cargo test -p maki-format --test random_prefix_config
+cargo test -p maki-nbdkit --test random_prefix --test random_prefix_remote --test random_prefix_admission
+```
+
+The tests inspect the actual expanded plaintext, fresh per-unit prefixes,
+provider response validation, capabilities and batch sizes, compatibility
+gates, authenticated-prefix corruption, partial writes, discard, reopen and
+two-endpoint remote operation. They do not establish a randomness benefit for
+every possible provider algorithm; existing nonce and integrity requirements
+still apply.
+
 ## Experimental rollback backing
 
 The [local-witness format](rollback-protection.md) has separate qualification

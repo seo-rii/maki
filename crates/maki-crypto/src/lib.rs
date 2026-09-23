@@ -11,6 +11,7 @@ pub mod endpoint;
 pub mod error;
 pub mod flow;
 pub mod provider;
+pub mod random_prefix;
 pub mod retry;
 pub mod scheduler;
 pub mod secret;
@@ -20,6 +21,7 @@ pub mod types;
 pub use clock::{Clock, SystemClock};
 pub use error::{ContextField, CryptoError, ErrorClass};
 pub use provider::CryptoProvider;
+pub use random_prefix::RandomPrefixProvider;
 pub use secret::SecretBuffer;
 pub use types::{
     BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit,

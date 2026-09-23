@@ -149,6 +149,14 @@ successful attachment; they do not trigger a plaintext fallback.
 
 ## Compatibility identity
 
+`crypto.random_prefix_bytes` can prepend random bytes to each plaintext unit
+before encryption. It defaults to zero; enabled lengths are 16–256 in multiples
+of 16. Provider plaintext capabilities must include the expanded unit size, and
+the ciphertext bound must include the provider's full result. Enabled volumes
+use a derived compatibility ID that includes the prefix length, so changing
+this option requires a new volume. See [random plaintext prefixes](random-plaintext-prefix.md)
+for configuration, batch accounting and security limits.
+
 `crypto_compatibility_id` identifies the cryptographic profile rather than a
 network endpoint. Every endpoint in a failover set must decrypt ciphertext from
 every other endpoint. Changing keys, algorithms, nonce layout, context binding,

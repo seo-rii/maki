@@ -145,13 +145,22 @@ async fn build_provider_for_volume(
     // Public callers can supply an unvalidated configuration. Refuse name
     // collisions before the name-only credential router loads any secret.
     config.validate_credential_sources()?;
-    let unit = config.volume.crypto_unit_size;
+    let unit = config.provider_plaintext_size()?;
     let compat = config.crypto.crypto_compatibility_id.as_str();
+    let volume_compat = config.crypto.effective_compatibility_id();
     let set = match config.crypto.provider.as_str() {
         #[cfg(feature = "fake-provider")]
         "fake" => {
             return Ok((
-                Arc::new(maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat)),
+                apply_random_prefix(
+                    Arc::new(
+                        maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat),
+                    ),
+                    config.volume.crypto_unit_size,
+                    config.crypto.random_prefix_bytes,
+                    &volume_compat,
+                )
+                .await?,
                 None,
             ))
         }
@@ -171,14 +180,52 @@ async fn build_provider_for_volume(
             } else {
                 Arc::new(AesXtsProvider::new(source.as_ref(), &name, unit, compat)?)
             };
-            return Ok((provider, None));
+            return Ok((
+                apply_random_prefix(
+                    provider,
+                    config.volume.crypto_unit_size,
+                    config.crypto.random_prefix_bytes,
+                    &volume_compat,
+                )
+                .await?,
+                None,
+            ));
         }
         "remote-http" => remote_http_provider(config, volume).await?,
         "remote-websocket" => remote_websocket_provider(config, volume).await?,
         "remote-grpc" => remote_grpc_provider(config, volume).await?,
         other => return Err(DaemonError::Unsupported(format!("provider {other:?}"))),
     };
-    Ok((set.clone() as Arc<dyn CryptoProvider>, Some(set)))
+    // Expand before entering the dispatcher, so retry and admission account
+    // for the actual provider payload and reuse one prepared prefix per call.
+    let provider = apply_random_prefix(
+        set.clone(),
+        config.volume.crypto_unit_size,
+        config.crypto.random_prefix_bytes,
+        &volume_compat,
+    )
+    .await?;
+    Ok((provider, Some(set)))
+}
+
+async fn apply_random_prefix(
+    provider: Arc<dyn CryptoProvider>,
+    logical_unit_size: u32,
+    prefix_bytes: u32,
+    compatibility_id: &str,
+) -> Result<Arc<dyn CryptoProvider>, maki_crypto::CryptoError> {
+    if prefix_bytes == 0 {
+        return Ok(provider);
+    }
+    Ok(Arc::new(
+        maki_crypto::RandomPrefixProvider::new(
+            provider,
+            logical_unit_size,
+            prefix_bytes,
+            compatibility_id.to_owned(),
+        )
+        .await?,
+    ))
 }
 
 /// Credential router for header, metadata and TLS-key secrets (SPEC 9).
@@ -504,7 +551,8 @@ async fn dispatch_endpoint_set(
     use maki_crypto::selftest::{cross_endpoint_self_test, provider_self_test};
 
     let unit = config.volume.crypto_unit_size as usize;
-    let compat = config.crypto.crypto_compatibility_id.clone();
+    let prefix_bytes = config.crypto.random_prefix_bytes;
+    let compat = config.crypto.effective_compatibility_id();
     let transport_failure = |e: &maki_crypto::CryptoError| {
         matches!(
             e.class(),
@@ -541,12 +589,14 @@ async fn dispatch_endpoint_set(
             reachable.push((name, provider));
             break;
         }
+        let validation_provider =
+            apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
         let mut last: Option<maki_crypto::CryptoError> = None;
         for attempt in 0..3 {
-            match provider_self_test(provider.as_ref(), &context, unit, &compat).await {
+            match provider_self_test(validation_provider.as_ref(), &context, unit, &compat).await {
                 Ok(()) => {
-                    let caps = provider.capabilities().await?;
-                    let checked = CheckedProvider::pinned(provider.clone(), unit as u32);
+                    let caps = validation_provider.capabilities().await?;
+                    let checked = CheckedProvider::pinned(validation_provider.clone(), unit as u32);
                     match maki_core::engine::verify_key_canary(
                         volume,
                         &checked,
@@ -597,13 +647,22 @@ async fn dispatch_endpoint_set(
 
     // 2. Interchangeability among the reachable ones (SPEC 34).
     let mut flagged: Vec<(String, Arc<dyn CryptoProvider>, bool)> = Vec::new();
-    let reference = reachable[0].1.clone();
+    let reference =
+        apply_random_prefix(reachable[0].1.clone(), unit as u32, prefix_bytes, &compat).await?;
     for (index, (name, provider)) in reachable.into_iter().enumerate() {
         if index == 0 {
             flagged.push((name, provider, true));
             continue;
         }
-        match cross_endpoint_self_test(reference.as_ref(), provider.as_ref(), &context, unit).await
+        let validation_provider =
+            apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
+        match cross_endpoint_self_test(
+            reference.as_ref(),
+            validation_provider.as_ref(),
+            &context,
+            unit,
+        )
+        .await
         {
             Ok(()) => flagged.push((name, provider, true)),
             Err(e) if transport_failure(&e) => {
@@ -631,6 +690,20 @@ async fn dispatch_endpoint_set(
         let context = validation_context.clone();
         let canary = canary.clone();
         Box::pin(async move {
+            let candidate = apply_random_prefix(
+                candidate,
+                unit as u32,
+                prefix_bytes,
+                &context.crypto_compatibility_id,
+            )
+            .await?;
+            let reference = apply_random_prefix(
+                reference,
+                unit as u32,
+                prefix_bytes,
+                &context.crypto_compatibility_id,
+            )
+            .await?;
             provider_self_test(
                 candidate.as_ref(),
                 &context,
@@ -804,14 +877,37 @@ pub async fn attach_from_config_with_stats(
 pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::SchedulerConfig {
     let batch = &config.crypto.batch;
     let limits = &config.limits;
+    // The scheduler holds logical plaintext; its inner prefix wrapper exposes
+    // fewer usable bytes/items than the raw provider. Cap aggregation as well
+    // as individual callers, or concurrent valid groups can form an oversized
+    // expanded batch. Configuration validation guarantees one unit fits.
+    let (max_items, max_bytes, max_pending_plaintext_bytes) =
+        if config.crypto.random_prefix_bytes == 0 {
+            (
+                batch.max_items as usize,
+                batch.max_bytes.0,
+                limits.max_pending_crypto_bytes.0,
+            )
+        } else {
+            let logical = u64::from(config.volume.crypto_unit_size);
+            let expanded = logical + u64::from(config.crypto.random_prefix_bytes);
+            let items = u64::from(batch.max_items).min(batch.max_bytes.0 / expanded);
+            (
+                items as usize,
+                items * logical,
+                // Reserve each queued unit's expanded cost even though its prefix
+                // is generated only once this group enters the wrapper.
+                (limits.max_pending_crypto_bytes.0 / expanded) * logical,
+            )
+        };
     maki_crypto::scheduler::SchedulerConfig {
-        target_items: batch.target_items as usize,
-        target_bytes: batch.target_bytes.0,
-        max_items: batch.max_items as usize,
-        max_bytes: batch.max_bytes.0,
+        target_items: (batch.target_items as usize).min(max_items),
+        target_bytes: batch.target_bytes.0.min(max_bytes),
+        max_items,
+        max_bytes,
         max_wait: batch.max_wait.0,
         max_pending_items: limits.max_pending_crypto_items,
-        max_pending_plaintext_bytes: limits.max_pending_crypto_bytes.0,
+        max_pending_plaintext_bytes,
         max_pending_ciphertext_bytes: limits.max_ciphertext_bytes.0,
         max_inflight_batches: limits.max_crypto_inflight_batches,
     }
@@ -856,7 +952,7 @@ fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, Dae
         generation: 0,
         volume_uuid: uuid::Uuid::new_v4(),
         provider_type: config.crypto.provider.clone(),
-        crypto_compatibility_id: config.crypto.crypto_compatibility_id.clone(),
+        crypto_compatibility_id: config.crypto.effective_compatibility_id(),
         key_identity: config
             .crypto
             .key
