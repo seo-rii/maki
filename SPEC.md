@@ -751,6 +751,24 @@ crypto compatibility ID
 
 AES-XTS MUST be documented as not providing authenticated integrity.
 
+An optional `crypto.random_prefix_bytes` setting prepends fresh random bytes
+to each plaintext unit before local or remote encryption. Zero disables it;
+enabled lengths MUST be 16–256 bytes in multiples of 16. Providers MUST accept
+the logical unit size plus the prefix, and ciphertext bounds MUST cover their
+complete result. Decryption MUST validate the full provider response before
+removing the prefix. Existing provider nonce/IV handling and security capability
+levels remain unchanged; this option does not establish extra integrity,
+context binding or replay protection.
+
+Enabled volumes MUST store the derived compatibility ID
+`maki-random-prefix-v1:<prefix bytes>:<base compatibility ID>`. This prefix is
+reserved and cannot be used as a configured base ID. The base ID remains on
+the provider wire; the derived ID binds the volume's plaintext layout. Changing
+the prefix length or enabling/disabling it on an existing volume MUST refuse
+attach. Batch limits and remote admission MUST account for expanded plaintext,
+and endpoint/canary verification MUST cover the same prefix wrapper used for
+volume I/O. See [random plaintext prefixes](docs/random-plaintext-prefix.md).
+
 ---
 
 # 18. Remote Crypto
