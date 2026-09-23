@@ -212,6 +212,10 @@ pub enum AvailabilityPolicy {
 pub struct CryptoSection {
     pub provider: String,
     pub crypto_compatibility_id: String,
+    /// Random bytes prepended to each logical crypto unit before encryption.
+    /// Zero preserves the original provider contract and compatibility id.
+    #[serde(default)]
+    pub random_prefix_bytes: u32,
     #[serde(default)]
     pub availability_policy: AvailabilityPolicy,
     /// Maximum operation time for `bounded-error` (SPEC §35).
@@ -238,6 +242,17 @@ pub struct CryptoSection {
 }
 
 impl CryptoSection {
+    pub fn effective_compatibility_id(&self) -> String {
+        if self.random_prefix_bytes == 0 {
+            self.crypto_compatibility_id.clone()
+        } else {
+            format!(
+                "maki-random-prefix-v1:{}:{}",
+                self.random_prefix_bytes, self.crypto_compatibility_id
+            )
+        }
+    }
+
     pub fn availability_policy_default(&self) -> &'static str {
         match self.availability_policy {
             AvailabilityPolicy::Stall => "stall",
@@ -798,6 +813,19 @@ impl VolumeConfig {
         )
     }
 
+    /// Plaintext bytes passed to the crypto provider for one logical unit.
+    pub fn provider_plaintext_size(&self) -> Result<u32, ConfigError> {
+        self.volume
+            .crypto_unit_size
+            .checked_add(self.crypto.random_prefix_bytes)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "crypto_unit_size {} plus random_prefix_bytes {} overflows u32",
+                    self.volume.crypto_unit_size, self.crypto.random_prefix_bytes
+                ))
+            })
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.config_schema_version != 1 {
             return Err(ConfigError::Invalid(format!(
@@ -883,11 +911,32 @@ impl VolumeConfig {
                 )));
             }
         }
+        if self.crypto.random_prefix_bytes != 0
+            && (!(16..=256).contains(&self.crypto.random_prefix_bytes)
+                || !self.crypto.random_prefix_bytes.is_multiple_of(16))
+        {
+            return Err(invalid(format!(
+                "crypto.random_prefix_bytes {} must be 0 or a multiple of 16 in 16..=256",
+                self.crypto.random_prefix_bytes
+            )));
+        }
+        if self
+            .crypto
+            .crypto_compatibility_id
+            .starts_with("maki-random-prefix-v1:")
+        {
+            return Err(invalid(
+                "crypto_compatibility_id uses the reserved maki-random-prefix-v1: namespace",
+            ));
+        }
+        let provider_plaintext_size = self.provider_plaintext_size()?;
+
         // These strings are stored in fixed superblock fields.
         let max = crate::superblock::MAX_STR;
-        if self.crypto.crypto_compatibility_id.len() > max {
+        let effective_compatibility_id = self.crypto.effective_compatibility_id();
+        if effective_compatibility_id.len() > max {
             return Err(ConfigError::Invalid(format!(
-                "crypto_compatibility_id exceeds {max} bytes"
+                "effective crypto_compatibility_id exceeds {max} bytes"
             )));
         }
         if let Some(key) = &self.crypto.key {
@@ -907,11 +956,29 @@ impl VolumeConfig {
             .crypto
             .capabilities
             .supported_plaintext_sizes
-            .contains(&self.volume.crypto_unit_size)
+            .contains(&provider_plaintext_size)
         {
             return Err(ConfigError::Invalid(format!(
-                "crypto_unit_size {} not in supported_plaintext_sizes",
-                self.volume.crypto_unit_size
+                "provider plaintext size {provider_plaintext_size} not in supported_plaintext_sizes"
+            )));
+        }
+        if self.crypto.capabilities.max_ciphertext_size < provider_plaintext_size {
+            return Err(invalid(format!(
+                "max_ciphertext_size {} must be at least provider plaintext size {provider_plaintext_size}",
+                self.crypto.capabilities.max_ciphertext_size
+            )));
+        }
+        let local_min_ciphertext = match self.crypto.provider.as_str() {
+            "local-aes-gcm-siv" => provider_plaintext_size.checked_add(28).ok_or_else(|| {
+                invalid("provider plaintext size plus local AES-GCM-SIV overhead overflows u32")
+            })?,
+            "local-aes-xts" => provider_plaintext_size,
+            _ => 0,
+        };
+        if self.crypto.capabilities.max_ciphertext_size < local_min_ciphertext {
+            return Err(invalid(format!(
+                "max_ciphertext_size {} must be at least {local_min_ciphertext} for provider {:?}",
+                self.crypto.capabilities.max_ciphertext_size, self.crypto.provider
             )));
         }
         for s in [
@@ -1359,13 +1426,13 @@ impl VolumeConfig {
         }
 
         let bt = &self.crypto.batch;
-        let unit = self.volume.crypto_unit_size as u64;
+        let unit = u64::from(self.provider_plaintext_size()?);
         if bt.max_items == 0 {
             return Err(invalid("crypto.batch.max_items must be positive"));
         }
         if bt.max_bytes.0 < unit {
             return Err(invalid(format!(
-                "crypto.batch.max_bytes must hold at least one crypto unit ({unit} bytes)"
+                "crypto.batch.max_bytes must hold at least one provider plaintext unit ({unit} bytes)"
             )));
         }
         if bt.target_items == 0 || bt.target_items > bt.max_items {
@@ -1399,9 +1466,9 @@ impl VolumeConfig {
                 l.max_pending_crypto_bytes.0, bt.max_bytes.0
             )));
         }
-        // Batch bytes are logical plaintext bytes. The ciphertext queue and
+        // Batch bytes are provider plaintext bytes. The ciphertext queue and
         // RPC admission hold ciphertext, including the provider's declared
-        // maximum overhead. Both item and logical limits bound a full batch.
+        // maximum overhead. Both item and byte limits bound a full batch.
         let batch_units = u64::from(bt.max_items).min(bt.max_bytes.0 / unit);
         let ciphertext_batch = batch_units
             .checked_mul(u64::from(self.crypto.capabilities.max_ciphertext_size))
