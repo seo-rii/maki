@@ -103,6 +103,9 @@ pub struct JournalScan {
     pub segments: Vec<SegmentInfo>,
     /// Records with sequence > checkpoint_sequence, in sequence order.
     pub replay: Vec<JournalRecord>,
+    /// Units with at least one such record, when the scan was asked to
+    /// collect units instead of payloads (`summarize_journal`).
+    pub replay_units: std::collections::BTreeSet<u64>,
     pub repairs: Vec<JournalRepair>,
     /// Whether a durable mark was found for the final segment.
     pub mark: Option<DurableMark>,
@@ -124,6 +127,10 @@ struct VerifiedPrefix {
 enum ReplayRecords {
     All(Vec<JournalRecord>),
     Discard,
+    /// Only the units that have an uncovered replay record: what the deep
+    /// checker needs to tell recoverable slot damage from unrecoverable
+    /// damage (R4-004). One `u64` per distinct unit, no payloads.
+    Units(std::collections::BTreeSet<u64>),
 }
 
 impl ReplayRecords {
@@ -131,14 +138,20 @@ impl ReplayRecords {
         match self {
             Self::All(records) => records.push(record),
             Self::Discard => {}
+            Self::Units(units) => {
+                units.insert(record.unit_index);
+            }
         }
         Ok(())
     }
 
-    fn into_records(self) -> Vec<JournalRecord> {
+    /// (retained records, units with an uncovered record). Only the mode
+    /// that was asked for is populated; the other side is empty.
+    fn into_parts(self) -> (Vec<JournalRecord>, std::collections::BTreeSet<u64>) {
         match self {
-            Self::All(records) => records,
-            Self::Discard => Vec::new(),
+            Self::All(records) => (records, Default::default()),
+            Self::Discard => Default::default(),
+            Self::Units(units) => (Vec::new(), units),
         }
     }
 }
@@ -484,6 +497,9 @@ pub(crate) struct JournalSummary {
     pub uncovered_records: u64,
     pub durable_sequence: u64,
     pub repairs: Vec<JournalRepair>,
+    /// Units recovery would rewrite (or discard) from a validated record:
+    /// damage to their slots is recoverable (R4-004).
+    pub replay_units: std::collections::BTreeSet<u64>,
 }
 
 pub(crate) fn summarize_journal(
@@ -497,7 +513,7 @@ pub(crate) fn summarize_journal(
         superblock,
         checkpoint_sequence,
         segment_size,
-        ReplayRecords::Discard,
+        ReplayRecords::Units(Default::default()),
     )?;
     let uncovered_records = scan
         .segments
@@ -513,6 +529,7 @@ pub(crate) fn summarize_journal(
         uncovered_records,
         durable_sequence: scan.durable_sequence,
         repairs: scan.repairs,
+        replay_units: scan.replay_units,
     })
 }
 
@@ -822,11 +839,13 @@ fn scan_journal_with_proof(
         None => 0,
     };
 
+    let (replay, replay_units) = replay.into_parts();
     Ok(JournalScan {
         durable_sequence,
         next_segment_index,
         segments,
-        replay: replay.into_records(),
+        replay,
+        replay_units,
         repairs,
         mark: final_mark,
         verified_prefixes,

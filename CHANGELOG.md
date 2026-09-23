@@ -43,6 +43,10 @@ documents.
 
 ### Added
 
+- **Deep-check verdict**: `maki check --deep` and `maki-check --deep` end
+  with `deep check verdict: clean | recoverable | unrecoverable`; slot damage
+  that a validated journal record repairs is a warning, not an error
+  (R4-004; [operations](docs/operations.md#volume-lifecycle)).
 - **Debian package safety**: `prerm` refuses removal while a volume is
   attached (upgrades are exempt), the builder verifies every artifact's ELF
   architecture against `--architecture`, and `--shlibdeps` adds native

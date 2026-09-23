@@ -123,7 +123,10 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     }
 
     // Apply recovery's validation and repair policy without retaining the
-    // replay payloads: this report needs only counts and repair decisions.
+    // replay payloads: this report needs counts, repair decisions and the
+    // set of units a replay would rewrite.
+    let mut replay_units = std::collections::BTreeSet::new();
+    let mut journal_ok = false;
     match summarize_journal(
         &backing,
         &superblock,
@@ -147,35 +150,61 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                     )),
                 }
             }
+            replay_units = scan.replay_units;
+            journal_ok = true;
         }
         Err(RecoveryError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("journal: {e}")),
     }
 
     // Every allocated slot must read back exactly as the engine would read
-    // it: valid header, matching unit, intact ciphertext CRC.
+    // it: valid header, matching unit, intact ciphertext CRC. A slot that
+    // fails but whose unit has a validated journal record newer than the
+    // checkpoint is *recoverable*: recovery rewrites (or discards) it from
+    // that record before the volume is exposed, so the raw damage is a
+    // warning, not a data-loss error (R4-004). Damage with no such record
+    // is unrecoverable and stays an error.
+    let mut recoverable = 0u64;
+    let mut unrecoverable = 0u64;
     match SlotStore::open(backing.clone(), superblock.geometry.clone()) {
         Ok(store) => {
             let mut checked = 0u64;
-            let mut bad = 0u64;
             for unit in store.allocated_units() {
                 checked += 1;
                 if let Err(e) = store.read_slot(unit) {
-                    bad += 1;
-                    if bad as usize <= MAX_SLOT_ERRORS {
-                        report.errors.push(format!("slot: {e}"));
+                    if journal_ok && replay_units.contains(&unit) {
+                        recoverable += 1;
+                        if recoverable as usize <= MAX_SLOT_ERRORS {
+                            report.warnings.push(format!(
+                                "slot: recoverable: {e} (a validated journal record for unit \
+                                 {unit} is newer than the checkpoint; recovery rewrites the slot)"
+                            ));
+                        }
+                    } else {
+                        unrecoverable += 1;
+                        if unrecoverable as usize <= MAX_SLOT_ERRORS {
+                            report.errors.push(format!("slot: {e}"));
+                        }
                     }
                 }
             }
-            if bad as usize > MAX_SLOT_ERRORS {
-                report.errors.push(format!(
-                    "slot: {} more invalid slot(s) not listed",
-                    bad - MAX_SLOT_ERRORS as u64
+            if recoverable as usize > MAX_SLOT_ERRORS {
+                report.warnings.push(format!(
+                    "slot: {} more recoverable slot(s) not listed",
+                    recoverable - MAX_SLOT_ERRORS as u64
                 ));
             }
-            report
-                .info
-                .push(format!("slots: {checked} allocated, {bad} invalid"));
+            if unrecoverable as usize > MAX_SLOT_ERRORS {
+                report.errors.push(format!(
+                    "slot: {} more invalid slot(s) not listed",
+                    unrecoverable - MAX_SLOT_ERRORS as u64
+                ));
+            }
+            report.info.push(format!(
+                "slots: {checked} allocated, {} invalid ({recoverable} recoverable by journal \
+                 replay, {unrecoverable} unrecoverable)",
+                recoverable + unrecoverable
+            ));
             // Slots the loaded allocation copy did not list but that hold
             // a header for their unit: the store repaired them at open and
             // the next checkpoint persists the map, but it means a copy of
@@ -202,6 +231,19 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         Err(CoreError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("slot store: {e}")),
     }
+
+    // One word for the operator: what the next attach will do with this
+    // volume. `clean` needs no repair beyond ordinary replay; `recoverable`
+    // has damage that a validated journal record repairs; `unrecoverable`
+    // has damage (or metadata failure) nothing on this volume can repair.
+    let verdict = if !report.errors.is_empty() {
+        "unrecoverable"
+    } else if recoverable > 0 {
+        "recoverable"
+    } else {
+        "clean"
+    };
+    report.info.push(format!("deep check verdict: {verdict}"));
 
     Ok(report)
 }
