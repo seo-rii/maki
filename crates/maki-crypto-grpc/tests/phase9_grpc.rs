@@ -122,7 +122,7 @@ where
     B: tonic::codegen::Body + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -157,7 +157,7 @@ where
                     .status(200)
                     .header("grpc-status", (Code::Unimplemented as i32).to_string())
                     .header("content-type", "application/grpc")
-                    .body(tonic::body::empty_body())
+                    .body(tonic::body::Body::empty())
                     .unwrap()),
             }
         })
@@ -360,7 +360,9 @@ async fn grpc_passes_provider_conformance() {
 /// redaction.
 #[test]
 fn followup_remote_status_does_not_expose_reflected_secrets() {
-    let error = map_status(&Status::internal("token=SECRET plaintext=PRIVATE\ninjected"));
+    let error = map_status(&Status::internal(
+        "token=SECRET plaintext=PRIVATE\ninjected",
+    ));
     let text = error.to_string();
     assert!(
         !text.contains("SECRET") && !text.contains("PRIVATE") && !text.contains('\n'),

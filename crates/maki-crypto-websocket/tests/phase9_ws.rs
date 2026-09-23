@@ -162,6 +162,7 @@ fn provider(url: &str) -> WsCryptoProvider {
         capabilities: caps(),
         timeout: Duration::from_secs(5),
         max_frame_bytes: 512 * 1024,
+        tls: None,
     })
 }
 
@@ -236,6 +237,7 @@ async fn oversized_outgoing_request_is_rejected_before_send() {
         capabilities: caps(),
         timeout: Duration::from_secs(2),
         max_frame_bytes: 128, // smaller than any encoded request
+        tls: None,
     });
     let err = p.encrypt_batch(&ctx(), &[pt(1, 0x01)]).await.unwrap_err();
     assert_eq!(err.class(), ErrorClass::NonRetryableRequest, "{err:?}");

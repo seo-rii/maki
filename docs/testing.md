@@ -40,8 +40,39 @@ The baseline workspace suite includes unit tests, parser mutation smokes,
 golden format vectors, provider conformance, transport chaos, failpoints,
 manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
 power-loss simulations, and real-process tests for all four binaries.
+The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
+before the workspace tests and checks their executables. This runs the native
+startup, negotiation, drain, process-crash, and ABI regressions instead of relying on optional
+tool availability. Native startup uses disposable files and Unix sockets; it
+does not attach a kernel NBD device or mount a filesystem. On developer hosts
+without nbdkit, native cases explicitly report that they were skipped; such a
+run is not native execution evidence.
+The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
+fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
+campaigns remain opt-in host qualification steps.
+
+The 2026-09-18 bounded-replay follow-up at revision `733833c` reran the Docker
+cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
+136 external ACK units intact, then passed the 192 MiB recovery and offline
+deep check. Because `memory.peak` reached the exact 32 MiB cap, this is a
+scenario result rather than a minimum-memory recommendation. See the
+[cgroup evidence](cgroup-fault-validation-2026-09-12.md#bounded-replay-follow-up--2026-09-18).
+
+The 2026-09-19 [constrained recovery RSS campaign](recovery-rss-validation-2026-09-19.md)
+then ran two independent 48 MiB and two independent 64 MiB post-OOM recoveries.
+All four matched 136 ACK units and passed deep checking. The largest observed
+nbdkit `VmHWM` was 11,415,552 bytes. Both 48 MiB cgroups touched their cap; both
+64 MiB runs stayed below it without max events. This qualifies that fixed
+profile and does not define a universal deployment minimum.
 
 The scheduled job runs:
+
+Linux PR, push, and scheduled CI installs the pinned `cargo-audit 0.22.1` and
+runs `cargo audit --deny warnings`. A known vulnerability, unmaintained or
+unsound advisory, or yanked crate therefore fails the job against the fetched
+RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
+from affected 0.23.43 to 0.23.45 after `RUSTSEC-2026-0285`; the focused HTTP/TLS
+package suite and a fresh warning-denying audit passed locally.
 
 | Test identifier | Workload |
 |---|---|
@@ -60,6 +91,55 @@ and `NBDKIT_*` constant the shim depends on. The same test runs under WSL
 when the header is installed there, and skips with a message otherwise.
 
 ## Test model
+
+### Opt-in discard validation
+
+The v3 discard feature uses new volumes created with `--discard`; v2 behavior
+remains unchanged. The focused suites are:
+
+```bash
+cargo test --locked -p maki-format --test review_discard_format
+cargo test --locked -p maki-core --test review_discard_storage --test review_discard_engine --test review_discard_physical --test review_discard_crash
+cargo test --locked -p maki-nbdkit --test review_discard -- --nocapture
+cargo test --locked -p maki --test review_discard_create
+```
+
+The physical test measures allocated filesystem blocks for 126 adjacent
+discarded slots between two retained neighbors, then checks reopening and
+rewriting. It reports a skip if the filesystem does not support hole punching.
+The crash matrix covers both discard-bit transitions, all four map data-sync
+and three directory-sync boundaries, same-process retry, recovery with readable
+failed-sync bytes, subsequent simulated power loss, and A/B fallback. It also
+checks partial punch failure, unsupported punching, repeated FUA discard, and
+ordered replay across multiple bounded batches.
+
+On Linux, the native test uses actual nbdkit and Python `ctypes` with
+`libnbd.so.0` to negotiate and issue FUA TRIM, check zero readback, and rewrite
+the range. It does not require `nbdsh`, a kernel NBD attachment, or a mount.
+See [space reclamation](space-reclamation.md) for supported semantics and limits.
+
+### Encrypted transport validation
+
+`maki-crypto-websocket/tests/wss_tls.rs` and
+`maki-crypto-grpc/src/tls_tests.rs` run local TLS/mTLS peers, verify trust and
+hostname rejection, and preserve the transport request contracts. The WSS suite
+also uses a TLS-1.2-only peer and checks the exact upgrade URI.
+`maki-nbdkit/tests/review_wss_tls_daemon.rs` and
+`review_grpc_tls_daemon.rs` connect the configured provider through real daemon
+construction, attach self-test/canary, adapter write/read and shutdown. The gRPC
+daemon fixture additionally rejects wrong CA, hostname and missing mTLS identity.
+
+These fixtures validate local integration. Earlier cross-host provider and
+database campaigns used HTTP; WSS/gRPC commercial services, target-network
+behavior and long-running database workloads still need separate qualification.
+
+The combined 2026-09-20 implementation passed `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+`cargo test --workspace --locked`: 1,051 passing test invocations, zero failures
+and ten ignored tests. This run used an immutable source snapshot and a private
+`CARGO_TARGET_DIR`; evidence is in
+`~/logs/maki-tls-final-20260920T090302Z/` (`exit.status` 0, `test.log`).
+The ignored long-running and external-service gates were not part of this run.
 
 `maki-test-support` provides the reusable verification environment:
 
@@ -83,6 +163,8 @@ has a constant residue.
 | Format and parsing | Overflow checks, malformed input, A/B fallback, CRC, torn-tail and middle-corruption classification |
 | Provider contract | Round trips, size/order/index validation, tamper checks, compatibility, and cross-endpoint decrypt |
 | Journal and recovery | Persistence-boundary failpoints, sequence continuity, checkpoint ordering, ENOSPC, and double attach |
+| Storage scheduling | `review_blocking_io.rs`: deliberately stalled reads, writes, FLUSH, checkpoint writes, recovery opens and free-space queries leave a single Tokio worker responsive; cancelling a dispatched write preserves admission and subsequent write order |
+| Checkpoint concurrency | `review_checkpoint_concurrency.rs`: stalled slot writes permit overlay/slot reads, overwrites and new shards; the captured horizon remains fixed, failures retry without losing concurrent writes, and caller cancellation preserves checkpoint serialization |
 | Block engine | RMW, concurrent access, FUA, FLUSH, provider batching, and differential model tests |
 | Availability | Request and byte bounds, retry budget, jitter, breaker transitions, failover, and permit-leak checks |
 | Transports | HTTP mapping/TLS/chaos, WebSocket reconnect/order/size, and gRPC status/metadata/size |
@@ -122,6 +204,9 @@ packaged configuration without installing services or creating users.
 | Partial journal writes (BUG-020) | `maki-core/tests/review_journal_retry.rs`: a BackingFile that writes a prefix then returns EIO, shorter retries, roll/FLUSH without retry, cleanup failure, and recovery after sealing the segment |
 | Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO, retry and process recovery followed by power loss, changes after the scan, valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer |
 | gRPC authentication evidence (TEST-002) | `maki-nbdkit/tests/phase9_daemon.rs`: attach without metadata must fail after the server actually rejects it with Unauthenticated; valid metadata roundtrips with no authentication rejection, independently of which deadline's error text wins |
+| Convergent privileged cleanup (R3-007) | `maki-privileged/src/exec_tests.rs`, `recover.rs`, and `maki-attach/tests/e2e.rs`: no record succeeds without probing, an owned connected backend selects detach, an absent backend selects recovery, and a foreign or unreadable backend preserves the record. The proof-scoped fallback runs only after an exited `vgchange` returns nonzero, accepts one exact closed target mapping, rechecks the backend, and rejects changed identity, multi-mapping topology, open count, or force/deferred/retry removal |
+| Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
+| Current privileged runner contract | `regression_nbd_client_version_probe.rs` and `phase7_priv.rs`: a 3.27.1 help banner with nonzero exit is accepted, netlink receives `nbdN`, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice |
 
 The native NBD negotiation case requires Linux, `nbdkit`, and `nbdinfo` from
 libnbd. It uses Cargo's cdylib and an isolated child process with a private Unix
@@ -133,22 +218,145 @@ userspace ABI and negotiation, without operating a kernel NBD device.
 
 ## Current qualification status
 
-The September helper changes require new target-host qualification with
-nbd-client netlink/backend identity support. The historical privileged Linux
-reports below cover earlier code. The current regression suite does not start
-systemd workloads or attach real devices; follow the
-[runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
+The current revision `448c0b2` passed a disposable Debian 12 GCE campaign with
+nbd-client 3.27.1, actual Maki nbdkit, kernel NBD, pinned single-PV LVM/XFS,
+trusted attach/verify/cleanup, and a Docker SQLite external ACK oracle under the
+Installed shipped systemd graph. Two automatic nbdkit `SIGKILL` recoveries
+advanced the fsynced ledger from 16 to 32 and 48 rows. A third crash while a
+root process held the LV open failed cleanup closed without restarting the
+workload; closing the descriptor and explicitly retrying recovery reached 64
+acknowledged rows in a fourth distinct container. An independent container
+matched all 64 rows and reported `integrity_check=ok`.
+Follow the [runtime-layout upgrade procedure](operations.md#upgrading-the-runtime-layout).
+
+Revision `ece7e39` then passed a separate two-host restore campaign. A source
+VM wrote 32 SQLite WAL rows and a fsynced external ledger, drained and exported
+the unchanged v2 backing, configuration, attach identity and credential, and
+was deleted with its boot disk. A newly created VM restored the artifacts,
+matched all 32 rows, added 16 rows, and matched all 48 after a full lifecycle
+restart. Both final offline checks passed and both VMs and disks were deleted.
+See the [fresh-host restore validation](fresh-host-restore-validation-2026-09-17.md).
+
+Revision `c385c99` then passed a separate remote-provider database campaign on
+one disposable GCE VM. Two authenticated loopback HTTP providers served the
+actual Maki kernel NBD/LVM/XFS path. SQLite committed eight rows with both
+providers, eight with only B, eight with only A, stalled one transaction while
+both were down, resumed that exact transaction after B returned, and finished
+at 32 rows. All IDs and body hashes matched an external fsynced ledger before
+and after a packaged lifecycle restart. See the
+[remote HTTP provider database validation](remote-provider-db-validation-2026-09-18.md).
+
+Revision `47058d2` then passed a separate three-host HTTPS campaign. A client
+used private VPC addresses to reach two nginx-terminated reference providers,
+explicitly proved TLS 1.2 and TLS 1.3 with the expected mTLS identity, and
+required a bearer credential. Wrong-CA, missing-client-certificate and
+wrong-bearer attachments failed before daemon readiness. Provider A and B
+were stopped separately while writes continued; with both down, the ledger
+stayed at 24 until B returned. The run reached 32 exact ACK rows, retained them
+through a Maki restart, passed deep checking with zero invalid slots, and
+deleted all three VMs. See the
+[cross-host TLS reference-provider validation](cross-host-tls-provider-validation-2026-09-19.md).
+
+Revision `5f50354` then passed a checksummed PostgreSQL 15 campaign on another
+disposable GCE VM. After 16 exact ACK rows, a cgroup-wide postmaster `SIGKILL`
+interrupted four pgbench clients. Automatic WAL recovery produced a distinct
+postmaster, preserved the whole ACK prefix, and passed `pg_amcheck`. The cluster
+advanced to 32 rows, retained them through a packaged Maki lifecycle restart,
+then reached 48 rows. Four `pg_amcheck` runs were clean. See the
+[PostgreSQL process-crash validation](postgresql-crash-validation-2026-09-18.md).
+
+Revision `3cac300` then passed a generated Debian package, topology, and
+migration campaign. A clean pre-upgrade package install ran two simultaneous
+kernel NBD/LVM/XFS volumes, including a second LV mapping, before the current
+package upgrade preserved configuration, credentials and both SQLite hashes.
+A corrupt DB-native restore was rejected before retry, a clean legacy-v1
+old-reader backup restored exactly into v2 while the current writer refused the
+unchanged v1 metadata, and multi-mapping plus foreign-backend cleanup both
+failed closed before mutation. See the
+[package, topology, and migration validation](package-topology-migration-validation-2026-09-19.md).
+
+Revision `bdb9113` then passed a separate three-host credential-rotation and
+new-key migration campaign. An existing K1 volume was stopped, detached and
+drained before its bearer token and mTLS client identity/CA changed; the old
+credentials were refused, both peers validated the new credentials, and the
+superblock/canary hashes stayed unchanged. A DB-native SQLite backup then
+restored into a distinct K2 volume, and an isolated K1 wrong-key canary was
+refused with unchanged superblock/canary hashes. The 24 exact external ACK rows
+survived a lifecycle restart.
+Both volumes passed final deep checking with zero invalid slots, and all three
+VMs and disks were deleted. See the
+[credential rotation and key migration validation](credential-rotation-key-migration-validation-2026-09-19.md).
+
+Revision `da89ae3` then passed a four-host stopped server-CA and endpoint
+rotation campaign. Mixed old/new server leaves worked with overlapping private
+roots; both peers then moved to the new CA before old trust was removed.
+Correct-root HTTP 204 and wrong-root curl 60 controls accompanied failed actual
+NBD negotiations in both trust directions. Replacing A's address with C's
+distinct IP while A's nginx listener was stopped preserved the key/profile,
+volume identity, superblock/canary hashes, and exact SQLite data. C/B reached
+48 ACK rows through another restart. The negative oracle was corrected in TDD
+to distinguish an early socket inode from readiness and an outer operation
+deadline from an explicit TLS error. See the
+[server CA and endpoint rotation validation](server-ca-endpoint-rotation-validation-2026-09-19.md).
+
+For unattended repetition of the existing DB model, persistence, concurrency,
+space-admission, recovery-allocation, and v3 discard crash/model/reclamation
+tests, see the
+[background storage runner](background-storage-validation.md). It freezes inputs,
+builds each campaign in a target directory private to that frozen run, records
+status and exit codes, and supports cancellation. The extended profile retains
+the original five suites and adds `review_discard_crash`,
+`review_discard_model`, and `review_discard_reclaim_retry`. The run at `9fec035`
+finished on 2026-09-20 with 100/100 rounds, 500 successful suite invocations,
+3,600 passing test invocations and supervisor exit 0; its result ledger and
+source/binary hashes were verified. Repeated fixed-seed model runs do not
+replace real-DB, physical-power or long-duration parser qualification.
+
+A second extended campaign from `f5bde3e` ran from 2026-09-20 11:18:48 UTC to
+17:04:40 UTC (2026-09-21 02:04:40 KST). It completed 100/100 rounds across all
+eight suites: 800 successful suite executions and 4,800 passing test invocations
+in 20,751.6 seconds, with supervisor exit 0. The private run directory is
+`~/logs/maki-storage-20260920T111848Z-5111c6/`; `status.json`, the 800-row
+`results.jsonl` ledger, frozen source and binary hashes, and per-suite logs retain
+the evidence. The fixed-seed/model and simulated power-loss coverage does not
+replace a real database, physical power loss, or production qualification.
+Inspect the completed result without restarting it:
+
+```bash
+python3 -B scripts/storage-repeat-validation.py status --run-dir ~/logs/maki-storage-20260920T111848Z-5111c6
+```
+
+The separate [v3 GCE reset campaign](gce-discard-reset-validation-2026-09-20.md)
+passed ten whole-instance resets with 160 verified units and a zero-invalid-slot
+offline deep check, then deleted its disposable resources. It used native NBD
+with the local provider; it was not a production database or physical Persistent
+Disk power-loss campaign.
 
 | Requirement | Target | Status | Evidence |
 |---|---:|---|---|
 | Randomized model operations | 100,000+ | Pass | 110,000-operation block-model gate |
-| Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs; not 10,000 OS process crashes |
+| Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
 | Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
-| Kernel NBD, LVM, XFS, and fio | Functional smoke | Pass on Debian 12/KVM | Guarded privileged run completed on a disposable NBD target |
-| Real databases | Required | Partial | SQLite WAL smoke passed; crash campaigns and other engines remain open |
+| Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
+| Packaged systemd lifecycle | Functional ordering and failure gates | Pass for one Debian 12 GCE topology | Installed shipped templates recreated the real daemon, attachment, workload, and Docker container twice, withheld restart on open-LV cleanup failure, then recovered on explicit retry |
+| Debian package install and upgrade | Clean install, stopped-volume upgrade, and exact reattach | Pass for one generated-package Debian 12 profile | Pre-upgrade and current packages preserved volume/attach configs, all token hashes and two SQLite logical hashes, did not auto-start volumes, and reattached both after upgrade |
+| Multi-mapping and foreign-backend refusal | Refuse ambiguous fallback and changed backend identity before mutation | Pass for one two-LV and one same-NBD foreign-backend topology | Packaged recovery preserved both mappings and proof after daemon death; cleanup preserved a foreign backend identifier and trusted record until explicit disconnect |
+| DB-native and legacy-v1 migration | Reject corrupt restore; old-reader backup into a fresh v2 volume | Pass for stopped-source SQLite profiles | Corrupt native restore failed before clean retry; current writer refused byte-stable v1 superblocks and the old-reader backup restored with the exact logical hash |
+| Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
+| Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
+| Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
+| Cross-host HTTPS reference provider | TLS/mTLS/auth refusal, host failover, and total-provider outage | Pass for one three-host private-VPC/SQLite topology | TLS 1.2 and 1.3 health gates recorded the client subject; wrong CA, absent client identity and wrong bearer failed closed; 32 ACK rows survived provider-VM stop/start and Maki restart |
+| Stopped credentials and new-key migration | Replace bearer and mTLS client identity without changing the existing key; restore into a distinct provider key/volume | Pass for one three-host private-VPC/reference-provider/SQLite topology | Old bearer and client identity were refused, both peers validated the replacements, existing superblock/canary hashes matched, K1/K2 fingerprints and volume UUIDs differed, a wrong-key canary kept those hashes unchanged, and 24 ACK rows survived DB-native restore and restart |
+| Server CA and endpoint-address rotation | Overlap private roots, replace leaves, remove old trust, then replace an address with the same key/profile | Pass for one four-host private-VPC/reference-provider/SQLite topology | Both wrong-trust directions refused real NBD negotiation; A/B changed to C/B with A's listener stopped; both peers validated, superblock/canary hashes matched across each attach, and 48 ACK rows survived restart |
+| PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for one PostgreSQL 15.19/scale-3 topology | Postmaster SIGKILL interrupted pgbench after 590 transactions; WAL recovery preserved 16 ACK rows, four `pg_amcheck` runs passed, and the cluster retained 32 rows through Maki restart before reaching 48 |
+| Real databases | Required | Partial | SQLite WAL and one short checksummed PostgreSQL 15 profile passed scoped campaigns; production PostgreSQL profiles, ClickHouse, MinIO, and application recovery contracts remain open |
+| cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Four later constrained recoveries passed at 48/64 MiB; process `VmHWM` stayed at or below 11,415,552 bytes, while only 64 MiB avoided cgroup max events |
+| Physical checkpoint-space reservation | Linux filesystem ENOSPC before ACK | Pass on one Debian 12/ext4/GCE PD topology | A 4,608-byte slot owned 8,192 allocated bytes before FUA ACK; with zero free bytes, the next FUA returned ENOSPC without changing sequence, journal bytes, or slot allocation, then retried and survived restart |
+| Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
+| GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
 | QEMU hard power loss | 300+ cuts | Open | Simulation is not hardware evidence |
 | Mixed workload | 72 hours | Open | Dedicated hardware run not recorded |
 
@@ -156,7 +364,56 @@ The detailed Debian run is preserved in the
 [rootless Linux validation report](native-linux-validation-2026-09-02.md). The
 later [privileged Linux validation report](privileged-linux-validation.md)
 records the kernel NBD, LVM, XFS, raw and filesystem fio, privilege, helper, and
-SQLite smoke results.
+SQLite results, including the installed-systemd combined campaign and its
+limits. The disposable instances and disks were deleted afterward, and fresh
+name-scoped queries found no remaining `maki-*` resources.
+The [September 12 fault report](cgroup-fault-validation-2026-09-12.md) records
+the new native process and cgroup executions, external ACK evidence, reproduction
+commands and the unresolved restart limit. The host was Debian, so no WSL
+shutdown was executed.
+The [Firecracker report](firecracker-validation-2026-09-12.md) records the
+separate guest-kernel/page-cache loss campaign, its host-fsynced ACK ledger,
+image hashes, cold-boot readbacks, and the boundary at the surviving L1 host.
+The [GCE reset report](gce-reset-validation-2026-09-13.md) records the later
+whole-workload-VM hard reset campaign, stable resource identities, shutdown
+witness, Cloud Audit Log entries, authenticated readbacks, and cloud cleanup.
+The [fresh-host restore report](fresh-host-restore-validation-2026-09-17.md)
+records the later graceful export, source deletion, new-host restore, continued
+writes, restart readback, harness corrections and cloud cleanup.
+The [remote-provider database report](remote-provider-db-validation-2026-09-18.md)
+records the two authenticated HTTP endpoints, per-endpoint failure, total
+provider outage, SQLite ACK/hash oracle, lifecycle restart, harness correction,
+and deletion of both attempted VMs and disks.
+The [cross-host TLS reference-provider report](cross-host-tls-provider-validation-2026-09-19.md)
+records private-VPC TLS 1.2/1.3, mTLS and bearer controls, provider-host
+stop/start, SQLite ACK/hash readback, final deep checking, immutable harness
+inputs, and deletion of all three VMs and disks.
+The [PostgreSQL crash report](postgresql-crash-validation-2026-09-18.md)
+records active durability settings, pgbench interruption, WAL redo, postmaster
+replacement, four logical checks, ACK/hash readback, Maki lifecycle restart,
+and deletion of the disposable VM and disk.
+The [physical reservation report](physical-reservation-validation-2026-09-18.md)
+records real ext4 block allocation before FUA acknowledgement, a zero-free-space
+ENOSPC refusal with unchanged journal state, retry, restart readback, offline
+checking, and deletion of the disposable VM and separate data disk.
+The [package, topology, and migration report](package-topology-migration-validation-2026-09-19.md)
+records clean install and upgrade, simultaneous volumes with a sidecar LV,
+fail-closed multi-mapping and foreign-backend cleanup, SQLite DB-native and
+legacy-v1 migration, final deep checks, and deletion of the disposable VM and
+disk.
+The [credential rotation and key migration report](credential-rotation-key-migration-validation-2026-09-19.md)
+records the stopped bearer/mTLS-client transition, old-credential refusal,
+unchanged existing-volume superblock/canary hashes, distinct provider-key
+fingerprints and volume UUIDs, wrong-key canary refusal, DB-native cutover and
+restart readback, final deep checks, immutable harness inputs, and deletion of
+all three VMs and disks.
+
+The [server CA and endpoint rotation report](server-ca-endpoint-rotation-validation-2026-09-19.md)
+records private-CA overlap/removal, fresh server-leaf fingerprints, paired trust
+controls and actual NBD refusal, same-key replacement on a distinct provider IP,
+unchanged volume identity, and 48-row restart readback. It also preserves the
+two invalid harness attempts and their corrections. It does not qualify hot
+reload, public-CA revocation, or C-only availability while B remains configured.
 
 ## Database qualification
 
@@ -197,6 +454,25 @@ available but is not enabled in the main power-loss gate. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 
+The opt-in Firecracker runner boots the same writable data image after each
+VMM `SIGKILL`. Its virtio data drive explicitly uses Firecracker `Writeback`
+cache semantics and synchronous host I/O, while the root filesystem remains
+read-only. A guest running the release Maki nbdkit plugin alternates FLUSH and
+FUA. Only complete guest ACK frames are fsynced into the L1 ledger, and the
+next boot reads and hashes the acknowledged units without receiving their
+expected hashes. This removes the guest kernel and guest page cache from the
+next recovery attempt. It does not cut power to the L1 kernel or persistent
+disk and therefore is not physical power-loss evidence.
+
+The opt-in GCE reset controller runs outside the disposable workload VM. It
+fsyncs each validated ACK to its own ledger, then invokes only
+`gcloud compute instances reset`. It requires the old SSH session to die and a
+globally new boot ID to appear. The guest systemd `ExecStop` witness must
+remain absent.
+This removes the workload VM's RAM, kernel, and page cache, while the Persistent
+Disk service and physical storage path stay operational. It is whole-VM reset
+evidence rather than physical power-loss evidence.
+
 QEMU qualification uses a guest on a dedicated virtual disk, an external
 host-side acknowledgement ledger, randomized `virsh destroy` cuts, offline
 checking after reboot, and at least 300 successful recovery cycles. Bare-metal
@@ -205,16 +481,61 @@ write-cache behavior must be characterized first.
 
 WSL is suitable for Linux syscall integration but not for power-loss claims.
 
+## Experimental rollback backing
+
+The [local-witness format](rollback-protection.md) has separate qualification
+requirements from default v2/v3 storage. Its focused suites are:
+
+```sh
+cargo test -p maki-backing --lib --test rollback_backing --test rollback_model
+cargo test -p maki-core --test rollback_protection --test rollback_process
+cargo test -p maki-format --test rollback_config
+cargo test -p maki-nbdkit --test rollback_config
+```
+
+Linux storage fixtures place the backing on the normal temporary filesystem and
+the witness under `/dev/shm`, which must have a different device identity. This
+fixture is deliberately not a persistent witness deployment. Tests cover old
+whole-image rejection, page authentication, immutable predecessor retention,
+namespace sync boundaries and open handles, witness failures and reopen
+durability, full-capacity acknowledged-write recovery, cache/overlay freshness,
+concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256 encoding vectors
+cover the witness record, manifest and page domains.
+
+The file model adds 1,600 deterministic operations against independent working
+and durable byte images, plus capacity reuse and unlink/handle-lifetime checks.
+The process suite runs eight SIGKILL/reopen cycles, checking every expected
+FUA/FLUSH write and discard against acknowledgements recorded by the parent
+outside the backing. It covers volatile writes after acknowledged operations
+and alternating checkpoint paths; the host page cache remains alive. The
+[background runner](background-storage-validation.md) can repeat these suites
+unattended with `--profile rollback`, preserving exact source and binary hashes.
+
+Requalify the new mode on independent persistent disks before production use,
+including hard resets, a separate ACK ledger, maximum metadata/RSS, latency and
+witness storage exhaustion. Earlier GCE/default-format campaigns do not establish
+these results for the new format.
+
 ## External qualification checklist
 
 - Repeat kernel `/dev/nbd`, LVM, XFS, and raw-device fio qualification on each
   supported target distribution.
 - Effective capability, ACL, core-dump, mount, and service-restart checks under
   installed systemd units.
+- Run the actual Maki daemon, kernel NBD/LVM/XFS, packaged systemd recovery, and
+  DB/container ACK oracle together in one crash/recovery campaign.
 - Vendor endpoint conformance with production mapping and credentials.
-- Credential rotation and TLS certificate rotation.
+- Repeat the scoped bearer/mTLS-client, server-certificate/private-CA, and
+  same-key/profile endpoint-address rotation procedures against the selected
+  commercial vendor and target network, including shared-client coordination,
+  rollback, and failures at each transition.
 - Real SQLite and PostgreSQL workloads before broader database qualification.
-- QEMU and bare-metal power cuts with an independent acknowledgement ledger.
+- Repeat the unchanged-backing fresh-host restore on each supported package and
+  distribution, and separately exercise DB-native backup or logical migration
+  with credentials protected outside the general backup.
+- Repeat GCE reset qualification on the selected deployment image and storage
+  class; run QEMU and bare-metal power cuts with an independent acknowledgement
+  ledger for the stronger storage-failure tiers.
 - Long-duration (24 CPU-hour-per-target) `cargo-fuzz` corpus runs (the
   targets exist in `fuzz/`; only short smoke runs have been done) and
   long-duration provider and mixed-I/O soaks.

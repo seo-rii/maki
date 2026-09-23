@@ -6,6 +6,11 @@ and listed 18 findings (M-001 … M-018). This page tracks what has been done
 about each one, in the review's own order, and records subsequent reviews and
 their regression evidence.
 
+These dated sections preserve the findings and evidence from each review
+pass. For current revisions, support limits and completed versus pending
+qualification, use the [R3 readiness record](production-readiness-review-2026-09-08.md).
+Later fixes can supersede an older section's remaining-work list.
+
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
@@ -243,7 +248,7 @@ process flag rather than per buffer.
 
 | Finding | Status | Change | Regression tests |
 |---|---|---|---|
-| M-004 no automatic checkpointing; journal / free-space bounds unenforced | Fixed | See [Bounded journal](#bounded-journal): a background checkpoint worker (watermark, low free space, interval), a forced journal sync at `limits.max_journal_pending_bytes`, inline reclaim and ENOSPC at `backing.journal_max_bytes`, ENOSPC below `backing.journal_emergency_reserve_bytes`, eager checkpoints below `backing.checkpoint_reserve_bytes`, a `Degraded` state, and the `maki_backing_free_bytes` / `maki_journal_bytes` / `maki_checkpoint_lag_bytes` metrics. `Backing::free_bytes` (statvfs on Unix) feeds the reserves. Config validation now requires `journal_max_bytes >= 2 * journal_segment_size`. | `review_bounded.rs` (maki-core): `sustained_writes_keep_journal_and_overlay_within_hard_limits`, `worker_checkpoints_when_watermark_is_crossed`, `worker_checkpoints_on_interval_and_syncs_pending_records`, `worker_stops_when_engine_is_dropped`, `pending_bytes_limit_forces_journal_sync`, `emergency_reserve_refuses_writes_until_space_returns`, `failed_reclaim_at_hard_limit_degrades_then_recovers` |
+| M-004 no automatic checkpointing; journal / free-space bounds unenforced | Fixed | See [Bounded journal](#bounded-journal): a background checkpoint worker (watermark, low free space, interval), a forced journal sync at `limits.max_journal_pending_bytes`, inline reclaim and ENOSPC at `backing.journal_max_bytes`, and fresh fail-closed admission unless free space covers `backing.journal_emergency_reserve_bytes` plus the projected record/segment-header footprint of the request. It also exposes a `Degraded` state and the `maki_backing_free_bytes` / `maki_journal_bytes` / `maki_checkpoint_lag_bytes` metrics. `Backing::free_bytes` (statvfs on Unix) feeds the reserves. Config validation requires `journal_max_bytes >= 2 * journal_segment_size`. | `review_bounded.rs` and `review_r3_space_admission.rs` (maki-core): hard journal bounds, forced sync, fresh high/low observations, exact append boundary, overflow, unknown and query-error rejection |
 | M-005 control socket not started by the daemon; no-op reloads | Fixed | `NbdAdapter::open_config` binds the control socket (`control.socket`, default `/run/maki-control/<volume>/control.sock`) on the adapter's runtime before returning and serves `EngineControlBackend` on it; a bind failure fails attach; `shutdown` stops the server and removes the socket. `reload` returns an explicit "NOT applied" error for every section the engine cannot apply at runtime (`retry`, `circuit-breaker`, `batch`, `limits`, `timeouts`, `semaphores`, `endpoints`, `credentials`); only `cache` is applied, and it requires `max_bytes`. `status` reports the engine state, journal size, free space, and checkpoint counters. | `review_control.rs` (maki-nbdkit, Unix): `control_socket_is_created_served_and_removed`, `missing_control_socket_directory_fails_attach` |
 | M-006 mount-identity verification is a no-op | Fixed | The Linux executor's `VerifyMountIdentity` step now gathers real observations (`/proc/self/mountinfo` fstype and source through the pure `parse_mountinfo`, `blkid` filesystem UUID, `<mountpoint>/.maki-sentinel`, sysfs NBD `pid` state, a write-fsync-read-remove probe) and runs the existing pure verifier; a failure rolls the attach back. The volume UUID comes from the root-owned attach config or `--uuid` and is required for execution (`--plan` still renders without it). `--init-sentinel` writes the sentinel on an empty filesystem, never overwriting a different value. The unit now carries `AssertPathExists` on the attach config (BUG-002) and documents that dependents must use both `Requires=` and `After=`. | `mountinfo_parsing_finds_the_visible_mount_and_decodes_escapes`, `verifier_rejects_wrong_device_and_missing_sentinel`, `execution_requires_a_volume_uuid_but_plan_rendering_does_not` (maki-privileged); `plan_mode_works_without_uuid_but_execution_requires_it` (maki-attach process). Real mount/rollback runs need the privileged Linux target (`docs/privileged-linux-validation.md`). |
 | M-009 A/B reader collapses I/O errors into "invalid copy" | Fixed | `AbStore` reports any I/O failure other than not-found as an error; empty, short, and CRC-invalid copies remain "invalid". `create_volume` writes both checkpoint-state copies (sequence 0) and recovery requires a valid copy on every volume instead of defaulting to 0. | `recovery_requires_valid_checkpoint_state`, `recovery_surfaces_hard_io_error_on_checkpoint_state`, `ab_load_reports_hard_io_errors_instead_of_masking_them`, `ab_load_treats_missing_empty_and_corrupt_sides_as_invalid_copies`, `create_volume_writes_checkpoint_state_and_durable_mark` |
@@ -404,7 +409,7 @@ under WSL.
 | ID | Finding | Fix | Regression tests |
 |---|---|---|---|
 | F08 | `can_fua` returned 1, which is `NBDKIT_FUA_EMULATE` (nbdkit-common.h: NONE 0, EMULATE 1, NATIVE 2), so nbdkit emulated FUA with a full flush after every FUA write and the engine's native FUA path was never exercised in production. | `can_fua` returns `NBDKIT_FUA_NATIVE`; every `NBDKIT_*` constant is named once. `review_abi.rs` compiles a C probe against the installed `nbdkit-plugin.h` (API version 2) and compares every field offset of the mirrored struct, up to the `block_size` callback the prefix now covers (BUG-011), and every constant; CI's nightly job installs `nbdkit-plugin-dev` and runs it; WSL has the header installed. | `fua_is_advertised_as_native_not_emulated`, `declared_prefix_ends_after_the_block_size_callback` (unit), `shim_constants_and_layout_match_the_installed_header` (Linux, header 1.46.2) |
-| F09 | The HTTP provider copied plaintext into plain vectors, JSON documents and request bodies that were never wiped, and parsed decrypt responses through plain buffers. | Every copy this crate makes is `Zeroizing`: payload copies, the serialized body (handed to reqwest through `Bytes::from_owner`, wiped when the body is released), the response body, decoded payloads; JSON documents are wiped in place after serialization or extraction. Copies inside reqwest, hyper, rustls and the kernel remain outside the crate's reach and are covered by the no-swap and no-core-dump posture, as documented. The WebSocket provider already sends slices; the gRPC provider's prost message copy remains a documented residual. | build (type changes) plus the existing provider conformance and chaos suites |
+| F09 | The HTTP provider copied plaintext into plain vectors, JSON documents and request bodies that were never wiped, and parsed decrypt responses through plain buffers. | Payload copies, the serialized body, response owner and decoded payloads use zeroizing owners. Fixed-size decoders erase malformed partial Base64/hex output; response growth wipes the replaced allocation; guarded JSON request trees drain and wipe keys, overwritten values and partial construction on every return. Resolved header/query values and the assembled mTLS identity PEM are erased on normal drop and construction errors, without an intermediate UTF-8 byte-vector copy. Source configuration strings, malformed-response allocations discarded inside serde_json, page locking, and copies inside reqwest, hyper, rustls and the kernel remain documented residuals. | provider conformance/chaos suites; `malformed_base64_erases_partial_decoded_output`, `malformed_hex_erases_partial_decoded_output`, `response_growth_erases_the_replaced_plaintext_allocation`, `zeroize_json_erases_object_key_allocations`, `pointer_error_erases_the_incoming_value`, `pointer_overwrite_erases_the_replaced_value`, `pointer_descent_erases_a_replaced_intermediate_value`, `per_item_build_error_erases_the_partial_request_tree`, `batch_build_error_erases_all_completed_item_trees`, `provider_drop_erases_owned_header_and_query_values`, `provider_construction_error_erases_owned_credentials`, `tls_spec_drop_erases_identity_pem`, `config_error_erases_a_resolved_credential_header` |
 | F10 | Control sessions were unbounded: one task per connection, no idle or write deadline, and administrative verbs queued behind each other. | At most 64 sessions are served at once (the slot is taken before `accept`, so excess clients wait in the backlog); a session idle for 60 s or a client that does not drain a response within 10 s is closed; `checkpoint` and `reload` run one at a time and a concurrent one is answered `busy`. | `review_limits.rs` (maki-control): `idle_session_is_closed_after_the_idle_timeout`, `an_active_session_outlives_the_idle_timeout`, `a_client_that_never_reads_is_disconnected_after_the_write_timeout`, `concurrent_mutating_verbs_are_refused_with_busy`, `extra_sessions_wait_in_the_backlog_until_a_slot_frees` (Unix) |
 | Backing paths | Lexical validation stopped `..` and absolute paths, but a symlink planted under the backing root redirected opens outside it. | No component under the root may be a symlink; Unix opens pass `O_NOFOLLOW`. | `symlinks_inside_the_root_are_never_followed` (maki-backing, Unix) |
 | CI | The CI workflow ran without `--locked`, unlike the documented commands. | `--locked` on every CI cargo invocation; the nbdkit ABI check joined the nightly job. | the workflow |
@@ -488,7 +493,7 @@ Fixed in this change:
 
 | ID | Finding | Fix | Regression tests |
 |---|---|---|---|
-| BUG-022 | **Journal reclaim could outrun the durability of the checkpoint state that authorized it.** A checkpoint-2 state whose sync failed could be read from the page cache after a restart, used to reclaim journal, and then lost to a power loss — leaving an older checkpoint whose covering segment was gone, so recovery refused to bridge. | Recovery re-persists the checkpoint state it selects (rewrite + sync, preserving the other valid A/B side first) before the writer resumes, and a failed A/B store already empties the side it could not sync (N-09), so a volatile newer generation is never adopted; either way a reclaim rests only on a durable checkpoint. | `journal_reclaim_never_outruns_checkpoint_state_durability` (maki-core `review_next_storage.rs`) |
+| BUG-022 | **Journal reclaim could outrun the durability of the checkpoint state that authorized it.** A checkpoint-2 state whose sync failed could be read from the page cache after a restart, used to reclaim journal, and then lost to a power loss — leaving an older checkpoint whose covering segment was gone, so recovery refused to bridge. | Recovery re-persists the checkpoint state it selects before the writer resumes. Every A/B store first rewrites and syncs the other valid copy and its directory before overwriting the selected target; a failed target sync may leave volatile bytes readable, but cannot destroy the preserved durable copy. Recovery persists whichever valid state it selects before journal mutation, so reclaim rests only on durable state. | `journal_reclaim_never_outruns_checkpoint_state_durability` (maki-core `review_next_storage.rs`) |
 | BUG-018 | **Grow ran `lvextend`/`xfs_growfs` with no trusted record and no attach lock**, so it could extend an LVM/XFS unrelated to any current attachment and race a detach. | `plan_grow` carries the attachment identity; the executor takes the attach lock for a grow and refuses one whose targets, or whose live NBD backend identity, do not match the trusted record before any command runs. | `review_next_grow_requires_trusted_attachment_before_commands`, `review_next_grow_rejects_reused_backend_and_changed_targets` (maki-privileged `exec_tests.rs`) |
 | BUG-017 | **A gRPC server that stalled after the response headers, or between the message and the trailers, held the RPC open indefinitely** (`Channel::timeout` bounds only the connection), pinning the inflight slot and blocking that request's retry and failover. | The provider wraps readiness plus the unary exchange in one `tokio::time::timeout(spec.timeout, …)`; a timeout is a retryable error. The `bounded-error` outer deadline (BUG-013) still applies separately. | `a_stalled_grpc_response_is_bounded_by_the_transport_timeout` (maki-crypto-grpc `review_next_transport.rs`) |
 | BUG-015 | **A clean `shutdown` stopped accepting but left live control sessions running**, each holding an `Engine` reference and so the volume lock; a detach that reported success left the volume `VOLUME_ALREADY_ATTACHED`. | Sessions run in a `JoinSet`; `serve_with_shutdown` aborts *and awaits* them on a shutdown signal, and the adapter signals then joins the serve task before releasing the engine, so no session outlives `shutdown`. | `shutdown_terminates_live_sessions_and_releases_the_volume_lock` (maki-nbdkit `review_next_control.rs`) |
@@ -569,7 +574,9 @@ not silently dropped; none is a data-durability defect.
   it is wrapped. Closing this needs owned wire types with RAII zeroization and
   an allocation/deallocation observer to prove the lifetime; the review notes
   reading freed memory directly in a test is itself invalid, so a meaningful
-  regression needs that observer harness first.
+  regression needs that observer harness first. Later transport-memory changes
+  supersede these provider-owned WebSocket/gRPC gaps and add that observer;
+  library copies, page locking and total resident accounting remain open.
 - **R07 (P2) — recovery memory grows with all uncheckpointed records.**
   Recovery collects every newer journal record before reducing them into the
   overlay, so a GiB-sized journal needs comparable scratch memory even when the
@@ -583,6 +590,12 @@ not silently dropped; none is a data-durability defect.
   lock); synchronous storage calls remain on async engine paths; the CI comment
   references a `docs/ci.md` and weekly/release tiers the uploaded workflow does
   not implement. These are availability/accuracy items, not correctness bugs.
+
+Later update: [native startup readiness](operations.md#data-plane-readiness)
+now initializes the adapter once in `after_fork`, before any client opens it.
+This supersedes the cold-open initialization finding above. The other bullets
+describe that review's snapshot; consult the [current remediation status](production-readiness-review-2026-09-08.md)
+for their subsequent fixes and remaining limits.
 
 ## Comprehensive review (2026-09-07): MAKI-001–050
 
@@ -612,7 +625,7 @@ closed.
 
 - **MAKI-001** (attach rollback disconnecting beneath a failed step) = **R01** — fixed (observation-reconciled, stop-on-failure rollback).
 - **MAKI-002** (grow re-verifying live mount/VG) = **R03** — fixed (`verify_live_attachment`). MAKI-002 additionally asks for per-step re-checks of PV/VG/LV/FS UUIDs and the sentinel immediately before *each* of lvextend and xfs_growfs; that finer per-step identity re-observation is tracked below.
-- **MAKI-004 / MAKI-005** (hung-command global lock; pre-mount device topology) = **R05 / R02** — R05's service-boundary timeout is landed; the in-process command deadline and the pre-mount identity probe remain tracked (see the R01–R08 "Tracked" section above).
+- **MAKI-004 / MAKI-005** (hung-command global lock; pre-mount device topology) = **R05 / R02** — the in-process command deadline, pre-mount topology probe, and optional administrator PV/VG/target-LV UUID pins are landed. Target-host udev/root coordination and qualification remain tracked.
 
 ### Tracked, not closed in this pass
 
@@ -627,7 +640,7 @@ regression.
 - **MAKI-029 / MAKI-030 / MAKI-031 / MAKI-032 / MAKI-033 / MAKI-034 / MAKI-036 (performance)** — checkpoint under the exclusive lock, synchronous backing I/O on async threads, serial per-chunk crypto, plaintext admission vs. real copies, per-unit syscalls, full-shard bitmap rewrites, per-FUA flush. Design/measurement work, not correctness bugs.
 - **MAKI-006 / MAKI-007 / MAKI-040 / MAKI-042 / MAKI-043 / MAKI-044 / MAKI-045 / MAKI-046 / MAKI-047 (deployment & ops)** — readiness vs. process start, a whole-stack recovery controller, a container mount-identity gate, the DB write-path encryption boundary, boot-dependency cycles, failure-domain isolation, backup/restore/key/format procedures, installable packaging, and the systemd credential drop-ins. These are packaging and operational designs to build and qualify on the target host.
 - **MAKI-012 / MAKI-013 / MAKI-014 / MAKI-015 / MAKI-018 / MAKI-019 (crypto policy & security)** — the postgres-prod example permitting unauthenticated crypto, replay/rollback outside the threat model, WSS/gRPC TLS unimplemented, transport plaintext copies outside `SecretBuffer` (MAKI-015 overlaps R06), Maki-backed encrypted swap recursion, and the credential/endpoint/key-rotation runbook. Policy decisions plus an allocation observer for MAKI-015.
-- **MAKI-020 / MAKI-021 / MAKI-022 (durability & space)** — the durable-mark-plus-final-segment ambiguity threat model, physical-space reservation/admission, and TRIM/deallocation. Durability-model and on-disk-format work requiring the release gates and power-loss campaigns.
+- **MAKI-020 / MAKI-021 / MAKI-022 (durability & space)** — the durable-mark-plus-final-segment ambiguity threat model, physical-space reservation beyond the projected journal footprint of a write, and TRIM/deallocation. Durability-model and on-disk-format work requiring the release gates and power-loss campaigns.
 - **MAKI-024 / MAKI-037 / MAKI-038 / MAKI-039 / MAKI-041 / MAKI-048 / MAKI-049 / MAKI-050 (observability, capacity, docs, qualification)** — deep-check grading vs. authenticated/recovery-view checks, thread-count config surfacing, remote-crypto I/O contract, lock-independent health, capacity/slot-span accounting, doc/CI drift, and the outstanding real-DB/power-loss/soak qualification and DB support matrix.
 
 ## Follow-up review (2026-09-08): FUP-001–015
@@ -659,10 +672,13 @@ fixtures.
 - **FUP-004 (P1)** — the in-process per-command deadline (bounded output,
   process-group reaping) — same as R05/MAKI-004, still needs the native-VM
   qualification.
-- **FUP-014 (P2)** — a TOCTOU between `FileBacking::resolve` and open
-  (`O_NOFOLLOW` on the final component only). Needs `openat2`
-  (`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`) with a pinned root dirfd and an
-  old-kernel fallback, plus a deterministic resolve-then-swap hook to test.
+- **FUP-014 (P2, later closed on Linux)** — at this review point a TOCTOU
+  remained between `FileBacking::resolve` and open (`O_NOFOLLOW` covered only
+  the final component). `df886a3` superseded this item on Linux: the backing
+  root and every parent are pinned by directory descriptors and all operations
+  are descriptor-relative with `O_NOFOLLOW`. Symlink, root-replacement, and
+  ancestor-permission regressions pass. The pathname implementation on
+  non-Linux development hosts does not claim the same guarantee.
 - **Residual sub-parts** — MAKI-003 relative-grow idempotency (persist the
   absolute target), the FUP-007 config alignment to guarantee one max ciphertext
   unit fits every layer, the FUP-013 blocking/non-blocking DualSemaphore oversize
@@ -680,15 +696,18 @@ named regression test.
 | ID | Finding | Fix | Regression tests |
 |---|---|---|---|
 | R3-004 | `EndpointSet::capabilities` returned the first validated endpoint's contract, so a batch built against it could be routed (load balancing, failover, a quarantined endpoint admitted later) to an endpoint with smaller `max_items`/`max_bytes` or without a claimed security capability. | The set reports the intersection over *all* endpoints: minimum batch limits, intersected plaintext sizes, the largest ciphertext bound, and the weakest security claim (`Capability::weakest`, `CryptoCapabilities::intersect`). | `aggregate_batch_limits_are_the_minimum_over_all_endpoints`, `aggregate_security_capabilities_are_the_weakest_claim`, `quarantined_endpoints_count_towards_the_aggregate`, `aggregate_plaintext_sizes_are_the_intersection`, `batch_within_the_aggregate_survives_failover_to_the_weakest_endpoint` (maki-crypto `review_r3b_endpoints.rs`) |
-| R3-006 | The context-binding self-test probed the unit index and the volume UUID only; a provider that normalized `format_version` or the compatibility id passed as fully bound. No wire transport even carried `format_version`. | Two more negative probes (format version, compatibility id); an explicit request-level or provider-fatal rejection of the foreign value is accepted, a decrypt to the original plaintext is not. HTTP gained the `format_version` field source, WebSocket the `format` request field, gRPC `CryptoBatchRequest.format_version = 4`; the reference fixtures bind all three fields (SPEC §18 "Context on the wire"). | `context_binding_selftest_exercises_format_version`, `context_binding_selftest_exercises_compatibility_id`, `explicit_rejection_of_a_foreign_context_passes_the_selftest`, `integrity_for_every_decrypt_never_certifies_a_provider`, `retryable_for_every_decrypt_never_certifies_a_provider` (maki-crypto `review_r3b_selftest.rs`); the authenticated pipelines in each transport's `review_integrity.rs` now run all four probes over the wire |
+| R3-006 | The context-binding self-test probed the unit index and the volume UUID only; a provider that normalized `format_version` or the compatibility id passed as fully bound. No wire transport even carried `format_version`. | Two more negative probes (format version, compatibility id); a field-specific `UnsupportedContext` rejection of the foreign value is accepted, while generic request/provider errors and a decrypt to the original plaintext are refused. HTTP gained the `format_version` field source, WebSocket the `format` request field, gRPC `CryptoBatchRequest.format_version = 4`; the reference fixtures bind all three fields (SPEC §18 "Context on the wire"). | `context_binding_selftest_exercises_format_version`, `context_binding_selftest_exercises_compatibility_id`, `explicit_rejection_of_a_foreign_context_passes_the_selftest`, `integrity_for_every_decrypt_never_certifies_a_provider`, `retryable_for_every_decrypt_never_certifies_a_provider` (maki-crypto `review_r3b_selftest.rs`); the authenticated pipelines in each transport's `review_integrity.rs` now run all four probes over the wire |
 | K-03 (residual, creation path) | `ensure_shard`'s catalog commit publishes the whole in-memory catalog, which after open names any *adopted* orphan shard — before that shard's allocation map has ever reached disk (only `persist_allocations` had the K-03 ordering). An interrupted checkpoint after such a commit plus a power loss left a cataloged shard with no allocation copy: every later attach refused. | Every shard tracks `map_stored`; `commit_adopted_maps` stores and dir-syncs the maps of adopted shards before *any* catalog commit, in `ensure_shard` as well as `persist_allocations`. | `adopted_shard_is_never_cataloged_by_another_shards_creation` (maki-core `review_r3b_durability.rs`) |
 | K-03 (residual, restart path) | After a plain restart an orphan's allocation copy can still be *readable* from the page cache although its sync failed (K-01); `open` loaded it as a valid copy and nothing re-stored it, so the next catalog commit named the shard and the next power loss dropped its only copy. | An adopted shard's loaded map is never trusted as durable: it is re-stored (preserve-first, so the readable copy becomes durable) before the shard can be cataloged. | `adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged`, plus the sweeps `random_workloads_survive_power_loss_and_restart_cycles`, `random_workloads_with_sync_failures_never_show_foreign_data`, `restart_followed_by_power_loss_keeps_recovered_state` and the `phase_r3b_durability_gate_full` release gate (maki-core `review_r3b_durability.rs`) |
 | test hygiene | Four maki-privileged fixtures named temp directories by pid + nanosecond clock; WSL's coarse clock let two tests collide (`File exists`). | A per-process sequence number is folded into the name. | (flake fix; `detach::tests::observation_distinguishes_complete_and_partial_detach` and siblings) |
 | R3-004 (addendum) | An `EndpointSet` whose *serving* endpoints report different compatibility ids has no common contract, yet `capabilities()` quietly reported the first one's id. | A validated endpoint with a foreign id is a `Contract` error; a quarantined one is skipped (the validator will never admit it). | `mismatched_compatibility_ids_have_no_aggregate_contract` (maki-crypto `review_r3b_endpoints.rs`) |
 | R3-006 (config) | A `remote-http` configuration could declare `context_binding` while its request bodies never carried `volume_id`, `compatibility_id` or `format_version`; every attach then failed late at the self-test with a "decrypts to the original plaintext" probe error. | Config validation requires all three field sources in both bodies whenever `context_binding != "none"`. | `declared_context_binding_requires_every_context_field_on_the_wire`, `without_context_binding_the_context_fields_are_optional` (maki-format `review_r3b_config.rs`) |
+| R3-007 (activation intent) | A helper crash after LVM activation but before complete proof publication left exact Maki mappings active without a product cleanup path. | Attach persists verified NBD geometry, partition and LVM intent before activation, then atomically replaces it with the complete proof. Absent-backend `recover` and connected-backend normal detach accept only exact, mount-free verified mappings and run device-list/VG-UUID-scoped deactivation; legacy no-proof/no-intent records stay fail closed. | `recover_tests.rs`, `exec_tests.rs`, and `lvm_preflight_tests.rs`: activation crash, corrupted intent, connected/absent backend, partial verified activation, foreign name/UUID/slave/holder/mount and unknown internal UUID suffix |
+| MAKI-005 (administrator pins) | The live LVM inventory was contained to the NBD candidates but was not authenticated against a root-configured expected identity. | Optional all-or-nothing `[lvm_identity]` pins the complete PV set, VG and configured target LV. Attach compares the independent inventory before activation; pins persist into the trusted record and recovery rechecks them. Grow/detach reject changed or omitted pins before mutation. Compatibility mode may omit them, but the production profile may not. | `configured_lvm_identity_pins_are_normalized_and_carried_into_plans`, `configured_lvm_identity_rejects_missing_duplicate_and_malformed_pins`, `administrator_lvm_pins_require_an_exact_pv_set_vg_and_target_lv`, `recovery_rechecks_persisted_lvm_identity_against_administrator_pins`, `lvm_pin_mismatch_stops_before_activation_or_lvm_teardown`, `changed_or_missing_lvm_pins_cannot_authorize_detach_mutations` |
+| MAKI-015 (HTTP credential ownership) | Provider-owned resolved header/query values and the combined mTLS identity PEM remained in ordinary allocations after drop or a later construction error. | Operation/TLS specifications and construction guards erase these owners; UTF-8 credential validation borrows the key-source bytes instead of making an intermediate vector. Transport-library copies remain outside the guarantee. | `provider_drop_erases_owned_header_and_query_values`, `provider_construction_error_erases_owned_credentials`, `tls_spec_drop_erases_identity_pem`, `config_error_erases_a_resolved_credential_header` |
 | coverage | Configuration drift (a `crypto_unit_size` that no longer matches the volume) through the daemon path; concurrent block-aligned partial-unit (RMW) writers racing FLUSH/checkpoints into power loss or restart; the same sweeps with a tiny plaintext cache (constant eviction and version turnover). No defect found; kept as regression coverage. | — | `crypto_unit_size_drift_refuses_attach_and_leaves_the_volume_intact` (maki-nbdkit `review_r3b_daemon.rs`); `concurrent_partial_unit_workloads_*`, `random_workloads_with_a_plaintext_cache_*`, `phase_r3b_concurrent_gate_full` (maki-core `review_r3b_durability.rs`) |
 | S-01 (residual) | A checkpointed unit whose newest allocation-map copy was lost *and* whose slot header was damaged (partly overwritten, not zeroed) read as **zeros**: the older map copy did not list it and the header probe treated every undecodable header as "unwritten". Found by the media-damage sweep (seed 16) within seconds. | A hole is never partly written: on a cleared slot only an all-zero header is unwritten; any other undecodable header is damage ⇒ EIO in `read_slot`. The open-time audit still leaves such slots unmarked (a torn first write of a still-journaled unit is the benign cause and is served from the overlay). SPEC §22 updated. | `damaged_header_on_a_cleared_slot_is_eio_not_zeros`, `media_damage_after_power_loss_never_yields_foreign_data`, `phase_r3b_media_damage_gate_full` (maki-core `review_r3b_durability.rs`) |
-| S-01 (residual, truncation) | The same sweep (seed 170): a shard data file truncated below a checkpointed slot whose newest allocation copy was lost too read that unit as **zeros**, because a header beyond EOF counted as "unwritten". A shard data file is created at its full sparse size and synced before it is ever used, so it never legitimately ends before a slot. | A slot beyond the end of a file shorter than its physical size (`units_per_shard × slot_size`) is damage, not a hole. The one legitimate short file belongs to a shard that was never checkpointed into (not named by the loaded catalog copy, empty allocation map): its creation never finished, its holes stay holes and its size is restored before its first slot write. Without that exception, adopting a zero-length orphan turned every unit of the shard into EIO, and later writes never restored the size. An earlier version of the exception required *no* allocation copy on disk; the full durability gate (seed 95) showed an interrupted creation leaving a stale empty copy next to a re-created, zero-length data file, which the rule then took for truncation (every unit EIO after a plain restart). The gate then found the K-01 twin (seed 388, sync faults): the data file's first sync failed, the process restarted, the page cache showed the full size the disk never got, and the next checkpoint wrote into and cataloged the shard — the power loss after that left a cataloged shard with a file ending at its last written slot, "truncated" by the new rule. Nothing proves an uncataloged, never-checkpointed shard's size, so `prove_data_file` sets and syncs it again before the first slot write and before `commit_adopted_maps` lets the catalog name it. Residual: a data file truncated *and* the catalog *and* every allocation copy listing its slots lost is indistinguishable from that orphan and serves zeros beyond the truncation point. | `truncated_shard_file_reads_eio_for_units_beyond_its_end_not_zeros`, `zero_length_orphan_shard_without_a_map_is_unwritten_not_damaged`, `zero_length_orphan_shard_with_a_stale_empty_map_is_unwritten_not_damaged`, `adopted_shards_data_file_size_is_re_proven_after_a_failed_sync_and_restart` (maki-core `review_r3b_durability.rs`); `check_all` now reports the seed, cycle and op history of a failed read |
+| S-01 (residual, truncation) | The same sweep (seed 170): a shard data file truncated below a checkpointed slot whose newest allocation copy was lost too read that unit as **zeros**, because a header beyond EOF counted as "unwritten". A shard data file is created at its full sparse size and synced before it is ever used, so it never legitimately ends before a slot. | A slot beyond the end of a file shorter than its physical size (`units_per_shard × slot_size`) is damage, not a hole. The one legitimate short file belongs to a shard that was never checkpointed into (not named by the loaded catalog copy, empty allocation map): its creation never finished, its holes stay holes and its size is restored before its first slot write. Without that exception, adopting a zero-length orphan turned every unit of the shard into EIO, and later writes never restored the size. An earlier version of the exception required *no* allocation copy on disk; the full durability gate (seed 95) showed an interrupted creation leaving a stale empty copy next to a re-created, zero-length data file, which the rule then took for truncation (every unit EIO after a plain restart). The gate then found the K-01 twin (seed 388, sync faults): the data file's first sync failed, the process restarted, the page cache showed the full size the disk never got, and the next checkpoint wrote into and cataloged the shard — the power loss after that left a cataloged shard with a file ending at its last written slot, "truncated" by the new rule. Nothing proves an uncataloged, never-checkpointed shard's size, so `prove_data_file` sets and syncs it again before the first slot write and before either catalog commit that can name it (`commit_adopted_maps` under `ensure_shard`, and the repair checkpoint's commit in `persist_allocations` — the sync-fault sweep, seed 29, found the latter cataloging a zero-length orphan once checkpoint destinations moved to write admission, after which the next power loss read the whole shard as EIO); `reserve_slot` and the checkpoint slot plan prove it as well, since they grow the file without `write_slot`. Residual: a data file truncated *and* the catalog *and* every allocation copy listing its slots lost is indistinguishable from that orphan and serves zeros beyond the truncation point. | `truncated_shard_file_reads_eio_for_units_beyond_its_end_not_zeros`, `zero_length_orphan_shard_without_a_map_is_unwritten_not_damaged`, `zero_length_orphan_shard_with_a_stale_empty_map_is_unwritten_not_damaged`, `adopted_shards_data_file_size_is_re_proven_after_a_failed_sync_and_restart`, `adopted_orphan_is_sized_before_a_repair_checkpoint_catalogs_it` (maki-core `review_r3b_durability.rs`); `check_all` now reports the seed, cycle and op history of a failed read |
 | S-01 (residual, truncation evidence) | Seed 58 of the same sweep, once the sweep logged its history: the truncated volume kept running, a checkpoint wrote a *later* slot of the shard, and that write grew the file back with zeros. A checkpointed unit in the zero-filled range whose newest allocation copy had been lost then read as **zeros** (all-zero header on a cleared bit), although the attach right after the truncation had reported EIO. The read-time rule above cannot hold once the evidence (the short file) is gone. | Open records the damage in the one place that persists: every cleared slot beyond the end of a truncated file is marked allocated, so it reads as allocated-but-invalid (EIO) until rewritten. Before the shard's first slot write grows the file (`heal_short_file`), the marks are stored and dir-synced, then the size is restored and synced; a restart before that re-derives the same marks from the still-short file. The deep checker counts the marked slots as invalid and explains them in a warning. Cost: a unit never written beyond the cut is EIO as well until rewritten, since nothing distinguishes it from a removed slot (SPEC §22). | `truncation_damage_survives_the_file_growing_back` (maki-core `review_r3b_durability.rs`); the sweep failure report now carries the full op history and an on-disk state dump |
 | S-04 (confirmed limitation) | The same sweep reproduces the documented S-04 trade-off (seed 56): with the durable mark lost in the crash, bit rot inside the final journal segment's synced records is truncated as a torn tail, so a FLUSH-acknowledged write reverts to its previous durable value instead of refusing attach. Not changed: making the mark durable costs an extra fsync per FLUSH; the sweep tolerates journal damage explicitly. | — | (documented in the sweep's assertion) |
 | gate hygiene | `cargo test --workspace --release -- --ignored` (the documented release gate) failed on `exec::command_tests::child_fixture`, an ignored subprocess fixture that panicked when run without its driving test. | The fixture returns early when its scenario environment is absent. | (gate fix; the full gate is otherwise green) |
@@ -762,8 +781,8 @@ daemon derives from configuration:
 | `journal_high_watermark_bytes` | `backing.journal_max_bytes / 2` | Write path wakes the worker once journal bytes on disk reach it; the worker checkpoints. |
 | `journal_max_bytes` | `backing.journal_max_bytes` | Hard limit. A write that would cross it first syncs the journal and checkpoints inline (under the volume lock); if the journal still cannot fit the write, it fails with ENOSPC. |
 | `max_pending_bytes` | `limits.max_journal_pending_bytes` | Appended-but-unsynced bytes; the write path forces a journal sync before exceeding it. |
-| `emergency_reserve_bytes` | `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC while backing free space is below it. Reads continue. |
-| `low_space_checkpoint_bytes` | `backing.checkpoint_reserve_bytes` | The worker checkpoints eagerly while free space is below it. |
+| `emergency_reserve_bytes` | `backing.journal_emergency_reserve_bytes` | Enables write-admission space checks; unknown/error fails closed and reads continue. |
+| `low_space_checkpoint_bytes` | `backing.checkpoint_reserve_bytes` | While admission is enabled, its value is preserved as headroom after the exact next record/segment-header footprint; the worker also checkpoints eagerly below it. |
 | `interval` | 30 s (engine default) | The worker syncs pending records and checkpoints at least this often while anything is unapplied. |
 
 The worker holds only a weak reference to the engine and exits when the
@@ -778,8 +797,12 @@ returns the engine to `Ready`. The control socket reports the state in
 
 ## On-disk additions
 
-All additions are new files; no existing structure changed, so the format
-version stays at 1. Volumes created before these changes lack these files:
+This section records the intermediate v1 state at the time of that remediation.
+At that point the additions were new files and the format version remained 1.
+The current release instead requires the v2 superblock envelope and dual
+durable-proof records described in [Durable recovery](durable-recovery.md);
+that later contract supersedes the current-tense v1 statements below. Volumes
+created before the intermediate changes lacked these files:
 
 - `canary.{a,b}`: established on the next attach as described above.
 
@@ -788,3 +811,249 @@ version stays at 1. Volumes created before these changes lack these files:
   attach with `no valid checkpoint state copy`.
 - `journal/durable-mark` is created empty at creation and recreated lazily by
   the writer if absent. Its absence only weakens corruption detection.
+
+### R3-006 context refusal classification after the remote follow-up
+
+The full-context probes and all upstream transport fields remain in place.
+Schema rejection now identifies the refused field with
+`CryptoError::UnsupportedContext(ContextField)`. Only the probe changing that
+same field accepts it; generic `ProviderFatal`/`NonRetryableRequest` errors,
+wrong-field refusals, and schema errors during integrity tests never certify a
+capability. Availability errors still propagate for endpoint retry/quarantine.
+The local and reference providers identify compatibility-ID refusal explicitly.
+HTTP/gRPC carry the allowlisted field token in one `maki-crypto-error` value;
+WebSocket uses `unsupported-context` plus the same reason token. Duplicate or
+ambiguous values are rejected and remote text is not reflected.
+
+Validation: `review_r3_context` supplements the upstream `review_r3b_selftest`
+with matching-field, wrong-field/generic-error, and inconclusive-probe tests.
+Each transport's `review_integrity` covers exact field tokens and malformed
+signals as well as the authenticated engine pipeline using the full context.
+
+## R3 final status and lifecycle qualification (2026-09-13)
+
+The direct R3-001–010 causes are closed in product paths and focused tests.
+This table distinguishes that closure from broader production qualification
+that the review bundle also tracks.
+
+| R3 item | Final direct-finding status | Evidence |
+|---|---|---|
+| R3-001 wire integrity | Closed | `3703683`; authenticated ciphertext reaches the engine and wire mappings preserve integrity, schema, and timeout classes |
+| R3-002 rollback ownership | Closed | `c834ff5`; foreign or unreadable backend identity stops teardown and preserves trusted state |
+| R3-003 request budgets | Closed | `4449a74`; logical, ciphertext, and RPC boundaries reject oversized requests before mutation |
+| R3-004 endpoint capabilities | Closed | Preserved per-endpoint intersection plus `27dce14`; heterogeneous endpoint regressions pass |
+| R3-005 UUID/canary identity | Closed | `8e725fc`; locked actual UUID, per-endpoint canary, and quarantine recovery tests |
+| R3-006 full context | Closed | `dd87466`; only exact context-field refusal is accepted as capability evidence |
+| R3-007 recovery lifecycle | Product path closed; installed crash and scoped topology qualification passed | Intent/recover/verify plus `3fc0404` convergent cleanup and `98a5b0e`/`90843db` packaged lifecycle; `448c0b2` combined the installed graph, actual storage, and SQLite through two automatic nbdkit crashes plus an open-LV cleanup failure/retry. The `3cac300` package campaign additionally refused a dead-backend two-LV fallback and a same-NBD foreign backend before mutation. Nested/internal mappings, partitions, holders, hot replacement and production topology remain |
+| R3-008 shutdown result/logging | Closed for supported foreground mode | `dc646ef`; explicit drain result, admission closure, retry, subprocess logging, and concurrent shutdown tests |
+| R3-009 response shape | Closed | `57ca845`; empty, extra, wrong-index, and wrong-length responses fail without panic |
+| R3-010 capability mode | Closed | `40502a7`; only declared mode is accepted and remote declarations are contractual |
+
+The earlier safe privileged run at `5a3bef6` used nbd-client 3.27.1 and passed
+22 checks on a disposable Debian 12 GCE host: real kernel NBD, single-PV
+LVM/XFS with all UUID pins, attach, verify, two cleanup calls, fio, SQLite WAL,
+and an offline check. The actual systemd transaction used fixture daemon,
+attach, verify, and workload components but proved stop, cleanup-success
+restart, cleanup-failure hold, and per-start gate ordering. A separate Docker
+run observed default `rprivate` propagation, distinct container IDs and
+creation times, SQLite rows 1→2 with `integrity_check=ok`, and zero container
+starts on a plain directory. Those two runs did not combine the Maki storage
+stack and installed controller.
+
+Revision `8bf0e941bd3501b972850240fb1050fbc2a90c0b` then passed 29 checks in one
+combined campaign. A default-`rprivate` Docker container committed 32 SQLite
+WAL `synchronous=FULL` rows individually and recorded each ACK in an external
+fsynced ledger. The actual nbdkit process exited 137 after `SIGKILL`; kernel NBD
+remained connected, and `maki-attach verify` still succeeded because it checks
+storage identity and topology rather than server liveness. Cleanup used the
+completed proof to remove the one exact closed mapping after normal `vgchange`
+failed, disconnected NBD, and reattached after nbdkit restart. A distinct
+container recovered all 32 ACK rows exactly and returned
+`integrity_check=ok`. Final cleanup, its idempotent replay, and the offline
+check passed.
+
+The proof fallback is limited to cleanup of one exact top-level target mapping;
+it rejects explicit detach/recover, pre-activation intent, multi-LV/internal or
+open/changed mappings, backend identity changes, and command timeouts. The
+combined campaign did not execute the installed systemd controller or cover a
+remote provider, whole-VM/physical power loss, another database, repeated
+crashes, or soak load.
+
+Revision `448c0b2a46bd748eb473e34405175db9b3cfa102` then installed the shipped
+systemd, sysusers, and tmpfiles artifacts over the actual single-PV/LV stack on
+a new Debian 12 GCE host. Two successive daemon `SIGKILL` events automatically
+recreated the daemon, attachment, per-start verification, and default-`rprivate`
+container while preserving external ACK prefixes of 32 and 48 rows. On a third
+crash, a root-held LV descriptor made both attach stop and recovery cleanup fail
+closed. The workload stayed stopped, the ledger stayed at 48, and NBD, the
+mapping, backend identity, and trusted volume record remained. Closing the
+descriptor and explicitly retrying recovery produced a fourth container and 64
+external-ACK rows. An independent reader matched every SQLite row and payload
+hash with `integrity_check=ok`.
+
+The final drain, target stop, ordered workload/attach/daemon completion, plugin
+unload and offline check passed with no remaining mount, mapping, NBD holder,
+volume record, or container. The result closes the earlier installed-controller
+combination gap for this one local-provider topology. It does not qualify a
+distribution package install or upgrade, multi-LV/internal mapping, foreign
+device replacement, remote providers, another database, DB-native migration,
+whole-VM loss on this topology, or soak load.
+
+At that point, revision `ece7e39` passed a separate
+[fresh-host backing restore](fresh-host-restore-validation-2026-09-17.md).
+A source GCE VM wrote and externally acknowledged 32 SQLite rows, drained,
+passed the offline check and exported the unchanged v2 backing, configuration,
+attach identity and credential. That VM and disk were deleted before a distinct
+target VM restored the artifacts, matched all 32 rows, advanced to 48 and
+matched all 48 again after a lifecycle restart. Both SQLite integrity checks,
+final drain, offline check and cloud cleanup passed. Three retained harness
+failures occurred before the product path: a `sudo` home-directory mismatch, a
+missing parent-directory mode in the ad hoc runtime tar, and non-idempotent
+`reset-failed` handling. Distribution package install/upgrade, DB-native or
+legacy migration and crash-time capture remain open.
+
+Revision `c385c99` then passed a separate
+[remote HTTP provider database campaign](remote-provider-db-validation-2026-09-18.md)
+on a disposable Debian 12 GCE VM. Two authenticated loopback providers served
+the actual packaged systemd, kernel NBD/LVM/XFS, and SQLite WAL path. Rows 0–7
+used both endpoints, 8–15 used only B after A stopped, and 16–23 used only A
+after B stopped. With both providers down, the next DB writer stayed blocked
+and the fsynced external ledger stayed at 24; restoring B advanced it to
+exactly 25 after a 4,094 ms observed outage. Both providers then returned and
+the database reached 32 exact ACK rows. All row IDs and body hashes plus
+`integrity_check=ok` matched before and after a packaged lifecycle restart.
+Metrics recorded six failovers and nine retries, and provider journals recorded
+21,326 encrypt/decrypt requests across both endpoints. This closes the narrow
+database-through-provider fault observation, while real network/TLS/vendor
+behavior, another DB, concurrent host loss, latency targets and soak remain.
+
+Revision `5f50354` then passed a separate
+[PostgreSQL process-crash campaign](postgresql-crash-validation-2026-09-18.md)
+on a disposable Debian 12 GCE VM. PostgreSQL 15.19 ran with data checksums,
+`fsync`, synchronous commit and full-page writes on the actual packaged Maki,
+kernel NBD/LVM/XFS path. After 16 external ACK rows, a cgroup-wide postmaster
+`SIGKILL` interrupted four pgbench clients after 590 transactions. A distinct
+postmaster performed WAL redo and an end-of-recovery checkpoint, preserved the
+entire ACK/hash prefix, and passed `pg_amcheck`. The cluster advanced to 32
+rows, retained all 32 through a packaged Maki lifecycle restart, then reached
+48 rows. Four `pg_amcheck` runs were clean. This narrows the other-database gap
+for one short PostgreSQL profile; production sizing, backup/restore,
+replication, DB-native migration, concurrent VM/storage loss and soak remain.
+
+Revision `3cac300` then passed a separate
+[package, topology, and migration campaign](package-topology-migration-validation-2026-09-19.md)
+on one disposable Debian 12 GCE VM. A generated pre-upgrade package cleanly
+installed and ran two simultaneous pinned NBD/LVM/XFS volumes, including a
+sidecar LV. The generated current package preserved every config and token hash,
+did not auto-start a volume, and reattached both SQLite databases with unchanged
+logical hashes. A corrupt native restore failed before clean retry. A matching
+old reader backed up a clean legacy-v1 volume; the current writer refused the
+unchanged v1 superblocks, and the backup restored exactly into fresh v2.
+
+After a daemon `SIGKILL`, packaged recovery preserved both top-level mappings
+and the trusted proof when proof-scoped fallback refused the ambiguous topology.
+Cleanup also preserved a same-number foreign NBD backend and trusted record.
+Explicit cleanup then converged, both offline deep checks reported zero invalid
+slots, and exact instance/disk lookups plus prefix queries proved cloud cleanup.
+This closes those scoped package, multi-mapping, foreign-backend and SQLite
+migration observations. Signed repositories, rollback, nested device stacks,
+live backup/cutover and other databases remain open.
+
+The disposable instances and their auto-delete boot disks were deleted. The
+last fresh project queries found zero name-matched `maki-*` instances and disks,
+and the latest combined disk's exact lookup returned 404. The CI run for
+`448c0b2` passed on Linux and Windows.
+
+Capacity follow-up `5803be8` partially closes MAKI-041's accounting gap. The
+geometry API and `maki volume inspect` now report maximum units and shards,
+full-shard slot span, and both copies of allocation-map and catalog metadata.
+They reject shard counts above the supported catalog limit and `u64` layout
+overflow. The standard 16 TiB geometry has an 18 TiB slot span before journal,
+checkpoint, filesystem, or database overhead. This planning output does not
+reserve physical blocks and does not close MAKI-021's external-consumer race.
+
+Physical reservation follow-up `ced2bda` closes that race for accepted Maki
+writes on Linux. The write path uses `posix_fallocate` for the exact journal
+range and full checkpoint slot before appending, and creates and syncs both
+allocation-map copies plus the catalog entry before a new shard can receive a
+journal record. Injected slot and journal ENOSPC leave the sequence unchanged
+and retry successfully. A real-filesystem regression verifies allocated slot
+blocks and both metadata copies before the first record is accepted. Core
+all-targets passed 204 tests with 6 ignored, and strict Clippy passed. This is
+not full-volume preallocation: untouched slots, filesystem/COW overhead, and
+database temporary space remain deployment-capacity inputs.
+
+The later [GCE physical reservation campaign](physical-reservation-validation-2026-09-18.md)
+exercised that path on ext4 over a separate standard Persistent Disk. A
+4,608-byte slot owned 8,192 allocated bytes before the first FUA ACK, and both
+allocation-map copies owned blocks. After consuming all 9,910,247,424 initially
+free bytes, the next FUA returned ENOSPC while sequence 1, the journal hashes,
+and slot allocation stayed unchanged. Releasing the space allowed sequence 2;
+restart readback, deep check, and unmounted `e2fsck` passed. This qualifies one
+Linux filesystem and storage class, not full-volume capacity or physical power
+loss.
+
+Bounded recovery follow-up `733833c` removes the attach-time map of retained
+latest ciphertext. Recovery validates and repairs the full journal first, then
+replays it through a 1 MiB batch into durable checkpoint slots. Controlled
+tests held the measured replay peak near 1.1 MiB for 4,096 distinct records and
+16,384 overwrites, and a slot-sync crash retried from the preserved journal.
+The actual Docker cgroup campaign then recovered a 21.5 MiB pressure tail at a
+32 MiB cap and matched 136 external ACK units, but touched the cap exactly.
+This closes payload retention proportional to distinct units; metadata,
+runtime/provider allocations, filesystem cache and a production RSS minimum
+remain target-specific qualification inputs.
+
+A later [constrained recovery RSS campaign](recovery-rss-validation-2026-09-19.md)
+ran two fresh 48 MiB and two fresh 64 MiB post-OOM recoveries. All four matched
+136 ACK units and passed deep checking; the maximum observed nbdkit `VmHWM` was
+11,415,552 bytes. Both 64 MiB runs stayed below the cgroup cap with zero max
+events, while both 48 MiB runs touched the cap. This supplies a scoped process
+RSS high-water observation and cgroup sizing result, not a universal bound.
+
+Revision `47058d2` then passed a separate
+[cross-host TLS reference-provider campaign](cross-host-tls-provider-validation-2026-09-19.md).
+Two GCE provider hosts required mTLS and a bearer credential over private VPC
+addresses. Explicit TLS 1.2 and TLS 1.3 health gates passed; wrong CA, absent
+client identity and wrong bearer all refused startup before
+daemon readiness. Provider-VM stop/start exercised each endpoint alone and
+both absent, after which SQLite reached 32 exact external ACK rows and retained
+them through a Maki restart. The final deep check had zero invalid slots and all
+three VMs and disks were deleted. This closes the scoped cross-host HTTPS
+reference-provider observation, while commercial vendor behavior and target
+network faults remain open.
+
+Revision `bdb9113` then passed a separate
+[credential rotation and key migration campaign](credential-rotation-key-migration-validation-2026-09-19.md)
+on the same three-host class of topology. A stopped K1 volume rejected its old
+bearer and mTLS client identity after rotation, validated the replacement
+identity on both peers, preserved its superblock/canary hashes, and reached 16
+external ACK rows. A SQLite DB-native backup restored into a distinct K2 volume;
+an isolated K1 wrong-key canary was refused with unchanged superblock/canary
+hashes, and 24 ACK rows survived a full restart. Both retained volumes had zero
+invalid slots and all resources were deleted. This closes the tested
+reference-provider client-credential and stopped K1-to-K2 migration profile.
+Commercial vendors, target networks, key retirement and production
+cutover/rollback remain open.
+
+Revision `da89ae3` then passed a four-host
+[server CA and endpoint-address campaign](server-ca-endpoint-rotation-validation-2026-09-19.md).
+Stopped transitions exercised mixed old/new server certificates with overlapping
+private roots, new-only trust, and wrong-trust NBD refusal in both directions.
+A/B changed to distinct-IP C/B with A's nginx listener stopped and the encryption
+key/profile, client credentials and volume identity unchanged. Both configured
+peers validated at each restart, superblock/canary hashes matched across each
+attach, and all 48 exact ACK rows survived. This qualifies that stopped
+reference-provider path, not C-only service, hot reload, CA revocation or a
+commercial deployment. The harness corrected two false failures in TDD: socket
+existence was mistaken for readiness, then an outer operation-deadline error
+was mistaken for an unrelated failure. Prior reports now describe the verified
+startup-refusal boundary accurately.
+
+The supplied R3 directory is retained because it also contains the inherited
+MAKI/FUP production checklist. Universal and target-profile RSS bounds,
+remaining transport-library copies, checkpoint stalls, actual provider
+faults over a commercial vendor and target network, replay policy, key migration,
+broader and live database migration, production database profiles and remaining
+engines, physical power loss, and long-duration load remain open.
+Direct R3 closure must not be read as general production approval.

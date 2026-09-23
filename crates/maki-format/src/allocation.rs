@@ -6,6 +6,7 @@ use crate::error::FormatError;
 
 pub const ALLOCATION_MAGIC: &[u8; 8] = b"MAKIALC1";
 pub const ALLOCATION_VERSION: u32 = 1;
+pub(crate) const ENCODED_FIXED_BYTES: u64 = ALLOCATION_MAGIC.len() as u64 + 4 + 8 + 8 + 4;
 /// Hard cap: 64 GiB shard at 4 KiB units = 16 Mi units = 2 MiB of bitmap.
 const MAX_UNITS: u64 = 1 << 32;
 

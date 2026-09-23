@@ -38,13 +38,16 @@ struct WritebackFile {
 impl BackingFile for WritebackFile {
     fn read_at(&self, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
         self.inner.read_at(offset, bytes)?;
+        let payload_end = SECOND_PAYLOAD_OFFSET + CIPHERTEXT_SIZE as u64;
         if self.is_segment
-            && offset == 0
-            && bytes.len() > SECOND_PAYLOAD_OFFSET as usize
+            && offset < payload_end
+            && offset + bytes.len() as u64 >= payload_end
             && self.change_after_scan.swap(false, Ordering::SeqCst)
         {
-            // The scan got the valid cached image, but subsequent reads see
-            // different bytes (e.g. failed writeback pages were reclaimed).
+            // The scan has received the final byte of the second payload,
+            // whether it reads a whole image or separate chunks. Corrupt its
+            // backing copy now; later zero/torn-tail reads do not move this
+            // boundary. A rewrite must detect the changed accepted bytes.
             self.inner.write_at(SECOND_PAYLOAD_OFFSET, &[0xFE])?;
         }
         Ok(())
@@ -242,8 +245,13 @@ fn recovery_refuses_bytes_that_changed_after_the_validated_scan() {
     backing.fail_sync.store(false, Ordering::SeqCst);
     backing.change_after_scan.store(true, Ordering::SeqCst);
 
+    let recovered = Volume::recover(backing.clone(), options());
     assert!(
-        Volume::recover(backing, options()).is_err(),
+        !backing.change_after_scan.load(Ordering::SeqCst),
+        "the validated-payload mutation must actually be injected"
+    );
+    assert!(
+        recovered.is_err(),
         "recovery must not persist a different image than it validated"
     );
 }

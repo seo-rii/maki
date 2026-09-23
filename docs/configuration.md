@@ -15,17 +15,22 @@ HTTP example is available at
 | `volume` | Name, maximum virtual size, block size, crypto unit size, and shard size |
 | `crypto` | Provider selection, compatibility identity, availability policy, and capabilities |
 | `crypto.http` | HTTP endpoints, request/response mapping, credentials, and TLS |
-| `crypto.websocket` | WebSocket endpoints, timeout, and frame-size limit |
-| `crypto.grpc` | gRPC endpoints, method paths, metadata, and message-size limit |
+| `crypto.websocket` | WebSocket endpoints, TLS, timeout, and frame-size limit |
+| `crypto.grpc` | gRPC endpoints, TLS, method paths, metadata, and message-size limit |
 | `limits` | Request, byte, queue, batch, and endpoint concurrency bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
+| `backing.rollback_protection` | Experimental Linux COW format: independent `witness_root` and preallocated logical-page `capacity` (new volumes only) |
 | `cache` | Read-cache mode, size, TTL, locking, and zeroization |
-| `nbd` | Socket and negotiated I/O geometry |
+| `nbd` | Socket, negotiated I/O geometry, and Tokio runtime worker count |
 | `control` | Administrative socket and group |
 | `security` | Core-dump, memory-lock, and secure-swap policy |
 
 Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
 Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
+
+See [Rollback-protected backing](rollback-protection.md) for the witness trust
+boundary, capacity/reserve sizing, creation and systemd access requirements.
+This option is off by default and does not upgrade existing volumes.
 
 ## Providers
 
@@ -34,17 +39,61 @@ Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
 | `local-aes-gcm-siv` | Local | Authenticated and context-bound | Not applicable |
 | `local-aes-xts` | Local | No authenticated integrity | Not applicable |
 | `remote-http` | HTTP | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
-| `remote-websocket` | WebSocket | Declared by provider contract | `wss://` currently rejected |
-| `remote-grpc` | gRPC | Declared by provider contract | TLS endpoints currently rejected |
+| `remote-websocket` | WebSocket | Declared by provider contract | WSS, custom CA, and mTLS supported |
+| `remote-grpc` | gRPC | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
 | `fake` | In-process test provider | Test-only | Refused unless built with `--features fake-provider` |
 
 The `fake` provider is not compiled into a default build; `maki volume create`
 and attach reject it at validation time. Enable the `fake-provider` feature of
 `maki-nbdkit` only for development and benchmark builds.
 
-WebSocket and gRPC fail closed when TLS is configured. Use `remote-http` when a
-remote production deployment requires TLS until those transports gain rustls
-support.
+All three remote transports verify server certificates and the hostname in the
+endpoint URL. The TLS section is optional when system/default trust is enough.
+A custom `ca_file` adds trust; it does not disable the built-in roots. There is
+no certificate-verification bypass setting.
+
+For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
+
+```toml
+[[crypto.websocket.endpoint]]
+name = "primary"
+url = "wss://crypto.example:8443"
+
+[crypto.websocket.tls]
+ca_file = "/etc/maki/crypto-ca.pem"
+client_cert_file = "/etc/maki/client-cert.pem"
+client_key = { source = "credential", name = "crypto-client-key" }
+```
+
+For gRPC, use `crypto.grpc.endpoint`, an `https://` URL and `crypto.grpc.tls`
+with the same fields. WebSocket and gRPC require `client_cert_file` and
+`client_key` together; the private key is loaded through the existing credential
+router. Omit both for server-only TLS. HTTP also retains support for a combined
+certificate/private-key PEM in `client_cert_file`.
+
+These transports have local certificate, hostname, mTLS and actual daemon I/O
+regressions. The cross-host reference-provider campaigns documented separately
+used HTTP; they do not qualify a commercial WSS/gRPC service or deployment.
+
+## Capability declarations and checks
+
+`crypto.capabilities.mode` supports only `declared` (also the default).
+`hybrid` and `probed` are rejected because endpoint capability discovery is
+not implemented. Replace either old mode with `declared` and confirm the
+configured limits against the endpoint's documented contract.
+
+| Mode / claim | Runtime behavior |
+|---|---|
+| `declared` | Use configured limits; mandatory round-trip, response-shape, declared security and cross-endpoint checks still run. |
+| `hybrid`, `probed` | Configuration error; no discovery or volume attach occurs. |
+| Remote `none` | Capability is absent. |
+| Remote `contractual` or legacy `verified` | Capability is contractual; a TOML declaration is not independent verification. |
+| Intrinsic local AEAD capability | Remains verified by the local implementation. |
+
+Endpoint status `validated` means the configured volume's conformance and
+key checks passed. It does not mean that every limit was discovered, that
+all possible inputs were checked, or that replay protection was proven.
+Changing a mode cannot bypass the mandatory integrity/context tests.
 
 ## Validation rules
 
@@ -57,11 +106,13 @@ schema, geometry, and secret-literal checks it rejects:
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
   targets above their maxima, or a batch byte limit smaller than one crypto
   unit;
-- a retry strategy other than `exponential-full-jitter`, an unknown
-  `capabilities.mode`, `availability_policy = "bounded-error"` without a
+- a retry strategy other than `exponential-full-jitter`, a
+  `capabilities.mode` other than `declared`, `availability_policy = "bounded-error"` without a
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
   `secure-buffers | all | off`;
 - a `backing.root` that is not an absolute path;
+- an `nbd.threads` value outside `1..=256`; the worker count is never
+  silently reduced;
 - NBD I/O sizes that are not powers of two or not ordered
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
@@ -79,10 +130,9 @@ schema, geometry, and secret-literal checks it rejects:
   names, or with a scheme the transport does not speak;
 - **plaintext transports to non-loopback hosts**: `http://`, `ws://`, and gRPC
   `http://` endpoints are accepted only for `localhost`, `127.0.0.0/8`, and
-  `::1`. Block data must not cross the network unencrypted; use `https://` or a
-  local tunnel. `wss://`, gRPC `https://`, and `[crypto.websocket.tls]` /
-  `[crypto.grpc.tls]` are refused because those transports have no TLS support
-  in this build;
+  `::1`. Use `https://` or `wss://` for remote endpoints. An explicit TLS section
+  requires encrypted URLs for every endpoint in that transport, including
+  loopback, so TLS options cannot be silently ignored;
 - HTTP batch layouts (`body.items_path`) whose response mapping lacks
   `items_path` or `item_index_path`: every batch element must echo its unit
   index so reordered, dropped, or duplicated results are detected;
@@ -92,9 +142,10 @@ schema, geometry, and secret-literal checks it rejects:
 - the `keyring` credential source, which this build does not implement, and
   the same credential name declared with different sources.
 
-The HTTP provider additionally refuses to start when a CA or client certificate
-file cannot be read or parsed, and reads `client_key` from its credential source
-to complete the client identity.
+The providers additionally refuse unreadable or invalid TLS material at
+construction or handshake, and read `client_key` from its credential source to
+complete the client identity. Certificate and hostname failures prevent
+successful attachment; they do not trigger a plaintext fallback.
 
 ## Compatibility identity
 
@@ -184,7 +235,34 @@ The gRPC transport uses the message shape in
 Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
 
+## Backing directory identity
+
+On Linux, `backing.root` and its ancestors must be real directories; symlink
+aliases are refused. The backing pins the selected directory with an open
+descriptor. Subsequent file, lock, rename, removal, listing, directory sync,
+and free-space operations resolve through directory descriptors without
+following symlinks. Renaming the root and replacing its old pathname cannot
+redirect an existing backing instance to another volume.
+
+Keep the backing tree writable only by its owner. Descriptor confinement does
+not authenticate file contents or prevent a process with direct write access
+from altering the volume. Other development platforms retain pathname-based
+checks; this Linux confinement guarantee does not apply to them.
+
 ## NBD request limits
+
+`nbd.connections` must be `1`; multi-connection operation is disabled.
+
+`nbd.threads` sets the number of Tokio runtime worker threads used by the
+plugin. The default is 64, and the supported range is `1..=256`. This is
+not the process's total thread count: nbdkit owns its native callback
+thread pool, and Tokio may also create blocking-operation threads. The
+plugin allows parallel nbdkit callbacks; changing `nbd.threads` does not
+configure nbdkit's callback pool.
+
+Request admission is controlled separately by `limits.max_active_callbacks`
+and `limits.max_plaintext_bytes`. Increasing the runtime worker count does
+not increase those limits or establish a tested throughput guarantee.
 
 The plugin advertises `minimum_io`, `preferred_io`, and `maximum_io` through
 nbdkit's block-size callback. The adapter also rejects read/write requests with
@@ -203,12 +281,40 @@ outside the configured constraints fail cleanly.
 |---|---|
 | `backing.journal_segment_size` | Size at which the journal writer starts a new segment (at least 4096 bytes) |
 | `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
-| `backing.journal_emergency_reserve_bytes` | Writes fail with ENOSPC while backing free space is below it |
-| `backing.checkpoint_reserve_bytes` | The worker checkpoints eagerly while backing free space is below it |
+| `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
+| `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; the write path forces a journal sync before exceeding it |
 
-Free space is read with `statvfs` on Unix hosts. Where it cannot be read, the
-free-space rules do not apply and `maki_backing_free_bytes` is null.
+Free space is read with `statvfs` on Unix hosts. When the emergency reserve is
+enabled, an unavailable or failed query fails write admission with ENOSPC;
+`maki_backing_free_bytes` is null until a usable observation is available.
+
+When the emergency reserve is enabled, every write admission refreshes free
+space while holding the volume write lock. It requires enough space for the
+configured emergency reserve and checkpoint headroom after all record bytes and
+segment headers created by that request. Checked arithmetic fails closed on an
+overflow. It does not reuse the statistics cache, so space lost or restored
+between consecutive writes is observed even within the same second. Setting
+the emergency reserve to zero retains the explicit admission opt-out; the
+checkpoint threshold still controls the worker. Status and metrics read cached
+observations and never initiate this filesystem query.
+
+The thresholds do not reserve the volume's entire maximum layout. On Linux,
+each write additionally uses `posix_fallocate` for its exact journal range and
+the complete destination slot before the journal accepts the record. A new
+shard also has both allocation-map copies and its catalog entry created and
+synced first. An unrelated filesystem consumer therefore cannot take the
+already allocated journal or slot blocks before checkpoint completes. A
+reservation failure returns ENOSPC without consuming a journal sequence and is
+retryable.
+
+Untouched slots remain sparse and unreserved. Filesystem directory metadata,
+copy-on-write amplification, snapshots, journal/checkpoint headroom beyond the
+exact admitted ranges, and application or database temporary space still need
+deployment capacity. Non-Linux development backings extend the file but do not
+claim the Linux physical-allocation guarantee. Include the remaining costs in
+capacity qualification instead of equating exported virtual size with backing
+space.
 
 ## Batching and pending bounds
 
@@ -245,10 +351,10 @@ attached, fails closed on Linux, and is reported under `security` in
 |---|---|
 | `disable_core_dump` (default true) | `prctl(PR_SET_DUMPABLE, 0)` and `RLIMIT_CORE = 0`, verified after the call |
 | `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
-| `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` every secret buffer (plaintext, keys, cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported |
+| `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` registered `SecretBuffer` allocations (including plaintext, keys and cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported. Separate transport allocations are described in [buffer lifetime limits](transport-memory.md) |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
 | `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
-| `require_secure_swap_policy` (default false) | When true, attach is refused unless `/proc/swaps` is readable, parseable, and lists only RAM-only zram devices (`/dev/zramN` whose `backing_dev` is `none`, or a dm-crypt one) or dm-crypt devices. Classification is by device identity, never by name: a swap file called `zram-backup` is a swap file. Set it in production (the shipped example does) |
+| `require_secure_swap_policy` (default false) | Requires readable, parseable `/proc/swaps` and accepts only RAM-only zram or dm-crypt with proven independent physical backing, including zram writeback. NBD ancestors, cycles, and unknown backing are refused. Device identity determines classification; keep the topology fixed while attached. See [swap dependency checks](operations.md#swap-dependency-checks). The shipped production example enables this policy |
 
 Buffers are zeroized before their page-lock ownership is released. Exporting a
 buffer as a plain vector releases that buffer's ownership and transfers the
@@ -263,6 +369,21 @@ On non-Linux hosts nothing is enforced; the status document reports
 `volume.max_virtual_size`, `crypto_unit_size`, provider ciphertext bounds, slot
 alignment, and NBD block sizes jointly define immutable volume geometry. Treat
 geometry or on-disk format changes as migrations, not hot reloads.
+
+`maki volume inspect` reports maximum units and shards, the full slot-file span,
+and the A/B allocation-map and catalog bytes calculated from that geometry. For
+the 16 TiB example with 4 KiB units, 4384-byte maximum ciphertext, 4608-byte
+slots and 64 GiB shards, the full slot span is 18 TiB. Its allocation maps use
+1,073,758,208 bytes across both copies at full allocation; the two full catalog
+copies use 4,152 bytes. The last partial logical shard still contributes a full
+shard file because shard files are created at their complete fixed length.
+
+These values describe format files at maximum allocation. Add journal and
+checkpoint headroom, filesystem allocation and metadata overhead,
+copy-on-write behavior, and database temporary space when sizing the backing
+filesystem. Sparse file lengths do not reserve those blocks. Geometry
+validation rejects a possible shard count above the catalog limit and any
+maximum-layout byte calculation that overflows `u64`.
 
 Set request-count and byte limits together. In particular, size global and
 per-endpoint concurrency below the memory and provider capacity available to a
@@ -281,3 +402,32 @@ cargo run --locked -p maki -- check path/to/config.toml
 
 Creating a volume writes metadata to the configured backing root. Do not point
 an unreviewed configuration at an existing volume.
+
+## Privileged attachment identity
+
+The root-owned `/etc/maki/attach/<volume>.toml` is separate from the data-plane
+volume configuration. Its template is
+[`packaging/examples/attach.toml`](../packaging/examples/attach.toml). A
+production attachment must pin the filesystem UUID and the LVM identity:
+
+```toml
+fs_uuid = "11111111-2222-3333-4444-555555555555"
+
+[lvm_identity]
+pv_uuids = ["111111-2222-3333-4444-5555-6666-777777"]
+vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"
+```
+
+When `[lvm_identity]` is present, all three fields are required. `pv_uuids`
+must list the complete PV set without duplicates; its order is normalized.
+Attach refuses a missing, additional, malformed or changed PV, VG or configured
+target-LV UUID before activation. The pins are stored in the trusted attachment
+record and rechecked during recovery. Grow and detach also require the current
+configuration, including the pins, to match that record before any mutation.
+
+Omitting the table remains accepted for old configurations and records, but
+does not authenticate the discovered LVM metadata against an administrator's
+expected identity. Do not use that compatibility mode for the production
+profile. Obtain the identifiers from a separately verified host inventory; the
+helper never learns or rewrites them.

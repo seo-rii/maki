@@ -18,6 +18,7 @@ use maki_crypto::scheduler::SchedulerStats;
 
 pub struct EngineControlBackend {
     engine: Engine,
+    admission: Arc<crate::drain::DrainGate>,
     volume_name: String,
     crypto_stats: Option<Arc<SchedulerStats>>,
     endpoints: Option<Arc<EndpointSet>>,
@@ -27,10 +28,17 @@ impl EngineControlBackend {
     pub fn new(engine: Engine, volume_name: impl Into<String>) -> Self {
         Self {
             engine,
+            admission: Arc::default(),
             volume_name: volume_name.into(),
             crypto_stats: None,
             endpoints: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_admission(mut self, admission: Arc<crate::drain::DrainGate>) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Attach the batch scheduler's counters (remote providers).
@@ -122,10 +130,22 @@ fn state_label(state: &EngineState) -> (&'static str, u64, Option<String>) {
 #[async_trait]
 impl ControlBackend for EngineControlBackend {
     async fn status(&self) -> Value {
-        let stats = self.engine.stats().await;
+        let observation = self.engine.monitoring_snapshot();
+        let stats = &observation.stats;
         let (label, _, reason) = state_label(&stats.state);
+        let (io_state, drain_error) = self.admission.status();
         json!({
-            "state": label,
+            "state": if observation.volume_busy { "busy" } else { label },
+            "last_observed_state": label,
+            "observability": {
+                "volume_snapshot": if observation.volume_busy { "cached" } else { "current" },
+                "volume_snapshot_age_ms": observation.volume_snapshot_age.as_millis().min(u64::MAX as u128) as u64,
+                "backing_space": if observation.backing_space_age.is_some() { "cached" } else { "unavailable" },
+                "backing_space_age_ms": observation.backing_space_age.map(|age| age.as_millis().min(u64::MAX as u128) as u64),
+                "cache_snapshot": if observation.cache.is_some() { "current" } else { "unavailable" },
+            },
+            "io_state": io_state,
+            "drain_error": drain_error,
             "degraded_reason": reason,
             "volume": self.volume_name,
             "size": self.engine.size(),
@@ -145,7 +165,8 @@ impl ControlBackend for EngineControlBackend {
     }
 
     async fn metrics(&self) -> Value {
-        let stats = self.engine.stats().await;
+        let observation = self.engine.monitoring_snapshot();
+        let stats = &observation.stats;
         let (_, state_code, _) = state_label(&stats.state);
         let dispatch = self.endpoints.as_ref().map(|set| set.metrics());
         let (inflight_rpcs, inflight_bytes) = self
@@ -196,7 +217,11 @@ impl ControlBackend for EngineControlBackend {
             "maki_fua_seconds_max": stats.fua_latency.seconds_max,
         });
         let mut doc = json!({
-            "maki_volume_state": state_code,
+            "maki_volume_state": (!observation.volume_busy).then_some(state_code),
+            "maki_volume_busy": u8::from(observation.volume_busy),
+            "maki_volume_snapshot_age_seconds": observation.volume_snapshot_age.as_secs_f64(),
+            "maki_backing_space_sample_age_seconds": observation.backing_space_age.map(|age| age.as_secs_f64()),
+            "maki_cache_stats_available": u8::from(observation.cache.is_some()),
             "maki_journal_appended_sequence": stats.appended_sequence,
             "maki_journal_durable_sequence": stats.durable_sequence,
             "maki_checkpoint_sequence": stats.checkpoint_sequence,
@@ -211,10 +236,10 @@ impl ControlBackend for EngineControlBackend {
             "maki_backing_free_bytes": stats.backing_free_bytes,
             "maki_overlay_units": stats.overlay_units,
             "maki_overlay_bytes": stats.overlay_bytes,
-            "maki_cache_hits_total": stats.cache_hits,
-            "maki_cache_misses_total": stats.cache_misses,
-            "maki_cache_bytes": stats.cache_bytes,
-            "maki_cache_entries": stats.cache_entries,
+            "maki_cache_hits_total": observation.cache.map(|cache| cache.hits),
+            "maki_cache_misses_total": observation.cache.map(|cache| cache.misses),
+            "maki_cache_bytes": observation.cache.map(|cache| cache.bytes),
+            "maki_cache_entries": observation.cache.map(|cache| cache.entries),
             "maki_crypto_pending_items": self.crypto_stats.as_ref().map(|s| s.pending_items()).unwrap_or(0),
             "maki_crypto_pending_bytes": self.crypto_stats.as_ref().map(|s| s.pending_bytes()).unwrap_or(0),
             "maki_crypto_batches_total": self.crypto_stats.as_ref().map(|s| s.batches_total()).unwrap_or(0),
@@ -227,10 +252,16 @@ impl ControlBackend for EngineControlBackend {
     }
 
     async fn checkpoint(&self) -> Result<u64, String> {
+        let _callback = self.admission.enter().map_err(str::to_owned)?;
         self.engine.checkpoint().await.map_err(|e| e.to_string())
     }
 
+    async fn drain(&self) -> Result<u64, String> {
+        self.admission.drain(&self.engine).await
+    }
+
     async fn reload(&self, section: &str, payload: &Value) -> Result<(), String> {
+        let _callback = self.admission.enter().map_err(str::to_owned)?;
         match section {
             // Hot-reloadable and actually applied (SPEC §20).
             "cache" => {

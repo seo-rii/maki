@@ -22,6 +22,7 @@ supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4104
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 [nbd]
 minimum_io = 4096
 preferred_io = 4096

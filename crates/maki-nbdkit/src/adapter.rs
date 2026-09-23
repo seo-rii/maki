@@ -2,9 +2,9 @@
 //!
 //! - Every entry point catches panics: nothing ever unwinds across the FFI
 //!   boundary; a panic maps to EIO and the adapter stays usable.
-//! - Capability surface per SPEC §48: FLUSH + FUA supported; trim, write-
-//!   zeroes, and multi-connection disabled (nbdkit emulates zeroes via
-//!   pwrite).
+//! - Capability surface per SPEC §48: FLUSH + FUA supported; TRIM enabled
+//!   only for opt-in v3 volumes; native write-zeroes and multi-connection
+//!   disabled (nbdkit emulates zeroes via pwrite).
 //! - The NBD I/O limits are advertised through the plugin's `block_size`
 //!   callback *and* enforced here: negotiation is advisory, so a request
 //!   outside the configured minimum/maximum, misaligned, or past the end of
@@ -76,6 +76,8 @@ struct ControlServer {
 pub struct NbdAdapter {
     runtime: tokio::runtime::Runtime,
     state: parking_lot::RwLock<Option<Arc<AdapterState>>>,
+    admission: Arc<crate::drain::DrainGate>,
+    shutdown: parking_lot::Mutex<()>,
     #[cfg(unix)]
     control: parking_lot::Mutex<Option<ControlServer>>,
 }
@@ -90,6 +92,8 @@ impl NbdAdapter {
         );
         Self {
             runtime,
+            admission: Arc::default(),
+            shutdown: parking_lot::Mutex::new(()),
             state: parking_lot::RwLock::new(Some(Arc::new(AdapterState {
                 engine,
                 block_sizes,
@@ -108,7 +112,7 @@ impl NbdAdapter {
         let config = daemon::parse_and_validate(&raw)
             .map_err(|e| AdapterError::new(EINVAL, e.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(config.nbd.threads.clamp(1, 256) as usize)
+            .worker_threads(config.nbd.threads as usize)
             .enable_all()
             .build()
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
@@ -127,6 +131,7 @@ impl NbdAdapter {
             engine.max_request_bytes().min(u32::MAX as u64) as u32,
         );
 
+        let admission = Arc::new(crate::drain::DrainGate::default());
         #[cfg(unix)]
         let control = {
             let socket = daemon::control_socket_path(&config);
@@ -135,6 +140,7 @@ impl NbdAdapter {
                     engine.clone(),
                     config.volume.name.clone(),
                 )
+                .with_admission(admission.clone())
                 .with_crypto_stats(crypto_stats.clone())
                 .with_endpoints(endpoints.clone()),
             );
@@ -165,6 +171,8 @@ impl NbdAdapter {
 
         Ok(Self {
             runtime,
+            admission,
+            shutdown: parking_lot::Mutex::new(()),
             state: parking_lot::RwLock::new(Some(Arc::new(AdapterState {
                 engine,
                 block_sizes,
@@ -209,17 +217,26 @@ impl NbdAdapter {
     }
 
     pub fn get_size(&self) -> u64 {
-        self.state().map(|s| s.engine.size()).unwrap_or(0)
+        self.state
+            .read()
+            .as_ref()
+            .map(|s| s.engine.size())
+            .unwrap_or(0)
     }
 
     pub fn block_sizes(&self) -> (u32, u32, u32) {
-        self.state()
+        self.state
+            .read()
+            .as_ref()
             .map(|s| s.block_sizes)
             .unwrap_or((512, 4096, 1 << 20))
     }
 
     pub fn can_trim(&self) -> bool {
-        false
+        self.state
+            .read()
+            .as_ref()
+            .is_some_and(|s| s.engine.can_trim())
     }
 
     pub fn can_write_zeroes(&self) -> bool {
@@ -261,6 +278,10 @@ impl NbdAdapter {
     }
 
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<(), AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
         self.validate_request(offset, buf.len())?;
         let len = buf.len();
         // Plaintext stays in zeroizing buffers until it is copied into the
@@ -272,6 +293,10 @@ impl NbdAdapter {
     }
 
     pub fn pwrite(&self, data: &[u8], offset: u64, fua: bool) -> Result<(), AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
         self.validate_request(offset, data.len())?;
         let owned = SecretBuffer::from_slice(data);
         self.run(move |engine| {
@@ -280,10 +305,27 @@ impl NbdAdapter {
     }
 
     pub fn flush(&self) -> Result<(), AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
         self.run(move |engine| Box::pin(async move { engine.flush().await }))
     }
 
+    pub fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
+        self.validate_request(offset, len)?;
+        self.run(move |engine| Box::pin(async move { engine.trim(offset, len, fua).await }))
+    }
+
     pub fn checkpoint(&self) -> Result<u64, AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
         self.run(move |engine| Box::pin(async move { engine.checkpoint().await }))
     }
 
@@ -309,8 +351,24 @@ impl NbdAdapter {
     /// Clean detach: FLUSH, checkpoint, stop the control socket, release
     /// the volume lock.
     pub fn shutdown(&self) -> Result<(), AdapterError> {
-        self.flush()?;
-        self.checkpoint()?;
+        // Serialize through state release, before cloning the engine: a
+        // waiting caller must not keep the volume locked after another
+        // caller acknowledges a completed shutdown.
+        let _shutdown = self.shutdown.lock();
+        // A completed shutdown is idempotent. On error keep the engine,
+        // control server and volume lock alive, with I/O admission closed.
+        if self.state.read().is_none() {
+            return Ok(());
+        }
+        let state = self.state()?;
+        self.runtime
+            .block_on(async {
+                let sequence = self.admission.drain(&state.engine).await?;
+                state.engine.stop_checkpoint_worker().await;
+                Ok::<_, String>(sequence)
+            })
+            .map_err(|e| AdapterError::new(EIO, e))?;
+        drop(state);
         self.stop_control();
         *self.state.write() = None; // drops Engine → volume lock released
         Ok(())

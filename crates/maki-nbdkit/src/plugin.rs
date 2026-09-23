@@ -5,10 +5,11 @@
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
 //!   populate; `_struct_size` includes the block_size callback so clients
 //!   can negotiate the configured limits. Other optional callbacks stay
-//!   NULL (multi-conn OFF, zero emulated via pwrite, trim absent).
-//! - The tokio runtime is created lazily at first `open`, which happens
-//!   after nbdkit forks — equivalent to the `after_fork` hook without
-//!   depending on newer struct fields.
+//!   NULL (multi-conn OFF, zero emulated via pwrite). TRIM is advertised
+//!   per connection only for opt-in v3 volumes.
+//! - `after_fork` initializes recovery, provider verification and the control
+//!   listener before announcing readiness. `open` only uses this adapter;
+//!   it never starts a runtime or retries a failed startup.
 //! - MUST be layout-verified against the distribution's nbdkit-plugin.h in
 //!   Linux qualification before production use (see docs/testing.md).
 
@@ -20,6 +21,9 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::adapter::NbdAdapter;
+
+#[path = "startup.rs"]
+mod startup;
 
 /// Values from `nbdkit-common.h` / `nbdkit-plugin.h` the shim depends on.
 /// `tests/review_abi.rs` compiles a C probe against the installed header
@@ -38,22 +42,27 @@ const API_VERSION: c_int = NBDKIT_API_VERSION;
 
 static CONFIG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static ADAPTER: OnceLock<NbdAdapter> = OnceLock::new();
+static STARTUP: startup::Startup = startup::Startup::new();
 
 fn adapter() -> Option<&'static NbdAdapter> {
-    if let Some(a) = ADAPTER.get() {
-        return Some(a);
-    }
-    let path = CONFIG_PATH.lock().clone()?;
-    match NbdAdapter::open_config(&path) {
-        Ok(a) => {
-            let _ = ADAPTER.set(a);
-            ADAPTER.get()
-        }
-        Err(e) => {
-            eprintln!("maki-nbdkit: attach failed: {e}");
-            None
-        }
-    }
+    STARTUP.ready().then(|| ADAPTER.get()).flatten()
+}
+
+unsafe extern "C" fn after_fork() -> c_int {
+    // run catches initialization panics and records failure permanently, so
+    // neither unwinding nor duplicate initialization can cross this ABI.
+    STARTUP.run(|| {
+        let path = CONFIG_PATH.lock().clone().ok_or("missing config path")?;
+        let adapter = NbdAdapter::open_config(&path).map_err(|error| error.to_string())?;
+        ADAPTER
+            .set(adapter)
+            .map_err(|_| "adapter already initialized")?;
+        // Publication precedes notification. If notification fails, open
+        // remains disabled and unload can still shut down the stored adapter.
+        startup::notify_ready(std::env::var_os("NOTIFY_SOCKET").as_deref())
+            .map_err(|error| format!("readiness notification: {error}"))?;
+        Ok(())
+    })
 }
 
 unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
@@ -119,8 +128,9 @@ unsafe extern "C" fn is_rotational(_h: *mut c_void) -> c_int {
     0
 }
 
-unsafe extern "C" fn can_trim(_h: *mut c_void) -> c_int {
-    0
+unsafe extern "C" fn can_trim(handle: *mut c_void) -> c_int {
+    let adapter = unsafe { &*(handle as *const NbdAdapter) };
+    c_int::from(adapter.can_trim())
 }
 
 unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
@@ -195,6 +205,17 @@ unsafe extern "C" fn flush_v2(handle: *mut c_void, _flags: u32) -> c_int {
         Ok(()) => 0,
         Err(e) => {
             set_errno(e.errno);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn trim_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
+    let adapter = unsafe { &*(handle as *const NbdAdapter) };
+    match adapter.trim(offset, count as usize, flags & NBDKIT_FLAG_FUA != 0) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error.errno);
             -1
         }
     }
@@ -305,7 +326,7 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     pread: Some(pread_v2),
     pwrite: Some(pwrite_v2),
     flush: Some(flush_v2),
-    trim: None,
+    trim: Some(trim_v2),
     zero: None,
     magic_config_key: std::ptr::null(),
     can_multi_conn: None,
@@ -317,7 +338,7 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     can_fast_zero: None,
     preconnect: None,
     get_ready: None,
-    after_fork: None,
+    after_fork: Some(after_fork),
     list_exports: None,
     default_export: None,
     export_description: None,

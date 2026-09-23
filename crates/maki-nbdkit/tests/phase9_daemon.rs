@@ -1,9 +1,8 @@
 //! Phase 9 follow-up — daemon wiring for the WebSocket and gRPC transports
 //! (SPEC §18 lists all three remote transports; the daemon must assemble
 //! `remote-websocket` / `remote-grpc` through the same dispatcher as
-//! `remote-http`). TLS is not yet compiled into these two transports, so a
-//! config asking for it must refuse to attach (fail closed), never silently
-//! downgrade.
+//! `remote-http`). Unsupported TLS overrides must still fail validation;
+//! encrypted daemon roundtrips have separate local TLS fixture suites.
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -121,7 +120,7 @@ mod grpc {
         B: tonic::codegen::Body + Send + 'static,
         B::Error: Into<StdError> + Send + 'static,
     {
-        type Response = http::Response<tonic::body::BoxBody>;
+        type Response = http::Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
         type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -161,7 +160,7 @@ mod grpc {
                         .status(200)
                         .header("grpc-status", (Code::Unimplemented as i32).to_string())
                         .header("content-type", "application/grpc")
-                        .body(tonic::body::empty_body())
+                        .body(tonic::body::Body::empty())
                         .unwrap()),
                 }
             })
@@ -227,6 +226,7 @@ max_delay = "200ms"
 {transport}
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 "#
     )
 }
@@ -306,25 +306,29 @@ async fn grpc_without_token_is_refused_by_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_tls_config_refuses_attach() {
-    // wss:// (and [crypto.websocket.tls]) are not yet supported by the
-    // transport build — the daemon must fail closed, not downgrade.
+async fn websocket_unsupported_tls_override_refuses_attach() {
     let dir = tempfile::tempdir().unwrap();
     let transport =
-        "[[crypto.websocket.endpoint]]\nname = \"ep0\"\nurl = \"wss://crypto.internal:7000\"\n"
+        "[[crypto.websocket.endpoint]]\nname = \"ep0\"\nurl = \"wss://crypto.internal:7000\"\n[crypto.websocket.tls]\nserver_name = \"unsupported\"\n"
             .to_string();
     let config = base_config(&temp_root(&dir), "remote-websocket", "", &transport);
     let err = attach(&config).await.unwrap_err();
-    assert!(err.contains("TLS"), "must name the TLS gap: {err}");
+    assert!(
+        err.contains("server_name"),
+        "must name the unsupported override: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn grpc_tls_config_refuses_attach() {
+async fn grpc_unsupported_tls_override_refuses_attach() {
     let dir = tempfile::tempdir().unwrap();
     let transport =
-        "[[crypto.grpc.endpoint]]\nname = \"ep0\"\nurl = \"https://crypto.internal:7000\"\n"
+        "[[crypto.grpc.endpoint]]\nname = \"ep0\"\nurl = \"https://crypto.internal:7000\"\n[crypto.grpc.tls]\nserver_name = \"unsupported\"\n"
             .to_string();
     let config = base_config(&temp_root(&dir), "remote-grpc", "", &transport);
     let err = attach(&config).await.unwrap_err();
-    assert!(err.contains("TLS"), "must name the TLS gap: {err}");
+    assert!(
+        err.contains("server_name"),
+        "must name the unsupported override: {err}"
+    );
 }

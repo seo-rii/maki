@@ -11,11 +11,12 @@
 //! checkpoint M".
 //!
 //! Recovery now re-persists the checkpoint state it selects before the
-//! writer resumes, and a failed A/B store empties the side it could not
-//! sync (so a volatile newer generation is never adopted). Either way the
-//! reclaim can only rest on a durable checkpoint. This test drives the full
-//! sequence and requires the final recovery to succeed with every
-//! FUA-acknowledged unit intact.
+//! writer resumes. Each A/B store rewrites and syncs the other valid copy
+//! before overwriting its target, so a failed target sync cannot destroy
+//! the preserved durable copy. Recovery persists whichever valid state it
+//! selects before journal mutation, so reclaim can only rest on a durable
+//! checkpoint. This test drives the full sequence and requires the final
+//! recovery to succeed with every FUA-acknowledged unit intact.
 
 use std::io;
 use std::sync::Arc;

@@ -95,6 +95,7 @@ impl Server {
             },
             timeout,
             max_frame_bytes: 4096,
+            tls: None,
         }))
     }
 

@@ -1,0 +1,10 @@
+# Lifecycle boundary for one Maki volume and all workloads registered against
+# it. Enable this target instead of enabling maki@ or maki-attach@ directly.
+
+[Unit]
+Description=Maki workload lifecycle %i
+Requires=maki-attach@%i.service
+After=maki-attach@%i.service
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,9 @@
 pub mod file;
 pub mod mem;
 pub mod path;
+mod rollback;
+pub mod witness;
+pub use rollback::RollbackBacking;
 
 pub use file::FileBacking;
 pub use mem::MemBacking;
@@ -34,6 +37,32 @@ pub trait BackingFile: Send + Sync {
 
     fn set_len(&self, len: u64) -> io::Result<()>;
 
+    /// Reserve physical storage for a byte range before the caller publishes
+    /// work that will later depend on writing it. Real Linux files override
+    /// this with `posix_fallocate`, whose successful return guarantees that
+    /// later writes to the range do not fail for lack of filesystem space.
+    /// In-memory and test backings model the reservation by extending the
+    /// file; fault injection can therefore exercise the same ordering.
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        if self.len()? < end {
+            self.set_len(end)?;
+        }
+        Ok(())
+    }
+
+    /// Replace an existing byte range with zeroes while allowing the backing
+    /// store to release its physical storage. The file length is unchanged,
+    /// and the change is volatile until `sync_data` succeeds.
+    fn punch_hole(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hole punching is not supported by this backing",
+        ))
+    }
+
     fn len(&self) -> io::Result<u64>;
 
     fn is_empty(&self) -> io::Result<bool> {
@@ -49,6 +78,12 @@ pub trait VolumeLock: Send + Sync {}
 
 /// A confined storage namespace for one volume.
 pub trait Backing: Send + Sync + 'static {
+    /// Validate the independent freshness authority, if this backing has one.
+    /// Callers serving cached data must also check this session guard.
+    fn check_freshness(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Open a file. With `create = true`, creates it (volatile until the
     /// parent directory is synced).
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>>;

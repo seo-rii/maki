@@ -542,6 +542,38 @@ impl BackingFile for CrashFile {
         })
     }
 
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.with_state(|inner, state| {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "punch overflow"))?;
+            let file_len = state.volatile.as_ref().unwrap().image.len() as u64;
+            let end = end.min(file_len);
+            if offset >= end {
+                return Ok(());
+            }
+            let len = usize::try_from(end - offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "punch range too large")
+            })?;
+            let zeros = vec![0; len];
+            let op = FaultOp::WriteAt {
+                path: &self.path,
+                offset,
+                len,
+            };
+            inner.check(&op)?;
+            let pend = Pend::Write {
+                offset,
+                data: zeros,
+            };
+            let vol = state.volatile.as_mut().unwrap();
+            apply(&mut vol.image, &pend);
+            vol.pending.push(pend);
+            inner.stats_pending_writes += 1;
+            Ok(())
+        })
+    }
+
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.with_state(|inner, state| {
             inner.check(&FaultOp::SetLen {

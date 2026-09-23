@@ -17,6 +17,7 @@ use crate::plan::{AttachmentIdentity, BOUND_DEVICE_RECORD_DIR};
 use crate::probe::nbd_index;
 
 const RECORD_MAX_BYTES: u64 = 4096;
+const CONFIG_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +29,13 @@ pub(crate) struct BoundDeviceRecord {
     /// Passed to nbd-client's netlink identifier and checked against the
     /// live kernel backend attribute, including before rollback.
     pub connection_id: String,
+    /// Kernel identity captured with this backend still connected, before mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::exec::recover::RecoveryProof>,
+    /// Verified LVM identity published before activation. It authorizes only
+    /// scoped recovery of that exact mapping if activation outlives the helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_intent: Option<crate::exec::recover::RecoveryIntent>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -45,6 +53,9 @@ impl BoundDeviceRecord {
             .map_err(|e| invalid(e.to_string()))?;
         check_lvm_name("vg_name", &self.attachment.vg_name).map_err(|e| invalid(e.to_string()))?;
         check_lvm_name("lv_name", &self.attachment.lv_name).map_err(|e| invalid(e.to_string()))?;
+        if let Some(pins) = &self.attachment.lvm_identity {
+            crate::config::check_lvm_identity(pins).map_err(|e| invalid(e.to_string()))?;
+        }
         let nonce = self
             .connection_id
             .strip_prefix("maki-")
@@ -52,6 +63,12 @@ impl BoundDeviceRecord {
         check_uuid("connection_id", nonce).map_err(|e| invalid(e.to_string()))?;
         if self.version != 1 || nbd_index(&self.device).is_none() {
             return Err(invalid("unsupported or invalid attach record"));
+        }
+        if self.recovery.is_some() && self.recovery_intent.is_some() {
+            return Err(invalid("attach record has conflicting recovery states"));
+        }
+        if let Some(intent) = &self.recovery_intent {
+            intent.validate(self)?;
         }
         Ok(())
     }
@@ -116,10 +133,33 @@ impl TrustedState {
         )
     }
 
-    pub(crate) fn open_beneath(
+    pub fn open_existing() -> io::Result<Self> {
+        Self::open_existing_beneath(
+            File::open("/")?,
+            Path::new(BOUND_DEVICE_RECORD_DIR)
+                .strip_prefix("/")
+                .unwrap(),
+            0,
+        )
+    }
+
+    pub(crate) fn open_beneath(directory: File, relative: &Path, owner: u32) -> io::Result<Self> {
+        Self::open_directory(directory, relative, owner, true)
+    }
+
+    pub(crate) fn open_existing_beneath(
+        directory: File,
+        relative: &Path,
+        owner: u32,
+    ) -> io::Result<Self> {
+        Self::open_directory(directory, relative, owner, false)
+    }
+
+    fn open_directory(
         mut directory: File,
         relative: &Path,
         owner: u32,
+        create: bool,
     ) -> io::Result<Self> {
         trusted_directory(&directory, owner)?;
         let components: Vec<_> = relative.components().collect();
@@ -133,7 +173,11 @@ impl TrustedState {
             let flags = libc::O_RDONLY | libc::O_DIRECTORY;
             let child = match openat(&directory, &name, flags, 0) {
                 Ok(child) => child,
-                Err(e) if e.kind() == io::ErrorKind::NotFound && index + 1 == components.len() => {
+                Err(e)
+                    if create
+                        && e.kind() == io::ErrorKind::NotFound
+                        && index + 1 == components.len() =>
+                {
                     // Only the final helper directory may be created. Its
                     // parent has already been verified through a held fd.
                     let rc = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -159,14 +203,32 @@ impl TrustedState {
         Ok(file)
     }
 
+    /// Verification joins the same exclusive lock without creating a file.
+    pub fn lock_existing(&self) -> io::Result<File> {
+        let name = CString::new("attach.lock").unwrap();
+        let file = openat(&self.directory, &name, libc::O_RDONLY | libc::O_NOATIME, 0)?;
+        private_regular_file(&file, self.owner)?;
+        file.lock()?;
+        Ok(file)
+    }
+
     fn record_name(volume: &str) -> io::Result<CString> {
         check_volume_name(volume).map_err(|e| invalid(e.to_string()))?;
         CString::new(format!("{volume}.nbd")).map_err(|_| invalid("invalid volume name"))
     }
 
     pub fn read(&self, volume: &str) -> io::Result<Option<BoundDeviceRecord>> {
+        self.read_record(volume, false)
+    }
+
+    pub fn read_for_verify(&self, volume: &str) -> io::Result<Option<BoundDeviceRecord>> {
+        self.read_record(volume, true)
+    }
+
+    fn read_record(&self, volume: &str, no_atime: bool) -> io::Result<Option<BoundDeviceRecord>> {
         let name = Self::record_name(volume)?;
-        let file = match openat(&self.directory, &name, libc::O_RDONLY, 0) {
+        let flags = libc::O_RDONLY | if no_atime { libc::O_NOATIME } else { 0 };
+        let file = match openat(&self.directory, &name, flags, 0) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
@@ -237,6 +299,43 @@ impl TrustedState {
         }
         self.directory.sync_all()
     }
+}
+
+/// The workload gate accepts only an existing root-controlled config. Other
+/// verbs retain their historical loader and command-line override contracts.
+pub(crate) fn read_verify_config(path: &Path) -> io::Result<String> {
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| invalid("config path must be absolute"))?;
+    read_config_beneath(File::open("/")?, relative, 0)
+}
+
+fn read_config_beneath(directory: File, relative: &Path, owner: u32) -> io::Result<String> {
+    let parent = relative
+        .parent()
+        .ok_or_else(|| invalid("config path has no parent"))?;
+    let name = relative
+        .file_name()
+        .ok_or_else(|| invalid("config path has no filename"))?;
+    let state = TrustedState::open_existing_beneath(directory, parent, owner)?;
+    let name = CString::new(name.as_bytes()).map_err(|_| invalid("invalid config filename"))?;
+    let file = openat(&state.directory, &name, libc::O_RDONLY | libc::O_NOATIME, 0)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "verify config must be a root-owned regular file without group/other write access and with one link"));
+    }
+    let mut content = String::new();
+    file.take(CONFIG_MAX_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > CONFIG_MAX_BYTES {
+        return Err(invalid("verify config exceeds size limit"));
+    }
+    Ok(content)
 }
 
 #[cfg(test)]

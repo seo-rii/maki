@@ -1,0 +1,163 @@
+# Remote crypto buffer lifetime
+
+`SecretBuffer` erases its allocation before releasing its optional page lock.
+Remote serialization can create other representations of the same plaintext.
+The `secure-buffers` setting covers registered buffers, and does not prove that
+every transport allocation is locked or erased. Logical request budgets also
+do not measure total resident memory.
+
+## HTTP decoded payloads
+
+HTTP response payloads are decoded into an exactly sized
+`SecretBuffer`. The guard exists before the first Base64, Base64URL, or
+hex byte is written, and the fixed allocation cannot reallocate while decoding.
+A malformed symbol therefore erases partial output before returning the error;
+successful extraction moves the same guard into the provider result. Dropping a
+partly built batch also erases payloads decoded before a later item fails.
+
+Focused allocation regressions observe the selected output immediately before
+deallocation and show that malformed Base64 and hex inputs no longer release a
+partial plaintext prefix. Response growth allocates a new guarded owner, copies
+into it, wipes the replaced owner, then swaps. Request JSON trees remain under a
+drop guard until serialization; recursive cleanup drains and wipes object keys
+and values, including pointer replacement and construction errors. The complete
+HTTP package passed 46 tests with three ignored network tests, and the changed
+packages passed scoped all-targets strict Clippy on 2026-09-13.
+
+Resolved header and query values are erased when their operation specification
+is dropped. Header values are guarded while the specification is assembled, so
+a later mapping error also erases values already resolved. Credential bytes are
+validated as UTF-8 by borrowing the key-source buffer rather than copying it to
+an intermediate vector. The combined mTLS certificate/private-key PEM is
+guarded during construction and erased when its TLS specification is dropped,
+including construction and client-builder errors.
+
+Maki-owned payloads, serialized request bodies, streamed response buffers and
+decoded outputs use page-lock-capable `SecretBuffer`s. Fixed-capacity allocation
+locks the whole allocation before plaintext is appended, when locking is
+enabled and succeeds. Response growth acquires a new guarded allocation before
+copying, then erases and releases the old owner. `Bytes::from_owner` retains the
+request-body guard until the last HTTP body clone is released. Raw decryption
+responses transfer their owner directly to the caller.
+
+JSON trees, credential-value strings and combined identity PEMs still have
+zeroizing ownership without per-allocation page locks. Plain source
+configuration strings and copies made inside reqwest, hyper, rustls or the
+kernel remain outside this ownership. A malformed JSON response may make
+serde_json discard partial parser-owned allocations before it returns a Value
+that Maki can guard. Admission also does not account for simultaneous decoded,
+encoded and library copies. MAKI-015 and the total-memory work in MAKI-032
+therefore remain open.
+
+The 2026-09-20 follow-up passed the complete `maki-crypto` and
+`maki-crypto-http` suites (175 passing invocations, two ignored) and strict
+all-target Clippy. Linux page-lifetime tests verify that spare-capacity pages
+remain locked, that shared-page owners retain their locks, and that memory is
+erased before deallocation. Evidence:
+`~/logs/maki-http-memory-20260920T084013Z/` (`exit.status` 0).
+
+## WebSocket requests
+
+Request serialization borrows input units and streams base64 and JSON directly
+into fixed `SecretBuffer` storage. It does not create the former intermediate
+request JSON tree or owned base64 strings. A counting pass uses the same
+serializer to enforce the frame limit, checked arithmetic and addressable
+buffer capacity before allocating the output. A second pass cannot grow the
+buffer; partial errors erase anything already written.
+
+The encoded allocation remains owned through the WebSocket message queue and
+`Bytes`/`Message` clones. Its last owner erases the buffer before releasing its
+optional page lock. Cancellation before connecting also drops the owner. The
+existing wire order, escaping and payload encoding are preserved.
+
+This protects Maki's owned request storage. Serializer/base64 scratch and
+tungstenite's internal output/framing copies are outside this guarantee.
+Incoming response ownership is described below. The final request unit passed all
+35 WebSocket package tests and strict Clippy on 2026-09-12, including actual
+request cancellation, rejection before output allocation, partial writer
+failure, exact wire compatibility and final clone ownership.
+
+## WebSocket decoded responses
+
+Base64 output is decoded directly into an exactly sized `SecretBuffer`, with
+the guard installed before any plaintext is written. Invalid base64 erases
+partially decoded output. If a later response item has a wrong unit, missing
+data, or invalid encoding, the earlier decoded items are also erased.
+Successful decryption transfers these guards to the caller without copying;
+encryption transfers the known ciphertext into ordinary output vectors.
+
+The decoded-output guard is separate from the incoming JSON and frame owners
+described below. Library-private copies remain outside both guarantees.
+MAKI-015 and the total-memory work in MAKI-032 remain open.
+
+The `decoded_response_tests` unit suite observes initialized allocations
+immediately before deallocation, including partial decoder output and a later
+item failure. It also checks canonical padding, exact output lengths, invalid
+alphabet and trailing bits. These tests do not inspect freed memory or claim
+to observe library-private copies. The complete WebSocket package passed
+28 tests and all-targets strict Clippy on 2026-09-12; exact logs are recorded
+in the [readiness review](production-readiness-review-2026-09-08.md).
+
+## WebSocket incoming responses
+
+The reader takes ownership of the received message payload before validating
+UTF-8. When `Bytes` proves the allocation unique, it transfers that allocation
+into `SecretBuffer`; otherwise it copies into an already guarded buffer without
+modifying the shared source. Invalid UTF-8 therefore also drops the owned
+guard. Frames rejected inside tungstenite before reaching the reader remain
+outside this protection.
+
+The private response tree stores every owned JSON string and object key in
+`SecretBuffer`, including base64 data, error text and unknown nested fields.
+Borrowed strings copy directly into guarded storage; owned strings transfer
+their allocation. Dropping malformed partial trees, overwritten duplicate
+values, stale responses or responses to cancelled receivers erases these
+owners. Debug output is redacted. Ordinary object lookups still select the
+last duplicate value. Negative self-test errors retain their stricter known
+field uniqueness and type checks without a second parse or remote strings
+in type-error messages. JSON syntax, recursion and frame limits are unchanged.
+
+Allocation tests inspect initialized bytes immediately before deallocation,
+including unique sliced payloads whose original prefix and suffix become
+spare capacity. Drop erases the adopted vector's full capacity. Optional page
+locking covers the entire allocation, including pages of spare capacity.
+Shared source owners, tungstenite read/framing buffers and serde's private
+escape-decoding scratch retain library-controlled lifetimes. The response
+tree's container/number storage and many small values also remain outside any
+total resident-memory bound. These changes do not close MAKI-015 or MAKI-032.
+
+The incoming-response unit adds 14 focused regressions. The complete
+WebSocket package passed 49 tests and all-targets strict Clippy on 2026-09-12.
+
+## gRPC provider-owned messages
+
+The provider uses private protobuf items backed by `SecretBuffer` that erase
+their full data capacity on Drop, `Message::clear`, and replacement of the
+singular bytes field. The
+replacement path erases the old allocation before validating or reserving
+space for new data, and copies directly from the decoder input. Each child
+owns this protection even when decoding fails before it joins its parent.
+
+Request size rejection, response count/unit rejection, and cancellation also
+drop these owners. Successful decryption transfers the allocation into
+`SecretBuffer` without copying; successful encryption transfers ciphertext
+to the caller. Private Debug output redacts bytes. Public `CryptoItem`,
+`CryptoBatchRequest`, and `CryptoBatchResponse` retain their existing API and
+wire encoding; external callers using those public structs are responsible
+for their own allocation lifetime.
+
+The private item is page-lock-capable before its first decoded byte is written,
+and retains that owner through rejection, cancellation and successful transfer.
+Tonic's encoded/decoded buffers and HTTP/TLS buffers remain separate allocations.
+These changes do not establish complete transport zeroization, page locking, or
+a total resident-memory cap.
+
+Fourteen focused regressions cover full-capacity deallocation, duplicate and
+malformed fields, partial nested decoding, public wire compatibility, actual
+tonic encoding and cancellation before encoding or while awaiting trailers,
+and real loopback RPC rejection/success. The complete gRPC package passed
+31 tests and all-targets strict Clippy on 2026-09-12.
+
+The 2026-09-20 page-lock ownership follow-up passed all 32 gRPC package tests
+and strict all-target Clippy in isolation from the separate TLS feature.
+Evidence: `~/logs/maki-grpc-memory-20260920T085835Z/` (`exit.status` 0).

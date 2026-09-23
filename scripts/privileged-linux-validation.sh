@@ -114,12 +114,14 @@ done
 [[ "$device" =~ ^/dev/nbd([0-9]+)$ ]] ||
     die "--device must be an explicit /dev/nbdN path"
 readonly nbd_index=$((10#${BASH_REMATCH[1]}))
+nbd_target="$(basename "$device")"
+readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
 required_commands=(
-    blockdev cargo df findmnt fio lsblk lvcreate lvremove mkfs.xfs modprobe
-    nbd-client nbdinfo nbdkit nm pvcreate pvremove sqlite3 sync vgchange
-    vgcreate vgremove setpriv
+    blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
+    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs setpriv sqlite3
+    sync vgchange vgcreate vgremove vgs
 )
 
 missing_commands() {
@@ -219,6 +221,11 @@ printf 'state=running\npid=%s\n' "$$" >"$status_path"
 work_dir=""
 runtime_dir=""
 runtime_parent_created=false
+control_runtime_dir=""
+control_runtime_parent_created=false
+control_socket_path=""
+attach_config_dir=""
+attach_config_path=""
 nbdkit_pid=""
 duplicate_pid=""
 sudo_keeper_pid=""
@@ -268,7 +275,7 @@ disconnect_test_nbd() {
     if [[ "$nbd_connected" == true ]] ||
         { [[ "$nbd_connection_attempted" == true ]] && nbd_has_pid; }; then
         log "cleanup: disconnecting $device"
-        if sudo -n nbd-client -d "$device"; then
+        if sudo -n nbd-client -d "$nbd_target"; then
             nbd_connected=false
             return 0
         fi
@@ -305,7 +312,7 @@ cleanup() {
     if [[ "$vg_created" == true || "$pv_created" == true ]]; then
         if ! nbd_has_pid && [[ -n "$nbdkit_pid" ]] && kill -0 "$nbdkit_pid" 2>/dev/null; then
             log "cleanup: reconnecting $device to remove disposable LVM metadata"
-            if sudo -n nbd-client -unix "$socket_path" "$device" -b 4096; then
+            if sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096; then
                 nbd_connected=true
             else
                 log "cleanup warning: could not reconnect $device for LVM cleanup"
@@ -370,6 +377,44 @@ cleanup() {
             log "cleanup warning: could not remove test-created /run/maki"
             cleanup_rc=1
         fi
+    fi
+
+    if [[ "$cleanup_safe" == true && -n "$control_runtime_dir" && "$control_runtime_dir" == /run/maki-control/privval-* ]]; then
+        if [[ -S "$control_socket_path" && "$control_socket_path" == "$control_runtime_dir/control.sock" ]]; then
+            log "cleanup: deleting stale test control socket $control_socket_path"
+            unlink "$control_socket_path" || cleanup_rc=1
+        elif [[ -e "$control_socket_path" ]]; then
+            log "cleanup warning: refusing unexpected control runtime entry $control_socket_path"
+            cleanup_rc=1
+        fi
+        if ! sudo -n rmdir "$control_runtime_dir"; then
+            log "cleanup warning: could not remove test control runtime directory $control_runtime_dir"
+            cleanup_rc=1
+        fi
+    fi
+    if [[ "$control_runtime_parent_created" == true && ! -e "$control_runtime_dir" ]]; then
+        if ! sudo -n rmdir /run/maki-control; then
+            log "cleanup warning: could not remove test-created /run/maki-control"
+            cleanup_rc=1
+        fi
+    fi
+
+    if [[ -n "$attach_config_dir" ]]; then
+        case "$attach_config_dir" in
+            /run/maki-attach-validation-*)
+                if [[ -n "$attach_config_path" && "$attach_config_path" == "$attach_config_dir/attach.toml" ]]; then
+                    sudo -n rm -f -- "$attach_config_path" || cleanup_rc=1
+                else
+                    log "cleanup warning: refusing unexpected attach config path $attach_config_path"
+                    cleanup_rc=1
+                fi
+                sudo -n rmdir "$attach_config_dir" 2>/dev/null || cleanup_rc=1
+                ;;
+            *)
+                log "cleanup warning: refusing unexpected attach config directory $attach_config_dir"
+                cleanup_rc=1
+                ;;
+        esac
     fi
 
     if [[ -n "$work_dir" && "$cleanup_safe" == true ]]; then
@@ -469,6 +514,12 @@ mapfile -t still_missing < <(missing_commands)
 ((${#still_missing[@]} == 0)) ||
     die "missing commands: ${still_missing[*]} (rerun with --install-missing on Debian)"
 [[ "$(fio --version)" =~ ^fio-[0-9] ]] || die "fio resolves to an unexpected executable: $(fio --version)"
+nbd_client_version="$(nbd-client -h 2>&1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n 1 || true)"
+if [[ ! "$nbd_client_version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]] ||
+    ((10#${BASH_REMATCH[1]} < 3)) ||
+    ((10#${BASH_REMATCH[1]} == 3 && 10#${BASH_REMATCH[2]} < 27)); then
+    die "nbd-client 3.27.0 or later with netlink identity support is required (found ${nbd_client_version:-unknown})"
+fi
 pass "required native tools available"
 
 log "building release binaries and nbdkit plugin"
@@ -516,12 +567,30 @@ if [[ ! -d /run/maki ]]; then
     sudo -n install -d -m 0755 /run/maki
     runtime_parent_created=true
 fi
-runtime_dir="/run/maki/$volume_name"
-[[ ! -e "$runtime_dir" ]] || die "runtime collision: $runtime_dir"
-sudo -n install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" "$runtime_dir"
+runtime_dir_candidate="/run/maki/$volume_name"
+[[ ! -e "$runtime_dir_candidate" ]] || die "runtime collision: $runtime_dir_candidate"
+sudo -n install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" "$runtime_dir_candidate"
+runtime_dir="$runtime_dir_candidate"
 socket_path="$runtime_dir/nbd.sock"
 
+if [[ -L /run/maki-control ]]; then
+    die "/run/maki-control is a symlink; refusing to use it"
+fi
+if [[ ! -d /run/maki-control ]]; then
+    sudo -n install -d -m 0755 /run/maki-control
+    control_runtime_parent_created=true
+fi
+control_runtime_dir_candidate="/run/maki-control/$volume_name"
+[[ ! -e "$control_runtime_dir_candidate" ]] ||
+    die "control runtime collision: $control_runtime_dir_candidate"
+sudo -n install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" "$control_runtime_dir_candidate"
+control_runtime_dir="$control_runtime_dir_candidate"
+control_socket_path="$control_runtime_dir/control.sock"
+
 config_path="$run_dir/volume.toml"
+key_path="$work_dir/local-aes-gcm-siv.key"
+dd if=/dev/urandom of="$key_path" bs=32 count=1 status=none
+chmod 0600 "$key_path"
 cat >"$config_path" <<EOF
 config_schema_version = 1
 
@@ -533,15 +602,20 @@ crypto_unit_size = 4096
 shard_logical_size = "16MiB"
 
 [crypto]
-provider = "fake"
+provider = "local-aes-gcm-siv"
 crypto_compatibility_id = "privileged-validation-v1"
+key = { source = "file", name = "$key_path" }
 
 [crypto.capabilities]
 supported_plaintext_sizes = [4096]
-max_ciphertext_size = 4104
+max_ciphertext_size = 4124
 
 [backing]
 root = "$work_dir/backing"
+journal_segment_size = "16MiB"
+journal_max_bytes = "128MiB"
+checkpoint_reserve_bytes = "16MiB"
+journal_emergency_reserve_bytes = "8MiB"
 
 [nbd]
 socket = "$socket_path"
@@ -550,10 +624,16 @@ minimum_io = 4096
 preferred_io = 4096
 maximum_io = "1MiB"
 connections = 1
+
+[control]
+socket = "$control_socket_path"
 EOF
 
 "$maki_bin" volume create "$config_path"
 "$maki_bin" volume inspect "$config_path" | tee "$run_dir/volume-inspect.txt"
+volume_uuid="$(awk '$1 == "uuid:" { print $2 }' "$run_dir/volume-inspect.txt")"
+[[ "$volume_uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
+    die "volume inspect returned an invalid UUID"
 pass "disposable Maki volume created and inspected"
 
 log "starting nbdkit as unprivileged user $(id -un) with no-new-privileges"
@@ -631,7 +711,7 @@ pass "$device exists and is unused"
 
 log "attaching the disposable export to $device"
 nbd_connection_attempted=true
-sudo -n nbd-client -unix "$socket_path" "$device" -b 4096
+sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096
 nbd_connected=true
 for _ in $(seq 1 100); do
     attached_size="$(sudo -n blockdev --getsize64 "$device" 2>/dev/null || printf '0')"
@@ -642,7 +722,7 @@ done
     die "$device size is ${attached_size:-unknown}, expected $VIRTUAL_SIZE_BYTES"
 pass "kernel NBD attach and 512 MiB geometry"
 
-if nbd-client -d "$device" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
+if nbd-client -d "$nbd_target" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
     nbd_connected=false
     die "the unprivileged invoking user unexpectedly disconnected $device"
 fi
@@ -667,13 +747,46 @@ sudo -n lvcreate --yes -L "$LV_SIZE" -n "$lv_name" "$vg_name"
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
 sudo -n mkfs.xfs -f "/dev/$vg_name/$lv_name" >"$run_dir/mkfs-xfs.txt"
+pv_uuid="$(sudo -n pvs --readonly --noheadings -o pv_uuid "$device" | awk 'NF { print $1; exit }')"
+vg_uuid="$(sudo -n vgs --readonly --noheadings -o vg_uuid "$vg_name" | awk 'NF { print $1; exit }')"
+lv_uuid="$(sudo -n lvs --readonly --noheadings -o lv_uuid "$vg_name/$lv_name" | awk 'NF { print $1; exit }')"
+fs_uuid="$(sudo -n blkid --probe --cache-file /dev/null --match-tag UUID --output value "/dev/$vg_name/$lv_name")"
+for observed_uuid in "$pv_uuid" "$vg_uuid" "$lv_uuid"; do
+    [[ "$observed_uuid" =~ ^[[:alnum:]]{6}(-[[:alnum:]]{4}){5}-[[:alnum:]]{6}$ ]] ||
+        die "LVM inventory returned an invalid UUID"
+done
+[[ "$fs_uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
+    die "filesystem inventory returned an invalid UUID"
 sudo -n vgchange -an "$vg_name"
-sudo -n nbd-client -d "$device"
+sudo -n nbd-client -d "$nbd_target"
 nbd_connected=false
 pass "LVM physical/volume/logical volume and XFS creation"
 
-"$attach_bin" attach --volume "$volume_name" --nbd-device "$device" \
-    --vg "$vg_name" --lv "$lv_name" --mountpoint "$mountpoint" --plan \
+attach_config_dir_candidate="/run/maki-attach-validation-$volume_name"
+[[ ! -e "$attach_config_dir_candidate" ]] || die "attach config runtime collision: $attach_config_dir_candidate"
+sudo -n install -d -m 0700 -o root -g root "$attach_config_dir_candidate"
+attach_config_dir="$attach_config_dir_candidate"
+attach_config_path="$attach_config_dir/attach.toml"
+cat >"$run_dir/attach.toml" <<EOF
+volume_uuid = "$volume_uuid"
+nbd_device = "$device"
+nbd_socket = "$socket_path"
+device_block_size = 4096
+vg_name = "$vg_name"
+lv_name = "$lv_name"
+mountpoint = "$mountpoint"
+fs_uuid = "$fs_uuid"
+init_sentinel = true
+
+[lvm_identity]
+pv_uuids = ["$pv_uuid"]
+vg_uuid = "$vg_uuid"
+lv_uuid = "$lv_uuid"
+EOF
+sudo -n install -m 0600 -o root -g root "$run_dir/attach.toml" "$attach_config_path"
+
+sudo -n env PATH="$PATH" "$attach_bin" attach --volume "$volume_name" \
+    --config "$attach_config_path" --plan \
     >"$run_dir/maki-attach-plan.txt"
 
 log "running the real maki-attach helper"
@@ -681,7 +794,7 @@ nbd_connection_attempted=true
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
 sudo -n env PATH="$PATH" "$attach_bin" attach --volume "$volume_name" \
-    --nbd-device "$device" --vg "$vg_name" --lv "$lv_name" --mountpoint "$mountpoint" \
+    --config "$attach_config_path" \
     >"$run_dir/maki-attach.txt" 2>&1
 nbd_connected=true
 mount_active=true
@@ -692,6 +805,10 @@ mounted_source="$(findmnt -n -o SOURCE -M "$mountpoint")"
 [[ "$mounted_source" == "/dev/mapper/"* || "$mounted_source" == "/dev/$vg_name/$lv_name" ]] ||
     die "unexpected mount source: $mounted_source"
 pass "maki-attach activated LVM and mounted XFS"
+
+sudo -n env PATH="$PATH" "$attach_bin" verify --volume "$volume_name" \
+    --config "$attach_config_path" >"$run_dir/maki-verify-before-workload.txt" 2>&1
+pass "root-controlled workload gate verified pinned storage identity"
 
 sudo -n install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" "$mountpoint/work"
 log "running filesystem fio as the unprivileged invoking user"
@@ -721,18 +838,29 @@ grep -qx 'ok' "$run_dir/sqlite.txt" || die "SQLite integrity_check did not retur
 sync -f "$mountpoint/work"
 pass "SQLite FULL-synchronous WAL checkpoint and integrity_check"
 
-log "running the real maki-attach detach helper"
+sudo -n env PATH="$PATH" "$attach_bin" verify --volume "$volume_name" \
+    --config "$attach_config_path" >"$run_dir/maki-verify-after-workload.txt" 2>&1
+pass "workload gate still verifies the live attachment after database I/O"
+
+log "running the real idempotent maki-attach cleanup helper"
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
-sudo -n env PATH="$PATH" "$attach_bin" detach --volume "$volume_name" \
-    --nbd-device "$device" --vg "$vg_name" --lv "$lv_name" --mountpoint "$mountpoint" \
-    >"$run_dir/maki-detach.txt" 2>&1
+sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
+    --config "$attach_config_path" \
+    >"$run_dir/maki-cleanup.txt" 2>&1
 mount_active=false
 nbd_connected=false
-pass "maki-attach clean unmount, LVM deactivation, and NBD disconnect"
+pass "maki-attach cleanup unmounted XFS, deactivated LVM, and disconnected NBD"
+
+# A service stop and its recovery coordinator may both request cleanup. The
+# second call must converge as success without a trusted record or live state.
+sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
+    --config "$attach_config_path" \
+    >"$run_dir/maki-cleanup-idempotent.txt" 2>&1
+pass "repeated maki-attach cleanup is idempotent"
 
 log "removing the disposable LVM metadata"
-sudo -n nbd-client -unix "$socket_path" "$device" -b 4096
+sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096
 nbd_connected=true
 sudo -n vgchange -ay "$vg_name"
 sudo -n lvremove --yes --force "/dev/$vg_name/$lv_name"
@@ -740,7 +868,7 @@ sudo -n vgremove --yes --force "$vg_name"
 sudo -n pvremove --yes --force "$device"
 vg_created=false
 pv_created=false
-sudo -n nbd-client -d "$device"
+sudo -n nbd-client -d "$nbd_target"
 nbd_connected=false
 pass "disposable LVM state removed"
 

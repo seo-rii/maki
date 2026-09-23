@@ -46,9 +46,12 @@ impl Fixture {
                     mountpoint: mountpoint.to_str().unwrap().into(),
                     vg_name: "vg-maki".into(),
                     lv_name: "data-lv".into(),
+                    lvm_identity: None,
                 },
                 device: "/dev/nbd3".into(),
                 connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),
+                recovery: None,
+                recovery_intent: None,
             },
         }
     }
@@ -184,4 +187,42 @@ fn direct_mounts_of_the_recorded_nbd_or_its_partition_prevent_disconnect() {
             "direct mount of {device} is still using the NBD device"
         );
     }
+}
+
+#[test]
+fn initial_rollback_only_relaxes_a_missing_sentinel() {
+    let fixture = Fixture::new();
+    fixture.mapping("vg--maki-data--lv", "nbd3");
+    let mounts = fixture.mountinfo("253:0", "/", "xfs");
+    let sentinel =
+        Path::new(&fixture.record.attachment.mountpoint).join(crate::plan::SENTINEL_FILE);
+    std::fs::remove_file(&sentinel).unwrap();
+    assert!(
+        fixture.observe(&mounts).is_err(),
+        "ordinary detach remains strict"
+    );
+    assert!(
+        observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true)
+            .unwrap()
+            .mounted
+    );
+    for contents in ["wrong-uuid", "", "malformed\nvalue"] {
+        std::fs::write(&sentinel, contents).unwrap();
+        assert!(
+            observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true).is_err()
+        );
+    }
+    std::fs::remove_file(&sentinel).unwrap();
+    std::os::unix::fs::symlink("absent-target", &sentinel).unwrap();
+    assert!(observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true).is_err());
+    std::fs::remove_file(&sentinel).unwrap();
+    std::fs::create_dir(&sentinel).unwrap();
+    assert!(observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true).is_err());
+    assert!(observe_rollback(
+        &fixture.record,
+        &fixture.mountinfo("253:1", "/", "xfs"),
+        &fixture.root.join("sys"),
+        true
+    )
+    .is_err());
 }

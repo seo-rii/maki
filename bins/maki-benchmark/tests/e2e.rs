@@ -42,6 +42,7 @@ supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 "#
         ),
     )

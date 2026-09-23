@@ -442,7 +442,10 @@ fn oversized_superblock_copy_is_rejected_before_it_is_read() {
     file.sync_data().unwrap();
     let store = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
     assert!(
-        store.load::<Superblock>(backing.as_ref()).unwrap().is_none(),
+        store
+            .load::<Superblock>(backing.as_ref())
+            .unwrap()
+            .is_none(),
         "an over-long superblock copy must be treated as invalid, not decoded from its prefix"
     );
 }

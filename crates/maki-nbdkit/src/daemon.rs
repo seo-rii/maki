@@ -1,7 +1,10 @@
 //! Config-driven daemon assembly: backing + provider + engine.
 
+use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use maki_backing::RollbackBacking;
 use maki_backing::{Backing, FileBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
 use maki_core::volume::{Volume, VolumeOptions};
@@ -34,6 +37,12 @@ pub enum DaemonError {
 pub fn parse_and_validate(raw: &str) -> Result<VolumeConfig, ConfigError> {
     let config = parse_config(raw)?;
     config.validate()?;
+    #[cfg(not(target_os = "linux"))]
+    if config.backing.rollback_protection.is_some() {
+        return Err(ConfigError::Invalid(
+            "backing rollback protection is supported only on Linux".to_string(),
+        ));
+    }
     check_provider_available(&config, cfg!(feature = "fake-provider"))?;
     Ok(config)
 }
@@ -56,6 +65,33 @@ pub fn check_provider_available(
 }
 
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    if let Some(rollback) = &config.backing.rollback_protection {
+        #[cfg(target_os = "linux")]
+        {
+            return Ok(Arc::new(RollbackBacking::open(
+                Path::new(&config.backing.root),
+                Path::new(&rollback.witness_root),
+            )?));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = rollback;
+            return Err(DaemonError::Unsupported(
+                "backing rollback protection is supported only on Linux".to_string(),
+            ));
+        }
+    }
+
+    // A protected root is never silently reinterpreted as a plain directory
+    // if its configuration stanza is accidentally removed.
+    if Path::new(&config.backing.root)
+        .join("rollback.format")
+        .try_exists()?
+    {
+        return Err(DaemonError::Unsupported(
+            "protected backing requires [backing.rollback_protection]".to_string(),
+        ));
+    }
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
@@ -230,10 +266,20 @@ async fn remote_http_provider(
     dispatch_endpoint_set(config, endpoints, volume).await
 }
 
-/// `remote-websocket`: per-endpoint WS transports through the shared
-/// dispatcher. The transport build has no TLS support yet, so `wss://` or a
-/// `[crypto.websocket.tls]` section refuses attach — fail closed, never a
-/// silent downgrade.
+fn read_tls_file(
+    section: &str,
+    field: &str,
+    path: Option<&String>,
+) -> Result<Option<Vec<u8>>, DaemonError> {
+    path.map(|path| {
+        std::fs::read(path).map_err(|error| {
+            DaemonError::Unsupported(format!("[crypto.{section}.tls] {field} {path:?}: {error}"))
+        })
+    })
+    .transpose()
+}
+
+/// Per-endpoint verified WS/WSS transports through the shared dispatcher.
 async fn remote_websocket_provider(
     config: &VolumeConfig,
     volume: Option<&Volume>,
@@ -248,23 +294,30 @@ async fn remote_websocket_provider(
             "remote-websocket requires at least one [[crypto.websocket.endpoint]]".to_string(),
         ));
     }
-    if ws.tls.is_some() {
-        return Err(DaemonError::Unsupported(
-            "TLS for the websocket transport is not compiled in; \
-             remove [crypto.websocket.tls] or use remote-http"
-                .to_string(),
-        ));
-    }
+    let tls = ws
+        .tls
+        .as_ref()
+        .map(|tls| -> Result<_, DaemonError> {
+            Ok(maki_crypto_websocket::WsTlsOptions {
+                ca_pem: read_tls_file("websocket", "ca_file", tls.ca_file.as_ref())?,
+                client_cert_pem: read_tls_file(
+                    "websocket",
+                    "client_cert_file",
+                    tls.client_cert_file.as_ref(),
+                )?,
+                client_key_pem: tls
+                    .client_key
+                    .as_ref()
+                    .map(|key| RoutedKeySource::from_config(config).load(&key.name))
+                    .transpose()?
+                    .map(Arc::new),
+            })
+        })
+        .transpose()?;
     let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     for endpoint in &ws.endpoint {
-        if !endpoint.url.starts_with("ws://") {
-            return Err(DaemonError::Unsupported(format!(
-                "websocket endpoint {:?} must be ws:// (TLS/wss is not compiled in)",
-                endpoint.url
-            )));
-        }
-        let provider =
-            maki_crypto_websocket::WsCryptoProvider::new(maki_crypto_websocket::WsProviderSpec {
+        let provider = maki_crypto_websocket::WsCryptoProvider::new_checked(
+            maki_crypto_websocket::WsProviderSpec {
                 url: endpoint.url.clone(),
                 capabilities: capabilities_from_config(config, "remote-websocket"),
                 timeout: ws
@@ -275,7 +328,9 @@ async fn remote_websocket_provider(
                     .max_frame_bytes
                     .map(|b| b.0 as usize)
                     .unwrap_or(maki_format::config::DEFAULT_WS_MAX_FRAME_BYTES as usize),
-            });
+                tls: tls.clone(),
+            },
+        )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
     dispatch_endpoint_set(config, endpoints, volume).await
@@ -283,8 +338,7 @@ async fn remote_websocket_provider(
 
 /// `remote-grpc`: fixed reference contract
 /// (`packaging/examples/maki-crypto.proto`) at configurable method paths,
-/// with credential-resolved ascii metadata. Same TLS fail-closed rule as the
-/// websocket transport.
+/// with credential-resolved ASCII metadata and verified HTTPS/mTLS support.
 async fn remote_grpc_provider(
     config: &VolumeConfig,
     volume: Option<&Volume>,
@@ -299,13 +353,27 @@ async fn remote_grpc_provider(
             "remote-grpc requires at least one [[crypto.grpc.endpoint]]".to_string(),
         ));
     }
-    if grpc.tls.is_some() {
-        return Err(DaemonError::Unsupported(
-            "TLS for the grpc transport is not compiled in; \
-             remove [crypto.grpc.tls] or use remote-http"
-                .to_string(),
-        ));
-    }
+    let tls = grpc
+        .tls
+        .as_ref()
+        .map(|tls| -> Result<_, DaemonError> {
+            let client_identity = match (&tls.client_cert_file, &tls.client_key) {
+                (Some(cert), Some(key)) => Some(maki_crypto_grpc::GrpcClientIdentity {
+                    certificate_pem: read_tls_file("grpc", "client_cert_file", Some(cert))?
+                        .expect("certificate path is present"),
+                    private_key_pem: RoutedKeySource::from_config(config).load(&key.name)?,
+                }),
+                (None, None) => None,
+                _ => return Err(DaemonError::Unsupported(
+                    "[crypto.grpc.tls] client certificate and private key must be configured together".into(),
+                )),
+            };
+            Ok(maki_crypto_grpc::GrpcTlsConfig {
+                ca_certificate_pem: read_tls_file("grpc", "ca_file", tls.ca_file.as_ref())?,
+                client_identity,
+            })
+        })
+        .transpose()?;
     let mut metadata = Vec::new();
     for (name, value) in &grpc.metadata {
         metadata.push((
@@ -315,34 +383,39 @@ async fn remote_grpc_provider(
     }
     let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     for endpoint in &grpc.endpoint {
-        if !endpoint.url.starts_with("http://") {
-            return Err(DaemonError::Unsupported(format!(
-                "grpc endpoint {:?} must be http:// (TLS/https is not compiled in)",
-                endpoint.url
-            )));
-        }
-        let provider =
-            maki_crypto_grpc::GrpcCryptoProvider::new(maki_crypto_grpc::GrpcProviderSpec {
-                url: endpoint.url.clone(),
-                encrypt_path: grpc
-                    .encrypt_path
-                    .clone()
-                    .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
-                decrypt_path: grpc
-                    .decrypt_path
-                    .clone()
-                    .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
-                metadata: metadata.clone(),
-                capabilities: capabilities_from_config(config, "remote-grpc"),
-                timeout: grpc
-                    .timeout
-                    .map(|d| d.0)
-                    .unwrap_or(std::time::Duration::from_secs(10)),
-                max_message_bytes: grpc
-                    .max_message_bytes
-                    .map(|b| b.0 as usize)
-                    .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
-            })?;
+        let spec = maki_crypto_grpc::GrpcProviderSpec {
+            url: endpoint.url.clone(),
+            encrypt_path: grpc
+                .encrypt_path
+                .clone()
+                .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
+            decrypt_path: grpc
+                .decrypt_path
+                .clone()
+                .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
+            metadata: metadata.clone(),
+            capabilities: capabilities_from_config(config, "remote-grpc"),
+            timeout: grpc
+                .timeout
+                .map(|d| d.0)
+                .unwrap_or(std::time::Duration::from_secs(10)),
+            max_message_bytes: grpc
+                .max_message_bytes
+                .map(|b| b.0 as usize)
+                .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
+        };
+        let encrypted = endpoint
+            .url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+        let provider = if encrypted || tls.is_some() {
+            maki_crypto_grpc::GrpcCryptoProvider::new_with_tls(
+                spec,
+                tls.clone().unwrap_or_default(),
+            )?
+        } else {
+            maki_crypto_grpc::GrpcCryptoProvider::new(spec)?
+        };
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
     dispatch_endpoint_set(config, endpoints, volume).await
@@ -356,7 +429,7 @@ fn capabilities_from_config(
 ) -> maki_crypto::CryptoCapabilities {
     let caps_cfg = &config.crypto.capabilities;
     let capability = |s: &str| match s {
-        "verified" => maki_crypto::Capability::Verified,
+        "verified" => maki_crypto::Capability::Contractual,
         "contractual" => maki_crypto::Capability::Contractual,
         _ => maki_crypto::Capability::Absent,
     };
@@ -747,8 +820,37 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
 /// `maki volume create`: initialize the on-disk layout for a configured
 /// volume.
 pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
+    create_volume_from_config(raw, false)
+}
+
+/// Initialize a new v3 volume with discard support. Existing volumes are
+/// refused by the format initializer; this never upgrades an attached volume.
+pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
+    create_volume_from_config(raw, true)
+}
+
+fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, DaemonError> {
     let config = parse_and_validate(raw)?;
-    let backing = build_backing(&config)?;
+    let backing: Arc<dyn Backing> = match &config.backing.rollback_protection {
+        Some(rollback) => {
+            #[cfg(target_os = "linux")]
+            {
+                Arc::new(RollbackBacking::create(
+                    Path::new(&config.backing.root),
+                    Path::new(&rollback.witness_root),
+                    rollback.capacity.0,
+                )?)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = rollback;
+                return Err(DaemonError::Unsupported(
+                    "backing rollback protection is supported only on Linux".to_string(),
+                ));
+            }
+        }
+        None => build_backing(&config)?,
+    };
     let geometry = config.geometry()?;
     let superblock = Superblock {
         generation: 0,
@@ -768,7 +870,11 @@ pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonErro
             .map(|d| d.as_secs())
             .unwrap_or(0),
     };
-    Ok(init::create_volume(backing.as_ref(), superblock)?)
+    Ok(if discard {
+        init::create_volume_with_discard(backing.as_ref(), superblock)?
+    } else {
+        init::create_volume(backing.as_ref(), superblock)?
+    })
 }
 
 /// The per-volume control socket path (SPEC §7): `control.socket`, or
@@ -779,4 +885,51 @@ pub fn control_socket_path(config: &VolumeConfig) -> String {
         .socket
         .clone()
         .unwrap_or_else(|| format!("/run/maki-control/{}/control.sock", config.volume.name))
+}
+
+#[cfg(test)]
+mod capability_mode_tests {
+    use super::*;
+    use maki_crypto::Capability;
+
+    #[test]
+    fn websocket_and_grpc_security_declarations_are_at_most_contractual() {
+        let mut config = maki_format::config::parse_config(include_str!(
+            "../../maki-format/tests/data/full_config.toml"
+        ))
+        .unwrap();
+        for provider in ["remote-websocket", "remote-grpc"] {
+            for (level, expected) in [
+                ("none", Capability::Absent),
+                ("contractual", Capability::Contractual),
+                ("verified", Capability::Contractual),
+            ] {
+                config.crypto.capabilities.integrity = level.into();
+                config.crypto.capabilities.context_binding = level.into();
+                config.crypto.capabilities.replay_protection = level.into();
+                let capabilities = capabilities_from_config(&config, provider);
+                assert_eq!(capabilities.integrity, expected, "{provider}: {level}");
+                assert_eq!(
+                    capabilities.context_binding, expected,
+                    "{provider}: {level}"
+                );
+                assert_eq!(
+                    capabilities.replay_protection, expected,
+                    "{provider}: {level}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn intrinsic_local_verification_remains_verified() {
+        let mut keys = maki_crypto_local::keysource::MapKeySource::new();
+        keys.insert("test", vec![0x42; 32]);
+        let provider =
+            maki_crypto_local::AesGcmSivProvider::new(&keys, "test", 512, "test-v1").unwrap();
+        let capabilities = provider.capabilities().await.unwrap();
+        assert_eq!(capabilities.integrity, Capability::Verified);
+        assert_eq!(capabilities.context_binding, Capability::Verified);
+        assert_eq!(capabilities.replay_protection, Capability::Absent);
+    }
 }

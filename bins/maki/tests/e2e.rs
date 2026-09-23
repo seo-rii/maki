@@ -98,6 +98,14 @@ fn volume_lifecycle_create_inspect_check() {
     assert!(text.contains("e2evol"), "{text}");
     assert!(text.contains("local-aes-gcm-siv"), "{text}");
     assert!(text.contains("generation"), "{text}");
+    assert!(text.contains("maximum units:             256"), "{text}");
+    assert!(text.contains("maximum shards:            16"), "{text}");
+    assert!(
+        text.contains("full slot span bytes:      1179648"),
+        "{text}"
+    );
+    assert!(text.contains("allocation map A/B bytes: 1088"), "{text}");
+    assert!(text.contains("catalog A/B bytes:        312"), "{text}");
 
     let out = maki(&["check", &vol.config_path], Some(key));
     assert!(out.status.success(), "check failed: {}", stderr(&out));
@@ -186,4 +194,68 @@ fn control_commands_time_out_against_a_silent_daemon() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("--timeout"), "{}", stderr(&out));
     drop(listener);
+}
+
+/// R3-008: the CLI must send drain and propagate both acknowledgement and failure.
+#[cfg(unix)]
+#[test]
+fn drain_command_propagates_the_control_result() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    for success in [true, false] {
+        let vol = setup("drain-cli", "drain-cli-key");
+        let socket = vol._dir.path().join("control.sock");
+        let mut cfg = std::fs::read_to_string(&vol.config_path).unwrap();
+        cfg.push_str(&format!(
+            "\n[control]\nsocket = {:?}\n",
+            socket.to_str().unwrap()
+        ));
+        std::fs::write(&vol.config_path, cfg).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = String::new();
+                        BufReader::new(&mut stream).read_line(&mut request).unwrap();
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&request).unwrap()["command"],
+                            "drain"
+                        );
+                        let response = if success {
+                            r#"{"ok":true,"data":{"checkpoint_sequence":7}}"#
+                        } else {
+                            r#"{"ok":false,"error":"checkpoint failed"}"#
+                        };
+                        writeln!(stream, "{response}").unwrap();
+                        return true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+            false
+        });
+        let out = maki(&["drain", &vol.config_path, "--timeout", "2"], None);
+        assert!(
+            peer.join().unwrap(),
+            "CLI did not send drain: {}",
+            stderr(&out)
+        );
+        assert_eq!(out.status.success(), success, "{}", stderr(&out));
+        if success {
+            assert!(stdout(&out).contains('7'));
+        } else {
+            assert!(stdout(&out).contains("checkpoint failed"));
+        }
+    }
 }

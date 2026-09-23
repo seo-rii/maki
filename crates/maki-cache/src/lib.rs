@@ -213,4 +213,44 @@ impl VersionedLruCache {
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
+
+    /// Observe the cache without waiting for insertion, eviction or resize.
+    /// `None` means unavailable, rather than an empty cache or zero counters.
+    pub fn try_stats(&self) -> Option<CacheStats> {
+        let inner = self.inner.try_lock()?;
+        Some(CacheStats {
+            entries: inner.map.len(),
+            bytes: inner.bytes,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[test]
+    fn observation_does_not_wait_for_cache_mutation() {
+        let cache = Arc::new(VersionedLruCache::new(
+            CacheConfig {
+                max_bytes: 4096,
+                ttl: Duration::from_secs(60),
+                zeroize_on_evict: true,
+            },
+            Arc::new(maki_crypto::SystemClock::new()),
+        ));
+        let mutation = cache.inner.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = {
+            let cache = cache.clone();
+            std::thread::spawn(move || tx.send(cache.try_stats()).unwrap())
+        };
+        let during = rx.recv_timeout(Duration::from_millis(250));
+        drop(mutation);
+        observer.join().unwrap();
+        assert_eq!(during.expect("monitoring waited for cache mutation"), None);
+        assert_eq!(cache.try_stats(), Some(cache.stats()));
+    }
 }

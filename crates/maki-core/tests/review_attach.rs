@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{AttachError, AttachIdentity, Engine, EngineOptions};
+use maki_core::engine::{AttachError, AttachIdentity, CheckpointPolicy, Engine, EngineOptions};
 use maki_core::volume::{Volume, VolumeOptions};
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
@@ -77,6 +77,10 @@ fn options(identity: Option<AttachIdentity>) -> EngineOptions {
             journal_segment_size: 1 << 20,
         },
         identity,
+        checkpoint: CheckpointPolicy {
+            emergency_reserve_bytes: 0,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

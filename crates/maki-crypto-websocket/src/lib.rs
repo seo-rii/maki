@@ -26,16 +26,60 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use response::Value;
+use rustls::pki_types::pem::PemObject as _;
+#[cfg(test)]
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
     SecretBuffer,
 };
+
+mod request;
+mod response;
+
+/// TLS trust and optional mutual-TLS identity for a `wss://` endpoint.
+///
+/// The configured CA augments the platform and public roots. Client
+/// certificate and key must be provided together. The key uses the protected
+/// secret owner and is never included in debug output.
+#[derive(Clone, Default)]
+pub struct WsTlsOptions {
+    pub ca_pem: Option<Vec<u8>>,
+    pub client_cert_pem: Option<Vec<u8>>,
+    pub client_key_pem: Option<Arc<SecretBuffer>>,
+}
+
+impl std::fmt::Debug for WsTlsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsTlsOptions")
+            .field(
+                "ca_pem",
+                &self
+                    .ca_pem
+                    .as_ref()
+                    .map(|value| format!("{} bytes", value.len())),
+            )
+            .field(
+                "client_cert_pem",
+                &self
+                    .client_cert_pem
+                    .as_ref()
+                    .map(|value| format!("{} bytes", value.len())),
+            )
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
 
 #[derive(Clone)]
 pub struct WsProviderSpec {
@@ -43,6 +87,7 @@ pub struct WsProviderSpec {
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_frame_bytes: usize,
+    pub tls: Option<WsTlsOptions>,
 }
 
 /// A URL may carry userinfo or a token query: print scheme and host only
@@ -66,6 +111,7 @@ impl std::fmt::Debug for WsProviderSpec {
             .field("capabilities", &self.capabilities)
             .field("timeout", &self.timeout)
             .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -138,6 +184,7 @@ impl Drop for MarkDeadOnDrop {
 
 pub struct WsCryptoProvider {
     spec: WsProviderSpec,
+    tls_connector: Result<Option<Connector>, String>,
     connection: AsyncMutex<Option<Connection>>,
     pending: Pending,
     next_id: AtomicU64,
@@ -148,6 +195,7 @@ pub struct WsCryptoProvider {
     dead_generation: Arc<AtomicU64>,
 }
 
+#[cfg(test)]
 fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
@@ -156,36 +204,90 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
     CryptoError::Retryable(msg.to_string())
 }
 
-// Value silently overwrites duplicate object keys. Before an integrity
-// frame can prove a negative self-test, deserialize its security-relevant
-// fields as structs, whose derived visitors reject duplicate fields. The
-// success path keeps its existing configurable payload parsing.
-#[derive(serde::Deserialize)]
-struct IntegrityEnvelope {
-    #[serde(rename = "id")]
-    _id: u64,
-    #[serde(rename = "error")]
-    _error: IntegrityFields,
-}
-
-#[derive(serde::Deserialize)]
-struct IntegrityFields {
-    #[serde(rename = "class")]
-    _class: String,
-    #[serde(rename = "reason")]
-    _reason: String,
-}
-
 impl WsCryptoProvider {
     pub fn new(spec: WsProviderSpec) -> Self {
+        let tls_connector = Self::build_tls_connector(&spec);
         Self {
             spec,
+            tls_connector,
             connection: AsyncMutex::new(None),
             pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             generation: AtomicU64::new(0),
             dead_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Construct a provider after validating its TLS configuration.
+    pub fn new_checked(spec: WsProviderSpec) -> Result<Self, CryptoError> {
+        let tls_connector = Self::build_tls_connector(&spec).map_err(CryptoError::ProviderFatal)?;
+        Ok(Self {
+            spec,
+            tls_connector: Ok(tls_connector),
+            connection: AsyncMutex::new(None),
+            pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            generation: AtomicU64::new(0),
+            dead_generation: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    fn build_tls_connector(spec: &WsProviderSpec) -> Result<Option<Connector>, String> {
+        let is_wss = spec
+            .url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("wss"));
+        if spec.tls.is_some() && !is_wss {
+            return Err("websocket TLS options require a wss:// URL".into());
+        }
+        if !is_wss {
+            return Ok(None);
+        }
+        let Some(tls) = &spec.tls else {
+            // tokio-tungstenite builds its verified rustls connector from the
+            // enabled system and public root sets.
+            return Ok(None);
+        };
+        if tls.client_cert_pem.is_some() != tls.client_key_pem.is_some() {
+            return Err("client certificate and private key must be configured together".into());
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        roots.add_parsable_certificates(native.certs);
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(ca_pem) = &tls.ca_pem {
+            let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("bad CA certificate: {error}"))?;
+            if certificates.is_empty() {
+                return Err("bad CA certificate: PEM contains no certificates".into());
+            }
+            let (added, _) = roots.add_parsable_certificates(certificates);
+            if added == 0 {
+                return Err("bad CA certificate: no valid certificates found".into());
+            }
+        }
+
+        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        let config = match (&tls.client_cert_pem, &tls.client_key_pem) {
+            (Some(cert_pem), Some(key_pem)) => {
+                let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("bad client certificate: {error}"))?;
+                if certificates.is_empty() {
+                    return Err("bad client certificate: PEM contains no certificates".into());
+                }
+                let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.expose())
+                    .map_err(|error| format!("bad client private key: {error}"))?;
+                builder
+                    .with_client_auth_cert(certificates, key)
+                    .map_err(|error| format!("bad client identity: {error}"))?
+            }
+            (None, None) => builder.with_no_client_auth(),
+            _ => unreachable!("certificate/key pairing checked above"),
+        };
+        Ok(Some(Connector::Rustls(Arc::new(config))))
     }
 
     /// Fail only the requests owned by the retiring connection generation.
@@ -204,6 +306,11 @@ impl WsCryptoProvider {
     }
 
     async fn connect(&self) -> Result<Connection, CryptoError> {
+        let connector = self
+            .tls_connector
+            .as_ref()
+            .map_err(|message| CryptoError::ProviderFatal(message.clone()))?
+            .clone();
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
@@ -212,7 +319,12 @@ impl WsCryptoProvider {
         // mutex forever, and with it every request on this provider (C-05).
         let (ws, _response) = tokio::time::timeout(
             self.spec.timeout,
-            tokio_tungstenite::connect_async_with_config(&self.spec.url, Some(config), false),
+            tokio_tungstenite::connect_async_tls_with_config(
+                &self.spec.url,
+                Some(config),
+                false,
+                connector,
+            ),
         )
         .await
         .map_err(|_| retryable("websocket connect timeout"))?
@@ -240,20 +352,28 @@ impl WsCryptoProvider {
             loop {
                 match source.next().await {
                     Some(Ok(msg)) => {
-                        let Ok(text) = msg.into_text() else { continue };
-                        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        let Some(frame) = response::own_message(msg) else {
+                            continue;
+                        };
+                        let text =
+                            std::str::from_utf8(frame.expose()).expect("WebSocket text is UTF-8");
+                        let Ok(value) = response::parse(text) else {
                             tracing::warn!("websocket: unparseable frame dropped");
                             continue;
                         };
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
                             continue;
                         };
-                        let frame = if value.pointer("/error/class").and_then(Value::as_str)
-                            == Some("integrity")
-                            && serde_json::from_str::<IntegrityEnvelope>(&text).is_err()
+                        let frame = if matches!(
+                            value
+                                .get("error")
+                                .and_then(|error| error.get("class"))
+                                .and_then(Value::as_str),
+                            Some("integrity" | "unsupported-context")
+                        ) && !value.valid_probe_envelope()
                         {
                             Err(CryptoError::Contract(
-                                "remote crypto provider returned an invalid integrity envelope"
+                                "remote crypto provider returned an invalid probe error envelope"
                                     .into(),
                             ))
                         } else {
@@ -314,16 +434,8 @@ impl WsCryptoProvider {
         })
     }
 
-    async fn request_once(&self, body: &Value) -> Result<Value, CryptoError> {
-        let id = body["id"].as_u64().expect("id set");
-        let encoded = body.to_string();
-        if encoded.len() > self.spec.max_frame_bytes {
-            return Err(CryptoError::NonRetryableRequest(format!(
-                "request of {} bytes exceeds frame limit {}",
-                encoded.len(),
-                self.spec.max_frame_bytes
-            )));
-        }
+    async fn request_once(&self, id: u64, encoded: SecretBuffer) -> Result<Value, CryptoError> {
+        let message = request::into_message(encoded)?;
 
         let (tx, rx) = oneshot::channel();
         let mut pending_request = {
@@ -348,9 +460,7 @@ impl WsCryptoProvider {
                 pending: self.pending.clone(),
                 cancellation: Some(conn.cancellation.clone()),
             };
-            let sent =
-                tokio::time::timeout(self.spec.timeout, conn.sender.send(Message::text(encoded)))
-                    .await;
+            let sent = tokio::time::timeout(self.spec.timeout, conn.sender.send(message)).await;
             if !matches!(sent, Ok(Ok(()))) {
                 // Writer gone or wedged: drop this connection if it's still
                 // the registered one.
@@ -391,7 +501,7 @@ impl WsCryptoProvider {
         op: &str,
         context: &CryptoContext,
         items: &[(u64, &[u8])],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let mut last_err = None;
         let attempts = if self.spec.capabilities.retry_safe {
             2
@@ -400,18 +510,9 @@ impl WsCryptoProvider {
         };
         for _attempt in 0..attempts {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-            let body = json!({
-                "id": id,
-                "op": op,
-                "profile": context.crypto_compatibility_id,
-                "volume": context.volume_uuid.to_string(),
-                "format": context.format_version,
-                "items": items
-                    .iter()
-                    .map(|(unit, data)| json!({"unit": unit, "data": b64(data)}))
-                    .collect::<Vec<_>>(),
-            });
-            match self.request_once(&body).await {
+            let encoded =
+                request::encode_request(id, op, context, items, self.spec.max_frame_bytes)?;
+            match self.request_once(id, encoded).await {
                 Ok(response) => return self.parse_response(&response, items),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),
@@ -427,7 +528,7 @@ impl WsCryptoProvider {
         &self,
         response: &Value,
         requested: &[(u64, &[u8])],
-    ) -> Result<Vec<Vec<u8>>, CryptoError> {
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let expected = requested.len();
         if let Some(error) = response.get("error") {
             // The remote error *message* is untrusted and may reflect secrets
@@ -454,6 +555,17 @@ impl WsCryptoProvider {
                     ),
                     _ => CryptoError::Contract(
                         "remote crypto provider returned an unrecognized integrity reason".into(),
+                    ),
+                },
+                "unsupported-context" => match error.get("reason").and_then(Value::as_str) {
+                    Some("unsupported-format-version") => {
+                        CryptoError::UnsupportedContext(maki_crypto::ContextField::FormatVersion)
+                    }
+                    Some("unsupported-compatibility-id") => {
+                        CryptoError::UnsupportedContext(maki_crypto::ContextField::CompatibilityId)
+                    }
+                    _ => CryptoError::Contract(
+                        "remote crypto provider returned an unrecognized context refusal".into(),
                     ),
                 },
                 _ => CryptoError::ProviderFatal(
@@ -486,9 +598,32 @@ impl WsCryptoProvider {
                     .get("data")
                     .and_then(|d| d.as_str())
                     .ok_or_else(|| CryptoError::Contract("item missing data".to_string()))?;
-                base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|e| CryptoError::Contract(format!("bad base64: {e}")))
+                // STANDARD requires complete four-byte groups, including
+                // canonical padding. Divide before multiplying so the exact
+                // output length cannot overflow. A nonempty group yields
+                // three bytes before subtracting at most two padding bytes.
+                let bytes = data.as_bytes();
+                if !bytes.len().is_multiple_of(4) {
+                    return Err(CryptoError::Contract(
+                        "bad base64: invalid encoded length".into(),
+                    ));
+                }
+                let padding =
+                    usize::from(bytes.ends_with(b"=")) + usize::from(bytes.ends_with(b"=="));
+                let decoded_len = bytes.len() / 4 * 3 - padding;
+                // Own the zeroization/page-lock guard before the first
+                // decoded byte. A late decoder failure wipes partial output;
+                // a later item failure also wipes all earlier decoded items.
+                let mut decoded = SecretBuffer::zeroed(decoded_len);
+                let written = base64::engine::general_purpose::STANDARD
+                    .decode_slice(data, decoded.expose_mut())
+                    .map_err(|e| CryptoError::Contract(format!("bad base64: {e}")))?;
+                if written != decoded_len {
+                    return Err(CryptoError::Contract(
+                        "bad base64: decoded length mismatch".into(),
+                    ));
+                }
+                Ok(decoded)
             })
             .collect()
     }
@@ -515,7 +650,7 @@ impl CryptoProvider for WsCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| CiphertextUnit {
                 unit_index: item.unit_index,
-                data,
+                data: data.into_vec(),
             })
             .collect())
     }
@@ -535,8 +670,20 @@ impl CryptoProvider for WsCryptoProvider {
             .zip(items.iter())
             .map(|(data, item)| PlaintextUnit {
                 unit_index: item.unit_index,
-                data: SecretBuffer::from_vec(data),
+                data,
             })
             .collect())
     }
 }
+
+#[cfg(test)]
+#[path = "decoded_response_tests.rs"]
+mod decoded_response_tests;
+
+#[cfg(test)]
+#[path = "request_secret_tests.rs"]
+mod request_secret_tests;
+
+#[cfg(test)]
+#[path = "response_secret_tests.rs"]
+mod response_secret_tests;

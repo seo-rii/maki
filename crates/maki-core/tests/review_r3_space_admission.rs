@@ -1,0 +1,436 @@
+//! MAKI-021: a prior free-space sample cannot authorize a later write, and an
+//! admitted append preserves configured emergency and checkpoint headroom.
+//! This is threshold enforcement, not physical allocation reservation.
+
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use maki_backing::FileBacking;
+use maki_backing::{Backing, BackingFile, VolumeLock};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
+#[cfg(target_os = "linux")]
+use maki_core::volume::Volume;
+use maki_core::volume::VolumeOptions;
+use maki_core::CoreError;
+use maki_crypto::Clock;
+use maki_format::{
+    geometry::Geometry,
+    init,
+    journal::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE},
+    superblock::Superblock,
+};
+use maki_test_support::crash_backing::FaultOp;
+use maki_test_support::fake_provider::FakeCryptoProvider;
+use maki_test_support::{CrashableBacking, ManualClock};
+
+const UNIT: u32 = 1024;
+const RESERVE: u64 = 1 << 20;
+const CHECKPOINT_HEADROOM: u64 = 2 << 20;
+const FIRST_APPEND_FOOTPRINT: u64 =
+    SEGMENT_HEADER_SIZE as u64 + RECORD_HEADER_SIZE as u64 + UNIT as u64 + 8;
+
+#[derive(Default)]
+struct SpaceBacking {
+    storage: CrashableBacking,
+    fail_query: AtomicBool,
+    queries: AtomicUsize,
+}
+
+impl Backing for SpaceBacking {
+    fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
+        self.storage.open(path, create)
+    }
+    fn exists(&self, path: &str) -> io::Result<bool> {
+        self.storage.exists(path)
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.storage.remove(path)
+    }
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.storage.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &str) -> io::Result<()> {
+        self.storage.create_dir_all(path)
+    }
+    fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.storage.list(dir)
+    }
+    fn sync_dir(&self, dir: &str) -> io::Result<()> {
+        self.storage.sync_dir(dir)
+    }
+    fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+        self.storage.try_lock(path)
+    }
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        if self.fail_query.load(Ordering::SeqCst) {
+            Err(io::Error::other("space query unavailable"))
+        } else {
+            self.storage.free_bytes()
+        }
+    }
+}
+
+async fn fixture(reserve: u64) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) {
+    fixture_with_checkpoint_headroom(reserve, 0).await
+}
+
+async fn fixture_with_checkpoint_headroom(
+    reserve: u64,
+    checkpoint_headroom: u64,
+) -> (Arc<SpaceBacking>, Arc<ManualClock>, Engine) {
+    let backing = Arc::new(SpaceBacking::default());
+    let clock = Arc::new(ManualClock::new());
+    init::create_volume(
+        backing.as_ref(),
+        Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::from_u128(0x215041),
+            provider_type: "fake".into(),
+            crypto_compatibility_id: "test-profile-v1".into(),
+            key_identity: "k".into(),
+            geometry: Geometry::compute(
+                512,
+                UNIT,
+                512,
+                UNIT + 8,
+                16 * UNIT as u64,
+                8 * UNIT as u64,
+            )
+            .unwrap(),
+            format_version: 1,
+            created_unix: 0,
+        },
+    )
+    .unwrap();
+    let engine = Engine::attach(
+        backing.clone() as Arc<dyn Backing>,
+        Arc::new(FakeCryptoProvider::new(UNIT)),
+        EngineOptions {
+            volume: VolumeOptions {
+                journal_segment_size: 8192,
+            },
+            checkpoint: CheckpointPolicy {
+                journal_high_watermark_bytes: u64::MAX,
+                journal_max_bytes: u64::MAX,
+                max_pending_bytes: u64::MAX,
+                emergency_reserve_bytes: reserve,
+                low_space_checkpoint_bytes: checkpoint_headroom,
+                interval: Duration::from_secs(3600),
+            },
+            clock: Some(clock.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    (backing, clock, engine)
+}
+
+#[tokio::test]
+async fn admission_preserves_configured_checkpoint_headroom() {
+    let (backing, _, engine) = fixture_with_checkpoint_headroom(RESERVE, CHECKPOINT_HEADROOM).await;
+    let required = RESERVE + CHECKPOINT_HEADROOM + FIRST_APPEND_FOOTPRINT;
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    backing.storage.set_free_bytes(Some(required - 1));
+    assert_storage_full(engine.write(0, &[0x31; UNIT as usize], false).await);
+    let rejected = engine.monitoring_snapshot().stats;
+    assert_eq!(rejected.appended_sequence, before.appended_sequence);
+    assert_eq!(rejected.durable_sequence, before.durable_sequence);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+
+    backing.storage.set_free_bytes(Some(required));
+    engine
+        .write(0, &[0x32; UNIT as usize], false)
+        .await
+        .expect("the exact emergency, checkpoint, and append boundary must pass");
+}
+
+#[tokio::test]
+async fn zero_emergency_reserve_disables_headroom_admission() {
+    let (backing, _, engine) = fixture_with_checkpoint_headroom(0, CHECKPOINT_HEADROOM).await;
+    backing.storage.set_free_bytes(Some(0));
+
+    engine
+        .write(0, &[0x41; UNIT as usize], false)
+        .await
+        .expect("zero emergency reserve must retain the admission opt-out");
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+}
+
+#[tokio::test]
+async fn overflowing_checkpoint_headroom_requirement_fails_closed() {
+    let (backing, _, engine) = fixture_with_checkpoint_headroom(1, u64::MAX).await;
+    backing.storage.set_free_bytes(Some(u64::MAX));
+    let writes = backing.storage.pending_write_count();
+
+    assert_storage_full(engine.write(0, &[0x51; UNIT as usize], false).await);
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 0);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+}
+
+fn assert_storage_full(result: Result<(), CoreError>) {
+    assert!(
+        matches!(result, Err(CoreError::Io(ref error)) if error.kind() == io::ErrorKind::StorageFull),
+        "space admission must refuse this write with ENOSPC"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_write_observes_external_space_drop_without_clock_advance() {
+    let (backing, clock, engine) = fixture(RESERVE).await;
+    backing.storage.set_free_bytes(Some(2 * RESERVE));
+    engine.write(0, &[0xA5; UNIT as usize], true).await.unwrap();
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    // Another user of the same filesystem consumes space before the next call.
+    backing.storage.set_free_bytes(Some(RESERVE - 1));
+    assert_storage_full(
+        engine
+            .write(UNIT as u64, &[0xB6; UNIT as usize], true)
+            .await,
+    );
+    let after = engine.monitoring_snapshot().stats;
+    assert_eq!(after.appended_sequence, before.appended_sequence);
+    assert_eq!(after.durable_sequence, before.durable_sequence);
+    assert_eq!(
+        backing.storage.pending_write_count(),
+        writes,
+        "refused admission changed storage"
+    );
+    assert_eq!(after.backing_free_bytes, Some(RESERVE - 1));
+    assert_eq!(
+        engine.read(0, UNIT as usize).await.unwrap(),
+        [0xA5; UNIT as usize]
+    );
+    assert_eq!(clock.now(), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn recovered_space_allows_retry_without_clock_advance() {
+    let (backing, clock, engine) = fixture(RESERVE).await;
+    backing.storage.set_free_bytes(Some(RESERVE - 1));
+    assert_storage_full(engine.write(0, &[1; UNIT as usize], false).await);
+    backing.storage.set_free_bytes(Some(2 * RESERVE));
+    engine
+        .write(0, &[2; UNIT as usize], true)
+        .await
+        .expect("a stale shortage must not keep refusing after space returns");
+    assert_eq!(
+        engine.read(0, UNIT as usize).await.unwrap(),
+        [2; UNIT as usize]
+    );
+    assert_eq!(clock.now(), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn admission_reserves_the_exact_next_journal_append_footprint() {
+    let (backing, _, engine) = fixture(RESERVE).await;
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    backing
+        .storage
+        .set_free_bytes(Some(RESERVE + FIRST_APPEND_FOOTPRINT - 1));
+    assert_storage_full(engine.write(0, &[5; UNIT as usize], false).await);
+    let rejected = engine.monitoring_snapshot().stats;
+    assert_eq!(rejected.appended_sequence, before.appended_sequence);
+    assert_eq!(rejected.durable_sequence, before.durable_sequence);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+
+    backing
+        .storage
+        .set_free_bytes(Some(RESERVE + FIRST_APPEND_FOOTPRINT));
+    engine
+        .write(0, &[6; UNIT as usize], false)
+        .await
+        .expect("exact reserve plus append footprint must be admitted");
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+}
+
+#[tokio::test]
+async fn overflowing_reserve_plus_append_footprint_fails_closed() {
+    let (backing, _, engine) = fixture(u64::MAX).await;
+    backing.storage.set_free_bytes(Some(u64::MAX));
+    let before = engine.monitoring_snapshot().stats;
+    let writes = backing.storage.pending_write_count();
+
+    assert_storage_full(engine.write(0, &[7; UNIT as usize], false).await);
+    let after = engine.monitoring_snapshot().stats;
+    assert_eq!(after.appended_sequence, before.appended_sequence);
+    assert_eq!(after.durable_sequence, before.durable_sequence);
+    assert_eq!(backing.storage.pending_write_count(), writes);
+}
+
+#[tokio::test]
+async fn newly_known_shortage_replaces_a_sufficient_cached_sample() {
+    let (backing, clock, engine) = fixture(RESERVE).await;
+    backing.storage.set_free_bytes(Some(2 * RESERVE));
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(2 * RESERVE));
+    backing.storage.set_free_bytes(Some(0));
+    assert_storage_full(engine.write(0, &[2; UNIT as usize], false).await);
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 0);
+    assert_eq!(clock.now(), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn statistics_keep_their_cache_and_monitoring_never_refreshes_space() {
+    let (backing, clock, engine) = fixture(RESERVE).await;
+    backing.storage.set_free_bytes(Some(2 * RESERVE));
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(2 * RESERVE));
+    let queries = backing.queries.load(Ordering::SeqCst);
+    backing.storage.set_free_bytes(Some(0));
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(2 * RESERVE));
+    assert_eq!(
+        engine.monitoring_snapshot().stats.backing_free_bytes,
+        Some(2 * RESERVE)
+    );
+    assert_eq!(backing.queries.load(Ordering::SeqCst), queries);
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(0));
+    assert!(backing.queries.load(Ordering::SeqCst) > queries);
+}
+
+#[tokio::test]
+async fn enabled_reserve_fails_closed_when_space_is_unknown_or_query_fails() {
+    for fail_query in [false, true] {
+        let (backing, _, engine) = fixture(RESERVE).await;
+        backing.fail_query.store(fail_query, Ordering::SeqCst);
+        let before = engine.monitoring_snapshot().stats;
+        let writes = backing.storage.pending_write_count();
+
+        assert_storage_full(engine.write(0, &[3; UNIT as usize], true).await);
+        let snapshot = engine.monitoring_snapshot();
+        assert_eq!(snapshot.stats.backing_free_bytes, None);
+        assert_eq!(snapshot.stats.appended_sequence, before.appended_sequence);
+        assert_eq!(snapshot.stats.durable_sequence, before.durable_sequence);
+        assert_eq!(backing.storage.pending_write_count(), writes);
+    }
+}
+
+#[tokio::test]
+async fn disabled_reserve_skips_the_admission_space_query() {
+    let (backing, _, engine) = fixture(0).await;
+    backing.storage.set_free_bytes(Some(0));
+    engine.write(0, &[4; UNIT as usize], true).await.unwrap();
+    assert_eq!(backing.queries.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 1);
+}
+
+#[tokio::test]
+async fn checkpoint_slot_reservation_failure_precedes_journal_append() {
+    let (backing, _, engine) = fixture(0).await;
+    backing
+        .storage
+        .set_fault_hook(Some(Arc::new(|operation| match operation {
+            FaultOp::SetLen { path, .. } if path.starts_with("data/shard-") => {
+                Some(io::Error::from(io::ErrorKind::StorageFull))
+            }
+            _ => None,
+        })));
+
+    assert_storage_full(engine.write(0, &[0x91; UNIT as usize], false).await);
+    let stats = engine.monitoring_snapshot().stats;
+    assert_eq!(stats.appended_sequence, 0);
+    assert_eq!(stats.durable_sequence, 0);
+    assert!(backing
+        .storage
+        .list("journal")
+        .unwrap()
+        .iter()
+        .all(|name| !name.starts_with("seg-")));
+
+    backing.storage.set_fault_hook(None);
+    engine
+        .write(0, &[0x92; UNIT as usize], true)
+        .await
+        .expect("a released reservation failure must be retryable");
+    assert_eq!(engine.monitoring_snapshot().stats.durable_sequence, 1);
+}
+
+#[tokio::test]
+async fn journal_range_reservation_failure_does_not_consume_a_sequence() {
+    let (backing, _, engine) = fixture(0).await;
+    engine.write(0, &[0x81; UNIT as usize], true).await.unwrap();
+    let before = engine.monitoring_snapshot().stats;
+    backing
+        .storage
+        .set_fault_hook(Some(Arc::new(|operation| match operation {
+            FaultOp::SetLen { path, len }
+                if path.starts_with("journal/seg-")
+                    && *len
+                        > (SEGMENT_HEADER_SIZE + RECORD_HEADER_SIZE + UNIT as usize + 8) as u64 =>
+            {
+                Some(io::Error::from(io::ErrorKind::StorageFull))
+            }
+            _ => None,
+        })));
+
+    assert_storage_full(
+        engine
+            .write(UNIT as u64, &[0x82; UNIT as usize], false)
+            .await,
+    );
+    let failed = engine.monitoring_snapshot().stats;
+    assert_eq!(failed.appended_sequence, before.appended_sequence);
+    assert_eq!(failed.durable_sequence, before.durable_sequence);
+
+    backing.storage.set_fault_hook(None);
+    engine
+        .write(UNIT as u64, &[0x83; UNIT as usize], true)
+        .await
+        .expect("journal allocation failure must leave the same sequence retryable");
+    assert_eq!(engine.monitoring_snapshot().stats.durable_sequence, 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_file_checkpoint_slot_has_physical_blocks_before_journal_ack() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn Backing> = Arc::new(FileBacking::new(directory.path()).unwrap());
+    let geometry =
+        Geometry::compute(512, UNIT, 512, UNIT, 16 * UNIT as u64, 8 * UNIT as u64).unwrap();
+    init::create_volume(
+        backing.as_ref(),
+        Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::from_u128(0x215042),
+            provider_type: "fake".into(),
+            crypto_compatibility_id: "physical-reservation".into(),
+            key_identity: "k".into(),
+            geometry: geometry.clone(),
+            format_version: 1,
+            created_unix: 0,
+        },
+    )
+    .unwrap();
+    let mut volume = Volume::recover(backing, VolumeOptions::default()).unwrap();
+
+    volume.write_ct(0, &[0xa7; UNIT as usize], false).unwrap();
+
+    let shard = std::fs::metadata(directory.path().join(maki_format::layout::shard_data(0)))
+        .expect("the future checkpoint slot must exist before the journal write is accepted");
+    assert_eq!(shard.len(), geometry.units_per_shard() * geometry.slot_size);
+    assert!(
+        shard.blocks() * 512 >= geometry.slot_size,
+        "the first slot range must own physical filesystem blocks before ACK"
+    );
+    for allocation in [
+        maki_format::layout::shard_alloc_a(0),
+        maki_format::layout::shard_alloc_b(0),
+    ] {
+        let metadata = std::fs::metadata(directory.path().join(&allocation)).unwrap_or_else(|_| {
+            panic!("both allocation-map copies must exist before ACK: {allocation}")
+        });
+        assert!(metadata.len() > 0 && metadata.blocks() > 0, "{allocation}");
+    }
+    assert_eq!(volume.journal_appended_sequence(), 1);
+}

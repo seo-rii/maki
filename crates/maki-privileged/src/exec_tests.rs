@@ -55,6 +55,27 @@ fn request() -> AttachRequest {
         .unwrap()
 }
 
+fn pinned_request() -> AttachRequest {
+    parse(
+        r#"volume_uuid = '0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c'
+[lvm_identity]
+pv_uuids = ['111111-2222-3333-4444-5555-6666-777777']
+vg_uuid = 'aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg'
+lv_uuid = 'hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn'
+"#,
+    )
+    .unwrap()
+    .into_request("pg", AttachOverrides::default(), true)
+    .unwrap()
+}
+
+#[test]
+fn nbd_client_netlink_target_is_the_validated_kernel_name() {
+    assert_eq!(nbd_client_target("/dev/nbd15").unwrap(), "nbd15");
+    assert!(nbd_client_target("nbd15").is_err());
+    assert!(nbd_client_target("/dev/sda").is_err());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BackendFault {
     Foreign,
@@ -64,26 +85,209 @@ enum BackendFault {
 
 #[derive(Default)]
 struct FakeSystem {
+    lvm_report: Option<serde_json::Value>,
+    wrong_activation_uuid: bool,
+    mapping_during_preflight: bool,
     backends: HashMap<String, String>,
     steps: Vec<&'static str>,
     fail_at: Option<&'static str>,
+    nonzero_at: Option<&'static str>,
     readiness_failure: bool,
     replace_on_failure: bool,
     replace_after_deactivate: bool,
     obstruct_record_cleanup: Option<PathBuf>,
     mounted: bool,
+    lv_size: u64,
     vg_active: bool,
     fail_after_at: Option<&'static str>,
     foreign_mount: bool,
     foreign_vg: bool,
     extra_holders: bool,
     observation_error: bool,
+    observation_error_after: Option<&'static str>,
+    process_death_after_activation: bool,
+    scoped_lvm_deactivations: usize,
     backend_fault_after: Option<(&'static str, BackendFault)>,
+    backend_fault_on_probe: Option<(usize, BackendFault)>,
+    backend_probes: std::cell::Cell<usize>,
+}
+
+fn lvm_report_fixture() -> serde_json::Value {
+    serde_json::json!({"report": [{
+        "vg": [{"vg_name": "vg_maki_pg", "vg_uuid": "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg",
+            "vg_seqno": "1", "pv_count": "1", "vg_missing_pv_count": "0", "vg_partial": "0",
+            "vg_exported": "0", "vg_systemid": "", "vg_lock_type": ""}],
+        "pv": [{"pv_name": "/dev/nbd3", "pv_uuid": "111111-2222-3333-4444-5555-6666-777777",
+            "vg_uuid": "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg", "pv_missing": "0", "pv_duplicate": "0"}],
+        "lv": [{"lv_name": "data", "lv_uuid": "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn",
+            "vg_uuid": "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg", "lv_layout": "linear"}]
+    }]})
+}
+
+#[test]
+fn lvm_preflight_rejects_foreign_pv_before_activation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut report = lvm_report_fixture();
+    report["report"][0]["pv"][0]["pv_name"] = "/dev/sda".into();
+    let mut system = FakeSystem {
+        lvm_report: Some(report),
+        ..Default::default()
+    };
+    let result = execute_with(&plan_attach(&request()), Some(&state), &mut system);
+    assert!(result.is_err(), "foreign PV metadata was accepted");
+    assert!(
+        !system.steps.contains(&"lvm-activate"),
+        "foreign PV reached vgchange"
+    );
+    assert!(!system.steps.contains(&"mount-xfs"));
+}
+
+#[test]
+fn lvm_preflight_rejects_a_forged_unbound_activation_plan() {
+    let mut plan = plan_attach(&request());
+    plan.steps
+        .retain(|s| matches!(s, PlannedStep::LvmActivate { .. }));
+    let mut system = FakeSystem::default();
+    assert!(execute_with(&plan, None, &mut system).is_err());
+    assert!(
+        system.steps.is_empty(),
+        "unbound vgchange must have no execution path"
+    );
+}
+
+#[test]
+fn lvm_preflight_failure_does_not_adopt_a_new_external_mapping_for_rollback() {
+    for appeared in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let mut report = lvm_report_fixture();
+        report["report"][0]["pv"][0]["pv_name"] = "/dev/sda".into();
+        let mut system = FakeSystem {
+            lvm_report: Some(report),
+            mapping_during_preflight: appeared,
+            ..Default::default()
+        };
+        assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+        assert!(!system.steps.contains(&"lvm-activate"));
+        assert!(
+            !system.steps.contains(&"lvm-deactivate"),
+            "preflight never owned the mapping"
+        );
+        assert_eq!(state.read("pg").unwrap().is_some(), appeared);
+        assert_eq!(system.steps.contains(&"nbd-disconnect"), !appeared);
+    }
+}
+
+#[test]
+fn lvm_preflight_cachevol_metadata_never_reaches_activation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut report = lvm_report_fixture();
+    report["report"][0]["lv"][0]["lv_layout"] = "cache,cachevol".into();
+    let mut system = FakeSystem {
+        lvm_report: Some(report),
+        ..Default::default()
+    };
+    assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
+    assert!(!system.steps.contains(&"lvm-activate"));
 }
 
 impl System for FakeSystem {
+    fn lvm_preflight(
+        &mut self,
+        record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        if self.mapping_during_preflight {
+            self.vg_active = true;
+        }
+        let report = self.lvm_report.clone().unwrap_or_else(lvm_report_fixture);
+        Ok(lvm_preflight::validate(
+            &serde_json::to_vec(&report).unwrap(),
+            vec![lvm_preflight::Device {
+                path: record.device.clone(),
+                number: (43, 3),
+                start: 0,
+                sectors: 1024,
+            }],
+            [(
+                record.device.clone(),
+                "111111-2222-3333-4444-5555-6666-777777".into(),
+            )]
+            .into(),
+            &record.attachment.vg_name,
+            &record.attachment.lv_name,
+            record.attachment.lvm_identity.as_ref(),
+            |path| {
+                if path == record.device {
+                    Ok((43, 3))
+                } else {
+                    Err(io::Error::other("foreign device"))
+                }
+            },
+        )?)
+    }
+    fn activate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+        attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        if &self.lvm_preflight(record)? != verified {
+            return Err(identity_error("fixture LVM metadata changed"));
+        }
+        *attempted = true;
+        self.run_step(
+            &PlannedStep::LvmActivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn verify_activated_lvm(
+        &self,
+        _record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.scoped_lvm_deactivations += 1;
+        self.run_step(
+            &PlannedStep::LvmDeactivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn recover_deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.run_step(
+            &PlannedStep::LvmDeactivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
+        Ok(self.lv_size)
+    }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.steps.push(step.kind());
+        if self.nonzero_at == Some(step.kind()) {
+            return Err(ExecError::StepFailed {
+                step: step.to_string(),
+                status: Some(5),
+                stderr: "external command output omitted".into(),
+            });
+        }
         if self.fail_at == Some(step.kind()) {
             if self.replace_on_failure {
                 self.backends
@@ -100,6 +304,9 @@ impl System for FakeSystem {
                 self.mounted = false;
             }
             PlannedStep::LvmActivate { .. } => self.vg_active = true,
+            PlannedStep::LvExtend { target_bytes, .. } => {
+                self.lv_size = self.lv_size.max(*target_bytes)
+            }
             PlannedStep::NbdConnect { device, .. } => {
                 self.backends
                     .insert(device.clone(), identifier.unwrap().to_string());
@@ -139,6 +346,17 @@ impl System for FakeSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        let probe = self.backend_probes.get() + 1;
+        self.backend_probes.set(probe);
+        if let Some((expected, fault)) = self.backend_fault_on_probe {
+            if probe == expected {
+                return match fault {
+                    BackendFault::Foreign => Ok(Some("other-connection".into())),
+                    BackendFault::Missing => Ok(None),
+                    BackendFault::Unreadable => Err(io::Error::other("fixture backend unreadable")),
+                };
+            }
+        }
         if let Some((step, fault)) = self.backend_fault_after {
             if self.steps.contains(&step) {
                 return match fault {
@@ -153,6 +371,9 @@ impl System for FakeSystem {
 
     fn detach_observation(&self, _record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         if self.observation_error
+            || self
+                .observation_error_after
+                .is_some_and(|step| self.steps.contains(&step))
             || (self.mounted && self.foreign_mount)
             || (self.vg_active && self.foreign_vg)
         {
@@ -167,6 +388,41 @@ impl System for FakeSystem {
             nbd_in_use: self.vg_active || self.extra_holders,
         })
     }
+}
+
+#[test]
+fn lvm_pin_mismatch_stops_before_activation_or_lvm_teardown() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut request = pinned_request();
+    request.lvm_identity.as_mut().unwrap().vg_uuid =
+        "333333-aaaa-bbbb-cccc-dddd-eeee-ffffff".into();
+    let mut system = FakeSystem::default();
+
+    assert!(execute_with(&plan_attach(&request), Some(&state), &mut system).is_err());
+    assert!(!system.steps.contains(&"lvm-activate"));
+    assert!(!system.steps.contains(&"lvm-deactivate"));
+}
+
+#[test]
+fn changed_or_missing_lvm_pins_cannot_authorize_detach_mutations() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let pinned = pinned_request();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&pinned), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+
+    let mut changed = pinned.clone();
+    changed.lvm_identity = None;
+    assert!(execute_with(&plan_detach(&changed), Some(&state), &mut system).is_err());
+    assert!(system.steps.is_empty());
+
+    let mut changed = pinned;
+    changed.lvm_identity.as_mut().unwrap().lv_uuid =
+        "333333-aaaa-bbbb-cccc-dddd-eeee-ffffff".into();
+    assert!(execute_with(&plan_detach(&changed), Some(&state), &mut system).is_err());
+    assert!(system.steps.is_empty());
 }
 
 #[test]
@@ -191,6 +447,72 @@ fn new_auto_and_fixed_attachments_record_and_verify_the_kernel_identifier() {
         assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
         assert!(state.read("pg").unwrap().is_none());
         assert!(system.backends.is_empty());
+    }
+}
+
+#[test]
+fn cleanup_is_idempotent_when_no_trusted_record_exists() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = FakeSystem::default();
+
+    cleanup_with(&plan_detach(&request()), &state, &mut system).unwrap();
+
+    assert!(system.steps.is_empty());
+    assert_eq!(system.backend_probes.get(), 0);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_dispatches_an_owned_connection_to_detach() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let request = request();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+    system.backend_probes.set(0);
+
+    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+
+    assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let request = request();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+    system.backends.clear();
+    system.backend_probes.set(0);
+
+    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+
+    assert_eq!(system.steps, ["umount", "lvm-deactivate"]);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn cleanup_preserves_state_for_foreign_or_unreadable_connections() {
+    for fault in [BackendFault::Foreign, BackendFault::Unreadable] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.backend_probes.set(0);
+        system.backend_fault_on_probe = Some((1, fault));
+
+        assert!(cleanup_with(&plan_detach(&request), &state, &mut system).is_err());
+
+        assert!(system.steps.is_empty(), "{fault:?}");
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{fault:?}");
     }
 }
 
@@ -568,7 +890,8 @@ fn grow_request() -> GrowRequest {
         nbd_socket: r.nbd_socket,
         vg_name: r.vg_name,
         lv_name: r.lv_name,
-        add_bytes: 1 << 30,
+        lvm_identity: r.lvm_identity,
+        target_bytes: 2 << 30,
         mountpoint: r.mountpoint,
     }
 }
@@ -734,7 +1057,7 @@ fn followup_observation_failure_after_activation_must_not_disconnect() {
     let _lock = state.lock().unwrap();
     let mut system = FakeSystem {
         fail_after_at: Some("lvm-activate"),
-        observation_error: true,
+        observation_error_after: Some("lvm-activate"),
         ..Default::default()
     };
     assert!(execute_with(&plan_attach(&request()), Some(&state), &mut system).is_err());
@@ -853,6 +1176,34 @@ impl ReviewForeignMountSystem {
 }
 
 impl System for ReviewForeignMountSystem {
+    fn lvm_preflight(
+        &mut self,
+        record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        self.inner.lvm_preflight(record)
+    }
+    fn activate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+        attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        self.inner.activate_lvm(record, verified, attempted)
+    }
+    fn verify_activated_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        self.inner.verify_activated_lvm(record, verified)
+    }
+    fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.inner.deactivate_lvm(record, verified)
+    }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.inner.run_step(step, identifier)?;
         match step {
@@ -946,6 +1297,8 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
         attachment: (&request).into(),
         device: "/dev/nbd3".into(),
         connection_id: "maki-fixture".into(),
+        recovery: None,
+        recovery_intent: None,
     };
     // Positive control: the production topology observer rejects this exact
     // mapping, and the fixture resolves its leaf to the unrelated local disk.
@@ -964,7 +1317,10 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
     );
 
     let result = execute_with(&plan_attach(&request), Some(&state), &mut system);
-    assert!(system.inner.steps.contains(&"verify-mount-device"));
+    assert!(
+        !system.inner.steps.contains(&"nbd-connect"),
+        "foreign topology must fail before connecting"
+    );
     assert!(
         result.is_err() && read_sentinel(&request.mountpoint).is_none(),
         "attach accepted/initialized a non-NBD filesystem: result={result:?}, sentinel={:?}; commands={:?}",
@@ -972,3 +1328,312 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
         system.inner.steps
     );
 }
+
+// Audit fixtures: production observer + production executor; no real commands.
+struct ObservedSystem {
+    fake: FakeSystem,
+    sysfs: PathBuf,
+}
+
+impl ObservedSystem {
+    fn mounts(&self, record: &BoundDeviceRecord) -> String {
+        if self.fake.mounted {
+            format!(
+                "40 25 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+                record.attachment.mountpoint
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
+impl System for ObservedSystem {
+    fn lvm_preflight(
+        &mut self,
+        record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        self.fake.lvm_preflight(record)
+    }
+    fn activate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+        attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        if &self.fake.lvm_preflight(record)? != verified {
+            return Err(identity_error("fixture LVM metadata changed"));
+        }
+        *attempted = true;
+        self.run_step(
+            &PlannedStep::LvmActivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn verify_activated_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        if self.fake.process_death_after_activation {
+            panic!("fixture process died after LVM activation");
+        }
+        lvm_preflight::verify_mapping(record, verified, &self.sysfs)
+    }
+    fn verify_rollback_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        lvm_preflight::verify_rollback_mapping(record, verified, &self.sysfs)
+    }
+    fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.fake.scoped_lvm_deactivations += 1;
+        self.run_step(
+            &PlannedStep::LvmDeactivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn recover_deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        _verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        self.run_step(
+            &PlannedStep::LvmDeactivate {
+                vg_name: record.attachment.vg_name.clone(),
+            },
+            None,
+        )
+    }
+    fn deactivate_lvm_from_proof(&mut self, record: &BoundDeviceRecord) -> Result<(), ExecError> {
+        verify_connection(record, self)?;
+        self.fake.steps.push("dm-proof-deactivate");
+        self.fake.vg_active = false;
+        let _ = std::fs::remove_dir_all(self.sysfs.join("dm-0"));
+        let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-0"));
+        Ok(())
+    }
+    fn recovery_proof(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<Option<recover::RecoveryProof>> {
+        recover::capture(record, &self.mounts(record), &self.sysfs).map(Some)
+    }
+    fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        recover::observe(record, &self.mounts(record), &self.sysfs)
+    }
+    fn run_step(&mut self, step: &PlannedStep, id: Option<&str>) -> Result<(), ExecError> {
+        let result = self.fake.run_step(step, id);
+        let dm = self.sysfs.join("dm-0");
+        if self.fake.vg_active {
+            std::fs::create_dir_all(dm.join("dm")).unwrap();
+            std::fs::create_dir_all(dm.join("slaves")).unwrap();
+            std::fs::create_dir_all(dm.join("holders")).unwrap();
+            std::fs::write(dm.join("dm/name"), "vg_maki_pg-data\n").unwrap();
+            std::fs::write(
+                dm.join("dm/uuid"),
+                "LVM-aaaaaabbbbccccddddeeeeffffgggggghhhhhhiiiijjjjkkkkllllmmmmnnnnnn\n",
+            )
+            .unwrap();
+            if self.fake.wrong_activation_uuid {
+                std::fs::write(dm.join("dm/uuid"), "LVM-foreign\n").unwrap();
+            }
+            std::fs::write(dm.join("dev"), "253:0\n").unwrap();
+            std::fs::write(dm.join("slaves/nbd3"), "").unwrap();
+            std::fs::write(self.sysfs.join("nbd3/holders/dm-0"), "").unwrap();
+        } else {
+            let _ = std::fs::remove_dir_all(dm);
+            let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-0"));
+            let _ = std::fs::remove_dir_all(self.sysfs.join("dm-1"));
+            let _ = std::fs::remove_file(self.sysfs.join("nbd3/holders/dm-1"));
+        }
+        result
+    }
+    fn wait_ready(&mut self, s: &PlannedStep, d: &str) -> Result<(), ExecError> {
+        self.fake.wait_ready(s, d)
+    }
+    fn allocate(&mut self) -> Result<String, ExecError> {
+        self.fake.allocate()
+    }
+    fn backend(&self, d: &str) -> io::Result<Option<String>> {
+        self.fake.backend(d)
+    }
+    fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        self.rollback_observation(record, false)
+    }
+    fn rollback_observation(
+        &self,
+        record: &BoundDeviceRecord,
+        allow_missing: bool,
+    ) -> io::Result<DetachObservation> {
+        let mounts = if self.fake.mounted {
+            format!(
+                "40 25 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+                record.attachment.mountpoint
+            )
+        } else {
+            String::new()
+        };
+        crate::detach::observe_rollback(record, &mounts, &self.sysfs, allow_missing)
+    }
+}
+
+fn mount_failure_after_effect(existing_sentinel: bool) {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut req = request();
+    req.init_sentinel = true;
+    req.mountpoint = fixture.0.join("mount").to_str().unwrap().to_string();
+    std::fs::create_dir(&req.mountpoint).unwrap();
+    if existing_sentinel {
+        std::fs::write(
+            Path::new(&req.mountpoint).join(SENTINEL_FILE),
+            &req.volume_uuid,
+        )
+        .unwrap();
+    }
+    let sysfs = fixture.0.join("sys");
+    std::fs::create_dir_all(sysfs.join("nbd3/holders")).unwrap();
+    std::fs::write(sysfs.join("nbd3/dev"), "43:3\n").unwrap();
+    let mut system = ObservedSystem {
+        fake: FakeSystem {
+            fail_after_at: Some("mount-xfs"),
+            ..Default::default()
+        },
+        sysfs,
+    };
+    let result = execute_with(&plan_attach(&req), Some(&state), &mut system);
+    let record_present = state.read("pg").unwrap().is_some();
+    assert!(result.is_err(), "must inject failure after mount effect");
+    assert!(!system.fake.mounted && !system.fake.vg_active && system.fake.backends.is_empty() && !record_present,
+        "first-attach rollback must recover its own verified mount even before sentinel publication");
+}
+
+#[test]
+fn existing_sentinel_allows_real_observer_rollback() {
+    mount_failure_after_effect(true);
+}
+#[test]
+fn missing_initial_sentinel_does_not_strand_our_mount() {
+    mount_failure_after_effect(false);
+}
+
+#[test]
+fn lvm_preflight_wrong_activated_uuid_cannot_authorize_rollback_deactivation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let sysfs = fixture.0.join("sys");
+    std::fs::create_dir_all(sysfs.join("nbd3/holders")).unwrap();
+    std::fs::write(sysfs.join("nbd3/dev"), "43:3\n").unwrap();
+    let mut system = ObservedSystem {
+        fake: FakeSystem {
+            wrong_activation_uuid: true,
+            ..Default::default()
+        },
+        sysfs,
+    };
+    let result = execute_with(&plan_attach(&request()), Some(&state), &mut system);
+    assert!(result.is_err());
+    assert!(
+        system.fake.steps.contains(&"lvm-activate"),
+        "fixture must reach activation"
+    );
+    assert!(
+        !system.fake.steps.contains(&"lvm-deactivate"),
+        "wrong UUID must not authorize VG deactivation"
+    );
+    assert!(!system.fake.steps.contains(&"mount-xfs") && !system.fake.steps.contains(&"umount"));
+    assert!(
+        state.read("pg").unwrap().is_some(),
+        "retain record for unresolved live mapping"
+    );
+}
+
+#[test]
+fn a_new_attach_does_not_adopt_unrecorded_live_resources() {
+    for layer in ["mount", "vg", "holder"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut req = request();
+        req.nbd_device = "/dev/nbd3".into();
+        req.init_sentinel = true;
+        let mut system = FakeSystem {
+            mounted: layer == "mount",
+            vg_active: layer == "vg",
+            extra_holders: layer == "holder",
+            ..Default::default()
+        };
+        let result = execute_with(&plan_attach(&req), Some(&state), &mut system);
+        assert!(result.is_err(), "adopted unrecorded {layer}");
+        assert!(
+            system.steps.is_empty(),
+            "modified unrecorded {layer}: {:?}",
+            system.steps
+        );
+        assert!(state.read("pg").unwrap().is_none());
+    }
+}
+
+#[test]
+fn growth_retry_does_not_apply_an_increase_twice() {
+    for failure in ["lvextend", "xfs-growfs"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let _lock = state.lock().unwrap();
+        let mut system = FakeSystem {
+            lv_size: 1 << 30,
+            ..Default::default()
+        };
+        execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+        let plan = plan_grow(&grow_request());
+        system.fail_after_at = Some(failure);
+        assert!(execute_with(&plan, Some(&state), &mut system).is_err());
+        system.fail_after_at = None;
+        execute_with(&plan, Some(&state), &mut system).unwrap();
+        assert_eq!(
+            system.lv_size,
+            2 << 30,
+            "retry after {failure} must reuse the same absolute target"
+        );
+    }
+}
+
+#[test]
+fn growth_rechecks_ownership_between_lv_and_filesystem_changes() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        lv_size: 1 << 30,
+        ..Default::default()
+    };
+    execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+    system.steps.clear();
+    system.backend_fault_after = Some(("lvextend", BackendFault::Foreign));
+    assert!(execute_with(&plan_grow(&grow_request()), Some(&state), &mut system).is_err());
+    assert_eq!(
+        system.steps,
+        ["lvextend"],
+        "filesystem change must re-check live ownership"
+    );
+}
+
+#[path = "recover_tests.rs"]
+mod recover_tests;
+
+#[path = "filesystem_tests.rs"]
+mod filesystem_tests;
+
+#[path = "workload_verify_tests.rs"]
+mod workload_verify_tests;

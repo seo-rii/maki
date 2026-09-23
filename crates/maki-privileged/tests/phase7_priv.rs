@@ -15,6 +15,12 @@ fn packaging(path: &str) -> String {
         .unwrap_or_else(|e| panic!("missing packaging file {path}: {e}"))
 }
 
+fn repository_file(path: &str) -> String {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+    std::fs::read_to_string(format!("{root}{path}"))
+        .unwrap_or_else(|e| panic!("missing repository file {path}: {e}"))
+}
+
 // ---------- packaging pins (PRIV-001/002/012/015 + sandbox) ----------
 
 #[test]
@@ -26,9 +32,9 @@ fn data_plane_unit_is_unprivileged_and_sandboxed() {
         "CapabilityBoundingSet=", // PRIV-002: empty capability set
         "AmbientCapabilities=",
         "NoNewPrivileges=yes",
-        "LimitCORE=0",          // PRIV-015: no core dumps
-        "Restart=on-failure",   // PRIV-012: restart after failure
-        "ProtectSystem=strict", // PRIV-004: /etc immutable
+        "LimitCORE=0",                       // PRIV-015: no core dumps
+        "OnFailure=maki-recover@%i.service", // PRIV-012: fail through cleanup
+        "ProtectSystem=strict",              // PRIV-004: /etc immutable
         "ProtectHome=yes",
         "PrivateTmp=yes",
         "ReadWritePaths=/var/lib/maki/%i",
@@ -77,6 +83,50 @@ fn helper_unit_is_oneshot_and_separate() {
     );
 }
 
+#[test]
+fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
+    let runner = repository_file("scripts/privileged-linux-validation.sh");
+
+    assert!(runner.contains("provider = \"local-aes-gcm-siv\""));
+    assert!(!runner.contains("provider = \"fake\""));
+    for required in [
+        "[lvm_identity]",
+        "pv_uuids = [\"$pv_uuid\"]",
+        "vg_uuid = \"$vg_uuid\"",
+        "lv_uuid = \"$lv_uuid\"",
+        "fs_uuid = \"$fs_uuid\"",
+        "\"$attach_bin\" verify --volume",
+        "\"$attach_bin\" cleanup --volume",
+        "--config \"$attach_config_path\"",
+        "nbd-client 3.27.0 or later",
+        "control_runtime_dir_candidate=\"/run/maki-control/$volume_name\"",
+        "control_socket_path=\"$control_runtime_dir/control.sock\"",
+        "rmdir \"$control_runtime_dir\"",
+        "nbd_target=\"$(basename \"$device\")\"",
+        "nbd-client -unix \"$socket_path\" \"$nbd_target\"",
+        "nbd-client -d \"$nbd_target\"",
+    ] {
+        assert!(
+            runner.contains(required),
+            "privileged validation must contain {required:?}"
+        );
+    }
+}
+
+#[test]
+fn privileged_validation_reads_the_root_owned_config_as_root_for_planning() {
+    let runner = repository_file("scripts/privileged-linux-validation.sh");
+    let output = runner
+        .find(">\"$run_dir/maki-attach-plan.txt\"")
+        .expect("privileged validation must preserve the attach plan");
+    let invocation = &runner[output.saturating_sub(300)..output];
+
+    assert!(
+        invocation.contains("sudo -n env PATH=\"$PATH\" \"$attach_bin\" attach"),
+        "the root-owned 0600 attach config must be planned through the root helper boundary"
+    );
+}
+
 // ---------- attach/detach/grow plans ----------
 
 fn request() -> AttachRequest {
@@ -87,6 +137,7 @@ fn request() -> AttachRequest {
         device_block_size: 4096,
         vg_name: "vg_maki_postgres".to_string(),
         lv_name: "data".to_string(),
+        lvm_identity: None,
         mountpoint: "/srv/postgres".to_string(),
         volume_uuid: "0123-4567".to_string(),
         fs_uuid: None,
@@ -105,6 +156,7 @@ fn attach_plan_has_expected_step_order() {
             "nbd-connect",
             "set-block-size",
             "lvm-activate",
+            "verify-filesystem-identity",
             "mount-xfs",
             "verify-mount-device",
             "verify-mount-identity",
@@ -126,7 +178,8 @@ fn plans_contain_no_credential_material() {
             nbd_socket: "/run/maki/postgres/nbd.sock".into(),
             vg_name: "vg_maki_postgres".into(),
             lv_name: "data".into(),
-            add_bytes: 10 << 30,
+            lvm_identity: None,
+            target_bytes: 10 << 30,
             mountpoint: "/srv/postgres".into(),
         })
     );
@@ -165,7 +218,8 @@ fn grow_plan_is_lvextend_then_xfs_growfs() {
         nbd_socket: "/run/maki/postgres/nbd.sock".into(),
         vg_name: "vg".into(),
         lv_name: "data".into(),
-        add_bytes: 1 << 30,
+        lvm_identity: None,
+        target_bytes: 1 << 30,
         mountpoint: "/srv/postgres".into(),
     });
     let kinds: Vec<&'static str> = plan.steps.iter().map(|s| s.kind()).collect();

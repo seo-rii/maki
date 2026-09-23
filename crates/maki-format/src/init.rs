@@ -5,16 +5,36 @@ use maki_backing::Backing;
 use crate::ab::AbStore;
 use crate::catalog::ShardCatalog;
 use crate::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use crate::durable_proof::DurableProofStore;
 use crate::error::FormatError;
 use crate::layout;
-use crate::superblock::Superblock;
+use crate::superblock::{
+    load_volume_superblock, Superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V2,
+    SUPERBLOCK_VERSION_V3,
+};
 
 /// Create a new volume in an empty backing root. Everything created here is
 /// durable when this returns (dirs synced), so a crash immediately after
 /// creation leaves a valid volume.
 pub fn create_volume(
     backing: &dyn Backing,
+    superblock: Superblock,
+) -> Result<Superblock, FormatError> {
+    create_volume_with_metadata_version(backing, superblock, SUPERBLOCK_VERSION_V2)
+}
+
+/// Create a new volume whose v3 envelope opts into per-shard discard metadata.
+pub fn create_volume_with_discard(
+    backing: &dyn Backing,
+    superblock: Superblock,
+) -> Result<Superblock, FormatError> {
+    create_volume_with_metadata_version(backing, superblock, SUPERBLOCK_VERSION_V3)
+}
+
+fn create_volume_with_metadata_version(
+    backing: &dyn Backing,
     mut superblock: Superblock,
+    metadata_version: u32,
 ) -> Result<Superblock, FormatError> {
     if backing.exists(layout::SUPERBLOCK_A)? || backing.exists(layout::SUPERBLOCK_B)? {
         return Err(FormatError::AlreadyExists(
@@ -34,12 +54,21 @@ pub fn create_volume(
     let lock_file = backing.open(layout::VOLUME_LOCK, true)?;
     lock_file.sync_data()?;
 
+    // Required evidence is initialized before publishing a v2 superblock.
+    // An interrupted initialization must never resemble a legacy volume or
+    // an empty history whose proof files were simply lost.
+    DurableProofStore::initialize(backing, superblock.volume_uuid)?;
+
     // Both superblock copies, so a single later torn write can never leave
     // the volume unreadable.
     superblock.generation = 0;
     let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
-    sb_ab.store(backing, &mut superblock)?; // side A, gen 1
-    sb_ab.store(backing, &mut superblock)?; // side B, gen 2
+    let mut envelope = VolumeSuperblock {
+        superblock,
+        metadata_version,
+    };
+    sb_ab.store(backing, &mut envelope)?; // side A, gen 1
+    sb_ab.store(backing, &mut envelope)?; // side B, gen 2
 
     // Empty shard catalog (single copy now; second side written on first
     // update).
@@ -68,12 +97,10 @@ pub fn create_volume(
     backing.sync_dir(layout::CHECKPOINT_DIR)?;
     backing.sync_dir("")?;
 
-    Ok(superblock)
+    Ok(envelope.superblock)
 }
 
 /// Load the current superblock of an existing volume.
 pub fn load_superblock(backing: &dyn Backing) -> Result<Superblock, FormatError> {
-    AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)
-        .load::<Superblock>(backing)?
-        .ok_or_else(|| FormatError::Invalid("no valid superblock".to_string()))
+    Ok(load_volume_superblock(backing)?.superblock)
 }

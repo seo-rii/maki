@@ -8,7 +8,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{Engine, EngineLimits, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineLimits, EngineOptions};
 use maki_core::volume::VolumeOptions;
 use maki_crypto::{Clock, SystemClock};
 use maki_format::geometry::Geometry;
@@ -50,7 +50,10 @@ async fn engine_with(
             volume: VolumeOptions::default(),
             limits,
             cache: None,
-            checkpoint: Default::default(),
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
             clock: None,
         },
     )

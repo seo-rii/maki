@@ -50,6 +50,51 @@ fn slot_size_matches_spec_example() {
 }
 
 #[test]
+fn capacity_plan_accounts_for_full_shards_and_both_metadata_copies() {
+    let geometry = geom();
+    let plan = geometry.capacity_plan().unwrap();
+    assert_eq!(plan.num_units, 1 << 32);
+    assert_eq!(plan.num_shards, 256);
+    assert_eq!(plan.full_slot_span_bytes, 18 << 40);
+    assert_eq!(plan.allocation_map_ab_bytes, (1 << 30) + (16 << 10));
+    assert_eq!(plan.catalog_ab_bytes, 4_152);
+
+    let allocation_copy_bytes = AllocationMap::new(geometry.units_per_shard())
+        .encode()
+        .len() as u64;
+    assert_eq!(
+        plan.allocation_map_ab_bytes,
+        plan.num_shards * 2 * allocation_copy_bytes
+    );
+    let mut catalog = ShardCatalog::new();
+    for shard in 0..plan.num_shards {
+        catalog.insert(shard);
+    }
+    assert_eq!(plan.catalog_ab_bytes, 2 * catalog.encode().len() as u64);
+}
+
+#[test]
+fn geometry_rejects_capacity_that_the_format_cannot_represent() {
+    Geometry::compute(4096, 4096, 512, 4384, (1u64 << 24) * 4096, 4096)
+        .expect("the maximum encodable shard count is valid");
+    let too_many_shards = ((1u64 << 24) + 1) * 4096;
+    let err = Geometry::compute(4096, 4096, 512, 4384, too_many_shards, 4096)
+        .expect_err("the shard catalog cannot encode this geometry");
+    assert!(err.to_string().contains("num_shards"), "{err}");
+
+    let err = Geometry::compute(
+        4096,
+        4096,
+        512,
+        maki_format::journal::MAX_PAYLOAD,
+        (i64::MAX as u64) - 4095,
+        1 << 40,
+    )
+    .expect_err("the full slot span must fit in the byte-count type");
+    assert!(err.to_string().contains("full slot span"), "{err}");
+}
+
+#[test]
 fn geometry_validation_rejects_bad_inputs() {
     // non-power-of-two device block
     assert!(Geometry::compute(4000, 4096, 512, 4384, 1 << 30, 64 << 20).is_err());

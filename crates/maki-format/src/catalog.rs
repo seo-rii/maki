@@ -9,7 +9,8 @@ use crate::error::FormatError;
 
 pub const CATALOG_MAGIC: &[u8; 8] = b"MAKICAT1";
 pub const CATALOG_VERSION: u32 = 1;
-const MAX_SHARDS: u32 = 1 << 24;
+pub const MAX_SHARDS: u64 = 1 << 24;
+pub(crate) const ENCODED_FIXED_BYTES: u64 = CATALOG_MAGIC.len() as u64 + 4 + 8 + 4 + 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShardCatalog {
@@ -69,7 +70,7 @@ impl ShardCatalog {
         }
         let generation = r.u64()?;
         let count = r.u32()?;
-        if count > MAX_SHARDS {
+        if u64::from(count) > MAX_SHARDS {
             return Err(FormatError::Invalid(format!("shard count {count}")));
         }
         let mut shards = BTreeSet::new();

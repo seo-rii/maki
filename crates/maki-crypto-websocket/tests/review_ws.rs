@@ -116,6 +116,7 @@ fn provider(url: &str, retry_safe: bool) -> WsCryptoProvider {
         capabilities: caps(retry_safe),
         timeout: Duration::from_secs(5),
         max_frame_bytes: 1 << 20,
+        tls: None,
     })
 }
 

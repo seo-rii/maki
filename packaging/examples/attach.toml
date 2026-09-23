@@ -27,3 +27,12 @@ device_block_size = 4096
 # First boot only: create the sentinel on an empty filesystem. Remove after
 # the first successful attach; an existing sentinel is never overwritten.
 init_sentinel = false
+
+# Production profile: pin the complete PV set, VG and configured target LV
+# after verifying their identity out of band (`pvs`, `vgs`, `lvs`). This table
+# is optional for compatibility, but when present every field is required and
+# attach refuses any missing, additional or changed UUID before activation.
+# [lvm_identity]
+# pv_uuids = ["111111-2222-3333-4444-5555-6666-777777"]
+# vg_uuid = "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg"
+# lv_uuid = "hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"

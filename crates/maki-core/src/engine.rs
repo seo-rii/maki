@@ -18,7 +18,8 @@
 //!   low backing free space, and on a time interval; the write path forces a
 //!   journal sync when unsynced bytes exceed their limit, checkpoints inline
 //!   at the hard journal limit, and refuses writes (ENOSPC) when the backing
-//!   is below its emergency reserve or the journal cannot be reclaimed. A
+//!   cannot preserve its emergency reserve and configured checkpoint headroom
+//!   after the exact next append or the journal cannot be reclaimed. A
 //!   failed reclaim puts the engine in a `Degraded` state that the next
 //!   successful checkpoint clears.
 
@@ -126,11 +127,13 @@ pub struct CheckpointPolicy {
     /// Appended-but-unsynced journal bytes at which the write path forces a
     /// journal sync before appending more.
     pub max_pending_bytes: u64,
-    /// Backing free space below which writes are refused with ENOSPC
-    /// (0 disables). Reads always continue.
+    /// Backing free space preserved after the next journal append. Writes
+    /// are refused with ENOSPC unless known free space covers this reserve
+    /// plus the exact append footprint (0 disables). Reads always continue.
     pub emergency_reserve_bytes: u64,
-    /// Backing free space below which the worker checkpoints eagerly to
-    /// reclaim journal segments (0 disables).
+    /// Backing free space preserved as checkpoint headroom after the next
+    /// journal append when emergency-reserve admission is enabled. The worker
+    /// also checkpoints eagerly below this value (0 disables both behaviors).
     pub low_space_checkpoint_bytes: u64,
     /// The worker checkpoints at least this often while anything is
     /// pending; unsynced records are synced first so they can be applied.
@@ -254,16 +257,17 @@ mod unit_lock_tests {
     }
 }
 
-/// How long a free-space reading is reused before the backing is asked
-/// again.
+/// How long statistics may reuse a free-space reading. Write admission
+/// always asks the backing again while holding the exclusive volume lock.
 const FREE_SPACE_CACHE_TTL: Duration = Duration::from_secs(1);
 
 struct EngineInner {
-    volume: RwLock<Volume>,
+    volume: Arc<RwLock<Volume>>,
     backing: Arc<dyn Backing>,
     provider: CheckedProvider,
     context: CryptoContext,
     geometry: Geometry,
+    supports_discard: bool,
     unit_locks: UnitLocks,
     /// Provider batch contract (SPEC §16): calls are chunked to fit.
     batch_max_items: usize,
@@ -278,11 +282,19 @@ struct EngineInner {
     clock: Arc<dyn Clock>,
     /// Wakes the checkpoint worker early (watermark crossed, shutdown).
     checkpoint_notify: Arc<Notify>,
+    checkpoint_stop: AtomicBool,
+    checkpoint_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes snapshots through publication, including inline reclaim.
+    checkpoint_gate: AsyncMutex<()>,
     state: parking_lot::Mutex<EngineState>,
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
     last_checkpoint_at: parking_lot::Mutex<Duration>,
     free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
+    /// Published samples have their own memory-only locks: `free_space`
+    /// may be held across a stalled statvfs, and `volume` across storage I/O.
+    observed_free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
+    observed_volume: parking_lot::Mutex<VolumeSnapshot>,
     /// Mirrors `Volume::journal_writeback_uncertain` after every journal
     /// operation, so [`Engine::state`] can report it without the volume
     /// lock: a journal that cannot be synced is a degraded volume.
@@ -329,6 +341,7 @@ pub struct LatencySnapshot {
 impl Drop for EngineInner {
     fn drop(&mut self) {
         // Let a sleeping worker observe that the engine is gone.
+        self.checkpoint_stop.store(true, Ordering::SeqCst);
         self.checkpoint_notify.notify_one();
     }
 }
@@ -361,6 +374,16 @@ fn record_len(ct: &CiphertextUnit) -> u64 {
     maki_format::journal::RECORD_HEADER_SIZE as u64 + ct.data.len() as u64
 }
 
+/// Acquire storage/admission guards before dispatch, and move them into this
+/// closure: dropping an async caller cannot cancel a running disk operation.
+async fn storage_task<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, std::io::Error> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| std::io::Error::other(format!("storage worker failed: {error}")))
+}
+
 impl Engine {
     /// Recover the volume, verify the provider (self-test + compatibility +
     /// geometry contract + identity + key canary), start the checkpoint
@@ -370,7 +393,8 @@ impl Engine {
         provider: Arc<dyn CryptoProvider>,
         options: EngineOptions,
     ) -> Result<Self, AttachError> {
-        let volume = Volume::recover(backing, options.volume.clone())?;
+        let volume_options = options.volume.clone();
+        let volume = storage_task(move || Volume::recover(backing, volume_options)).await??;
         Self::attach_recovered(volume, provider, options).await
     }
 
@@ -382,6 +406,7 @@ impl Engine {
         options: EngineOptions,
     ) -> Result<Self, AttachError> {
         let backing = volume.backing().clone();
+        let supports_discard = volume.supports_discard();
         let superblock = volume.superblock().clone();
         let geometry = superblock.geometry.clone();
 
@@ -456,12 +481,14 @@ impl Engine {
             .clock
             .unwrap_or_else(|| Arc::new(SystemClock::new()));
         let notify = Arc::new(Notify::new());
+        let observed_volume = VolumeSnapshot::new(&volume, EngineState::Ready, clock.now());
         let inner = Arc::new(EngineInner {
-            volume: RwLock::new(volume),
+            volume: Arc::new(RwLock::new(volume)),
             backing,
             provider,
             context,
             geometry,
+            supports_discard,
             unit_locks: UnitLocks::new(),
             batch_max_items,
             batch_max_bytes,
@@ -484,16 +511,35 @@ impl Engine {
             last_checkpoint_at: parking_lot::Mutex::new(clock.now()),
             clock,
             checkpoint_notify: notify.clone(),
+            checkpoint_stop: AtomicBool::new(false),
+            checkpoint_worker: AsyncMutex::new(None),
+            checkpoint_gate: AsyncMutex::new(()),
             state: parking_lot::Mutex::new(EngineState::Ready),
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
             free_space: parking_lot::Mutex::new(None),
+            observed_free_space: parking_lot::Mutex::new(None),
+            observed_volume: parking_lot::Mutex::new(observed_volume),
             journal_uncertain: AtomicBool::new(false),
             flush_latency: LatencyStats::default(),
             fua_latency: LatencyStats::default(),
         });
-        spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
+        let worker = spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
+        *inner.checkpoint_worker.lock().await = Some(worker);
         Ok(Self { inner })
+    }
+
+    /// Stop the background checkpoint worker and wait for any storage work it
+    /// already dispatched. Repeated and concurrent callers return only after
+    /// the same worker has exited.
+    pub async fn stop_checkpoint_worker(&self) {
+        self.inner.checkpoint_stop.store(true, Ordering::SeqCst);
+        self.inner.checkpoint_notify.notify_one();
+        let mut worker = self.inner.checkpoint_worker.lock().await;
+        if let Some(handle) = worker.as_mut() {
+            let _ = handle.await;
+            worker.take();
+        }
     }
 
     /// Split `count` items with `size_of(i)` bytes each into chunk ranges
@@ -532,6 +578,11 @@ impl Engine {
         &self.inner.geometry
     }
 
+    /// Discard is available only on explicitly created v3 volumes.
+    pub fn can_trim(&self) -> bool {
+        self.inner.supports_discard
+    }
+
     /// Current operational state. A journal whose last sync failed and has
     /// not been rewritten and synced since counts as degraded (SPEC §26:
     /// a persistence failure must be visible), whatever the checkpoint
@@ -558,6 +609,12 @@ impl Engine {
                 self.inner.max_request_bytes
             )));
         }
+        Ok(())
+    }
+
+    async fn check_freshness(&self) -> Result<(), CoreError> {
+        let backing = self.inner.backing.clone();
+        storage_task(move || backing.check_freshness()).await??;
         Ok(())
     }
 
@@ -624,25 +681,30 @@ impl Engine {
     /// path; SPEC §36).
     pub async fn read_secret(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
-        let _admission = self
-            .inner
-            .admission
-            .acquire(self.admission_cost(offset, len))
-            .await?;
+        self.check_freshness().await?;
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(offset, len))
+                .await?,
+        );
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
 
         // Consistent per-unit ciphertext snapshot; cache hits (keyed by the
         // unit's current write sequence, SPEC §29) skip decryption.
-        let mut cached: HashMap<u64, std::sync::Arc<SecretBuffer>> = HashMap::new();
-        let mut cts = Vec::new();
-        let mut seqs: HashMap<u64, u64> = HashMap::new();
-        {
-            let volume = self.inner.volume.read().await;
+        let volume = self.inner.volume.clone().read_owned().await;
+        let inner = self.inner.clone();
+        let io_admission = admission.clone();
+        let (mut cached, cts, seqs) = storage_task(move || {
+            let _admission = io_admission;
+            let mut cached = HashMap::new();
+            let mut cts = Vec::new();
+            let mut seqs = HashMap::new();
             for unit in first..=last {
                 if let Some((seq, data)) = volume.read_ct(unit)? {
-                    if let Some(cache) = &self.inner.cache {
+                    if let Some(cache) = &inner.cache {
                         if let Some(buf) = cache.get(unit, seq) {
                             cached.insert(unit, buf);
                             continue;
@@ -655,7 +717,9 @@ impl Engine {
                     });
                 }
             }
-        }
+            Ok::<_, CoreError>((cached, cts, seqs))
+        })
+        .await??;
         let mut plain = self.decrypt_units(cts).await?;
 
         if let Some(cache) = &self.inner.cache {
@@ -694,27 +758,33 @@ impl Engine {
     /// durable before returning.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
-        let _admission = self
-            .inner
-            .admission
-            .acquire(self.admission_cost(offset, data.len()))
-            .await?;
+        self.check_freshness().await?;
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(offset, data.len()))
+                .await?,
+        );
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + data.len() as u64 - 1) / unit_size;
 
         // Serialize against other writers/RMW of the same units (SPEC §28).
-        let _guards = self.inner.unit_locks.lock_range(first, last).await;
+        let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
 
         // Build plaintext for each touched unit (RMW for partial coverage).
-        let mut rmw_cts = Vec::new();
-        let mut need_rmw = Vec::new();
-        {
-            let volume = self.inner.volume.read().await;
+        let volume = self.inner.volume.clone().read_owned().await;
+        let io_admission = admission.clone();
+        let io_guards = guards.clone();
+        let data_len = data.len();
+        let (rmw_cts, need_rmw) = storage_task(move || {
+            let (_admission, _guards) = (io_admission, io_guards);
+            let mut rmw_cts = Vec::new();
+            let mut need_rmw = Vec::new();
             for unit in first..=last {
                 let unit_start = unit * unit_size;
                 let full =
-                    offset <= unit_start && offset + data.len() as u64 >= unit_start + unit_size;
+                    offset <= unit_start && offset + data_len as u64 >= unit_start + unit_size;
                 if !full {
                     need_rmw.push(unit);
                     if let Some((_seq, ct)) = volume.read_ct(unit)? {
@@ -725,7 +795,9 @@ impl Engine {
                     }
                 }
             }
-        }
+            Ok::<_, CoreError>((rmw_cts, need_rmw))
+        })
+        .await??;
         let mut existing = self.decrypt_units(rmw_cts).await?;
 
         let mut items = Vec::with_capacity((last - first + 1) as usize);
@@ -774,21 +846,86 @@ impl Engine {
                 bad.data.len()
             ))));
         }
-        let incoming: u64 = cts.iter().map(record_len).sum();
+        self.publish_ciphertexts(cts, fua, admission, guards).await
+    }
 
-        // Journal + publish under the exclusive volume lock.
-        {
-            let mut volume = self.inner.volume.write().await;
-            let outcome = self.journal_request(&mut volume, incoming, &cts, fua);
-            // Whatever happened, the state report must know whether the
-            // journal can still be synced.
-            self.inner.note_journal(&volume);
-            outcome?;
-            if volume.journal_total_bytes() >= self.inner.policy.journal_high_watermark_bytes {
-                self.inner.checkpoint_notify.notify_one();
-            }
+    /// Discard complete crypto units covered by the range. Partial edge
+    /// units are left untouched, as permitted for the NBD discard hint.
+    /// Logical zeroes become durable through the usual FLUSH/FUA protocol;
+    /// physical space is reclaimed during a later checkpoint if supported.
+    pub async fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
+        self.check_range(offset, len)?;
+        self.check_freshness().await?;
+        if !self.can_trim() {
+            return Err(CoreError::Invalid(
+                "discard requires a volume created with --discard".into(),
+            ));
         }
-        Ok(())
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(offset, len))
+                .await?,
+        );
+        let unit_size = self.unit_size();
+        let first = offset.div_ceil(unit_size);
+        let end = (offset + len as u64) / unit_size;
+        if first >= end {
+            return if fua { self.flush().await } else { Ok(()) };
+        }
+        let guards = Arc::new(self.inner.unit_locks.lock_range(first, end - 1).await);
+        let cts = (first..end)
+            .map(|unit_index| CiphertextUnit {
+                unit_index,
+                data: Vec::new(),
+            })
+            .collect();
+        self.publish_ciphertexts(cts, fua, admission, guards).await
+    }
+
+    async fn publish_ciphertexts(
+        &self,
+        cts: Vec<CiphertextUnit>,
+        fua: bool,
+        admission: Arc<maki_crypto::flow::DualPermit>,
+        guards: Arc<Vec<OwnedMutexGuard<()>>>,
+    ) -> Result<(), CoreError> {
+        // Own the orchestration as well as each storage operation. Inline
+        // reclaim releases the volume lock while applying checkpoint data;
+        // cancelling the caller must not release its write/admission guards.
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let cts = Arc::new(cts);
+            let (_admission, _guards) = (admission, guards);
+            for reclaimed in [false, true] {
+                let mut volume = engine.inner.volume.clone().write_owned().await;
+                let io_engine = engine.clone();
+                let io_cts = cts.clone();
+                let io_admission = _admission.clone();
+                let io_guards = _guards.clone();
+                let written = storage_task(move || {
+                    let (_admission, _guards) = (io_admission, io_guards);
+                    let outcome = io_engine.journal_request(&mut volume, &io_cts, fua, reclaimed);
+                    io_engine.inner.note_journal(&volume);
+                    if matches!(outcome, Ok(true))
+                        && volume.journal_total_bytes()
+                            >= io_engine.inner.policy.journal_high_watermark_bytes
+                    {
+                        io_engine.inner.checkpoint_notify.notify_one();
+                    }
+                    outcome
+                })
+                .await??;
+                if written {
+                    return Ok(());
+                }
+                // Never wait for the checkpoint gate while holding volume.
+                engine.inner.checkpoint().await?;
+            }
+            unreachable!("a second unsuccessful admission returns ENOSPC")
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("journal task failed: {error}")))?
     }
 
     /// Admit, append and publish one request's records; with `fua`, sync
@@ -796,13 +933,36 @@ impl Engine {
     fn journal_request(
         &self,
         volume: &mut Volume,
-        incoming: u64,
         cts: &[CiphertextUnit],
         fua: bool,
-    ) -> Result<(), CoreError> {
-        self.admit_journal(volume, incoming, cts)?;
+        reclaimed: bool,
+    ) -> Result<bool, CoreError> {
+        // Already-zero trim hints must not reserve storage or consume journal
+        // capacity. All records in a request are either writes or tombstones.
+        let mut filtered = Vec::new();
+        let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
+            for ct in cts {
+                if volume.read_ct(ct.unit_index)?.is_some() {
+                    filtered.push(CiphertextUnit {
+                        unit_index: ct.unit_index,
+                        data: Vec::new(),
+                    });
+                }
+            }
+            filtered.as_slice()
+        } else {
+            cts
+        };
+        let incoming = cts.iter().map(record_len).sum();
+        if !cts.is_empty() && !self.admit_journal(volume, incoming, cts, reclaimed)? {
+            return Ok(false);
+        }
         for ct in cts {
-            volume.write_ct(ct.unit_index, &ct.data, false)?;
+            if ct.data.is_empty() {
+                volume.discard_ct(ct.unit_index, false)?;
+            } else {
+                volume.write_ct(ct.unit_index, &ct.data, false)?;
+            }
             // Any cached plaintext of an older version is now dead. The
             // version key alone already prevents stale reads; this frees
             // the space eagerly.
@@ -817,7 +977,7 @@ impl Engine {
                 .fua_latency
                 .record(self.inner.clock.now().saturating_sub(started));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Journal admission for one request (SPEC §30 "journal queue"; review
@@ -836,52 +996,74 @@ impl Engine {
         volume: &mut Volume,
         incoming: u64,
         cts: &[CiphertextUnit],
-    ) -> Result<(), CoreError> {
+        reclaimed: bool,
+    ) -> Result<bool, CoreError> {
         let policy = &self.inner.policy;
+        let footprint =
+            |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
         if policy.emergency_reserve_bytes > 0 {
-            if let Some(free) = self.backing_free_bytes() {
-                if free < policy.emergency_reserve_bytes {
-                    return Err(enospc(format!(
-                        "backing free space {free} below emergency reserve {}",
-                        policy.emergency_reserve_bytes
-                    )));
-                }
+            // A recent observation cannot authorize a new write: another
+            // filesystem user or an earlier operation may have consumed the
+            // space. This remains a threshold check, not a physical reservation.
+            let append_footprint = footprint(volume);
+            let reserved = policy
+                .emergency_reserve_bytes
+                .checked_add(policy.low_space_checkpoint_bytes)
+                .ok_or_else(|| {
+                    enospc(format!(
+                        "emergency reserve {} plus checkpoint headroom {} exceeds free-space accounting range",
+                        policy.emergency_reserve_bytes, policy.low_space_checkpoint_bytes
+                    ))
+                })?;
+            let required = reserved.checked_add(append_footprint).ok_or_else(|| {
+                enospc(format!(
+                    "reserves {reserved} plus journal append footprint {append_footprint} exceeds free-space accounting range"
+                ))
+            })?;
+            let Some(free) = self.backing_free_bytes(Duration::ZERO) else {
+                return Err(enospc(
+                    "backing free space unavailable while emergency reserve is enabled",
+                ));
+            };
+            if free < required {
+                return Err(enospc(format!(
+                    "backing free space {free} below required {required} bytes (emergency reserve {} + checkpoint headroom {} + journal append footprint {append_footprint})",
+                    policy.emergency_reserve_bytes, policy.low_space_checkpoint_bytes
+                )));
             }
         }
         let pending = volume.journal_pending_bytes();
         if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
             volume.flush()?;
         }
-        let footprint =
-            |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
         if volume
             .journal_total_bytes()
             .saturating_add(footprint(volume))
             > policy.journal_max_bytes
         {
-            // Everything sealed becomes reclaimable once it is durable.
-            volume.flush()?;
-            self.inner.checkpoint_locked(volume)?;
-            if volume
-                .journal_total_bytes()
-                .saturating_add(footprint(volume))
-                > policy.journal_max_bytes
-            {
+            if reclaimed {
                 return Err(enospc(format!(
                     "journal at hard limit {} bytes and cannot be reclaimed",
                     policy.journal_max_bytes
                 )));
             }
+            // Everything sealed becomes reclaimable once it is durable.
+            // The caller drops volume before acquiring the checkpoint gate,
+            // then repeats admission against current space and footprint.
+            volume.flush()?;
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Cached backing free space (`None` = unknown).
-    fn backing_free_bytes(&self) -> Option<u64> {
+    /// Backing free space (`None` = unknown), allowing samples younger than
+    /// `max_age`. A zero age forces a fresh sample for write admission; stats
+    /// retain their cache and monitoring reads only the published observation.
+    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
         let now = self.inner.clock.now();
         let mut cache = self.inner.free_space.lock();
         if let Some((value, at)) = *cache {
-            if now.saturating_sub(at) < FREE_SPACE_CACHE_TTL {
+            if now.saturating_sub(at) < max_age {
                 return value;
             }
         }
@@ -893,6 +1075,7 @@ impl Engine {
             }
         };
         *cache = Some((value, now));
+        *self.inner.observed_free_space.lock() = Some((value, now));
         value
     }
 
@@ -913,22 +1096,24 @@ impl Engine {
     /// FLUSH barrier: everything acknowledged before this call is durable
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
-        let mut volume = self.inner.volume.write().await;
-        let started = self.inner.clock.now();
-        let outcome = volume.flush();
-        self.inner.note_journal(&volume);
-        outcome?;
-        self.inner
-            .flush_latency
-            .record(self.inner.clock.now().saturating_sub(started));
-        Ok(())
+        self.check_freshness().await?;
+        let mut volume = self.inner.volume.clone().write_owned().await;
+        let inner = self.inner.clone();
+        storage_task(move || {
+            let started = inner.clock.now();
+            let outcome = volume.flush();
+            inner.note_journal(&volume);
+            outcome?;
+            inner
+                .flush_latency
+                .record(inner.clock.now().saturating_sub(started));
+            Ok(())
+        })
+        .await?
     }
 
     pub async fn checkpoint(&self) -> Result<u64, CoreError> {
-        let mut volume = self.inner.volume.write().await;
-        let outcome = self.inner.checkpoint_locked(&mut volume);
-        self.inner.note_journal(&volume);
-        outcome
+        self.inner.checkpoint().await
     }
 
     /// Journal/checkpoint/cache observability (metrics inputs, SPEC §40).
@@ -939,26 +1124,68 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let backing_free_bytes = self.backing_free_bytes();
-        let admission = &self.inner.admission;
-        let active_callbacks = (admission.max_items() - admission.available_items()) as u64;
-        let plaintext_bytes_in_flight = admission.max_bytes() - admission.available_bytes();
+        let engine = self.clone();
+        let backing_free_bytes =
+            storage_task(move || engine.backing_free_bytes(FREE_SPACE_CACHE_TTL))
+                .await
+                .unwrap_or(None);
         let volume = self.inner.volume.read().await;
+        let snapshot = VolumeSnapshot::new(&volume, self.state(), self.inner.clock.now());
+        self.stats_from_snapshot(&snapshot, cache, backing_free_bytes)
+    }
+
+    /// Monitoring never acquires the storage lock or refreshes free space.
+    /// A busy volume uses its last completed observation, with age and busy
+    /// flags; cache contention is explicitly unavailable. The snapshot is
+    /// observational and cannot authorize writes, drain or workload startup.
+    pub fn monitoring_snapshot(&self) -> MonitoringSnapshot {
+        let now = self.inner.clock.now();
+        let (volume, volume_busy) = match self.inner.volume.try_read() {
+            Ok(volume) => (VolumeSnapshot::new(&volume, self.state(), now), false),
+            Err(_) => (self.inner.observed_volume.lock().clone(), true),
+        };
+        let cache = self
+            .inner
+            .cache
+            .as_ref()
+            .map(|cache| cache.try_stats())
+            .unwrap_or(Some(maki_cache::CacheStats::default()));
+        let free_space = *self.inner.observed_free_space.lock();
+        MonitoringSnapshot {
+            stats: self.stats_from_snapshot(
+                &volume,
+                cache.unwrap_or_default(),
+                free_space.and_then(|(bytes, _)| bytes),
+            ),
+            volume_busy,
+            volume_snapshot_age: now.saturating_sub(volume.at),
+            cache,
+            backing_space_age: free_space.map(|(_, at)| now.saturating_sub(at)),
+        }
+    }
+
+    fn stats_from_snapshot(
+        &self,
+        volume: &VolumeSnapshot,
+        cache: maki_cache::CacheStats,
+        backing_free_bytes: Option<u64>,
+    ) -> EngineStats {
+        let admission = &self.inner.admission;
         EngineStats {
-            active_callbacks,
-            plaintext_bytes_in_flight,
+            active_callbacks: (admission.max_items() - admission.available_items()) as u64,
+            plaintext_bytes_in_flight: admission.max_bytes() - admission.available_bytes(),
             flush_latency: self.inner.flush_latency.snapshot(),
             fua_latency: self.inner.fua_latency.snapshot(),
-            durable_sequence: volume.journal_durable_sequence(),
-            appended_sequence: volume.journal_appended_sequence(),
-            checkpoint_sequence: volume.checkpoint_sequence(),
-            journal_segments: volume.journal_segment_count(),
-            journal_pending_bytes: volume.journal_pending_bytes(),
-            journal_total_bytes: volume.journal_total_bytes(),
-            journal_sync_failures_total: volume.journal_sync_failures(),
-            journal_writeback_uncertain: volume.journal_writeback_uncertain(),
-            overlay_units: volume.overlay_len(),
-            overlay_bytes: volume.overlay_bytes(),
+            durable_sequence: volume.durable_sequence,
+            appended_sequence: volume.appended_sequence,
+            checkpoint_sequence: volume.checkpoint_sequence,
+            journal_segments: volume.journal_segments,
+            journal_pending_bytes: volume.journal_pending_bytes,
+            journal_total_bytes: volume.journal_total_bytes,
+            journal_sync_failures_total: volume.journal_sync_failures_total,
+            journal_writeback_uncertain: volume.journal_writeback_uncertain,
+            overlay_units: volume.overlay_units,
+            overlay_bytes: volume.overlay_bytes,
             cache_hits: cache.hits,
             cache_misses: cache.misses,
             cache_bytes: cache.bytes,
@@ -966,7 +1193,7 @@ impl Engine {
             backing_free_bytes,
             checkpoints_total: self.inner.checkpoints_total.load(Ordering::Relaxed),
             checkpoint_failures_total: self.inner.checkpoint_failures_total.load(Ordering::Relaxed),
-            state: self.inner.effective_state(self.inner.state.lock().clone()),
+            state: volume.state.clone(),
         }
     }
 }
@@ -977,6 +1204,12 @@ impl EngineInner {
     fn note_journal(&self, volume: &Volume) {
         self.journal_uncertain
             .store(volume.journal_writeback_uncertain(), Ordering::SeqCst);
+        let snapshot = VolumeSnapshot::new(
+            volume,
+            self.effective_state(self.state.lock().clone()),
+            self.clock.now(),
+        );
+        *self.observed_volume.lock() = snapshot;
     }
 
     /// The reported state: a checkpoint-degraded volume stays degraded; a
@@ -994,32 +1227,54 @@ impl EngineInner {
         }
     }
 
-    /// Run a checkpoint under the (already held) volume lock and record the
-    /// outcome in counters and state.
-    fn checkpoint_locked(&self, volume: &mut Volume) -> Result<u64, CoreError> {
-        match volume.checkpoint() {
-            Ok(seq) => {
-                self.checkpoints_total.fetch_add(1, Ordering::Relaxed);
-                *self.last_checkpoint_at.lock() = self.clock.now();
-                *self.state.lock() = EngineState::Ready;
-                Ok(seq)
+    /// A caller may stop waiting, but the owner keeps the gate until data I/O
+    /// and metadata publication finish. New writes keep their live overlay
+    /// versions while the immutable checkpoint snapshot is applied.
+    async fn checkpoint(self: &Arc<Self>) -> Result<u64, CoreError> {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let _checkpoint = inner.checkpoint_gate.lock().await;
+            let completed = async {
+                let mut volume = inner.volume.clone().write_owned().await;
+                let prepared = storage_task(move || volume.prepare_checkpoint()).await??;
+                storage_task(move || prepared.execute()).await?
             }
-            Err(e) => {
-                self.checkpoint_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
-                *self.state.lock() = EngineState::Degraded {
-                    reason: format!("checkpoint failed: {e}"),
-                };
-                Err(e)
-            }
-        }
+            .await;
+            let mut volume = inner.volume.clone().write_owned().await;
+            let publishing = inner.clone();
+            storage_task(move || {
+                let outcome = completed.and_then(|plan| volume.finish_checkpoint(plan));
+                // Publish the counters and state under the same lock as the
+                // new horizon, so a coherent stats snapshot includes both.
+                match &outcome {
+                    Ok(_) => {
+                        publishing.checkpoints_total.fetch_add(1, Ordering::Relaxed);
+                        *publishing.last_checkpoint_at.lock() = publishing.clock.now();
+                        *publishing.state.lock() = EngineState::Ready;
+                    }
+                    Err(e) => {
+                        publishing
+                            .checkpoint_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        *publishing.state.lock() = EngineState::Degraded {
+                            reason: format!("checkpoint failed: {e}"),
+                        };
+                    }
+                }
+                publishing.note_journal(&volume);
+                outcome
+            })
+            .await?
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))?
     }
 
     /// One worker pass: checkpoint if the journal crossed its watermark,
     /// the backing is low on space, or the interval elapsed with work
     /// pending (unsynced records are synced first so they can be applied).
-    async fn worker_pass(&self) {
-        let (total, appended, checkpointed, durable, covered) = {
+    async fn worker_pass(self: &Arc<Self>) {
+        let (total, appended, checkpointed, durable, covered, reclaim) = {
             let v = self.volume.read().await;
             (
                 v.journal_total_bytes(),
@@ -1027,53 +1282,85 @@ impl EngineInner {
                 v.checkpoint_sequence(),
                 v.journal_durable_sequence(),
                 v.journal_covered_segment_count(),
+                v.has_pending_reclamation(),
             )
         };
-        if appended <= checkpointed && covered == 0 {
+        if appended <= checkpointed && covered == 0 && !reclaim {
             return; // nothing to apply and nothing to reclaim
         }
         let by_size = total >= self.policy.journal_high_watermark_bytes;
-        let by_space = self.policy.low_space_checkpoint_bytes > 0
-            && self
-                .backing
-                .free_bytes()
+        let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
+            let backing = self.backing.clone();
+            storage_task(move || backing.free_bytes())
+                .await
                 .ok()
+                .and_then(Result::ok)
                 .flatten()
                 .map(|free| free < self.policy.low_space_checkpoint_bytes)
-                .unwrap_or(false);
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if self.checkpoint_stop.load(Ordering::SeqCst) {
+            return;
+        }
         let elapsed = self
             .clock
             .now()
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
-        if !(by_size || by_space || by_time) {
+        if !(by_size || by_space || by_time || reclaim) {
             return;
         }
-        let mut volume = self.volume.write().await;
         if by_time && durable < appended {
-            let flushed = volume.flush();
-            self.note_journal(&volume);
-            if let Err(e) = flushed {
+            let mut volume = self.volume.clone().write_owned().await;
+            if self.checkpoint_stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let inner = self.clone();
+            let flushed = storage_task(move || {
+                let flushed = volume.flush();
+                inner.note_journal(&volume);
+                flushed
+            })
+            .await;
+            if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
                 return;
             }
         }
-        if let Err(e) = self.checkpoint_locked(&mut volume) {
-            tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+        if !self.checkpoint_stop.load(Ordering::SeqCst) {
+            if let Err(e) = self.checkpoint().await {
+                tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+            } else if self.volume.read().await.has_pending_reclamation() {
+                // Drain another bounded batch without sleeping an entire
+                // checkpoint interval. Each pass releases the volume lock;
+                // failures wait for the regular interval before retrying.
+                self.checkpoint_notify.notify_one();
+            }
         }
-        self.note_journal(&volume);
     }
 }
 
 /// The background checkpoint worker. Holds only a weak reference so it
 /// exits once the engine is dropped (the engine's drop wakes it).
-fn spawn_checkpoint_worker(weak: Weak<EngineInner>, notify: Arc<Notify>, clock: Arc<dyn Clock>) {
+fn spawn_checkpoint_worker(
+    weak: Weak<EngineInner>,
+    notify: Arc<Notify>,
+    clock: Arc<dyn Clock>,
+) -> tokio::task::JoinHandle<()> {
     let interval = weak
         .upgrade()
         .map(|i| i.policy.interval)
         .unwrap_or(Duration::from_secs(30));
     tokio::spawn(async move {
         loop {
+            if weak
+                .upgrade()
+                .is_none_or(|inner| inner.checkpoint_stop.load(Ordering::SeqCst))
+            {
+                return;
+            }
             let sleep = clock.sleep(interval);
             tokio::select! {
                 _ = sleep => {}
@@ -1082,9 +1369,12 @@ fn spawn_checkpoint_worker(weak: Weak<EngineInner>, notify: Arc<Notify>, clock: 
             let Some(inner) = weak.upgrade() else {
                 return;
             };
+            if inner.checkpoint_stop.load(Ordering::SeqCst) {
+                return;
+            }
             inner.worker_pass().await;
         }
-    });
+    })
 }
 
 /// Key-canary check (SPEC §12, review M-001).
@@ -1230,6 +1520,59 @@ async fn decrypt_probe(
         }
         Err(e) => Err(AttachError::KeyMismatch(e.to_string())),
     }
+}
+
+/// Last coherent volume metadata observation. No backing operations occur
+/// while constructing or publishing it.
+#[derive(Clone)]
+struct VolumeSnapshot {
+    at: Duration,
+    state: EngineState,
+    durable_sequence: u64,
+    appended_sequence: u64,
+    checkpoint_sequence: u64,
+    journal_segments: usize,
+    journal_pending_bytes: u64,
+    journal_total_bytes: u64,
+    journal_sync_failures_total: u64,
+    journal_writeback_uncertain: bool,
+    overlay_units: usize,
+    overlay_bytes: u64,
+}
+
+impl VolumeSnapshot {
+    fn new(volume: &Volume, state: EngineState, at: Duration) -> Self {
+        Self {
+            at,
+            state,
+            durable_sequence: volume.journal_durable_sequence(),
+            appended_sequence: volume.journal_appended_sequence(),
+            checkpoint_sequence: volume.checkpoint_sequence(),
+            journal_segments: volume.journal_segment_count(),
+            journal_pending_bytes: volume.journal_pending_bytes(),
+            journal_total_bytes: volume.journal_total_bytes(),
+            journal_sync_failures_total: volume.journal_sync_failures(),
+            journal_writeback_uncertain: volume.journal_writeback_uncertain(),
+            overlay_units: volume.overlay_len(),
+            overlay_bytes: volume.overlay_bytes(),
+        }
+    }
+}
+
+/// An observation for status/metrics, which must remain usable during stalls.
+#[derive(Debug, Clone)]
+pub struct MonitoringSnapshot {
+    /// Volume fields use the observation described by `volume_busy` and
+    /// `volume_snapshot_age`; admission and latency counters are sampled now.
+    /// Use `cache` for cache fields: `stats` has placeholders if unavailable.
+    pub stats: EngineStats,
+    pub volume_busy: bool,
+    pub volume_snapshot_age: Duration,
+    /// `None` while a cache insertion, eviction or resize owns its lock.
+    pub cache: Option<maki_cache::CacheStats>,
+    /// `None` before a storage operation has completed a free-space query.
+    /// An available sample can still report unknown free bytes.
+    pub backing_space_age: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]

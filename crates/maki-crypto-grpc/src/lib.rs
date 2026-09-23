@@ -6,18 +6,29 @@
 //! Responses echo `unit_index`, giving native reorder detection. Message
 //! sizes are bounded in both directions. Dynamic descriptor loading
 //! (arbitrary message shapes) is not supported; see docs/configuration.md.
+//!
+//! The provider's private wire items erase their owned data on drop and field
+//! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::metadata::{MetadataKey, MetadataValue};
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
     PlaintextUnit, SecretBuffer,
 };
+
+mod protected;
+use protected::{WireItem, WireRequest, WireResponse};
+
+#[cfg(test)]
+mod protected_tests;
+#[cfg(test)]
+mod tls_tests;
 
 // ---------------------------------------------------------------- messages
 
@@ -60,15 +71,23 @@ pub fn map_status(status: &tonic::Status) -> CryptoError {
     if status.code() == Code::FailedPrecondition {
         let mut reasons = status.metadata().get_all("maki-crypto-error").iter();
         if let (Some(reason), None) = (reasons.next(), reasons.next()) {
-            let message = match reason.as_encoded_bytes() {
-                b"auth-tag-mismatch" => {
-                    Some("remote crypto provider rejected the authentication tag")
-                }
-                b"context-mismatch" => Some("remote crypto provider rejected the crypto context"),
+            let error = match reason.as_encoded_bytes() {
+                b"auth-tag-mismatch" => Some(CryptoError::Integrity(
+                    "remote crypto provider rejected the authentication tag".into(),
+                )),
+                b"context-mismatch" => Some(CryptoError::Integrity(
+                    "remote crypto provider rejected the crypto context".into(),
+                )),
+                b"unsupported-format-version" => Some(CryptoError::UnsupportedContext(
+                    maki_crypto::ContextField::FormatVersion,
+                )),
+                b"unsupported-compatibility-id" => Some(CryptoError::UnsupportedContext(
+                    maki_crypto::ContextField::CompatibilityId,
+                )),
                 _ => None,
             };
-            if let Some(message) = message {
-                return CryptoError::Integrity(message.into());
+            if let Some(error) = error {
+                return error;
             }
         }
     }
@@ -101,7 +120,6 @@ pub fn class_of_code(code: tonic::Code) -> ErrorClass {
 
 // ---------------------------------------------------------------- provider
 
-#[derive(Clone)]
 pub struct GrpcProviderSpec {
     /// e.g. `http://crypto.internal:7000` (or https with TLS config).
     pub url: String,
@@ -113,6 +131,64 @@ pub struct GrpcProviderSpec {
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_message_bytes: usize,
+}
+
+impl Clone for GrpcProviderSpec {
+    fn clone(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            encrypt_path: self.encrypt_path.clone(),
+            decrypt_path: self.decrypt_path.clone(),
+            metadata: self.metadata.clone(),
+            capabilities: self.capabilities.clone(),
+            timeout: self.timeout,
+            max_message_bytes: self.max_message_bytes,
+        }
+    }
+}
+
+/// Client certificate and private key used for mutual TLS.
+pub struct GrpcClientIdentity {
+    pub certificate_pem: Vec<u8>,
+    pub private_key_pem: SecretBuffer,
+}
+
+impl Clone for GrpcClientIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificate_pem: self.certificate_pem.clone(),
+            private_key_pem: self.private_key_pem.duplicate(),
+        }
+    }
+}
+
+impl std::fmt::Debug for GrpcClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcClientIdentity")
+            .field("certificate_pem", &"<redacted>")
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Verified TLS configuration. Native platform roots remain enabled when a
+/// custom CA is supplied; the custom CA augments rather than replaces them.
+#[derive(Clone, Default)]
+pub struct GrpcTlsConfig {
+    pub ca_certificate_pem: Option<Vec<u8>>,
+    pub client_identity: Option<GrpcClientIdentity>,
+}
+
+impl std::fmt::Debug for GrpcTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcTlsConfig")
+            .field(
+                "ca_certificate_pem",
+                &self.ca_certificate_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("client_identity", &self.client_identity)
+            .finish()
+    }
 }
 
 /// Metadata values are resolved credentials: never printed (C-11).
@@ -146,10 +222,80 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 impl GrpcCryptoProvider {
     pub fn new(spec: GrpcProviderSpec) -> Result<Self, CryptoError> {
-        let channel = Channel::from_shared(spec.url.clone())
-            .map_err(|e| fatal(format!("bad endpoint url: {e}")))?
+        Self::build(spec, None)
+    }
+
+    pub fn new_with_tls(spec: GrpcProviderSpec, tls: GrpcTlsConfig) -> Result<Self, CryptoError> {
+        Self::build(spec, Some(tls))
+    }
+
+    fn build(spec: GrpcProviderSpec, tls: Option<GrpcTlsConfig>) -> Result<Self, CryptoError> {
+        let mut endpoint = Channel::from_shared(spec.url.clone())
+            .map_err(|e| fatal(format!("bad endpoint url: {e}")))?;
+        match (endpoint.uri().scheme_str(), tls) {
+            (Some("http"), None) => {
+                let host = endpoint
+                    .uri()
+                    .host()
+                    .ok_or_else(|| fatal("gRPC endpoint URL has no host"))?;
+                if !is_loopback_host(host) {
+                    return Err(fatal(
+                        "plaintext gRPC endpoints are permitted only on loopback",
+                    ));
+                }
+            }
+            (Some("http"), Some(_)) => {
+                return Err(fatal(
+                    "TLS configuration cannot be used with an http endpoint",
+                ));
+            }
+            (Some("https"), None) => {
+                return Err(fatal("https endpoint requires explicit TLS configuration"));
+            }
+            (Some("https"), Some(tls)) => {
+                let mut config = ClientTlsConfig::new().with_native_roots();
+                if let Some(ca) = tls.ca_certificate_pem {
+                    if ca.is_empty() {
+                        return Err(fatal("custom TLS CA certificate is empty"));
+                    }
+                    config = config.ca_certificate(Certificate::from_pem(ca));
+                }
+                if let Some(identity) = tls.client_identity {
+                    if identity.certificate_pem.is_empty() || identity.private_key_pem.is_empty() {
+                        return Err(fatal(
+                            "mTLS client certificate and private key must both be non-empty",
+                        ));
+                    }
+                    config = config.identity(Identity::from_pem(
+                        identity.certificate_pem,
+                        identity.private_key_pem.expose(),
+                    ));
+                }
+                endpoint = endpoint
+                    .tls_config(config)
+                    .map_err(|e| fatal(format!("invalid TLS configuration: {e}")))?;
+            }
+            (Some(scheme), _) => {
+                return Err(fatal(format!(
+                    "unsupported gRPC endpoint scheme {scheme:?}"
+                )));
+            }
+            (None, _) => return Err(fatal("gRPC endpoint URL has no scheme")),
+        }
+        let channel = endpoint
             .timeout(spec.timeout)
             .connect_timeout(spec.timeout)
             .connect_lazy();
@@ -173,7 +319,7 @@ impl GrpcCryptoProvider {
         })
     }
 
-    fn request_bytes(items: &[CryptoItem]) -> usize {
+    fn request_bytes(items: &[WireItem]) -> usize {
         items.iter().map(|i| i.data.len() + 16).sum::<usize>() + 64
     }
 
@@ -181,8 +327,8 @@ impl GrpcCryptoProvider {
         &self,
         path: PathAndQuery,
         context: &CryptoContext,
-        items: Vec<CryptoItem>,
-    ) -> Result<Vec<CryptoItem>, CryptoError> {
+        items: Vec<WireItem>,
+    ) -> Result<Vec<WireItem>, CryptoError> {
         if Self::request_bytes(&items) > self.spec.max_message_bytes {
             return Err(CryptoError::NonRetryableRequest(format!(
                 "request exceeds message-size limit {}",
@@ -190,7 +336,7 @@ impl GrpcCryptoProvider {
             )));
         }
         let expected: Vec<u64> = items.iter().map(|i| i.unit_index).collect();
-        let message = CryptoBatchRequest {
+        let message = WireRequest {
             volume_id: context.volume_uuid.to_string(),
             compatibility_id: context.crypto_compatibility_id.clone(),
             items,
@@ -211,7 +357,7 @@ impl GrpcCryptoProvider {
             request.metadata_mut().insert(key, value);
         }
 
-        let codec: tonic::codec::ProstCodec<CryptoBatchRequest, CryptoBatchResponse> =
+        let codec: tonic::codec::ProstCodec<WireRequest, WireResponse> =
             tonic::codec::ProstCodec::default();
 
         // `Channel::timeout` bounds the connection, not the whole exchange:
@@ -269,11 +415,11 @@ impl CryptoProvider for GrpcCryptoProvider {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let wire: Vec<CryptoItem> = items
+        let wire: Vec<WireItem> = items
             .iter()
-            .map(|i| CryptoItem {
+            .map(|i| WireItem {
                 unit_index: i.unit_index,
-                data: i.data.expose().to_vec(),
+                data: i.data.duplicate(),
             })
             .collect();
         let out = self.call(self.encrypt_path.clone(), context, wire).await?;
@@ -281,7 +427,7 @@ impl CryptoProvider for GrpcCryptoProvider {
             .into_iter()
             .map(|i| CiphertextUnit {
                 unit_index: i.unit_index,
-                data: i.data,
+                data: i.data.into_vec(),
             })
             .collect())
     }
@@ -291,11 +437,11 @@ impl CryptoProvider for GrpcCryptoProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let wire: Vec<CryptoItem> = items
+        let wire: Vec<WireItem> = items
             .iter()
-            .map(|i| CryptoItem {
+            .map(|i| WireItem {
                 unit_index: i.unit_index,
-                data: i.data.clone(),
+                data: SecretBuffer::from_slice(&i.data),
             })
             .collect();
         let out = self.call(self.decrypt_path.clone(), context, wire).await?;
@@ -303,7 +449,7 @@ impl CryptoProvider for GrpcCryptoProvider {
             .into_iter()
             .map(|i| PlaintextUnit {
                 unit_index: i.unit_index,
-                data: SecretBuffer::from_vec(i.data),
+                data: i.data,
             })
             .collect())
     }

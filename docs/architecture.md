@@ -62,13 +62,14 @@ writes.
 
 | Structure | Protection | Role |
 |---|---|---|
-| Superblock | Two generations plus CRC | Volume identity, geometry, provider type, key name, and compatibility ID |
+| Superblock | Two generations plus CRC; new volumes use envelope v2 | Volume identity, geometry, provider type, key name, compatibility ID, and required recovery policy |
 | Key canary | Two generations plus CRC, written at first attach | Provider/key-bound ciphertext of a fixed plaintext; must decrypt on every attach |
 | Shard catalog | Two generations plus CRC | Durable set of allocated shard files |
 | Allocation map | Per-shard A/B copies | Distinguishes unwritten units from allocated slots |
 | Slot | Header CRC and ciphertext CRC | Stores one encrypted unit and write sequence |
 | Journal segment | Header and record CRCs | Ordered ciphertext writes pending checkpoint |
-| Journal durable mark | CRC, single copy, never fsync'd | Lower bound on the fdatasync'd prefix of the active segment |
+| Journal durable proof | Two 64-byte CRC records, both published before a barrier succeeds | Required sequence and exact segment/record-end boundary for v2 recovery |
+| Legacy journal durable mark | CRC, single advisory copy | Retained advisory metadata; does not replace or weaken the v2 proof requirement |
 | Checkpoint state | Two generations plus CRC, written at creation | Highest durably applied journal sequence |
 
 Metadata updates select an absent, invalid, or older A/B side for replacement.
@@ -86,10 +87,30 @@ the preserved generation. A side that is absent, empty, short, or fails its
 CRC or typed decode is an invalid copy; any other read error is an I/O error
 and refuses attach rather than silently selecting the other side.
 
+The required durable-proof store prevalidates future versions and semantic
+consistency before using A/B storage. It performs two publications of the same
+horizon, including directory syncs, so both copies attest every successfully
+acknowledged boundary. One ordinary A/B update would leave the fallback horizon
+behind an ACK. Unsupported proof versions, contradictory generations and
+regressing horizons therefore fail explicitly rather than selecting or
+overwriting a convenient older side.
+
+Envelope v2 is distinct from the crypto AAD's `format_version`. Old binaries
+reject v2; the current writable recovery path refuses legacy v1. Read-only
+legacy inspection remains available with a warning. The
+[compatibility and migration procedure](durable-recovery.md) requires a separate
+verified data migration; there is no automatic in-place upgrade.
+
 ## Recovery and checkpointing
 
-Recovery acquires the volume lock, validates superblock and allocation state,
-loads the checkpoint state (required on every volume), scans journal segments,
+New volumes can explicitly select metadata envelope v3 for discard support.
+V2 creation remains the default. V3 adds replicated discard bitmaps and journal
+tombstones, preserving the crypto context and required durable proofs. The
+[space reclamation protocol](space-reclamation.md) specifies logical zero reads,
+bitmap publication, physical hole punching and replay ordering.
+
+Recovery acquires the volume lock, checks the superblock envelope and required
+proof, validates allocation state, loads checkpoint state, scans journal segments,
 and rebuilds the in-memory overlay from records newer than the checkpoint. It
 fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
@@ -97,18 +118,18 @@ larger than the writer can produce is rejected before it is read, and a
 complete-but-invalid final segment header is treated as damage rather than as
 a creation crash.
 
-Journal tails may be truncated after a crash, but only after the point the
-durable mark proves was fdatasync'd. Damage inside that prefix is corruption
-even at the very end of the segment; damage after it is a torn tail even when
-an intact record follows, because unsynced records may persist in any order.
-The mark itself is a plain write, so the crash it describes may lose it; when
-no mark names the final segment only its header counts as proven, and every
-damage beyond it is a torn tail. Recovery never infers durability from what
-follows a damaged record.
-Because the mark outlives the segment it names, segment indexes are never
-reused: recovery continues numbering above both the surviving segments and the
-mark. The [review remediation log](review-remediation.md) describes these rules
-in detail.
+The journal above the selected checkpoint must bridge through the proof's
+required sequence and exact record-end offset before recovery changes metadata.
+A missing final segment, a shortened complete-record prefix, or corruption
+inside that required prefix fails explicitly. A proof may name a pruned segment
+only when the checkpoint already covers its horizon. Both proof copies absent
+or invalid is an error even for an empty-looking v2 volume.
+
+Unproven final-tail bytes may be truncated after a crash. Intact later records
+do not prove the durability of earlier damaged bytes, because unsynced sectors
+may persist out of order. A missing/stale advisory mark cannot weaken the v2
+proof requirement. Recovered sequence/index bookkeeping also accounts for proof
+metadata that can outlive the segment it names.
 
 A failed append can leave bytes beyond the last accepted record. The writer
 retains a cleanup flag until truncation and synchronization succeed, including
@@ -119,25 +140,65 @@ unpersisted page-cache bytes behind. The writer re-reads and rewrites its
 accepted pending range in 64 KiB chunks, compares an ephemeral streaming
 fingerprint, and only then synchronizes it. Recovery similarly binds each
 prefix to the bytes accepted by its scan, rewrites and verifies that prefix,
-then synchronizes before publishing a durable mark. Changed bytes refuse
+then synchronizes before publishing both required proofs. Changed bytes refuse
 recovery or the durability acknowledgement. Normal successful live flushes
 avoid this extra rewrite; recovery pays an additional pass over valid data.
 While a rewrite is still owed, the engine reports the volume `degraded` and
 `journal_writeback_uncertain`, and counts `journal_sync_failures_total`; a
-successful barrier clears the flag, a successful checkpoint does not.
+successful barrier clears the flag, a successful checkpoint does not. Proof
+publication failure also keeps the barrier pending, including when its retry
+has no new append. Data sync alone does not advance the public durable boundary
+or make those records checkpoint-eligible. Recovery publishes every accepted
+horizon to both proof copies before READY.
+
+Segment scanning uses fixed 64 KiB scratch and discards checkpoint-covered
+payloads as they are validated. Volume attach retains only the latest record
+per unit, and the deep checker discards each validated payload after counting
+it. With shared overlay storage, the four-unit overwrite regression measures
+21,280 bytes of extra heap
+for recovery and 9,176 bytes for deep checking at both 1 MiB and 64 MiB history.
+Distinct units, different latest/durable versions and segment/allocation metadata
+still consume memory; public all-record APIs retain their return contract. See the
+[measurements and limits](durable-recovery.md#cost-and-verification-limits).
 
 The overlay keeps both the latest version and the latest durable version for
 each unit. This distinction is required when a newer unflushed write exists at
-checkpoint time. The durable boundary can move inside `append` itself (an
-automatic segment roll fdatasyncs the sealed segment), so the volume promotes
-the overlay after every journal operation and *before* publishing a newer
+checkpoint time. The durable boundary can move inside `append` itself: an
+automatic segment roll synchronizes the sealed segment and publishes its proof.
+The volume promotes the overlay after every journal operation and *before* publishing a newer
 version of the same unit; checkpointing re-derives the checkpointable set from
 the journal's own boundary rather than trusting earlier promotions.
 
-Checkpointing writes slots, synchronizes data, writes allocation metadata and
-fsyncs the data directory before clearing any dirty flag, commits checkpoint
-state, and only then deletes covered journal segments. A checkpoint that fails
-part-way leaves every incomplete step marked for the retry.
+Checkpointing captures a fixed durable horizon and shared overlay versions under
+the volume lock, then releases that lock while writing and synchronizing slot
+data. The live overlay remains readable, and new journal writes can proceed,
+including writes to the same unit or a new shard. A separate checkpoint gate
+serializes this whole sequence. Publication reacquires the volume lock, updates
+the current allocation metadata, fsyncs the data directory before clearing any
+dirty flag, commits the captured checkpoint horizon, and only then deletes
+covered journal segments and retires overlay versions through that horizon.
+Newer versions remain pending for a later checkpoint. A checkpoint that fails
+part-way retains the journal and incomplete steps needed for retry.
+
+Engine reads, journal writes, FLUSH, checkpoint data/metadata work, recovery in
+`Engine::attach`, and free-space queries run on Tokio's blocking pool. Storage
+locks are acquired asynchronously before dispatch. A dispatched read or write
+keeps its admission charge, and a write keeps its unit locks, until the storage
+operation finishes even if its caller is cancelled. Slow storage therefore does
+not monopolize a Tokio worker or let a later write overtake an unfinished write
+to the same unit. Checkpoint slot writes and shard syncs run outside the exclusive
+volume lock; preparation and metadata publication still hold it. Cancelling a
+checkpoint caller leaves its owned task running through publication or failure,
+so another checkpoint cannot overtake its data writes. Inline journal reclaim
+uses the same gate and repeats capacity admission after reclaim. Clean adapter
+shutdown also signals and joins the checkpoint worker,
+including an already dispatched free-space query, before releasing the volume.
+Attach-time key-canary metadata I/O remains synchronous.
+
+Proof replicas share the backing filesystem. Their CRCs do not provide
+authenticity or an external freshness anchor against coordinated valid rollback.
+Additional proof-file and directory syncs need target-system latency measurement;
+the current protocol prioritizes durable evidence over reducing barrier calls.
 
 Slot headers are authoritative; the shard catalog and the allocation maps are
 accelerators that an A/B fallback can leave one generation behind. Opening the
@@ -156,8 +217,11 @@ Checkpoints are not only a shutdown step. A background worker checkpoints when
 the journal crosses a size watermark, when backing free space drops below the
 checkpoint reserve, and on a time interval (syncing unsynced records first). The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims
-inline at the hard journal limit, and refuses writes with ENOSPC when the
-backing is below its emergency reserve or the journal cannot be reclaimed. A
+inline at the hard journal limit, and refuses writes with ENOSPC unless fresh
+backing space covers the emergency reserve, configured checkpoint headroom,
+projected record bytes, and all segment headers created by that write, or when
+the journal cannot be
+reclaimed. A
 failed reclaim marks the engine degraded until a later checkpoint succeeds; the
 [remediation log](review-remediation.md#bounded-journal) lists the exact rules.
 
@@ -208,6 +272,11 @@ connection replacement, and provider drop retire that generation, cancel its
 task, release its socket, and fail its pending requests without disturbing a
 successor connection.
 
+All remote transports support verified TLS and optional client certificate
+authentication. WSS and gRPC configuration resolves client keys through the
+same credential router as HTTP. Explicit TLS settings cannot be applied to a
+plaintext endpoint, and certificate failures never downgrade the connection.
+
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
 jitter retry. Retry budgets, circuit breakers, endpoint limits, and global byte
@@ -237,7 +306,10 @@ separate privileged `lvextend` and `xfs_growfs` operation.
   runtime layout lets `maki-admin` reach it through a separate directory tree
   while keeping the NBD runtime tree restricted to the daemon's group.
 - Privileged storage operations are isolated in `maki-attach`.
-- Keys and plaintext use redacted, zeroizing buffers and must not be logged.
+- Keys and plaintext must not be logged. `SecretBuffer` owners are redacted
+  and zeroized; remote serialization also creates allocations with separate
+  lifetimes. See [transport memory protection](transport-memory.md) for the
+  verified ownership boundaries and remaining copies.
 - Optional buffer page locks have shared ownership: buffers on the same page
   keep it locked until the final owner releases it. Drop zeroizes before
   releasing ownership; `into_vec` transfers zeroization to the caller and
@@ -246,6 +318,10 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 - Repeated credential names must declare the same source throughout a volume
   configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.
+- Whole-image and same-unit historical rollback remain outside the current
+  freshness guarantee. The [rollback protection proposal](rollback-protection-design.md)
+  describes an independent witness and retained authenticated generations;
+  those mechanisms are not implemented.
 
 See [Configuration](configuration.md), [Operations](operations.md), and the
 [technical specification](../SPEC.md) for detailed contracts.

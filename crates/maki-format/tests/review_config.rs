@@ -143,7 +143,7 @@ fn local_provider_requires_key_and_rejects_transport_sections() {
 }
 
 #[test]
-fn websocket_and_grpc_require_their_sections_and_reject_tls() {
+fn websocket_and_grpc_require_their_sections_and_accept_tls() {
     let ws = base()
         .replace(
             "provider = \"remote-http\"",
@@ -175,9 +175,9 @@ root = "/x"
 "#;
     ok(ws_only);
     let wss = ws_only.replace("ws://127.0.0.1:7000", "wss://crypto.internal:7000");
-    assert!(err(&wss).contains("TLS"));
+    ok(&wss);
     let ws_tls = format!("{ws_only}\n[crypto.websocket.tls]\nca_file = \"/etc/ca.pem\"\n");
-    assert!(err(&ws_tls).contains("TLS"));
+    assert!(err(&ws_tls).contains("not readable"));
 
     let grpc = ws_only
         .replace("remote-websocket", "remote-grpc")
@@ -185,7 +185,7 @@ root = "/x"
         .replace("ws://127.0.0.1:7000", "http://localhost:7000");
     ok(&grpc);
     let grpcs = grpc.replace("http://localhost:7000", "https://crypto.internal:7000");
-    assert!(err(&grpcs).contains("TLS"));
+    ok(&grpcs);
     let missing = "config_schema_version = 1\n[volume]\nname = \"t\"\nmax_virtual_size = \"1GiB\"\n[crypto]\nprovider = \"remote-grpc\"\ncrypto_compatibility_id = \"v1\"\n[crypto.capabilities]\nsupported_plaintext_sizes = [4096]\nmax_ciphertext_size = 4384\n[backing]\nroot = \"/x\"\n";
     assert!(err(missing).contains("crypto.grpc"));
 }

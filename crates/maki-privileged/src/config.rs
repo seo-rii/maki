@@ -9,7 +9,9 @@
 
 use serde::Deserialize;
 
-use crate::plan::{AttachRequest, AUTO_NBD_DEVICE};
+use crate::plan::{AttachRequest, LvmIdentityPins, AUTO_NBD_DEVICE};
+
+const MAX_LVM_PVS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -41,6 +43,8 @@ pub struct AttachConfig {
     pub vg_name: Option<String>,
     #[serde(default)]
     pub lv_name: Option<String>,
+    #[serde(default)]
+    pub lvm_identity: Option<LvmIdentityPins>,
     #[serde(default)]
     pub mountpoint: Option<String>,
     #[serde(default)]
@@ -117,6 +121,7 @@ impl AttachConfig {
             .or(self.lv_name)
             .unwrap_or_else(|| "data".to_string());
         check_lvm_name("lv_name", &lv_name)?;
+        let lvm_identity = self.lvm_identity.map(normalize_lvm_identity).transpose()?;
         let mountpoint = overrides
             .mountpoint
             .or(self.mountpoint)
@@ -153,12 +158,39 @@ impl AttachConfig {
             device_block_size,
             vg_name,
             lv_name,
+            lvm_identity,
             mountpoint,
             volume_uuid,
             fs_uuid,
             init_sentinel: overrides.init_sentinel || self.init_sentinel,
         })
     }
+}
+
+fn normalize_lvm_identity(mut pins: LvmIdentityPins) -> Result<LvmIdentityPins, ConfigError> {
+    check_lvm_identity(&pins)?;
+    pins.pv_uuids.sort();
+    Ok(pins)
+}
+
+pub(crate) fn check_lvm_identity(pins: &LvmIdentityPins) -> Result<(), ConfigError> {
+    if pins.pv_uuids.is_empty() || pins.pv_uuids.len() > MAX_LVM_PVS {
+        return Err(ConfigError::Invalid(format!(
+            "lvm_identity.pv_uuids must contain 1..={MAX_LVM_PVS} values"
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for value in &pins.pv_uuids {
+        check_lvm_uuid("lvm_identity.pv_uuids", value)?;
+        if !seen.insert(value) {
+            return Err(ConfigError::Invalid(
+                "lvm_identity.pv_uuids contains a duplicate".into(),
+            ));
+        }
+    }
+    check_lvm_uuid("lvm_identity.vg_uuid", &pins.vg_uuid)?;
+    check_lvm_uuid("lvm_identity.lv_uuid", &pins.lv_uuid)?;
+    Ok(())
 }
 
 /// A value passed to a system utility: never empty, never option-like,
@@ -249,6 +281,23 @@ pub fn check_uuid(name: &str, value: &str) -> Result<(), ConfigError> {
     if !ok {
         return Err(ConfigError::Invalid(format!(
             "{name} {value:?} is not a hyphenated UUID"
+        )));
+    }
+    Ok(())
+}
+
+/// LVM's 6-4-4-4-4-4-6 alphanumeric identifier format.
+pub fn check_lvm_uuid(name: &str, value: &str) -> Result<(), ConfigError> {
+    check_argument(name, value)?;
+    let parts: Vec<&str> = value.split('-').collect();
+    let shape = [6usize, 4, 4, 4, 4, 4, 6];
+    let ok = parts.len() == shape.len()
+        && parts.iter().zip(shape).all(|(part, len)| {
+            part.len() == len && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        });
+    if !ok {
+        return Err(ConfigError::Invalid(format!(
+            "{name} {value:?} is not an LVM UUID"
         )));
     }
     Ok(())

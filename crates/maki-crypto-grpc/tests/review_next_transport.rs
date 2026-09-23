@@ -61,7 +61,7 @@ where
     B: tonic::codegen::Body + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -80,7 +80,7 @@ where
                 .status(200)
                 .header("grpc-status", "0")
                 .header("content-type", "application/grpc")
-                .body(tonic::body::empty_body())
+                .body(tonic::body::Body::empty())
                 .unwrap())
         })
     }
@@ -227,7 +227,7 @@ mod response_body {
         B: tonic::codegen::Body + Send + 'static,
         B::Error: Into<StdError> + Send + 'static,
     {
-        type Response = http::Response<tonic::body::BoxBody>;
+        type Response = http::Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
         type Future = BoxFuture<Self::Response, Self::Error>;
 

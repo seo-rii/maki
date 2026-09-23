@@ -24,7 +24,7 @@ use maki_format::layout;
 use crate::error::CoreError;
 use crate::journal::effective_segment_size;
 use crate::recovery::{
-    acquire_lock, load_checkpoint_state, load_durable_mark, load_superblock, scan_journal,
+    acquire_lock, load_checkpoint_state, load_durable_mark, load_superblock, summarize_journal,
     JournalRepair, RecoveryError,
 };
 use crate::store::SlotStore;
@@ -122,8 +122,9 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         Err(e) => report.errors.push(format!("durable mark: {e}")),
     }
 
-    // Journal, exactly as recovery would see it.
-    match scan_journal(
+    // Apply recovery's validation and repair policy without retaining the
+    // replay payloads: this report needs only counts and repair decisions.
+    match summarize_journal(
         &backing,
         &superblock,
         checkpoint_sequence,
@@ -132,8 +133,8 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         Ok(scan) => {
             report.info.push(format!(
                 "journal: {} segment(s), {} record(s) newer than the checkpoint, durable sequence {}",
-                scan.segments.len(),
-                scan.replay.len(),
+                scan.segment_count,
+                scan.uncovered_records,
                 scan.durable_sequence
             ));
             for repair in &scan.repairs {

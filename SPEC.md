@@ -219,7 +219,8 @@ Responsibilities:
 allocate an NBD device
 connect the NBD device to the Unix socket
 configure device block size
-activate LVM PV/VG/LV
+verify NBD candidates and complete LVM membership
+activate the discovered VG UUID within the verified NBD device list
 mount XFS
 verify mount identity
 grow LVM
@@ -240,6 +241,16 @@ crypto request bodies
 ```
 
 The privileged helper is therefore strictly a **storage connection and control-plane component**.
+
+`maki-attach verify` supplies a repeatable read-only workload-start check using
+existing trusted state and root-controlled configuration. Both volume and XFS
+UUIDs must be pinned. It checks the connected backend, complete persisted
+mapping proof, whole read/write XFS mount without nested mounts, and volume
+sentinel; potentially blocking reads are followed by fresh identity checks.
+It does not create state or write-probe files, repair storage, start a DB, or certify
+another mount namespace. A successful `--plan` is only a preview. See
+[the verification contract](docs/storage-recovery.md#checking-storage-before-each-workload-start)
+for privilege, deadline and lifecycle limits.
 
 ---
 
@@ -441,7 +452,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=180
 
 User=maki
 Group=maki
@@ -474,6 +487,18 @@ ReadWritePaths=/run/maki-control/%i
 ```
 
 The exact sandbox options MUST be finalized after compatibility testing with nbdkit and all required shared libraries.
+
+The native plugin initializes its adapter in `after_fork`, so recovery,
+configured provider validation, and control socket binding precede the first
+NBD client. It sends `READY=1` from nbdkit's main process only after those
+steps succeed. Initialization or configured notification failure fails startup.
+Manual runs without `NOTIFY_SOCKET` perform the same initialization without
+notifying a service manager. The startup timeout needs qualification for the
+deployment's recovery size and provider latency.
+
+Initial data-plane readiness is separate from the helper's verified XFS mount,
+the fresh `maki-attach verify` workload gate, and database recovery. It does not
+provide continuous health monitoring or container reattachment.
 
 ---
 
@@ -617,6 +642,30 @@ Alignment             512
 
 Slot size            4608
 ```
+
+Maximum fully allocated layout sizes are calculated from the immutable
+geometry with checked arithmetic:
+
+```text
+num_units              = max_virtual_size / crypto_unit_size
+units_per_shard         = shard_logical_size / crypto_unit_size
+num_shards              = ceil(num_units / units_per_shard)
+full_slot_span_bytes    = num_shards * units_per_shard * slot_size
+allocation_map_ab_bytes = num_shards * 2 * (32 + ceil(units_per_shard / 8))
+catalog_ab_bytes        = 2 * (28 + 8 * num_shards)
+```
+
+Geometry creation MUST reject more than 2^24 possible shards, matching the
+supported shard-catalog limit, and any capacity calculation that overflows an
+unsigned 64-bit byte count. `maki volume inspect` reports these five
+maximum-layout values. They exclude journal and checkpoint headroom,
+filesystem metadata and copy-on-write overhead, and application temporary
+space; they are not a full-volume physical reservation. Before accepting a
+journal record, a Linux backing MUST physically allocate the exact journal
+range and the record's complete checkpoint slot. Both allocation-map copies
+and the catalog entry of a newly touched shard MUST already be durable. A
+failed reservation MUST NOT consume a sequence or append the record. Untouched
+slots MAY remain sparse.
 
 ---
 
@@ -765,8 +814,21 @@ for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
 `CryptoBatchRequest`. A provider that declares context binding MUST tie
 ciphertext to all of them. Maki's attach self-test probes each field
 separately (plus the unit index) and refuses attach when a foreign value
-decrypts to the original plaintext; an explicit rejection of an unsupported
-format version or compatibility ID is acceptable, a decrypt is not.
+decrypts to the original plaintext. A schema-level refusal is accepted only as
+`CryptoError::UnsupportedContext` for the exact field that probe changed:
+`FormatVersion` or `CompatibilityId`. A generic bad request, provider failure,
+or a refusal of another field does not prove context binding. Definitive
+`CryptoError::Integrity` or a valid changed plaintext also satisfies a context
+probe; an unavailable endpoint remains inconclusive.
+
+Explicit schema refusals use HTTP status `422` or gRPC status
+`FailedPrecondition` with exactly one `maki-crypto-error` header/metadata value:
+`unsupported-format-version` or `unsupported-compatibility-id`. WebSocket uses
+`error.class = "unsupported-context"` and one of the same `error.reason` values.
+Missing, unknown, duplicated, or conflicting classification fields are never
+context evidence. These tokens denote a field refusal, not an authentication
+failure; they cannot satisfy unit-index, volume-UUID, or tamper probes. Remote
+error text is ignored.
 
 ---
 
@@ -830,13 +892,8 @@ Requires daemon restart and self-test:
 ```text
 HTTP body mapping
 response mapping
-gRPC descriptor
+gRPC service method paths (the message schema is fixed)
 protocol adapter configuration
-```
-
-Hot-reloadable:
-
-```text
 endpoints
 credentials
 timeouts
@@ -844,8 +901,13 @@ retry settings
 circuit-breaker settings
 semaphore limits
 batch sizing
-LRU cache size
 ```
+
+The current runtime reload supports only `cache.max_bytes`, while
+`cache.mode = "read"`. It requires an integer byte count and refuses the change
+when the cache is disabled. Endpoint, credential, timeout, retry,
+circuit-breaker, semaphore, and batch reload requests explicitly report that
+the change was not applied; use the restart and self-test procedure above.
 
 ---
 
@@ -863,16 +925,69 @@ LRU cache size
 ├── data/
 ├── journal/
 │   ├── seg-<index>
-│   └── durable-mark
+│   ├── durable-proof.a
+│   ├── durable-proof.b
+│   └── durable-mark       (legacy/advisory)
 └── checkpoint/
     ├── state.a
     └── state.b
 ```
 
-`checkpoint/state.{a,b}` are written at creation (sequence 0) and recovery
-requires a valid copy. `journal/durable-mark` records the fdatasync'd prefix of
-the active segment after every sync, as a never-fsync'd lower bound; recovery
-uses it to distinguish durable-body corruption from a torn tail.
+New volumes MUST use superblock envelope v2 and require
+`journal/durable-proof.{a,b}`. The envelope version is separate from the crypto
+context's `format_version`; changing the envelope MUST NOT silently change AAD.
+Both initial proof copies and their directory entries MUST be durable before
+publishing the v2 superblock. `checkpoint/state.{a,b}` are also written at
+creation (sequence 0), and recovery requires a valid checkpoint copy.
+
+A durable proof is exactly 64 bytes:
+
+```text
+magic[8] = MAKIJDP1
+version u32 = 1
+generation u64
+volume_uuid[16]
+durable_sequence u64
+segment_index u64
+durable_size u64
+crc32
+```
+
+Sequence zero MUST use segment index zero and size zero. A positive horizon
+MUST identify an exact journal record end after the segment header. Decoders
+MUST enforce field and file-size bounds. Unsupported proof versions and hard
+I/O errors MUST NOT be downgraded to an invalid-copy fallback. Foreign UUIDs,
+contradictory equal generations and regressing horizons MUST fail explicitly.
+An unchanged sequence MUST NOT move to a different record end merely because
+an empty successor segment was created.
+
+After journal data sync, two preserve-first A/B publications of the same horizon
+and their directory syncs MUST complete before the public durable sequence or
+FUA/FLUSH acknowledgement advances. Both copies then attest that horizon even
+though their generations differ. The highest valid proof MUST be preserved
+before replacing the lower or invalid side. One missing/stale/corrupt copy may
+be tolerated when another retains the current horizon; both invalid/absent
+copies MUST refuse v2 recovery, including on an empty-looking volume.
+
+The single `journal/durable-mark` remains advisory and MAY be absent or stale.
+It MUST NOT replace or weaken required v2 evidence. Local CRC records do not
+authenticate metadata, prevent coordinated valid rollback, or provide separate
+physical failure domains.
+
+An optional, experimental outer backing format can anchor the authenticated
+namespace and retained COW pages in an independent trusted local witness.
+`backing.rollback_protection` requires `witness_root` and `capacity`; it is Linux
+only, restricted to new volumes, and does not reinterpret ordinary v2/v3 roots.
+Its bounded capacity, commit protocol and explicit threat model are specified in
+[Rollback-protected backing](docs/rollback-protection.md). This storage option
+does not upgrade the crypto provider's declared replay capability.
+
+Older envelope-v1-only binaries reject v2. Current writable recovery MUST refuse
+v1 before changing recovery metadata; acquiring or creating the advisory lock
+may happen first. Read-only checks MAY inspect v1 with an explicit warning that
+its missing horizon cannot be reconstructed. No automatic in-place upgrade is
+provided: preserve the source and perform a verified data migration as described
+in [Durable recovery and migration](docs/durable-recovery.md).
 
 Maki MUST acquire an exclusive volume lock.
 
@@ -1011,6 +1126,8 @@ journal append
  ↓
 journal fdatasync
  ↓
+publish the same required horizon to both proof copies and sync directory entries
+ ↓
 verify durable_sequence
  ↓
 success
@@ -1038,6 +1155,8 @@ A/B append complete
  ↓
 journal fdatasync
  ↓
+publish the same required horizon to both proof copies and sync directory entries
+ ↓
 advance durable_sequence
  ↓
 FLUSH success
@@ -1046,7 +1165,12 @@ FLUSH success
 After writeback failure, a successful sync retry alone MUST NOT establish
 durability. The writer MUST rewrite the accepted pending bytes, verify their
 identity, and synchronize them before advancing the durable boundary. Changed
-or lost bytes MUST cause failure without acknowledging them.
+or lost bytes MUST cause failure without acknowledging them. Proof write, sync
+or directory-sync failure MUST likewise fail the barrier and keep its pending
+range retryable, even without a new append. Public durable_sequence and
+checkpoint eligibility MUST remain behind that failed publication. Additional
+metadata and directory sync costs MUST be included in target-system FUA/FLUSH
+latency qualification.
 
 ---
 
@@ -1088,10 +1212,14 @@ write would exceed journal_max_bytes                 (inline, before the append)
 ```
 
 A write that would exceed `journal_max_bytes` after an inline checkpoint, or
-that arrives while backing free space is below
-`journal_emergency_reserve_bytes`, MUST fail with ENOSPC; reads continue. A
-failed checkpoint MUST be visible as a degraded volume state until a later
-checkpoint succeeds.
+whose fresh backing-space observation does not cover
+`journal_emergency_reserve_bytes` plus `checkpoint_reserve_bytes` and the exact
+projected journal footprint of that write, MUST fail with ENOSPC; reads
+continue. This admission check is enabled when
+`journal_emergency_reserve_bytes` is nonzero. An unavailable or failed
+free-space query
+MUST fail write admission while that reserve is enabled. A failed checkpoint
+MUST be visible as a degraded volume state until a later checkpoint succeeds.
 
 ---
 
@@ -1104,21 +1232,27 @@ acquire volume lock
  ↓
 select valid superblock
  ↓
-validate shard catalog (adopt unlisted shard data files)
+require envelope v2 and load valid durable proof (both missing/invalid = error)
  ↓
-validate allocation metadata (repair from slot headers when a copy is invalid)
+read shard catalog and allocation metadata
  ↓
-scan journal
+load selected checkpoint state
+ ↓
+scan journal and validate the required sequence and exact record-end boundary
+ ↓
+persist selected checkpoint state and apply approved metadata repairs
  ↓
 discard/truncate partial tail
  ↓
 rewrite and verify every accepted prefix, then fdatasync each segment
-and publish the durable mark
+and durably publish the accepted horizon to both required proof copies
 (a process restart hands recovery page-cache bytes: nothing it
 accepts may stay unsynced once the writer resumes, including pages
 whose dirty bits were cleared by failed writeback)
  ↓
-rebuild overlay
+scan the validated journal again and replay accepted records through a
+bounded ciphertext batch into checkpoint slots; sync shard data and
+allocation metadata, advance checkpoint state, then prune covered segments
  ↓
 run provider self-test
  ↓
@@ -1130,6 +1264,27 @@ verify key canary
  ↓
 READY
 ```
+
+Above the selected checkpoint, the surviving journal MUST bridge through the
+required horizon. Missing its entire segment or truncating it at an earlier
+complete-record boundary MUST fail. A proof's segment may have been pruned only
+when the checkpoint covers its horizon. Required-horizon validation MUST precede
+recovery metadata changes and tail repairs.
+
+Damage beyond the required final-tail boundary MAY be treated as torn unsynced
+data. An intact later record MUST NOT be used to infer earlier durability:
+unsynced sectors may persist out of order. Recovery MUST rewrite, verify and
+sync accepted prefixes, then publish both proofs before READY. It MUST NOT
+lower the horizon to make a damaged volume attach.
+
+The first scan streams segment data and retains no replay payloads. After all
+durability checks and repairs succeed, a second scan replays accepted records
+through a ciphertext batch capped at 1 MiB and advances the checkpoint before
+READY. A crash during that replay leaves the durable journal available for an
+idempotent retry. Shard catalogs, allocation maps, runtime state, provider
+buffers and filesystem cache remain separate memory costs. This establishes a
+payload replay bound, not a whole-process RSS limit or hardware/DB power-loss
+qualification.
 
 Key canary: on the first attach of a pristine volume, Maki encrypts a fixed,
 volume-bound plaintext at a reserved unit index and stores it A/B-replicated
@@ -1480,6 +1635,36 @@ read/write probe succeeds
 
 If the secure mount is unavailable, the container MUST NOT start.
 
+The attach helper probes the activated LV before mounting and requires XFS
+TYPE plus the configured `fs_uuid`, when present. It revalidates the NBD
+backend and recorded mapping before and after that bounded probe, then retains
+the post-mount checks above. The current helper permits `fs_uuid` to be omitted
+for compatibility; that does not establish the filesystem UUID match required
+by this production profile. The filesystem probe follows LVM activation.
+The separate pre-activation check compares independently probed PV labels
+with complete LVM metadata and scopes the helper's activation to verified
+NBD candidates and the discovered VG UUID. For the production profile, the
+root-owned attachment configuration MUST also provide the complete PV UUID set,
+VG UUID and configured target-LV UUID in `[lvm_identity]`; any mismatch MUST
+refuse activation. These administrator pins are part of the trusted attachment
+identity and MUST be rechecked during recovery. Grow and detach MUST refuse a
+configuration that removes or changes them. Omitting the table remains a
+compatibility mode and does not satisfy this production requirement. The helper
+durably records the verified live identity before activation and replaces it
+with the complete mapping proof after activation. If activation outlives the
+helper, ordinary detach may
+consume the intent while the recorded backend nonce remains connected, and
+recover may consume it only while that backend is absent. Both paths require
+the current NBD geometry and partition set plus every observed mapper name,
+UUID, dependency, holder and mount state to match the intent before they run
+device-list/VG-UUID-scoped deactivation. A partial activation is eligible only
+when every observed mapping is a verified subset; an unknown internal UUID
+suffix or mapper name is refused. The intent never authorizes an unmount or
+workload start. UUID pins do not coordinate udev or other privileged tools or
+provide automatic container reattachment. Its
+[supported topology and refusal rules](docs/storage-recovery.md#checking-lvm-before-activation)
+also apply.
+
 Example systemd dependency:
 
 ```text
@@ -1653,8 +1838,10 @@ are release-blocking failures.
 # 48. nbdkit Adapter Verification
 
 The adapter MUST verify device geometry, read and write callbacks, emulated FUA,
-FLUSH, parallel callbacks, panic containment, disabled native TRIM and
-write-zeroes, disabled multi-connection, disconnect, and clean detach.
+FLUSH, parallel callbacks, panic containment, opt-in v3 TRIM (complete crypto
+units only), disabled native write-zeroes, disabled multi-connection, disconnect,
+and clean detach. Default v2 volumes continue to advertise no TRIM; see
+`docs/space-reclamation.md` for the v3 persistence contract.
 
 Linux qualification additionally covers the exported API-v2 prefix, libnbd
 round trips, fio verification, and the kernel NBD path. See
@@ -1736,6 +1923,15 @@ valid power-loss evidence.
 ---
 
 # 55. CI Strategy
+
+The checked-in workflow runs the pull-request suite on Linux and Windows.
+Scheduled nightly jobs run the seven named release phase gates, the plugin
+build/ABI check, and fake-provider refusal. The DB gate is a simulated commit
+ledger; it does not run SQLite, PostgreSQL or a kernel XFS stack. The broader
+tiers below are qualification targets. Continued fuzzing, systemd sandbox,
+real DB/XFS, weekly and release qualification require separate runners and
+recorded results; a green push or nightly run does not certify those targets.
+See [the testing guide](docs/testing.md) for the implemented commands and limits.
 
 ## Pull Request
 
@@ -1843,7 +2039,7 @@ crypto_compatibility_id = "vendor-profile-prod-v1"
 availability_policy = "stall"
 
 [crypto.capabilities]
-mode = "hybrid"
+mode = "declared"
 
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
@@ -1851,8 +2047,11 @@ max_ciphertext_size = 4384
 stateless = true
 retry_safe = true
 
-integrity = "none"
-context_binding = "none"
+# Required authenticated provider contract; failed probes must be fixed at
+# the provider rather than bypassed by lowering these declarations.
+integrity = "contractual"
+context_binding = "contractual"
+# Authentication alone does not prevent replay of older valid ciphertext.
 replay_protection = "none"
 
 [[crypto.http.endpoint]]

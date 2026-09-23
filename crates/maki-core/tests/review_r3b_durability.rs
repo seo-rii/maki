@@ -14,8 +14,9 @@
 //! dirty writes are lost) during the workload; acknowledged data must still
 //! obey the oracle and a failed write may surface but never a foreign value.
 
-// The process-global failpoint lock is held across the whole body of the
-// deterministic tests (single-threaded runtime, like `review_audit2.rs`).
+// Every test holds the process-global failpoint lock for its whole body:
+// even a sweep that installs no global fault can consume another test's
+// injection. Worker tasks remain concurrent within each workload.
 #![allow(clippy::await_holding_lock)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +29,7 @@ use rand::{Rng, SeedableRng};
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{AttachError, Engine, EngineCacheConfig, EngineOptions};
+use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineCacheConfig, EngineOptions};
 use maki_core::error::CoreError;
 use maki_format::geometry::Geometry;
 use maki_format::init;
@@ -76,6 +77,10 @@ fn cache_options(unit: u32, cache: bool) -> EngineOptions {
             max_bytes: 6 * unit as u64,
             ttl: std::time::Duration::from_secs(3600),
         }),
+        checkpoint: CheckpointPolicy {
+            emergency_reserve_bytes: 0,
+            ..Default::default()
+        },
         ..EngineOptions::default()
     }
 }
@@ -377,9 +382,6 @@ async fn sweep_verbose(
 
 #[tokio::test]
 async fn random_workloads_survive_power_loss_and_restart_cycles() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..120u64 {
         sweep(seed, 4, 0).await;
@@ -388,9 +390,6 @@ async fn random_workloads_survive_power_loss_and_restart_cycles() {
 
 #[tokio::test]
 async fn random_workloads_with_sync_failures_never_show_foreign_data() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..80u64 {
         sweep(seed, 4, 150).await;
@@ -401,9 +400,6 @@ async fn random_workloads_with_sync_failures_never_show_foreign_data() {
 /// restart's recovery must have made what it accepted durable.
 #[tokio::test]
 async fn restart_followed_by_power_loss_keeps_recovered_state() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..80u64 {
         let mut rng = StdRng::seed_from_u64(seed);
@@ -448,9 +444,6 @@ async fn restart_followed_by_power_loss_keeps_recovered_state() {
 #[tokio::test]
 #[ignore = "release gate: long randomized durability sweep"]
 async fn phase_r3b_durability_gate_full() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..1500u64 {
         sweep(seed, 6, 0).await;
@@ -460,15 +453,9 @@ async fn phase_r3b_durability_gate_full() {
     }
 }
 
-/// Minimised from `random_workloads_with_sync_failures_never_show_foreign_data`
-/// seed 3. An orphan shard data file (its allocation map's first sync
-/// failed, then power was lost) is adopted at open with an in-memory empty
-/// map. Creating *another* shard afterwards commits the in-memory catalog —
-/// which now names the adopted shard — before the adopted shard's map has
-/// ever reached disk. If the checkpoint then fails before allocation
-/// persistence and power is lost, the catalog names a shard with no
-/// allocation copy and every later attach is refused (K-03's residual: the
-/// order was fixed in `persist_allocations` but not in `ensure_shard`).
+/// A failed pre-journal reservation can leave an orphan shard file. Creating
+/// another shard must never catalog that orphan without an allocation copy,
+/// and the rejected write must remain absent after power loss.
 #[tokio::test]
 async fn adopted_shard_is_never_cataloged_by_another_shards_creation() {
     let _serial = maki_test_support::failpoints::test_lock();
@@ -487,22 +474,22 @@ async fn adopted_shard_is_never_cataloged_by_another_shards_creation() {
         }
         _ => None,
     })));
-    engine.write(off(16), &image(16, 1), false).await.unwrap();
-    engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine
+        .write(off(16), &image(16, 1), false)
+        .await
+        .unwrap_err();
     // A lower shard's creation in the next attempt syncs the data
     // directory, making shard 2's data-file dirent durable; shard 2's map
     // still fails.
     engine.write(off(8), &image(8, 1), false).await.unwrap();
     engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine.checkpoint().await.unwrap();
     backing.set_fault_hook(None);
     drop(engine);
     backing.crash_all_lost();
 
-    // Recovery adopts the orphan. A write to a new, higher shard makes the
-    // next checkpoint create shard 3, whose catalog commit names shard 2
-    // too; allocation persistence then fails before shard 2's map exists.
+    // Recovery adopts any surviving orphan. A write to a new, higher shard
+    // may publish a new catalog, but only after adopted maps are durable.
     let engine = attach(&backing).await;
     engine.write(off(24), &image(24, 2), false).await.unwrap();
     engine.flush().await.unwrap();
@@ -521,20 +508,21 @@ async fn adopted_shard_is_never_cataloged_by_another_shards_creation() {
     let engine = try_attach(&backing)
         .await
         .unwrap_or_else(|e| panic!("attach refused after an interrupted shard creation: {e}"));
-    for (unit, stamp) in [(0u64, 1u32), (8, 1), (16, 1), (24, 2)] {
+    for (unit, stamp) in [(0u64, 1u32), (8, 1), (24, 2)] {
         assert_eq!(
             engine.read(off(unit), UNIT as usize).await.unwrap(),
             image(unit, stamp),
             "unit {unit}"
         );
     }
+    assert_eq!(
+        engine.read(off(16), UNIT as usize).await.unwrap(),
+        vec![0; UNIT as usize]
+    );
 }
 
-/// Minimised from the same sweep, seed 12. The orphan's allocation map is
-/// *readable* after a plain restart (its sync failed, the page cache kept
-/// the bytes — K-01), so open loaded it as if it were on disk and nothing
-/// ever re-stored it; the next catalog commit named the shard, and the power
-/// loss that followed dropped the only copy.
+/// The same orphan rule holds across a plain restart where a failed map sync
+/// can remain readable from page cache until the next catalog publication.
 #[tokio::test]
 async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
     let _serial = maki_test_support::failpoints::test_lock();
@@ -550,12 +538,13 @@ async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
         }
         _ => None,
     })));
-    engine.write(off(40), &image(40, 1), false).await.unwrap();
-    engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine
+        .write(off(40), &image(40, 1), false)
+        .await
+        .unwrap_err();
     engine.write(off(8), &image(8, 1), false).await.unwrap();
     engine.flush().await.unwrap();
-    engine.checkpoint().await.unwrap_err();
+    engine.checkpoint().await.unwrap();
     backing.set_fault_hook(None);
 
     // Restart, not power loss: shard 5's volatile map is still readable.
@@ -578,13 +567,17 @@ async fn adopted_shards_page_cache_map_is_re_stored_before_it_is_cataloged() {
     let engine = try_attach(&backing)
         .await
         .unwrap_or_else(|e| panic!("attach refused after a restart adopted an orphan: {e}"));
-    for (unit, stamp) in [(0u64, 1u32), (8, 1), (16, 2), (40, 1)] {
+    for (unit, stamp) in [(0u64, 1u32), (8, 1), (16, 2)] {
         assert_eq!(
             engine.read(off(unit), UNIT as usize).await.unwrap(),
             image(unit, stamp),
             "unit {unit}"
         );
     }
+    assert_eq!(
+        engine.read(off(40), UNIT as usize).await.unwrap(),
+        vec![0; UNIT as usize]
+    );
 }
 
 /// Minimised from `phase_r3b_durability_gate_full` (seed 388, sync faults).
@@ -843,9 +836,6 @@ async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_partial_unit_workloads_survive_power_loss_and_restart() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..24u64 {
         concurrent_sweep(seed, 3, false).await;
@@ -855,9 +845,6 @@ async fn concurrent_partial_unit_workloads_survive_power_loss_and_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "release gate: long concurrent partial-unit durability sweep"]
 async fn phase_r3b_concurrent_gate_full() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..300u64 {
         concurrent_sweep(seed, 4, false).await;
@@ -874,9 +861,6 @@ async fn phase_r3b_concurrent_gate_full() {
 
 #[tokio::test]
 async fn random_workloads_with_a_plaintext_cache_survive_power_loss_and_restart() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..60u64 {
         sweep_cached(seed, 4, 0).await;
@@ -885,9 +869,6 @@ async fn random_workloads_with_a_plaintext_cache_survive_power_loss_and_restart(
 
 #[tokio::test]
 async fn random_workloads_with_a_plaintext_cache_and_sync_failures_never_show_foreign_data() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..40u64 {
         sweep_cached(seed, 4, 150).await;
@@ -896,9 +877,6 @@ async fn random_workloads_with_a_plaintext_cache_and_sync_failures_never_show_fo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_partial_unit_workloads_with_a_plaintext_cache() {
-    // Failpoints are process-global: every engine in this binary must be
-    // serialized against the failpoint-using tests, or a background
-    // checkpoint of another test consumes an armed failure.
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..12u64 {
         concurrent_sweep(seed, 3, true).await;
@@ -1467,5 +1445,67 @@ async fn never_finished_shard_reads_as_holes(backing: &Arc<CrashableBacking>, pa
         engine.read(off(5), UNIT as usize).await.unwrap(),
         vec![0u8; UNIT as usize],
         "a never-written unit of the adopted shard still reads as zeros"
+    );
+}
+
+/// Minimised from `random_workloads_with_sync_failures_never_show_foreign_data`
+/// (seed 29) once checkpoint destinations were reserved at write admission.
+/// A shard's creation stopped at its data file's size sync and power was
+/// lost: a zero-length orphan with no allocation copy, adopted at the next
+/// attach as never finished. A checkpoint with nothing new to apply then
+/// persisted the pending repairs — and cataloged the orphan without proving
+/// its size first. The next power loss left a *cataloged* zero-length file,
+/// which the truncation rule marks allocated: every never-written unit of
+/// the shard read EIO. `ensure_shard`'s catalog commit already proved the
+/// file through `commit_adopted_maps`; the repair checkpoint's commit is the
+/// other one and must do the same.
+#[tokio::test]
+async fn adopted_orphan_is_sized_before_a_repair_checkpoint_catalogs_it() {
+    let _serial = maki_test_support::failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    drop(attach(&backing).await);
+    let geometry = superblock().geometry;
+    let per_shard = geometry.units_per_shard();
+    let shard_idx = 4;
+    let path = maki_format::layout::shard_data(shard_idx);
+    drop(backing.open(&path, true).unwrap());
+    backing.sync_dir(maki_format::layout::DATA_DIR).unwrap();
+
+    // Nothing new is durable: the checkpoint only persists the repairs
+    // (the adopted shard's map and the catalog naming it).
+    let engine = attach(&backing).await;
+    engine.checkpoint().await.unwrap();
+    assert_eq!(
+        backing.open(&path, false).unwrap().len().unwrap(),
+        per_shard * geometry.slot_size,
+        "the data file is sized before the catalog names the shard"
+    );
+    drop(engine);
+    backing.crash_all_lost();
+
+    let engine = attach(&backing).await;
+    for in_shard in [0, 3, per_shard - 1] {
+        let unit = shard_idx * per_shard + in_shard;
+        assert_eq!(
+            engine.read(off(unit), UNIT as usize).await.unwrap(),
+            vec![0u8; UNIT as usize],
+            "unit {unit} of a never-written, now cataloged shard is a hole"
+        );
+    }
+    let unit = shard_idx * per_shard + 1;
+    engine.write(off(unit), &image(unit, 1), true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+    drop(engine);
+    backing.crash_all_lost();
+
+    let engine = attach(&backing).await;
+    assert_eq!(
+        engine.read(off(unit), UNIT as usize).await.unwrap(),
+        image(unit, 1)
+    );
+    assert_eq!(
+        engine.read(off(unit + 1), UNIT as usize).await.unwrap(),
+        vec![0u8; UNIT as usize],
+        "a neighbouring never-written unit still reads as zeros"
     );
 }

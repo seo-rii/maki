@@ -137,3 +137,31 @@ async fn credential_source_never_falls_back_to_the_environment() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn production_sample_requires_authenticated_full_context_encryption() {
+    use maki_crypto::{Capability, CryptoProvider};
+    let config = parse_and_validate(SAMPLE).unwrap();
+    let mut keys = MapKeySource::new();
+    keys.insert("crypto-token", b"test-token".to_vec());
+    let provider = HttpCryptoProvider::from_config(
+        &config,
+        &config.crypto.http.as_ref().unwrap().endpoint[0].url,
+        &keys,
+    )
+    .unwrap();
+    let capabilities = provider.capabilities().await.unwrap();
+    assert!(
+        capabilities.integrity.present(),
+        "production template must require ciphertext authentication"
+    );
+    assert!(
+        capabilities.context_binding.present(),
+        "production template must require full context binding"
+    );
+    assert_eq!(
+        capabilities.replay_protection,
+        Capability::Absent,
+        "AEAD does not prove freshness"
+    );
+}

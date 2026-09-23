@@ -59,7 +59,7 @@ fn policy() -> CheckpointPolicy {
         journal_high_watermark_bytes: 32 * 1024,
         journal_max_bytes: 64 * 1024,
         max_pending_bytes: 16 * 1024,
-        emergency_reserve_bytes: 1 << 20,
+        emergency_reserve_bytes: 0,
         low_space_checkpoint_bytes: 0,
         interval: Duration::from_secs(30),
     }
@@ -101,6 +101,20 @@ async fn settle() {
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
+}
+
+async fn wait_checkpoint(engine: &Engine, sequence: u64) -> maki_core::engine::EngineStats {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = engine.stats().await;
+            if s.checkpoint_sequence == sequence {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background checkpoint did not complete")
 }
 
 // ---------- hard limit ----------
@@ -165,13 +179,13 @@ async fn worker_checkpoints_when_watermark_is_crossed() {
     let p = policy();
     let engine = engine(&backing, p.clone(), None).await;
 
-    // Enough FUA writes to cross the watermark but stay under the hard cap.
-    let n = p.journal_high_watermark_bytes / RECORD + 2;
+    // Stop at the first crossing. A later write can legitimately land after
+    // the worker has reclaimed the journal and be below the new watermark.
+    let n = p.journal_high_watermark_bytes / RECORD + 1;
     for i in 0..n {
         engine.write(off(i % UNITS), &data(1), true).await.unwrap();
     }
-    settle().await;
-    let s = engine.stats().await;
+    let s = wait_checkpoint(&engine, n).await;
     assert!(s.checkpoints_total >= 1, "worker did not checkpoint: {s:?}");
     assert!(s.journal_total_bytes < p.journal_high_watermark_bytes);
     assert_eq!(s.checkpoint_sequence, s.durable_sequence);
@@ -191,8 +205,7 @@ async fn worker_checkpoints_on_interval_and_syncs_pending_records() {
     assert_eq!(before.durable_sequence, 0, "not synced yet");
 
     clock.advance(Duration::from_secs(31));
-    settle().await;
-    let after = engine.stats().await;
+    let after = wait_checkpoint(&engine, 1).await;
     assert_eq!(after.durable_sequence, 1, "interval pass syncs the tail");
     assert_eq!(after.checkpoint_sequence, 1, "and applies it");
     assert_eq!(after.checkpoints_total, 1);
@@ -256,7 +269,10 @@ async fn emergency_reserve_refuses_writes_until_space_returns() {
     let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
     let clock = Arc::new(ManualClock::new());
-    let engine = engine(&backing, policy(), Some(clock.clone())).await;
+    backing.set_free_bytes(Some(1 << 30));
+    let mut p = policy();
+    p.emergency_reserve_bytes = 1 << 20;
+    let engine = engine(&backing, p, Some(clock.clone())).await;
     engine.write(off(0), &data(0xAA), true).await.unwrap();
 
     backing.set_free_bytes(Some(4096));
@@ -350,7 +366,9 @@ async fn audit_20260907_journal_hard_limit_counts_new_segment_headers() {
     p.journal_high_watermark_bytes = p.journal_max_bytes;
     let e = engine(&backing, p.clone(), None).await;
     for i in 0..filled_segments * records_per_segment {
-        e.write(off(i % UNITS), &data(i as u8), false).await.unwrap();
+        e.write(off(i % UNITS), &data(i as u8), false)
+            .await
+            .unwrap();
     }
     assert_eq!(e.stats().await.journal_total_bytes, before_roll);
     // Record-only admission sees exact equality. The actual append must also

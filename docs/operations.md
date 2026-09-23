@@ -8,6 +8,21 @@ appropriate privileges.
 The repository includes a guarded, destructive-target-restricted procedure in
 [Privileged Linux validation](privileged-linux-validation.md).
 
+## Volume compatibility before upgrade
+
+New volumes use superblock envelope v2 with two required durable-proof files.
+Older binaries reject v2. This build refuses writable recovery of legacy v1
+before changing recovery metadata, although it may acquire/create the advisory
+lock first. Read-only checks support v1 with a warning; they cannot certify
+history whose durable horizon is missing.
+
+Read [durable recovery and migration](durable-recovery.md) before replacing an
+existing installation. There is no automatic in-place format upgrade. Preserve
+an untouched source, old software and provider/key material, then use an
+isolated recovery copy and verified logical/DB-native transfer to a fresh v2
+volume. Do not remove proofs or change format bytes to bypass a refusal. The
+crypto context's `format_version` is unchanged by the envelope version.
+
 ## Prerequisites
 
 Building the Rust workspace requires a Rust toolchain. The Linux data path also
@@ -19,6 +34,12 @@ On Debian-family systems the relevant packages are `nbdkit`,
 `nbdkit-plugin-dev`, `libnbd-bin`, and `fio`. Package and service installation
 remain distribution-specific.
 
+Privileged attachment additionally requires nbd-client 3.27.0 or later built
+with netlink and backend-identifier support. The helper validates `/dev/nbdN`
+as the configured block path and supplies `nbdN` to netlink nbd-client
+connect/disconnect commands. Debian 12's stock nbd-client 3.24 does not satisfy
+this requirement.
+
 ## Build the plugin
 
 ```bash
@@ -27,9 +48,14 @@ nm -D --defined-only target/release/libmaki_nbdkit.so |
   grep -Eq '[[:space:]]T[[:space:]]plugin_init$'
 ```
 
-The exported structure uses the validated nbdkit API-v2 prefix. FLUSH is
-available, FUA is emulated by nbdkit, and native TRIM, write-zeroes, block-size
-negotiation, and multi-connection callbacks are not exported.
+The exported structure uses the validated nbdkit API-v2 prefix. FLUSH and
+native FUA reach the engine, and the block-size callback advertises the
+configured I/O limits. TRIM is available for new volumes explicitly created with
+`--discard`; ordinary v2 volumes retain their existing behavior. Multi-connection
+is disabled. See [space reclamation](space-reclamation.md) for format selection,
+partial-unit behavior and checkpoint ordering. The plugin
+does not provide a native write-zeroes callback; nbdkit emulates zeroing with
+ordinary writes.
 
 ## Volume lifecycle
 
@@ -40,6 +66,16 @@ maki volume create /etc/maki/volumes/example.toml
 maki volume inspect /etc/maki/volumes/example.toml
 maki check /etc/maki/volumes/example.toml
 ```
+
+The inspect output includes `maximum units`, `maximum shards`, `full slot span
+bytes`, `allocation map A/B bytes`, `discard map A/B bytes`, and `catalog A/B bytes`.
+The discard-map estimate is zero for v2 and equals the allocation-map estimate
+for v3. Use them as the
+format-file baseline for a fully allocated volume. They do not include journal
+or checkpoint headroom, filesystem metadata, copy-on-write overhead, or
+database temporary files, and the command does not reserve disk space. Keep
+the configured reserves and independently qualified operational margin beyond
+the reported values.
 
 `volume create` writes the initial superblock, catalog, and backing directories,
 all owner-only (`0700` directories, `0600` files). The command must target an
@@ -61,18 +97,37 @@ maki-check /var/lib/maki/example --deep
 maki check /etc/maki/volumes/example.toml --deep
 ```
 
-Without `--deep` the check covers the superblock, shard catalog, allocation-map
-sizes, and file presence only. `--deep` additionally verifies both checkpoint
-state copies, the key canary, the durable mark, every journal segment exactly
-as recovery would scan it (reporting the repairs recovery would make), and
-every allocated slot exactly as the engine would read it. A volume that holds
-data is only known good after a deep check passes. `--deep` takes the volume
-lock and refuses to run while a daemon is attached; when checking a backing
+Without `--deep` the check covers the superblock, required v2 proof records,
+shard catalog, allocation-map sizes, and file presence. `--deep` additionally
+verifies both checkpoint state copies, the key canary, and every journal
+segment as recovery would scan it, including the required horizon and its
+exact record end (or the legacy advisory-mark policy). It reports the repairs
+recovery would make and checks every allocated slot's stored structure and
+checksums. A successful deep check
+does not decrypt data, authenticate its ciphertext, establish freshness, or
+prove filesystem or database consistency. Canary checking here validates its
+stored structure and volume identity; actual key verification happens at
+attach. Combine these checks with provider authentication and application
+recovery/backup verification before accepting recovered data.
+
+`--deep` takes the volume lock and refuses to run while a daemon is attached;
+when checking a backing
 root directly, pass `--journal-segment-size` if the volume uses a non-default
 size.
 
 Run offline checks only after the daemon or nbdkit process has released the
 volume lock.
+
+## Swap dependency checks
+
+With `security.require_secure_swap_policy`, Linux attach accepts no swap,
+RAM-only zram, or dm-crypt whose complete kernel dependency graph terminates
+at independent physical devices. The same check applies to zram writeback.
+Encrypted swap above NBD, including through partitions, LVM, or MD, is refused:
+paging out Maki must not require Maki to serve that paging I/O. Missing or
+inconsistent sysfs metadata, cycles, and unproven virtual backing are refused.
+Keep swap and its dependency topology fixed while the attachment is running;
+this is an attach-time check, not a watcher of privileged device changes.
 
 ## Key binding at first attach
 
@@ -107,8 +162,17 @@ nbdkit --foreground \
   config=/etc/maki/volumes/example.toml
 ```
 
-The plugin creates its Tokio runtime after nbdkit forks. Clean shutdown flushes
-the engine, checkpoints durable state, and releases the volume lock.
+The plugin creates its Tokio runtime after nbdkit forks. Run it in the foreground,
+including under systemd, and retain stderr in the service journal: attach and
+unload failures are reported there. Background daemonization is not a qualified
+logging mode. Clean shutdown closes I/O admission, waits for admitted callbacks,
+flushes the engine, checkpoints durable state, and releases the volume lock.
+
+After stopping workloads and unmounting their filesystems, use `maki drain` to
+obtain an explicit durability acknowledgement before stopping nbdkit. The
+plugin's unload callback cannot return an error to nbdkit; a zero process exit
+status alone does not acknowledge a successful drain. The packaged service's
+stop path is not a substitute for this administrative check.
 
 ## Rootless userspace smoke test
 
@@ -160,8 +224,25 @@ line limit. The `maki` CLI exposes the supported operations:
 maki status /etc/maki/volumes/example.toml
 maki metrics /etc/maki/volumes/example.toml
 maki checkpoint /etc/maki/volumes/example.toml
+maki drain /etc/maki/volumes/example.toml
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 ```
+
+`drain` permanently closes admission to reads, writes, flushes, checkpoints,
+and reloads for that attachment. It waits for already admitted callbacks,
+including writes still waiting for encryption, then flushes and checkpoints.
+Success returns `checkpoint_sequence`; repeated drains return the same
+acknowledgement. `status` and `metrics` remain available, and the daemon retains
+the volume lock until shutdown. Reattach to resume I/O.
+
+`status` includes `io_state` (`running`, `draining`, `failed`, or `drained`) and
+`drain_error`. A failed drain returns an error to the CLI, preserves the engine
+and volume lock, and keeps admission closed. Correct the storage failure and
+retry `maki drain` while the process is still alive. A timeout is not an
+acknowledgement: inspect status and retry. If the process exits after a failed
+drain, its unload error is logged; the next attach performs recovery. Do not
+treat process cleanup or socket removal as proof that the failed barrier
+succeeded.
 
 `reload cache` needs the new size; it is refused (not silently accepted) on a
 daemon running with `cache.mode = "off"`.
@@ -169,16 +250,53 @@ daemon running with `cache.mode = "off"`.
 Attach, detach, mount, unmount, NBD, and growth verbs are deliberately absent
 from the control socket.
 
+## Data-plane readiness
+
+The packaged data-plane service uses `Type=notify`. The native plugin opens
+the configured volume in nbdkit's `after_fork` callback, before the first NBD
+client, and sends `READY=1` after recovery, the configured provider checks, and
+control socket binding succeed. `maki-attach@` therefore waits for this initial
+data-plane readiness through its existing `Requires=` and `After=` ordering.
+An initialization or notification failure fails startup. The unit has a
+180-second startup deadline; qualify and override that value for the expected
+recovery size and provider latency. The packaged foreground process is the
+notification sender. Manual runs without `NOTIFY_SOCKET` still initialize
+before accepting clients, without sending a service notification.
+
+This notification does not certify XFS attachment, database recovery, or
+continued health. Mount readiness still requires successful attach, and every
+workload start needs the fresh [storage identity gate](storage-recovery.md#checking-storage-before-each-workload-start).
+The lifecycle follows nbdkit's [after-fork callback contract](https://libguestfs.org/nbdkit-plugin.3.html#Callback-lifecycle)
+and systemd's [notification protocol](https://github.com/systemd/systemd/blob/v252/man/sd_notify.xml#L370).
+
 ## Privileged helper
 
 `maki-attach` reads its parameters from the root-owned
 `/etc/maki/attach/<volume>.toml` (template:
 [`packaging/examples/attach.toml`](../packaging/examples/attach.toml)): the Maki
 volume UUID, the mountpoint, VG and LV names, an optional pinned NBD device and
-an optional expected XFS UUID. Command-line flags override individual values.
+an optional expected XFS UUID. The production profile also provides the complete
+PV UUID set, VG UUID and configured target-LV UUID in `[lvm_identity]`.
+Command-line flags override individual values other than those LVM pins.
 Every value is checked before it reaches a system utility: option-like values,
 relative or non-canonical paths, and malformed UUIDs are rejected with exit
 code 2 and no plan is printed.
+
+Before its LVM activation, attach inventories the recorded NBD and its kernel
+partitions, compares independently probed PV identifiers with the complete VG
+report, and limits activation to those devices and the discovered VG UUID.
+It refuses incomplete or foreign membership, duplicate PV labels, existing
+holders, overlapping PV regions, blank or unclassified candidates, shared VGs,
+nonempty VG system IDs, and cachevol layouts. This requires compatible LVM2
+report and scoped activation options.
+When `[lvm_identity]` is present, attach additionally requires the observed PV
+set and VG/target-LV UUIDs to equal the administrator pins before activation.
+Those pins become part of the trusted record; recovery rechecks them, and a
+grow or detach whose current configuration omits or changes them is refused
+before mutation. Omitting the table is supported only for compatibility and is
+outside the production profile. The checks do not coordinate host udev or other
+privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
+before using an existing partition layout or host activation policy.
 
 The helper prints an auditable operation plan before execution. Always review
 plan mode first:
@@ -186,8 +304,16 @@ plan mode first:
 ```bash
 maki-attach attach --volume example --plan
 maki-attach detach --volume example --plan
-maki-attach grow --volume example --add-bytes 1073741824 --plan
+maki-attach grow --volume example --size-bytes 2147483648 --plan
 ```
+
+`grow --size-bytes` is an absolute minimum LV size in bytes. LVM may round
+up to its extent size; an LV already at or above the target is left unchanged,
+and XFS growth is retried. Reuse the same target after a timeout or failure,
+including a failure after `lvextend` already changed the LV. The former
+`--add-bytes` option is rejected because a relative increase cannot identify
+a retry. Growth revalidates the live attachment before each mutation and
+never shrinks the LV or filesystem.
 
 Execution (Linux, root) then:
 
@@ -197,9 +323,12 @@ Execution (Linux, root) then:
 2. records the requested attachment and a random connection identifier before
    connecting NBD, then connects with the configured block size, waits until
    the device reports a size, and verifies its kernel backend identifier;
-3. activates the VG, mounts XFS, and on `--init-sentinel` (or
-   `init_sentinel = true`, first boot only) creates `<mountpoint>/.maki-sentinel`
-   holding the volume UUID, never overwriting a different value;
+3. activates the VG and records its mapping identity, then verifies XFS TYPE
+   and the optional configured `fs_uuid` with a bounded block probe before
+   mounting. It rechecks backend/mapping identity around that probe. After
+   mounting, `--init-sentinel` (or `init_sentinel = true`, first boot only)
+   creates `<mountpoint>/.maki-sentinel` holding the volume UUID, never
+   overwriting a different value; see [attachment limits](storage-recovery.md);
 4. verifies the mount identity from `/proc/self/mountinfo`, `blkid`, sysfs NBD
    state, the sentinel, and a read/write probe (the mount root belongs to the
    workload: the sentinel is opened without following symlinks and read to a
@@ -214,14 +343,41 @@ Attachment records live in `/run/maki-attach/<volume>.nbd`, under a
 `root:root` 0700 directory. Records are bounded, private, single-link regular
 files containing versioned JSON. The helper refuses symlinks, writable
 ancestors, unexpected ownership, and malformed or legacy device-only records.
-An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV, device,
-and random connection identifier.
+An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV,
+optional administrator LVM pins, device, random connection identifier, and
+either the pre-activation recovery intent or the complete post-activation
+mapping proof.
 
 `maki-attach detach` takes the same lock and compares the requested attachment
 with that record and the live `/sys/block/nbdN/backend` before unmounting or
 deactivating a VG. It verifies the backend again immediately before disconnect,
 including rollback. Missing records or mismatched identities refuse execution;
 an explicit `--nbd-device` cannot bypass this check.
+
+`maki-attach cleanup --volume <volume>` is the idempotent selector used by the
+packaged service lifecycle. Under the same single attach lock, no trusted
+record is already clean and succeeds without probing the backend. A matching
+connected backend follows the detach path; a known absent backend follows the
+recovery path. A foreign or unreadable backend fails before mutation and keeps
+the record. Re-run cleanup after a partial successful effect; each selected
+path re-observes storage identity before its next change.
+
+If a dead nbdkit server leaves its recorded kernel connection present, only
+`cleanup` has a narrow fallback for the resulting LVM read failure. It first
+runs the normal `vgchange -an`; only an exited command with a nonzero status may
+continue. The completed post-activation proof must contain one recorded target
+mapping and no other DM layer. The current mapping must still match its name,
+UUID, major/minor, slave edge and backend nonce, have no mount or foreign holder,
+and report open count zero through `dmsetup info`. Cleanup then issues one plain
+`dmsetup remove` for that exact name, rechecks that the mapping and holder are
+gone, and only then disconnects NBD. It never uses force, deferred removal, or
+retry flags.
+
+Explicit `detach` and `recover`, a pre-activation intent, multi-LV/internal
+thin/cache/RAID mappings, open or changed targets, backend changes, and command
+timeouts do not enter this fallback. They retain the trusted record and require
+operator diagnosis. This limit keeps direct device-mapper mutation within the
+single-LV topology qualified on the disposable GCE host.
 
 Detach retries observe current mountinfo and sysfs state before each step.
 An already completed unmount or VG deactivation is skipped. A remaining mount
@@ -230,6 +386,14 @@ VG mappings must use the recorded NBD device. A different mount or backend,
 unreadable observations, remaining device holders (including partition
 holders), and direct mounts of the NBD device or its partitions block unsafe
 deactivation or disconnect.
+
+If attach stopped after verified activation but before publishing the complete
+mapping proof, normal detach may use the saved recovery intent only while its
+backend nonce remains connected. It refuses any mount and any changed device,
+partition, mapper name, UUID, dependency or holder. A verified partial mapping
+subset can be deactivated with the recorded device list and VG UUID; an unknown
+internal LVM UUID suffix is not treated as owned. The intent never authorizes an
+unmount or workload access.
 
 If disconnect succeeded but the process stopped before retiring its record,
 a retry may remove that record without running device commands only after
@@ -245,16 +409,103 @@ An unsupported client or unverifiable connection fails closed. Qualify the
 updated helper on the intended Linux target before deployment; older privileged
 validation reports do not cover this connection-identity protocol.
 
-`maki-attach@<volume>.service` therefore stays active only after the identity
-check passed. Services that need the secure mount must declare
-`Requires=maki-attach@<volume>.service` and `After=` it. `AssertPathExists`
-makes a missing attach configuration fail startup, so the dependent service's
-start job also fails. Execution without a volume UUID is
-refused.
+`maki-attach@<volume>.service` becomes active after the identity check passes.
+Its `RemainAfterExit=yes` retains that past result even if the mount later
+disappears; the service state is not a live readiness check. The packaged
+`maki-workload@<volume>.target` requires the attach unit, while the attach unit
+binds to the daemon. `AssertPathExists` makes a missing attach configuration
+fail startup. Every registered workload start also needs a fresh mount/backend
+identity check, including container recreation. Execution without a volume
+UUID is refused.
+
+Use `maki-attach verify --volume <volume>` as the repeatable, read-only storage
+gate. It requires root privileges, an existing trusted attachment record and
+both UUIDs pinned in the root-controlled attach configuration. Do not pass
+`--plan` to a workload gate: that option only prints a preview. For a host
+systemd service whose namespace exposes the configured mount, install the
+example `packaging/examples/maki-workload.service.d/10-maki.conf`, replace `pg`
+with the volume name, and adapt it below the real workload unit. Its essential
+contract is:
+
+The gate proves current kernel identity, mapping and mount topology; it does not
+perform data I/O or test nbdkit process liveness. In the qualified crash run it
+still returned success immediately after nbdkit was killed because the kernel
+NBD connection and mapping remained. The lifecycle must react to daemon failure
+and complete cleanup/restart rather than treating `verify` alone as a health
+probe.
+
+```ini
+[Unit]
+BindsTo=maki-attach@pg.service
+After=maki-attach@pg.service
+PartOf=maki-workload@pg.target
+Conflicts=maki-recover@pg.service
+
+[Service]
+ExecStartPre=!/usr/bin/maki-attach verify --volume pg
+
+[Install]
+RequiredBy=maki-workload@pg.target
+```
+
+The `!` keeps the helper's root user/group credentials while retaining the
+service's other restrictions, including its filesystem view. The gate must
+still be able to read the trusted configuration/state and probe the verified LV
+under those restrictions. Keep the configuration root-controlled; this is not
+a generic sudo grant. A failed check prevents that start. Qualify the service's
+actual mount namespace and sandbox on the target host. A host check cannot establish which
+filesystem an existing container's bind mount exposes; stop and recreate those
+bindings through the workload recovery procedure. See the
+[gate's checks and limits](storage-recovery.md#checking-storage-before-each-workload-start).
+
+Enable the workload so its `RequiredBy=` link is installed, then enable and
+start the lifecycle target:
+
+```bash
+systemctl enable your-workload.service
+systemctl enable --now maki-workload@pg.target
+```
+
+Do not enable `maki@pg.service` or `maki-attach@pg.service` directly. A daemon
+failure triggers `maki-recover@pg.service`, which stops the target's registered
+workloads, attachment, and daemon. Only a successful cleanup activates the
+target again; the workload's privileged `ExecStartPre` gate then rechecks the
+new attachment. Configure the workload so its start succeeds only after its
+own database recovery and health gate is complete.
+
+For Docker, put container creation and removal in the registered workload unit
+and disable an independent `restart: always` path that could bypass the target.
+Docker bind mounts are `rprivate` by default, so a host remount does not make an
+old container safe; the lifecycle must stop and create the container again.
+For planned shutdown, obtain a successful `maki drain` acknowledgement first,
+after the application has quiesced and closed its database, then stop
+`maki-workload@pg.target`. Do not stop only the workload or attach unit: the
+`Requires=` and `PartOf=` relationships can deactivate the rest of the graph.
+The target stop orders the workload before attach cleanup and attach cleanup
+before daemon shutdown. The target's own stop job may finish while those
+dependent stop jobs are still deactivating. Wait for every lifecycle unit to
+become inactive before running an offline check, taking a snapshot, or removing
+backing storage:
+
+```bash
+systemctl stop maki-workload@pg.target
+while systemctl is-active --quiet your-workload.service || \
+      systemctl is-active --quiet maki-attach@pg.service || \
+      systemctl is-active --quiet maki@pg.service; do
+    sleep 1
+done
+maki check /etc/maki/volumes/pg.toml
+```
+
+Use a bounded operator timeout around that loop. If it expires, preserve the
+host state for diagnosis rather than forcing NBD, LVM, or device-mapper cleanup.
+The 2026-09-17 combined qualification observed this asynchronous tail directly;
+after all named units became inactive, no mount, mapping, NBD connection,
+trusted volume record, or workload container remained.
 
 > [!CAUTION]
-> Removing `--plan` executes NBD, LVM, mount, or filesystem-growth commands on
-> Linux.
+> For attach, detach, recover and grow, removing `--plan` executes the planned
+> storage changes on Linux. The separate `verify` command performs observations.
 
 The helper has no crypto dependencies and must not receive provider credentials.
 
@@ -268,11 +519,20 @@ The data-plane unit runs as `maki`, has an empty capability set, disables core
 dumps, uses `NoNewPrivileges`, and receives crypto credentials. The attach unit
 is a separate privileged oneshot service without credentials.
 
+The recovery template uses `OnSuccess=`, which requires systemd 249 or later.
+This version boundary is recorded in the
+[upstream v249 unit documentation](https://github.com/systemd/systemd/blob/v249/man/systemd.unit.xml).
+
 Before production use, verify the installed units on the target distribution:
 
 ```bash
 systemd-analyze security maki@example.service
-systemd-analyze verify maki@example.service maki-attach@example.service
+systemd-analyze verify \
+  maki@example.service \
+  maki-attach@example.service \
+  maki-recover@example.service \
+  maki-workload@example.target \
+  your-workload.service
 ```
 
 Also verify socket ACLs, effective capabilities, core-dump policy, duplicate
@@ -286,17 +546,66 @@ path. Apply the package changes during a planned maintenance window:
 1. Stop dependent workloads and detach existing volumes **using the old
    helper before replacing it**. Do not copy legacy
    `/run/maki/attach/<volume>.nbd` files into the new helper directory.
-2. Install the updated helper, units, and tmpfiles rules, and ensure the
-   nbd-client and kernel requirements above are satisfied.
+2. Disable old direct enablement of `maki@<volume>` and
+   `maki-attach@<volume>`. Install the updated helper, daemon, attach, recover,
+   and workload-target units plus tmpfiles rules, and ensure the nbd-client,
+   systemd, and kernel requirements above are satisfied.
 3. Update explicit `control.socket` values to
    `/run/maki-control/<volume>/control.sock`, or provision an equivalent custom
    path whose ancestors permit the configured control group to traverse it.
-4. Reattach and verify the trusted record, mount identity, administrator control
-   access, and NBD socket isolation before starting workloads.
+4. Install the workload drop-in, enable the workload to create its
+   `RequiredBy=maki-workload@<volume>.target` link, and enable the lifecycle
+   target. Reattach through that target and verify the trusted record, mount
+   identity, administrator control access, NBD socket isolation, and workload
+   start gate.
 
 If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
+
+The [2026-09-19 package qualification](package-topology-migration-validation-2026-09-19.md)
+installed a generated pre-upgrade Debian package on a clean Debian 12 VM,
+detached two live volumes using that helper, upgraded to the current generated
+package without auto-start, and reattached both with unchanged configuration,
+credential and logical SQLite hashes. This covers one direct `dpkg -i` path;
+signed repositories, downgrade and maintainer-script rollback remain separate
+release checks.
+
+### Fresh-host restore of an unchanged v2 backing
+
+Use this procedure only when restoring the same v2 volume UUID, backing data,
+crypto compatibility identity and key. A DB-native or legacy-v1 migration uses
+the separate process in [durable recovery](durable-recovery.md).
+
+1. Stop database writers, close database connections, run `maki drain`, and
+   stop `maki-workload@<volume>.target`. Wait until the workload, attach and
+   daemon units are inactive. Run `maki check` before capture.
+2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
+   Capture the credential through the deployment's secret-backup mechanism,
+   separately from ordinary logs and backups. Record hashes, Maki revision,
+   volume UUID, provider identity, filesystem and LVM identities, tool versions,
+   and an independent database transaction or content ledger.
+3. On the fresh host, install the same qualified runtime and packaged systemd,
+   sysusers and tmpfiles artifacts. Recreate package directory modes explicitly;
+   in particular `/usr/lib/maki` must be traversable by the `maki` service.
+   Run sysusers before restoring ownership because a dynamic service UID may
+   differ from the source host.
+4. Restore the backing as `maki:maki`, the volume config as `root:maki 0640`,
+   the attach config as `root:root 0600`, and the credential as
+   `root:root 0400`. Recreate the configured mountpoint, then run `maki volume
+   inspect` and the offline check before starting the target.
+5. Start the workload target, run `maki-attach verify`, and compare logical DB
+   contents and database integrity with the independent ledger. Perform a
+   planned drain and restart, then repeat the comparison before accepting the
+   restored host.
+
+The [2026-09-17 qualification](fresh-host-restore-validation-2026-09-17.md)
+passed this flow for one graceful local-provider, single-PV/LV, SQLite backing.
+It was an ad hoc artifact install. A later
+[package and migration campaign](package-topology-migration-validation-2026-09-19.md)
+qualified one generated Debian package upgrade plus stopped-source SQLite
+DB-native and legacy-v1 backup/restore. Other distributions, databases,
+live/crash-time backup and production cutover remain separate qualifications.
 
 ## Growth and cache reload
 
@@ -309,6 +618,11 @@ through the control socket after changing them. Reducing the byte limit evicts
 entries immediately; setting it to zero disables caching.
 
 ## Metrics and health
+
+Status and metrics use in-memory observations and remain callable while a
+volume operation or free-space query is blocked. Busy, cached, and unavailable
+fields must not be interpreted as current readiness or zero counters; see
+[observation freshness and failure limits](observability.md).
 
 `maki metrics` carries every metric SPEC §40 names: request and byte admission
 (`maki_active_callbacks`, `maki_plaintext_bytes`), ciphertext held in memory,
@@ -326,11 +640,14 @@ high-cardinality values as metric labels.
 
 - Provider contract or compatibility failures refuse attach.
 - A wrong key, key name, or provider type refuses attach (key canary).
-- Corrupt metadata, sequence gaps, missing journal segments, and journal
-  corruption before the durable mark fail loudly.
-- A torn final journal tail after the durable mark is truncated during recovery.
-- A failed journal `fdatasync` fails the FLUSH or FUA that needed it, and
-  every later barrier keeps failing until the journal has *rewritten* the
+- Corrupt metadata, sequence gaps, and failure to reach the required v2 horizon
+  at its exact record end fail loudly. Its segment may be absent only when the
+  selected checkpoint already covers it. Losing both valid proof copies also
+  refuses recovery of an otherwise empty-looking volume.
+- A torn final journal tail beyond the proven boundary may be truncated during
+  recovery. A missing/stale advisory mark does not weaken the v2 proof rule.
+- A failed journal `fdatasync` or required proof publication fails the FLUSH or
+  FUA that needed it, and every later barrier keeps failing until the journal has *rewritten* the
   unsynced records, verified them against what it accepted, and synced them
   (a bare retry of `fdatasync` succeeds on Linux without writing anything).
   `maki status` shows `journal_writeback_uncertain: true` and counts
@@ -338,8 +655,9 @@ high-cardinality values as metric labels.
   cached bytes no longer match what was accepted, no barrier can succeed:
   restart the daemon so recovery re-scans the journal and discards what was
   never acknowledged. After a restart, recovery rewrites and verifies every
-  segment prefix it accepted before it syncs, so page-cache bytes a failed
-  writeback left behind are never acknowledged unwritten.
+  segment prefix it accepted before it syncs, then publishes both required
+  proofs before READY. New records become checkpoint-eligible only after
+  their proof publication succeeds. See [durability ordering and limits](durable-recovery.md).
 - A journal write that fails part-way leaves no torn bytes behind: the
   segment is truncated back to its last record before anything is appended
   or the segment is sealed, and the cleanup stays pending until that
@@ -351,8 +669,8 @@ high-cardinality values as metric labels.
   larger request outright, so the value bounds the memory one request pins.
 - The control socket serves at most 64 sessions at once (further clients wait
   in the listen backlog), closes a session idle for 60 s or a client that does
-  not drain a response within 10 s, and runs one `checkpoint` or `reload` at a
-  time: a concurrent one is answered `busy` and must be retried.
+  not drain a response within 10 s, and runs one `checkpoint`, `reload`, or
+  `drain` at a time: a concurrent one is answered `busy` and must be retried.
 - `maki-attach detach` compares the request with the trusted attach record
   under the attach lock and refuses one the record does not back (a different
   device, mountpoint, VG or LV, a re-attached volume, a live backend with
@@ -364,12 +682,27 @@ high-cardinality values as metric labels.
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.
-- Writes fail with ENOSPC when backing free space is below
-  `backing.journal_emergency_reserve_bytes`, or when the journal has reached
-  `backing.journal_max_bytes` and an inline checkpoint could not reclaim it.
-  Reads keep working. `maki status` then shows `state: degraded` with the
-  checkpoint error; the state returns to `ready` once a checkpoint succeeds
-  (the worker retries on its interval, and every write retries the reclaim).
+- Writes fail with ENOSPC unless fresh backing free space covers
+  `backing.journal_emergency_reserve_bytes`,
+  `backing.checkpoint_reserve_bytes`, and the projected record and
+  segment-header footprint of the write, or when that write would exceed
+  `backing.journal_max_bytes` even after an inline checkpoint. An unavailable
+  or failed free-space query also fails closed while the emergency reserve is
+  enabled. A zero emergency reserve disables this admission check while the
+  checkpoint reserve still controls the worker. Admission
+  refreshes the observation; that threshold check alone does not reserve
+  storage. After admission, the Linux file backing uses `posix_fallocate` for
+  the exact journal range and physical checkpoint-completion space before it
+  publishes the record. A scoped ext4/GCE Persistent Disk campaign verified
+  allocation before FUA acknowledgement and an ENOSPC refusal with no sequence
+  or journal change; see the
+  [physical reservation report](physical-reservation-validation-2026-09-18.md).
+  This does not preallocate untouched slots or cover non-Linux backing behavior.
+  A reserve-only refusal leaves existing data readable and does not
+  by itself set a checkpoint error or change the engine state. A failed
+  checkpoint reports `state: degraded` with its error, cleared by a successful
+  checkpoint; the worker retries on its interval and writes retry necessary
+  reclaim. Other outstanding failure states can still prevent `ready`.
 - `maki reload` returns an error naming the section for any change the running
   daemon cannot apply; only `cache` is applied at runtime today. An error means
   the change was not applied: restart the daemon.

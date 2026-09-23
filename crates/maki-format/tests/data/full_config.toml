@@ -18,7 +18,7 @@ crypto_compatibility_id = "vendor-profile-prod-v1"
 availability_policy = "stall"
 
 [crypto.capabilities]
-mode = "hybrid"
+mode = "declared"
 
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384

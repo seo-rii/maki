@@ -49,17 +49,17 @@ fn locked_pages() -> &'static parking_lot::Mutex<HashMap<usize, usize>> {
 }
 
 #[cfg(unix)]
-fn lock_pages(data: &[u8]) -> Option<PageLock> {
-    if data.is_empty() {
+fn lock_pages(address: *const u8, length: usize) -> Option<PageLock> {
+    if length == 0 {
         return None;
     }
     // SAFETY: sysconf has no pointer arguments.
     let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .ok()
         .filter(|size| *size > 0)?;
-    let address = data.as_ptr() as usize;
+    let address = address as usize;
     let start = address / page_size * page_size;
-    let last = (address + data.len() - 1) / page_size * page_size;
+    let last = address.checked_add(length - 1)? / page_size * page_size;
     let mut references = locked_pages().lock();
     // mlock/munlock do not stack: serialize them with the ownership counts.
     // A failed mlock changes no locks and earns no references.
@@ -101,7 +101,7 @@ impl Drop for PageLock {
 struct PageLock;
 
 #[cfg(not(unix))]
-fn lock_pages(_data: &[u8]) -> Option<PageLock> {
+fn lock_pages(_address: *const u8, _length: usize) -> Option<PageLock> {
     None
 }
 
@@ -114,11 +114,26 @@ pub struct SecretBuffer {
     page_lock: Option<PageLock>,
 }
 
+/// A fixed-capacity secret buffer cannot accept more bytes without moving
+/// plaintext through an unguarded allocator growth path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretBufferCapacityError;
+
+impl std::fmt::Display for SecretBufferCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("secret buffer capacity exceeded")
+    }
+}
+
+impl std::error::Error for SecretBufferCapacityError {}
+
 impl SecretBuffer {
     fn wrap(data: Vec<u8>) -> Self {
         let page_lock = if page_locking_enabled() {
-            let lock = lock_pages(&data);
-            if lock.is_none() && !data.is_empty() {
+            // Drop erases the complete allocation, including spare capacity,
+            // so the page lock must cover that same range.
+            let lock = lock_pages(data.as_ptr(), data.capacity());
+            if lock.is_none() && data.capacity() != 0 {
                 LOCK_FAILURES.fetch_add(1, Ordering::SeqCst);
             }
             lock
@@ -133,6 +148,15 @@ impl SecretBuffer {
         Self::wrap(vec![0u8; len])
     }
 
+    /// Allocate fixed-capacity guarded storage without initializing its
+    /// logical contents. The allocation is page-locked, when enabled, before
+    /// callers can write secret bytes into it.
+    pub fn with_capacity(capacity: usize) -> Result<Self, std::collections::TryReserveError> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(capacity)?;
+        Ok(Self::wrap(data))
+    }
+
     /// Take ownership of an existing byte vector.
     pub fn from_vec(data: Vec<u8>) -> Self {
         Self::wrap(data)
@@ -140,7 +164,10 @@ impl SecretBuffer {
 
     /// Copy from a slice.
     pub fn from_slice(data: &[u8]) -> Self {
-        Self::wrap(data.to_vec())
+        let mut copy = Self::with_capacity(data.len()).expect("secret buffer allocation failed");
+        copy.try_extend_from_slice(data)
+            .expect("secret buffer capacity was preallocated");
+        copy
     }
 
     pub fn expose(&self) -> &[u8] {
@@ -155,8 +182,26 @@ impl SecretBuffer {
         self.data.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Append without reallocating. On failure the buffer is unchanged.
+    pub fn try_extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), SecretBufferCapacityError> {
+        let length = self
+            .data
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(SecretBufferCapacityError)?;
+        if length > self.data.capacity() {
+            return Err(SecretBufferCapacityError);
+        }
+        self.data.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Whether this buffer's pages are pinned in RAM.
@@ -166,7 +211,7 @@ impl SecretBuffer {
 
     /// Explicit, intentional copy of secret material.
     pub fn duplicate(&self) -> Self {
-        Self::wrap(self.data.clone())
+        Self::from_slice(&self.data)
     }
 
     /// Consume, returning the inner vector. The caller takes over the
@@ -251,5 +296,28 @@ mod tests {
         assert_eq!(plain.len(), 64);
         set_page_locking(false);
         assert!(!SecretBuffer::zeroed(64).is_page_locked());
+    }
+
+    #[test]
+    fn spare_capacity_is_part_of_the_protected_allocation() {
+        let _serial = serial();
+        let mut data = Vec::with_capacity(8192);
+        data.push(0x5a);
+        set_page_locking(true);
+        let buffer = SecretBuffer::from_vec(data);
+        assert_eq!(buffer.capacity(), 8192);
+        assert!(buffer.is_page_locked() || page_lock_failures() > 0);
+        set_page_locking(false);
+    }
+
+    #[test]
+    fn fixed_capacity_append_never_reallocates() {
+        let mut buffer = SecretBuffer::with_capacity(4).unwrap();
+        let address = buffer.expose().as_ptr();
+        buffer.try_extend_from_slice(b"test").unwrap();
+        assert_eq!(buffer.expose(), b"test");
+        assert_eq!(buffer.expose().as_ptr(), address);
+        assert!(buffer.try_extend_from_slice(b"!").is_err());
+        assert_eq!(buffer.expose(), b"test");
     }
 }

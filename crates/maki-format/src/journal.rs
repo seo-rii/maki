@@ -208,7 +208,12 @@ pub fn scan_segment_bounded(
                 // Heuristic: a torn payload at the tail is normal; a valid
                 // record *after* the damaged one suggests durable damage.
                 None => parse_header(&buf[payload_end..])
-                    .map(|h| h.sequence == expected + 1)
+                    .map(|h| match expected.checked_add(1) {
+                        Some(next) => h.sequence == next,
+                        // MAX has no legitimate successor; a following
+                        // valid header must never be accepted via wraparound.
+                        None => true,
+                    })
                     .unwrap_or(false),
             };
             return if corrupt {
@@ -224,12 +229,24 @@ pub fn scan_segment_bounded(
             };
         }
 
+        // Keep the existing torn-payload decisions above, but never accept
+        // a complete record whose successor cannot be represented. Reject
+        // before copying its payload into the returned valid prefix.
+        let Some(next_expected) = expected.checked_add(1) else {
+            return (
+                records,
+                ScanOutcome::Corrupt {
+                    at: pos,
+                    reason: "journal sequence has no representable successor".into(),
+                },
+            );
+        };
         records.push(JournalRecord {
             sequence: header.sequence,
             unit_index: header.unit_index,
             payload: payload.to_vec(),
         });
-        expected += 1;
+        expected = next_expected;
         pos = payload_end;
     }
 }

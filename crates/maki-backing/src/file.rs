@@ -1,26 +1,54 @@
 //! Real-filesystem backing rooted at a volume directory.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(not(target_os = "linux"), test))]
+use std::fs;
+use std::fs::File;
+#[cfg(not(target_os = "linux"))]
+use std::fs::OpenOptions;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(any(not(target_os = "linux"), test))]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
 use std::sync::Arc;
 
+#[cfg(not(target_os = "linux"))]
 use crate::path::validate;
 use crate::{Backing, BackingFile, VolumeLock};
 
-/// `Backing` over a real directory tree. Paths are validated so no operation
-/// can escape `root`.
+#[cfg(target_os = "linux")]
+#[path = "file_linux.rs"]
+mod linux;
+
+/// `Backing` over a real directory tree. Linux pins the root and resolves
+/// every component through directory descriptors without following symlinks.
+/// Other development platforms perform pathname validation only.
 pub struct FileBacking {
+    #[cfg(target_os = "linux")]
+    directory: linux::Directory,
+    #[cfg(not(target_os = "linux"))]
     root: PathBuf,
 }
 
 impl FileBacking {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        create_private_dir_all(&root)?;
-        Ok(Self { root })
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                directory: linux::Directory::new(&root)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            create_private_dir_all(&root)?;
+            Ok(Self { root })
+        }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn resolve(&self, rel: &str, allow_empty: bool) -> io::Result<PathBuf> {
         validate(rel, allow_empty)?;
         let mut p = self.root.clone();
@@ -46,6 +74,7 @@ impl FileBacking {
 /// `OpenOptions` that never follow a symlink at the final component and
 /// create files owner-only (SPEC §8: data, journal and metadata files are
 /// `maki:maki 0600`).
+#[cfg(not(target_os = "linux"))]
 fn open_options() -> OpenOptions {
     #[allow(unused_mut)] // only Unix adds flags
     let mut options = OpenOptions::new();
@@ -61,6 +90,7 @@ fn open_options() -> OpenOptions {
 /// `create_dir_all` with owner-only directories (SPEC §8: the volume
 /// directory and everything under it are `maki:maki 0700`). Existing
 /// directories keep their mode.
+#[cfg(not(target_os = "linux"))]
 fn create_private_dir_all(path: &Path) -> io::Result<()> {
     #[allow(unused_mut)] // only Unix sets a mode
     let mut builder = fs::DirBuilder::new();
@@ -88,6 +118,95 @@ impl BackingFile for RealFile {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
+    }
+
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        let _end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let offset = i64::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "allocation offset exceeds off_t",
+                )
+            })?;
+            let len = i64::try_from(len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "allocation length exceeds off_t",
+                )
+            })?;
+            // SAFETY: the descriptor stays open for the call and both
+            // non-negative ranges were checked to fit `off_t`.
+            let error = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, len) };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if self.len()? < _end {
+                self.set_len(_end)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hole-punch overflow"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let offset = i64::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hole-punch offset exceeds off_t",
+                )
+            })?;
+            let len = i64::try_from(len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hole-punch length exceeds off_t",
+                )
+            })?;
+            i64::try_from(end).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "hole-punch end exceeds off_t")
+            })?;
+            loop {
+                // SAFETY: the descriptor stays open for the call and the
+                // validated range is non-negative and representable by off_t.
+                let result = unsafe {
+                    libc::fallocate(
+                        self.file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset,
+                        len,
+                    )
+                };
+                if result == 0 {
+                    return Ok(());
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = end;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hole punching is not supported on this platform",
+            ))
+        }
     }
 
     fn len(&self) -> io::Result<u64> {
@@ -161,6 +280,7 @@ struct FileLock {
 
 impl VolumeLock for FileLock {}
 
+#[cfg(not(target_os = "linux"))]
 impl Backing for FileBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         let p = self.resolve(path, false)?;
@@ -244,7 +364,7 @@ impl Backing for FileBacking {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn sync_dir_impl(p: &Path) -> io::Result<()> {
     File::open(p)?.sync_all()
 }

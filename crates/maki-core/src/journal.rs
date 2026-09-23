@@ -7,7 +7,8 @@
 //! file whose dirent might vanish.
 //!
 //! Durability boundary contract: `durable_sequence` only advances after a
-//! successful `sync_data`, and a failed seal keeps the active segment (its
+//! successful data sync and (for v2 volumes) mirrored proof publication.
+//! A failed seal keeps the active segment (its
 //! records stay pending) so a later barrier still syncs them. Callers must
 //! treat *every* return from [`JournalWriter::append`] — including errors —
 //! as a point where `durable_sequence` may have moved (an automatic roll
@@ -27,7 +28,12 @@
 //!   and the cleanup stays pending until the truncation itself has been
 //!   synced; until it succeeds, appends and seals fail (F03, BUG-020).
 //!
-//! After every successful segment fdatasync the writer records the synced
+//! V2 volumes require two synced durable-proof copies before ACK or
+//! checkpoint eligibility. Failure keeps the journal range pending for a
+//! verified rewrite and proof retry. The old advisory mark remains an
+//! additional lower bound, never the sole v2 evidence.
+//!
+//! After every successful durability barrier the writer records the synced
 //! prefix in the durable mark (`journal/durable-mark`, see
 //! `maki_format::journal::DurableMark`) with a plain, un-synced write. The
 //! mark lets recovery tell durable-body corruption from a torn tail; it is
@@ -41,6 +47,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use maki_backing::{Backing, BackingFile};
+use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
     encode_record, DurableMark, JournalRecord, SegmentHeader, SEGMENT_HEADER_SIZE,
 };
@@ -88,6 +95,13 @@ struct ActiveSegment {
     pending_fingerprint: DefaultHasher,
 }
 
+/// The writer is constructed by volume recovery after validating required
+/// evidence and acquiring the volume lock. Its resume hook is not a public
+/// way to create a writer without those checks.
+///
+/// ```compile_fail
+/// let _constructor = maki_core::journal::JournalWriter::resume;
+/// ```
 pub struct JournalWriter {
     backing: Arc<dyn Backing>,
     volume_uuid: Uuid,
@@ -100,6 +114,8 @@ pub struct JournalWriter {
     next_segment_index: u64,
     /// `journal/durable-mark`, opened lazily on the first successful sync.
     mark: Option<Arc<dyn BackingFile>>,
+    /// Required v2 evidence, validated before the writer can be constructed.
+    proof: DurableProof,
     /// Sealed segments whose records are all at or below this sequence may
     /// be non-contiguous: they are checkpoint-covered survivors whose
     /// neighbours' deletion persisted (recovery accepts such holes, K-07)
@@ -112,13 +128,14 @@ pub struct JournalWriter {
 impl JournalWriter {
     /// Resume after recovery. All `sealed` segments are fully durable;
     /// appends start a fresh segment.
-    pub fn resume(
+    pub(crate) fn resume(
         backing: Arc<dyn Backing>,
         volume_uuid: Uuid,
         segment_size: u64,
         durable_sequence: u64,
         next_segment_index: u64,
         sealed: Vec<SegmentInfo>,
+        proof: DurableProof,
     ) -> Self {
         Self {
             backing,
@@ -131,6 +148,7 @@ impl JournalWriter {
             active: None,
             next_segment_index,
             mark: None,
+            proof,
             holes_allowed_below: 0,
             sync_failures: 0,
         }
@@ -228,7 +246,10 @@ impl JournalWriter {
         // Projected active-segment state as records are appended:
         // (write_offset, record_count). `None` = no active segment, which
         // forces a roll on the first record exactly as `append` does.
-        let mut projected = self.active.as_ref().map(|a| (a.write_offset, a.info.record_count));
+        let mut projected = self
+            .active
+            .as_ref()
+            .map(|a| (a.write_offset, a.info.record_count));
         for record_len in record_lens {
             let needs_roll = match projected {
                 None => true,
@@ -282,6 +303,26 @@ impl JournalWriter {
             self.sanitize();
             return Err(error.into());
         }
+        // Data sync alone cannot make a record checkpoint-eligible or ACKed.
+        // Keep the old offset and fingerprint until both proof copies are
+        // durable. A metadata failure leaves this full range retryable even
+        // when no more journal bytes are appended.
+        if self.appended_sequence > self.proof.durable_sequence && active.info.record_count > 0 {
+            let mut candidate = self.proof.clone();
+            candidate.durable_sequence = self.appended_sequence;
+            candidate.segment_index = active.info.index;
+            candidate.durable_size = active.write_offset;
+            if let Err(error) = DurableProofStore::advance(self.backing.as_ref(), &mut candidate) {
+                active.needs_redirty = true;
+                self.sync_failures += 1;
+                self.sanitize();
+                return Err(match error {
+                    maki_format::FormatError::Io(error) => CoreError::Io(error),
+                    error => CoreError::Format(error),
+                });
+            }
+            self.proof = candidate;
+        }
         active.unsynced = false;
         active.needs_tail_cleanup = false;
         active.needs_redirty = false;
@@ -329,8 +370,13 @@ impl JournalWriter {
     }
 
     fn roll(&mut self) -> Result<(), CoreError> {
-        self.seal_active()?;
         let index = self.next_segment_index;
+        // Refuse exhaustion before syncing the previous segment or creating
+        // a header whose index could not advance without wrapping/reuse.
+        let next_segment_index = index
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Corrupt("journal segment index exhausted".into()))?;
+        self.seal_active()?;
         let path = layout::journal_segment(index);
         let base_sequence = self.next_sequence;
 
@@ -338,6 +384,7 @@ impl JournalWriter {
             fp("journal.segment.create")?;
             let file = self.backing.open(&path, true)?;
             file.set_len(0)?;
+            file.allocate_range(0, SEGMENT_HEADER_SIZE as u64)?;
             let header = SegmentHeader {
                 segment_index: index,
                 volume_uuid: self.volume_uuid,
@@ -353,7 +400,7 @@ impl JournalWriter {
 
         match result {
             Ok(file) => {
-                self.next_segment_index += 1;
+                self.next_segment_index = next_segment_index;
                 self.active = Some(ActiveSegment {
                     info: SegmentInfo {
                         index,
@@ -393,6 +440,13 @@ impl JournalWriter {
     /// `durable_sequence` may still have advanced (an automatic roll seals
     /// the previous segment before the failure).
     pub fn append(&mut self, unit_index: u64, payload: &[u8]) -> Result<u64, CoreError> {
+        // MAX is a next-value sentinel, not a writable sequence: publishing
+        // it would break both the writer invariant and durable-proof bounds.
+        // Check before a roll or any append/truncation can mutate storage.
+        let sequence = self.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Corrupt("journal sequence exhausted".into()))?;
         let record_len = 32 + payload.len() as u64;
         let needs_roll = match &self.active {
             None => true,
@@ -401,7 +455,6 @@ impl JournalWriter {
         if needs_roll {
             self.roll()?;
         }
-        let sequence = self.next_sequence;
         let record = JournalRecord {
             sequence,
             unit_index,
@@ -415,6 +468,13 @@ impl JournalWriter {
             fp("journal.tail.truncate")?;
             active.file.set_len(active.write_offset)?;
         }
+        // The accepted logical end must never outrun physical filesystem
+        // allocation. Keep cleanup armed while allocation/write may have
+        // extended the file; only a fully written record clears it.
+        active.needs_tail_cleanup = true;
+        active
+            .file
+            .allocate_range(active.write_offset, bytes.len() as u64)?;
         fp("journal.append.write")?;
         if let Err(error) = active.file.write_at(active.write_offset, &bytes) {
             // The write may have persisted a prefix: the file can now be
@@ -429,7 +489,8 @@ impl JournalWriter {
         active.info.record_count += 1;
         active.info.size = active.write_offset;
         active.unsynced = true;
-        self.next_sequence += 1;
+        active.needs_tail_cleanup = false;
+        self.next_sequence = next_sequence;
         self.appended_sequence = sequence;
         self.sanitize();
         Ok(sequence)

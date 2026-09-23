@@ -12,6 +12,7 @@ pub mod checker;
 pub mod checkpoint;
 pub mod codec;
 pub mod config;
+pub mod durable_proof;
 pub mod error;
 pub mod geometry;
 pub mod init;
@@ -47,6 +48,14 @@ pub mod layout {
 
     pub fn shard_alloc_b(shard: u64) -> String {
         format!("{DATA_DIR}/shard-{shard:08x}.alloc.b")
+    }
+
+    pub fn shard_discard_a(shard: u64) -> String {
+        format!("{DATA_DIR}/shard-{shard:08x}.discard.a")
+    }
+
+    pub fn shard_discard_b(shard: u64) -> String {
+        format!("{DATA_DIR}/shard-{shard:08x}.discard.b")
     }
 
     pub fn journal_segment(index: u64) -> String {

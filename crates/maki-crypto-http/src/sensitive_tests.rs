@@ -1,0 +1,527 @@
+//! MAKI-015: partial HTTP payload decodes must wipe their output allocation
+//! when malformed input is rejected.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+use std::time::Duration;
+
+use super::{
+    append_response_chunk, pointer_set, zeroize_json, BodySpec, FieldSource, HttpCryptoProvider,
+    HttpProviderSpec, OpSpec, PayloadEncoding, RespKind, RespSpec,
+};
+use maki_crypto::{BatchCapability, Capability, CryptoCapabilities, CryptoContext, SecretBuffer};
+use maki_crypto_local::keysource::MapKeySource;
+use serde_json::{json, Value};
+
+const PAYLOAD_LEN: usize = 257;
+const FILL: u8 = 0xa5;
+const JSON_FILL: u8 = b'Q';
+
+#[derive(Clone, Copy, Default, Debug)]
+struct Inspection {
+    enabled: bool,
+    allocations: usize,
+    deallocations: usize,
+    zeroized: usize,
+    plaintext_deallocations: usize,
+}
+
+thread_local! {
+    static INSPECTION: Cell<Inspection> = const { Cell::new(Inspection {
+        enabled: false,
+        allocations: 0,
+        deallocations: 0,
+        zeroized: 0,
+        plaintext_deallocations: 0,
+    }) };
+}
+
+struct InspectDecodeAllocation;
+
+fn selected(layout: Layout) -> bool {
+    [
+        PAYLOAD_LEN,
+        PAYLOAD_LEN + 1,
+        PAYLOAD_LEN.next_power_of_two() / 2,
+    ]
+    .contains(&layout.size())
+}
+
+// SAFETY: every operation delegates to System. Selected allocations are
+// zero-initialized, so the observer may read their complete live allocation
+// immediately before delegating deallocation. The thread-local counters do not
+// allocate and are disabled outside each focused decoder call.
+unsafe impl GlobalAlloc for InspectDecodeAllocation {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let watching = INSPECTION
+            .try_with(|cell| cell.get().enabled && selected(layout))
+            .unwrap_or(false);
+        if watching {
+            unsafe { self.alloc_zeroed(layout) }
+        } else {
+            unsafe { System.alloc(layout) }
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() && selected(layout) {
+            let _ = INSPECTION.try_with(|cell| {
+                let mut inspection = cell.get();
+                if inspection.enabled {
+                    inspection.allocations += 1;
+                    cell.set(inspection);
+                }
+            });
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if selected(layout) {
+            let _ = INSPECTION.try_with(|cell| {
+                let mut inspection = cell.get();
+                if inspection.enabled {
+                    // SAFETY: `pointer` still names the selected live
+                    // zero-initialized allocation and `layout.size()` bytes
+                    // are readable until System.dealloc below.
+                    let bytes = unsafe { std::slice::from_raw_parts(pointer, layout.size()) };
+                    inspection.deallocations += 1;
+                    inspection.zeroized += usize::from(bytes.iter().all(|byte| *byte == 0));
+                    inspection.plaintext_deallocations += usize::from(
+                        bytes.len() >= 64
+                            && (bytes[..64].iter().all(|byte| *byte == FILL)
+                                || bytes[..64].iter().all(|byte| *byte == JSON_FILL)),
+                    );
+                    cell.set(inspection);
+                }
+            });
+        }
+        unsafe { System.dealloc(pointer, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: InspectDecodeAllocation = InspectDecodeAllocation;
+
+fn inspect_rejected_decode(encoding: PayloadEncoding, encoded: &str) -> Inspection {
+    begin_inspection();
+    let result = encoding.decode(encoded);
+    assert!(result.is_err(), "malformed payload was accepted");
+    drop(result);
+    finish_inspection()
+}
+
+fn begin_inspection() {
+    INSPECTION.with(|cell| {
+        let previous = cell.replace(Inspection {
+            enabled: true,
+            ..Inspection::default()
+        });
+        assert!(!previous.enabled, "nested decoder allocation inspection");
+    });
+}
+
+fn finish_inspection() -> Inspection {
+    INSPECTION.with(|cell| {
+        let inspection = cell.get();
+        cell.set(Inspection::default());
+        inspection
+    })
+}
+
+fn sensitive_string() -> String {
+    String::from_utf8(vec![JSON_FILL; PAYLOAD_LEN]).unwrap()
+}
+
+fn assert_sensitive_allocations_wiped(inspection: Inspection, minimum: usize) {
+    assert_eq!(
+        inspection.plaintext_deallocations, 0,
+        "sensitive allocation was freed without zeroization: {inspection:?}"
+    );
+    assert!(
+        inspection.zeroized >= minimum,
+        "expected at least {minimum} wiped sensitive allocation(s): {inspection:?}"
+    );
+}
+
+fn assert_partial_output_wiped(inspection: Inspection) {
+    assert!(
+        inspection.allocations > 0 && inspection.deallocations > 0,
+        "decoder output allocation was not observed: {inspection:?}"
+    );
+    assert_eq!(
+        inspection.plaintext_deallocations, 0,
+        "partial plaintext was freed without zeroization: {inspection:?}"
+    );
+    assert!(
+        inspection.zeroized > 0,
+        "decoder output was not wiped before deallocation: {inspection:?}"
+    );
+}
+
+#[test]
+fn malformed_base64_erases_partial_decoded_output() {
+    let mut encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [FILL; PAYLOAD_LEN],
+    )
+    .into_bytes();
+    encoded[PAYLOAD_LEN] = b'!';
+    let encoded = String::from_utf8(encoded).unwrap();
+
+    let inspection = inspect_rejected_decode(PayloadEncoding::Base64, &encoded);
+    assert_partial_output_wiped(inspection);
+}
+
+#[test]
+fn malformed_hex_erases_partial_decoded_output() {
+    let mut encoded = "a5".repeat(PAYLOAD_LEN).into_bytes();
+    let invalid = encoded.len() - 2;
+    encoded[invalid..].copy_from_slice(b"gg");
+    let encoded = String::from_utf8(encoded).unwrap();
+
+    let inspection = inspect_rejected_decode(PayloadEncoding::HexLower, &encoded);
+    assert_partial_output_wiped(inspection);
+}
+
+#[test]
+fn response_growth_erases_the_replaced_plaintext_allocation() {
+    begin_inspection();
+
+    let mut response = SecretBuffer::with_capacity(PAYLOAD_LEN).unwrap();
+    response
+        .try_extend_from_slice(&[FILL; PAYLOAD_LEN])
+        .unwrap();
+    append_response_chunk(&mut response, &[FILL], PAYLOAD_LEN + 1).unwrap();
+    drop(response);
+
+    let inspection = finish_inspection();
+    assert_eq!(inspection.plaintext_deallocations, 0, "{inspection:?}");
+    assert!(inspection.zeroized >= 2, "{inspection:?}");
+}
+
+#[test]
+fn response_owner_is_page_lock_capable_before_plaintext_is_written() {
+    use maki_crypto::secret::{page_lock_failures, set_page_locking};
+
+    set_page_locking(true);
+    let before = page_lock_failures();
+    let mut response = super::new_response_buffer(PAYLOAD_LEN).unwrap();
+    assert!(response.is_page_locked() || page_lock_failures() > before);
+    append_response_chunk(&mut response, &[FILL; PAYLOAD_LEN], PAYLOAD_LEN).unwrap();
+    assert_eq!(response.expose(), &[FILL; PAYLOAD_LEN]);
+    set_page_locking(false);
+}
+
+#[test]
+fn zeroize_json_erases_object_key_allocations() {
+    begin_inspection();
+    let mut root = Value::Object(serde_json::Map::from_iter([(
+        sensitive_string(),
+        Value::Null,
+    )]));
+    zeroize_json(&mut root);
+    drop(root);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn pointer_error_erases_the_incoming_value() {
+    begin_inspection();
+    let mut root = json!({});
+    let result = pointer_set(
+        &mut root,
+        "missing-leading-slash",
+        Value::String(sensitive_string()),
+    );
+    assert!(result.is_err());
+    drop(result);
+    drop(root);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn pointer_overwrite_erases_the_replaced_value() {
+    begin_inspection();
+    let mut root = Value::Object(serde_json::Map::from_iter([(
+        "secret".to_string(),
+        Value::String(sensitive_string()),
+    )]));
+    pointer_set(&mut root, "/secret", Value::Null).unwrap();
+    drop(root);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn pointer_descent_erases_a_replaced_intermediate_value() {
+    begin_inspection();
+    let mut root = Value::Object(serde_json::Map::from_iter([(
+        "secret".to_string(),
+        Value::String(sensitive_string()),
+    )]));
+    pointer_set(&mut root, "/secret/child", Value::Null).unwrap();
+    drop(root);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+fn test_context() -> CryptoContext {
+    CryptoContext {
+        volume_uuid: uuid::Uuid::nil(),
+        format_version: 1,
+        crypto_compatibility_id: sensitive_string(),
+    }
+}
+
+fn test_op(body: BodySpec) -> OpSpec {
+    OpSpec {
+        method: "POST".to_string(),
+        path: "/unused".to_string(),
+        headers: Vec::new(),
+        query: Vec::new(),
+        body,
+        response: RespSpec {
+            kind: RespKind::Raw,
+            data_path: None,
+            encoding: PayloadEncoding::Base64,
+            items_path: None,
+            item_index_path: None,
+        },
+    }
+}
+
+fn test_provider(op: &OpSpec) -> HttpCryptoProvider {
+    HttpCryptoProvider {
+        client: reqwest::Client::new(),
+        spec: HttpProviderSpec {
+            base_url: "http://127.0.0.1:1".to_string(),
+            encrypt: op.clone(),
+            decrypt: op.clone(),
+            capabilities: CryptoCapabilities {
+                provider_id: "json-wipe-test".to_string(),
+                crypto_compatibility_id: "json-wipe-test".to_string(),
+                supported_plaintext_sizes: vec![1],
+                max_ciphertext_size: 1,
+                stateless: true,
+                retry_safe: false,
+                batch: BatchCapability::default(),
+                integrity: Capability::Absent,
+                context_binding: Capability::Absent,
+                replay_protection: Capability::Absent,
+            },
+            timeout: Duration::from_millis(1),
+            max_response_bytes: 1,
+            tls: None,
+        },
+    }
+}
+
+fn sensitive_credentials_spec(tls: Option<super::TlsSpec>) -> HttpProviderSpec {
+    let op = OpSpec {
+        method: "POST".to_string(),
+        path: "/unused".to_string(),
+        headers: vec![("authorization".to_string(), sensitive_string())],
+        query: vec![("api_key".to_string(), sensitive_string())],
+        body: BodySpec::Raw,
+        response: RespSpec {
+            kind: RespKind::Raw,
+            data_path: None,
+            encoding: PayloadEncoding::Base64,
+            items_path: None,
+            item_index_path: None,
+        },
+    };
+    HttpProviderSpec {
+        base_url: "http://127.0.0.1:1".to_string(),
+        encrypt: op.clone(),
+        decrypt: op,
+        capabilities: CryptoCapabilities {
+            provider_id: "credential-wipe-test".to_string(),
+            crypto_compatibility_id: "credential-wipe-test".to_string(),
+            supported_plaintext_sizes: vec![1],
+            max_ciphertext_size: 1,
+            stateless: true,
+            retry_safe: false,
+            batch: BatchCapability::default(),
+            integrity: Capability::Absent,
+            context_binding: Capability::Absent,
+            replay_protection: Capability::Absent,
+        },
+        timeout: Duration::from_millis(1),
+        max_response_bytes: 1,
+        tls,
+    }
+}
+
+#[test]
+fn provider_drop_erases_owned_header_and_query_values() {
+    let spec = sensitive_credentials_spec(None);
+
+    begin_inspection();
+    let provider = HttpCryptoProvider::new(spec).unwrap();
+    drop(provider);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 4);
+}
+
+#[test]
+fn provider_construction_error_erases_owned_credentials() {
+    let spec = sensitive_credentials_spec(Some(super::TlsSpec {
+        ca_pem: None,
+        // Keep this outside the watched allocation size. reqwest's parser may
+        // make transport-owned copies that this crate cannot erase.
+        identity_pem: Some(b"invalid client identity".to_vec()),
+    }));
+
+    begin_inspection();
+    let result = HttpCryptoProvider::new(spec);
+    assert!(result.is_err(), "invalid client identity was accepted");
+    drop(result);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 4);
+}
+
+#[test]
+fn tls_spec_drop_erases_identity_pem() {
+    let tls = super::TlsSpec {
+        ca_pem: None,
+        identity_pem: Some(vec![JSON_FILL; PAYLOAD_LEN]),
+    };
+
+    begin_inspection();
+    drop(tls);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn config_error_erases_a_resolved_credential_header() {
+    let mut config = maki_format::config::parse_config(
+        r#"
+config_schema_version = 1
+[volume]
+name = "credential-wipe-test"
+max_virtual_size = "1MiB"
+device_block_size = 512
+crypto_unit_size = 512
+shard_logical_size = "64KiB"
+[crypto]
+provider = "remote-http"
+crypto_compatibility_id = "credential-wipe-test"
+[crypto.capabilities]
+supported_plaintext_sizes = [512]
+max_ciphertext_size = 512
+[[crypto.http.endpoint]]
+name = "primary"
+url = "https://crypto.internal"
+[crypto.http.encrypt]
+method = "POST"
+path = "/encrypt"
+[crypto.http.encrypt.headers]
+Authorization = { source = "credential", name = "token", format = "{}" }
+[crypto.http.encrypt.body]
+type = "json"
+[crypto.http.encrypt.body.fields]
+"/data" = { source = "payload", encoding = "base64" }
+[crypto.http.decrypt]
+method = "POST"
+path = "/decrypt"
+[backing]
+root = "/tmp/unused"
+"#,
+    )
+    .unwrap();
+    config
+        .crypto
+        .http
+        .as_mut()
+        .unwrap()
+        .encrypt
+        .as_mut()
+        .unwrap()
+        .body
+        .as_mut()
+        .unwrap()
+        .fields
+        .get_mut("/data")
+        .unwrap()
+        .source = "invalid-after-credential-resolution".to_string();
+    let mut keys = MapKeySource::new();
+    keys.insert("token", vec![JSON_FILL; PAYLOAD_LEN]);
+
+    begin_inspection();
+    let result = HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys);
+    assert!(result.is_err(), "invalid field source was accepted");
+    drop(result);
+    let inspection = finish_inspection();
+
+    // The KeySource result and the resolved header allocation must both wipe.
+    assert_sensitive_allocations_wiped(inspection, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_item_build_error_erases_the_partial_request_tree() {
+    let op = test_op(BodySpec::Json {
+        fields: vec![
+            ("/secret".to_string(), FieldSource::CompatibilityId),
+            ("invalid".to_string(), FieldSource::UnitIndex),
+        ],
+        items_path: None,
+        item_fields: Vec::new(),
+    });
+    let provider = test_provider(&op);
+    let context = test_context();
+    let items = vec![(0, SecretBuffer::from_slice(&[0]))];
+
+    begin_inspection();
+    let result = provider.run_per_item(&op, &context, &items).await;
+    assert!(result.is_err());
+    drop(result);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_build_error_erases_all_completed_item_trees() {
+    let op = test_op(BodySpec::Json {
+        fields: Vec::new(),
+        items_path: Some("invalid".to_string()),
+        item_fields: vec![("/secret".to_string(), FieldSource::CompatibilityId)],
+    });
+    let provider = test_provider(&op);
+    let context = test_context();
+    let items = vec![
+        (0, SecretBuffer::from_slice(&[0])),
+        (1, SecretBuffer::from_slice(&[0])),
+    ];
+
+    begin_inspection();
+    let result = provider
+        .run_batched(
+            &op,
+            &context,
+            &items,
+            "invalid",
+            &[],
+            &[("/secret".to_string(), FieldSource::CompatibilityId)],
+        )
+        .await;
+    assert!(result.is_err());
+    drop(result);
+    let inspection = finish_inspection();
+
+    assert_sensitive_allocations_wiped(inspection, 2);
+}

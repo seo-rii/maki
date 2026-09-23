@@ -8,7 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use maki_backing::Backing;
-use maki_core::engine::{Engine, EngineLimits, EngineOptions};
+use maki_core::engine::{CheckpointPolicy, Engine, EngineLimits, EngineOptions};
 use maki_core::volume::VolumeOptions;
 use maki_core::CoreError;
 use maki_format::geometry::Geometry;
@@ -48,7 +48,10 @@ async fn engine(max_request_bytes: u64) -> Engine {
                 ..EngineLimits::default()
             },
             cache: None,
-            checkpoint: Default::default(),
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
             clock: None,
         },
     )

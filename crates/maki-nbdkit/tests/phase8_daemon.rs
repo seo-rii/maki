@@ -105,6 +105,7 @@ data_path = "/ciphertext"
 encoding = "base64"
 [backing]
 root = "{root}"
+journal_emergency_reserve_bytes = "0B"
 "#
     )
 }

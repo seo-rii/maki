@@ -22,8 +22,8 @@ use crate::error::CoreError;
 use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
-use crate::recovery::{recover, Recovered, RecoveryError};
-use crate::store::{SlotRead, SlotStore};
+use crate::recovery::{recover_bounded, Recovered, RecoveryError};
+use crate::store::{CheckpointSlotPlan, SlotRead, SlotStore};
 
 #[derive(Debug, Clone)]
 pub struct VolumeOptions {
@@ -49,6 +49,39 @@ pub struct Volume {
     ck_state: CheckpointState,
 }
 
+/// A fixed checkpoint horizon whose slot destinations have been captured
+/// under the volume lock. Its fields are private so only `Volume` can finish
+/// a plan it prepared.
+pub(crate) struct PreparedCheckpoint {
+    base_checkpoint: u64,
+    horizon: u64,
+    allow_discard: bool,
+    items: Vec<(u64, Arc<crate::overlay::OverlayVersion>)>,
+    slots: CheckpointSlotPlan,
+}
+
+pub(crate) struct CompletedCheckpoint(PreparedCheckpoint);
+
+impl PreparedCheckpoint {
+    /// Write and sync only immutable slot data. Allocation metadata,
+    /// checkpoint state, journal reclamation, and overlay retirement remain
+    /// for `Volume::finish_checkpoint` under the volume lock.
+    pub(crate) fn execute(self) -> Result<CompletedCheckpoint, CoreError> {
+        let mut slot_index = 0;
+        for (_, version) in &self.items {
+            if self.allow_discard && version.ciphertext.is_empty() {
+                continue;
+            }
+            fp("checkpoint.slot_write")?;
+            self.slots
+                .write(slot_index, version.sequence, &version.ciphertext)?;
+            slot_index += 1;
+        }
+        self.slots.sync_shards()?;
+        Ok(CompletedCheckpoint(self))
+    }
+}
+
 impl Volume {
     /// Run recovery (SPEC §27) and return a ready volume.
     pub fn recover(
@@ -59,13 +92,14 @@ impl Volume {
         let Recovered {
             lock,
             superblock,
-            store,
+            mut store,
             checkpoint_state,
             durable_sequence,
+            durable_proof,
             next_segment_index,
             segments,
             replay,
-        } = recover(&backing, segment_size)?;
+        } = recover_bounded(&backing, segment_size)?;
 
         let mut journal = JournalWriter::resume(
             backing.clone(),
@@ -74,15 +108,21 @@ impl Volume {
             durable_sequence,
             next_segment_index,
             segments,
+            durable_proof,
         );
         journal.allow_covered_holes_below(checkpoint_state.checkpoint_sequence);
 
-        // Rebuild overlay: everything in the surviving journal is durable.
+        // Bounded recovery checkpoints every surviving record before it
+        // returns, so attach normally receives an empty replay. Keep this
+        // construction for the public/full-replay recovery contract and as
+        // a defensive invariant if another recovery mode is added.
         let mut overlay = Overlay::new();
         for record in replay {
             overlay.publish(record.unit_index, record.sequence, record.payload);
         }
         overlay.promote(durable_sequence);
+
+        store.schedule_reclamation();
 
         let volume = Self {
             backing,
@@ -178,6 +218,22 @@ impl Volume {
         self.overlay.bytes()
     }
 
+    pub fn supports_discard(&self) -> bool {
+        self.store.supports_discard()
+    }
+
+    /// Refuse service when an independent freshness authority no longer
+    /// names this backing session. This must also guard in-memory overlay and
+    /// plaintext-cache paths, which otherwise perform no backing read.
+    pub fn check_freshness(&self) -> Result<(), CoreError> {
+        self.backing.check_freshness()?;
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_reclamation(&self) -> bool {
+        self.store.has_pending_reclamation()
+    }
+
     /// True when no write has ever been acknowledged or applied: no
     /// checkpoint, no journal records, no shard. Used by the attach layer to
     /// decide whether binding a crypto identity to the volume is safe.
@@ -192,7 +248,12 @@ impl Volume {
     /// Some unit that currently holds ciphertext (overlay first, then the
     /// slots), for key probing on volumes without a canary.
     pub fn first_ciphertext_unit(&self) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
-        if let Some(unit) = self.overlay.first_unit() {
+        let overlay_unit = if self.supports_discard() {
+            self.overlay.first_nonempty_unit()
+        } else {
+            self.overlay.first_unit()
+        };
+        if let Some(unit) = overlay_unit {
             return Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)));
         }
         let Some(unit) = self.store.first_allocated_unit() else {
@@ -205,6 +266,24 @@ impl Volume {
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
+        self.check_freshness()?;
+        // Preserve the writer's exhaustion boundary: no storage mutation is
+        // allowed once the next sequence cannot advance.
+        if self.journal.next_sequence() == u64::MAX {
+            return Err(CoreError::Corrupt("journal sequence exhausted".into()));
+        }
+        if ciphertext.len() > self.superblock.geometry.max_ciphertext_size as usize {
+            return Err(CoreError::Corrupt(format!(
+                "ciphertext {} exceeds max {}",
+                ciphertext.len(),
+                self.superblock.geometry.max_ciphertext_size
+            )));
+        }
+        // Reserve the checkpoint destination before the journal makes this
+        // version visible or durable. This closes the free-space sample race
+        // for slot data: an admitted record always has physical completion
+        // space even if another filesystem user consumes every free byte.
+        self.store.reserve_slot(unit)?;
         let appended = self.journal.append(unit, ciphertext);
         // An automatic roll inside `append` may have advanced the durable
         // boundary (even when the append itself failed). Promote *before*
@@ -232,8 +311,61 @@ impl Volume {
         Ok(sequence)
     }
 
+    /// Journal a v3 logical discard without creating or reserving storage for
+    /// a unit that is already zero.
+    pub fn discard_ct(&mut self, unit: u64, fua: bool) -> Result<u64, CoreError> {
+        self.check_freshness()?;
+        if !self.supports_discard() {
+            return Err(CoreError::Invalid(
+                "discard requires a v3 discard-enabled volume".into(),
+            ));
+        }
+        if unit >= self.superblock.geometry.num_units() {
+            return Err(CoreError::Invalid(format!("unit {unit} beyond the device")));
+        }
+        if let Some(version) = self.overlay.get(unit) {
+            if version.ciphertext.is_empty() {
+                let sequence = version.sequence;
+                if fua {
+                    let durable = self.journal.sync()?;
+                    self.overlay.promote(durable);
+                    if durable < sequence {
+                        return Err(CoreError::Durability(format!(
+                            "discard FUA verify failed: durable {durable} < sequence {sequence}"
+                        )));
+                    }
+                }
+                self.sanitize();
+                return Ok(sequence);
+            }
+        } else if matches!(self.store.read_slot(unit)?, SlotRead::Zero) {
+            return Ok(self.journal.appended_sequence());
+        }
+        if self.journal.next_sequence() == u64::MAX {
+            return Err(CoreError::Corrupt("journal sequence exhausted".into()));
+        }
+        let appended = self.journal.append(unit, &[]);
+        self.overlay.promote(self.journal.durable_sequence());
+        let sequence = appended?;
+        self.overlay.publish(unit, sequence, Vec::new());
+        self.overlay.promote(self.journal.durable_sequence());
+        if fua {
+            let sync = self.journal.sync();
+            self.overlay.promote(self.journal.durable_sequence());
+            let durable = sync?;
+            if durable < sequence {
+                return Err(CoreError::Durability(format!(
+                    "discard FUA verify failed: durable {durable} < sequence {sequence}"
+                )));
+            }
+        }
+        self.sanitize();
+        Ok(sequence)
+    }
+
     /// FLUSH barrier (SPEC §25): everything appended becomes durable.
     pub fn flush(&mut self) -> Result<(), CoreError> {
+        self.check_freshness()?;
         let durable = self.journal.sync()?;
         self.overlay.promote(durable);
         self.sanitize();
@@ -243,7 +375,11 @@ impl Volume {
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
     pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        self.check_freshness()?;
         if let Some(v) = self.overlay.get(unit) {
+            if self.supports_discard() && v.ciphertext.is_empty() {
+                return Ok(None);
+            }
             return Ok(Some((v.sequence, v.ciphertext.clone())));
         }
         match self.store.read_slot(unit)? {
@@ -258,70 +394,128 @@ impl Volume {
     /// Checkpoint (SPEC §26). Consumes only durable journal records;
     /// `checkpoint_sequence <= durable_sequence` always.
     pub fn checkpoint(&mut self) -> Result<u64, CoreError> {
+        let prepared = self.prepare_checkpoint()?;
+        let completed = prepared.execute()?;
+        self.finish_checkpoint(completed)
+    }
+
+    /// Capture a fixed durable horizon and immutable slot-I/O targets. The
+    /// caller may execute the returned plan without holding the volume lock;
+    /// publication is deferred until `finish_checkpoint`.
+    pub(crate) fn prepare_checkpoint(&mut self) -> Result<PreparedCheckpoint, CoreError> {
         let durable = self.journal.durable_sequence();
         // Never rely on callers having promoted after the last boundary
         // move: the checkpointable set is derived here, from the journal's
         // own durable boundary.
         self.overlay.promote(durable);
-        if durable <= self.ck_state.checkpoint_sequence {
+        let base_checkpoint = self.ck_state.checkpoint_sequence;
+        let allow_discard = self.supports_discard();
+        let items = if durable <= base_checkpoint {
+            Vec::new()
+        } else {
+            self.overlay.collect_durable_shared(durable)
+        };
+        let slots =
+            self.store
+                .checkpoint_slot_plan(items.iter().filter_map(|(unit, version)| {
+                    (!allow_discard || !version.ciphertext.is_empty()).then_some(*unit)
+                }))?;
+        Ok(PreparedCheckpoint {
+            base_checkpoint,
+            horizon: durable.max(base_checkpoint),
+            allow_discard,
+            items,
+            slots,
+        })
+    }
+
+    /// Publish a completed fixed-horizon slot plan. The checkpoint gate in
+    /// the engine ensures plans do not overlap; the base check also refuses
+    /// accidental stale-plan publication by another in-crate caller.
+    pub(crate) fn finish_checkpoint(
+        &mut self,
+        completed: CompletedCheckpoint,
+    ) -> Result<u64, CoreError> {
+        let PreparedCheckpoint {
+            base_checkpoint,
+            horizon,
+            allow_discard,
+            items,
+            slots: _,
+        } = completed.0;
+        if self.ck_state.checkpoint_sequence != base_checkpoint {
+            return Err(CoreError::Durability(format!(
+                "stale checkpoint plan based at {base_checkpoint}, current checkpoint is {}",
+                self.ck_state.checkpoint_sequence
+            )));
+        }
+        if horizon <= base_checkpoint {
             // Nothing new is durable; still retire anything a previously
             // interrupted checkpoint applied but could not clean up, and
             // persist metadata the store repaired at open (an adopted shard
             // or an allocation map rebuilt from slot headers).
-            self.overlay.retire(self.ck_state.checkpoint_sequence);
+            self.overlay.retire(base_checkpoint);
             if self.store.has_pending_repairs() {
+                self.store.persist_discards()?;
                 self.store.persist_allocations()?;
             }
             // Segments the checkpoint already covers can still be on disk:
             // their deletion failed (state was stored first) or was lost in
             // a crash. Reclaim them, or the journal stays at its limit and
             // every write fails with ENOSPC while nothing is "new" (K-02).
-            if self
-                .journal
-                .delete_covered(self.ck_state.checkpoint_sequence)?
-                > 0
-            {
+            if self.journal.delete_covered(base_checkpoint)? > 0 {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
             }
-            self.sanitize();
-            return Ok(self.ck_state.checkpoint_sequence);
-        }
-        let items = self.overlay.collect_durable(durable);
-
-        // 1. write main slots
-        for (unit, version) in &items {
-            fp("checkpoint.slot_write")?;
             self.store
-                .write_slot(*unit, version.sequence, &version.ciphertext)?;
-        }
-        // 2. fdatasync affected data shards
-        for shard in self.store.shards_of_units(items.iter().map(|(u, _)| u)) {
-            fp("checkpoint.shard_sync")?;
-            self.store.sync_shard_data(shard)?;
+                .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
+            self.sanitize();
+            return Ok(base_checkpoint);
         }
         // 3. update + sync allocation metadata
-        for (unit, _) in &items {
-            self.store.mark_allocated(*unit)?;
+        for (unit, version) in &items {
+            if !allow_discard || !version.ciphertext.is_empty() {
+                self.store.mark_allocated(*unit)?;
+            }
+        }
+        if allow_discard {
+            for (unit, version) in &items {
+                self.store
+                    .set_discarded(*unit, version.ciphertext.is_empty())?;
+            }
+            // Both complete logical copies and their directory entries must
+            // be durable before a slot reservation can be physically removed.
+            self.store.persist_discards()?;
+            let punchable = items.iter().filter_map(|(unit, version)| {
+                (version.ciphertext.is_empty()
+                    && self
+                        .overlay
+                        .get(*unit)
+                        .is_none_or(|latest| latest.sequence <= version.sequence))
+                .then_some(*unit)
+            });
+            self.store.punch_slots(punchable)?;
         }
         self.store.persist_allocations()?;
         // 4. sync checkpoint metadata (in-memory state only advances after
         //    the durable store succeeds)
         fp("checkpoint.state_store")?;
         let mut new_state = self.ck_state.clone();
-        new_state.checkpoint_sequence = durable;
+        new_state.checkpoint_sequence = horizon;
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
         // 5. delete completed journal segments
-        self.journal.delete_covered(durable)?;
+        self.journal.delete_covered(horizon)?;
         // 6. fsync journal directory
         fp("checkpoint.dirsync")?;
         self.backing.sync_dir(layout::JOURNAL_DIR)?;
 
-        self.overlay.retire(durable);
+        self.overlay.retire(horizon);
+        self.store
+            .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
         self.sanitize();
-        Ok(durable)
+        Ok(horizon)
     }
 
     /// Cross-component invariants (SPEC §12, §26): the checkpoint never
@@ -362,4 +556,57 @@ impl Volume {
     #[cfg(not(debug_assertions))]
     #[inline(always)]
     fn sanitize(&self) {}
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use std::io;
+    use std::sync::Arc;
+
+    use maki_format::geometry::Geometry;
+    use maki_format::init::create_volume_with_discard;
+    use maki_format::superblock::Superblock;
+    use maki_test_support::crash_backing::FaultOp;
+    use maki_test_support::CrashableBacking;
+
+    use super::{Volume, VolumeOptions};
+
+    #[test]
+    fn newer_tombstone_cannot_hide_an_intermediate_write_reservation_from_punch() {
+        let backing = Arc::new(CrashableBacking::new());
+        let geometry = Geometry::compute(512, 1024, 512, 1032, 16 * 1024, 8 * 1024).unwrap();
+        let slot_size = geometry.slot_size as usize;
+        create_volume_with_discard(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(0x007a_1234),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "discard-reservation-v1".into(),
+                key_identity: "k".into(),
+                geometry,
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        volume.write_ct(1, &[0x11; 1032], true).unwrap();
+        volume.checkpoint().unwrap();
+
+        volume.discard_ct(1, true).unwrap(); // snapshot tombstone 2
+        let prepared = volume.prepare_checkpoint().unwrap();
+        let completed = prepared.execute().unwrap();
+        volume.write_ct(1, &[0x13; 1032], true).unwrap(); // durable reservation 3
+        volume.discard_ct(1, false).unwrap(); // volatile latest tombstone 4
+
+        backing.set_fault_hook(Some(Arc::new(move |operation| match operation {
+            FaultOp::WriteAt { path, len, .. } if path.ends_with(".dat") && *len == slot_size => {
+                Some(io::Error::other("checkpoint punched a newer reservation"))
+            }
+            _ => None,
+        })));
+        assert_eq!(volume.finish_checkpoint(completed).unwrap(), 2);
+        backing.set_fault_hook(None);
+    }
 }
