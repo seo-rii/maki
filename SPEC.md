@@ -1389,6 +1389,11 @@ max_inflight_per_endpoint = 8
 max_inflight_bytes_per_endpoint = "8MiB"
 
 max_journal_pending_bytes = "64MiB"
+
+# In-memory overlay of journaled, not yet checkpointed ciphertext: a RAM
+# budget independent of the on-disk journal limit (0 disables either bound).
+max_overlay_bytes = "256MiB"
+max_overlay_entries = 262144
 ```
 
 Pipeline:
@@ -2154,6 +2159,11 @@ max_inflight_per_endpoint = 8
 max_inflight_bytes_per_endpoint = "8MiB"
 
 max_journal_pending_bytes = "64MiB"
+
+# In-memory overlay of journaled, not yet checkpointed ciphertext: a RAM
+# budget independent of the on-disk journal limit (0 disables either bound).
+max_overlay_bytes = "256MiB"
+max_overlay_entries = 262144
 
 [crypto.batch]
 target_items = 64

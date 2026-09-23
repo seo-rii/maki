@@ -17,7 +17,7 @@ HTTP example is available at
 | `crypto.http` | HTTP endpoints, request/response mapping, credentials, and TLS |
 | `crypto.websocket` | WebSocket endpoints, TLS, timeout, and frame-size limit |
 | `crypto.grpc` | gRPC endpoints, TLS, method paths, metadata, and message-size limit |
-| `limits` | Request, byte, queue, batch, and endpoint concurrency bounds |
+| `limits` | Request, byte, queue, batch, endpoint concurrency, and in-memory overlay bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
 | `backing.rollback_protection` | Experimental Linux COW format: independent `witness_root` and preallocated logical-page `capacity` (new volumes only) |
 | `cache` | Read-cache mode, size, TTL, locking, and zeroization |
@@ -292,6 +292,15 @@ outside the configured constraints fail cleanly.
 | `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
 | `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; the write path forces a journal sync before exceeding it |
+| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC if that cannot make room; the worker checkpoints at half of it. Must be at least twice `limits.max_plaintext_bytes`, or `0` to disable |
+| `limits.max_overlay_entries` (default 262144) | Units the overlay may hold, whatever their payload (a v3 discard tombstone has none but still costs an entry). Same inline-checkpoint and ENOSPC behaviour; must cover one maximal request in crypto units, or `0` to disable |
+
+The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
+a slow or failing checkpoint the overlay would otherwise grow toward the whole
+journal, and `limits.max_ciphertext_bytes` only governs the remote scheduler's
+queue, not this structure. `maki status` reports `overlay_bytes` and
+`overlay_units`; the byte figure is the logical charge (a shared version is
+counted twice), not process RSS, and the bound applies to that projection.
 
 Free space is read with `statvfs` on Unix hosts. When the emergency reserve is
 enabled, an unavailable or failed query fails write admission with ENOSPC;

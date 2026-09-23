@@ -218,6 +218,12 @@ impl Volume {
         self.overlay.bytes()
     }
 
+    /// Sum of the overlay's latest versions; `2 *` this is the overlay's
+    /// eventual charge once every version has a durable copy (R4-005).
+    pub fn overlay_latest_bytes(&self) -> u64 {
+        self.overlay.latest_bytes()
+    }
+
     pub fn supports_discard(&self) -> bool {
         self.store.supports_discard()
     }

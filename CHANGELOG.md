@@ -43,6 +43,14 @@ documents.
 
 ### Added
 
+- **Overlay memory bound**: `limits.max_overlay_bytes` (default 256 MiB)
+  and `limits.max_overlay_entries` (default 262144) bound the in-memory
+  ciphertext overlay independently of the on-disk journal; a write over the
+  bound checkpoints inline and fails with ENOSPC if that cannot make room,
+  and the worker checkpoints at half the bound (R4-005;
+  [configuration](docs/configuration.md#journal-bounds)). Existing
+  configurations gain the defaults; set either to `0` to keep the old
+  unbounded behaviour.
 - **Deep-check verdict**: `maki check --deep` and `maki-check --deep` end
   with `deep check verdict: clean | recoverable | unrecoverable`; slot damage
   that a validated journal record repairs is a warning, not an error

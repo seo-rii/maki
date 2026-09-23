@@ -88,6 +88,17 @@ pub struct EngineLimits {
     /// one request can pin (third review, F07). Must be a multiple of the
     /// device block size.
     pub max_request_bytes: u64,
+    /// Bound on the ciphertext overlay (journaled, not yet checkpointed
+    /// records held in memory), counting a unit's latest and durable copies
+    /// (R4-005). A write that would exceed it syncs and checkpoints inline
+    /// first, and fails with ENOSPC if that cannot make room; the worker
+    /// checkpoints at half of it. `0` disables the bound. The daemon always
+    /// sets it from `limits.max_overlay_bytes`; the disk-side
+    /// `journal_max_bytes` is not a RAM budget.
+    pub max_overlay_bytes: u64,
+    /// Bound on the number of units the overlay holds (tombstones have no
+    /// payload but still cost an entry). `0` disables the bound.
+    pub max_overlay_entries: u64,
 }
 
 impl Default for EngineLimits {
@@ -96,6 +107,8 @@ impl Default for EngineLimits {
             max_active_callbacks: 64,
             max_plaintext_bytes: 128 << 20,
             max_request_bytes: 1 << 20,
+            max_overlay_bytes: 0,
+            max_overlay_entries: 0,
         }
     }
 }
@@ -276,6 +289,9 @@ struct EngineInner {
     admission: maki_crypto::flow::DualSemaphore,
     /// Hard bound on one request's length (F07).
     max_request_bytes: u64,
+    /// Overlay bounds (R4-005); 0 = unbounded.
+    max_overlay_bytes: u64,
+    max_overlay_entries: u64,
     /// Versioned plaintext read cache (SPEC §29). `None` = mode off.
     cache: Option<maki_cache::VersionedLruCache>,
     policy: CheckpointPolicy,
@@ -497,6 +513,8 @@ impl Engine {
                 options.limits.max_plaintext_bytes,
             ),
             max_request_bytes: options.limits.max_request_bytes,
+            max_overlay_bytes: options.limits.max_overlay_bytes,
+            max_overlay_entries: options.limits.max_overlay_entries,
             cache: options.cache.map(|c| {
                 maki_cache::VersionedLruCache::new(
                     maki_cache::CacheConfig {
@@ -908,8 +926,9 @@ impl Engine {
                     let outcome = io_engine.journal_request(&mut volume, &io_cts, fua, reclaimed);
                     io_engine.inner.note_journal(&volume);
                     if matches!(outcome, Ok(true))
-                        && volume.journal_total_bytes()
+                        && (volume.journal_total_bytes()
                             >= io_engine.inner.policy.journal_high_watermark_bytes
+                            || io_engine.inner.overlay_above_watermark(&volume))
                     {
                         io_engine.inner.checkpoint_notify.notify_one();
                     }
@@ -1035,6 +1054,37 @@ impl Engine {
         let pending = volume.journal_pending_bytes();
         if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
             volume.flush()?;
+        }
+        // Overlay bound (R4-005): the RAM held by uncheckpointed records is
+        // independent of the disk journal limit. Charge the request at its
+        // eventual size — every unit ends up with a durable copy equal to its
+        // latest version, so the projection is 2x the latest bytes — and, if
+        // it does not fit, sync and checkpoint inline exactly like the hard
+        // journal limit; after a reclaim that still cannot make room the
+        // write is refused rather than growing memory.
+        let payload: u64 = cts.iter().map(|ct| ct.data.len() as u64).sum();
+        let over_bytes = self.inner.max_overlay_bytes > 0
+            && volume
+                .overlay_bytes()
+                .max(volume.overlay_latest_bytes().saturating_mul(2))
+                .saturating_add(payload.saturating_mul(2))
+                > self.inner.max_overlay_bytes;
+        let over_entries = self.inner.max_overlay_entries > 0
+            && (volume.overlay_len() as u64).saturating_add(cts.len() as u64)
+                > self.inner.max_overlay_entries;
+        if over_bytes || over_entries {
+            if reclaimed {
+                return Err(enospc(format!(
+                    "overlay at its limit ({} bytes / {} units held, limits {} bytes / {} \
+                     units) and cannot be reclaimed",
+                    volume.overlay_bytes(),
+                    volume.overlay_len(),
+                    self.inner.max_overlay_bytes,
+                    self.inner.max_overlay_entries
+                )));
+            }
+            volume.flush()?;
+            return Ok(false);
         }
         if volume
             .journal_total_bytes()
@@ -1270,11 +1320,25 @@ impl EngineInner {
         .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))?
     }
 
+    /// The overlay has crossed half of a configured bound (R4-005): the
+    /// worker should checkpoint before write admission has to do it inline.
+    fn overlay_above_watermark(&self, volume: &Volume) -> bool {
+        let by_bytes = self.max_overlay_bytes > 0
+            && volume
+                .overlay_bytes()
+                .max(volume.overlay_latest_bytes().saturating_mul(2))
+                >= self.max_overlay_bytes / 2;
+        let by_entries =
+            self.max_overlay_entries > 0 && volume.overlay_len() as u64 >= self.max_overlay_entries / 2;
+        by_bytes || by_entries
+    }
+
     /// One worker pass: checkpoint if the journal crossed its watermark,
-    /// the backing is low on space, or the interval elapsed with work
-    /// pending (unsynced records are synced first so they can be applied).
+    /// the overlay crossed half its bound, the backing is low on space, or
+    /// the interval elapsed with work pending (unsynced records are synced
+    /// first so they can be applied).
     async fn worker_pass(self: &Arc<Self>) {
-        let (total, appended, checkpointed, durable, covered, reclaim) = {
+        let (total, appended, checkpointed, durable, covered, reclaim, by_overlay) = {
             let v = self.volume.read().await;
             (
                 v.journal_total_bytes(),
@@ -1283,6 +1347,7 @@ impl EngineInner {
                 v.journal_durable_sequence(),
                 v.journal_covered_segment_count(),
                 v.has_pending_reclamation(),
+                self.overlay_above_watermark(&v),
             )
         };
         if appended <= checkpointed && covered == 0 && !reclaim {
@@ -1309,10 +1374,13 @@ impl EngineInner {
             .now()
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
-        if !(by_size || by_space || by_time || reclaim) {
+        if !(by_size || by_space || by_time || by_overlay || reclaim) {
             return;
         }
-        if by_time && durable < appended {
+        // A checkpoint applies only durable records: when the trigger is
+        // the elapsed interval or the overlay bound, sync first so the pass
+        // actually shrinks what it was woken for.
+        if (by_time || by_overlay) && durable < appended {
             let mut volume = self.volume.clone().write_owned().await;
             if self.checkpoint_stop.load(Ordering::SeqCst) {
                 return;

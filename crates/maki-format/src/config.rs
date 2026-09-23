@@ -476,6 +476,16 @@ pub struct LimitsSection {
     pub max_inflight_per_endpoint: u32,
     pub max_inflight_bytes_per_endpoint: ByteSize,
     pub max_journal_pending_bytes: ByteSize,
+    /// Ciphertext bytes the in-memory overlay (journaled, not yet
+    /// checkpointed records) may hold, counting a unit's latest and durable
+    /// copies. A write that would exceed it checkpoints inline first and
+    /// fails with ENOSPC if that cannot make room; the worker checkpoints at
+    /// half of it. `0` disables the bound (R4-005).
+    pub max_overlay_bytes: ByteSize,
+    /// Units the overlay may hold at once, independent of payload size
+    /// (v3 discard tombstones carry no payload but still cost an entry).
+    /// `0` disables the bound.
+    pub max_overlay_entries: u64,
 }
 
 impl Default for LimitsSection {
@@ -491,6 +501,8 @@ impl Default for LimitsSection {
             max_inflight_per_endpoint: 8,
             max_inflight_bytes_per_endpoint: ByteSize(8 << 20),
             max_journal_pending_bytes: ByteSize(64 << 20),
+            max_overlay_bytes: ByteSize(256 << 20),
+            max_overlay_entries: 262_144,
         }
     }
 }
@@ -1374,6 +1386,29 @@ impl VolumeConfig {
             return Err(invalid(
                 "limits.max_ciphertext_bytes must be at least limits.max_plaintext_bytes",
             ));
+        }
+        // Progress guarantee for the overlay bound (R4-005): after an inline
+        // checkpoint the overlay is empty, and the largest admitted request
+        // is charged twice (latest plus durable copy), so it must fit twice.
+        let overlay_needed = l.max_plaintext_bytes.0.saturating_mul(2);
+        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
+            return Err(invalid(format!(
+                "limits.max_overlay_bytes {} must be at least twice limits.max_plaintext_bytes \
+                 ({overlay_needed}) so one maximal request can always be admitted after an \
+                 inline checkpoint, or 0 to disable the bound",
+                l.max_overlay_bytes.0
+            )));
+        }
+        let overlay_units = l
+            .max_plaintext_bytes
+            .0
+            .div_ceil(self.volume.crypto_unit_size.max(1) as u64);
+        if l.max_overlay_entries != 0 && l.max_overlay_entries < overlay_units {
+            return Err(invalid(format!(
+                "limits.max_overlay_entries {} must be at least {overlay_units} (one maximal \
+                 request in crypto units) or 0 to disable the bound",
+                l.max_overlay_entries
+            )));
         }
 
         let r = &self.crypto.retry;

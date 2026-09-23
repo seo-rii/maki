@@ -30,6 +30,11 @@ pub struct Overlay {
     /// reports the sequence durable. Processed strictly in sequence order.
     pending_promotion: BTreeMap<u64, u64>,
     bytes: u64,
+    /// Sum of every unit's *latest* version length. Every unit eventually
+    /// holds a durable copy equal to its latest version, so `2 * latest_bytes`
+    /// is the overlay's eventual charge; admission bounds that projection
+    /// (R4-005) so promotions cannot carry `bytes` past the limit.
+    latest_bytes: u64,
     /// Highest durable boundary ever promoted to (debug sanitizer input).
     durable_boundary: u64,
     #[cfg(debug_assertions)]
@@ -54,6 +59,11 @@ impl Overlay {
     /// it is not a measurement of physical allocations or process RSS.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Sum of the latest versions' ciphertext lengths (see `latest_bytes`).
+    pub fn latest_bytes(&self) -> u64 {
+        self.latest_bytes
     }
 
     /// Lowest unit currently held in the overlay.
@@ -83,10 +93,14 @@ impl Overlay {
     /// Publish a freshly journaled version (after successful append).
     pub fn publish(&mut self, unit: u64, sequence: u64, ciphertext: Vec<u8>) {
         self.bytes += ciphertext.len() as u64;
+        self.latest_bytes += ciphertext.len() as u64;
         let entry = self.units.entry(unit).or_default();
         if entry.latest.sequence != 0 {
             self.bytes = self
                 .bytes
+                .saturating_sub(entry.latest.ciphertext.len() as u64);
+            self.latest_bytes = self
+                .latest_bytes
                 .saturating_sub(entry.latest.ciphertext.len() as u64);
         }
         entry.latest = Arc::new(OverlayVersion {
@@ -184,6 +198,9 @@ impl Overlay {
                 self.bytes = self
                     .bytes
                     .saturating_sub(entry.latest.ciphertext.len() as u64);
+                self.latest_bytes = self
+                    .latest_bytes
+                    .saturating_sub(entry.latest.ciphertext.len() as u64);
                 remove.push(*unit);
             }
         }
@@ -223,12 +240,14 @@ impl Overlay {
     ///   whose latest sequence is at least the pending one.
     pub fn check_invariants(&self) {
         let mut expected = 0u64;
+        let mut expected_latest = 0u64;
         for (unit, e) in &self.units {
             assert!(
                 e.latest.sequence != 0,
                 "overlay sanitizer: unit {unit} has no latest version"
             );
             expected += e.latest.ciphertext.len() as u64;
+            expected_latest += e.latest.ciphertext.len() as u64;
             if let Some(d) = &e.durable {
                 expected += d.ciphertext.len() as u64;
                 assert!(
@@ -265,6 +284,10 @@ impl Overlay {
         assert_eq!(
             self.bytes, expected,
             "overlay sanitizer: byte accounting drifted"
+        );
+        assert_eq!(
+            self.latest_bytes, expected_latest,
+            "overlay sanitizer: latest-byte accounting drifted"
         );
         for (seq, unit) in &self.pending_promotion {
             assert!(

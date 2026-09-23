@@ -743,6 +743,12 @@ high-cardinality values as metric labels.
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.
+- A write that would push the in-memory overlay past
+  `limits.max_overlay_bytes` or `limits.max_overlay_entries` first syncs and
+  checkpoints inline; if the checkpoint fails it returns ENOSPC and the
+  engine reports `state: degraded` until a later checkpoint succeeds. The
+  worker also checkpoints when the overlay reaches half of either bound, so
+  the inline path is the exception, not the norm. Reads are unaffected.
 - Writes fail with ENOSPC unless fresh backing free space covers
   `backing.journal_emergency_reserve_bytes`,
   `backing.checkpoint_reserve_bytes`, and the projected record and
