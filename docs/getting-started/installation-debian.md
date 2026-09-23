@@ -115,8 +115,13 @@ python3 packaging/debian/build-deb.py \
   --release-dir target/release \
   --version 0.1.0+git$(git rev-parse --short=12 HEAD) \
   --architecture "$(dpkg --print-architecture)" \
-  --output ../maki.deb
+  --output ../maki.deb \
+  --shlibdeps
 ```
+
+The builder verifies that every artifact is an ELF image for the requested
+architecture, and `--shlibdeps` records the binaries' native library
+dependencies in the package.
 
 [`packaging/debian/README.md`](../../packaging/debian/README.md) describes what
 the package contains. It deliberately owns nothing below `/etc/maki`, does not

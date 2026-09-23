@@ -605,6 +605,13 @@ If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
+Removing the package (`apt remove maki`) is refused by its `prerm` while any
+trusted attachment record exists or a `maki@`, `maki-attach@` or
+`maki-workload@` unit is active: the helper being removed is what the
+lifecycle needs to detach. Drain and deactivate every volume first. Upgrades
+are not blocked and no maintainer script starts, stops or restarts a service
+([package behaviour](../packaging/debian/README.md#removal-and-upgrade-behaviour)).
+
 The [2026-09-19 package qualification](qualification/package-topology-migration-validation-2026-09-19.md)
 installed a generated pre-upgrade Debian package on a clean Debian 12 VM,
 detached two live volumes using that helper, upgraded to the current generated
