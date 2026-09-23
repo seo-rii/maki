@@ -64,18 +64,52 @@ fn valid_credential_name(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
-fn try_hex_decode(bytes: &[u8]) -> Option<Vec<u8>> {
+/// Decode a pure even-length hex string (surrounding whitespace allowed)
+/// into a guarded buffer; `None` when the bytes are not such a string.
+fn try_hex_decode(bytes: &[u8]) -> Option<SecretBuffer> {
     let s = std::str::from_utf8(bytes).ok()?.trim();
     if s.is_empty() || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks(2) {
+    // Guarded before the first key byte is produced (R4-002).
+    let mut out = SecretBuffer::zeroed(s.len() / 2);
+    for (index, chunk) in s.as_bytes().chunks(2).enumerate() {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
+        out.expose_mut()[index] = ((hi << 4) | lo) as u8;
     }
     Some(out)
+}
+
+/// The raw or hex-decoded key from `bytes`, born in guarded memory.
+fn key_from_bytes(bytes: &[u8]) -> SecretBuffer {
+    try_hex_decode(bytes).unwrap_or_else(|| SecretBuffer::from_slice(bytes))
+}
+
+/// Read a whole credential file into a guarded buffer without an
+/// intermediate ordinary allocation. Files are small; a bound keeps a
+/// misconfigured path from pinning arbitrary memory.
+fn read_guarded(path: &std::path::Path, expected_len: u64) -> std::io::Result<SecretBuffer> {
+    use std::io::Read;
+    const MAX_CREDENTIAL_BYTES: u64 = 1 << 20;
+    if expected_len > MAX_CREDENTIAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "credential file exceeds 1 MiB",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut raw = SecretBuffer::zeroed(expected_len as usize);
+    file.read_exact(raw.expose_mut())?;
+    // A file that grew after stat is refused rather than partially read.
+    let mut probe = [0u8; 1];
+    if file.read(&mut probe)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "credential file changed while being read",
+        ));
+    }
+    Ok(raw)
 }
 
 impl KeySource for FileKeySource {
@@ -90,10 +124,10 @@ impl KeySource for FileKeySource {
         // readable by the group or by others, or anything but a regular
         // file (a symlink to somewhere else, a FIFO), is refused rather
         // than loaded. systemd's LoadCredential files are 0400.
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| missing(name))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::symlink_metadata(&path).map_err(|_| missing(name))?;
             if !meta.file_type().is_file() {
                 return Err(CryptoError::ProviderFatal(format!(
                     "credential {name:?} is not a regular file"
@@ -107,13 +141,10 @@ impl KeySource for FileKeySource {
                 )));
             }
         }
-        let mut raw = std::fs::read(&path).map_err(|_| missing(name))?;
-        let result = match try_hex_decode(&raw) {
-            Some(decoded) => SecretBuffer::from_vec(decoded),
-            None => SecretBuffer::from_slice(&raw),
-        };
-        zeroize::Zeroize::zeroize(&mut raw);
-        Ok(result)
+        // The file bytes and the decoded key both live only in guarded
+        // buffers (R4-002); `raw` zeroizes when it goes out of scope.
+        let raw = read_guarded(&path, meta.len()).map_err(|_| missing(name))?;
+        Ok(key_from_bytes(raw.expose()))
     }
 }
 
@@ -127,12 +158,13 @@ impl KeySource for EnvKeySource {
             "MAKI_CREDENTIAL_{}",
             name.to_uppercase().replace(['-', '.'], "_")
         );
-        let value = std::env::var(&var).map_err(|_| missing(name))?;
-        let bytes = value.into_bytes();
-        Ok(match try_hex_decode(&bytes) {
-            Some(decoded) => SecretBuffer::from_vec(decoded),
-            None => SecretBuffer::from_vec(bytes),
-        })
+        // The environment copy itself is outside our control (development
+        // only, SPEC §9); the key is copied into guarded memory and the
+        // intermediate string is erased.
+        let mut value = std::env::var(&var).map_err(|_| missing(name))?;
+        let key = key_from_bytes(value.as_bytes());
+        zeroize::Zeroize::zeroize(&mut value);
+        Ok(key)
     }
 }
 

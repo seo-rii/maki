@@ -69,8 +69,9 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   rollback-protected backing addresses this, and it is not qualified.
 - `local-aes-xts` returns garbage rather than an error for a wrong key once
   the canary check is bypassed by an empty volume; use `local-aes-gcm-siv`.
-- Remote transport libraries may keep plaintext copies outside `SecretBuffer`
-  ([transport memory](transport-memory.md)).
+- Remote transport libraries may keep plaintext copies outside `SecretBuffer`,
+  and the local providers' expanded AES key schedules are zeroized on drop but
+  not page-locked under `secure-buffers` ([transport memory](transport-memory.md)).
 - Recovery memory is bounded by a 1 MiB replay batch, but a total-RSS bound for
   arbitrary geometry, provider and cache settings has not been established.
 - Privileged attach supports the single-PV/single-data-LV XFS topology; other

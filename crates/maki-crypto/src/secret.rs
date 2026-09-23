@@ -20,6 +20,17 @@ use zeroize::Zeroize;
 
 static LOCK_PAGES: AtomicBool = AtomicBool::new(false);
 static LOCK_FAILURES: AtomicU64 = AtomicU64::new(0);
+static UNGUARDED_WRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Buffers created by [`SecretBuffer::from_vec`] since process start: secret
+/// bytes that already existed in an ordinary, unguarded allocation before
+/// they were wrapped. A data path that decrypts or loads keys correctly
+/// allocates the guarded buffer *first* and fills it in place, so this
+/// counter must not move while it runs (R4-002). Diagnostic; tests compare
+/// deltas around an operation.
+pub fn unguarded_wraps() -> u64 {
+    UNGUARDED_WRAPS.load(Ordering::SeqCst)
+}
 
 /// Enable or disable page locking for buffers created from now on.
 pub fn set_page_locking(enabled: bool) {
@@ -158,8 +169,26 @@ impl SecretBuffer {
     }
 
     /// Take ownership of an existing byte vector.
+    ///
+    /// The bytes were produced outside guarded memory (unlocked, and not
+    /// zeroized if a copy was reallocated on the way). Prefer allocating
+    /// the buffer first ([`zeroed`](Self::zeroed), [`with_capacity`](Self::with_capacity),
+    /// [`from_slice`](Self::from_slice)) and producing the secret in place;
+    /// every call here is counted by [`unguarded_wraps`].
     pub fn from_vec(data: Vec<u8>) -> Self {
+        UNGUARDED_WRAPS.fetch_add(1, Ordering::SeqCst);
         Self::wrap(data)
+    }
+
+    /// Shorten the logical contents to `len` bytes without reallocating.
+    /// The bytes beyond `len` stay inside the guarded allocation until the
+    /// buffer is dropped (Drop zeroizes the whole capacity). A `len` beyond
+    /// the current length is a no-op.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.data.len() {
+            self.data[len..].zeroize();
+            self.data.truncate(len);
+        }
     }
 
     /// Copy from a slice.
@@ -308,6 +337,37 @@ mod tests {
         assert_eq!(buffer.capacity(), 8192);
         assert!(buffer.is_page_locked() || page_lock_failures() > 0);
         set_page_locking(false);
+    }
+
+    #[test]
+    fn truncate_keeps_the_allocation_and_erases_the_tail() {
+        let mut buffer = SecretBuffer::from_slice(b"plaintext-and-tag");
+        let address = buffer.expose().as_ptr();
+        let capacity = buffer.capacity();
+        buffer.truncate(9);
+        assert_eq!(buffer.expose(), b"plaintext");
+        assert_eq!(buffer.expose().as_ptr(), address);
+        assert_eq!(buffer.capacity(), capacity);
+        // The tail is erased eagerly, not only at drop.
+        // SAFETY: the bytes are inside the buffer's own capacity, which is
+        // still allocated and was initialized by from_slice.
+        let tail = unsafe { std::slice::from_raw_parts(address.add(9), capacity - 9) };
+        assert!(tail.iter().all(|b| *b == 0), "{tail:?}");
+        buffer.truncate(100);
+        assert_eq!(buffer.len(), 9);
+    }
+
+    #[test]
+    fn guarded_constructors_are_not_counted_as_unguarded_wraps() {
+        let _serial = serial();
+        let before = unguarded_wraps();
+        let _a = SecretBuffer::zeroed(32);
+        let _b = SecretBuffer::with_capacity(32).unwrap();
+        let _c = SecretBuffer::from_slice(b"copied into guarded memory first");
+        let _d = _c.duplicate();
+        assert_eq!(unguarded_wraps(), before);
+        let _e = SecretBuffer::from_vec(vec![1, 2, 3]);
+        assert_eq!(unguarded_wraps(), before + 1);
     }
 
     #[test]

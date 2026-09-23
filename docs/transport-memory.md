@@ -161,3 +161,30 @@ and real loopback RPC rejection/success. The complete gRPC package passed
 The 2026-09-20 page-lock ownership follow-up passed all 32 gRPC package tests
 and strict all-target Clippy in isolation from the separate TLS feature.
 Evidence: `~/logs/maki-grpc-memory-20260920T085835Z/` (`exit.status` 0).
+
+## Local providers and key material
+
+The local providers produce plaintext only inside guarded buffers (R4-002).
+`local-aes-gcm-siv` copies the ciphertext body into a `SecretBuffer` that is
+page-locked (when enabled) *before* decryption and decrypts it in place with
+the detached-tag AEAD API; on an authentication failure the cipher re-encrypts
+the buffer and the buffer is zeroized when dropped. Encryption copies the
+caller's plaintext into a guarded working buffer and encrypts in place, so no
+unlocked copy of the plaintext exists at any point. `local-aes-xts` follows
+the same pattern. The earlier implementation used the allocating AEAD API,
+which decrypted into an ordinary vector and wrapped it afterwards.
+
+Key files (`file`, systemd `credential`) are read directly into a guarded
+buffer and hex-decoded into another; `env` keys are copied out of the
+environment string, which is then erased (the environment block itself is
+outside the daemon's control and is a development-only source).
+`maki_crypto::secret::unguarded_wraps()` counts buffers that were wrapped
+after the fact; `review_r4_guarded_buffers.rs` requires it to stay constant
+through encryption, decryption and key loading.
+
+**Residual.** The expanded AES key schedule inside the cipher objects
+(`Aes256GcmSiv`, the two XTS `Aes256` instances) lives in the provider struct,
+not in a `SecretBuffer`. It is zeroized on drop (the AES crate's `zeroize`
+feature) but is not page-locked by `secure-buffers`; `memory_lock_mode =
+"all"` (`mlockall`) or the secure-swap policy covers it. Stack temporaries of
+the cipher implementation are likewise outside the page-lock claim.

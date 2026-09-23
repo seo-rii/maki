@@ -4,9 +4,17 @@
 //! overhead). AAD binds volume UUID, crypto unit index, format version, and
 //! crypto compatibility ID, so ciphertext relocated to another unit, volume,
 //! or profile fails authentication.
+//!
+//! Plaintext only ever exists inside a [`SecretBuffer`] (R4-002): encryption
+//! copies the input into a guarded buffer and encrypts it in place, and
+//! decryption copies the ciphertext body into a guarded buffer and decrypts
+//! it in place. The allocating `Aead` API would instead produce plaintext in
+//! an ordinary, unlocked `Vec` and wrap it afterwards. The AES key schedule
+//! inside the cipher object is zeroized on drop (`zeroize` feature) but is
+//! not page-locked; `memory_lock_mode = "all"` covers it.
 
-use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
-use aes_gcm_siv::{Aes256GcmSiv, Nonce};
+use aes_gcm_siv::aead::{AeadInPlace, KeyInit};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce, Tag};
 use async_trait::async_trait;
 use rand::RngCore;
 
@@ -122,13 +130,18 @@ impl CryptoProvider for AesGcmSivProvider {
             let mut nonce = [0u8; NONCE_LEN];
             rng.fill_bytes(&mut nonce);
             let aad = self.aad(context, item.unit_index);
-            let ct = self
+            // The working copy is guarded before any plaintext lands in it
+            // and is encrypted in place; it holds ciphertext by the time it
+            // is read out and zeroizes on drop regardless.
+            let mut work = SecretBuffer::from_slice(pt);
+            let tag = self
                 .cipher
-                .encrypt(Nonce::from_slice(&nonce), Payload { msg: pt, aad: &aad })
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, work.expose_mut())
                 .map_err(|_| CryptoError::ProviderFatal("AEAD encryption failed".to_string()))?;
-            let mut data = Vec::with_capacity(NONCE_LEN + ct.len());
+            let mut data = Vec::with_capacity(NONCE_LEN + work.len() + TAG_LEN);
             data.extend_from_slice(&nonce);
-            data.extend_from_slice(&ct);
+            data.extend_from_slice(work.expose());
+            data.extend_from_slice(&tag);
             out.push(CiphertextUnit {
                 unit_index: item.unit_index,
                 data,
@@ -149,27 +162,32 @@ impl CryptoProvider for AesGcmSivProvider {
                 return Err(CryptoError::Integrity("ciphertext too short".to_string()));
             }
             let (nonce, body) = item.data.split_at(NONCE_LEN);
-            let aad = self.aad(context, item.unit_index);
-            let pt = self
-                .cipher
-                .decrypt(
-                    Nonce::from_slice(nonce),
-                    Payload {
-                        msg: body,
-                        aad: &aad,
-                    },
-                )
-                // Never include any data in the message: authentication
-                // failure yields no information.
-                .map_err(|_| CryptoError::Integrity("AEAD authentication failed".to_string()))?;
-            if pt.len() != self.unit_size as usize {
+            let (ciphertext, tag) = body.split_at(body.len() - TAG_LEN);
+            // The length is fixed by the layout, so refuse a wrong size
+            // before allocating or touching the key.
+            if ciphertext.len() != self.unit_size as usize {
                 return Err(CryptoError::Integrity(
                     "decrypted length mismatch".to_string(),
                 ));
             }
+            let aad = self.aad(context, item.unit_index);
+            // Plaintext is produced inside a buffer that was guarded before
+            // decryption started; on failure the cipher re-encrypts the
+            // buffer and the buffer is zeroized when dropped here.
+            let mut pt = SecretBuffer::from_slice(ciphertext);
+            self.cipher
+                .decrypt_in_place_detached(
+                    Nonce::from_slice(nonce),
+                    &aad,
+                    pt.expose_mut(),
+                    Tag::from_slice(tag),
+                )
+                // Never include any data in the message: authentication
+                // failure yields no information.
+                .map_err(|_| CryptoError::Integrity("AEAD authentication failed".to_string()))?;
             out.push(PlaintextUnit {
                 unit_index: item.unit_index,
-                data: SecretBuffer::from_vec(pt),
+                data: pt,
             });
         }
         Ok(out)

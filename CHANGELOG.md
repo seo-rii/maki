@@ -78,6 +78,12 @@ documents.
 
 ### Fixed
 
+- Local providers now encrypt and decrypt in place inside pre-allocated
+  `SecretBuffer`s and key files are read straight into guarded memory, so
+  plaintext and keys never first exist in an unlocked allocation; the AES key
+  schedule is zeroized on drop (R4-002;
+  [transport memory](docs/transport-memory.md#local-providers-and-key-material)).
+
 Every fix has a regression test named in the
 [review remediation log](docs/review-remediation.md). Highlights that change
 observable behaviour:

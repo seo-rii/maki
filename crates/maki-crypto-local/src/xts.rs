@@ -116,16 +116,18 @@ impl CryptoProvider for AesXtsProvider {
                     pt.len()
                 )));
             }
-            let mut buf = pt.to_vec();
+            // Guarded working copy, encrypted in place (R4-002): the
+            // plaintext copy never lives in an unlocked allocation.
+            let mut work = SecretBuffer::from_slice(pt);
             self.xts.encrypt_area(
-                &mut buf,
+                work.expose_mut(),
                 self.unit_size as usize,
                 item.unit_index as u128,
                 get_tweak_default,
             );
             out.push(CiphertextUnit {
                 unit_index: item.unit_index,
-                data: buf,
+                data: work.expose().to_vec(),
             });
         }
         Ok(out)
@@ -146,16 +148,17 @@ impl CryptoProvider for AesXtsProvider {
                     self.unit_size
                 )));
             }
-            let mut buf = item.data.clone();
+            // Decrypt in place inside a buffer guarded before decryption.
+            let mut pt = SecretBuffer::from_slice(&item.data);
             self.xts.decrypt_area(
-                &mut buf,
+                pt.expose_mut(),
                 self.unit_size as usize,
                 item.unit_index as u128,
                 get_tweak_default,
             );
             out.push(PlaintextUnit {
                 unit_index: item.unit_index,
-                data: SecretBuffer::from_vec(buf),
+                data: pt,
             });
         }
         Ok(out)
