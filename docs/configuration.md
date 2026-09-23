@@ -283,6 +283,31 @@ This negotiation path was verified with the installed nbdkit header and a real
 rootless nbdkit/libnbd connection. Older clients can still connect, but requests
 outside the configured constraints fail cleanly.
 
+## Read cache
+
+`cache.mode = "read"` keeps decrypted units in a versioned LRU keyed by
+`(unit, write_sequence)`, bounded by `cache.max_bytes` and `cache.ttl`, with
+entries in zeroizing (and, with `lock_memory`, page-locked) buffers. A read
+first establishes each unit's current version — the overlay entry, or the
+64-byte slot header — and serves a hit without reading the ciphertext
+payload or calling the provider; a miss reads, verifies and decrypts the
+payload and caches the result. A newer write changes the sequence, so a
+stale entry can never be served.
+
+Two consequences to know:
+
+- The cache saves the payload read and the crypto call, not the header
+  read: a hit still costs one small read (usually from the page cache).
+- A hit does not re-verify the on-disk payload CRC of a version that was
+  verified when it was cached. Payload-only damage that appears afterwards
+  is therefore served from the cache until the entry is evicted by TTL,
+  LRU pressure, a resize, or a newer write; header-level damage (an
+  undecodable header, a foreign unit) still refuses the read, and
+  `maki check --deep` reports the payload damage. Set `cache.ttl` with that
+  window in mind, or keep `mode = "off"` for a workload with its own cache.
+
+The size and TTL are runtime settings (`maki reload <config> cache`).
+
 ## Journal bounds
 
 | Setting | Enforced as |

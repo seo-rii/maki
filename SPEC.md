@@ -1356,6 +1356,14 @@ Cache key:
 
 This prevents stale plaintext from being returned after concurrent overwrite.
 
+A read MUST establish the unit's current `write_sequence` (overlay version,
+else the slot header) under the volume read lock before consulting the cache.
+A hit for that key MAY be served without reading the slot payload; a miss
+MUST read and verify the payload before decrypting. Every header-level
+refusal of a slot read (undecodable header, foreign unit, damaged unlisted
+slot) applies to the cached path as well. A hit does not re-verify the
+payload of an already verified version until the entry is evicted.
+
 Unsupported:
 
 ```text

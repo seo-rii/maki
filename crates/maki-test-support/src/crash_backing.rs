@@ -127,6 +127,8 @@ struct Inner {
     /// the writes are marked clean and lost.
     lenient_sync_failures: bool,
     stats_pending_writes: usize,
+    /// Bytes returned by `read_at` since creation (cache-efficiency tests).
+    stats_read_bytes: u64,
     /// Simulated free space reported by `Backing::free_bytes`.
     free_bytes: Option<u64>,
 }
@@ -265,6 +267,11 @@ impl CrashableBacking {
 
     pub fn pending_write_count(&self) -> usize {
         self.inner.lock().stats_pending_writes
+    }
+
+    /// Total bytes served by `read_at` on any file of this backing.
+    pub fn read_bytes(&self) -> u64 {
+        self.inner.lock().stats_read_bytes
     }
 
     /// Simulate a crash: every volatile operation is independently kept or
@@ -511,6 +518,7 @@ impl BackingFile for CrashFile {
                 ));
             }
             buf.copy_from_slice(&data[start..end]);
+            inner.stats_read_bytes += buf.len() as u64;
             Ok(())
         })
     }

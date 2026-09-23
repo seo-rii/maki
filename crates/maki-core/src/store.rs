@@ -1033,18 +1033,30 @@ impl SlotStore {
         Ok(())
     }
 
-    /// SPEC §22 read classification.
-    pub fn read_slot(&self, unit: u64) -> Result<SlotRead, CoreError> {
+    /// The write sequence of the version a slot currently holds, without
+    /// reading or verifying its payload: `None` for an unwritten (or v3
+    /// discarded) unit. Every header-level refusal of [`read_slot`] applies
+    /// here too, so a caller that finds a plaintext cache entry for
+    /// `(unit, sequence)` may serve it without the payload read (R4-006).
+    pub fn slot_sequence(&self, unit: u64) -> Result<Option<u64>, CoreError> {
+        Ok(self.slot_header(unit)?.map(|header| header.write_sequence))
+    }
+
+    /// SPEC §22 read classification, header part: which version the slot
+    /// holds, or `None` for zeros. Refuses undecodable, foreign-unit and
+    /// oversized headers and damaged unlisted slots exactly as a full read
+    /// would.
+    fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let Some(shard) = self.shards.get(&shard_idx) else {
-            return Ok(SlotRead::Zero);
+            return Ok(None);
         };
         if shard
             .discard
             .as_ref()
             .is_some_and(|discard| discard.get(in_shard))
         {
-            return Ok(SlotRead::Zero);
+            return Ok(None);
         }
         let offset = self.geometry.slot_offset(in_shard);
         let header = if shard.alloc.get(in_shard) {
@@ -1070,7 +1082,7 @@ impl SlotStore {
             // (allocation copy behind the data, see module docs).
             let len = shard.data.len()?;
             match probe_header(&self.geometry, shard, unit, in_shard, len)? {
-                Probe::Unwritten => return Ok(SlotRead::Zero),
+                Probe::Unwritten => return Ok(None),
                 Probe::Damaged => {
                     return Err(CoreError::Corrupt(format!(
                         "unit {unit}: unlisted slot holds a damaged header (written, then \
@@ -1092,6 +1104,21 @@ impl SlotStore {
                 header.ciphertext_len
             )));
         }
+        Ok(Some(header))
+    }
+
+    /// SPEC §22 read classification: header, then the payload verified
+    /// against the header's CRC.
+    pub fn read_slot(&self, unit: u64) -> Result<SlotRead, CoreError> {
+        let Some(header) = self.slot_header(unit)? else {
+            return Ok(SlotRead::Zero);
+        };
+        let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
+        let shard = self
+            .shards
+            .get(&shard_idx)
+            .expect("slot_header found the shard");
+        let offset = self.geometry.slot_offset(in_shard);
         let mut data = vec![0u8; header.ciphertext_len as usize];
         shard
             .data

@@ -710,8 +710,14 @@ impl Engine {
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
 
-        // Consistent per-unit ciphertext snapshot; cache hits (keyed by the
-        // unit's current write sequence, SPEC §29) skip decryption.
+        // Consistent per-unit ciphertext snapshot under the volume read
+        // lock. With a cache, the unit's current write sequence is
+        // established first (overlay entry or 64-byte slot header) and a hit
+        // for `(unit, sequence)` (SPEC §29) is served without reading the
+        // payload (R4-006); only misses read and decrypt the ciphertext.
+        // Header-level damage still refuses the read, and a payload that was
+        // verified when the entry was cached is not re-verified until the
+        // entry is evicted.
         let volume = self.inner.volume.clone().read_owned().await;
         let inner = self.inner.clone();
         let io_admission = admission.clone();
@@ -721,13 +727,18 @@ impl Engine {
             let mut cts = Vec::new();
             let mut seqs = HashMap::new();
             for unit in first..=last {
-                if let Some((seq, data)) = volume.read_ct(unit)? {
-                    if let Some(cache) = &inner.cache {
-                        if let Some(buf) = cache.get(unit, seq) {
-                            cached.insert(unit, buf);
-                            continue;
+                if let Some(cache) = &inner.cache {
+                    match volume.current_sequence(unit)? {
+                        None => continue,
+                        Some(seq) => {
+                            if let Some(buf) = cache.get(unit, seq) {
+                                cached.insert(unit, buf);
+                                continue;
+                            }
                         }
                     }
+                }
+                if let Some((seq, data)) = volume.read_ct(unit)? {
                     seqs.insert(unit, seq);
                     cts.push(CiphertextUnit {
                         unit_index: unit,

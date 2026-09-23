@@ -378,6 +378,22 @@ impl Volume {
         Ok(())
     }
 
+    /// The write sequence of a unit's current version without reading its
+    /// payload (overlay first, then the slot header); `None` = unwritten
+    /// zeros. Under the same volume lock this equals the sequence `read_ct`
+    /// would return, so a plaintext-cache entry keyed by it is current
+    /// (R4-006).
+    pub fn current_sequence(&self, unit: u64) -> Result<Option<u64>, CoreError> {
+        self.check_freshness()?;
+        if let Some(v) = self.overlay.get(unit) {
+            if self.supports_discard() && v.ciphertext.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(v.sequence));
+        }
+        self.store.slot_sequence(unit)
+    }
+
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
     pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {

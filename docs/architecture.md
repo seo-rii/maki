@@ -286,7 +286,12 @@ and request semaphores prevent a failing provider from causing unbounded work.
 
 The optional cache stores plaintext under `(unit_index, write_sequence)`. A
 version mismatch is always a miss, so correctness does not depend on invalidation
-timing. Entries use zeroizing buffers and are never written back.
+timing. Entries use zeroizing buffers and are never written back. A read
+establishes the current sequence first (overlay entry or 64-byte slot header)
+and serves a hit without reading the payload or calling the provider, so the
+cache saves both the ciphertext read and the crypto call; the trade-off
+(payload damage under a valid header is served until eviction) is described
+with the [read-cache settings](configuration.md#read-cache).
 
 The virtual device capacity is fixed by the volume geometry. Maki creates
 backing shards lazily as writes reach new regions. Filesystem-level growth is a

@@ -95,6 +95,11 @@ documents.
 
 ### Fixed
 
+- A plaintext-cache hit now skips the ciphertext payload read (it reads the
+  64-byte slot header to establish the version) instead of only skipping
+  decryption; a hit no longer re-verifies an already validated payload's
+  CRC until the entry is evicted (R4-006;
+  [configuration](docs/configuration.md#read-cache)).
 - Local providers now encrypt and decrypt in place inside pre-allocated
   `SecretBuffer`s and key files are read straight into guarded memory, so
   plaintext and keys never first exist in an unlocked allocation; the AES key
