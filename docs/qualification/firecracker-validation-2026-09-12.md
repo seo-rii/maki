@@ -12,10 +12,10 @@ removed the workload VM's RAM, kernel, and page cache and is the stronger
 cloud-reset result. This report remains useful evidence for the independently
 reproducible Firecracker guest boundary and retains its original limits.
 
-Related: [qualification tiers](testing.md),
+Related: [qualification tiers](../testing.md),
 [native process and cgroup evidence](cgroup-fault-validation-2026-09-12.md),
-[durable recovery contract](durable-recovery.md),
-[production readiness review](production-readiness-review-2026-09-08.md).
+[durable recovery contract](../durable-recovery.md),
+[production readiness review](historical-reviews/production-readiness-review-2026-09-08.md).
 
 ## Environment and artifacts
 
@@ -54,9 +54,9 @@ evidence of rebuilding every binary at the later documentation checkout.
 
 ## Fault and oracle protocol
 
-The [host runner](../scripts/firecracker-powercut-validation.py) creates a new
+The [host runner](../../scripts/firecracker-powercut-validation.py) creates a new
 Firecracker process for each boot, always opening the same data image. The
-[guest PID 1 agent](../scripts/firecracker-guest-agent.py) mounts ext4 with
+[guest PID 1 agent](../../scripts/firecracker-guest-agent.py) mounts ext4 with
 normal journal replay. Only boot 0 may initialize the Maki volume; later boots
 refuse missing or changed volume/configuration. They never format, run repair
 tools or silently create replacement data.
@@ -110,7 +110,7 @@ runner reported failure instead of accepting the boot. A regression test was
 added before setting an explicit system PATH for guest children; the corrected
 smoke and main campaign then passed. This was a guest harness setup defect,
 not a Maki durability failure. The
-[harness tests](../scripts/test_firecracker_powercut_validation.py) also cover
+[harness tests](../../scripts/test_firecracker_powercut_validation.py) also cover
 false/incomplete ACKs, stale identities, malformed oracles, wrong readbacks,
 failed barriers, actual child timeout cleanup and Python optimization.
 

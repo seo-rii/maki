@@ -16,10 +16,10 @@ leaves attached disks unchanged. See the
 [gcloud reset reference](https://docs.cloud.google.com/sdk/gcloud/reference/compute/instances/reset)
 and [Compute Engine reset guide](https://docs.cloud.google.com/compute/docs/instances/reset-instance).
 
-Related: [qualification tiers](testing.md),
+Related: [qualification tiers](../testing.md),
 [native process and cgroup evidence](cgroup-fault-validation-2026-09-12.md),
-[durable recovery contract](durable-recovery.md), and
-[production readiness review](production-readiness-review-2026-09-08.md).
+[durable recovery contract](../durable-recovery.md), and
+[production readiness review](historical-reviews/production-readiness-review-2026-09-08.md).
 
 ## Environment
 
@@ -53,9 +53,9 @@ Stable resource identities recorded before and throughout the campaign were:
 
 ## Fault and oracle protocol
 
-The [external controller](../scripts/gcp-reset-validation.py) first freezes the
+The [external controller](../../scripts/gcp-reset-validation.py) first freezes the
 instance ID, data disk ID and self-link, attachment URL and device name, and
-filesystem UUID. The [guest agent](../scripts/gcp-reset-guest.py) starts the
+filesystem UUID. The [guest agent](../../scripts/gcp-reset-guest.py) starts the
 real nbdkit plugin and waits for its startup READY notification. It then opens
 the Unix NBD endpoint with libnbd and refuses to proceed unless FLUSH and FUA
 are both available.

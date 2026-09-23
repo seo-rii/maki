@@ -8,9 +8,9 @@ trial, with 21.75 MiB completed before OOM, did recover at 32 MiB. Recovery at
 192 MiB succeeded. These outcomes do not establish reliable availability at
 32 MiB or a minimum-memory sizing rule.
 
-Related: [qualification tiers](testing.md),
-[production readiness review](production-readiness-review-2026-09-08.md),
-[durable recovery contract](durable-recovery.md).
+Related: [qualification tiers](../testing.md),
+[production readiness review](historical-reviews/production-readiness-review-2026-09-08.md),
+[durable recovery contract](../durable-recovery.md).
 
 ## Environment and isolation
 
@@ -32,7 +32,7 @@ Related: [qualification tiers](testing.md),
 
 ## Executed checks
 
-The [Docker runner](../scripts/cgroup-validation.py) completed three cases.
+The [Docker runner](../../scripts/cgroup-validation.py) completed three cases.
 Each initial workload performed eight FLUSH batches of 128 distinct 4 KiB units
 and 64 FUA writes, overwriting those same units across rounds. The final latest
 image contains 136 independently checked units. Unbarriered writes use other
@@ -60,7 +60,7 @@ insufficient. A startup timeout is recorded as unavailable, never as successful
 recovery. `results.json`'s top-level `passed` covers the campaign's durability
 checks and completed observations; inspect `recovery_at_32m.ready` separately.
 
-The [native Rust regression](../crates/maki-nbdkit/tests/review_r3_native_crash.rs)
+The [native Rust regression](../../crates/maki-nbdkit/tests/review_r3_native_crash.rs)
 adds six cases using disposable fake-provider volumes, nbdkit and libnbd:
 
 - FLUSH and FUA each survive three SIGKILL/restart cycles by default.

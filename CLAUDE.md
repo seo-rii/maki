@@ -3,7 +3,10 @@
 Maki is a crash-consistent, bounded, privilege-separated encrypted block-storage
 layer exposed through nbdkit. `SPEC.md` is normative. Start with
 `docs/architecture.md`, `docs/configuration.md`, `docs/operations.md`, and
-`docs/testing.md` for maintained project documentation.
+`docs/testing.md` for maintained project documentation. `docs/status.md` is
+the only page that states current support; dated campaign reports live under
+`docs/qualification/` and never claim current state. Run
+`python3 -B scripts/check_docs_links.py` after moving or renaming a document.
 
 ## Ground rules
 

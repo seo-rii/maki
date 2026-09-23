@@ -96,7 +96,7 @@ item failure. It also checks canonical padding, exact output lengths, invalid
 alphabet and trailing bits. These tests do not inspect freed memory or claim
 to observe library-private copies. The complete WebSocket package passed
 28 tests and all-targets strict Clippy on 2026-09-12; exact logs are recorded
-in the [readiness review](production-readiness-review-2026-09-08.md).
+in the [readiness review](qualification/historical-reviews/production-readiness-review-2026-09-08.md).
 
 ## WebSocket incoming responses
 

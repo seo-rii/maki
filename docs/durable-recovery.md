@@ -36,7 +36,7 @@ For existing data, prepare an explicit migration:
 
 No command in this build performs those migration steps automatically.
 
-The [2026-09-19 package and migration qualification](package-topology-migration-validation-2026-09-19.md)
+The [2026-09-19 package and migration qualification](qualification/package-topology-migration-validation-2026-09-19.md)
 exercised this procedure for one cleanly drained envelope-v1 SQLite source. The
 matching old reader produced a native backup, the current writable path refused
 the unchanged v1 superblocks, and restoring into a fresh v2 volume matched the
@@ -166,7 +166,7 @@ The MAKI-020 integration in `1bc0ab5` passed 768 workspace tests (10 ignored),
 all nine selected release gates, and Linux/Windows CI. The subsequent latest-
 record retention change is tracked separately. These results do not establish
 actual DB or hardware power-loss qualification. See the
-[readiness record](production-readiness-review-2026-09-08.md) for exact revisions
+[readiness record](qualification/historical-reviews/production-readiness-review-2026-09-08.md) for exact revisions
 and completed versus pending validation, and
 [storage recovery](storage-recovery.md) for the separate NBD/LVM/mount cleanup
 limitations.

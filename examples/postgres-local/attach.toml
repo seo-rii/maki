@@ -1,0 +1,34 @@
+# Root-owned attach configuration for the `postgres` volume.
+#
+#   install -m 0600 -o root -g root attach.toml /etc/maki/attach/postgres.toml
+#
+# Fill every <...> value from the bootstrap in docs/getting-started/first-volume.md.
+# The helper never receives crypto credentials; this file contains no secrets.
+
+# `maki volume inspect /etc/maki/volumes/postgres.toml` → uuid:
+volume_uuid = "<volume-uuid>"
+
+# Block size handed to nbd-client -b and blockdev --setbsz; equals
+# volume.device_block_size.
+device_block_size = 4096
+
+# Names used when the layout was created. Defaults would be
+# vg_maki_postgres / data / /srv/postgres.
+vg_name = "vg_maki_postgres"
+lv_name = "data"
+mountpoint = "/srv/postgres"
+
+# Production profile: pin the XFS UUID (`blkid` on the data LV).
+fs_uuid = "<xfs-uuid>"
+
+# true for the very first attach only (creates <mountpoint>/.maki-sentinel),
+# then set it back to false.
+init_sentinel = false
+
+# Production profile: the complete PV set, the VG and the data LV, taken from
+# `pvs -o pv_uuid`, `vgs -o vg_uuid`, `lvs -o lv_uuid` while the layout was
+# active. Attach refuses any missing, additional or changed UUID.
+[lvm_identity]
+pv_uuids = ["<pv-uuid>"]
+vg_uuid = "<vg-uuid>"
+lv_uuid = "<lv-uuid>"

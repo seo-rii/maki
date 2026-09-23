@@ -9,6 +9,11 @@ Historical `phase*` test filenames and `phase*_gate_full` function names remain
 stable internal identifiers. They do not represent the public documentation or
 an active implementation plan.
 
+What Maki currently supports is summarized in [status](status.md); the
+"Current qualification status" section below is the evidence trail behind
+that summary, and the dated reports it cites live under
+[`qualification/`](qualification/README.md).
+
 ## Run checks locally
 
 ```bash
@@ -56,9 +61,9 @@ cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
 136 external ACK units intact, then passed the 192 MiB recovery and offline
 deep check. Because `memory.peak` reached the exact 32 MiB cap, this is a
 scenario result rather than a minimum-memory recommendation. See the
-[cgroup evidence](cgroup-fault-validation-2026-09-12.md#bounded-replay-follow-up--2026-09-18).
+[cgroup evidence](qualification/cgroup-fault-validation-2026-09-12.md#bounded-replay-follow-up--2026-09-18).
 
-The 2026-09-19 [constrained recovery RSS campaign](recovery-rss-validation-2026-09-19.md)
+The 2026-09-19 [constrained recovery RSS campaign](qualification/recovery-rss-validation-2026-09-19.md)
 then ran two independent 48 MiB and two independent 64 MiB post-OOM recoveries.
 All four matched 136 ACK units and passed deep checking. The largest observed
 nbdkit `VmHWM` was 11,415,552 bytes. Both 48 MiB cgroups touched their cap; both
@@ -235,7 +240,7 @@ the unchanged v2 backing, configuration, attach identity and credential, and
 was deleted with its boot disk. A newly created VM restored the artifacts,
 matched all 32 rows, added 16 rows, and matched all 48 after a full lifecycle
 restart. Both final offline checks passed and both VMs and disks were deleted.
-See the [fresh-host restore validation](fresh-host-restore-validation-2026-09-17.md).
+See the [fresh-host restore validation](qualification/fresh-host-restore-validation-2026-09-17.md).
 
 Revision `c385c99` then passed a separate remote-provider database campaign on
 one disposable GCE VM. Two authenticated loopback HTTP providers served the
@@ -244,7 +249,7 @@ providers, eight with only B, eight with only A, stalled one transaction while
 both were down, resumed that exact transaction after B returned, and finished
 at 32 rows. All IDs and body hashes matched an external fsynced ledger before
 and after a packaged lifecycle restart. See the
-[remote HTTP provider database validation](remote-provider-db-validation-2026-09-18.md).
+[remote HTTP provider database validation](qualification/remote-provider-db-validation-2026-09-18.md).
 
 Revision `47058d2` then passed a separate three-host HTTPS campaign. A client
 used private VPC addresses to reach two nginx-terminated reference providers,
@@ -255,7 +260,7 @@ were stopped separately while writes continued; with both down, the ledger
 stayed at 24 until B returned. The run reached 32 exact ACK rows, retained them
 through a Maki restart, passed deep checking with zero invalid slots, and
 deleted all three VMs. See the
-[cross-host TLS reference-provider validation](cross-host-tls-provider-validation-2026-09-19.md).
+[cross-host TLS reference-provider validation](qualification/cross-host-tls-provider-validation-2026-09-19.md).
 
 Revision `5f50354` then passed a checksummed PostgreSQL 15 campaign on another
 disposable GCE VM. After 16 exact ACK rows, a cgroup-wide postmaster `SIGKILL`
@@ -263,7 +268,7 @@ interrupted four pgbench clients. Automatic WAL recovery produced a distinct
 postmaster, preserved the whole ACK prefix, and passed `pg_amcheck`. The cluster
 advanced to 32 rows, retained them through a packaged Maki lifecycle restart,
 then reached 48 rows. Four `pg_amcheck` runs were clean. See the
-[PostgreSQL process-crash validation](postgresql-crash-validation-2026-09-18.md).
+[PostgreSQL process-crash validation](qualification/postgresql-crash-validation-2026-09-18.md).
 
 Revision `3cac300` then passed a generated Debian package, topology, and
 migration campaign. A clean pre-upgrade package install ran two simultaneous
@@ -273,7 +278,7 @@ A corrupt DB-native restore was rejected before retry, a clean legacy-v1
 old-reader backup restored exactly into v2 while the current writer refused the
 unchanged v1 metadata, and multi-mapping plus foreign-backend cleanup both
 failed closed before mutation. See the
-[package, topology, and migration validation](package-topology-migration-validation-2026-09-19.md).
+[package, topology, and migration validation](qualification/package-topology-migration-validation-2026-09-19.md).
 
 Revision `bdb9113` then passed a separate three-host credential-rotation and
 new-key migration campaign. An existing K1 volume was stopped, detached and
@@ -285,7 +290,7 @@ refused with unchanged superblock/canary hashes. The 24 exact external ACK rows
 survived a lifecycle restart.
 Both volumes passed final deep checking with zero invalid slots, and all three
 VMs and disks were deleted. See the
-[credential rotation and key migration validation](credential-rotation-key-migration-validation-2026-09-19.md).
+[credential rotation and key migration validation](qualification/credential-rotation-key-migration-validation-2026-09-19.md).
 
 Revision `da89ae3` then passed a four-host stopped server-CA and endpoint
 rotation campaign. Mixed old/new server leaves worked with overlapping private
@@ -297,7 +302,7 @@ volume identity, superblock/canary hashes, and exact SQLite data. C/B reached
 48 ACK rows through another restart. The negative oracle was corrected in TDD
 to distinguish an early socket inode from readiness and an outer operation
 deadline from an explicit TLS error. See the
-[server CA and endpoint rotation validation](server-ca-endpoint-rotation-validation-2026-09-19.md).
+[server CA and endpoint rotation validation](qualification/server-ca-endpoint-rotation-validation-2026-09-19.md).
 
 For unattended repetition of the existing DB model, persistence, concurrency,
 space-admission, recovery-allocation, and v3 discard crash/model/reclamation
@@ -326,7 +331,7 @@ Inspect the completed result without restarting it:
 python3 -B scripts/storage-repeat-validation.py status --run-dir ~/logs/maki-storage-20260920T111848Z-5111c6
 ```
 
-The separate [v3 GCE reset campaign](gce-discard-reset-validation-2026-09-20.md)
+The separate [v3 GCE reset campaign](qualification/gce-discard-reset-validation-2026-09-20.md)
 passed ten whole-instance resets with 160 verified units and a zero-invalid-slot
 offline deep check, then deleted its disposable resources. It used native NBD
 with the local provider; it was not a production database or physical Persistent
@@ -361,54 +366,54 @@ Disk power-loss campaign.
 | Mixed workload | 72 hours | Open | Dedicated hardware run not recorded |
 
 The detailed Debian run is preserved in the
-[rootless Linux validation report](native-linux-validation-2026-09-02.md). The
-later [privileged Linux validation report](privileged-linux-validation.md)
+[rootless Linux validation report](qualification/native-linux-validation-2026-09-02.md). The
+later [privileged Linux validation report](qualification/privileged-linux-validation.md)
 records the kernel NBD, LVM, XFS, raw and filesystem fio, privilege, helper, and
 SQLite results, including the installed-systemd combined campaign and its
 limits. The disposable instances and disks were deleted afterward, and fresh
 name-scoped queries found no remaining `maki-*` resources.
-The [September 12 fault report](cgroup-fault-validation-2026-09-12.md) records
+The [September 12 fault report](qualification/cgroup-fault-validation-2026-09-12.md) records
 the new native process and cgroup executions, external ACK evidence, reproduction
 commands and the unresolved restart limit. The host was Debian, so no WSL
 shutdown was executed.
-The [Firecracker report](firecracker-validation-2026-09-12.md) records the
+The [Firecracker report](qualification/firecracker-validation-2026-09-12.md) records the
 separate guest-kernel/page-cache loss campaign, its host-fsynced ACK ledger,
 image hashes, cold-boot readbacks, and the boundary at the surviving L1 host.
-The [GCE reset report](gce-reset-validation-2026-09-13.md) records the later
+The [GCE reset report](qualification/gce-reset-validation-2026-09-13.md) records the later
 whole-workload-VM hard reset campaign, stable resource identities, shutdown
 witness, Cloud Audit Log entries, authenticated readbacks, and cloud cleanup.
-The [fresh-host restore report](fresh-host-restore-validation-2026-09-17.md)
+The [fresh-host restore report](qualification/fresh-host-restore-validation-2026-09-17.md)
 records the later graceful export, source deletion, new-host restore, continued
 writes, restart readback, harness corrections and cloud cleanup.
-The [remote-provider database report](remote-provider-db-validation-2026-09-18.md)
+The [remote-provider database report](qualification/remote-provider-db-validation-2026-09-18.md)
 records the two authenticated HTTP endpoints, per-endpoint failure, total
 provider outage, SQLite ACK/hash oracle, lifecycle restart, harness correction,
 and deletion of both attempted VMs and disks.
-The [cross-host TLS reference-provider report](cross-host-tls-provider-validation-2026-09-19.md)
+The [cross-host TLS reference-provider report](qualification/cross-host-tls-provider-validation-2026-09-19.md)
 records private-VPC TLS 1.2/1.3, mTLS and bearer controls, provider-host
 stop/start, SQLite ACK/hash readback, final deep checking, immutable harness
 inputs, and deletion of all three VMs and disks.
-The [PostgreSQL crash report](postgresql-crash-validation-2026-09-18.md)
+The [PostgreSQL crash report](qualification/postgresql-crash-validation-2026-09-18.md)
 records active durability settings, pgbench interruption, WAL redo, postmaster
 replacement, four logical checks, ACK/hash readback, Maki lifecycle restart,
 and deletion of the disposable VM and disk.
-The [physical reservation report](physical-reservation-validation-2026-09-18.md)
+The [physical reservation report](qualification/physical-reservation-validation-2026-09-18.md)
 records real ext4 block allocation before FUA acknowledgement, a zero-free-space
 ENOSPC refusal with unchanged journal state, retry, restart readback, offline
 checking, and deletion of the disposable VM and separate data disk.
-The [package, topology, and migration report](package-topology-migration-validation-2026-09-19.md)
+The [package, topology, and migration report](qualification/package-topology-migration-validation-2026-09-19.md)
 records clean install and upgrade, simultaneous volumes with a sidecar LV,
 fail-closed multi-mapping and foreign-backend cleanup, SQLite DB-native and
 legacy-v1 migration, final deep checks, and deletion of the disposable VM and
 disk.
-The [credential rotation and key migration report](credential-rotation-key-migration-validation-2026-09-19.md)
+The [credential rotation and key migration report](qualification/credential-rotation-key-migration-validation-2026-09-19.md)
 records the stopped bearer/mTLS-client transition, old-credential refusal,
 unchanged existing-volume superblock/canary hashes, distinct provider-key
 fingerprints and volume UUIDs, wrong-key canary refusal, DB-native cutover and
 restart readback, final deep checks, immutable harness inputs, and deletion of
 all three VMs and disks.
 
-The [server CA and endpoint rotation report](server-ca-endpoint-rotation-validation-2026-09-19.md)
+The [server CA and endpoint rotation report](qualification/server-ca-endpoint-rotation-validation-2026-09-19.md)
 records private-CA overlap/removal, fresh server-leaf fingerprints, paired trust
 controls and actual NBD refusal, same-key replacement on a distinct provider IP,
 unchanged volume identity, and 48-row restart readback. It also preserves the

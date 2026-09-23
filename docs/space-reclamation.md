@@ -126,7 +126,7 @@ eight storage suites, including discard crash, model, and reclamation retry:
 AES-GCM-SIV provider. Eleven boots verified 160 acknowledged units; the final
 offline deep check reported proof/checkpoint sequence 190, eight shards, 15
 allocated slots, and zero invalid slots. Exact-name instance and disk cleanup
-queries were empty. See the [GCE v3 report](gce-discard-reset-validation-2026-09-20.md).
+queries were empty. See the [GCE v3 report](qualification/gce-discard-reset-validation-2026-09-20.md).
 These runs do not establish production approval, real-database recovery, or
 physical Persistent Disk power-loss behavior.
 

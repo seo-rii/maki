@@ -14,9 +14,9 @@ header ABI probe, and live Maki nbdkit/libnbd/fio path all passed. Kernel NBD,
 installed-service, vendor, real-database, and physical power-loss
 qualifications remain open.
 
-Related documentation: [Architecture](architecture.md) ·
-[Operations](operations.md) ·
-[Testing and qualification](testing.md)
+Related documentation: [Architecture](../architecture.md) ·
+[Operations](../operations.md) ·
+[Testing and qualification](../testing.md)
 
 ## Summary
 
@@ -298,12 +298,12 @@ raw-device durability, or hard-power-loss recovery.
 
 | Qualification | Why it was not run | Prerequisite to close it | Runbook |
 |---|---|---|---|
-| Kernel `/dev/nbd`, filesystem, and raw-device fio | Root-only attachment and destructive writes to the selected device | Dedicated disposable NBD target and authorized root environment | [Operations](operations.md) |
-| Live privilege, ACL, capability, and service-crash checks | Packaging and dedicated service identities absent; includes intentional crash | Installed package on an isolated Linux host | [Operations](operations.md) |
-| Vendor contract and soak | No endpoint or credential supplied | Vendor test environment with production mapping and credentials | [Configuration](configuration.md) |
-| Real SQLite/PostgreSQL qualification | Requires the privileged NBD/XFS path first | Completed kernel path and disposable database instance | [Testing](testing.md) |
-| QEMU hard cuts and bare-metal cuts | Intentionally disruptive | Dedicated VM/hardware, independent ledger, and authorized power control | [Testing](testing.md) |
-| 24/72-hour soak and 24 CPU-hour parser fuzzing | Long, resource-intensive qualification; fuzz wiring is pending | Dedicated runner, bounded monitoring, and cargo-fuzz targets/corpus | [Testing](testing.md) |
+| Kernel `/dev/nbd`, filesystem, and raw-device fio | Root-only attachment and destructive writes to the selected device | Dedicated disposable NBD target and authorized root environment | [Operations](../operations.md) |
+| Live privilege, ACL, capability, and service-crash checks | Packaging and dedicated service identities absent; includes intentional crash | Installed package on an isolated Linux host | [Operations](../operations.md) |
+| Vendor contract and soak | No endpoint or credential supplied | Vendor test environment with production mapping and credentials | [Configuration](../configuration.md) |
+| Real SQLite/PostgreSQL qualification | Requires the privileged NBD/XFS path first | Completed kernel path and disposable database instance | [Testing](../testing.md) |
+| QEMU hard cuts and bare-metal cuts | Intentionally disruptive | Dedicated VM/hardware, independent ledger, and authorized power control | [Testing](../testing.md) |
+| 24/72-hour soak and 24 CPU-hour parser fuzzing | Long, resource-intensive qualification; fuzz wiring is pending | Dedicated runner, bounded monitoring, and cargo-fuzz targets/corpus | [Testing](../testing.md) |
 
 ## Impact on release qualification
 

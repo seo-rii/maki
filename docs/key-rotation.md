@@ -253,7 +253,7 @@ mount identity, database recovery/read checks, and a rollback rehearsal. An
 offline `maki check <config.toml> --deep` checks stored structure and checksums; it does not
 decrypt or authenticate the database and cannot replace those checks.
 
-The [2026-09-19 three-host qualification](credential-rotation-key-migration-validation-2026-09-19.md)
+The [2026-09-19 three-host qualification](qualification/credential-rotation-key-migration-validation-2026-09-19.md)
 exercised this stopped sequence with bearer and mTLS client credentials, two
 reference-provider hosts, actual kernel NBD/LVM/XFS, trusted attach/verify,
 SQLite external acknowledgements, and a DB-native restore into a distinct K2
@@ -263,7 +263,7 @@ fingerprints, wrong-key
 canary refusal with unchanged superblock/canary hashes, 24-row restart
 readback, and zero invalid slots on both volumes.
 
-The separate [four-host server-CA and endpoint campaign](server-ca-endpoint-rotation-validation-2026-09-19.md)
+The separate [four-host server-CA and endpoint campaign](qualification/server-ca-endpoint-rotation-validation-2026-09-19.md)
 then exercised old/new private-CA overlap, sequential server-leaf replacement,
 old-root removal, and A/B-to-C/B address replacement with A's old listener
 stopped. Both trust-direction negative controls refused actual NBD negotiation,

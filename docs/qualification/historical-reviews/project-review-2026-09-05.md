@@ -2,8 +2,8 @@
 
 이 문서는 수정 전 `8b06c53`에 대한 평가 기록이다. 이후 BUG-001부터
 BUG-009까지와 TEST-001을 TDD로 수정했다. 변경 내용, 검증 결과와 운영 경로
-전환 절차는 [수정 기록](review-remediation.md#follow-up-review-2026-09-05)과
-[업그레이드 절차](operations.md#upgrading-the-runtime-layout)에 있다.
+전환 절차는 [수정 기록](../../review-remediation.md#follow-up-review-2026-09-05)과
+[업그레이드 절차](../../operations.md#upgrading-the-runtime-layout)에 있다.
 
 검토 대상은 `main`의 `8b06c53`이다. 시작 시 작업 트리는 깨끗했다. 구현과 기존 수정 기록을 대조하고 Linux에서 기본 검사와 별도 재현을 실행했다. 운영 코드, 기존 테스트, 서비스, 장치, 인프라는 변경하지 않았다.
 

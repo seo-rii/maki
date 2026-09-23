@@ -1,213 +1,121 @@
 # Maki
 
 Maki is a crash-consistent encrypted block-storage layer for Linux. It exposes
-a standard NBD device through nbdkit and can use either local cryptography or a
-remote HTTP, WebSocket, or gRPC crypto service.
+a standard NBD device through nbdkit, keeps only ciphertext on disk, and can
+use local AES-256-GCM-SIV or a remote HTTP, WebSocket or gRPC crypto service.
 
-Maki is designed around four constraints:
-
-- plaintext is never written to the backing store;
-- acknowledged FLUSH and FUA operations survive recovery;
-- queues, requests, and remote-provider retries are bounded; and
-- the long-running data plane runs without root privileges.
-
-> [!WARNING]
-> Maki is not yet production-qualified. One Debian 12 GCE campaign ran the
-> installed shipped systemd graph over actual kernel NBD/LVM/XFS and recovered
-> 64 externally acknowledged SQLite rows. Two automatic nbdkit SIGKILL recoveries
-> plus one fail-closed open-LV cleanup and explicit retry preserved them.
-> Production database profiles and other engines, vendor endpoints and their
-> network failure modes, broader storage topologies and migrations, soak, and
-> physical power-loss qualification remain open. A separate
-> [fresh-host restore validation](docs/fresh-host-restore-validation-2026-09-17.md)
-> recovered an unchanged v2 backing and 32 external-ACK rows on a new VM, then
-> retained 48 rows after new writes and a lifecycle restart. A scoped
-> [remote HTTP provider validation](docs/remote-provider-db-validation-2026-09-18.md)
-> also carried SQLite through single-endpoint failover and a total provider
-> outage with exact ACK and hash recovery. A scoped
-> [PostgreSQL crash validation](docs/postgresql-crash-validation-2026-09-18.md)
-> recovered a checksummed PostgreSQL 15 cluster after postmaster `SIGKILL`,
-> verified it with `pg_amcheck`, and retained 48 exact ACK rows through a Maki
-> lifecycle restart. A scoped
-> [package, topology, and migration validation](docs/package-topology-migration-validation-2026-09-19.md)
-> also passed a Debian package upgrade, SQLite native and legacy-v1 migration,
-> and multi-mapping and foreign-backend fail-closed qualification on one VM. A
-> [cross-host TLS provider validation](docs/cross-host-tls-provider-validation-2026-09-19.md)
-> then passed mTLS and bearer refusal controls, two-host failover, total-outage
-> stall/resume, and restart readback over private VPC addresses. A subsequent
-> [credential rotation and key migration validation](docs/credential-rotation-key-migration-validation-2026-09-19.md)
-> passed a stopped bearer/mTLS-client rotation and a SQLite DB-native restore
-> from a K1 volume into a distinct K2 volume. A further
-> [server CA and endpoint rotation validation](docs/server-ca-endpoint-rotation-validation-2026-09-19.md)
-> passed stopped private-CA overlap/removal, server-certificate refusal controls,
-> and same-key endpoint-address replacement with 48 ACK rows. Commercial vendor
-> and target deployment behavior remain unqualified.
-
-**Volume compatibility:** new volumes default to superblock envelope v2 and
-mirrored durable proofs. `maki volume create <config> --discard` explicitly
-selects v3 for new volumes with [TRIM and space reclamation](docs/space-reclamation.md).
-Older binaries reject unsupported envelopes, and this build refuses writable
-recovery of legacy v1 volumes. The crypto AAD format version is unchanged.
-Read [durable recovery and migration](docs/durable-recovery.md)
-before replacing an existing installation; no automatic in-place upgrade is
-provided.
-
-## Features
-
-- Crash-safe ciphertext journal, checkpointing, and A/B metadata.
-- Local AES-256-GCM-SIV and AES-256-XTS providers.
-- Configurable HTTP, WebSocket, and gRPC crypto transports.
-- Verified HTTPS/WSS/gRPC TLS and optional mutual TLS.
-- Opt-in durable TRIM for new v3 volumes, with Linux backing-space reclamation.
-- Provider contract validation, retry budgets, circuit breakers, and failover.
-- Versioned plaintext read cache with zeroization on eviction.
-- Offline format checking and deterministic crash simulation.
-- Privilege-separated attach, detach, recovery and growth operations, with a
-  repeatable read-only storage identity check before workload starts.
-- Native startup notification after recovery, provider checks and control
-  binding, before the first NBD client.
-
-## Project status
-
-| Area | Status |
-|---|---|
-| Core engine, format, recovery, and provider contracts | v2 durability baseline passed workspace tests, nine release gates and Linux/Windows CI; subsequent fixes and remaining limits are tracked in the [R3 readiness record](docs/production-readiness-review-2026-09-08.md) |
-| nbdkit ABI and userspace libnbd/fio path | Validated on Debian 12/KVM |
-| HTTP transport TLS and provider fault handling | Automated tests plus cross-host VPC campaigns passed TLS 1.2/1.3 mTLS, bearer refusal, two-provider failover, total-outage stall/resume, lifecycle restart, stopped bearer/mTLS-client rotation, private server-CA overlap/removal, and same-key endpoint-address replacement; commercial vendors and target deployment behavior remain open |
-| WebSocket and gRPC transports | Verified TLS/mTLS and local daemon I/O tests pass; external vendor and deployment qualification remain open |
-| Kernel `/dev/nbd`, LVM, XFS, and fio path | Installed systemd recovery plus two automatic nbdkit-crash cycles and one open-target failure/retry passed on one pinned single-PV/LV Debian 12 GCE topology; a second campaign proved fail-closed two-LV and same-NBD foreign-backend boundaries; other target topologies remain |
-| Debian package and migration path | Clean install and generated-package upgrade preserved two attached-volume DB hashes, configs and credentials; SQLite DB-native restore passed both a same-key package campaign and a distinct K1-to-K2 three-host migration, and one old-reader legacy-v1 backup into v2 passed |
-| Real database and vendor-provider workloads | SQLite WAL passed installed-lifecycle, fresh-host, DB-native/legacy migration, loopback-provider, and cross-host TLS reference-provider campaigns; checksummed PostgreSQL 15 recovered after postmaster SIGKILL, passed four `pg_amcheck` runs, and retained 48 ACK rows through a Maki restart; production DB profiles, other engines, commercial vendor endpoints and their network behavior, and broader migration profiles remain open |
-| VM and physical power-loss testing | Firecracker VMM loss and GCE hard reset campaigns passed their scoped checks; physical power loss remains open |
-| 2026-09-02 external review (18 findings) | All addressed with regression tests; see [Review remediation log](docs/review-remediation.md) for scope and residual external validation |
-| 2026-09-03 sanitizer and randomized-suite pass | Debug-build invariant checkers plus fuzz, stress, corruption, and model suites; five findings (S-01 data read as zeros after an A/B fallback, S-02 overlay accounting, S-03 stale durable mark, S-04/S-05 recovery under out-of-order sector persistence) fixed with regression tests; see the [remediation log](docs/review-remediation.md#sanitizers-and-randomized-suites-2026-09-03) |
-| 2026-09-03 second audit (core, crypto, operations) | 27 confirmed findings fixed with regression tests, among them recovery accepting never-synced page-cache bytes after a process restart, HTTP redirects re-sending plaintext, the root helper following symlinks in the mount root, and detach disconnecting the wrong NBD device; see the [remediation log](docs/review-remediation.md#second-audit-2026-09-03-core-crypto-layer-operational-layers) |
-
-The [2026-09-05 review](docs/project-review-2026-09-05.md) identified nine further
-issues in A/B retries, request lifetimes, credentials, and deployment boundaries.
-All nine have TDD fixes; the [remediation log](docs/review-remediation.md#follow-up-review-2026-09-05)
-records the evidence. The updated helper requires a new runtime layout and NBD
-backend identity support; follow the [upgrade procedure](docs/operations.md#upgrading-the-runtime-layout)
-and qualify it on the target host before deployment.
-
-A [further reliability review](docs/review-remediation.md#further-reliability-review-2026-09-05)
-reproduced and fixed partial journal writes, failed-writeback retries, cancelled
-crypto work, queue deadlines, NBD request limits, interrupted detach retries,
-and control-socket permission races.
-Each fix has a regression that failed before implementation.
-
-A [supplementary review (2026-09-07)](docs/review-remediation.md#supplementary-review-2026-09-07-r01r08)
-addressed safe attach rollback, live-topology grow checks, the batch
-scheduler's admission bound, a hung-helper lock timeout, and the journal
-hard-limit segment-header accounting, each with a TDD regression. Its remaining
-P1/P2 items (pre-mount target verification, an in-process command deadline,
-transport plaintext zeroization, and recovery peak memory) are scoped in the
-same log under "Tracked, not closed in this pass" pending native-VM and
-measurement infrastructure.
-
-A wider [comprehensive review (2026-09-07)](docs/review-remediation.md#comprehensive-review-2026-09-07-maki-001050)
-of 50 items followed. Its self-contained code defects — robust provider
-self-test batching and integrity proof, remote-error redaction, fail-closed
-zram-swap classification, per-type A/B read bounds, and checked generation
-arithmetic — are fixed with TDD regressions; the many design, performance,
-deployment, capacity, and qualification items (including the P0 real-UUID
-multi-endpoint self-test) are scoped in the same log's "Tracked, not closed in
-this pass" pending the native-VM, real-database, and measurement infrastructure
-the review itself calls for.
-
-A [follow-up review (2026-09-08)](docs/review-remediation.md#follow-up-review-2026-09-08-fup-001015)
-audited those fixes, found several incomplete and one availability regression,
-and its testable items are now closed with TDD regressions: observation-based
-attach rollback that fails closed, stale-record and live-mount grow guards,
-full remote-error redaction, plaintext-vs-ciphertext scheduler budgets,
-inconclusive-vs-proven self-test probes, volume-UUID context binding,
-first-attach canary verification, tighter A/B read bounds, and in-flight byte
-budget validation. The residual items (an in-process command deadline, a
-FileBacking `openat2` TOCTOU fix, grow idempotency, and a shutdown logging
-lifecycle) are tracked in the same log.
-
-See [Testing and qualification](docs/testing.md) for the exact evidence and
-remaining release gates.
-
-The current [R3 readiness record](docs/production-readiness-review-2026-09-08.md)
-supersedes the historical remaining-work lists above. MAKI-020 now has required
-mirrored acknowledgement evidence: `fb3da46` passed 812 workspace tests,
-nine release gates, and Linux/Windows CI. The later `b3c5103` snapshot passed
-865 workspace tests and the release DB simulation. The `2a3f023` snapshot adds
-LVM preflight and native startup readiness and passed 901 workspace tests,
-formatting, strict Clippy, and Linux/Windows CI. Linux CI now installs the native
-NBD test tools before its workspace run. Revision-specific gate results are
-recorded separately. Volume recovery streams segments and replays accepted
-records through a fixed 1 MiB payload batch. A scoped
-[constrained recovery RSS campaign](docs/recovery-rss-validation-2026-09-19.md)
-recovered four independent OOM tails at 48/64 MiB caps; the largest observed
-nbdkit `VmHWM` was 11,415,552 bytes. Metadata, providers, caches and other
-deployment profiles still need their own total-memory bound. Production approval
-remains pending.
-
-An experimental [rollback-protected backing](docs/rollback-protection.md) is
-available for new Linux volumes. It anchors authenticated copy-on-write storage
-in a separate trusted witness filesystem; default volume formats retain their
-existing rollback limitation. Capacity, performance and qualification limits
-are documented with the configuration.
-
-## Build
-
-The Rust workspace builds on Linux, macOS, and Windows. The nbdkit plugin and
-privileged integration require Linux.
-
-```bash
-cargo build --workspace --locked
-cargo test --workspace --locked
+```text
+ database / files            root-owned helper: attach, verify, detach, grow
+        │                                     │
+   XFS on LVM on /dev/nbdN  ◀── nbd-client ◀──┘
+        │
+   nbdkit + maki plugin (unprivileged `maki` user)
+        │   ciphertext journal ─ checkpoint ─ A/B metadata
+   /var/lib/maki/<volume>  (local filesystem)     ⇄  crypto provider (local or remote)
 ```
 
-To create and inspect a volume from a configuration file:
+## Why Maki
+
+- Plaintext never reaches the backing store; keys and plaintext live in
+  zeroizing, page-locked buffers.
+- Every acknowledged FLUSH and FUA survives a crash: journal, mirrored
+  durable proofs and checkpoint ordering are verified by an executable
+  durability model, crash simulation and fault injection.
+- Bounded everything: requests, queues, provider retries, circuit breakers,
+  memory during recovery.
+- Privilege separation: the data plane runs without root; NBD, LVM and mount
+  operations run in a separate helper that has no crypto code and pins the
+  storage identity it manages.
+- Providers are untrusted: contracts are probed at attach and every response
+  is validated.
+
+## Status
+
+Maki is **not production-qualified**. Its most-tested environment is Debian 12
+on Google Compute Engine with one XFS data LV on one NBD device; scoped
+campaigns there covered nbdkit crashes, whole-instance resets, package
+upgrades, SQLite and one PostgreSQL 15 crash. Physical power loss, commercial
+crypto vendors, other distributions and long soaks are open.
+
+- [Current status](docs/status.md): the one page that states what is supported.
+- [Support matrix](docs/deployment/support-matrix.md): hosts, backing stores,
+  storage topologies, RAID.
+- [Qualification evidence](docs/qualification/README.md): dated campaign reports.
+
+## Installation
+
+Debian 12 is the primary platform. The stock `nbd-client` 3.24 is too old;
+3.27.0 or later is required, and the guide shows how to build the backport
+and the Maki package:
+
+- [Installing on Debian 12](docs/getting-started/installation-debian.md)
+
+No prebuilt packages are published yet.
+
+## Quick start
+
+The [quick start](docs/getting-started/quickstart.md) runs one local-key volume
+through the packaged systemd lifecycle and a full stop/start round trip. In
+outline:
 
 ```bash
-cargo run --locked -p maki -- volume create path/to/config.toml
-cargo run --locked -p maki -- volume inspect path/to/config.toml
-cargo run --locked -p maki -- check path/to/config.toml
+head -c 32 /dev/urandom > /etc/maki/secrets/demo.token            # key
+install -m 0640 -o root -g maki demo.toml /etc/maki/volumes/demo.toml
+install -d -o maki -g maki -m 0700 /var/lib/maki/demo
+sudo -u maki maki volume create /etc/maki/volumes/demo.toml
+# one-time: pvcreate / vgcreate / lvcreate / mkfs.xfs on the export,
+# then pin the UUIDs in /etc/maki/attach/demo.toml  (docs/getting-started/first-volume.md)
+systemctl start maki-workload@demo.target
+maki-attach verify --volume demo && echo hello > /srv/demo/hello.txt
+maki drain /etc/maki/volumes/demo.toml && systemctl stop maki-workload@demo.target
 ```
 
-The repository includes a production-oriented remote HTTP example at
-[`packaging/examples/postgres-prod.toml`](packaging/examples/postgres-prod.toml).
-Review the configuration and use a disposable backing directory before running
-`volume create`.
+## Production deployment
+
+- [PostgreSQL deployment guide](docs/deployment/postgres.md) and the matching
+  file bundle in [`examples/postgres-local/`](examples/postgres-local/README.md).
+- [Operations](docs/operations.md): lifecycle, control socket, recovery,
+  growth, upgrades.
+- [Configuration](docs/configuration.md): every section and validation rule.
 
 ## Documentation
 
-| Document | Contents |
+| Audience | Start at |
 |---|---|
-| [Documentation index](docs/README.md) | Entry point for users, operators, and contributors |
-| [Architecture](docs/architecture.md) | Data path, durability model, provider boundary, and security model |
-| [Configuration](docs/configuration.md) | Configuration sections, providers, credentials, and compatibility |
-| [Operations](docs/operations.md) | Volume lifecycle, nbdkit, systemd, control socket, and recovery |
-| [Durable recovery and migration](docs/durable-recovery.md) | Required v2 acknowledgement proofs, legacy-volume compatibility, and corruption limits |
-| [Testing and qualification](docs/testing.md) | CI, fault testing, database tests, power loss, and release status |
-| [Privileged Linux validation](docs/privileged-linux-validation.md) | Reproducible kernel NBD, LVM, XFS, fio, privilege, and SQLite run |
-| [Package, topology, and migration validation](docs/package-topology-migration-validation-2026-09-19.md) | Debian install/upgrade, multi-mapping and foreign-backend refusal, and SQLite native/legacy migration |
-| [Constrained recovery RSS validation](docs/recovery-rss-validation-2026-09-19.md) | Repeated 48/64 MiB cgroup recovery and measured nbdkit resident high-water marks |
-| [Cross-host TLS reference-provider validation](docs/cross-host-tls-provider-validation-2026-09-19.md) | Private-VPC TLS 1.2/1.3, mTLS and bearer controls, host failover, outage resume, and SQLite restart readback |
-| [Credential rotation and key migration validation](docs/credential-rotation-key-migration-validation-2026-09-19.md) | Stopped bearer/mTLS-client rotation, distinct provider keys and volumes, wrong-key canary refusal, and SQLite DB-native cutover |
-| [Server CA and endpoint rotation validation](docs/server-ca-endpoint-rotation-validation-2026-09-19.md) | Private-CA trust overlap and removal, server-certificate refusal controls, and same-key endpoint-address replacement |
-| [Technical specification](SPEC.md) | Normative storage and security requirements |
+| New users | [Getting started](docs/README.md#getting-started) |
+| Operators | [Operations](docs/operations.md), [storage recovery](docs/storage-recovery.md), [key rotation](docs/key-rotation.md) |
+| Architects and reviewers | [Architecture](docs/architecture.md), [technical specification](SPEC.md), [durable recovery](docs/durable-recovery.md) |
+| Release and QA | [Testing and qualification](docs/testing.md), [qualification evidence](docs/qualification/README.md) |
 
-## Repository layout
-
-| Path | Purpose |
-|---|---|
-| `crates/` | Storage engine, format, crypto providers, control plane, and test support |
-| `bins/` | `maki`, `maki-attach`, `maki-check`, and `maki-benchmark` |
-| `packaging/` | systemd, sysusers, tmpfiles, and provider examples |
-| `docs/` | User, operator, architecture, and qualification documentation |
+The full index is [`docs/README.md`](docs/README.md).
 
 ## Development
 
-Changes follow the test-first rules in SPEC §41. Formatting and strict Clippy
-are blocking CI checks:
+The Rust workspace builds on Linux, macOS and Windows; the nbdkit plugin and
+the privileged helper are Linux-only.
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo test --workspace --release --locked -- --ignored   # release gates
 ```
+
+Development follows the test-first rules in SPEC §41; see
+[CONTRIBUTING.md](CONTRIBUTING.md). Security reports: [SECURITY.md](SECURITY.md).
+Format and behaviour changes: [CHANGELOG.md](CHANGELOG.md).
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `crates/` | Storage engine, format, crypto providers, control plane, test support |
+| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark` |
+| `packaging/` | Debian package builder, systemd, sysusers, tmpfiles, provider examples |
+| `examples/` | Complete deployment bundles |
+| `docs/` | User, operator, reference and qualification documentation |
+| `scripts/` | Validation harnesses and repository checks |
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).

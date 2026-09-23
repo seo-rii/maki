@@ -1,14 +1,14 @@
 # Review remediation log
 
-The independent code and architecture review dated 2026-09-02
-(`maki-review-report.md`) rated Maki a strong alpha but a production **No-Go**,
+The [independent code and architecture review dated 2026-09-02](qualification/historical-reviews/external-review-2026-09-02.md)
+rated Maki a strong alpha but a production **No-Go**,
 and listed 18 findings (M-001 … M-018). This page tracks what has been done
 about each one, in the review's own order, and records subsequent reviews and
 their regression evidence.
 
 These dated sections preserve the findings and evidence from each review
 pass. For current revisions, support limits and completed versus pending
-qualification, use the [R3 readiness record](production-readiness-review-2026-09-08.md).
+qualification, use the [R3 readiness record](qualification/historical-reviews/production-readiness-review-2026-09-08.md).
 Later fixes can supersede an older section's remaining-work list.
 
 Status values: **Fixed** (regression test landed and passes), **Partial**
@@ -88,7 +88,7 @@ limits remain.
 
 ## Follow-up review (2026-09-05)
 
-The [project assessment](project-review-2026-09-05.md) of `8b06c53` found nine
+The [project assessment](qualification/historical-reviews/project-review-2026-09-05.md) of `8b06c53` found nine
 additional defects and one formatting failure. All nine were reproduced by a
 failing regression before implementation, then verified green. Each issue has
 its own code commit. The changes preserve the on-disk format and golden vectors.
@@ -594,7 +594,7 @@ not silently dropped; none is a data-durability defect.
 Later update: [native startup readiness](operations.md#data-plane-readiness)
 now initializes the adapter once in `after_fork`, before any client opens it.
 This supersedes the cold-open initialization finding above. The other bullets
-describe that review's snapshot; consult the [current remediation status](production-readiness-review-2026-09-08.md)
+describe that review's snapshot; consult the [current remediation status](qualification/historical-reviews/production-readiness-review-2026-09-08.md)
 for their subsequent fixes and remaining limits.
 
 ## Comprehensive review (2026-09-07): MAKI-001–050
@@ -900,7 +900,7 @@ device replacement, remote providers, another database, DB-native migration,
 whole-VM loss on this topology, or soak load.
 
 At that point, revision `ece7e39` passed a separate
-[fresh-host backing restore](fresh-host-restore-validation-2026-09-17.md).
+[fresh-host backing restore](qualification/fresh-host-restore-validation-2026-09-17.md).
 A source GCE VM wrote and externally acknowledged 32 SQLite rows, drained,
 passed the offline check and exported the unchanged v2 backing, configuration,
 attach identity and credential. That VM and disk were deleted before a distinct
@@ -913,7 +913,7 @@ missing parent-directory mode in the ad hoc runtime tar, and non-idempotent
 legacy migration and crash-time capture remain open.
 
 Revision `c385c99` then passed a separate
-[remote HTTP provider database campaign](remote-provider-db-validation-2026-09-18.md)
+[remote HTTP provider database campaign](qualification/remote-provider-db-validation-2026-09-18.md)
 on a disposable Debian 12 GCE VM. Two authenticated loopback providers served
 the actual packaged systemd, kernel NBD/LVM/XFS, and SQLite WAL path. Rows 0–7
 used both endpoints, 8–15 used only B after A stopped, and 16–23 used only A
@@ -928,7 +928,7 @@ database-through-provider fault observation, while real network/TLS/vendor
 behavior, another DB, concurrent host loss, latency targets and soak remain.
 
 Revision `5f50354` then passed a separate
-[PostgreSQL process-crash campaign](postgresql-crash-validation-2026-09-18.md)
+[PostgreSQL process-crash campaign](qualification/postgresql-crash-validation-2026-09-18.md)
 on a disposable Debian 12 GCE VM. PostgreSQL 15.19 ran with data checksums,
 `fsync`, synchronous commit and full-page writes on the actual packaged Maki,
 kernel NBD/LVM/XFS path. After 16 external ACK rows, a cgroup-wide postmaster
@@ -941,7 +941,7 @@ for one short PostgreSQL profile; production sizing, backup/restore,
 replication, DB-native migration, concurrent VM/storage loss and soak remain.
 
 Revision `3cac300` then passed a separate
-[package, topology, and migration campaign](package-topology-migration-validation-2026-09-19.md)
+[package, topology, and migration campaign](qualification/package-topology-migration-validation-2026-09-19.md)
 on one disposable Debian 12 GCE VM. A generated pre-upgrade package cleanly
 installed and ran two simultaneous pinned NBD/LVM/XFS volumes, including a
 sidecar LV. The generated current package preserved every config and token hash,
@@ -983,7 +983,7 @@ all-targets passed 204 tests with 6 ignored, and strict Clippy passed. This is
 not full-volume preallocation: untouched slots, filesystem/COW overhead, and
 database temporary space remain deployment-capacity inputs.
 
-The later [GCE physical reservation campaign](physical-reservation-validation-2026-09-18.md)
+The later [GCE physical reservation campaign](qualification/physical-reservation-validation-2026-09-18.md)
 exercised that path on ext4 over a separate standard Persistent Disk. A
 4,608-byte slot owned 8,192 allocated bytes before the first FUA ACK, and both
 allocation-map copies owned blocks. After consuming all 9,910,247,424 initially
@@ -1004,7 +1004,7 @@ This closes payload retention proportional to distinct units; metadata,
 runtime/provider allocations, filesystem cache and a production RSS minimum
 remain target-specific qualification inputs.
 
-A later [constrained recovery RSS campaign](recovery-rss-validation-2026-09-19.md)
+A later [constrained recovery RSS campaign](qualification/recovery-rss-validation-2026-09-19.md)
 ran two fresh 48 MiB and two fresh 64 MiB post-OOM recoveries. All four matched
 136 ACK units and passed deep checking; the maximum observed nbdkit `VmHWM` was
 11,415,552 bytes. Both 64 MiB runs stayed below the cgroup cap with zero max
@@ -1012,7 +1012,7 @@ events, while both 48 MiB runs touched the cap. This supplies a scoped process
 RSS high-water observation and cgroup sizing result, not a universal bound.
 
 Revision `47058d2` then passed a separate
-[cross-host TLS reference-provider campaign](cross-host-tls-provider-validation-2026-09-19.md).
+[cross-host TLS reference-provider campaign](qualification/cross-host-tls-provider-validation-2026-09-19.md).
 Two GCE provider hosts required mTLS and a bearer credential over private VPC
 addresses. Explicit TLS 1.2 and TLS 1.3 health gates passed; wrong CA, absent
 client identity and wrong bearer all refused startup before
@@ -1024,7 +1024,7 @@ reference-provider observation, while commercial vendor behavior and target
 network faults remain open.
 
 Revision `bdb9113` then passed a separate
-[credential rotation and key migration campaign](credential-rotation-key-migration-validation-2026-09-19.md)
+[credential rotation and key migration campaign](qualification/credential-rotation-key-migration-validation-2026-09-19.md)
 on the same three-host class of topology. A stopped K1 volume rejected its old
 bearer and mTLS client identity after rotation, validated the replacement
 identity on both peers, preserved its superblock/canary hashes, and reached 16
@@ -1037,7 +1037,7 @@ Commercial vendors, target networks, key retirement and production
 cutover/rollback remain open.
 
 Revision `da89ae3` then passed a four-host
-[server CA and endpoint-address campaign](server-ca-endpoint-rotation-validation-2026-09-19.md).
+[server CA and endpoint-address campaign](qualification/server-ca-endpoint-rotation-validation-2026-09-19.md).
 Stopped transitions exercised mixed old/new server certificates with overlapping
 private roots, new-only trust, and wrong-trust NBD refusal in both directions.
 A/B changed to distinct-IP C/B with A's nginx listener stopped and the encryption

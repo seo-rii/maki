@@ -5,8 +5,8 @@ qualification. It drives a disposable Maki export through kernel NBD, LVM,
 XFS, fio, and SQLite, while keeping the chosen device and all artifacts easy
 to audit.
 
-Related documentation: [Operations](operations.md) ·
-[Testing and qualification](testing.md)
+Related documentation: [Operations](../operations.md) ·
+[Testing and qualification](../testing.md)
 
 The runner is intentionally conservative: it accepts only `/dev/nbdN`,
 requires the same path again as an explicit wipe confirmation, and stops if
@@ -289,4 +289,4 @@ This run supplies privileged kernel-NBD, filesystem, and safe host privilege
 evidence. It is not evidence for destructive database crash campaigns,
 hard-power-loss testing, or long-duration mixed-workload qualification; those
 remain separate, isolated-host gates described in
-[Testing and qualification](testing.md).
+[Testing and qualification](../testing.md).

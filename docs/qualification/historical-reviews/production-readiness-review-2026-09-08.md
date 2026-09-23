@@ -2,11 +2,11 @@
 
 최초 검토 기준은 `9911cf7`, 최근 로컬 전체 workspace snapshot 검사는 `2a3f023`의 901 passed이며 전체 9 release gates/CI를 함께 완료한 기준선은 `fb3da46`이다(2026-09-12). 2026-09-11에 원격 `732ff74`까지의 10개 변경을 합친 뒤 같은 `main`에서 원격을 반복 확인하며 TDD 수정과 단위별 커밋을 이어갔다. 이후 실제 native 프로세스 충돌, cgroup 장애, Firecracker guest 종료와 전체 GCE 인스턴스 reset 검사를 추가했고, privileged 및 lifecycle crash 검증 기준은 `448c0b2`, remote-provider/SQLite qualification 기준은 `c385c99`이다. 최신 패키지 수정 `3cac300`의 [Linux·Windows CI](https://github.com/seo-rii/maki/actions/runs/35356803628)도 모두 성공했다. 아래에서 수정별 검증 범위와 과거 snapshot을 구분한다.
 
-**운영 승인은 보류한다.** 실제 Maki nbdkit, kernel NBD/LVM/XFS, trusted cleanup/reattach, 설치된 packaged recovery controller와 Docker SQLite 외부 ACK를 한 단일-PV/LV 캠페인에 결합하고 두 번의 자동 crash와 한 번의 cleanup 실패·재시도를 통과했다. 별도의 두 GCE 호스트에서 제한된 fresh-host backing 복원도 통과해 source의 32개 ACK 행을 새 host에서 대조하고, 16개를 추가한 뒤 lifecycle 재시작 후 48개를 다시 대조했다. 두 인증 loopback HTTP provider와 SQLite를 결합한 별도 캠페인도 개별 endpoint failover, 전체 provider 중단의 무-ACK stall과 복구 후 정확한 진행, 32개 행의 restart readback을 통과했다. checksummed PostgreSQL 15도 pgbench 중 postmaster SIGKILL 뒤 WAL 복구와 네 번의 `pg_amcheck`, 48개 ACK 및 Maki lifecycle restart를 통과했다. `733833c`는 recovery payload replay를 1 MiB batch로 제한했다. 후속 [constrained RSS 캠페인](recovery-rss-validation-2026-09-19.md)은 실제 OOM tail 네 개를 48/64 MiB에서 복구했고 관찰한 nbdkit `VmHWM`은 최대 11,415,552 bytes였지만 이는 고정 profile의 측정값이다. 별도 ext4/GCE Persistent Disk 캠페인은 첫 FUA 전에 checkpoint slot과 A/B metadata의 실제 block allocation을 확인하고, 가용 공간 0에서 다음 FUA가 sequence와 journal을 바꾸지 않은 채 ENOSPC로 닫힌 뒤 retry·restart·deep check를 통과했다. [패키지·토폴로지·마이그레이션 캠페인](package-topology-migration-validation-2026-09-19.md)은 generated Debian package clean install/upgrade, 두 동시 volume과 sidecar LV, multi-mapping 및 foreign backend의 fail-closed cleanup, SQLite DB-native와 clean legacy-v1→v2 복원을 통과했다. 그러나 전송 라이브러리의 남은 평문 복사본, 다른 geometry/provider/cache를 포함한 전체 RSS 규격, 더 넓은 storage topology, commercial vendor와 대상 network의 고유 동작, production PostgreSQL과 다른 DB profile 및 migration, 장시간 부하와 물리 전원 손실에는 코드·검증 과제가 있다. `47058d2`의 [cross-host TLS reference-provider 캠페인](cross-host-tls-provider-validation-2026-09-19.md)은 실제 private VPC에서 TLS 1.2/1.3, mTLS·bearer 거절, 두 provider host의 개별·전체 중단과 32 ACK restart readback을 통과했지만 vendor qualification은 아니다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
+**운영 승인은 보류한다.** 실제 Maki nbdkit, kernel NBD/LVM/XFS, trusted cleanup/reattach, 설치된 packaged recovery controller와 Docker SQLite 외부 ACK를 한 단일-PV/LV 캠페인에 결합하고 두 번의 자동 crash와 한 번의 cleanup 실패·재시도를 통과했다. 별도의 두 GCE 호스트에서 제한된 fresh-host backing 복원도 통과해 source의 32개 ACK 행을 새 host에서 대조하고, 16개를 추가한 뒤 lifecycle 재시작 후 48개를 다시 대조했다. 두 인증 loopback HTTP provider와 SQLite를 결합한 별도 캠페인도 개별 endpoint failover, 전체 provider 중단의 무-ACK stall과 복구 후 정확한 진행, 32개 행의 restart readback을 통과했다. checksummed PostgreSQL 15도 pgbench 중 postmaster SIGKILL 뒤 WAL 복구와 네 번의 `pg_amcheck`, 48개 ACK 및 Maki lifecycle restart를 통과했다. `733833c`는 recovery payload replay를 1 MiB batch로 제한했다. 후속 [constrained RSS 캠페인](../recovery-rss-validation-2026-09-19.md)은 실제 OOM tail 네 개를 48/64 MiB에서 복구했고 관찰한 nbdkit `VmHWM`은 최대 11,415,552 bytes였지만 이는 고정 profile의 측정값이다. 별도 ext4/GCE Persistent Disk 캠페인은 첫 FUA 전에 checkpoint slot과 A/B metadata의 실제 block allocation을 확인하고, 가용 공간 0에서 다음 FUA가 sequence와 journal을 바꾸지 않은 채 ENOSPC로 닫힌 뒤 retry·restart·deep check를 통과했다. [패키지·토폴로지·마이그레이션 캠페인](../package-topology-migration-validation-2026-09-19.md)은 generated Debian package clean install/upgrade, 두 동시 volume과 sidecar LV, multi-mapping 및 foreign backend의 fail-closed cleanup, SQLite DB-native와 clean legacy-v1→v2 복원을 통과했다. 그러나 전송 라이브러리의 남은 평문 복사본, 다른 geometry/provider/cache를 포함한 전체 RSS 규격, 더 넓은 storage topology, commercial vendor와 대상 network의 고유 동작, production PostgreSQL과 다른 DB profile 및 migration, 장시간 부하와 물리 전원 손실에는 코드·검증 과제가 있다. `47058d2`의 [cross-host TLS reference-provider 캠페인](../cross-host-tls-provider-validation-2026-09-19.md)은 실제 private VPC에서 TLS 1.2/1.3, mTLS·bearer 거절, 두 provider host의 개별·전체 중단과 32 ACK restart readback을 통과했지만 vendor qualification은 아니다. MAKI-020의 필수 proof 정책과 새 포맷은 전체 workspace·릴리스 검사와 Linux/Windows CI를 통과했으며 운영 대상 검증은 남는다. 기존 v1 볼륨은 현재 writable recovery가 거절하므로 교체 전에 [호환성과 데이터 이전 절차](../../durable-recovery.md)를 읽어야 한다. R3-001–010의 직접 원인은 아래 제품 경로와 집중 검사로 닫았지만, 리뷰 묶음이 함께 추적한 이전 MAKI/FUP 운영 과제는 남아 있으므로 로컬 `maki-review-r3-2026-09-08/` 원본은 보존한다.
 
-`bdb9113` 기준의 후속 [credential rotation·key migration 캠페인](credential-rotation-key-migration-validation-2026-09-19.md)은 중지된 K1 volume의 bearer와 mTLS client identity/CA 교체, old credential 거절, 두 peer 재검증과 superblock/canary hash 불변을 통과했다. 별도 K2 volume으로 SQLite DB-native restore한 24 ACK도 lifecycle restart 뒤 그대로 대조했고 양쪽 volume의 deep check는 invalid slot 0이었다. 이 캠페인은 client credential과 K1→K2 migration 범위였다.
+`bdb9113` 기준의 후속 [credential rotation·key migration 캠페인](../credential-rotation-key-migration-validation-2026-09-19.md)은 중지된 K1 volume의 bearer와 mTLS client identity/CA 교체, old credential 거절, 두 peer 재검증과 superblock/canary hash 불변을 통과했다. 별도 K2 volume으로 SQLite DB-native restore한 24 ACK도 lifecycle restart 뒤 그대로 대조했고 양쪽 volume의 deep check는 invalid slot 0이었다. 이 캠페인은 client credential과 K1→K2 migration 범위였다.
 
-`da89ae3` 기준의 별도 [server CA·endpoint 교체 캠페인](server-ca-endpoint-rotation-validation-2026-09-19.md)은 네 GCE 호스트에서 private CA overlap, 순차 server certificate 교체, old root 제거, 양방향 wrong-trust의 실제 NBD 거절과 같은 key/profile의 A/B→C/B IP 교체를 통과했다. A의 nginx listener를 중지한 상태로 두 peer 재검증과 48 ACK restart readback, 동일 volume UUID와 전환별 superblock/canary hash 불변을 확인했다. B가 계속 남았으므로 C 단독 운용 검증은 아니다. Commercial vendor와 대상 배포 환경 검증은 남아 있어 운영 승인 보류와 R3 원본 보존은 유지한다.
+`da89ae3` 기준의 별도 [server CA·endpoint 교체 캠페인](../server-ca-endpoint-rotation-validation-2026-09-19.md)은 네 GCE 호스트에서 private CA overlap, 순차 server certificate 교체, old root 제거, 양방향 wrong-trust의 실제 NBD 거절과 같은 key/profile의 A/B→C/B IP 교체를 통과했다. A의 nginx listener를 중지한 상태로 두 peer 재검증과 48 ACK restart readback, 동일 volume UUID와 전환별 superblock/canary hash 불변을 확인했다. B가 계속 남았으므로 C 단독 운용 검증은 아니다. Commercial vendor와 대상 배포 환경 검증은 남아 있어 운영 승인 보류와 R3 원본 보존은 유지한다.
 
 ## 실제 cgroup·프로세스 장애 검사 — 2026-09-12
 
@@ -30,7 +30,7 @@ SIGKILL 및 32MiB·swap 0의 실제 workload OOM을 확인했다. 세 시나리�
 21.75MiB를 완료한 마지막 시험은 같은 상한에서 복구했지만 한도에 도달했고,
 192MiB 복구는 성공했다. 당시 구현에서 고유 단위 replay와 메모리·시간 예산의
 과제가 남아 있다는 실제 증거였다. 특정 최소 RAM이나 정상 운영 용량을 도출한 것은
-아니다. 실패와 성공의 원장·종료 상태는 [상세 장애 보고서](cgroup-fault-validation-2026-09-12.md)에 함께 기록했다.
+아니다. 실패와 성공의 원장·종료 상태는 [상세 장애 보고서](../cgroup-fault-validation-2026-09-12.md)에 함께 기록했다.
 
 후속 `733833c`는 attach replay를 1 MiB batch로 바꾸었고 2026-09-18
 재실행에서 21.5MiB tail을 같은 32MiB cap으로 복구해 ACK 136개를 대조했다.
@@ -57,7 +57,7 @@ process group을 `SIGKILL`하고 `-9` 종료를 회수했다.
 합계는 ACK 320개와 cold-boot readback 320개다. 마지막 hard cut 뒤 offline
 deep check도 durable sequence 320, journal 20 segment/320 record를 확인하고
 통과했다. 상세한 해시·실패 시행·재현 범위는
-[Firecracker 보고서](firecracker-validation-2026-09-12.md)에 기록한다.
+[Firecracker 보고서](../firecracker-validation-2026-09-12.md)에 기록한다.
 
 이 검사는 L2 guest RAM과 guest kernel/page cache를 잃는 실제 VM 경계를
 추가했다. L1 kernel/page cache와 GCP Persistent Disk는 계속 동작했으므로
@@ -84,7 +84,7 @@ reset 10개는 모두 exit 0, 기존 SSH 10개는 모두 종료됐고, 11개 boo
 모든 READY에서 정상 종료 표식은 없었으며 마지막 deep check는 durable 및
 checkpoint sequence 160, invalid slot 0으로 통과했다. Cloud Audit Logs에서도
 smoke 2개와 본 검사 10개에 대응하는 완료된 reset operation 12개를 확인했다.
-상세 프로토콜과 재현 명령은 [GCE reset 보고서](gce-reset-validation-2026-09-13.md)에
+상세 프로토콜과 재현 명령은 [GCE reset 보고서](../gce-reset-validation-2026-09-13.md)에
 기록한다.
 
 이 결과는 workload VM의 RAM, kernel, page cache를 실제로 잃으므로 앞선
@@ -218,7 +218,7 @@ sequence는 1, journal length와 SHA-256, slot allocated block 수는 모두
 같았다. filler를 지워 같은 write를 다시 실행하자 sequence 2로 성공했고,
 nbdkit 재시작 뒤 두 payload hash가 일치했다. deep check는 allocated slot 2,
 invalid 0으로 통과했고 unmount 뒤 `e2fsck -fn`도 통과했다. 상세 결과는
-[물리 예약 보고서](physical-reservation-validation-2026-09-18.md)에 기록했다.
+[물리 예약 보고서](../physical-reservation-validation-2026-09-18.md)에 기록했다.
 
 VM, auto-delete boot disk와 별도 data disk는 모두 삭제했고 정확한 재조회와
 `maki-physical-*` 조회에서 남은 리소스가 없었다. 이 결과는 Linux ext4와
@@ -270,7 +270,7 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 - `b98e8be` (MAKI-027): signed NBD size로 표현할 수 없는 geometry를 생성/디코드에서 거절한다.
 - `67e0ea3`, `90c2c24`: 기존 포맷 불일치와 export-size 경계 테스트의 Clippy 표현을 별도 정리했다. 이 사실만으로 최종 전체 CI 통과를 주장하지 않는다.
 - `bf63103` (MAKI-012): production template이 integrity/context binding을 요구하도록 변경했다. vendor 계약과 실제 인증 provider 검증이 필요하며 replay 보호까지 제공하는 설정은 아니다.
-- `597eb3c` (R3-007, MAKI-007/040 일부): `maki-attach recover`가 backend 부재와 저장된 장치 번호·LVM UUID·slave 관계를 확인하고 mount/VG를 단계적으로 정리한다. 끊긴 파일시스템의 sentinel을 읽지 않는다. proof 없는 활성 mapping은 거절하며, [복구 제한](storage-recovery.md#remaining-recovery-limits)을 그대로 적용한다.
+- `597eb3c` (R3-007, MAKI-007/040 일부): `maki-attach recover`가 backend 부재와 저장된 장치 번호·LVM UUID·slave 관계를 확인하고 mount/VG를 단계적으로 정리한다. 끊긴 파일시스템의 sentinel을 읽지 않는다. proof 없는 활성 mapping은 거절하며, [복구 제한](../../storage-recovery.md#remaining-recovery-limits)을 그대로 적용한다.
 - `b68935d` (R3-007): 검증된 NBD geometry·partition과 LVM metadata를 activation 전에 원자적으로 기록하고, 성공한 activation 뒤 complete mapping proof로 승격한다. 중간 crash의 intent는 mount/unmount/workload 시작 권한을 주지 않으며, backend가 사라진 복구에서 exact UUID/device/topology만 scoped deactivation한다. legacy proof/intent 없는 기록은 계속 fail closed다.
 - `91d406f` (R3-007): recorded backend nonce가 계속 연결된 정상 detach도 recovery intent를 사용한다. 검증된 부분 activation subset만 scoped deactivation하며 changed mapper name/UUID/slave/holder/mount와 알 수 없는 internal LVM UUID suffix는 mutation 전에 거절한다.
 - `3fc0404` (R3-007): `maki-attach cleanup`이 하나의 lock 아래 no-record 성공, owned connected backend의 detach, absent backend의 recover를 선택한다. foreign/unreadable backend는 mutation 없이 실패하고 record를 보존한다.
@@ -286,16 +286,16 @@ Release gates PID 1946132, 종료 코드 0: `/home/seorii/logs/maki-readiness-re
 - `8419b3d` (MAKI-015 일부): HTTP가 소유한 resolved header/query 값과 결합된 mTLS identity PEM을 정상 drop·구성 오류에서 지운다. key-source credential은 중간 UTF-8 byte vector를 만들지 않고 빌린다. 원본 설정 문자열과 reqwest/hyper/rustls/kernel 복사본은 보장 밖이다.
 - `a2cc5bc` (MAKI-005): 선택적인 `[lvm_identity]`가 전체 PV UUID 집합, VG UUID와 설정 대상 LV UUID를 고정한다. attach는 activation 전에 exact match를 요구하고 recovery는 저장된 핀을 재검증한다. grow/detach는 핀이 바뀌거나 빠진 설정을 mutation 전에 거절한다. 생략 호환 모드는 운영 프로필로 승인하지 않는다.
 - `fce9066` (MAKI-018): dm-crypt 또는 zram writeback 하부에 NBD가 있거나, cycle·판독 오류·알 수 없는 virtual leaf가 있으면 secure swap으로 인정하지 않는다. device-mapper/MD/partition을 거쳐 실제 장치까지 확인하는 fixture 회귀이며, 실제 swap을 변경한 시험은 아니다.
-- `f64f3d8` (MAKI-037): `nbd.threads`를 `1..=256`에서 검증하고 runtime의 숨은 clamp를 제거했다. [설정 계약](configuration.md#nbd-request-limits)은 Tokio worker, native nbdkit callback pool, request admission을 구분한다. 성능 보장은 별도다.
+- `f64f3d8` (MAKI-037): `nbd.threads`를 `1..=256`에서 검증하고 runtime의 숨은 clamp를 제거했다. [설정 계약](../../configuration.md#nbd-request-limits)은 Tokio worker, native nbdkit callback pool, request admission을 구분한다. 성능 보장은 별도다.
 - `df886a3` (FUP-014): Linux backing이 root와 부모 디렉터리 descriptor를 고정하여 open·rename·remove·list·sync·lock을 수행한다. root 교체·symlink 거절·상위 디렉터리 권한 회귀를 추가했다. Linux 밖의 개발용 경로에 같은 보장을 확대해 주장하지 않는다.
-- `be3b362` (MAKI-039): status/metrics가 storage lock과 free-space 조회를 기다리지 않는다. [관측 상태와 제한](observability.md)에 cached snapshot의 나이, busy 상태, unavailable cache/space 값과 외부 deadline을 명시했다. runtime 전체 정지나 thread starvation은 해결하지 않았다.
-- `f20bb61` (MAKI-019 절차)와 `bdb9113` 기준 qualification: [자격 증명 교체와 키 이전 절차](key-rotation.md)를 추가했고, [세 호스트 실행](credential-rotation-key-migration-validation-2026-09-19.md)이 같은 K1을 유지한 bearer/mTLS client 교체와 별도 K2 volume으로의 SQLite DB-native 복원을 통과했다. [후속 네 호스트 실행](server-ca-endpoint-rotation-validation-2026-09-19.md)이 stopped server certificate/private-CA와 endpoint IP 교체를 추가로 통과했다. Commercial vendor와 대상 배포 환경 검증은 남는다.
+- `be3b362` (MAKI-039): status/metrics가 storage lock과 free-space 조회를 기다리지 않는다. [관측 상태와 제한](../../observability.md)에 cached snapshot의 나이, busy 상태, unavailable cache/space 값과 외부 deadline을 명시했다. runtime 전체 정지나 thread starvation은 해결하지 않았다.
+- `f20bb61` (MAKI-019 절차)와 `bdb9113` 기준 qualification: [자격 증명 교체와 키 이전 절차](../../key-rotation.md)를 추가했고, [세 호스트 실행](../credential-rotation-key-migration-validation-2026-09-19.md)이 같은 K1을 유지한 bearer/mTLS client 교체와 별도 K2 volume으로의 SQLite DB-native 복원을 통과했다. [후속 네 호스트 실행](../server-ca-endpoint-rotation-validation-2026-09-19.md)이 stopped server certificate/private-CA와 endpoint IP 교체를 추가로 통과했다. Commercial vendor와 대상 배포 환경 검증은 남는다.
 - `24d06dd` (MAKI-048 일부): 설정표의 swap 제약과 복구·모니터링 문서 링크, CI 주석의 검사 문서 경로를 정리했다.
 - `ad84cc0` (MAKI-047): 활성 `LoadCredential` directive와 맞지 않던 “Uncomment” 주석을 수정했다.
-- `7a2bf94` (MAKI-024의 문서 범위): [deep check 설명](operations.md)을 저장 구조·CRC 검사로 한정했다. AEAD, 복구 후 논리 읽기 또는 DB 의미 일관성 검사를 새로 구현한 변경은 아니다.
+- `7a2bf94` (MAKI-024의 문서 범위): [deep check 설명](../../operations.md)을 저장 구조·CRC 검사로 한정했다. AEAD, 복구 후 논리 읽기 또는 DB 의미 일관성 검사를 새로 구현한 변경은 아니다.
 - `466056d`: Unix 전용 control 생성 경로의 `with_admission`을 `cfg(unix)`로 제한해 Windows strict Clippy의 dead-code 오류를 수정했다. 변경 후 해당 snapshot의 전체 검사와 Linux·Windows CI가 통과했다.
 - `133d36d` (MAKI-025 일부): checkpoint에 포함된 journal segment를 streaming으로 검사한다. 해당 fixture의 추가 heap peak는 135,397,624바이트에서 488바이트로 줄었으며 고정 64KiB stack scratch는 별도다. replay payload와 overlay 전체 메모리에는 아직 상한이 없다.
-- `f7312c6`, `f643005`, `e14a018` 및 후속 통합 변경 (MAKI-020): 새 볼륨은 superblock envelope v2와 64바이트 `journal/durable-proof.a/b`를 요구한다. journal sync와 양쪽 proof 게시가 성공해야 ACK와 공개 durable sequence가 전진한다. recovery는 복구 메타데이터를 고치기 전에 required horizon의 연속성과 정확한 record end를 검증하며, 받아들인 tail의 양쪽 proof를 게시한 뒤 READY가 된다. [보장 범위와 호환성](durable-recovery.md)에 v1 writable 거절, 읽기 전용 검사 경고, 자동 in-place 이전 부재, 양쪽 유효 rollback에 대한 비보장을 명시했다. 통합 커밋 `1bc0ab5`의 전체 snapshot 검증 결과는 아래에 기록했다.
+- `f7312c6`, `f643005`, `e14a018` 및 후속 통합 변경 (MAKI-020): 새 볼륨은 superblock envelope v2와 64바이트 `journal/durable-proof.a/b`를 요구한다. journal sync와 양쪽 proof 게시가 성공해야 ACK와 공개 durable sequence가 전진한다. recovery는 복구 메타데이터를 고치기 전에 required horizon의 연속성과 정확한 record end를 검증하며, 받아들인 tail의 양쪽 proof를 게시한 뒤 READY가 된다. [보장 범위와 호환성](../../durable-recovery.md)에 v1 writable 거절, 읽기 전용 검사 경고, 자동 in-place 이전 부재, 양쪽 유효 rollback에 대한 비보장을 명시했다. 통합 커밋 `1bc0ab5`의 전체 snapshot 검증 결과는 아래에 기록했다.
 
 완료 검증 로그 (각 exit 0):
 
@@ -476,7 +476,7 @@ MAKI-006의 native 초기 준비 상태를 별도로 수정했다. 첫 NBD `open
 서비스의 `Type=notify`와 `NotifyAccess=main`은 기존 attach 의존 순서가
 이 신호를 기다리게 하며, 시작 대기에는 180초 기본 상한을 둔다. 준비 실패나
 지정된 통지 경로의 실패는 시작 실패다. 통지 환경변수가 없는 수동 실행도
-첫 client 전에 초기화한다. [초기 준비 상태의 범위](operations.md#data-plane-readiness)는
+첫 client 전에 초기화한다. [초기 준비 상태의 범위](../../operations.md#data-plane-readiness)는
 NBD data plane이며, XFS mount·workload별 storage verify·DB 복구·지속적인
 건강 상태를 대신하지 않는다. 실제 서비스 배포와 운영 대상 검증은 남는다.
 
@@ -512,7 +512,7 @@ strict Clippy exit 0(PID 798404;
 `/home/seorii/logs/maki-r3-ws-response-secrets-verified-clippy-20260912T105742.787597Z.log`)이다.
 고유 sliced Bytes의 초기화된 원본 전체 capacity 소거도 확인했다. 선택적
 page lock은 노출된 길이를 대상으로 하며 공유 원본, tungstenite 내부 버퍼,
-serde escape scratch와 전체 RSS는 남는다. [소유권 범위](transport-memory.md)를
+serde escape scratch와 전체 RSS는 남는다. [소유권 범위](../../transport-memory.md)를
 전체 transport 보호 완료로 확대하지 않는다.
 
 R3-007/MAKI-006/040의 workload 시작 전 재검증 경로를 추가했다.
@@ -532,7 +532,7 @@ privileged/attach 전체 122 passed, 1 ignored, exit 0(PID 810317;
 `/home/seorii/logs/maki-r3-workload-submount-final-all-20260912T110156.606393Z.log`),
 두 package all-targets strict Clippy exit 0(PID 810561;
 `/home/seorii/logs/maki-r3-workload-submount-final-clippy-20260912T110157.024822Z.log`)을
-확인했다. [실행 범위](storage-recovery.md#checking-storage-before-each-workload-start)는
+확인했다. [실행 범위](../../storage-recovery.md#checking-storage-before-each-workload-start)는
 현재 caller namespace의 storage identity다. lock 대기·kernel read의 전체 시간 상한,
 명령 종료 이후 가용성, 다른 container namespace 및 DB 복구를 보장하지 않는다.
 당시 남았던 활성화 전 LVM 신원과 activation→proof crash 공백은 각각 후속
@@ -551,7 +551,7 @@ PV label 목록을 LVM 전체 VG 보고서에 대조한다. VG 이름만 사용�
 거절한다. 기존 unpinned 설정/기록은 호환을 위해 읽지만 독립 관리 신원 인증이
 아니므로 운영 프로필로 승인하지 않는다. host udev 자동 활성화와 다른 root
 작업의 원자성은 남는다.
-[LVM 사전 검사 제한](storage-recovery.md#checking-lvm-before-activation)을
+[LVM 사전 검사 제한](../../storage-recovery.md#checking-lvm-before-activation)을
 실제 운영 토폴로지와 함께 검증해야 하며 이 항목 전체를 완료로 처리하지 않는다.
 
 실제 RED는 외부 PV와 연결 없는 활성화 계획 2개(PID 832344, exit 101;
@@ -753,7 +753,7 @@ MAKI-015의 WebSocket decoded-output 단위는 별도로 완료했다. 부분 ba
 strict Clippy exit 0(PID 517699;
 `/home/seorii/logs/maki-r3-ws-decoded-secrets-clippy-20260912T095733.902307Z.log`)을
 확인했다. JSON/base64 문자열과 transport 내부 복사본은 이 수정의 범위가
-아니다. [소유권과 남은 범위](transport-memory.md)를 별도로 명시한다.
+아니다. [소유권과 남은 범위](../../transport-memory.md)를 별도로 명시한다.
 
 `d843540`은 같은 원칙을 HTTP Base64/Base64URL/hex decoder의 오류 경로에
 적용했다. malformed 입력이 257-byte 부분 평문을 지우지 않고 해제하는 RED
@@ -812,31 +812,31 @@ buffer 소거나 성공 전 page lock까지 확대해 주장하지 않는다.
 |---|---|---|
 | MAKI-005 | 코드 지원 완료, 좁은 실제 topology 검증 완료: mount 전 TYPE/configured FS UUID와 `[lvm_identity]`의 전체 PV/VG/대상-LV UUID exact match를 제공하고, 한 개의 pinned single-PV GCE topology에서 attach/verify/cleanup을 통과했다. unpinned 호환 모드, host udev 및 외부 root 조정은 운영 보장 밖 | 운영 구성에 핀을 필수화하고 지원 토폴로지에서 foreign/unknown 대상 변경 0회, 실패·재시도, udev/root 경합을 포함한 실제 대상 검증 |
 | R3-007, MAKI-006/007/040, FUP-004의 복구 범위 | 제품 경로와 실제 installed-graph 결합 검증 완료: `448c0b2`에서 두 자동 SIGKILL cleanup/reattach, open-LV 실패 차단과 Docker ACK 64개 복구를 수행했다. `3cac300` 패키지 캠페인은 two-LV fallback과 same-NBD foreign backend를 mutation 전에 거절하고 proof/record를 보존했다 | nested/internal mapping, partition·holder·udev 경합, hot replacement, 실패 단계별 실제 장치 재시도와 운영 topology를 더 검증 |
-| MAKI-015/032 | 부분 수정: 기존 WS 요청·decoded output·수신 frame/JSON 보호에 더해 `52640cc`는 HTTP 소유 요청·응답·decode를 SecretBuffer로 유지하고 전체 할당 용량을 잠근다. gRPC private protobuf item도 decode·오류·취소부터 결과 전달까지 SecretBuffer를 유지한다. 원본 설정 문자열, parser/library-private 복사본 및 전체 resident 비용은 별도 | 소유 버퍼의 집중 수명 회귀는 통과. 라이브러리 복사본까지 완전 소거·잠금이나 보편 RSS 상한으로 확대하지 않으며, 목표 구성의 실제 peak RSS를 검증. [전송 보호 범위](transport-memory.md) 참고 |
-| MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료. Firecracker guest hard cut 20회와 전체 GCE instance reset 10회에서 필수 proof와 ACK readback은 보존됨. GCE reset은 workload VM memory/kernel cache를 잃었지만 Persistent Disk 서비스와 물리 저장 경로는 살아 있었음. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, 물리 전원 차단, proof sync 비용 측정, [legacy 데이터 이전](durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
+| MAKI-015/032 | 부분 수정: 기존 WS 요청·decoded output·수신 frame/JSON 보호에 더해 `52640cc`는 HTTP 소유 요청·응답·decode를 SecretBuffer로 유지하고 전체 할당 용량을 잠근다. gRPC private protobuf item도 decode·오류·취소부터 결과 전달까지 SecretBuffer를 유지한다. 원본 설정 문자열, parser/library-private 복사본 및 전체 resident 비용은 별도 | 소유 버퍼의 집중 수명 회귀는 통과. 라이브러리 복사본까지 완전 소거·잠금이나 보편 RSS 상한으로 확대하지 않으며, 목표 구성의 실제 peak RSS를 검증. [전송 보호 범위](../../transport-memory.md) 참고 |
+| MAKI-020 | v2 코드·집중 회귀·전체 workspace/9 release gates/CI 완료. Firecracker guest hard cut 20회와 전체 GCE instance reset 10회에서 필수 proof와 ACK readback은 보존됨. GCE reset은 workload VM memory/kernel cache를 잃었지만 Persistent Disk 서비스와 물리 저장 경로는 살아 있었음. v1의 이미 모호한 이력은 복원해 증명할 수 없음 | 지원 복합 fault의 운영 대상 qualification, 물리 전원 차단, proof sync 비용 측정, [legacy 데이터 이전](../../durable-recovery.md) 검증. CRC/동시 유효 rollback 비보장과 일반 정전 COMMIT 유실을 재현한 것이 아니라는 범위를 유지 |
 | MAKI-021/041 | `ced2bda`에서 accepted Linux write의 exact journal range와 전체 checkpoint slot을 `posix_fallocate`하고 새 shard allocation/catalog A/B를 append 전에 동기화한다. ENOSPC는 sequence를 소비하지 않고 재시도된다. `5803be8`은 최대 layout을 검사·표시한다. untouched slot의 전체-volume 선점과 filesystem/COW/DB 공간은 별도다 | 실제 fill ratio·filesystem overhead·quota·DB 임시 공간별 배포 용량을 검증하고, 지원 filesystem에서 reservation 의미를 qualification |
-| MAKI-025 | `733833c`에서 attach recovery payload를 1 MiB batch로 replay하고 checkpoint 뒤 journal을 회수한다. 4,096 distinct/16,384 overwrite 회귀가 약 1.1 MiB measured peak를 유지했다. [실제 cgroup/RSS 캠페인](recovery-rss-validation-2026-09-19.md)은 OOM tail 네 개를 48/64 MiB에서 복구해 ACK 136개와 zero-invalid deep check를 반복했고 nbdkit `VmHWM`은 최대 11,415,552 bytes였다. 64 MiB 두 번은 max event 없이 cap 아래였고 48 MiB는 cap에 닿았다 | 최대 catalog/fill ratio와 remote provider/cache/multi-volume profile에서 전체 working set의 RSS 여유와 복구 시간을 검증. 관찰한 profile `VmHWM`을 코드상 보편 상한으로 해석하지 않음 |
+| MAKI-025 | `733833c`에서 attach recovery payload를 1 MiB batch로 replay하고 checkpoint 뒤 journal을 회수한다. 4,096 distinct/16,384 overwrite 회귀가 약 1.1 MiB measured peak를 유지했다. [실제 cgroup/RSS 캠페인](../recovery-rss-validation-2026-09-19.md)은 OOM tail 네 개를 48/64 MiB에서 복구해 ACK 136개와 zero-invalid deep check를 반복했고 nbdkit `VmHWM`은 최대 11,415,552 bytes였다. 64 MiB 두 번은 max event 없이 cap 아래였고 48 MiB는 cap에 닿았다 | 최대 catalog/fill ratio와 remote provider/cache/multi-volume profile에서 전체 working set의 RSS 여유와 복구 시간을 검증. 관찰한 profile `VmHWM`을 코드상 보편 상한으로 해석하지 않음 |
 | MAKI-028 | 부분 수정: 동일한 latest/durable 버전과 내부 checkpoint snapshot은 immutable ciphertext를 공유. 서로 다른 버전·공개 owned snapshot·slot codec·metadata 비용은 남음 | 실제 최대 overlay에서 peak RSS 한도 검증; 두 버전을 합산하는 보수적 논리 budget을 유지하며 전체 메모리 증거로 사용하지 않음 |
 | MAKI-029/030 | 코드 개선 완료: `4a3a29a`는 runtime 데이터 경로·복구·checkpoint의 동기 backing I/O를 blocking pool로 옮기고 취소 중 guard 및 shutdown worker 수명을 보존한다. `0e29a24`는 고정 horizon의 slot 쓰기·sync 동안 volume lock을 해제한다 | 지연·취소·동시 신규 shard·실패 재시도 회귀 통과. metadata publication과 v3 punch는 계속 lock을 보유하고 일부 attach canary I/O도 동기 경로다. 목표 부하의 최악 지연과 전체 runtime 여유를 별도 측정 |
-| MAKI-013 | 기본 v2/v3의 제한 유지. 새 Linux 볼륨에서 선택하는 [독립 로컬 witness·COW backing](rollback-protection.md)을 구현했다. 현재 witness에 대한 과거 backing 거절, page 인증, cache/overlay freshness, FUA·discard·동시 checkpoint와 용량 소진 후 복구를 로컬 테스트했다 | 새 형식의 독립 persistent-disk 정전·RSS·지연 qualification 및 witness 운영 절차가 남는다. 전체 호스트/witness 동시 rollback, 원격 witness와 분산 fencing, 같은 identity의 restore epoch는 지원하지 않음 |
+| MAKI-013 | 기본 v2/v3의 제한 유지. 새 Linux 볼륨에서 선택하는 [독립 로컬 witness·COW backing](../../rollback-protection.md)을 구현했다. 현재 witness에 대한 과거 backing 거절, page 인증, cache/overlay freshness, FUA·discard·동시 checkpoint와 용량 소진 후 복구를 로컬 테스트했다 | 새 형식의 독립 persistent-disk 정전·RSS·지연 qualification 및 witness 운영 절차가 남는다. 전체 호스트/witness 동시 rollback, 원격 witness와 분산 fencing, 같은 identity의 restore epoch는 지원하지 않음 |
 | MAKI-014 | 구현·로컬 통합 검증 완료: HTTP 외에 WSS/gRPC TLS 및 mTLS, CA/hostname 검증, credential 기반 client key, 실제 daemon attach·쓰기/읽기·종료를 지원. TLS 설정과 평문 URL 조합을 거절 | 로컬 provider 및 daemon 인증서 회귀 통과. 실제 vendor·대상 network·장시간 DB profile의 WSS/gRPC qualification은 별도이며 과거 HTTP VPC 캠페인을 전용하지 않음 |
-| MAKI-019 | 범위 한정 통과: `f20bb61` 절차에 이어 `bdb9113`의 [세 호스트 캠페인](credential-rotation-key-migration-validation-2026-09-19.md)이 stopped bearer/mTLS-client 교체, old credential 거절, superblock/canary hash 불변, 두 peer 재검증, 서로 다른 provider key fingerprint와 volume UUID, wrong-key canary 거절, K1→K2 SQLite DB-native restore와 24 ACK restart readback을 통과했다. `da89ae3`의 [네 호스트 캠페인](server-ca-endpoint-rotation-validation-2026-09-19.md)은 stopped server-CA overlap/removal, 두 wrong-trust 거절, 동일 key/profile의 distinct-IP 교체와 48 ACK restart readback도 통과했다 | Commercial vendor와 대상 network에서 client/server credential·CA·endpoint 교체를 반복하고, 공유 client 영향과 cross-sign/revocation 정책, key retirement, 새 volume write 이후 rollback과 production DB cutover를 검증 |
-| MAKI-022 | 구현·로컬 검증 완료: `8f7606f`의 `--discard` 새 v3 볼륨만 durable TRIM을 제공. 기본 v2 의미 유지. ext4 실제 blocks 감소, 이웃·재쓰기, A/B sync 실패·restart·fallback, 실제 nbdkit/libnbd 및 전체 workspace 통과. 후속 구현은 replay 종료 뒤 빠진 물리 회수를 최대 4,096개 슬롯 위치씩 checkpoint/worker에서 재시도. `fe259e3`의 별도 v3 GCE 캠페인은 native NBD에서 10회 whole-instance reset, 11개 boot, ACK unit 160개 대조와 final deep check의 invalid slot 0을 통과했고 리소스를 삭제했다 | [공간 회수 제한](space-reclamation.md) 유지: 부분 crypto unit 미회수, 지원 filesystem 필요, punch batch 중 volume lock 유지. 이 GCE 실행은 local provider의 128 MiB 볼륨이며 production DB, 물리 Persistent Disk 전원 차단, 대상 fill-ratio qualification은 별도 |
+| MAKI-019 | 범위 한정 통과: `f20bb61` 절차에 이어 `bdb9113`의 [세 호스트 캠페인](../credential-rotation-key-migration-validation-2026-09-19.md)이 stopped bearer/mTLS-client 교체, old credential 거절, superblock/canary hash 불변, 두 peer 재검증, 서로 다른 provider key fingerprint와 volume UUID, wrong-key canary 거절, K1→K2 SQLite DB-native restore와 24 ACK restart readback을 통과했다. `da89ae3`의 [네 호스트 캠페인](../server-ca-endpoint-rotation-validation-2026-09-19.md)은 stopped server-CA overlap/removal, 두 wrong-trust 거절, 동일 key/profile의 distinct-IP 교체와 48 ACK restart readback도 통과했다 | Commercial vendor와 대상 network에서 client/server credential·CA·endpoint 교체를 반복하고, 공유 client 영향과 cross-sign/revocation 정책, key retirement, 새 volume write 이후 rollback과 production DB cutover를 검증 |
+| MAKI-022 | 구현·로컬 검증 완료: `8f7606f`의 `--discard` 새 v3 볼륨만 durable TRIM을 제공. 기본 v2 의미 유지. ext4 실제 blocks 감소, 이웃·재쓰기, A/B sync 실패·restart·fallback, 실제 nbdkit/libnbd 및 전체 workspace 통과. 후속 구현은 replay 종료 뒤 빠진 물리 회수를 최대 4,096개 슬롯 위치씩 checkpoint/worker에서 재시도. `fe259e3`의 별도 v3 GCE 캠페인은 native NBD에서 10회 whole-instance reset, 11개 boot, ACK unit 160개 대조와 final deep check의 invalid slot 0을 통과했고 리소스를 삭제했다 | [공간 회수 제한](../../space-reclamation.md) 유지: 부분 crypto unit 미회수, 지원 filesystem 필요, punch batch 중 volume lock 유지. 이 GCE 실행은 local provider의 128 MiB 볼륨이며 production DB, 물리 Persistent Disk 전원 차단, 대상 fill-ratio qualification은 별도 |
 | MAKI-024 | 검증 범위: 문서 과장은 수정했으나 deep check는 AEAD/논리 읽기/DB 검사가 아님 | 각 검사 범위를 분리하고 암호 검증·복구 후 데이터·DB 의미 검증의 필요한 도구와 실행 증거 확보 |
 | MAKI-031/033/034/035 | 성능·확장: 순차 batch, 작은 syscall, 신규 할당 bitmap 전체 쓰기, 상주 bitmap/fallback scan | 고정 용량·fill ratio에서 tail latency·RSS·복구 시간·쓰기 증폭 기준을 충족하거나 해당 병목 수정 |
 | MAKI-036 | 선택적 성능 개선: FUA group commit 미구현 자체는 데이터 무결성 결함이 아님 | FUA 의미를 유지한 목표 성능 충족 여부로 구현 필요성을 결정; 미구현을 근거 없이 P0로 올리지 않음 |
-| MAKI-038 | 부분 검증: `c385c99`의 loopback 캠페인에 이어 `47058d2`의 [세 호스트 TLS 캠페인](cross-host-tls-provider-validation-2026-09-19.md)이 private VPC에서 TLS 1.2/1.3, mTLS와 bearer, wrong-CA/no-client/wrong-bearer 거절, A/B provider VM 개별 중단과 양쪽 중단의 24→25 stall/resume, 최종 32 ACK 및 restart readback을 통과했다. 후속 client credential 교체와 [server-CA·endpoint IP 교체](server-ca-endpoint-rotation-validation-2026-09-19.md)도 고정 reference-provider profile에서 통과했다 | commercial vendor endpoint와 대상 network의 DNS/proxy/packet-loss/rate-limit 동작, 대상 환경의 credential/certificate rotation 재검증, bounded-error 정책의 DB 오류, 지연 목표, daemon/VM 동시 장애, 장시간 부하를 검증 |
+| MAKI-038 | 부분 검증: `c385c99`의 loopback 캠페인에 이어 `47058d2`의 [세 호스트 TLS 캠페인](../cross-host-tls-provider-validation-2026-09-19.md)이 private VPC에서 TLS 1.2/1.3, mTLS와 bearer, wrong-CA/no-client/wrong-bearer 거절, A/B provider VM 개별 중단과 양쪽 중단의 24→25 stall/resume, 최종 32 ACK 및 restart readback을 통과했다. 후속 client credential 교체와 [server-CA·endpoint IP 교체](../server-ca-endpoint-rotation-validation-2026-09-19.md)도 고정 reference-provider profile에서 통과했다 | commercial vendor endpoint와 대상 network의 DNS/proxy/packet-loss/rate-limit 동작, 대상 환경의 credential/certificate rotation 재검증, bounded-error 정책의 DB 오류, 지연 목표, daemon/VM 동시 장애, 장시간 부하를 검증 |
 | MAKI-042/043/044 | 배포·장애 도메인: WAL/temp/log/backup 보호 범위, key/provider/Docker 부팅 순환, 공유 장치·provider 장애가 미확정 | 정확한 배포 경로·의존성·물리 topology를 고정하고 독립 장애와 공유 장애를 구분한 시험 |
 | MAKI-045/046 | 운영·패키징: `ece7e39`의 fresh-host unchanged-v2 복원에 더해 `3cac300` 캠페인이 한 Debian 12 VM에서 generated package clean install/upgrade와 두 볼륨 재attach를 통과했다. stopped-source SQLite native restore는 corrupt copy를 거절한 뒤 exact retry했고, old-reader legacy-v1 backup은 unchanged v1 metadata의 current-writer 거절 뒤 fresh v2에 exact restore됐다 | signed repository와 downgrade/maintainer rollback, 별도 secret-backup system, live/crash-time capture, 다른 DB와 실제 cutover를 대상 환경에서 검증 |
-| MAKI-049/050 | 외부 qualification·지원 범위: 고정 버전·digest의 Firecracker guest hard cut 20회와 전체 GCE instance reset 10회가 외부 ACK/hash 대조를 통과. installed-systemd SQLite crash, fresh-host restore, loopback 및 [cross-host TLS reference provider](cross-host-tls-provider-validation-2026-09-19.md), PostgreSQL 15 process crash, physical reservation, 그리고 [package/topology/migration 캠페인](package-topology-migration-validation-2026-09-19.md)이 각 scoped profile을 통과했다. physical power, production DB profile과 다른 engine, commercial vendor와 대상 network 고유 동작, 더 넓은 migration과 장시간 결과는 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 장시간 실제 DB ACK/hash 대조와 성능·복원 승인 |
+| MAKI-049/050 | 외부 qualification·지원 범위: 고정 버전·digest의 Firecracker guest hard cut 20회와 전체 GCE instance reset 10회가 외부 ACK/hash 대조를 통과. installed-systemd SQLite crash, fresh-host restore, loopback 및 [cross-host TLS reference provider](../cross-host-tls-provider-validation-2026-09-19.md), PostgreSQL 15 process crash, physical reservation, 그리고 [package/topology/migration 캠페인](../package-topology-migration-validation-2026-09-19.md)이 각 scoped profile을 통과했다. physical power, production DB profile과 다른 engine, commercial vendor와 대상 network 고유 동작, 더 넓은 migration과 장시간 결과는 미확정 | 버전·digest·내구성 설정·provider·용량·실패 시나리오를 고정한 장시간 실제 DB ACK/hash 대조와 성능·복원 승인 |
 
 MAKI-004의 명령 제한, MAKI-012/018/023/027/037/047, FUP-014의 Linux 경로 원인은 위 수정 기록으로 추적한다. MAKI-039의 storage 대기 제거와 후속 blocking-pool I/O 분리는 검증했지만 별도 프로세스 heartbeat를 구현한 것은 아니다. 지원 기능과 선택적 성능 개선의 보류는 명시적인 지원 범위 결정으로 관리할 수 있으나, 이 문서에서 그 결정을 이미 승인된 것으로 간주하지 않는다.
 
 ## 운영 승인 조건
 
-먼저 위 코드·복구 과제를 수정하거나 검증 가능한 지원 범위로 결정해야 한다. 현재 revision은 설치된 controller, actual Maki nbdkit, single-PV/LV kernel NBD/LVM/XFS와 SQLite 외부 ACK를 한 캠페인에 결합해 두 번의 자동 SIGKILL 및 open-LV 실패·재시도를 통과했고, [별도 fresh-host backing restore](fresh-host-restore-validation-2026-09-17.md)는 source VM 삭제 후 새 VM에서 32개 ACK를 복원하고 48개까지 진행한 뒤 restart readback을 통과했다. [별도 remote HTTP provider DB 캠페인](remote-provider-db-validation-2026-09-18.md)은 두 loopback provider의 개별 failover와 양쪽 중단 중 무-ACK stall, 복구 후 정확한 진행 및 restart readback을 통과했다. [별도 cross-host TLS 캠페인](cross-host-tls-provider-validation-2026-09-19.md)은 private VPC에서 TLS 1.2/1.3, mTLS·bearer 거절, 두 provider VM의 개별·전체 중단과 32 ACK restart readback을 통과했다. [별도 PostgreSQL 캠페인](postgresql-crash-validation-2026-09-18.md)은 checksummed cluster의 postmaster SIGKILL/WAL 복구, `pg_amcheck`와 48 ACK를 통과했다. [패키지·토폴로지·마이그레이션 캠페인](package-topology-migration-validation-2026-09-19.md)은 generated package upgrade, two-LV와 foreign-backend fail-closed 경계, stopped-source SQLite native 및 clean legacy-v1→v2 restore를 통과했다. 다음 단계는 nested/internal/partition/holder topology, commercial vendor와 대상 network 고유 장애, signed package repository와 rollback, live·production DB migration, production PostgreSQL과 다른 engine, physical power와 장시간 부하를 검증하는 것이다. Firecracker와 전체 GCE reset 시험은 guest crash 및 workload VM reset 경로의 증거지만 kernel NBD/LVM/XFS/DB 물리 정전 시험의 대체가 아니다. 대상 VM/DB 이미지/용량과 지연·복구 목표는 아직 확정되지 않았다.
+먼저 위 코드·복구 과제를 수정하거나 검증 가능한 지원 범위로 결정해야 한다. 현재 revision은 설치된 controller, actual Maki nbdkit, single-PV/LV kernel NBD/LVM/XFS와 SQLite 외부 ACK를 한 캠페인에 결합해 두 번의 자동 SIGKILL 및 open-LV 실패·재시도를 통과했고, [별도 fresh-host backing restore](../fresh-host-restore-validation-2026-09-17.md)는 source VM 삭제 후 새 VM에서 32개 ACK를 복원하고 48개까지 진행한 뒤 restart readback을 통과했다. [별도 remote HTTP provider DB 캠페인](../remote-provider-db-validation-2026-09-18.md)은 두 loopback provider의 개별 failover와 양쪽 중단 중 무-ACK stall, 복구 후 정확한 진행 및 restart readback을 통과했다. [별도 cross-host TLS 캠페인](../cross-host-tls-provider-validation-2026-09-19.md)은 private VPC에서 TLS 1.2/1.3, mTLS·bearer 거절, 두 provider VM의 개별·전체 중단과 32 ACK restart readback을 통과했다. [별도 PostgreSQL 캠페인](../postgresql-crash-validation-2026-09-18.md)은 checksummed cluster의 postmaster SIGKILL/WAL 복구, `pg_amcheck`와 48 ACK를 통과했다. [패키지·토폴로지·마이그레이션 캠페인](../package-topology-migration-validation-2026-09-19.md)은 generated package upgrade, two-LV와 foreign-backend fail-closed 경계, stopped-source SQLite native 및 clean legacy-v1→v2 restore를 통과했다. 다음 단계는 nested/internal/partition/holder topology, commercial vendor와 대상 network 고유 장애, signed package repository와 rollback, live·production DB migration, production PostgreSQL과 다른 engine, physical power와 장시간 부하를 검증하는 것이다. Firecracker와 전체 GCE reset 시험은 guest crash 및 workload VM reset 경로의 증거지만 kernel NBD/LVM/XFS/DB 물리 정전 시험의 대체가 아니다. 대상 VM/DB 이미지/용량과 지연·복구 목표는 아직 확정되지 않았다.
 
-초기 검증 프로파일은 고정 Linux 도구 버전, 단일 인증 provider, 단일 disposable volume/DB부터 시작할 수 있다. 한 VM의 두 loopback provider를 통한 실제 볼륨별 실패 전환과 total-outage stall/resume 통과는 목표 운영 topology 승인을 뜻하지 않는다. [검사와 qualification 절차](testing.md), [저장소 복구 제한](storage-recovery.md), 로컬 리뷰의 `05-release-plan.md` 승인 계획을 함께 적용한다. 외부에서 복원할 수 없는 유일한 원본 저장소로의 운영은 승인하지 않는다.
+초기 검증 프로파일은 고정 Linux 도구 버전, 단일 인증 provider, 단일 disposable volume/DB부터 시작할 수 있다. 한 VM의 두 loopback provider를 통한 실제 볼륨별 실패 전환과 total-outage stall/resume 통과는 목표 운영 topology 승인을 뜻하지 않는다. [검사와 qualification 절차](../../testing.md), [저장소 복구 제한](../../storage-recovery.md), 로컬 리뷰의 `05-release-plan.md` 승인 계획을 함께 적용한다. 외부에서 복원할 수 없는 유일한 원본 저장소로의 운영은 승인하지 않는다.
 
 ### 2026-09-20 구현 후 운영 판단
 

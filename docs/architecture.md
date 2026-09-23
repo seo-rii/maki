@@ -318,10 +318,16 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 - Repeated credential names must declare the same source throughout a volume
   configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.
-- Whole-image and same-unit historical rollback remain outside the current
-  freshness guarantee. The [rollback protection proposal](rollback-protection-design.md)
-  describes an independent witness and retained authenticated generations;
-  those mechanisms are not implemented.
+- Default v2/v3 backings do not provide historical rollback protection:
+  restoring an older, internally valid whole image or an older valid
+  ciphertext for the same unit is not detected. An experimental
+  [rollback-protected backing](rollback-protection.md) is available for new
+  Linux volumes; it anchors an authenticated copy-on-write store in an
+  independently managed local witness filesystem and is bounded to
+  experimental workloads without production qualification. Remote witnesses,
+  distributed fencing and controlled restore epochs from the
+  [design proposal](rollback-protection-design.md) remain unimplemented.
+  [Status](status.md) records the current state of both.
 
 See [Configuration](configuration.md), [Operations](operations.md), and the
 [technical specification](../SPEC.md) for detailed contracts.

@@ -6,7 +6,7 @@ mount filesystems, or grow filesystems require an isolated Linux target and
 appropriate privileges.
 
 The repository includes a guarded, destructive-target-restricted procedure in
-[Privileged Linux validation](privileged-linux-validation.md).
+[Privileged Linux validation](qualification/privileged-linux-validation.md).
 
 ## Volume compatibility before upgrade
 
@@ -38,7 +38,15 @@ Privileged attachment additionally requires nbd-client 3.27.0 or later built
 with netlink and backend-identifier support. The helper validates `/dev/nbdN`
 as the configured block path and supplies `nbdN` to netlink nbd-client
 connect/disconnect commands. Debian 12's stock nbd-client 3.24 does not satisfy
-this requirement.
+this requirement; the [Debian installation guide](getting-started/installation-debian.md)
+shows how to build and install the required version and the Maki package.
+
+A new volume exports an empty device. Before its first `maki-attach attach`,
+create the PV, VG, XFS data LV and record their identities as described in
+[provisioning the first volume](getting-started/first-volume.md); the
+[quick start](getting-started/quickstart.md) runs the whole sequence once.
+Which hosts, backing stores and storage topologies are covered is listed in
+the [support matrix](deployment/support-matrix.md).
 
 ## Build the plugin
 
@@ -563,7 +571,7 @@ If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
-The [2026-09-19 package qualification](package-topology-migration-validation-2026-09-19.md)
+The [2026-09-19 package qualification](qualification/package-topology-migration-validation-2026-09-19.md)
 installed a generated pre-upgrade Debian package on a clean Debian 12 VM,
 detached two live volumes using that helper, upgraded to the current generated
 package without auto-start, and reattached both with unchanged configuration,
@@ -599,10 +607,10 @@ the separate process in [durable recovery](durable-recovery.md).
    planned drain and restart, then repeat the comparison before accepting the
    restored host.
 
-The [2026-09-17 qualification](fresh-host-restore-validation-2026-09-17.md)
+The [2026-09-17 qualification](qualification/fresh-host-restore-validation-2026-09-17.md)
 passed this flow for one graceful local-provider, single-PV/LV, SQLite backing.
 It was an ad hoc artifact install. A later
-[package and migration campaign](package-topology-migration-validation-2026-09-19.md)
+[package and migration campaign](qualification/package-topology-migration-validation-2026-09-19.md)
 qualified one generated Debian package upgrade plus stopped-source SQLite
 DB-native and legacy-v1 backup/restore. Other distributions, databases,
 live/crash-time backup and production cutover remain separate qualifications.
@@ -696,7 +704,7 @@ high-cardinality values as metric labels.
   publishes the record. A scoped ext4/GCE Persistent Disk campaign verified
   allocation before FUA acknowledgement and an ENOSPC refusal with no sequence
   or journal change; see the
-  [physical reservation report](physical-reservation-validation-2026-09-18.md).
+  [physical reservation report](qualification/physical-reservation-validation-2026-09-18.md).
   This does not preallocate untouched slots or cover non-Linux backing behavior.
   A reserve-only refusal leaves existing data readable and does not
   by itself set a checkpoint error or change the engine state. A failed

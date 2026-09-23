@@ -1,0 +1,100 @@
+# Production-profile data-plane configuration for one PostgreSQL cluster on
+# one Maki volume with the local AES-256-GCM-SIV provider.
+#
+#   install -m 0640 -o root -g maki volume.toml /etc/maki/volumes/postgres.toml
+#
+# Guide: docs/deployment/postgres.md. Every section is explained in
+# docs/configuration.md. Values marked "decide" need a deployment decision.
+
+config_schema_version = 1
+
+[volume]
+name = "postgres"
+
+# decide: the exported block-device size. It cannot grow after creation.
+max_virtual_size = "1TiB"
+
+device_block_size = 4096
+crypto_unit_size = 4096
+
+shard_logical_size = "16GiB"
+
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "local-aes-gcm-siv-v1"
+
+availability_policy = "stall"
+
+# The 32-byte key arrives as the systemd credential `crypto-token`
+# (LoadCredential=crypto-token:/etc/maki/secrets/postgres.token in the
+# packaged unit). Never a literal (SPEC §9).
+key = { source = "credential", name = "crypto-token" }
+
+[crypto.capabilities]
+mode = "declared"
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+
+[limits]
+max_active_callbacks = 64
+
+max_plaintext_bytes = "128MiB"
+max_ciphertext_bytes = "160MiB"
+
+max_pending_crypto_items = 4096
+max_pending_crypto_bytes = "128MiB"
+
+max_crypto_inflight_batches = 32
+max_crypto_inflight_bytes = "32MiB"
+
+max_inflight_per_endpoint = 8
+max_inflight_bytes_per_endpoint = "8MiB"
+
+max_journal_pending_bytes = "64MiB"
+
+[backing]
+root = "/var/lib/maki/postgres"
+
+slot_alignment = 512
+
+journal_segment_size = "256MiB"
+journal_max_bytes = "4GiB"
+
+# Keep both reserves non-zero: ENOSPC is then refused before acknowledgement.
+checkpoint_reserve_bytes = "4GiB"
+journal_emergency_reserve_bytes = "1GiB"
+
+[cache]
+# PostgreSQL has its own buffer cache; enable "read" only after measuring.
+mode = "off"
+
+max_bytes = "256MiB"
+ttl = "30s"
+
+lock_memory = true
+zeroize_on_evict = true
+
+[nbd]
+socket = "/run/maki/postgres/nbd.sock"
+
+device_block_size = 4096
+
+minimum_io = 4096
+preferred_io = 4096
+maximum_io = "1MiB"
+
+threads = 64
+connections = 1
+
+[control]
+socket = "/run/maki-control/postgres/control.sock"
+group = "maki-admin"
+
+[security]
+memory_lock_mode = "secure-buffers"
+
+disable_core_dump = true
+madv_dontdump = true
+
+# Production profile: refuse swap that would depend on Maki itself.
+require_secure_swap_policy = true
