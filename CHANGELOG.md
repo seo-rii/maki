@@ -64,6 +64,10 @@ documents.
 - Verified **WSS and gRPC TLS/mTLS** for the WebSocket and gRPC providers
   (`a1aac42`).
 - **RustSec dependency audit** in CI (`47058d2`).
+- Optional **random plaintext prefix** (`crypto.random_prefix_bytes`, 16 to
+  256 bytes in multiples of 16) prepended to every crypto unit before
+  provider encryption; new volumes only (`562b397`, `1115e1d`;
+  [random plaintext prefixes](docs/random-plaintext-prefix.md)).
 - Getting-started, deployment and status documentation; `LICENSE`,
   `SECURITY.md`, `CONTRIBUTING.md`, this changelog, and a documentation link
   checker in CI (2026-09-23).

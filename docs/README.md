@@ -46,6 +46,7 @@ hold everywhere:
 | Data path, durability model, provider boundary, security model | [Architecture](architecture.md) |
 | Normative requirements | [Technical specification](../SPEC.md) |
 | Remote plaintext buffer lifetimes | [Transport memory](transport-memory.md) |
+| Optional random plaintext prefix per crypto unit | [Random plaintext prefixes](random-plaintext-prefix.md) |
 | Rollback-protected backing (experimental) | [Rollback protection](rollback-protection.md), [design proposal](rollback-protection-design.md) |
 | Format and behaviour changes | [Changelog](../CHANGELOG.md) |
 
