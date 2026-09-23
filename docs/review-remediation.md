@@ -1057,3 +1057,16 @@ faults over a commercial vendor and target network, replay policy, key migration
 broader and live database migration, production database profiles and remaining
 engines, physical power loss, and long-duration load remain open.
 Direct R3 closure must not be read as general production approval.
+
+## Fourth review (2026-09-23): R4-001–R4-007
+
+A code and packaging review of the 2026-09-22 tree looked at observability,
+memory protection scope, resource bounds, diagnostics and package behaviour
+rather than at durability under crash. It reproduced the packaging finding
+(R4-007) directly and reported the Rust findings from code analysis. None of
+them is an acknowledged-data-loss defect. Each fix below starts from a
+regression test that failed before the change.
+
+| Finding | Problem | Fix | Tests |
+|---|---|---|---|
+| R4-001 (logging) | The default plugin execution path never installed a `tracing` subscriber, so `checkpoint worker: … failed`, `control socket server stopped`, provider quarantine and store repair warnings were dropped; only startup and unload failures used `eprintln!`. | `maki_core::logging::install_default_logging` installs a stderr `fmt` subscriber (no ANSI, target and fields, `MAKI_LOG` filter, default `info`). The plugin calls it in `config_complete` and again in `after_fork` (idempotent); `maki` and `maki-check` call it at startup. Documented in [operations](operations.md#logging). | `logging::tests::*` (maki-core; a child process installs the subscriber and the parent checks its stderr and the `MAKI_LOG` filter), `runtime_warnings_reach_stderr_in_the_default_plugin_path`, `maki_log_filters_the_default_plugin_output` (maki-nbdkit `review_r4_native_logging.rs`: real nbdkit, an adopted orphan shard's `WARN` must appear in the captured stderr) |

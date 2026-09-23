@@ -43,6 +43,10 @@ documents.
 
 ### Added
 
+- **Runtime logging**: the nbdkit plugin, `maki` and `maki-check` install a
+  stderr `tracing` subscriber (`MAKI_LOG` filter, default `info`), so
+  checkpoint, journal-sync, control-server and store-repair warnings reach
+  the service journal (R4-001; [operations](docs/operations.md#logging)).
 - Opt-in **envelope v3** with durable TRIM and Linux backing-space
   reclamation: `maki volume create <config> --discard` (`8f7606f`,
   `e911471`; [space reclamation](docs/space-reclamation.md)).

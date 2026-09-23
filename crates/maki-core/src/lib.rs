@@ -12,6 +12,7 @@ pub mod check;
 pub mod engine;
 pub mod error;
 pub mod journal;
+pub mod logging;
 pub mod overlay;
 pub mod recovery;
 pub mod store;

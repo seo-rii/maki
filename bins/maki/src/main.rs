@@ -57,6 +57,9 @@ fn take_timeout(args: &mut Vec<String>) -> Result<Option<Duration>, String> {
 }
 
 fn main() -> ExitCode {
+    // Store repairs and recovery decisions are reported through `tracing`;
+    // an offline check or volume creation must show them too (R4-001).
+    maki_core::logging::install_default_logging();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,

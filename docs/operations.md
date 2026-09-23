@@ -182,6 +182,40 @@ plugin's unload callback cannot return an error to nbdkit; a zero process exit
 status alone does not acknowledge a successful drain. The packaged service's
 stop path is not a substitute for this administrative check.
 
+### Logging
+
+The plugin installs a `tracing` subscriber that writes to stderr as soon as
+nbdkit has parsed its configuration, so every runtime event the engine,
+store, control server and providers emit reaches nbdkit's log and, under the
+packaged unit, the service journal. Without it these events would be
+silently dropped; startup and unload failures were already printed directly.
+The `maki` and `maki-check` binaries install the same subscriber, so an
+offline check shows the repairs the store made at open.
+
+Events that matter operationally:
+
+| Level | Event |
+|---|---|
+| `ERROR` | control socket server stopped; shutdown during unload failed; panic caught at the NBD boundary |
+| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings |
+| `INFO` | default threshold; lifecycle milestones |
+| `DEBUG` | free-space query failures, control session lifecycle |
+
+`MAKI_LOG` selects the threshold with `tracing_subscriber::EnvFilter`
+directives, for example `MAKI_LOG=warn` or `MAKI_LOG=info,maki_core=debug`;
+unset or invalid values mean `info`. Set it through a drop-in on the packaged
+unit:
+
+```ini
+[Service]
+Environment=MAKI_LOG=info,maki_core::engine=debug
+```
+
+Lines carry the level, the target module and structured fields such as the
+volume, operation and error class. Keys, plaintext, credentials and request
+payloads are never passed to a log macro; `SecretBuffer` redacts itself.
+Read the journal with `journalctl -u maki@<volume>.service`.
+
 ## Rootless userspace smoke test
 
 The following test overwrites the complete disposable export:

@@ -51,3 +51,14 @@ hold a drain's backing sync and a free-space query independently, verify that
 status and metrics return before either is released, and then release and
 join every fixture worker. They also verify that a first status request does
 not invent a free-space observation.
+
+## Logs
+
+Status and metrics answer "what is the state now"; the log answers "why".
+The plugin and the administrative binaries install a stderr `tracing`
+subscriber at startup (default threshold `info`, `MAKI_LOG` overrides), so
+checkpoint and journal-sync failures, provider quarantine, store repairs and
+control-server errors appear in `journalctl -u maki@<volume>.service` with
+their level and target. A `state: degraded` in `maki status` therefore has a
+matching `WARN` line with the underlying error class. See
+[operations: logging](operations.md#logging).

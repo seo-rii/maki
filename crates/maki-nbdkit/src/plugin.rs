@@ -52,6 +52,11 @@ unsafe extern "C" fn after_fork() -> c_int {
     // run catches initialization panics and records failure permanently, so
     // neither unwinding nor duplicate initialization can cross this ABI.
     STARTUP.run(|| {
+        // The subscriber is process-global and survives nbdkit's fork, but
+        // install it here too in case `config_complete` was skipped: every
+        // runtime warning (checkpoint, journal sync, control server,
+        // provider quarantine) must reach the captured stderr (R4-001).
+        maki_core::logging::install_default_logging();
         let path = CONFIG_PATH.lock().clone().ok_or("missing config path")?;
         let adapter = NbdAdapter::open_config(&path).map_err(|error| error.to_string())?;
         ADAPTER
@@ -78,6 +83,9 @@ unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
 }
 
 unsafe extern "C" fn config_complete() -> c_int {
+    // Install the tracing sink before anything that can warn runs, so even
+    // pre-fork validation failures are logged with their level (R4-001).
+    maki_core::logging::install_default_logging();
     if CONFIG_PATH.lock().is_none() {
         eprintln!("maki-nbdkit: missing config=<path> parameter");
         return -1;

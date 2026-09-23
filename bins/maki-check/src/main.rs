@@ -16,6 +16,9 @@ fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // The store reports adopted shards and repaired allocation maps through
+    // `tracing`; the checker must not drop them (R4-001).
+    maki_core::logging::install_default_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut root: Option<String> = None;
     let mut deep = false;
