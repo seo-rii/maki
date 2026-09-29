@@ -279,6 +279,11 @@ mod unit_lock_tests {
 /// always asks the backing again while holding the exclusive volume lock.
 const FREE_SPACE_CACHE_TTL: Duration = Duration::from_secs(1);
 
+/// Inline reclaim rounds one write may take before ENOSPC. Each round syncs
+/// the journal and checkpoints; more than one is needed only when other
+/// writers append volatile records while a round runs.
+const MAX_RECLAIM_ROUNDS: usize = 4;
+
 struct EngineInner {
     volume: Arc<RwLock<Volume>>,
     backing: Arc<dyn Backing>,
@@ -953,7 +958,9 @@ impl Engine {
         tokio::spawn(async move {
             let cts = Arc::new(cts);
             let (_admission, _guards) = (admission, guards);
-            for reclaimed in [false, true] {
+            for round in 0..=MAX_RECLAIM_ROUNDS {
+                let reclaimed = round > 0;
+                let last_round = round == MAX_RECLAIM_ROUNDS;
                 let mut volume = engine.inner.volume.clone().write_owned().await;
                 let io_engine = engine.clone();
                 let io_cts = cts.clone();
@@ -961,7 +968,13 @@ impl Engine {
                 let io_guards = _guards.clone();
                 let written = storage_task(move || {
                     let (_admission, _guards) = (io_admission, io_guards);
-                    let outcome = io_engine.journal_request(&mut volume, &io_cts, fua, reclaimed);
+                    let outcome = io_engine.journal_request(
+                        &mut volume,
+                        &io_cts,
+                        fua,
+                        reclaimed,
+                        last_round,
+                    );
                     io_engine.inner.note_journal(&volume);
                     if matches!(outcome, Ok(true))
                         && (volume.journal_total_bytes()
@@ -979,7 +992,7 @@ impl Engine {
                 // Never wait for the checkpoint gate while holding volume.
                 engine.inner.checkpoint().await?;
             }
-            unreachable!("a second unsuccessful admission returns ENOSPC")
+            unreachable!("the last unsuccessful admission round returns ENOSPC")
         })
         .await
         .map_err(|error| std::io::Error::other(format!("journal task failed: {error}")))?
@@ -993,6 +1006,7 @@ impl Engine {
         cts: &[CiphertextUnit],
         fua: bool,
         reclaimed: bool,
+        last_round: bool,
     ) -> Result<bool, CoreError> {
         // Already-zero trim hints must not reserve storage or consume journal
         // capacity. All records in a request are either writes or tombstones.
@@ -1011,7 +1025,9 @@ impl Engine {
             cts
         };
         let incoming = cts.iter().map(record_len).sum();
-        if !cts.is_empty() && !self.admit_journal(volume, incoming, cts, reclaimed)? {
+        if !cts.is_empty()
+            && !self.admit_journal(volume, incoming, cts, reclaimed, last_round)?
+        {
             return Ok(false);
         }
         for ct in cts {
@@ -1048,13 +1064,25 @@ impl Engine {
     /// *total*, which does count those headers, so it is checked against the
     /// exact append footprint (records + any new segment headers), recomputed
     /// after reclaim because reclaim can change the active segment (R08).
+    ///
+    /// A request that still does not fit after a reclaim is refused only
+    /// when nothing more can be reclaimed: a checkpoint retires records up
+    /// to the durable mark, so volatile records another writer appended
+    /// while the reclaim ran are synced and a further round is taken, up to
+    /// [`MAX_RECLAIM_ROUNDS`] (`last_round`).
     fn admit_journal(
         &self,
         volume: &mut Volume,
         incoming: u64,
         cts: &[CiphertextUnit],
         reclaimed: bool,
+        last_round: bool,
     ) -> Result<bool, CoreError> {
+        let exhausted = |volume: &Volume| {
+            reclaimed
+                && (last_round
+                    || volume.journal_durable_sequence() >= volume.journal_appended_sequence())
+        };
         let policy = &self.inner.policy;
         let footprint =
             |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
@@ -1111,7 +1139,7 @@ impl Engine {
             && (volume.overlay_len() as u64).saturating_add(cts.len() as u64)
                 > self.inner.max_overlay_entries;
         if over_bytes || over_entries {
-            if reclaimed {
+            if exhausted(volume) {
                 return Err(enospc(format!(
                     "overlay at its limit ({} bytes / {} units held, limits {} bytes / {} \
                      units) and cannot be reclaimed",
@@ -1129,7 +1157,7 @@ impl Engine {
             .saturating_add(footprint(volume))
             > policy.journal_max_bytes
         {
-            if reclaimed {
+            if exhausted(volume) {
                 return Err(enospc(format!(
                     "journal at hard limit {} bytes and cannot be reclaimed",
                     policy.journal_max_bytes

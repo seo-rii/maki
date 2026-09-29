@@ -273,3 +273,70 @@ async fn a_zero_limit_keeps_the_overlay_unbounded_for_library_callers() {
     assert_eq!(stats.checkpoints_total, 0);
     assert_eq!(stats.overlay_units, 48);
 }
+
+/// A write that another writer's volatile records keep out after its inline
+/// reclaim must sync and reclaim again, not fail with ENOSPC: a checkpoint
+/// retires only records up to the durable mark, so a non-FUA write that
+/// lands while the reclaim runs (the volume lock is released while slot data
+/// is written) is still in the overlay when the first writer retries. The
+/// minimum `max_overlay_bytes` promises that one maximal request always fits
+/// after a reclaim; it held only when no other writer ran concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_volatile_write_during_inline_reclaim_does_not_cause_enospc() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    // The validated minimum for 8-unit requests: 2 x (8 + 1) units.
+    let limit = 18 * CT;
+    let engine = engine(
+        &backing,
+        EngineLimits {
+            max_request_bytes: 8 * UNIT as u64,
+            max_overlay_bytes: limit,
+            ..Default::default()
+        },
+        Some(manual_clock()),
+    )
+    .await;
+    // Two volatile units: projection 4 CT, so an 8-unit write (16 CT) does
+    // not fit and must reclaim inline.
+    engine.write(off(0), &data(1), false).await.unwrap();
+    engine.write(off(1), &data(2), false).await.unwrap();
+
+    // While that reclaim writes slot data, a second writer adds two volatile
+    // units (it fits: 4 + 4 CT), which the reclaim cannot retire.
+    let injected = Arc::new(AtomicBool::new(false));
+    let runtime = tokio::runtime::Handle::current();
+    let other = engine.clone();
+    let once = injected.clone();
+    let _hook = failpoints::set(
+        "checkpoint.slot_write",
+        failpoints::FailpointAction::Callback(Arc::new(move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                let payload = vec![0xA5; 2 * UNIT as usize];
+                runtime
+                    .block_on(other.write(off(40), &payload, false))
+                    .expect("the concurrent small write is admitted");
+            }
+            None
+        })),
+    );
+
+    let big = vec![0xB6; 8 * UNIT as usize];
+    engine
+        .write(off(16), &big, false)
+        .await
+        .expect("one maximal request must be admitted after reclaim");
+    assert!(injected.load(Ordering::SeqCst), "the reclaim ran and the hook fired");
+    drop(_hook);
+
+    let stats = engine.stats().await;
+    assert!(stats.overlay_bytes <= limit, "overlay {} over {limit}", stats.overlay_bytes);
+    assert_eq!(engine.read(off(16), big.len()).await.unwrap(), big);
+    assert_eq!(
+        engine.read(off(40), 2 * UNIT as usize).await.unwrap(),
+        vec![0xA5; 2 * UNIT as usize]
+    );
+    assert_eq!(engine.read(off(0), UNIT as usize).await.unwrap(), data(1));
+}

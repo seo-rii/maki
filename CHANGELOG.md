@@ -96,6 +96,12 @@ documents.
 
 ### Fixed
 
+- A write that still exceeded the overlay bound or the journal hard limit
+  after its inline reclaim failed with ENOSPC even when the space was held
+  by another writer's volatile records, which that reclaim could not retire;
+  it now syncs and reclaims again (up to four rounds) before refusing
+  (R4-005 follow-up; [configuration](docs/configuration.md#journal-bounds)).
+
 - `maki-attach` now installs a stderr `tracing` sink (`MAKI_LOG`, default
   `info`); its executed steps and halted-rollback errors were silently
   dropped before ([operations](docs/operations.md#logging)).
