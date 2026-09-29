@@ -57,8 +57,9 @@ documents.
   (R4-004; [operations](docs/operations.md#volume-lifecycle)).
 - **Debian package safety**: `prerm` refuses removal while a volume is
   attached (upgrades are exempt), the builder verifies every artifact's ELF
-  architecture against `--architecture`, and `--shlibdeps` adds native
-  library dependencies (R4-003, R4-007;
+  architecture against `--architecture`, and native library dependencies are
+  added to `Depends` with `dpkg-shlibdeps` by default (the build now needs
+  `dpkg-dev`; `--no-shlibdeps` opts out for test fixtures only) (R4-003, R4-007;
   [packaging README](packaging/debian/README.md)).
 - **Runtime logging**: the nbdkit plugin, `maki` and `maki-check` install a
   stderr `tracing` subscriber (`MAKI_LOG` filter, default `info`), so

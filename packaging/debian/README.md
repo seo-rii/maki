@@ -10,8 +10,7 @@ python3 packaging/debian/build-deb.py \
   --release-dir target/release \
   --version 0.1.0+git$(git rev-parse --short=12 HEAD) \
   --architecture "$(dpkg --print-architecture)" \
-  --output ../maki.deb \
-  --shlibdeps
+  --output ../maki.deb
 ```
 
 The package installs the daemon, helper, checker, plugin, service templates,
@@ -44,11 +43,14 @@ package it unless its machine, class and byte order match the requested
 and the binaries are executables. A wrong artifact used to produce a
 "valid" package for the wrong CPU (R4-007).
 
-Pass `--shlibdeps` to compute the native library dependencies of the
-binaries with `dpkg-shlibdeps` (package `dpkg-dev`) and append them to
-`Depends`, for example `libc6 (>= 2.34)`. Use it for every package built for
-installation; the build fails rather than guessing when the scan cannot
-analyse an artifact.
+The builder then computes the native library dependencies of the binaries
+with `dpkg-shlibdeps` (package `dpkg-dev`) and appends them to `Depends`, for
+example `libc6 (>= 2.39), libgcc-s1 (>= 4.2)`. The scan is on by default and
+fails closed: the build is refused rather than guessing when `dpkg-shlibdeps`
+is missing or cannot analyse an artifact. `--no-shlibdeps` skips it with a
+warning and keeps only the static `Depends`; it exists for the contract tests'
+header-only ELF stubs and must not be used for a package that will be
+installed.
 
 ## Removal and upgrade behaviour
 

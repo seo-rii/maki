@@ -83,7 +83,8 @@ class DebianPackageTests(unittest.TestCase):
         ]
 
     def build(self, name="maki.deb", version="0.1.0+test1", umask=None, architecture="amd64"):
-        output, command = self.builder_command(name, version, architecture)
+        # Header-only ELF stubs cannot be scanned for native dependencies.
+        output, command = self.builder_command(name, version, architecture, ["--no-shlibdeps"])
         environment = os.environ.copy()
         environment["SOURCE_DATE_EPOCH"] = "1789689600"
         subprocess.run(
@@ -97,7 +98,10 @@ class DebianPackageTests(unittest.TestCase):
         )
         return output
 
-    def build_failure(self, name, architecture="amd64", extra=()):
+    def build_failure(self, name, architecture="amd64", extra=(), opt_out=True):
+        extra = list(extra)
+        if opt_out and "--shlibdeps" not in extra:
+            extra.append("--no-shlibdeps")
         _, command = self.builder_command(name, "0.1.0+test9", architecture, extra)
         result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -274,6 +278,31 @@ class DebianPackageTests(unittest.TestCase):
         # Depends line.
         stderr = self.build_failure("shlibdeps.deb", extra=["--shlibdeps"])
         self.assertIn("dpkg-shlibdeps", stderr)
+
+    def test_native_dependency_scan_is_on_by_default(self):
+        # A package without its native Depends installs on a host whose libc
+        # is too old and fails at run time, so the scan is not opt-in: a
+        # plain build of stubs it cannot analyse (or on a host without
+        # dpkg-shlibdeps) is refused and names the explicit opt-out.
+        stderr = self.build_failure("default-scan.deb", extra=[], opt_out=False)
+        self.assertIn("dpkg-shlibdeps", stderr)
+        if shutil.which("dpkg-shlibdeps") is None:
+            self.assertIn("--no-shlibdeps", stderr)
+
+    def test_opting_out_of_the_scan_keeps_the_static_depends_and_warns(self):
+        output, command = self.builder_command("opt-out.deb", "0.1.0+test1")
+        environment = os.environ.copy()
+        environment["SOURCE_DATE_EPOCH"] = "1789689600"
+        result = subprocess.run(
+            [*command, "--no-shlibdeps"], cwd=ROOT, env=environment, capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--no-shlibdeps", result.stderr)
+        self.assertIn("native library dependencies", result.stderr)
+        self.assertEqual(
+            self.field(output, "Depends"),
+            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd",
+        )
 
     def test_build_is_reproducible_and_rejects_invalid_inputs(self):
         first = self.build("first.deb")

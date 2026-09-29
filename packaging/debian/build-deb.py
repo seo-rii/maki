@@ -64,9 +64,12 @@ def parse_args():
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument(
         "--shlibdeps",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="compute native library dependencies of the release artifacts with "
-        "dpkg-shlibdeps and add them to Depends (fails the build if the scan fails)",
+        "dpkg-shlibdeps and add them to Depends (default; fails the build if the "
+        "scan fails). --no-shlibdeps keeps only the static Depends and is meant "
+        "for test fixtures, not for packages that will be installed",
     )
     return parser.parse_args()
 
@@ -177,7 +180,17 @@ def validate(args):
         fail(f"invalid Debian architecture: {args.architecture}")
     validate_release_files(args)
     if args.shlibdeps and shutil.which("dpkg-shlibdeps") is None:
-        fail("--shlibdeps requires dpkg-shlibdeps (package dpkg-dev)")
+        fail(
+            "computing native library dependencies requires dpkg-shlibdeps "
+            "(package dpkg-dev); pass --no-shlibdeps only for a package that "
+            "will not be installed"
+        )
+    if not args.shlibdeps:
+        print(
+            "build-deb: warning: --no-shlibdeps: Depends omits the binaries' native "
+            "library dependencies",
+            file=sys.stderr,
+        )
     try:
         epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
     except ValueError:
