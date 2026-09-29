@@ -1387,35 +1387,6 @@ impl VolumeConfig {
                 "limits.max_ciphertext_bytes must be at least limits.max_plaintext_bytes",
             ));
         }
-        // Progress guarantee for the overlay bound (R4-005): after an inline
-        // checkpoint the overlay is empty, and the largest single request
-        // (nbd.maximum_io plus one unit of misalignment, as ciphertext) is
-        // charged twice (latest plus durable copy), so it must fit twice.
-        let overlay_units = self
-            .nbd
-            .maximum_io
-            .0
-            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
-            + 1;
-        let overlay_needed = overlay_units
-            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
-            .saturating_mul(2);
-        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
-            return Err(invalid(format!(
-                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
-                 largest request ({overlay_units} units of {} ciphertext bytes) so it can \
-                 always be admitted after an inline checkpoint, or 0 to disable the bound",
-                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
-            )));
-        }
-        if l.max_overlay_entries != 0 && l.max_overlay_entries < overlay_units {
-            return Err(invalid(format!(
-                "limits.max_overlay_entries {} must be at least {overlay_units} (the largest \
-                 request in crypto units) or 0 to disable the bound",
-                l.max_overlay_entries
-            )));
-        }
-
         let r = &self.crypto.retry;
         if r.strategy != "exponential-full-jitter" {
             return Err(invalid(format!(
@@ -1605,6 +1576,36 @@ impl VolumeConfig {
                 "limits.max_plaintext_bytes {} must be at least nbd.maximum_io {} plus one \
                  crypto unit ({}): the admission budget must hold one maximal request",
                 self.limits.max_plaintext_bytes.0, n.maximum_io.0, self.volume.crypto_unit_size
+            )));
+        }
+        // Progress guarantee for the overlay bound (R4-005): after an inline
+        // checkpoint the overlay is empty, and the largest single request
+        // (nbd.maximum_io plus one unit of misalignment, as ciphertext) is
+        // charged twice (latest plus durable copy), so it must fit twice.
+        // Checked after nbd.maximum_io itself so an unrepresentable maximum
+        // is reported as such.
+        let l = &self.limits;
+        let overlay_units = n
+            .maximum_io
+            .0
+            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
+            + 1;
+        let overlay_needed = overlay_units
+            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
+            .saturating_mul(2);
+        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
+            return Err(invalid(format!(
+                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
+                 largest request ({overlay_units} units of {} ciphertext bytes) so it can \
+                 always be admitted after an inline checkpoint, or 0 to disable the bound",
+                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
+            )));
+        }
+        if l.max_overlay_entries != 0 && l.max_overlay_entries < overlay_units {
+            return Err(invalid(format!(
+                "limits.max_overlay_entries {} must be at least {overlay_units} (the largest \
+                 request in crypto units) or 0 to disable the bound",
+                l.max_overlay_entries
             )));
         }
 
