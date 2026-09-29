@@ -626,6 +626,30 @@ impl SlotStore {
         })
     }
 
+    /// Units of the loaded shards whose allocation bit is clear and that are
+    /// not discarded, in ascending order: the slots the read path probes
+    /// (a non-zero, undecodable header there is damage, S-01 residual).
+    /// The offline deep check reads them like [`allocated_units`](Self::allocated_units).
+    pub fn unlisted_units(&self) -> impl Iterator<Item = u64> + '_ {
+        let mut shards: Vec<u64> = self.shards.keys().copied().collect();
+        shards.sort_unstable();
+        let per_shard = self.geometry.units_per_shard();
+        let units = self.geometry.num_units();
+        shards.into_iter().flat_map(move |shard_idx| {
+            let shard = &self.shards[&shard_idx];
+            (0..shard.alloc.units()).filter_map(move |in_shard| {
+                let unit = shard_idx * per_shard + in_shard;
+                (unit < units
+                    && !shard.alloc.get(in_shard)
+                    && !shard
+                        .discard
+                        .as_ref()
+                        .is_some_and(|discard| discard.get(in_shard)))
+                .then_some(unit)
+            })
+        })
+    }
+
     /// Lowest allocated unit, if any slot has ever been checkpointed.
     pub fn first_allocated_unit(&self) -> Option<u64> {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();

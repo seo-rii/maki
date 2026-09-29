@@ -127,9 +127,14 @@ The deep report ends with one of three verdicts:
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
-| `clean` | Every allocated slot reads back; ordinary replay of the journal is all the next attach does | None |
+| `clean` | Every allocated slot reads back and no unlisted slot holds a damaged header; ordinary replay of the journal is all the next attach does | None |
 | `recoverable` | Some slot payloads are damaged, but each such unit has a validated journal record newer than the checkpoint, so recovery rewrites (or discards) the slot before the volume is exposed. The report lists them as `warning: slot: recoverable: …` and `check passed` | Attach normally; re-run the deep check afterwards and expect `clean` |
 | `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
+
+The check reads every slot the map lists and probes the header of every
+slot it does not list in an existing shard, exactly like the read path: a
+non-zero header that does not decode on a cleared slot is damage (EIO at
+runtime), not a hole.
 
 The raw slot reader and recovery see different states of the same volume:
 the checker reports what is on disk, the verdict says what the next attach

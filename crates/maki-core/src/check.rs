@@ -163,14 +163,23 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // checkpoint is *recoverable*: recovery rewrites (or discards) it from
     // that record before the volume is exposed, so the raw damage is a
     // warning, not a data-loss error (R4-004). Damage with no such record
-    // is unrecoverable and stays an error.
+    // is unrecoverable and stays an error. Slots whose allocation bit is
+    // clear are probed as the read path probes them: a non-zero header that
+    // does not decode there is damage (EIO), never a hole.
     let mut recoverable = 0u64;
     let mut unrecoverable = 0u64;
     match SlotStore::open(backing.clone(), superblock.geometry.clone()) {
         Ok(store) => {
             let mut checked = 0u64;
-            for unit in store.allocated_units() {
-                checked += 1;
+            let mut probed = 0u64;
+            let listed = store.allocated_units().map(|unit| (unit, true));
+            let unlisted = store.unlisted_units().map(|unit| (unit, false));
+            for (unit, allocated) in listed.chain(unlisted) {
+                if allocated {
+                    checked += 1;
+                } else {
+                    probed += 1;
+                }
                 if let Err(e) = store.read_slot(unit) {
                     if journal_ok && replay_units.contains(&unit) {
                         recoverable += 1;
@@ -202,7 +211,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             }
             report.info.push(format!(
                 "slots: {checked} allocated, {} invalid ({recoverable} recoverable by journal \
-                 replay, {unrecoverable} unrecoverable)",
+                 replay, {unrecoverable} unrecoverable); {probed} unlisted slot(s) probed",
                 recoverable + unrecoverable
             ));
             // Slots the loaded allocation copy did not list but that hold

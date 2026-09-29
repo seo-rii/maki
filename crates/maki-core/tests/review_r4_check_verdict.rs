@@ -183,3 +183,41 @@ fn a_healthy_volume_reports_a_clean_verdict() {
     assert!(report.ok());
     assert_eq!(verdict(&report), "clean");
 }
+
+/// A slot whose allocation bit is clear but whose header is non-zero and
+/// undecodable reads as EIO (S-01 residual: a hole is never partly written),
+/// so the deep check must report it too. It used to walk only the units
+/// the allocation map lists and called such a volume clean.
+#[test]
+fn damage_in_an_unlisted_slot_is_reported_like_the_read_path_refuses_it() {
+    let backing = Arc::new(CrashableBacking::new());
+    {
+        let _guard = failpoints::test_lock();
+        let mut vol = new_volume(&backing);
+        vol.write_ct(1, &ct(0x11), true).unwrap();
+        vol.checkpoint().unwrap(); // shard 0 exists with both map copies valid
+        drop(vol);
+    }
+    let g = geometry();
+    let (shard, idx) = g.shard_of_unit(7);
+    assert_eq!(shard, g.shard_of_unit(1).0, "same shard as the written unit");
+    let f = backing.open(&layout::shard_data(shard), false).unwrap();
+    f.write_at(g.slot_offset(idx), &[0xEE; 16]).unwrap();
+    f.sync_data().unwrap();
+
+    {
+        let vol = recover(&backing);
+        assert!(
+            vol.read_ct(7).is_err(),
+            "the read path refuses a damaged header on a cleared slot"
+        );
+    }
+    let report = deep(&backing);
+    assert!(!report.ok(), "the damaged unlisted slot is an error");
+    assert!(
+        joined(&report.errors).contains("unit 7"),
+        "{}",
+        joined(&report.errors)
+    );
+    assert_eq!(verdict(&report), "unrecoverable");
+}

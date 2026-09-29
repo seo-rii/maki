@@ -96,6 +96,11 @@ documents.
 
 ### Fixed
 
+- `maki check --deep` now probes the slots the allocation map does not list:
+  a damaged header there reads as EIO, but the check walked only allocated
+  units and reported such a volume `clean` (R4-004 follow-up;
+  [operations](docs/operations.md#volume-lifecycle)).
+
 - A write that still exceeded the overlay bound or the journal hard limit
   after its inline reclaim failed with ENOSPC even when the space was held
   by another writer's volatile records, which that reclaim could not retire;
