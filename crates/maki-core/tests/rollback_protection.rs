@@ -190,6 +190,7 @@ async fn revoked_freshness_rejects_a_plaintext_cache_hit() {
             cache: Some(EngineCacheConfig {
                 max_bytes: 4 * UNIT as u64,
                 ttl: Duration::from_secs(60),
+                verify_on_hit: false,
             }),
             checkpoint: CheckpointPolicy {
                 emergency_reserve_bytes: 0,

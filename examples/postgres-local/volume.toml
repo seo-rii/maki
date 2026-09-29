@@ -78,6 +78,7 @@ ttl = "30s"
 
 lock_memory = true
 zeroize_on_evict = true
+verify_on_hit = false
 
 [nbd]
 socket = "/run/maki/postgres/nbd.sock"

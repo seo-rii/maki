@@ -1362,7 +1362,9 @@ A hit for that key MAY be served without reading the slot payload; a miss
 MUST read and verify the payload before decrypting. Every header-level
 refusal of a slot read (undecodable header, foreign unit, damaged unlisted
 slot) applies to the cached path as well. A hit does not re-verify the
-payload of an already verified version until the entry is evicted.
+payload of an already verified version until the entry is evicted, unless
+`cache.verify_on_hit = true`: then every read MUST read and verify the payload
+(as a miss does) and the cache only saves the decryption.
 
 Unsupported:
 
@@ -2221,6 +2223,7 @@ ttl = "30s"
 
 lock_memory = true
 zeroize_on_evict = true
+verify_on_hit = false
 
 [nbd]
 socket = "/run/maki/postgres-prod/nbd.sock"

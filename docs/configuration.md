@@ -304,7 +304,15 @@ Two consequences to know:
   LRU pressure, a resize, or a newer write; header-level damage (an
   undecodable header, a foreign unit) still refuses the read, and
   `maki check --deep` reports the payload damage. Set `cache.ttl` with that
-  window in mind, or keep `mode = "off"` for a workload with its own cache.
+  window in mind, set `cache.verify_on_hit = true`, or keep `mode = "off"`
+  for a workload with its own cache.
+
+`cache.verify_on_hit = true` (default `false`) closes that window: every read
+reads and CRC-checks the ciphertext payload exactly as a miss does, so payload
+damage is EIO at once, and a hit saves only the provider call. Use it when the
+decryption, not the storage read, is the cost you want the cache to remove
+(a remote provider, for example). It is read at attach; changing it needs a
+restart.
 
 The size and TTL are runtime settings (`maki reload <config> cache`).
 

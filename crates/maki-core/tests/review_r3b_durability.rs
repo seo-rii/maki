@@ -76,6 +76,7 @@ fn cache_options(unit: u32, cache: bool) -> EngineOptions {
         cache: cache.then(|| EngineCacheConfig {
             max_bytes: 6 * unit as u64,
             ttl: std::time::Duration::from_secs(3600),
+            verify_on_hit: false,
         }),
         checkpoint: CheckpointPolicy {
             emergency_reserve_bytes: 0,

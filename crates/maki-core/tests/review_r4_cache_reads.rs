@@ -73,6 +73,7 @@ async fn engine(
             cache: cache.then(|| EngineCacheConfig {
                 max_bytes: 64 * UNIT as u64,
                 ttl: Duration::from_secs(3600),
+                verify_on_hit: false,
             }),
             ..Default::default()
         },
@@ -243,4 +244,67 @@ async fn without_a_cache_every_read_still_reads_and_verifies_the_payload() {
         engine.read(off(3), UNIT as usize).await,
         Err(CoreError::Corrupt(_))
     ));
+}
+
+async fn verifying_engine(
+    backing: &Arc<CrashableBacking>,
+    provider: Arc<FakeCryptoProvider>,
+) -> Engine {
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
+    Engine::attach(
+        backing.clone() as Arc<dyn Backing>,
+        provider,
+        EngineOptions {
+            volume: VolumeOptions {
+                journal_segment_size: 8192,
+            },
+            checkpoint: CheckpointPolicy {
+                journal_high_watermark_bytes: u64::MAX,
+                journal_max_bytes: 64 << 20,
+                max_pending_bytes: 64 << 20,
+                emergency_reserve_bytes: 0,
+                low_space_checkpoint_bytes: 0,
+                interval: Duration::from_secs(3600),
+            },
+            cache: Some(EngineCacheConfig {
+                max_bytes: 64 * UNIT as u64,
+                ttl: Duration::from_secs(3600),
+                verify_on_hit: true,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// `cache.verify_on_hit = true` closes the trade-off above: a hit re-reads
+/// and CRC-checks the payload (so payload damage is EIO at once) but still
+/// skips the provider call.
+#[tokio::test]
+async fn verify_on_hit_rereads_the_payload_but_skips_decryption() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT));
+    let engine = verifying_engine(&backing, provider.clone()).await;
+    engine.write(off(3), &data(0x33), true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+
+    let decrypts = provider.decrypt_calls();
+    let before = backing.read_bytes();
+    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(provider.decrypt_calls(), decrypts, "still served from the cache");
+    assert!(
+        backing.read_bytes() - before >= 64 + CT,
+        "a verified hit reads the header and the whole payload"
+    );
+
+    damage(&backing, 3, false);
+    let result = engine.read(off(3), UNIT as usize).await;
+    assert!(
+        matches!(result, Err(CoreError::Corrupt(_))),
+        "payload damage is EIO immediately, cached plaintext or not: {result:?}"
+    );
+    assert_eq!(provider.decrypt_calls(), decrypts);
 }

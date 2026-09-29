@@ -118,6 +118,11 @@ impl Default for EngineLimits {
 pub struct EngineCacheConfig {
     pub max_bytes: u64,
     pub ttl: std::time::Duration,
+    /// Re-read and CRC-check the ciphertext payload on every hit, skipping
+    /// only the provider call. Off: a hit reads just the slot header, and
+    /// payload damage under a valid header is served from the cache until
+    /// the entry is evicted (R4-006).
+    pub verify_on_hit: bool,
 }
 
 /// What the configuration says the volume's crypto identity is; compared
@@ -294,6 +299,8 @@ struct EngineInner {
     max_overlay_entries: u64,
     /// Versioned plaintext read cache (SPEC §29). `None` = mode off.
     cache: Option<maki_cache::VersionedLruCache>,
+    /// [`EngineCacheConfig::verify_on_hit`].
+    cache_verify_on_hit: bool,
     policy: CheckpointPolicy,
     clock: Arc<dyn Clock>,
     /// Wakes the checkpoint worker early (watermark crossed, shutdown).
@@ -515,6 +522,7 @@ impl Engine {
             max_request_bytes: options.limits.max_request_bytes,
             max_overlay_bytes: options.limits.max_overlay_bytes,
             max_overlay_entries: options.limits.max_overlay_entries,
+            cache_verify_on_hit: options.cache.as_ref().is_some_and(|c| c.verify_on_hit),
             cache: options.cache.map(|c| {
                 maki_cache::VersionedLruCache::new(
                     maki_cache::CacheConfig {
@@ -717,7 +725,9 @@ impl Engine {
         // payload (R4-006); only misses read and decrypt the ciphertext.
         // Header-level damage still refuses the read, and a payload that was
         // verified when the entry was cached is not re-verified until the
-        // entry is evicted.
+        // entry is evicted — unless `verify_on_hit` is set, which reads and
+        // CRC-checks the payload first and uses the cache only to skip the
+        // provider call.
         let volume = self.inner.volume.clone().read_owned().await;
         let inner = self.inner.clone();
         let io_admission = admission.clone();
@@ -727,16 +737,33 @@ impl Engine {
             let mut cts = Vec::new();
             let mut seqs = HashMap::new();
             for unit in first..=last {
-                if let Some(cache) = &inner.cache {
-                    match volume.current_sequence(unit)? {
-                        None => continue,
-                        Some(seq) => {
-                            if let Some(buf) = cache.get(unit, seq) {
-                                cached.insert(unit, buf);
-                                continue;
+                match &inner.cache {
+                    Some(cache) if !inner.cache_verify_on_hit => {
+                        match volume.current_sequence(unit)? {
+                            None => continue,
+                            Some(seq) => {
+                                if let Some(buf) = cache.get(unit, seq) {
+                                    cached.insert(unit, buf);
+                                    continue;
+                                }
                             }
                         }
                     }
+                    Some(cache) => {
+                        if let Some((seq, data)) = volume.read_ct(unit)? {
+                            if let Some(buf) = cache.get(unit, seq) {
+                                cached.insert(unit, buf);
+                            } else {
+                                seqs.insert(unit, seq);
+                                cts.push(CiphertextUnit {
+                                    unit_index: unit,
+                                    data,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    None => {}
                 }
                 if let Some((seq, data)) = volume.read_ct(unit)? {
                     seqs.insert(unit, seq);

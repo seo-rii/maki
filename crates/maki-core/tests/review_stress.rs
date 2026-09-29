@@ -79,6 +79,7 @@ fn options() -> EngineOptions {
         cache: Some(EngineCacheConfig {
             max_bytes: 32 * UNIT as u64,
             ttl: Duration::from_secs(5),
+            verify_on_hit: false,
         }),
         checkpoint: CheckpointPolicy {
             journal_high_watermark_bytes: 3 * SEGMENT,

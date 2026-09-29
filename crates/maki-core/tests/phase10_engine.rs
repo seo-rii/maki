@@ -63,6 +63,7 @@ fn read_cache() -> Option<EngineCacheConfig> {
     Some(EngineCacheConfig {
         max_bytes: 1 << 20,
         ttl: std::time::Duration::from_secs(30),
+        verify_on_hit: false,
     })
 }
 

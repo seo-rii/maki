@@ -827,6 +827,7 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
             maki_format::config::CacheMode::Read => Some(maki_core::engine::EngineCacheConfig {
                 max_bytes: config.cache.max_bytes.0,
                 ttl: config.cache.ttl.0,
+                verify_on_hit: config.cache.verify_on_hit,
             }),
         },
     }

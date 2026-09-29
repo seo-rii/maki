@@ -647,6 +647,10 @@ pub struct CacheSection {
     pub ttl: MakiDuration,
     pub lock_memory: bool,
     pub zeroize_on_evict: bool,
+    /// Re-read and CRC-check the ciphertext payload on every cache hit
+    /// (skipping only the provider call), so payload damage is EIO even for
+    /// a cached unit. Off by default: a hit reads only the slot header.
+    pub verify_on_hit: bool,
 }
 
 impl Default for CacheSection {
@@ -657,6 +661,7 @@ impl Default for CacheSection {
             ttl: MakiDuration(Duration::from_secs(30)),
             lock_memory: true,
             zeroize_on_evict: true,
+            verify_on_hit: false,
         }
     }
 }
