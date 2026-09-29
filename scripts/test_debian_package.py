@@ -207,6 +207,24 @@ class DebianPackageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("maki@pg.service", result.stderr)
 
+    def test_prerm_fails_closed_when_systemd_cannot_be_queried(self):
+        # A failed `systemctl list-units` proves nothing about the maki
+        # units; treating its empty output as "idle" let removal proceed
+        # under a live attachment.
+        package = self.build()
+        _, control = self.extract(package, "prerm-query-failure")
+        state = self.work / "state-query"
+        state.mkdir()
+        broken = self.work / "systemctl-broken"
+        broken.write_text("#!/bin/sh\necho 'Failed to connect to bus' >&2\nexit 1\n")
+        broken.chmod(0o755)
+        result = self.run_prerm(control, "remove", state, broken)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("systemd", result.stderr)
+        # Upgrades stay exempt even then.
+        upgrade = self.run_prerm(control, "upgrade", state, broken, ["0.1.0+next"])
+        self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
+
     def test_prerm_allows_idle_removal_and_never_blocks_an_upgrade(self):
         package = self.build()
         _, control = self.extract(package, "prerm-idle")

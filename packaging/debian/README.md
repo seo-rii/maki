@@ -56,7 +56,7 @@ installed.
 
 `prerm` refuses `remove` while any volume is attached: a trusted attachment
 record under `/run/maki-attach/`, or an active `maki@`, `maki-attach@` or
-`maki-workload@` unit (R4-003). The helper this package installs is what the
+`maki-workload@` unit (R4-003). A failed `systemctl` query also refuses the removal: it proves nothing about the units. The helper this package installs is what the
 lifecycle needs to detach cleanly, so removing it under a live attachment
 would strand the operator. Drain each volume, deactivate its lifecycle
 target, wait for the units to become inactive, then remove the package.

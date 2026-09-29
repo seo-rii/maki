@@ -272,13 +272,18 @@ case "$1" in
             fi
         done
         if [ -n "${MAKI_SYSTEMCTL:-}" ] || [ -d /run/systemd/system ]; then
-            units=$("$systemctl_bin" list-units --plain --no-legend \\
+            # A failed query proves nothing about the units: refuse rather
+            # than read its empty output as "idle".
+            if listed=$("$systemctl_bin" list-units --plain --no-legend \\
                 --state=active,activating,reloading,deactivating \\
                 'maki@*.service' 'maki-attach@*.service' 'maki-workload@*.target' \\
-                2>/dev/null | awk '{print $1}' || true)
-            for unit in $units; do
-                busy="$busy unit:$unit"
-            done
+                2>/dev/null); then
+                for unit in $(printf '%s\\n' "$listed" | awk '{print $1}'); do
+                    busy="$busy unit:$unit"
+                done
+            else
+                busy="$busy systemd-unit-query-failed"
+            fi
         fi
         if [ -n "$busy" ]; then
             echo "maki: refusing to remove the package while volumes are attached:$busy" >&2
