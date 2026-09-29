@@ -202,13 +202,18 @@ store, control server and providers emit reaches nbdkit's log and, under the
 packaged unit, the service journal. Without it these events would be
 silently dropped; startup and unload failures were already printed directly.
 The `maki` and `maki-check` binaries install the same subscriber, so an
-offline check shows the repairs the store made at open.
+offline check shows the repairs the store made at open. The privileged
+helper `maki-attach` installs an equivalent one (from `maki-privileged`, which
+links no crypto crate): every executed step is logged at `INFO` and every
+halted rollback at `ERROR`/`WARN` ("rollback halted…", "keeping the attach
+record"), and it reaches `journalctl -u maki-attach@<volume>.service`. Before
+this, the helper dropped those reasons and showed only its exit status.
 
 Events that matter operationally:
 
 | Level | Event |
 |---|---|
-| `ERROR` | control socket server stopped; shutdown during unload failed; panic caught at the NBD boundary |
+| `ERROR` | control socket server stopped; shutdown during unload failed; panic caught at the NBD boundary; `maki-attach` rollback halted (attach record kept) |
 | `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings |
 | `INFO` | default threshold; lifecycle milestones |
 | `DEBUG` | free-space query failures, control session lifecycle |
@@ -620,7 +625,7 @@ the NBD device is not a migration shortcut.
 Removing the package (`apt remove maki`) is refused by its `prerm` while any
 trusted attachment record exists or a `maki@`, `maki-attach@` or
 `maki-workload@` unit is active: the helper being removed is what the
-lifecycle needs to detach. Drain and deactivate every volume first. Upgrades
+lifecycle needs to detach. A failed `systemctl` query refuses the removal too. Drain and deactivate every volume first. Upgrades
 are not blocked and no maintainer script starts, stops or restarts a service
 ([package behaviour](../packaging/debian/README.md#removal-and-upgrade-behaviour)).
 

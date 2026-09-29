@@ -8,9 +8,11 @@
 //! - [`config`]: the root-owned attach configuration and argument hygiene;
 //! - [`probe`]: pure parsers for mountinfo, sysfs and swap listings;
 //! - [`verify`]: the secure-mount verifier;
-//! - `exec` (Linux): command execution, observation, allocation, rollback.
+//! - `exec` (Linux): command execution, observation, allocation, rollback;
+//! - [`logging`]: the stderr `tracing` sink the executor reports through.
 
 pub mod config;
+pub mod logging;
 pub mod plan;
 pub mod probe;
 pub mod verify;

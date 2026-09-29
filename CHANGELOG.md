@@ -96,6 +96,13 @@ documents.
 
 ### Fixed
 
+- `maki-attach` now installs a stderr `tracing` sink (`MAKI_LOG`, default
+  `info`); its executed steps and halted-rollback errors were silently
+  dropped before ([operations](docs/operations.md#logging)).
+- The package `prerm` refuses removal when `systemctl list-units` fails,
+  instead of reading the empty output as "no active maki units"
+  ([packaging README](packaging/debian/README.md#removal-and-upgrade-behaviour)).
+
 - A plaintext-cache hit now skips the ciphertext payload read (it reads the
   64-byte slot header to establish the version) instead of only skipping
   decryption; a hit no longer re-verifies an already validated payload's

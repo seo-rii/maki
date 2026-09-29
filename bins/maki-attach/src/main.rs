@@ -37,6 +37,10 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 }
 
 fn main() -> ExitCode {
+    // Executed steps and every halted rollback are reported through
+    // `tracing`; without a sink they vanish and the operator sees only the
+    // exit status.
+    maki_privileged::logging::install_default_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(verb) = args.first().cloned() else {
         return usage();
