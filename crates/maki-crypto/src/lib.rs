@@ -22,7 +22,7 @@ pub use clock::{Clock, SystemClock};
 pub use error::{ContextField, CryptoError, ErrorClass};
 pub use provider::CryptoProvider;
 pub use random_prefix::RandomPrefixProvider;
-pub use secret::SecretBuffer;
+pub use secret::{SecretBox, SecretBuffer};
 pub use types::{
     BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit,
 };

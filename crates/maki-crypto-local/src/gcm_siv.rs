@@ -9,9 +9,9 @@
 //! copies the input into a guarded buffer and encrypts it in place, and
 //! decryption copies the ciphertext body into a guarded buffer and decrypts
 //! it in place. The allocating `Aead` API would instead produce plaintext in
-//! an ordinary, unlocked `Vec` and wrap it afterwards. The AES key schedule
-//! inside the cipher object is zeroized on drop (`zeroize` feature) but is
-//! not page-locked; `memory_lock_mode = "all"` covers it.
+//! an ordinary, unlocked `Vec` and wrap it afterwards. The cipher object, with
+//! its expanded AES key schedule, lives in a [`SecretBox`]: page-locked under
+//! `secure-buffers` and zeroized on drop (`zeroize` feature).
 
 use aes_gcm_siv::aead::{AeadInPlace, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce, Tag};
@@ -20,7 +20,7 @@ use rand::RngCore;
 
 use maki_crypto::{
     BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError,
-    CryptoProvider, PlaintextUnit, SecretBuffer,
+    CryptoProvider, PlaintextUnit, SecretBox, SecretBuffer,
 };
 
 use crate::keysource::KeySource;
@@ -30,7 +30,7 @@ const TAG_LEN: usize = 16;
 pub const GCM_SIV_OVERHEAD: u32 = (NONCE_LEN + TAG_LEN) as u32;
 
 pub struct AesGcmSivProvider {
-    cipher: Aes256GcmSiv,
+    cipher: SecretBox<Aes256GcmSiv>,
     unit_size: u32,
     compatibility_id: String,
     key_name: String,
@@ -61,14 +61,23 @@ impl AesGcmSivProvider {
                 key.len()
             )));
         }
-        let cipher = Aes256GcmSiv::new_from_slice(key.expose())
-            .map_err(|_| CryptoError::ProviderFatal("cipher init failed".to_string()))?;
+        let cipher = SecretBox::new(
+            Aes256GcmSiv::new_from_slice(key.expose())
+                .map_err(|_| CryptoError::ProviderFatal("cipher init failed".to_string()))?,
+        );
         Ok(Self {
             cipher,
             unit_size,
             compatibility_id: compatibility_id.to_string(),
             key_name: key_name.to_string(),
         })
+    }
+
+    /// Whether the cipher object (the expanded key schedule) is pinned in
+    /// RAM: true only when `secure-buffers` locking was on at construction
+    /// and the lock succeeded.
+    pub fn key_schedule_locked(&self) -> bool {
+        self.cipher.is_page_locked()
     }
 
     fn aad(&self, context: &CryptoContext, unit_index: u64) -> Vec<u8> {

@@ -7,6 +7,9 @@
 //! capability report says `integrity: Absent` so the engine treats it that
 //! way. The tweak is the crypto unit index, which binds position but is not
 //! verifiable at decrypt time (`context_binding: Absent`).
+//!
+//! Both AES key schedules live in one [`SecretBox`]: page-locked under
+//! `secure-buffers` and zeroized on drop.
 
 use aes::cipher::KeyInit;
 use aes::Aes256;
@@ -15,13 +18,13 @@ use xts_mode::{get_tweak_default, Xts128};
 
 use maki_crypto::{
     BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError,
-    CryptoProvider, PlaintextUnit, SecretBuffer,
+    CryptoProvider, PlaintextUnit, SecretBox, SecretBuffer,
 };
 
 use crate::keysource::KeySource;
 
 pub struct AesXtsProvider {
-    xts: Xts128<Aes256>,
+    xts: SecretBox<Xts128<Aes256>>,
     unit_size: u32,
     compatibility_id: String,
     key_name: String,
@@ -63,11 +66,17 @@ impl AesXtsProvider {
             ));
         }
         Ok(Self {
-            xts: Xts128::new(c1, c2),
+            xts: SecretBox::new(Xts128::new(c1, c2)),
             unit_size,
             compatibility_id: compatibility_id.to_string(),
             key_name: key_name.to_string(),
         })
+    }
+
+    /// Whether the two AES key schedules are pinned in RAM (see
+    /// [`AesGcmSivProvider::key_schedule_locked`](crate::AesGcmSivProvider::key_schedule_locked)).
+    pub fn key_schedule_locked(&self) -> bool {
+        self.xts.is_page_locked()
     }
 
     fn check_context(&self, context: &CryptoContext) -> Result<(), CryptoError> {

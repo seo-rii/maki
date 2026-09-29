@@ -15,7 +15,8 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use maki_crypto::{
-    secret::unguarded_wraps, CiphertextUnit, CryptoContext, CryptoError, CryptoProvider,
+    secret::{page_lock_failures, set_page_locking, unguarded_wraps},
+    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider,
     PlaintextUnit, SecretBuffer,
 };
 use maki_crypto_local::keysource::{EnvKeySource, FileKeySource, KeySource, MapKeySource};
@@ -172,4 +173,45 @@ fn env_key_source_copies_the_variable_into_guarded_memory() {
     assert_eq!(unguarded_wraps(), before);
     assert_eq!(loaded.expose(), &raw[..]);
     std::env::remove_var("MAKI_CREDENTIAL_R4_GUARDED");
+}
+
+#[test]
+fn key_schedules_are_page_locked_under_secure_buffers() {
+    // R4-002 residual: the expanded AES key schedule is key material too.
+    // With `secure-buffers` on, each provider keeps its cipher object in
+    // guarded memory for its whole lifetime (or counts the lock failure,
+    // e.g. under an exhausted RLIMIT_MEMLOCK or on a non-Unix host).
+    let _serial = serial();
+    let keys = keys();
+    set_page_locking(true);
+    let failures = page_lock_failures();
+    let gcm = AesGcmSivProvider::new(&keys, "gcm", UNIT, "gcm-v1").unwrap();
+    let after_gcm = page_lock_failures();
+    let xts = AesXtsProvider::new(&keys, "xts", UNIT, "xts-v1").unwrap();
+    let after_xts = page_lock_failures();
+    set_page_locking(false);
+    assert!(gcm.key_schedule_locked() || after_gcm > failures);
+    assert!(xts.key_schedule_locked() || after_xts > after_gcm);
+    #[cfg(target_os = "linux")]
+    if after_xts == failures {
+        assert!(gcm.key_schedule_locked() && xts.key_schedule_locked());
+    }
+
+    // Off by default, like every other SecretBuffer.
+    let plain = AesGcmSivProvider::new(&keys, "gcm", UNIT, "gcm-v1").unwrap();
+    assert!(!plain.key_schedule_locked());
+    assert!(!AesXtsProvider::new(&keys, "xts", UNIT, "xts-v1")
+        .unwrap()
+        .key_schedule_locked());
+}
+
+#[tokio::test]
+async fn locked_key_schedules_still_encrypt_and_decrypt() {
+    let _serial = serial();
+    set_page_locking(true);
+    let gcm = AesGcmSivProvider::new(&keys(), "gcm", UNIT, "gcm-v1").unwrap();
+    let xts = AesXtsProvider::new(&keys(), "xts", UNIT, "xts-v1").unwrap();
+    set_page_locking(false);
+    round_trip_without_unguarded_wraps(&gcm, &ctx("gcm-v1")).await;
+    round_trip_without_unguarded_wraps(&xts, &ctx("xts-v1")).await;
 }

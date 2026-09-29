@@ -11,6 +11,8 @@
 //!   best-effort per buffer because `RLIMIT_MEMLOCK` can be exhausted;
 //!   failures are counted ([`page_lock_failures`]) and reported by the
 //!   daemon, and the secure-swap policy is the second line of defence.
+//! - [`SecretBox`] gives the same page lock to a non-byte value that is key
+//!   material, such as a cipher object holding an expanded key schedule.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(unix)]
@@ -138,19 +140,24 @@ impl std::fmt::Display for SecretBufferCapacityError {
 
 impl std::error::Error for SecretBufferCapacityError {}
 
+/// Lock `length` bytes at `address` when page locking is enabled, counting
+/// a failure. An empty range has nothing to protect and is not a failure.
+fn guard(address: *const u8, length: usize) -> Option<PageLock> {
+    if !page_locking_enabled() {
+        return None;
+    }
+    let lock = lock_pages(address, length);
+    if lock.is_none() && length != 0 {
+        LOCK_FAILURES.fetch_add(1, Ordering::SeqCst);
+    }
+    lock
+}
+
 impl SecretBuffer {
     fn wrap(data: Vec<u8>) -> Self {
-        let page_lock = if page_locking_enabled() {
-            // Drop erases the complete allocation, including spare capacity,
-            // so the page lock must cover that same range.
-            let lock = lock_pages(data.as_ptr(), data.capacity());
-            if lock.is_none() && data.capacity() != 0 {
-                LOCK_FAILURES.fetch_add(1, Ordering::SeqCst);
-            }
-            lock
-        } else {
-            None
-        };
+        // Drop erases the complete allocation, including spare capacity,
+        // so the page lock must cover that same range.
+        let page_lock = guard(data.as_ptr(), data.capacity());
         Self { data, page_lock }
     }
 
@@ -283,6 +290,88 @@ impl PartialEq for SecretBuffer {
 }
 impl Eq for SecretBuffer {}
 
+/// A heap value that *is* key material, such as a cipher object holding an
+/// expanded AES key schedule.
+///
+/// The allocation is page-locked, when [`set_page_locking`] is on, before
+/// the value is moved into it, and stays locked until the value has been
+/// dropped. The value's own `Drop` is responsible for erasing it (the `aes`
+/// crate's `zeroize` feature does this for key schedules); the box adds the
+/// page lock and erases the staging copy the move leaves behind. Temporaries
+/// the value's constructor made before it was handed over are outside its
+/// reach. No `Clone`; `Debug` is redacted.
+pub struct SecretBox<T> {
+    value: std::ptr::NonNull<T>,
+    page_lock: Option<PageLock>,
+}
+
+// SAFETY: SecretBox uniquely owns its value, exactly like Box<T>.
+unsafe impl<T: Send> Send for SecretBox<T> {}
+// SAFETY: shared access only hands out &T.
+unsafe impl<T: Sync> Sync for SecretBox<T> {}
+
+impl<T> SecretBox<T> {
+    pub fn new(value: T) -> Self {
+        let mut slot = Box::<T>::new_uninit();
+        let page_lock = guard(slot.as_ptr().cast(), std::mem::size_of::<T>());
+        let mut staged = std::mem::MaybeUninit::new(value);
+        // SAFETY: both pointers are valid, aligned and distinct; the staged
+        // value is moved (not dropped) and its bytes are then erased as
+        // plain bytes, which MaybeUninit permits.
+        unsafe {
+            std::ptr::copy_nonoverlapping(staged.as_ptr(), slot.as_mut_ptr(), 1);
+            std::slice::from_raw_parts_mut(
+                staged.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of::<T>(),
+            )
+            .zeroize();
+        }
+        // SAFETY: the slot was initialized by the copy above.
+        let value = Box::into_raw(unsafe { slot.assume_init() });
+        Self {
+            // SAFETY: Box::into_raw never returns null.
+            value: unsafe { std::ptr::NonNull::new_unchecked(value) },
+            page_lock,
+        }
+    }
+
+    /// Whether the value's pages are pinned in RAM.
+    pub fn is_page_locked(&self) -> bool {
+        self.page_lock.is_some()
+    }
+}
+
+impl<T> std::ops::Deref for SecretBox<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the pointer is valid and initialized until drop.
+        unsafe { self.value.as_ref() }
+    }
+}
+
+impl<T> Drop for SecretBox<T> {
+    fn drop(&mut self) {
+        // Drop (and so erase) the value while its pages are still locked,
+        // then release the lock, then free the allocation.
+        // SAFETY: the value is initialized and dropped exactly once here;
+        // the allocation came from Box::<T>::new_uninit.
+        unsafe {
+            std::ptr::drop_in_place(self.value.as_ptr());
+            self.page_lock.take();
+            drop(Box::from_raw(
+                self.value.as_ptr().cast::<std::mem::MaybeUninit<T>>(),
+            ));
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for SecretBox<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretBox({} bytes, redacted)", std::mem::size_of::<T>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +457,44 @@ mod tests {
         assert_eq!(unguarded_wraps(), before);
         let _e = SecretBuffer::from_vec(vec![1, 2, 3]);
         assert_eq!(unguarded_wraps(), before + 1);
+    }
+
+    struct DropCounter<'a>(&'a AtomicU64, [u8; 48]);
+
+    impl Drop for DropCounter<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn secret_box_drops_its_value_exactly_once() {
+        let drops = AtomicU64::new(0);
+        let boxed = SecretBox::new(DropCounter(&drops, [7; 48]));
+        assert_eq!(boxed.1, [7; 48]);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(boxed);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn secret_box_is_page_locked_when_enabled_and_redacted() {
+        let _serial = serial();
+        assert!(!SecretBox::new([1u8; 64]).is_page_locked());
+        set_page_locking(true);
+        let before = page_lock_failures();
+        let boxed = SecretBox::new([0x5au8; 512]);
+        assert!(boxed.is_page_locked() || page_lock_failures() > before);
+        // A zero-sized value has no bytes to protect: neither locked nor
+        // counted as a failure.
+        let failures = page_lock_failures();
+        assert!(!SecretBox::new(()).is_page_locked());
+        assert_eq!(page_lock_failures(), failures);
+        set_page_locking(false);
+        assert_eq!(boxed[511], 0x5a);
+        let rendered = format!("{boxed:?}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(!rendered.contains("90"), "{rendered}");
     }
 
     #[test]

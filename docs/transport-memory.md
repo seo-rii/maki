@@ -182,9 +182,17 @@ outside the daemon's control and is a development-only source).
 after the fact; `review_r4_guarded_buffers.rs` requires it to stay constant
 through encryption, decryption and key loading.
 
-**Residual.** The expanded AES key schedule inside the cipher objects
-(`Aes256GcmSiv`, the two XTS `Aes256` instances) lives in the provider struct,
-not in a `SecretBuffer`. It is zeroized on drop (the AES crate's `zeroize`
-feature) but is not page-locked by `secure-buffers`; `memory_lock_mode =
-"all"` (`mlockall`) or the secure-swap policy covers it. Stack temporaries of
-the cipher implementation are likewise outside the page-lock claim.
+The cipher objects holding the expanded AES key schedules (`Aes256GcmSiv`,
+the XTS pair of `Aes256` instances) live in a `maki_crypto::SecretBox`: a heap
+allocation that is page-locked under `secure-buffers` before the cipher is
+moved into it and stays locked until the cipher has been dropped, which
+zeroizes the schedule (the AES crate's `zeroize` feature). The box also erases
+the staging copy the move leaves behind. Lock failures are counted with every
+other `SecretBuffer` failure. `AesGcmSivProvider::key_schedule_locked()` and
+`AesXtsProvider::key_schedule_locked()` report the state;
+`key_schedules_are_page_locked_under_secure_buffers` requires it.
+
+**Residual.** Temporaries the cipher crates create on the stack while
+expanding the key, and stack or register state during encryption, are outside
+the page-lock claim; `memory_lock_mode = "all"` (`mlockall`) or the
+secure-swap policy covers them.
