@@ -51,7 +51,12 @@ shard with neither valid discard-map copy is refused during recovery.
 
 Checkpoint data writes finish and sync before publication changes the logical
 bitmap. Both complete discard-map copies and their directory are synced before
-any slot is punched or the checkpoint sequence advances. The current store is
+the checkpoint sequence advances, and a checkpoint punches the slots it retires
+only after its new checkpoint state and directory are synced. Until then
+recovery replays from the older checkpoint and may rewrite an older durable
+write of the unit into its slot before reaching the tombstone, which needs the
+reservation (R5-008). A punch that fails after the state is durable does not
+fail the checkpoint; it schedules the reclamation scan below. The current store is
 updated, preserving concurrently created shards. Clearing a discard bit for a
 later write follows the same two-copy rule after the new slot data is synced.
 An interrupted publication keeps the covering journal for retry or recovery.

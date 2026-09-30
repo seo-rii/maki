@@ -102,6 +102,12 @@ documents.
 
 ### Fixed
 
+- v3 discard: a checkpoint **punches retired slots only after its state is
+  durable** (R5-008), so a crash or failed state store can no longer leave
+  recovery replaying an older write into a released hole (ENOSPC on a full
+  backing). A failed punch now defers reclamation instead of failing the
+  checkpoint. A failed shard-catalog commit no longer makes later
+  reclamation checkpoints panic (R5-009).
 - Remote providers: a **broken endpoint now fails over** (R5-005). A
   contract-violating response (malformed JSON, wrong item count, bad
   encoding) or HTTP 404/405/410 counts as an endpoint failure, opens that

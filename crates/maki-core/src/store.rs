@@ -551,9 +551,9 @@ impl SlotStore {
             .catalog
             .shard_indices()
             .find(|idx| {
-                self.shards[idx]
-                    .discard
-                    .as_ref()
+                self.shards
+                    .get(idx)
+                    .and_then(|shard| shard.discard.as_ref())
                     .is_some_and(|map| map.set_count() > 0)
             })
             .map(|idx| (idx, 0));
@@ -724,11 +724,15 @@ impl SlotStore {
         fp("store.shard_dirsync")?;
         self.backing.sync_dir(layout::DATA_DIR)?;
         // 4. catalog commit
+        // The in-memory catalog names the shard only once the commit is
+        // durable: a failed store or sync must not leave it listing a shard
+        // that is not open (R5-009).
         fp("store.catalog_store")?;
-        self.catalog.insert(shard_idx);
-        self.catalog_ab
-            .store(self.backing.as_ref(), &mut self.catalog)?;
+        let mut catalog = self.catalog.clone();
+        catalog.insert(shard_idx);
+        self.catalog_ab.store(self.backing.as_ref(), &mut catalog)?;
         self.backing.sync_dir("")?;
+        self.catalog = catalog;
 
         self.shards.insert(
             shard_idx,
@@ -1003,9 +1007,10 @@ impl SlotStore {
                 .shard_indices()
                 .find(|next| {
                     *next > idx
-                        && self.shards[next]
-                            .discard
-                            .as_ref()
+                        && self
+                            .shards
+                            .get(next)
+                            .and_then(|shard| shard.discard.as_ref())
                             .is_some_and(|map| map.set_count() > 0)
                 })
                 .map(|next| (next, 0))

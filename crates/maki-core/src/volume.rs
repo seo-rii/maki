@@ -508,16 +508,26 @@ impl Volume {
             // Both complete logical copies and their directory entries must
             // be durable before a slot reservation can be physically removed.
             self.store.persist_discards()?;
-            let punchable = items.iter().filter_map(|(unit, version)| {
-                (version.ciphertext.is_empty()
-                    && self
-                        .overlay
-                        .get(*unit)
-                        .is_none_or(|latest| latest.sequence <= version.sequence))
-                .then_some(*unit)
-            });
-            self.store.punch_slots(punchable)?;
         }
+        // Slots this checkpoint retires, punched only once its state is
+        // durable: until then recovery replays from the older checkpoint and
+        // may rewrite an older durable write of the unit into its slot
+        // before the tombstone, which needs the reservation (R5-008).
+        let punchable: Vec<u64> = if allow_discard {
+            items
+                .iter()
+                .filter_map(|(unit, version)| {
+                    (version.ciphertext.is_empty()
+                        && self
+                            .overlay
+                            .get(*unit)
+                            .is_none_or(|latest| latest.sequence <= version.sequence))
+                    .then_some(*unit)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.store.persist_allocations()?;
         // 4. sync checkpoint metadata (in-memory state only advances after
         //    the durable store succeeds)
@@ -527,6 +537,15 @@ impl Volume {
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
+        // Physical reclamation. A failure only leaves space unreclaimed (the
+        // discard map is durable and reads return zeros), so it does not
+        // fail the checkpoint; the reclamation scan retries it.
+        if !punchable.is_empty() {
+            if let Err(error) = self.store.punch_slots(punchable) {
+                tracing::warn!("checkpoint: slot reclamation deferred: {error}");
+                self.store.schedule_reclamation();
+            }
+        }
         // 5. delete completed journal segments
         self.journal.delete_covered(horizon)?;
         // 6. fsync journal directory

@@ -205,8 +205,11 @@ fn partial_punch_failure_keeps_both_discards_and_the_gap_across_crash() {
             None
         }
     })));
-    assert!(volume.checkpoint().is_err());
-    assert_eq!(volume.checkpoint_sequence(), previous);
+    // Slots are punched only after the checkpoint state is durable
+    // (R5-008): a failed punch no longer fails the checkpoint, it only
+    // defers physical reclamation to the next scan.
+    volume.checkpoint().unwrap();
+    assert!(volume.checkpoint_sequence() > previous);
     backing.set_fault_hook(None);
     drop(volume);
     backing.crash(&mut StdRng::seed_from_u64(19));
