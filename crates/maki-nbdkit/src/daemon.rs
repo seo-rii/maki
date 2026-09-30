@@ -318,10 +318,12 @@ fn read_tls_file(
     field: &str,
     path: Option<&String>,
 ) -> Result<Option<Vec<u8>>, DaemonError> {
+    // WebSocket and gRPC take the private key from a credential, so these
+    // files are certificates or CA bundles: regular files, read without
+    // blocking on a FIFO (same rules as HTTP).
     path.map(|path| {
-        std::fs::read(path).map_err(|error| {
-            DaemonError::Unsupported(format!("[crypto.{section}.tls] {field} {path:?}: {error}"))
-        })
+        maki_crypto_http::read_tls_file(section, field, path, false)
+            .map_err(|error| DaemonError::Unsupported(error.to_string()))
     })
     .transpose()
 }

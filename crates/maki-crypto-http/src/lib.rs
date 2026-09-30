@@ -417,13 +417,14 @@ impl std::fmt::Debug for HttpCryptoProvider {
 /// not be readable by group or others. Certificates and CA bundles may be
 /// symlinks (`/etc/ssl/certs`, certbot's `live/`).
 pub fn read_tls_file(
+    section: &str,
     what: &str,
     path: &str,
     may_hold_private_key: bool,
 ) -> Result<Vec<u8>, CryptoError> {
     use std::io::Read;
     const MAX_TLS_FILE_BYTES: u64 = 1 << 20;
-    let fail = |message: String| fatal(format!("[crypto.http.tls] {what} {path:?}: {message}"));
+    let fail = |message: String| fatal(format!("[crypto.{section}.tls] {what} {path:?}: {message}"));
     let opened = if may_hold_private_key {
         maki_crypto_local::keysource::open_credential(std::path::Path::new(path))
     } else {
@@ -1065,7 +1066,7 @@ impl HttpCryptoProvider {
                     )));
                 }
                 let ca_pem = match &t.ca_file {
-                    Some(path) => Some(read_tls_file("ca_file", path, false)?),
+                    Some(path) => Some(read_tls_file("http", "ca_file", path, false)?),
                     None => None,
                 };
                 let identity_pem = match &t.client_cert_file {
@@ -1074,7 +1075,7 @@ impl HttpCryptoProvider {
                         // PEM and holds the private key itself.
                         let combined = t.client_key.is_none();
                         let mut pem =
-                            PendingIdentityPem(read_tls_file("client_cert_file", path, combined)?);
+                            PendingIdentityPem(read_tls_file("http", "client_cert_file", path, combined)?);
                         if let Some(key) = &t.client_key {
                             // Private key from its credential source, appended
                             // to the certificate PEM for the client identity.

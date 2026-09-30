@@ -27,11 +27,11 @@ fn a_combined_identity_pem_readable_by_others_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("id.pem");
     write(&path, &identity_pem(), 0o644);
-    let error = read_tls_file("client_cert_file", path.to_str().unwrap(), true).unwrap_err();
+    let error = read_tls_file("http", "client_cert_file", path.to_str().unwrap(), true).unwrap_err();
     assert!(error.to_string().contains("private key"), "{error}");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
-        read_tls_file("client_cert_file", path.to_str().unwrap(), true).unwrap(),
+        read_tls_file("http", "client_cert_file", path.to_str().unwrap(), true).unwrap(),
         identity_pem_len_check(&path)
     );
 }
@@ -47,7 +47,7 @@ fn a_symlinked_combined_identity_pem_is_refused() {
     write(&real, &identity_pem(), 0o600);
     let link = dir.path().join("id.pem");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    assert!(read_tls_file("client_cert_file", link.to_str().unwrap(), true).is_err());
+    assert!(read_tls_file("http", "client_cert_file", link.to_str().unwrap(), true).is_err());
 }
 
 #[test]
@@ -59,10 +59,10 @@ fn certificates_may_be_symlinks_and_world_readable() {
     let link = dir.path().join("link.pem");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     // A certificate paired with a separate client_key, or a CA bundle.
-    read_tls_file("client_cert_file", link.to_str().unwrap(), false).unwrap();
-    read_tls_file("ca_file", link.to_str().unwrap(), false).unwrap();
+    read_tls_file("http", "client_cert_file", link.to_str().unwrap(), false).unwrap();
+    read_tls_file("http", "ca_file", link.to_str().unwrap(), false).unwrap();
     // A certificate-only file in the combined slot is not a secret either.
-    read_tls_file("client_cert_file", real.to_str().unwrap(), true).unwrap();
+    read_tls_file("http", "client_cert_file", real.to_str().unwrap(), true).unwrap();
 }
 
 #[test]
@@ -72,6 +72,6 @@ fn a_fifo_is_refused_without_blocking() {
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-    assert!(read_tls_file("ca_file", fifo.to_str().unwrap(), false).is_err());
-    assert!(read_tls_file("client_cert_file", fifo.to_str().unwrap(), true).is_err());
+    assert!(read_tls_file("http", "ca_file", fifo.to_str().unwrap(), false).is_err());
+    assert!(read_tls_file("http", "client_cert_file", fifo.to_str().unwrap(), true).is_err());
 }
