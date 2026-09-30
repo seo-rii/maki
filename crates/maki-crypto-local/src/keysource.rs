@@ -116,7 +116,7 @@ fn read_guarded(mut file: std::fs::File, expected_len: u64) -> std::io::Result<S
 /// follows a symlink (`O_NOFOLLOW`) nor blocks on a FIFO without a writer
 /// (`O_NONBLOCK`); validating a path and then opening it again let a swap
 /// in between be loaded as the key.
-fn open_credential(path: &std::path::Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+pub fn open_credential(path: &std::path::Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

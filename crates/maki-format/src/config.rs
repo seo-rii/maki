@@ -1251,6 +1251,12 @@ fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
         ("client_cert_file", &tls.client_cert_file),
     ] {
         if let Some(path) = path {
+            // Check the type before opening: opening a FIFO would block.
+            if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+                return Err(invalid(format!(
+                    "[crypto.{section}.tls] {field} {path:?} is not readable (missing, or not a regular file)"
+                )));
+            }
             std::fs::File::open(path).map_err(|e| {
                 invalid(format!(
                     "[crypto.{section}.tls] {field} {path:?} is not readable: {e}"

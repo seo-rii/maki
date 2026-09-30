@@ -69,7 +69,11 @@ For gRPC, use `crypto.grpc.endpoint`, an `https://` URL and `crypto.grpc.tls`
 with the same fields. WebSocket and gRPC require `client_cert_file` and
 `client_key` together; the private key is loaded through the existing credential
 router. Omit both for server-only TLS. HTTP also retains support for a combined
-certificate/private-key PEM in `client_cert_file`.
+certificate/private-key PEM in `client_cert_file`; such a file is a secret file
+like a `file` credential: it is opened without following a symlink and, when it
+holds a private key, must not be readable by group or others (0600 or 0400).
+Every TLS file must be a regular file of at most 1 MiB; CA bundles and
+certificates paired with `client_key` may be symlinks.
 
 These transports have local certificate, hostname, mTLS and actual daemon I/O
 regressions. The cross-host reference-provider campaigns documented separately

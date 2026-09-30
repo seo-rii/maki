@@ -96,6 +96,14 @@ documents.
 
 ### Fixed
 
+- `remote-http`: a combined certificate/private-key PEM (`client_cert_file`
+  without `client_key`) now passes the `file` credential checks (no symlink,
+  not group/other-readable); every TLS file must be a regular file, so a
+  FIFO cannot hang attach ([configuration](docs/configuration.md)).
+- `remote-http`: a header credential that resolves to an invalid header
+  value (a control character inside it) is refused at attach as
+  `ProviderFatal` instead of failing every request as a retryable error.
+
 - `maki-attach` refuses to mount onto a path a non-root user could redirect:
   every ancestor of the mountpoint must be a root-owned, non-group/other-
   writable real directory and the mountpoint a real directory. A workload

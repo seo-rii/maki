@@ -406,6 +406,68 @@ impl std::fmt::Debug for HttpCryptoProvider {
     }
 }
 
+/// Read a configured TLS file: a CA bundle, a client certificate, or (HTTP
+/// only, `client_cert_file` without `client_key`) a combined
+/// certificate/private-key PEM.
+///
+/// Every TLS file must be a regular file of at most 1 MiB, opened without
+/// blocking, so a FIFO cannot hang attach. A file that `may_hold_private_key`
+/// is a secret file like a `file` credential: it is opened once without
+/// following a symlink, and if it does hold a `PRIVATE KEY` block it must
+/// not be readable by group or others. Certificates and CA bundles may be
+/// symlinks (`/etc/ssl/certs`, certbot's `live/`).
+pub fn read_tls_file(
+    what: &str,
+    path: &str,
+    may_hold_private_key: bool,
+) -> Result<Vec<u8>, CryptoError> {
+    use std::io::Read;
+    const MAX_TLS_FILE_BYTES: u64 = 1 << 20;
+    let fail = |message: String| fatal(format!("[crypto.http.tls] {what} {path:?}: {message}"));
+    let opened = if may_hold_private_key {
+        maki_crypto_local::keysource::open_credential(std::path::Path::new(path))
+    } else {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        options
+            .open(path)
+            .and_then(|file| file.metadata().map(|meta| (file, meta)))
+    };
+    let (file, meta) = opened.map_err(|e| fail(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(fail("is not a regular file".into()));
+    }
+    if meta.len() > MAX_TLS_FILE_BYTES {
+        return Err(fail("exceeds 1 MiB".into()));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_TLS_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fail(e.to_string()))?;
+    if bytes.len() as u64 > MAX_TLS_FILE_BYTES {
+        bytes.zeroize();
+        return Err(fail("exceeds 1 MiB".into()));
+    }
+    #[cfg(unix)]
+    if may_hold_private_key && bytes.windows(11).any(|w| w == b"PRIVATE KEY") {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bytes.zeroize();
+            return Err(fail(format!(
+                "holds a private key and has mode {mode:04o}: it is readable by the group or \
+                 by others; make it 0600 or 0400, or move the key to client_key (SPEC 9)"
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
 fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
@@ -877,6 +939,26 @@ impl HttpCryptoProvider {
                         }
                     }
                 };
+                // An invalid name or value would fail every request at send
+                // time as a (retryable) builder error; refuse it now, and
+                // never echo a value that may be a credential.
+                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(fatal(format!("header name {name:?} is not a valid HTTP header")));
+                }
+                // The HeaderValue rule (visible ASCII, obs-text, SP, HTAB),
+                // checked in place: HeaderValue::from_str would copy the
+                // credential into an allocation that is never wiped.
+                let valid_value = resolved
+                    .bytes()
+                    .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f));
+                if !valid_value {
+                    let mut resolved = resolved;
+                    resolved.zeroize();
+                    return Err(fatal(format!(
+                        "header {name:?} resolves to an invalid HTTP header value \
+                         (control character?)"
+                    )));
+                }
                 headers.0.push((name.clone(), resolved));
             }
             let body = match &op_cfg.body {
@@ -982,17 +1064,17 @@ impl HttpCryptoProvider {
                          put the certificate's name in the endpoint url"
                     )));
                 }
-                let read = |what: &str, path: &str| -> Result<Vec<u8>, CryptoError> {
-                    std::fs::read(path)
-                        .map_err(|e| fatal(format!("[crypto.http.tls] {what} {path:?}: {e}")))
-                };
                 let ca_pem = match &t.ca_file {
-                    Some(path) => Some(read("ca_file", path)?),
+                    Some(path) => Some(read_tls_file("ca_file", path, false)?),
                     None => None,
                 };
                 let identity_pem = match &t.client_cert_file {
                     Some(path) => {
-                        let mut pem = PendingIdentityPem(read("client_cert_file", path)?);
+                        // Without client_key the file is a combined identity
+                        // PEM and holds the private key itself.
+                        let combined = t.client_key.is_none();
+                        let mut pem =
+                            PendingIdentityPem(read_tls_file("client_cert_file", path, combined)?);
                         if let Some(key) = &t.client_key {
                             // Private key from its credential source, appended
                             // to the certificate PEM for the client identity.
