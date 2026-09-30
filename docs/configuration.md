@@ -357,7 +357,10 @@ enabled, an unavailable or failed query fails write admission with ENOSPC;
 When the emergency reserve is enabled, every write admission refreshes free
 space while holding the volume write lock. It requires enough space for the
 configured emergency reserve and checkpoint headroom after all record bytes and
-segment headers created by that request. Checked arithmetic fails closed on an
+segment headers created by that request. A discard (v3) needs only the
+emergency reserve: its tombstones carry no payload and their checkpoint writes
+no slot data, so `fstrim` keeps working inside the checkpoint headroom, where
+it is the workload's way to give space back. Checked arithmetic fails closed on an
 overflow. It does not reuse the statistics cache, so space lost or restored
 between consecutive writes is observed even within the same second. Setting
 the emergency reserve to zero retains the explicit admission opt-out; the

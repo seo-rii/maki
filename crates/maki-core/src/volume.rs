@@ -344,7 +344,9 @@ impl Volume {
                 self.sanitize();
                 return Ok(sequence);
             }
-        } else if matches!(self.store.read_slot(unit)?, SlotRead::Zero) {
+        } else if matches!(self.store.slot_sequence(unit), Ok(None)) {
+            // Only a header proving the unit unwritten skips the tombstone;
+            // a damaged slot is retired by one rather than refused (R5-012).
             return Ok(self.journal.appended_sequence());
         }
         if self.journal.next_sequence() == u64::MAX {

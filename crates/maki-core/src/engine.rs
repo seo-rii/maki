@@ -1033,10 +1033,13 @@ impl Engine {
     ) -> Result<bool, CoreError> {
         // Already-zero trim hints must not reserve storage or consume journal
         // capacity. All records in a request are either writes or tombstones.
+        // Only a header that proves the unit unwritten skips it: the payload
+        // is never read, and a damaged unit is retired by its tombstone
+        // instead of failing the discard with EIO (R5-012).
         let mut filtered = Vec::new();
         let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
             for ct in cts {
-                if volume.read_ct(ct.unit_index)?.is_some() {
+                if !matches!(volume.current_sequence(ct.unit_index), Ok(None)) {
                     filtered.push(CiphertextUnit {
                         unit_index: ct.unit_index,
                         data: Vec::new(),
@@ -1112,9 +1115,18 @@ impl Engine {
             // filesystem user or an earlier operation may have consumed the
             // space. This remains a threshold check, not a physical reservation.
             let append_footprint = footprint(volume);
+            // Tombstones carry no payload and their checkpoint writes no slot
+            // data, so they need no checkpoint headroom: discard is how the
+            // workload gives space back and must work inside it (R5-011).
+            let tombstones = cts.iter().all(|ct| ct.data.is_empty());
+            let headroom = if tombstones {
+                0
+            } else {
+                policy.low_space_checkpoint_bytes
+            };
             let reserved = policy
                 .emergency_reserve_bytes
-                .checked_add(policy.low_space_checkpoint_bytes)
+                .checked_add(headroom)
                 .ok_or_else(|| {
                     enospc(format!(
                         "emergency reserve {} plus checkpoint headroom {} exceeds free-space accounting range",
@@ -1133,8 +1145,8 @@ impl Engine {
             };
             if free < required {
                 return Err(enospc(format!(
-                    "backing free space {free} below required {required} bytes (emergency reserve {} + checkpoint headroom {} + journal append footprint {append_footprint})",
-                    policy.emergency_reserve_bytes, policy.low_space_checkpoint_bytes
+                    "backing free space {free} below required {required} bytes (emergency reserve {} + checkpoint headroom {headroom} + journal append footprint {append_footprint})",
+                    policy.emergency_reserve_bytes
                 )));
             }
         }

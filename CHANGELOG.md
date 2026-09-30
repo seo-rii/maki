@@ -102,6 +102,11 @@ documents.
 
 ### Fixed
 
+- v3 discard works under space pressure and on damaged units (R5-011,
+  R5-012): tombstones are admitted against the emergency reserve alone, not
+  the checkpoint headroom, and a unit whose slot is damaged can be discarded
+  (previously EIO). "Already zero" is decided from the slot header, so a
+  discard no longer reads every payload twice under the volume lock.
 - v3 discard: **trims longer than `nbd.maximum_io` are accepted** (R5-010).
   The maximum block size bounds payloads; kernel discards (`fstrim`,
   `-o discard`) are far larger and all failed with EINVAL.
