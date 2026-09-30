@@ -48,6 +48,10 @@ impl Model {
     }
 
     fn put(&mut self, unit: u64, seq: u64, len: u64, now: Duration) {
+        // A newer cached version is kept (R5-020).
+        if self.entries.get(&unit).is_some_and(|e| e.seq > seq) {
+            return;
+        }
         self.entries.remove(&unit);
         if len > self.max_bytes || self.max_bytes == 0 {
             return;
@@ -69,14 +73,16 @@ impl Model {
 
     /// Expected hit (true) or miss (false), applying the side effects.
     fn get(&mut self, unit: u64, seq: u64, now: Duration) -> bool {
-        let hit = match self.entries.get(&unit) {
-            Some(e) => e.seq == seq && now.saturating_sub(e.inserted_at) < self.ttl,
-            None => false,
+        let live = |e: &Entry| now.saturating_sub(e.inserted_at) < self.ttl;
+        let (hit, keep) = match self.entries.get(&unit) {
+            Some(e) => (e.seq == seq && live(e), e.seq > seq && live(e)),
+            None => (false, false),
         };
         if hit {
             self.tick += 1;
             self.entries.get_mut(&unit).unwrap().last_used = self.tick;
-        } else {
+        } else if !keep {
+            // A lookup for an older version keeps the newer entry (R5-020).
             self.entries.remove(&unit);
         }
         hit

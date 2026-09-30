@@ -124,11 +124,21 @@ impl VersionedLruCache {
     }
 
     /// Cache the plaintext of `(unit, write_sequence)`. Replaces any older
-    /// version of the unit. Oversized entries are silently not cached.
+    /// version of the unit; a newer cached version is kept, since a slow
+    /// reader may finish decrypting an older version after a faster one
+    /// cached the current one (R5-020). Oversized entries are silently not
+    /// cached.
     pub fn put(&self, unit: u64, write_sequence: u64, data: SecretBuffer) {
         let len = data.len() as u64;
         let now = self.clock.now();
         let mut inner = self.inner.lock();
+        if inner
+            .map
+            .get(&unit)
+            .is_some_and(|entry| entry.write_sequence > write_sequence)
+        {
+            return; // dropped => zeroized
+        }
         inner.remove(unit);
         if len > inner.max_bytes || inner.max_bytes == 0 {
             return; // dropped => zeroized
@@ -161,6 +171,14 @@ impl VersionedLruCache {
                     && now.saturating_sub(entry.inserted_at) < ttl =>
             {
                 Some(entry.data.clone())
+            }
+            // A lookup for an older version (a slow reader) leaves the
+            // newer entry in place (R5-020).
+            Some(entry)
+                if entry.write_sequence > write_sequence
+                    && now.saturating_sub(entry.inserted_at) < ttl =>
+            {
+                None
             }
             Some(_) => {
                 // stale version or expired: evict

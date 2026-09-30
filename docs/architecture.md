@@ -293,7 +293,8 @@ and request semaphores prevent a failing provider from causing unbounded work.
 
 The optional cache stores plaintext under `(unit_index, write_sequence)`. A
 version mismatch is always a miss, so correctness does not depend on invalidation
-timing. Entries use zeroizing buffers and are never written back. A read
+timing. A slow reader's older version never displaces a newer cached one:
+neither its `put` nor its lookup evicts the newer entry. Entries use zeroizing buffers and are never written back. A read
 establishes the current sequence first (overlay entry or 64-byte slot header)
 and serves a hit without reading the payload or calling the provider, so the
 cache saves both the ciphertext read and the crypto call; the trade-off
