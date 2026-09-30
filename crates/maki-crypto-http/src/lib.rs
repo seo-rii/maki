@@ -624,9 +624,13 @@ impl HttpCryptoProvider {
         // on encrypt) to whatever `Location` the server names — possibly a
         // different host, possibly over plaintext HTTP — and turn a POST
         // into a GET on 301/302/303 (C-01, SPEC §18 no transport resend).
+        // Never use an environment proxy either: `HTTP_PROXY`/`ALL_PROXY`
+        // inherited by the daemon would receive every plaintext request and
+        // answer it with "ciphertext" of its own (R5-003).
         let mut builder = reqwest::Client::builder()
             .timeout(spec.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .use_rustls_tls();
         if let Some(tls) = &spec.tls {
             if let Some(ca) = &tls.ca_pem {

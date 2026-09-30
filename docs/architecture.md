@@ -264,7 +264,9 @@ permit cannot affect a later breaker generation. Abandoning an RPC also
 releases its transport inflight slot.
 
 The HTTP transport never follows a redirect (a 3xx fails the endpoint over
-rather than re-sending plaintext to a server-chosen URL). It removes request
+rather than re-sending plaintext to a server-chosen URL) and never uses a proxy
+from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` are ignored), so
+plaintext only goes to the configured endpoint. It removes request
 URLs from transport errors before classification and formatting, keeping query
 credentials out of those error messages. Each WebSocket connection generation
 owns both reader and writer futures in one task. Timeout, request cancellation,

@@ -96,6 +96,10 @@ documents.
 
 ### Fixed
 
+- `remote-http` **ignores environment proxies** (R5-003): an inherited
+  `HTTP_PROXY`/`ALL_PROXY` no longer receives plaintext encrypt requests.
+  Deployments that relied on a proxy to reach the provider must connect to
+  it directly.
 - **The volume is mounted `nosuid,nodev`** (R5-002). A setuid binary or a
   device node inside the volume no longer takes effect on the host; attach
   verification refuses a mount without both flags, and `maki@.service` sets
