@@ -939,6 +939,14 @@ impl HttpCryptoProvider {
         let build_op = |op_cfg: &maki_format::config::HttpOpConfig| -> Result<OpSpec, CryptoError> {
             let mut headers = PendingHeaders::default();
             for (name, value) in &op_cfg.headers {
+                // An invalid name would fail every request at send time as
+                // a (retryable) builder error; refuse it now, before any
+                // credential is loaded for it (R5-021).
+                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(fatal(format!(
+                        "header name {name:?} is not a valid HTTP header"
+                    )));
+                }
                 let resolved = match value {
                     HeaderValue::Literal(v) => v.clone(),
                     HeaderValue::Credential(cred) => {
@@ -951,14 +959,8 @@ impl HttpCryptoProvider {
                         }
                     }
                 };
-                // An invalid name or value would fail every request at send
-                // time as a (retryable) builder error; refuse it now, and
-                // never echo a value that may be a credential.
-                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                    return Err(fatal(format!(
-                        "header name {name:?} is not a valid HTTP header"
-                    )));
-                }
+                // Likewise an invalid value; never echo a value that may be
+                // a credential.
                 // The HeaderValue rule (visible ASCII, obs-text, SP, HTAB),
                 // checked in place: HeaderValue::from_str would copy the
                 // credential into an allocation that is never wiped.

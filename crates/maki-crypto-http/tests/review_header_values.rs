@@ -37,3 +37,39 @@ fn a_header_credential_with_a_control_character_is_refused_at_attach() {
     // Surrounding whitespace is trimmed, as before.
     provider_with_token(b"  test-token\n").unwrap();
 }
+
+/// R5-021: an invalid header *name* was refused only after its credential
+/// had been loaded and formatted into a plain `String`, which that error
+/// path dropped without wiping. The name is checked before any secret is
+/// loaded.
+#[test]
+fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(AtomicUsize);
+    impl maki_crypto_local::keysource::KeySource for Counting {
+        fn load(&self, _name: &str) -> Result<maki_crypto::SecretBuffer, CryptoError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(maki_crypto::SecretBuffer::from_slice(b"test-token"))
+        }
+    }
+
+    let text = include_str!("../../../packaging/examples/postgres-prod.toml").replacen(
+        "[crypto.http.encrypt.headers]\nAuthorization =",
+        "[crypto.http.encrypt.headers]\n\"Bad Authorization\" =",
+        1,
+    );
+    let config = parse_config(&text).unwrap();
+    config.validate().unwrap();
+    let keys = Counting(AtomicUsize::new(0));
+    let Err(error) = HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys)
+    else {
+        panic!("an invalid header name must be refused");
+    };
+    assert!(matches!(error, CryptoError::ProviderFatal(_)), "{error:?}");
+    assert_eq!(
+        keys.0.load(Ordering::SeqCst),
+        0,
+        "the credential was loaded for a header that can never be sent"
+    );
+}
