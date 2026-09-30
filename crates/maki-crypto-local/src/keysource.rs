@@ -89,7 +89,7 @@ fn key_from_bytes(bytes: &[u8]) -> SecretBuffer {
 /// Read a whole credential file into a guarded buffer without an
 /// intermediate ordinary allocation. Files are small; a bound keeps a
 /// misconfigured path from pinning arbitrary memory.
-fn read_guarded(path: &std::path::Path, expected_len: u64) -> std::io::Result<SecretBuffer> {
+fn read_guarded(mut file: std::fs::File, expected_len: u64) -> std::io::Result<SecretBuffer> {
     use std::io::Read;
     const MAX_CREDENTIAL_BYTES: u64 = 1 << 20;
     if expected_len > MAX_CREDENTIAL_BYTES {
@@ -98,7 +98,6 @@ fn read_guarded(path: &std::path::Path, expected_len: u64) -> std::io::Result<Se
             "credential file exceeds 1 MiB",
         ));
     }
-    let mut file = std::fs::File::open(path)?;
     let mut raw = SecretBuffer::zeroed(expected_len as usize);
     file.read_exact(raw.expose_mut())?;
     // A file that grew after stat is refused rather than partially read.
@@ -112,6 +111,24 @@ fn read_guarded(path: &std::path::Path, expected_len: u64) -> std::io::Result<Se
     Ok(raw)
 }
 
+/// Open a credential file once and describe the opened descriptor, so the
+/// checks and the read concern the same file. On Unix the open neither
+/// follows a symlink (`O_NOFOLLOW`) nor blocks on a FIFO without a writer
+/// (`O_NONBLOCK`); validating a path and then opening it again let a swap
+/// in between be loaded as the key.
+fn open_credential(path: &std::path::Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    Ok((file, meta))
+}
+
 impl KeySource for FileKeySource {
     fn load(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
         if !valid_credential_name(name) {
@@ -123,8 +140,19 @@ impl KeySource for FileKeySource {
         // SPEC §9: a file credential is a *root-only secret file*. A key
         // readable by the group or by others, or anything but a regular
         // file (a symlink to somewhere else, a FIFO), is refused rather
-        // than loaded. systemd's LoadCredential files are 0400.
-        let meta = std::fs::symlink_metadata(&path).map_err(|_| missing(name))?;
+        // than loaded. systemd's LoadCredential files are 0400. The checks
+        // run on the opened descriptor (see `open_credential`).
+        let (file, meta) = match open_credential(&path) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(missing(name))
+            }
+            Err(_) => {
+                return Err(CryptoError::ProviderFatal(format!(
+                    "credential {name:?} is not a regular file"
+                )))
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -143,7 +171,13 @@ impl KeySource for FileKeySource {
         }
         // The file bytes and the decoded key both live only in guarded
         // buffers (R4-002); `raw` zeroizes when it goes out of scope.
-        let raw = read_guarded(&path, meta.len()).map_err(|_| missing(name))?;
+        #[cfg(not(unix))]
+        if !meta.file_type().is_file() {
+            return Err(CryptoError::ProviderFatal(format!(
+                "credential {name:?} is not a regular file"
+            )));
+        }
+        let raw = read_guarded(file, meta.len()).map_err(|_| missing(name))?;
         Ok(key_from_bytes(raw.expose()))
     }
 }
@@ -171,4 +205,64 @@ impl KeySource for EnvKeySource {
 /// systemd credentials directory, when running under `LoadCredential`.
 pub fn systemd_credential_source() -> Option<FileKeySource> {
     std::env::var_os("CREDENTIALS_DIRECTORY").map(FileKeySource::new)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn secret_file(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    /// The checks and the read must describe the same file: validating a
+    /// path and then opening it again lets a swap in between (a symlink to
+    /// another file of the same length) be loaded as the key. The opened
+    /// descriptor is refused if it is not the regular file it claims to be.
+    #[test]
+    fn the_opened_credential_is_the_file_that_was_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = secret_file(dir.path(), "target");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            open_credential(&link).is_err(),
+            "opening must not follow a symlink planted after the check"
+        );
+        let (_, meta) = open_credential(&target).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.len(), 32);
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // No writer: a blocking open would hang here forever. The
+        // non-blocking open returns, and the descriptor is no regular file.
+        let (_, meta) = open_credential(&fifo).unwrap();
+        assert!(!meta.file_type().is_file());
+        assert!(matches!(
+            FileKeySource::new(dir.path()).load("fifo"),
+            Err(CryptoError::ProviderFatal(_))
+        ));
+    }
+
+    #[test]
+    fn a_readable_by_others_mode_is_refused_on_the_open_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = secret_file(dir.path(), "loose");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(FileKeySource::new(dir.path()).load("loose").is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(FileKeySource::new(dir.path()).load("loose").unwrap().len(), 32);
+    }
 }
