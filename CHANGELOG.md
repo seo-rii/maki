@@ -106,6 +106,7 @@ documents.
 
 ### Fixed
 
+- `maki-attach` refuses `mountpoint = "/"` (R5-019).
 - `maki volume create` refuses a backing root that still holds an earlier
   volume's `data/`, `journal/` or `checkpoint/` files (R5-018); they used to
   be adopted and served by the new volume.

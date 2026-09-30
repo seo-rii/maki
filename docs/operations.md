@@ -358,7 +358,7 @@ directory. `mount(8)` runs as root and resolves the path, so a workload able
 to replace a component could otherwise have its filesystem mounted over, say,
 `/etc`, where neither rollback nor detach would find it. Use a mountpoint
 such as `/srv/<volume>` whose parents are root-controlled; the mountpoint
-directory itself may belong to the workload.
+directory itself may belong to the workload. `/` is refused as a mountpoint.
 
 Before its LVM activation, attach inventories the recorded NBD and its kernel
 partitions, compares independently probed PV identifiers with the complete VG

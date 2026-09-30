@@ -127,6 +127,14 @@ impl AttachConfig {
             .or(self.mountpoint)
             .unwrap_or_else(|| format!("/srv/{volume}"));
         check_abs_path("mountpoint", &mountpoint)?;
+        if mountpoint == "/" {
+            // Mounting over the host root hides the running system, and
+            // detach would unmount `/` (R5-019).
+            return Err(ConfigError::Invalid(
+                "mountpoint \"/\" would hide the host root; use a directory such as /srv/<volume>"
+                    .to_string(),
+            ));
+        }
         let device_block_size = self.device_block_size.unwrap_or(4096);
         if device_block_size == 0 || !device_block_size.is_power_of_two() {
             return Err(ConfigError::Invalid(format!(
