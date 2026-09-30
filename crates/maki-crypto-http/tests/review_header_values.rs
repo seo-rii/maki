@@ -54,11 +54,15 @@ fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
         }
     }
 
-    let text = include_str!("../../../packaging/examples/postgres-prod.toml").replacen(
+    // Windows checkouts may carry CRLF line endings.
+    let original =
+        include_str!("../../../packaging/examples/postgres-prod.toml").replace("\r\n", "\n");
+    let text = original.replacen(
         "[crypto.http.encrypt.headers]\nAuthorization =",
         "[crypto.http.encrypt.headers]\n\"Bad Authorization\" =",
         1,
     );
+    assert_ne!(text, original, "the fixture substitution must apply");
     let config = parse_config(&text).unwrap();
     config.validate().unwrap();
     let keys = Counting(AtomicUsize::new(0));
