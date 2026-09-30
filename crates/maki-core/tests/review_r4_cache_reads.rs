@@ -31,7 +31,15 @@ const UNITS: u64 = 64;
 const CT: u64 = UNIT as u64 + 8;
 
 fn geometry() -> Geometry {
-    Geometry::compute(512, UNIT, 512, UNIT + 8, UNITS * UNIT as u64, 16 * UNIT as u64).unwrap()
+    Geometry::compute(
+        512,
+        UNIT,
+        512,
+        UNIT + 8,
+        UNITS * UNIT as u64,
+        16 * UNIT as u64,
+    )
+    .unwrap()
 }
 
 fn superblock() -> Superblock {
@@ -110,10 +118,16 @@ async fn a_cache_hit_reads_only_the_slot_header_from_the_backing() {
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap(); // unit 3 lives in a slot now
 
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     let decrypts = provider.decrypt_calls();
     let before = backing.read_bytes();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     let read = backing.read_bytes() - before;
     assert_eq!(
         provider.decrypt_calls(),
@@ -125,7 +139,10 @@ async fn a_cache_hit_reads_only_the_slot_header_from_the_backing() {
         "a cache hit must read at most the 64-byte slot header, read {read} bytes \
          (ciphertext is {CT} bytes)"
     );
-    assert!(read > 0, "the current version must still be established from the header");
+    assert!(
+        read > 0,
+        "the current version must still be established from the header"
+    );
 }
 
 #[tokio::test]
@@ -135,10 +152,16 @@ async fn an_overlay_hit_reads_nothing_from_the_backing() {
     let provider = Arc::new(FakeCryptoProvider::new(UNIT));
     let engine = engine(&backing, provider.clone(), true).await;
     engine.write(off(5), &data(0x55), false).await.unwrap(); // stays in the overlay
-    assert_eq!(engine.read(off(5), UNIT as usize).await.unwrap(), data(0x55));
+    assert_eq!(
+        engine.read(off(5), UNIT as usize).await.unwrap(),
+        data(0x55)
+    );
     let before = backing.read_bytes();
     let decrypts = provider.decrypt_calls();
-    assert_eq!(engine.read(off(5), UNIT as usize).await.unwrap(), data(0x55));
+    assert_eq!(
+        engine.read(off(5), UNIT as usize).await.unwrap(),
+        data(0x55)
+    );
     assert_eq!(backing.read_bytes(), before);
     assert_eq!(provider.decrypt_calls(), decrypts);
 }
@@ -151,18 +174,30 @@ async fn a_newer_version_misses_the_cache_and_is_decrypted_again() {
     let engine = engine(&backing, provider.clone(), true).await;
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     let decrypts = provider.decrypt_calls();
 
     // Overwrite through both paths: overlay first, then checkpointed slot.
     engine.write(off(3), &data(0x34), true).await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x34));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x34)
+    );
     assert_eq!(provider.decrypt_calls(), decrypts + 1);
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x34));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x34)
+    );
     engine.write(off(3), &data(0x35), true).await.unwrap();
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x35));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x35)
+    );
     assert_eq!(provider.decrypt_calls(), decrypts + 2);
 }
 
@@ -191,7 +226,10 @@ async fn a_damaged_slot_header_is_eio_even_with_a_cached_plaintext() {
     let engine = engine(&backing, provider.clone(), true).await;
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     damage(&backing, 3, true);
     let result = engine.read(off(3), UNIT as usize).await;
     assert!(
@@ -212,7 +250,10 @@ async fn payload_damage_under_a_valid_header_is_served_from_cache_until_eviction
     let engine = engine(&backing, provider.clone(), true).await;
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     damage(&backing, 3, false);
     assert_eq!(
         engine.read(off(3), UNIT as usize).await.unwrap(),
@@ -235,9 +276,15 @@ async fn without_a_cache_every_read_still_reads_and_verifies_the_payload() {
     let engine = engine(&backing, provider.clone(), false).await;
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     let before = backing.read_bytes();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
     assert!(backing.read_bytes() - before >= 64 + CT);
     damage(&backing, 3, false);
     assert!(matches!(
@@ -289,12 +336,22 @@ async fn verify_on_hit_rereads_the_payload_but_skips_decryption() {
     let engine = verifying_engine(&backing, provider.clone()).await;
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
 
     let decrypts = provider.decrypt_calls();
     let before = backing.read_bytes();
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), data(0x33));
-    assert_eq!(provider.decrypt_calls(), decrypts, "still served from the cache");
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        data(0x33)
+    );
+    assert_eq!(
+        provider.decrypt_calls(),
+        decrypts,
+        "still served from the cache"
+    );
     assert!(
         backing.read_bytes() - before >= 64 + CT,
         "a verified hit reads the header and the whole payload"

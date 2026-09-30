@@ -626,8 +626,14 @@ async fn adopted_shards_data_file_size_is_re_proven_after_a_failed_sync_and_rest
         physical,
         "the size was proven again before the shard was written to"
     );
-    assert_eq!(engine.read(off(1), UNIT as usize).await.unwrap(), image(1, 1));
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), image(3, 1));
+    assert_eq!(
+        engine.read(off(1), UNIT as usize).await.unwrap(),
+        image(1, 1)
+    );
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        image(3, 1)
+    );
     assert_eq!(
         engine.read(off(6), UNIT as usize).await.unwrap(),
         vec![0u8; UNIT as usize],
@@ -959,8 +965,8 @@ fn damage(backing: &CrashableBacking, path: &str, rng: &mut StdRng) -> String {
 fn dump_state(backing: &CrashableBacking, geometry: &Geometry, unit: u64) -> String {
     use maki_format::ab::AbStore;
     use maki_format::allocation::AllocationMap;
-    use maki_format::layout;
     use maki_format::catalog::ShardCatalog;
+    use maki_format::layout;
     let mut out = Vec::new();
     for path in damage_candidates(backing) {
         let len = backing.open(&path, false).unwrap().len().unwrap();
@@ -1144,7 +1150,10 @@ async fn media_damage_after_power_loss_never_yields_foreign_data() {
             attached += 1;
         }
     }
-    assert!(attached > 0, "every damaged volume was refused; the sweep proves nothing");
+    assert!(
+        attached > 0,
+        "every damaged volume was refused; the sweep proves nothing"
+    );
 }
 
 #[tokio::test]
@@ -1208,11 +1217,15 @@ async fn damaged_header_on_a_cleared_slot_is_eio_not_zeros() {
     let data = backing
         .open(&maki_format::layout::shard_data(shard_idx), false)
         .unwrap();
-    data.write_at(geometry.slot_offset(in_shard), &[0u8; 54]).unwrap();
+    data.write_at(geometry.slot_offset(in_shard), &[0u8; 54])
+        .unwrap();
     data.sync_data().unwrap();
 
     let engine = attach(&backing).await;
-    assert_eq!(engine.read(off(17), UNIT as usize).await.unwrap(), image(17, 1));
+    assert_eq!(
+        engine.read(off(17), UNIT as usize).await.unwrap(),
+        image(17, 1)
+    );
     assert_eq!(
         engine.read(off(21), UNIT as usize).await.unwrap(),
         vec![0u8; UNIT as usize],
@@ -1267,7 +1280,10 @@ async fn truncated_shard_file_reads_eio_for_units_beyond_its_end_not_zeros() {
     data.sync_data().unwrap();
 
     let engine = attach(&backing).await;
-    assert_eq!(engine.read(off(1), UNIT as usize).await.unwrap(), image(1, 1));
+    assert_eq!(
+        engine.read(off(1), UNIT as usize).await.unwrap(),
+        image(1, 1)
+    );
     match engine.read(off(6), UNIT as usize).await {
         Ok(actual) => panic!(
             "unit beyond a truncated shard file read as data: first bytes {:?}",
@@ -1317,7 +1333,8 @@ async fn truncation_damage_survives_the_file_growing_back() {
     let path = maki_format::layout::shard_data(shard_idx);
     let data = backing.open(&path, false).unwrap();
     // Cut inside slot 4: slots 5..7 are gone entirely.
-    data.set_len(geometry.slot_offset(in_shard - 1) + 447).unwrap();
+    data.set_len(geometry.slot_offset(in_shard - 1) + 447)
+        .unwrap();
     data.sync_data().unwrap();
 
     let expect_eio = |unit: u64, result: Result<Vec<u8>, CoreError>, when: &str| match result {
@@ -1330,8 +1347,15 @@ async fn truncation_damage_survives_the_file_growing_back() {
     };
 
     let engine = attach(&backing).await;
-    assert_eq!(engine.read(off(1), UNIT as usize).await.unwrap(), image(1, 1));
-    expect_eio(5, engine.read(off(5), UNIT as usize).await, "after the truncation");
+    assert_eq!(
+        engine.read(off(1), UNIT as usize).await.unwrap(),
+        image(1, 1)
+    );
+    expect_eio(
+        5,
+        engine.read(off(5), UNIT as usize).await,
+        "after the truncation",
+    );
     // A later slot of the same shard is checkpointed: the file grows back
     // past unit 5's slot, which is now all zeros.
     engine.write(off(7), &image(7, 1), true).await.unwrap();
@@ -1341,17 +1365,35 @@ async fn truncation_damage_survives_the_file_growing_back() {
         geometry.units_per_shard() * geometry.slot_size,
         "the file is restored to its physical size before the slot write"
     );
-    expect_eio(5, engine.read(off(5), UNIT as usize).await, "after the file grew back");
+    expect_eio(
+        5,
+        engine.read(off(5), UNIT as usize).await,
+        "after the file grew back",
+    );
     drop(engine);
     backing.crash_all_lost();
 
     let engine = attach(&backing).await;
-    assert_eq!(engine.read(off(1), UNIT as usize).await.unwrap(), image(1, 1));
-    assert_eq!(engine.read(off(7), UNIT as usize).await.unwrap(), image(7, 1));
-    expect_eio(5, engine.read(off(5), UNIT as usize).await, "after power loss");
+    assert_eq!(
+        engine.read(off(1), UNIT as usize).await.unwrap(),
+        image(1, 1)
+    );
+    assert_eq!(
+        engine.read(off(7), UNIT as usize).await.unwrap(),
+        image(7, 1)
+    );
+    expect_eio(
+        5,
+        engine.read(off(5), UNIT as usize).await,
+        "after power loss",
+    );
     // Beyond the cut nothing can be told apart from a removed slot: a unit
     // never written there is EIO too, until it is rewritten.
-    expect_eio(6, engine.read(off(6), UNIT as usize).await, "after power loss");
+    expect_eio(
+        6,
+        engine.read(off(6), UNIT as usize).await,
+        "after power loss",
+    );
     assert_eq!(
         engine.read(off(2), UNIT as usize).await.unwrap(),
         vec![0u8; UNIT as usize],
@@ -1362,7 +1404,10 @@ async fn truncation_damage_survives_the_file_growing_back() {
     engine.checkpoint().await.unwrap();
     drop(engine);
     let engine = attach(&backing).await;
-    assert_eq!(engine.read(off(5), UNIT as usize).await.unwrap(), image(5, 2));
+    assert_eq!(
+        engine.read(off(5), UNIT as usize).await.unwrap(),
+        image(5, 2)
+    );
 }
 
 /// The flip side of the truncation rule. A shard data file is created and
@@ -1441,7 +1486,10 @@ async fn never_finished_shard_reads_as_holes(backing: &Arc<CrashableBacking>, pa
     backing.crash_all_lost();
 
     let engine = attach(backing).await;
-    assert_eq!(engine.read(off(3), UNIT as usize).await.unwrap(), image(3, 1));
+    assert_eq!(
+        engine.read(off(3), UNIT as usize).await.unwrap(),
+        image(3, 1)
+    );
     assert_eq!(
         engine.read(off(5), UNIT as usize).await.unwrap(),
         vec![0u8; UNIT as usize],
@@ -1494,7 +1542,10 @@ async fn adopted_orphan_is_sized_before_a_repair_checkpoint_catalogs_it() {
         );
     }
     let unit = shard_idx * per_shard + 1;
-    engine.write(off(unit), &image(unit, 1), true).await.unwrap();
+    engine
+        .write(off(unit), &image(unit, 1), true)
+        .await
+        .unwrap();
     engine.checkpoint().await.unwrap();
     drop(engine);
     backing.crash_all_lost();

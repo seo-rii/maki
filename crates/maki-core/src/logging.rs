@@ -73,7 +73,10 @@ mod tests {
             return;
         }
         assert!(super::install_default_logging());
-        assert!(!super::install_default_logging(), "second install is a no-op");
+        assert!(
+            !super::install_default_logging(),
+            "second install is a no-op"
+        );
         tracing::warn!(volume = "fixture", "fixture warning reaches stderr");
         tracing::info!("fixture info reaches stderr");
         tracing::debug!("fixture debug is hidden by default");
@@ -83,20 +86,32 @@ mod tests {
     #[test]
     fn default_install_writes_info_and_above_to_stderr_without_ansi() {
         let stderr = child_stderr(None);
-        assert!(stderr.contains("fixture warning reaches stderr"), "{stderr}");
+        assert!(
+            stderr.contains("fixture warning reaches stderr"),
+            "{stderr}"
+        );
         assert!(stderr.contains("volume=\"fixture\""), "{stderr}");
         assert!(stderr.contains("fixture info reaches stderr"), "{stderr}");
         assert!(stderr.contains("fixture error reaches stderr"), "{stderr}");
         assert!(!stderr.contains("fixture debug is hidden"), "{stderr}");
-        assert!(stderr.contains("WARN") && stderr.contains("ERROR"), "{stderr}");
-        assert!(!stderr.contains("\u{1b}["), "no ANSI escapes in a journal:\n{stderr}");
+        assert!(
+            stderr.contains("WARN") && stderr.contains("ERROR"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("\u{1b}["),
+            "no ANSI escapes in a journal:\n{stderr}"
+        );
     }
 
     #[test]
     fn maki_log_directives_filter_the_output() {
         let stderr = child_stderr(Some("error"));
         assert!(stderr.contains("fixture error reaches stderr"), "{stderr}");
-        assert!(!stderr.contains("fixture warning reaches stderr"), "{stderr}");
+        assert!(
+            !stderr.contains("fixture warning reaches stderr"),
+            "{stderr}"
+        );
         let stderr = child_stderr(Some("debug"));
         assert!(stderr.contains("fixture debug is hidden"), "{stderr}");
     }

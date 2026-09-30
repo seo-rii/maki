@@ -16,8 +16,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use maki_crypto::{
     secret::{page_lock_failures, set_page_locking, unguarded_wraps},
-    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider,
-    PlaintextUnit, SecretBuffer,
+    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer,
 };
 use maki_crypto_local::keysource::{EnvKeySource, FileKeySource, KeySource, MapKeySource};
 use maki_crypto_local::{AesGcmSivProvider, AesXtsProvider};
@@ -109,7 +108,10 @@ async fn gcm_siv_encrypts_and_decrypts_inside_guarded_buffers() {
                 }],
             )
             .await;
-        assert!(matches!(result, Err(CryptoError::Integrity(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(CryptoError::Integrity(_))),
+            "{result:?}"
+        );
     }
     assert_eq!(unguarded_wraps(), before);
 
@@ -140,7 +142,10 @@ fn file_key_source_loads_raw_and_hex_keys_into_guarded_memory() {
     let dir = tempfile::tempdir().unwrap();
     let raw: Vec<u8> = (100..132u8).collect();
     let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-    for (name, contents) in [("raw", raw.clone()), ("hex", format!("{hex}\n").into_bytes())] {
+    for (name, contents) in [
+        ("raw", raw.clone()),
+        ("hex", format!("{hex}\n").into_bytes()),
+    ] {
         let path = dir.path().join(name);
         std::fs::write(&path, contents).unwrap();
         #[cfg(unix)]

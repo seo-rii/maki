@@ -88,6 +88,13 @@ package suite and a fresh warning-denying audit passed locally.
 | `phase5_gate_breaker_cycles_full` | 10,000 circuit-breaker lifecycles |
 | `phase11_gate_dbsim_full` | 500 database-simulation runs |
 | `phase12_gate_full` | 500 barrier and 500 FUA power-loss simulations |
+| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
+| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
+| `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
+
+The job runs `cargo test --workspace --release --locked -- --ignored` without
+a name filter, so every ignored test runs, including any new gate; the
+`maki-privileged` subprocess fixture is a no-op there.
 
 It also builds the Linux cdylib, verifies the global `plugin_init` symbol,
 installs `nbdkit-plugin-dev` and runs `review_abi.rs`, which compiles a C probe

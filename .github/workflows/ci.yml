@@ -67,13 +67,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # SPEC §55 nightly tier: full property tests, crash cycles, queue
-      # saturation, retry storm — the ignored phase gates.
+      # saturation, retry storm — every ignored release gate. No name filter:
+      # a filter silently dropped the R3b sweeps, so new gates run by default.
       - name: phase gates (release)
-        run: >
-          cargo test --workspace --release --locked -- --ignored
-          phase0_gate_full phase3_gate_full phase4_gate_full
-          phase5_gate_endpoint_cycles_full phase5_gate_breaker_cycles_full
-          phase11_gate_dbsim_full phase12_gate_full
+        run: cargo test --workspace --release --locked -- --ignored
       - name: nbdkit plugin build (cdylib + plugin_init symbol)
         run: |
           cargo build --release --locked -p maki-nbdkit

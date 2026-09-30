@@ -29,7 +29,10 @@ fn a_header_credential_with_a_control_character_is_refused_at_attach() {
         };
         assert!(matches!(error, CryptoError::ProviderFatal(_)), "{error:?}");
         let message = error.to_string();
-        assert!(!message.contains("tok"), "the value is never echoed: {message}");
+        assert!(
+            !message.contains("tok"),
+            "the value is never echoed: {message}"
+        );
     }
     // Surrounding whitespace is trimmed, as before.
     provider_with_token(b"  test-token\n").unwrap();

@@ -249,7 +249,10 @@ fn failed_reclaim_at_the_overlay_limit_refuses_the_write_and_degrades() {
             "{err}"
         );
         assert!(matches!(engine.state(), EngineState::Degraded { .. }));
-        assert!(engine.stats().await.overlay_bytes <= 8 * CT, "memory kept growing");
+        assert!(
+            engine.stats().await.overlay_bytes <= 8 * CT,
+            "memory kept growing"
+        );
         // Acknowledged data stays readable.
         assert_eq!(
             engine.read(off(at - 1), UNIT as usize).await.unwrap(),
@@ -328,11 +331,18 @@ async fn a_concurrent_volatile_write_during_inline_reclaim_does_not_cause_enospc
         .write(off(16), &big, false)
         .await
         .expect("one maximal request must be admitted after reclaim");
-    assert!(injected.load(Ordering::SeqCst), "the reclaim ran and the hook fired");
+    assert!(
+        injected.load(Ordering::SeqCst),
+        "the reclaim ran and the hook fired"
+    );
     drop(_hook);
 
     let stats = engine.stats().await;
-    assert!(stats.overlay_bytes <= limit, "overlay {} over {limit}", stats.overlay_bytes);
+    assert!(
+        stats.overlay_bytes <= limit,
+        "overlay {} over {limit}",
+        stats.overlay_bytes
+    );
     assert_eq!(engine.read(off(16), big.len()).await.unwrap(), big);
     assert_eq!(
         engine.read(off(40), 2 * UNIT as usize).await.unwrap(),

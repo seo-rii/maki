@@ -19,7 +19,12 @@ fn write(path: &Path, bytes: &[u8], mode: u32) {
 
 fn identity_pem() -> Vec<u8> {
     let identity = rcgen::generate_simple_self_signed(vec!["maki-client".into()]).unwrap();
-    format!("{}{}", identity.key_pair.serialize_pem(), identity.cert.pem()).into_bytes()
+    format!(
+        "{}{}",
+        identity.key_pair.serialize_pem(),
+        identity.cert.pem()
+    )
+    .into_bytes()
 }
 
 #[test]
@@ -27,7 +32,8 @@ fn a_combined_identity_pem_readable_by_others_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("id.pem");
     write(&path, &identity_pem(), 0o644);
-    let error = read_tls_file("http", "client_cert_file", path.to_str().unwrap(), true).unwrap_err();
+    let error =
+        read_tls_file("http", "client_cert_file", path.to_str().unwrap(), true).unwrap_err();
     assert!(error.to_string().contains("private key"), "{error}");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(

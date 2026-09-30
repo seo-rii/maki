@@ -65,7 +65,10 @@ mod tests {
             return;
         }
         assert!(super::install_default_logging());
-        assert!(!super::install_default_logging(), "second install is a no-op");
+        assert!(
+            !super::install_default_logging(),
+            "second install is a no-op"
+        );
         tracing::info!("maki-attach: fixture step");
         tracing::error!("maki-attach: rollback halted, fixture reason");
         tracing::debug!("fixture debug is hidden by default");
@@ -76,9 +79,15 @@ mod tests {
         let stderr = child_stderr(None);
         assert!(stderr.contains("maki-attach: fixture step"), "{stderr}");
         assert!(stderr.contains("ERROR"), "{stderr}");
-        assert!(stderr.contains("rollback halted, fixture reason"), "{stderr}");
+        assert!(
+            stderr.contains("rollback halted, fixture reason"),
+            "{stderr}"
+        );
         assert!(!stderr.contains("fixture debug is hidden"), "{stderr}");
-        assert!(!stderr.contains("\u{1b}["), "no ANSI escapes in a journal:\n{stderr}");
+        assert!(
+            !stderr.contains("\u{1b}["),
+            "no ANSI escapes in a journal:\n{stderr}"
+        );
     }
 
     #[test]

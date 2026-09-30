@@ -210,5 +210,9 @@ async fn an_unknown_command_error_fits_the_line_limit() {
     assert_eq!(response["ok"], json!(false));
     let error = response["error"].as_str().unwrap();
     assert!(error.contains("unknown command"), "{error}");
-    assert!(error.len() < 1024, "the echoed name is truncated: {} bytes", error.len());
+    assert!(
+        error.len() < 1024,
+        "the echoed name is truncated: {} bytes",
+        error.len()
+    );
 }

@@ -168,11 +168,17 @@ fn mixed_damage_reports_both_classes_and_an_unrecoverable_verdict() {
     let report = deep(&backing);
     assert!(!report.ok());
     assert!(joined(&report.errors).contains("unit 1"));
-    assert!(!joined(&report.errors).contains("unit 5"), "unit 5 is recoverable");
+    assert!(
+        !joined(&report.errors).contains("unit 5"),
+        "unit 5 is recoverable"
+    );
     assert!(joined(&report.warnings).contains("unit 5"));
     assert_eq!(verdict(&report), "unrecoverable");
     let info = joined(&report.info);
-    assert!(info.contains("1 recoverable") && info.contains("1 unrecoverable"), "{info}");
+    assert!(
+        info.contains("1 recoverable") && info.contains("1 unrecoverable"),
+        "{info}"
+    );
 }
 
 #[test]
@@ -200,7 +206,11 @@ fn damage_in_an_unlisted_slot_is_reported_like_the_read_path_refuses_it() {
     }
     let g = geometry();
     let (shard, idx) = g.shard_of_unit(7);
-    assert_eq!(shard, g.shard_of_unit(1).0, "same shard as the written unit");
+    assert_eq!(
+        shard,
+        g.shard_of_unit(1).0,
+        "same shard as the written unit"
+    );
     let f = backing.open(&layout::shard_data(shard), false).unwrap();
     f.write_at(g.slot_offset(idx), &[0xEE; 16]).unwrap();
     f.sync_data().unwrap();

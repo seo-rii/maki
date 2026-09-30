@@ -197,9 +197,7 @@ fn notify_socket(fixture: &Fixture) -> (UnixDatagram, PathBuf) {
 fn plant_orphan_shard(fixture: &Fixture) {
     let data_dir = fixture.root.join(maki_format::layout::DATA_DIR);
     std::fs::create_dir_all(&data_dir).unwrap();
-    let orphan = fixture
-        .root
-        .join(maki_format::layout::shard_data(1));
+    let orphan = fixture.root.join(maki_format::layout::shard_data(1));
     std::fs::write(&orphan, b"").unwrap();
     assert_eq!(std::fs::metadata(&orphan).unwrap().len(), 0);
 }
@@ -240,7 +238,10 @@ fn runtime_warnings_reach_stderr_in_the_default_plugin_path() {
         "the level must be visible so journald filters work:\n{stderr}"
     );
     for forbidden in ["fixture-plaintext", "Bearer ", "key ="] {
-        assert!(!stderr.contains(forbidden), "no payloads or secrets:\n{stderr}");
+        assert!(
+            !stderr.contains(forbidden),
+            "no payloads or secrets:\n{stderr}"
+        );
     }
 }
 

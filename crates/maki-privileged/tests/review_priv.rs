@@ -629,7 +629,13 @@ mod mount_root_hygiene {
 fn pinned_nbd_devices_must_be_canonical() {
     assert_eq!(nbd_index("/dev/nbd0"), Some(0));
     assert_eq!(nbd_index("/dev/nbd15"), Some(15));
-    for device in ["/dev/nbd01", "/dev/nbd+1", "/dev/nbd", "/dev/nbd1p1", "/dev/nbd 1"] {
+    for device in [
+        "/dev/nbd01",
+        "/dev/nbd+1",
+        "/dev/nbd",
+        "/dev/nbd1p1",
+        "/dev/nbd 1",
+    ] {
         assert_eq!(nbd_index(device), None, "{device}");
     }
     let cfg = parse(&config_text()).unwrap();

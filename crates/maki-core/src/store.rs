@@ -765,9 +765,7 @@ impl SlotStore {
         };
         if short == ShortFile::Truncated {
             fp("store.damage_marks_store")?;
-            shard
-                .alloc_ab
-                .store(backing.as_ref(), &mut shard.alloc)?;
+            shard.alloc_ab.store(backing.as_ref(), &mut shard.alloc)?;
             backing.sync_dir(layout::DATA_DIR)?;
         }
         fp("store.data_size_sync")?;

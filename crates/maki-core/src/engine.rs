@@ -968,13 +968,8 @@ impl Engine {
                 let io_guards = _guards.clone();
                 let written = storage_task(move || {
                     let (_admission, _guards) = (io_admission, io_guards);
-                    let outcome = io_engine.journal_request(
-                        &mut volume,
-                        &io_cts,
-                        fua,
-                        reclaimed,
-                        last_round,
-                    );
+                    let outcome =
+                        io_engine.journal_request(&mut volume, &io_cts, fua, reclaimed, last_round);
                     io_engine.inner.note_journal(&volume);
                     if matches!(outcome, Ok(true))
                         && (volume.journal_total_bytes()
@@ -1025,9 +1020,7 @@ impl Engine {
             cts
         };
         let incoming = cts.iter().map(record_len).sum();
-        if !cts.is_empty()
-            && !self.admit_journal(volume, incoming, cts, reclaimed, last_round)?
-        {
+        if !cts.is_empty() && !self.admit_journal(volume, incoming, cts, reclaimed, last_round)? {
             return Ok(false);
         }
         for ct in cts {
@@ -1394,8 +1387,8 @@ impl EngineInner {
                 .overlay_bytes()
                 .max(volume.overlay_latest_bytes().saturating_mul(2))
                 >= self.max_overlay_bytes / 2;
-        let by_entries =
-            self.max_overlay_entries > 0 && volume.overlay_len() as u64 >= self.max_overlay_entries / 2;
+        let by_entries = self.max_overlay_entries > 0
+            && volume.overlay_len() as u64 >= self.max_overlay_entries / 2;
         by_bytes || by_entries
     }
 

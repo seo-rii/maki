@@ -1640,9 +1640,11 @@ impl VolumeConfig {
         // so it must never share one with the NBD export socket. Compare the
         // effective paths (defaults included) component-wise, so `a//b` and
         // `a/./b` name the same file.
-        let control_socket = self.control.socket.clone().unwrap_or_else(|| {
-            format!("/run/maki-control/{}/control.sock", self.volume.name)
-        });
+        let control_socket = self
+            .control
+            .socket
+            .clone()
+            .unwrap_or_else(|| format!("/run/maki-control/{}/control.sock", self.volume.name));
         let nbd_socket = self
             .nbd
             .socket

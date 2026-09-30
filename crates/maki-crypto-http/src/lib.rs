@@ -424,7 +424,8 @@ pub fn read_tls_file(
 ) -> Result<Vec<u8>, CryptoError> {
     use std::io::Read;
     const MAX_TLS_FILE_BYTES: u64 = 1 << 20;
-    let fail = |message: String| fatal(format!("[crypto.{section}.tls] {what} {path:?}: {message}"));
+    let fail =
+        |message: String| fatal(format!("[crypto.{section}.tls] {what} {path:?}: {message}"));
     let opened = if may_hold_private_key {
         maki_crypto_local::keysource::open_credential(std::path::Path::new(path))
     } else {
@@ -944,7 +945,9 @@ impl HttpCryptoProvider {
                 // time as a (retryable) builder error; refuse it now, and
                 // never echo a value that may be a credential.
                 if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                    return Err(fatal(format!("header name {name:?} is not a valid HTTP header")));
+                    return Err(fatal(format!(
+                        "header name {name:?} is not a valid HTTP header"
+                    )));
                 }
                 // The HeaderValue rule (visible ASCII, obs-text, SP, HTAB),
                 // checked in place: HeaderValue::from_str would copy the
@@ -1074,8 +1077,12 @@ impl HttpCryptoProvider {
                         // Without client_key the file is a combined identity
                         // PEM and holds the private key itself.
                         let combined = t.client_key.is_none();
-                        let mut pem =
-                            PendingIdentityPem(read_tls_file("http", "client_cert_file", path, combined)?);
+                        let mut pem = PendingIdentityPem(read_tls_file(
+                            "http",
+                            "client_cert_file",
+                            path,
+                            combined,
+                        )?);
                         if let Some(key) = &t.client_key {
                             // Private key from its credential source, appended
                             // to the certificate PEM for the client identity.
