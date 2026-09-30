@@ -177,7 +177,15 @@ key material itself matches, which the self-test alone cannot.
 ## Credentials and secrets
 
 Sensitive values must be credential references. Literal authorization headers,
-API keys, tokens, and similar fields are rejected during validation. Production
+API keys, tokens, and similar fields are rejected during validation. An HTTP
+header or gRPC metadata name counts as sensitive when it is one of the classic
+names (`Authorization`, `Cookie`, `X-Api-Key`, ...) or contains `auth`, `token`,
+`secret`, `passw`, `cookie`, `session`, `signature`, `credential`, `apikey`,
+`api_key`, `-key` or `_key`, which covers vendor headers such as
+`X-Vault-Token`, `X-Goog-Api-Key` and `Ocp-Apim-Subscription-Key`. Any other
+header may still use a credential reference, and every reference is validated.
+Query parameters (`[crypto.http.*.query]`) accept only literals, so never put a
+secret there. Production
 deployments should use systemd credentials; environment-backed credentials are
 intended for development.
 

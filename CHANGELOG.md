@@ -11,6 +11,12 @@ documents.
 
 ### Breaking changes
 
+- **Credential-like header names refuse literal values** (R5-007). An HTTP
+  header or gRPC metadata name containing `auth`, `token`, `secret`,
+  `passw`, `cookie`, `session`, `signature`, `credential`, `apikey`,
+  `api_key`, `-key` or `_key` must use a credential reference
+  ([configuration](docs/configuration.md#credentials-and-secrets)); a
+  configuration that put such a value inline no longer validates.
 - **Superblock envelope v2 with mirrored durable proofs is required for
   writable volumes** (`1bc0ab5`, 2026-09-12). Older binaries reject v2
   volumes; this build refuses writable recovery of legacy v1 volumes and

@@ -748,7 +748,37 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "cookie",
     "x-secret",
     "secret",
+    "key",
 ];
+
+/// Name fragments that mark a vendor credential header (`X-Vault-Token`,
+/// `X-Goog-Api-Key`, `Ocp-Apim-Subscription-Key`, `X-Amz-Security-Token`,
+/// ...). An exact list missed most of them (R5-007); a false positive only
+/// asks for a credential reference, which always works.
+const SENSITIVE_HEADER_FRAGMENTS: &[&str] = &[
+    "auth",
+    "token",
+    "secret",
+    "passw",
+    "cookie",
+    "session",
+    "signature",
+    "credential",
+    "apikey",
+    "api_key",
+    "-key",
+    "_key",
+];
+
+/// Whether a header or gRPC metadata value must come from a credential
+/// reference rather than a literal (SPEC §9).
+pub fn is_sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SENSITIVE_HEADERS.contains(&name.as_str())
+        || SENSITIVE_HEADER_FRAGMENTS
+            .iter()
+            .any(|fragment| name.contains(fragment))
+}
 
 impl VolumeConfig {
     /// Every credential reference the configuration declares, with the
@@ -1025,17 +1055,15 @@ impl VolumeConfig {
             if let Some(http) = &self.crypto.http {
                 for op in [&http.encrypt, &http.decrypt].into_iter().flatten() {
                     for (name, value) in &op.headers {
-                        let sensitive = SENSITIVE_HEADERS.contains(&name.to_lowercase().as_str());
-                        if sensitive {
-                            match value {
-                                HeaderValue::Literal(_) => {
-                                    return Err(ConfigError::Invalid(format!(
-                                        "header {name:?} must use a credential reference, \
-                                         not a literal secret (SPEC §9)"
-                                    )));
-                                }
-                                HeaderValue::Credential(c) => validate_credential(c)?,
+                        match value {
+                            HeaderValue::Literal(_) if is_sensitive_header(name) => {
+                                return Err(ConfigError::Invalid(format!(
+                                    "header {name:?} must use a credential reference, \
+                                     not a literal secret (SPEC §9)"
+                                )));
                             }
+                            HeaderValue::Literal(_) => {}
+                            HeaderValue::Credential(c) => validate_credential(c)?,
                         }
                     }
                 }
@@ -1043,16 +1071,15 @@ impl VolumeConfig {
         }
         if let Some(grpc) = &self.crypto.grpc {
             for (name, value) in &grpc.metadata {
-                if SENSITIVE_HEADERS.contains(&name.to_lowercase().as_str()) {
-                    match value {
-                        HeaderValue::Literal(_) => {
-                            return Err(ConfigError::Invalid(format!(
-                                "gRPC metadata {name:?} must use a credential reference, \
-                                 not a literal secret (SPEC §9)"
-                            )));
-                        }
-                        HeaderValue::Credential(c) => validate_credential(c)?,
+                match value {
+                    HeaderValue::Literal(_) if is_sensitive_header(name) => {
+                        return Err(ConfigError::Invalid(format!(
+                            "gRPC metadata {name:?} must use a credential reference, \
+                             not a literal secret (SPEC §9)"
+                        )));
                     }
+                    HeaderValue::Literal(_) => {}
+                    HeaderValue::Credential(c) => validate_credential(c)?,
                 }
             }
         }
