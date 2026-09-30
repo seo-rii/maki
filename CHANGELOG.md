@@ -126,6 +126,9 @@ documents.
   rejection of a coalesced batch no longer fails every request merged into
   it; the batch scheduler re-sends each request alone, so a tampered unit
   read by one client cannot turn another client's healthy read into EIO.
+  The re-send happens only for a retry-safe provider (a provider that is
+  not retry-safe gets the error fanned out, as before), and each re-send is
+  counted in flight and abandoned when its caller leaves (R5-004).
 
 - Configuration validation refuses a `control.socket` that names the same
   file as `nbd.socket` (defaults included); binding the control socket

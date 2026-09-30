@@ -174,6 +174,12 @@ type CallFuture<I, O> = std::pin::Pin<
     Box<dyn std::future::Future<Output = (Vec<I>, Result<Vec<O>, CryptoError>)> + Send>,
 >;
 type LaneCall<I, O> = Arc<dyn Fn(CryptoContext, Vec<I>) -> CallFuture<I, O> + Send + Sync>;
+/// Whether the inner provider may be sent the same request twice. Asked
+/// only on the failure path, before a coalesced batch is re-sent request by
+/// request (R5-004).
+type ResendSafe = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
+>;
 
 struct Lane<I, O> {
     tx: mpsc::Sender<Group<I, O>>,
@@ -194,6 +200,7 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         clock: Arc<dyn Clock>,
         stats: Arc<SchedulerStats>,
         call: LaneCall<I, O>,
+        resend_safe: ResendSafe,
     ) -> Self {
         let max_pending_items = config.max_pending_items.max(1);
         let (tx, rx) = mpsc::channel::<Group<I, O>>(max_pending_items as usize);
@@ -202,7 +209,15 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
         ));
         let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
         let max_admit_logical_bytes = config.max_bytes;
-        tokio::spawn(run_lane(rx, config, clock, stats, call, inflight));
+        tokio::spawn(run_lane(
+            rx,
+            config,
+            clock,
+            stats,
+            call,
+            resend_safe,
+            inflight,
+        ));
         Self {
             tx,
             admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
@@ -287,6 +302,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
     clock: Arc<dyn Clock>,
     stats: Arc<SchedulerStats>,
     call: LaneCall<I, O>,
+    resend_safe: ResendSafe,
     inflight: Arc<tokio::sync::Semaphore>,
 ) {
     // Groups received while a full lane waits keep their payload and queue
@@ -396,6 +412,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
         // is in flight (C-04); the inflight semaphore bounds the overlap.
         let call = call.clone();
         let stats = stats.clone();
+        let resend_safe = resend_safe.clone();
         tokio::spawn(async move {
             let _slot = slot;
             // `inflight_batches` counts provider calls dispatched and not
@@ -414,25 +431,39 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             // An integrity or other request-specific rejection of a
             // coalesced batch may concern a single request: re-send each
             // request alone so an unrelated request's verdict is its own.
-            // Transport-class errors say nothing per request and fan out.
+            // Transport-class errors say nothing per request and fan out,
+            // and a provider that is not retry-safe is never sent the same
+            // request twice (M-010, R5-004).
             let per_request = replies.len() > 1
                 && matches!(
                     &result,
                     Err(error) if error.class() == crate::error::ErrorClass::NonRetryableRequest
-                );
+                )
+                && resend_safe().await;
             if !per_request {
                 deliver(result, items, lengths, replies);
                 return;
             }
             let mut rest = all_items;
-            for (len, reply) in lengths.into_iter().zip(replies) {
+            for (len, mut reply) in lengths.into_iter().zip(replies) {
                 let tail = rest.split_off(len);
                 let group = std::mem::replace(&mut rest, tail);
                 if reply.is_closed() {
                     continue;
                 }
-                let (_, result) = call(context.clone(), group).await;
-                deliver(result, len, vec![len], vec![reply]);
+                // Each re-send is a provider call of its own: counted in
+                // flight and abandoned once its caller has left, so it can
+                // never hold the lane slot for nobody (BUG-012).
+                stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
+                let result = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    result = call(context.clone(), group) => Some(result),
+                };
+                stats.inflight_batches.fetch_sub(1, Ordering::SeqCst);
+                if let Some((_, result)) = result {
+                    deliver(result, len, vec![len], vec![reply]);
+                }
             }
         });
     }
@@ -511,6 +542,11 @@ impl BatchScheduler {
         unit_size: Option<u32>,
     ) -> Self {
         let stats = Arc::new(SchedulerStats::default());
+        let caps_inner = inner.clone();
+        let resend_safe: ResendSafe = Arc::new(move || {
+            let inner = caps_inner.clone();
+            Box::pin(async move { inner.capabilities().await.is_ok_and(|caps| caps.retry_safe) })
+        });
         let enc_inner = inner.clone();
         let encrypt = Lane::spawn(
             config.clone(),
@@ -524,6 +560,7 @@ impl BatchScheduler {
                     (items, result)
                 })
             }),
+            resend_safe.clone(),
         );
         let dec_inner = inner.clone();
         let decrypt = Lane::spawn(
@@ -538,6 +575,7 @@ impl BatchScheduler {
                     (items, result)
                 })
             }),
+            resend_safe,
         );
         Self {
             inner,
