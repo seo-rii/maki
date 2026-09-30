@@ -8,7 +8,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,63 @@ pub enum ExecError {
         rolled_back: usize,
         rollback_failed: usize,
     },
+}
+
+/// Refuse a mountpoint whose path a non-trusted user could redirect.
+///
+/// `mount(8)` resolves the path it is given, as root, and the directories
+/// along it may belong to the workload. Every ancestor must therefore be a
+/// real directory (not a symlink) owned by a `trusted` uid and not writable
+/// by group or others, so the path cannot change between this check and the
+/// mount; the mountpoint itself must be a real directory. Rollback and
+/// detach look for the mount at the configured path, so a redirected mount
+/// (say over `/etc`) could never be undone.
+pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let refuse = |message: String| ExecError::Step {
+        step: "mount-target".into(),
+        message,
+    };
+    let path = Path::new(mountpoint);
+    if !path.is_absolute() {
+        return Err(refuse(format!("mountpoint {mountpoint:?} is not absolute")));
+    }
+    let mut prefix = PathBuf::new();
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        prefix.push(component);
+        let meta = std::fs::symlink_metadata(&prefix)
+            .map_err(|e| refuse(format!("{}: {e}", prefix.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(refuse(format!(
+                "{} is a symlink; a mountpoint path must not contain one",
+                prefix.display()
+            )));
+        }
+        if !meta.is_dir() {
+            return Err(refuse(format!("{} is not a directory", prefix.display())));
+        }
+        if index + 1 == components.len() {
+            break;
+        }
+        if !trusted.contains(&meta.uid()) {
+            return Err(refuse(format!(
+                "{} is owned by uid {}; every ancestor of the mountpoint must be owned by root",
+                prefix.display(),
+                meta.uid()
+            )));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(refuse(format!(
+                "{} is writable by group or others (mode {:04o}); the mountpoint path could \
+                 be replaced before the mount",
+                prefix.display(),
+                meta.mode() & 0o7777
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError> {
@@ -439,11 +496,14 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             )?;
             verify_filesystem_probe(fs_uuid.as_deref(), &output)
         }
-        PlannedStep::MountXfs { device, mountpoint } => run(
-            step,
-            "mount",
-            &["-t", "xfs", "-o", "noatime", device, mountpoint],
-        ),
+        PlannedStep::MountXfs { device, mountpoint } => {
+            check_mount_target(mountpoint, &[0])?;
+            run(
+                step,
+                "mount",
+                &["-t", "xfs", "-o", "noatime", device, mountpoint],
+            )
+        }
         PlannedStep::VerifyMountDevice {
             mountpoint,
             nbd_device,

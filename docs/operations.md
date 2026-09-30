@@ -343,8 +343,17 @@ an optional expected XFS UUID. The production profile also provides the complete
 PV UUID set, VG UUID and configured target-LV UUID in `[lvm_identity]`.
 Command-line flags override individual values other than those LVM pins.
 Every value is checked before it reaches a system utility: option-like values,
-relative or non-canonical paths, and malformed UUIDs are rejected with exit
-code 2 and no plan is printed.
+relative or non-canonical paths, non-canonical pinned devices (`/dev/nbd01`)
+and malformed UUIDs are rejected with exit code 2 and no plan is printed.
+
+Right before the XFS mount the helper checks the mountpoint path itself:
+every ancestor directory must be a real directory (no symlink), owned by
+root and not writable by group or others, and the mountpoint must be a real
+directory. `mount(8)` runs as root and resolves the path, so a workload able
+to replace a component could otherwise have its filesystem mounted over, say,
+`/etc`, where neither rollback nor detach would find it. Use a mountpoint
+such as `/srv/<volume>` whose parents are root-controlled; the mountpoint
+directory itself may belong to the workload.
 
 Before its LVM activation, attach inventories the recorded NBD and its kernel
 partitions, compares independently probed PV identifiers with the complete VG

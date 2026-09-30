@@ -96,6 +96,15 @@ documents.
 
 ### Fixed
 
+- `maki-attach` refuses to mount onto a path a non-root user could redirect:
+  every ancestor of the mountpoint must be a root-owned, non-group/other-
+  writable real directory and the mountpoint a real directory. A workload
+  that replaced the mountpoint with a symlink previously got its filesystem
+  mounted by root at the symlink target (e.g. `/etc`), beyond rollback and
+  detach ([operations](docs/operations.md#privileged-helper)).
+- Pinned NBD devices must be spelled canonically (`/dev/nbd1`, not
+  `/dev/nbd01` or `/dev/nbd+1`).
+
 - Remote providers: an integrity (or other non-retryable, request-specific)
   rejection of a coalesced batch no longer fails every request merged into
   it; the batch scheduler re-sends each request alone, so a tampered unit
