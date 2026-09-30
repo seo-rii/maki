@@ -19,7 +19,10 @@ normal migration procedure.
 ## Logical discard and physical release
 
 NBD TRIM discards the complete crypto units contained in its range. Partial
-units at either edge remain unchanged. Trim is a hint, so an edge-only request
+units at either edge remain unchanged. A trim may be longer than
+`nbd.maximum_io`, which bounds payloads only: the engine journals it in
+unit-aligned chunks of at most that size, and FUA on the request makes the
+whole range durable (R5-010). Trim is a hint, so an edge-only request
 can complete without changing data. Discarding an already-zero unit does not
 create a shard, reserve a slot, or append another journal record.
 

@@ -289,7 +289,10 @@ nbdkit's block-size callback. The adapter also rejects read/write requests with
 zero length, invalid minimum-size alignment, an out-of-range end, or a length
 above `maximum_io` with EINVAL, before copying write plaintext or entering the
 engine. Clients that ignore negotiation therefore cannot bypass the bound used
-to validate journal headroom. `preferred_io` remains a performance hint.
+to validate journal headroom. A trim carries no payload, so `maximum_io` does
+not limit its length (the Linux nbd driver sends much larger discards); the
+engine journals a long trim in unit-aligned chunks of at most `maximum_io`.
+`preferred_io` remains a performance hint.
 
 This negotiation path was verified with the installed nbdkit header and a real
 rootless nbdkit/libnbd connection. Older clients can still connect, but requests

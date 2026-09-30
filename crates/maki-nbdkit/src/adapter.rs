@@ -259,10 +259,22 @@ impl NbdAdapter {
     /// these limits. Refuse them before copying plaintext or entering the
     /// engine, whose journal headroom is sized for the configured maximum.
     fn validate_request(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
+        let (_, _, maximum) = self.state()?.block_sizes;
+        if length as u64 > maximum as u64 {
+            return Err(AdapterError::new(
+                EINVAL,
+                "request exceeds NBD size or alignment constraints",
+            ));
+        }
+        self.validate_extent(offset, length)
+    }
+
+    /// Alignment and bounds only: the NBD maximum block size limits
+    /// payloads, and a trim has none (R5-010).
+    fn validate_extent(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
         let state = self.state()?;
-        let (minimum, _, maximum) = state.block_sizes;
+        let (minimum, _, _) = state.block_sizes;
         if length == 0
-            || length as u64 > maximum as u64
             || !(length as u64).is_multiple_of(minimum as u64)
             || !offset.is_multiple_of(minimum as u64)
             || offset
@@ -317,7 +329,7 @@ impl NbdAdapter {
             .admission
             .enter()
             .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
-        self.validate_request(offset, len)?;
+        self.validate_extent(offset, len)?;
         self.run(move |engine| Box::pin(async move { engine.trim(offset, len, fua).await }))
     }
 

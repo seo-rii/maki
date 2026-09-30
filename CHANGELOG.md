@@ -102,6 +102,9 @@ documents.
 
 ### Fixed
 
+- v3 discard: **trims longer than `nbd.maximum_io` are accepted** (R5-010).
+  The maximum block size bounds payloads; kernel discards (`fstrim`,
+  `-o discard`) are far larger and all failed with EINVAL.
 - v3 discard: a checkpoint **punches retired slots only after its state is
   durable** (R5-008), so a crash or failed state store can no longer leave
   recovery replaying an older write into a released hole (ENOSPC on a full

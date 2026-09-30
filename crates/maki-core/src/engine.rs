@@ -624,6 +624,19 @@ impl Engine {
     }
 
     fn check_range(&self, offset: u64, len: usize) -> Result<(), CoreError> {
+        self.check_extent(offset, len)?;
+        if len as u64 > self.inner.max_request_bytes {
+            return Err(CoreError::Invalid(format!(
+                "request of {len} bytes exceeds the maximum I/O size {} (nbd.maximum_io)",
+                self.inner.max_request_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Alignment and bounds only. A trim carries no payload, so the NBD
+    /// maximum block size does not apply to it (R5-010).
+    fn check_extent(&self, offset: u64, len: usize) -> Result<(), CoreError> {
         let block = self.inner.geometry.device_block_size as u64;
         if len == 0
             || !offset.is_multiple_of(block)
@@ -632,12 +645,6 @@ impl Engine {
         {
             return Err(CoreError::Invalid(format!(
                 "bad request range: offset {offset}, len {len}"
-            )));
-        }
-        if len as u64 > self.inner.max_request_bytes {
-            return Err(CoreError::Invalid(format!(
-                "request of {len} bytes exceeds the maximum I/O size {} (nbd.maximum_io)",
-                self.inner.max_request_bytes
             )));
         }
         Ok(())
@@ -914,26 +921,47 @@ impl Engine {
     /// units are left untouched, as permitted for the NBD discard hint.
     /// Logical zeroes become durable through the usual FLUSH/FUA protocol;
     /// physical space is reclaimed during a later checkpoint if supported.
+    ///
+    /// A trim may be longer than `nbd.maximum_io` (the kernel sends
+    /// discards far beyond the advertised maximum block size); it is
+    /// journaled in unit-aligned chunks of at most that size, each with its
+    /// own admission and unit locks. FUA applies to the last chunk, whose
+    /// journal sync also makes every earlier chunk durable (R5-010).
     pub async fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
-        self.check_range(offset, len)?;
+        self.check_extent(offset, len)?;
         self.check_freshness().await?;
         if !self.can_trim() {
             return Err(CoreError::Invalid(
                 "discard requires a volume created with --discard".into(),
             ));
         }
-        let admission = Arc::new(
-            self.inner
-                .admission
-                .acquire(self.admission_cost(offset, len))
-                .await?,
-        );
         let unit_size = self.unit_size();
         let first = offset.div_ceil(unit_size);
         let end = (offset + len as u64) / unit_size;
         if first >= end {
             return if fua { self.flush().await } else { Ok(()) };
         }
+        let per_chunk = (self.inner.max_request_bytes / unit_size).max(1);
+        let mut start = first;
+        while start < end {
+            let stop = start.saturating_add(per_chunk).min(end);
+            self.trim_units(start, stop, fua && stop == end).await?;
+            start = stop;
+        }
+        Ok(())
+    }
+
+    /// Journal tombstones for the whole units `first..end`.
+    async fn trim_units(&self, first: u64, end: u64, fua: bool) -> Result<(), CoreError> {
+        let unit_size = self.unit_size();
+        let bytes = usize::try_from((end - first) * unit_size)
+            .map_err(|_| CoreError::Invalid("discard chunk exceeds the address space".into()))?;
+        let admission = Arc::new(
+            self.inner
+                .admission
+                .acquire(self.admission_cost(first * unit_size, bytes))
+                .await?,
+        );
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, end - 1).await);
         let cts = (first..end)
             .map(|unit_index| CiphertextUnit {

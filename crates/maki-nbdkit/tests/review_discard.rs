@@ -112,11 +112,47 @@ fn discard_volume_trims_durably_and_can_be_overwritten() {
 fn trim_obeys_request_bounds_and_stops_after_drain() {
     let fixture = Fixture::new(true);
     let adapter = fixture.open();
-    for (offset, len) in [(512, 4096), (0, 512), (0, 12 * 1024), (2 << 20, 4096)] {
+    // A trim longer than `maximum_io` is valid (R5-010, below); misaligned,
+    // too short and out-of-range trims are not.
+    for (offset, len) in [(512, 4096), (0, 512), (2 << 20, 4096), (1 << 20, 2 << 20)] {
         assert_eq!(adapter.trim(offset, len, false).unwrap_err().errno, EINVAL);
     }
     adapter.shutdown().unwrap();
     assert_eq!(adapter.trim(0, 4096, false).unwrap_err().errno, ESHUTDOWN);
+}
+
+/// R5-010: `maximum_io` bounds payloads; NBD_CMD_TRIM carries none, and the
+/// Linux nbd driver sends discards far larger than the advertised maximum
+/// block size (`fstrim`, `-o discard`). A long trim discards every whole
+/// unit it covers, durably with FUA.
+#[test]
+fn a_trim_longer_than_maximum_io_discards_every_whole_unit() {
+    let fixture = Fixture::new(true);
+    let adapter = fixture.open();
+    for offset in (0..40 * 1024).step_by(8192) {
+        adapter.pwrite(&[0x5a; 8192], offset, true).unwrap();
+    }
+    // 32 KiB, four times `maximum_io`: units 1..=8; 0 and 9 stay.
+    adapter.trim(4096, 32 * 1024, true).unwrap();
+    adapter.shutdown().unwrap();
+
+    let reopened = fixture.open();
+    let mut data = vec![0xff; 40 * 1024];
+    for (chunk, offset) in data.chunks_mut(8192).zip((0..).step_by(8192)) {
+        reopened.pread(chunk, offset).unwrap();
+    }
+    assert_eq!(
+        &data[..4096],
+        &[0x5a; 4096][..],
+        "unit before the trim kept"
+    );
+    assert!(data[4096..9 * 4096].iter().all(|byte| *byte == 0));
+    assert_eq!(
+        &data[9 * 4096..],
+        &[0x5a; 4096][..],
+        "partial edge unit kept"
+    );
+    reopened.shutdown().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -191,6 +227,14 @@ try:
     check(pwrite(h, rewritten, 4096, 0, 1))
     check(pread(h, readback, 4096, 0, 0))
     if readback.raw != b'R' * 4096: raise RuntimeError('trimmed range could not be rewritten')
+    # A discard longer than the advertised maximum block size (8 KiB), as
+    # the kernel sends for fstrim (R5-010).
+    for offset in range(8192, 8192 + 65536, 4096):
+        check(pwrite(h, written, 4096, offset, 0))
+    check(trim(h, 65536, 8192, 1))
+    for offset in range(8192, 8192 + 65536, 4096):
+        check(pread(h, readback, 4096, offset, 0))
+        if readback.raw != b'\0' * 4096: raise RuntimeError('long trim left data at %d' % offset)
     check(shutdown(h, 0))
     print('native libnbd trim negotiated and executed')
 finally:
