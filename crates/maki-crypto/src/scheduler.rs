@@ -15,6 +15,12 @@
 //! and decrypt run on separate lanes, each bounded (count + bytes) so pending
 //! crypto work can never grow without limit (SPEC §12).
 //!
+//! A transport-class provider error reaches every request of the batch.
+//! An integrity or other request-specific rejection of a coalesced batch
+//! may concern one request only, so the batch is then re-sent one request
+//! at a time and each gets its own verdict: a tampered unit read by one
+//! client never turns another client's healthy read into EIO.
+//!
 //! Costs: a request pays at most `max_wait` of extra latency when it is
 //! alone, and plaintext is copied once into the lane (the provider trait
 //! takes slices). Local providers gain nothing from coalescing, so the
@@ -161,9 +167,13 @@ async fn queued_caller_closed<I, O>(batch: &mut [Group<I, O>], queued: &mut VecD
     .await;
 }
 
-type CallFuture<O> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<O>, CryptoError>> + Send>>;
-type LaneCall<I, O> = Arc<dyn Fn(CryptoContext, Vec<I>) -> CallFuture<O> + Send + Sync>;
+/// A provider call hands its items back with the result, so a batch whose
+/// failure may concern only one of its requests can be re-sent request by
+/// request without copying any plaintext.
+type CallFuture<I, O> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Vec<I>, Result<Vec<O>, CryptoError>)> + Send>,
+>;
+type LaneCall<I, O> = Arc<dyn Fn(CryptoContext, Vec<I>) -> CallFuture<I, O> + Send + Sync>;
 
 struct Lane<I, O> {
     tx: mpsc::Sender<Group<I, O>>,
@@ -395,11 +405,34 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             let result = tokio::select! {
                 biased;
                 _ = all_replies_closed(replies.iter_mut()) => None,
-                result = call(context, all_items) => Some(result),
+                result = call(context.clone(), all_items) => Some(result),
             };
             stats.inflight_batches.fetch_sub(1, Ordering::SeqCst);
-            if let Some(result) = result {
+            let Some((all_items, result)) = result else {
+                return;
+            };
+            // An integrity or other request-specific rejection of a
+            // coalesced batch may concern a single request: re-send each
+            // request alone so an unrelated request's verdict is its own.
+            // Transport-class errors say nothing per request and fan out.
+            let per_request = replies.len() > 1
+                && matches!(
+                    &result,
+                    Err(error) if error.class() == crate::error::ErrorClass::NonRetryableRequest
+                );
+            if !per_request {
                 deliver(result, items, lengths, replies);
+                return;
+            }
+            let mut rest = all_items;
+            for (len, reply) in lengths.into_iter().zip(replies) {
+                let tail = rest.split_off(len);
+                let group = std::mem::replace(&mut rest, tail);
+                if reply.is_closed() {
+                    continue;
+                }
+                let (_, result) = call(context.clone(), group).await;
+                deliver(result, len, vec![len], vec![reply]);
             }
         });
     }
@@ -486,7 +519,10 @@ impl BatchScheduler {
             stats.clone(),
             Arc::new(move |context, items: Vec<PlaintextUnit>| {
                 let inner = enc_inner.clone();
-                Box::pin(async move { inner.encrypt_batch(&context, &items).await })
+                Box::pin(async move {
+                    let result = inner.encrypt_batch(&context, &items).await;
+                    (items, result)
+                })
             }),
         );
         let dec_inner = inner.clone();
@@ -497,7 +533,10 @@ impl BatchScheduler {
             stats.clone(),
             Arc::new(move |context, items: Vec<CiphertextUnit>| {
                 let inner = dec_inner.clone();
-                Box::pin(async move { inner.decrypt_batch(&context, &items).await })
+                Box::pin(async move {
+                    let result = inner.decrypt_batch(&context, &items).await;
+                    (items, result)
+                })
             }),
         );
         Self {

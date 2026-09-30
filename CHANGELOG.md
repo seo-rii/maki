@@ -96,6 +96,11 @@ documents.
 
 ### Fixed
 
+- Remote providers: an integrity (or other non-retryable, request-specific)
+  rejection of a coalesced batch no longer fails every request merged into
+  it; the batch scheduler re-sends each request alone, so a tampered unit
+  read by one client cannot turn another client's healthy read into EIO.
+
 - Configuration validation refuses a `control.socket` that names the same
   file as `nbd.socket` (defaults included); binding the control socket
   replaces whatever is at its path.

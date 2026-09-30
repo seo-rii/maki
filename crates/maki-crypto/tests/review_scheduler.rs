@@ -287,3 +287,44 @@ async fn audit_20260907_first_group_obeys_batch_maxima() {
         "two units reached a one-unit batch in one successful provider call"
     );
 }
+
+/// An integrity (or other request-specific, non-retryable) rejection of a
+/// coalesced batch says nothing about the *other* requests merged into it:
+/// a tampered unit read by one client must not turn an unrelated client's
+/// healthy read into EIO. The batch is re-sent one request at a time and
+/// each request gets its own verdict. (Transport errors still fan out; see
+/// `provider_error_reaches_every_request_in_the_batch`.)
+#[tokio::test]
+async fn one_requests_integrity_failure_does_not_fail_the_others_in_its_batch() {
+    let h = harness(cfg());
+    let mut cts = h
+        .provider
+        .encrypt_batch(&ctx(), &[pt(5), pt(900)])
+        .await
+        .unwrap();
+    let healthy = cts.pop().unwrap();
+    let mut tampered = cts.pop().unwrap();
+    tampered.data[0] ^= 0xFF;
+
+    let s = h.scheduler.clone();
+    let bad = tokio::spawn(async move { s.decrypt_batch(&ctx(), &[tampered]).await });
+    let s = h.scheduler.clone();
+    let good = tokio::spawn(async move { s.decrypt_batch(&ctx(), &[healthy]).await });
+    settle().await;
+    h.clock.advance(Duration::from_millis(5));
+    settle().await;
+
+    let bad = bad.await.unwrap();
+    assert!(matches!(bad, Err(CryptoError::Integrity(_))), "{bad:?}");
+    let good = good
+        .await
+        .unwrap()
+        .expect("the healthy request in the same batch must still decrypt");
+    assert_eq!(good.len(), 1);
+    assert_eq!(good[0].unit_index, 900);
+    assert_eq!(good[0].data.expose(), &vec![900u64 as u8; UNIT][..]);
+    assert!(
+        h.scheduler.stats().coalesced_batches_total() >= 1,
+        "the two requests were coalesced into one batch first"
+    );
+}
