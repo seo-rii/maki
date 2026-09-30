@@ -593,3 +593,27 @@ async fn payloads_never_appear_in_logs() {
 }
 
 use tracing_subscriber::Layer as _;
+
+/// R5-005: an endpoint that does not serve the configured operation (a
+/// misrouted reverse proxy: 404, 405, 410) is at fault, not the request;
+/// the dispatcher must fail over and charge that endpoint's breaker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_operation_statuses_are_endpoint_faults() {
+    let server = TestServer::start(Arc::new(|_: &RecordedRequest| ResponseSpec::status(404))).await;
+    let provider = HttpCryptoProvider::new(spec(
+        &server.url(),
+        json_op("/encrypt", "/data", "/result"),
+        json_op("/decrypt", "/data", "/result"),
+    ))
+    .unwrap();
+    for status in [404u16, 405, 410] {
+        server.set_handler(Arc::new(move |_: &RecordedRequest| {
+            ResponseSpec::status(status)
+        }));
+        let err = provider
+            .encrypt_batch(&ctx(), &[pt(1, 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.class(), ErrorClass::EndpointFatal, "HTTP {status}");
+    }
+}

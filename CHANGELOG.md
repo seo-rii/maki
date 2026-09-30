@@ -96,6 +96,11 @@ documents.
 
 ### Fixed
 
+- Remote providers: a **broken endpoint now fails over** (R5-005). A
+  contract-violating response (malformed JSON, wrong item count, bad
+  encoding) or HTTP 404/405/410 counts as an endpoint failure, opens that
+  endpoint's circuit and lets a retry-safe request move to a healthy peer;
+  previously every request failed while the circuit stayed closed.
 - `remote-http` **ignores environment proxies** (R5-003): an inherited
   `HTTP_PROXY`/`ALL_PROXY` no longer receives plaintext encrypt requests.
   Deployments that relied on a proxy to reach the provider must connect to

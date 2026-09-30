@@ -612,6 +612,12 @@ fn classify_status(
         )),
         429 => CryptoError::Throttled(format!("HTTP {code}")),
         401 | 403 | 407 => CryptoError::EndpointFatal(format!("HTTP {code}")),
+        // The endpoint does not serve the configured operation (a misrouted
+        // reverse proxy, a wrong path): its fault, not the request's, so
+        // the dispatcher fails over and charges its breaker (R5-005).
+        404 | 405 | 410 => CryptoError::EndpointFatal(format!(
+            "HTTP {code}: the endpoint does not serve this operation"
+        )),
         408 => CryptoError::Retryable(format!("HTTP {code}")),
         400..=499 => CryptoError::NonRetryableRequest(format!("HTTP {code}")),
         _ => CryptoError::Retryable(format!("HTTP {code}")),

@@ -281,7 +281,12 @@ plaintext endpoint, and certificate failures never downgrade the connection.
 
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
-jitter retry. Retry budgets, circuit breakers, endpoint limits, and global byte
+jitter retry. A response that breaks the provider contract (malformed body,
+wrong item count, bad encoding) and an HTTP 404/405/410 are charged to the
+endpoint that sent them: its breaker counts the failure and a retry-safe
+request fails over to an endpoint it has not tried yet, so a misrouted
+endpoint cannot absorb most traffic. A contract violation with no untried
+endpoint left is reported at once. Retry budgets, circuit breakers, endpoint limits, and global byte
 and request semaphores prevent a failing provider from causing unbounded work.
 
 ## Cache and growth

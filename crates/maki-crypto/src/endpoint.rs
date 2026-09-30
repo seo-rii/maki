@@ -668,6 +668,31 @@ impl EndpointSet {
                                 }
                                 // fall through to the next endpoint
                             }
+                            ErrorClass::ProviderFatal
+                                if matches!(err, CryptoError::Contract(_)) =>
+                            {
+                                // The response broke the provider contract
+                                // (malformed body, wrong items, bad
+                                // encoding): the endpoint that sent it is at
+                                // fault. Charge its breaker so routing stops
+                                // preferring it, and fail over to an
+                                // endpoint this operation has not tried yet;
+                                // with none left the violation is reported
+                                // at once, never retried into (R5-005).
+                                probe.on_failure();
+                                if !retry_safe {
+                                    return Err(err);
+                                }
+                                let untried = self.endpoints.iter().any(|e| {
+                                    !tried.iter().any(|t| Arc::ptr_eq(t, e))
+                                        && e.validated.load(Ordering::SeqCst)
+                                        && e.breaker.would_allow()
+                                });
+                                if !untried {
+                                    return Err(err);
+                                }
+                                last_error = Some(err);
+                            }
                             ErrorClass::NonRetryableRequest | ErrorClass::ProviderFatal => {
                                 // Not the endpoint's fault (or fatal for the
                                 // whole provider): never retried into.
