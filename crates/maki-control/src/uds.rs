@@ -47,24 +47,42 @@ impl Drop for ControlListener {
 
 /// Resolve a group name to its gid.
 pub fn resolve_gid(name: &str) -> io::Result<u32> {
+    resolve_gid_with_capacity(name, 16 * 1024)
+}
+
+/// Largest group record buffer [`resolve_gid`] grows to.
+const MAX_GROUP_BUFFER: usize = 16 << 20;
+
+/// [`resolve_gid`] starting from an `initial` record buffer. `getgrnam_r`
+/// reports `ERANGE` when the record (a directory group's member list can
+/// be large) does not fit; the buffer is doubled and the lookup retried, up
+/// to [`MAX_GROUP_BUFFER`].
+pub fn resolve_gid_with_capacity(name: &str, initial: usize) -> io::Result<u32> {
     let cname = std::ffi::CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group name contains NUL"))?;
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; initial.clamp(1, MAX_GROUP_BUFFER)];
     let mut result: *mut libc::group = std::ptr::null_mut();
-    // SAFETY: all pointers reference live, correctly sized buffers for the
-    // duration of the call; getgrnam_r writes only within them.
-    let rc = unsafe {
-        libc::getgrnam_r(
-            cname.as_ptr(),
-            &mut grp,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            &mut result,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc));
+    loop {
+        // SAFETY: all pointers reference live, correctly sized buffers for
+        // the duration of the call; getgrnam_r writes only within them.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < MAX_GROUP_BUFFER {
+            buf = vec![0u8; (buf.len() * 2).min(MAX_GROUP_BUFFER)];
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        break;
     }
     if result.is_null() {
         return Err(io::Error::new(

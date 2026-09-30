@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use maki_control::server::ControlBackend;
-use maki_control::uds::{bind_control_socket, resolve_gid, serve};
+use maki_control::uds::{bind_control_socket, resolve_gid, resolve_gid_with_capacity, serve};
 
 struct Fake;
 
@@ -164,4 +164,21 @@ async fn bind_supports_a_maximum_length_filesystem_socket_path() {
 #[test]
 fn root_group_resolves_to_gid_zero() {
     assert_eq!(resolve_gid("root").unwrap(), 0);
+}
+
+/// `getgrnam_r` reports ERANGE when the group record (member list) does not
+/// fit the caller's buffer; the caller must retry with a larger one. A
+/// single fixed-size attempt made attach fail for a large directory group
+/// (`control.group` backed by LDAP/SSSD with thousands of members).
+#[cfg(target_os = "linux")]
+#[test]
+fn group_lookup_grows_its_buffer_on_erange() {
+    assert_eq!(resolve_gid_with_capacity("root", 8).unwrap(), 0);
+    assert_eq!(resolve_gid_with_capacity("root", 1).unwrap(), 0);
+    assert_eq!(
+        resolve_gid_with_capacity("maki-no-such-group-r5", 8)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
 }

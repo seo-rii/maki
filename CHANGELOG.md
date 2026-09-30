@@ -96,6 +96,15 @@ documents.
 
 ### Fixed
 
+- `control.group` resolution retries `getgrnam_r` with a larger buffer on
+  `ERANGE`; a directory group whose record exceeded 16 KiB made attach fail.
+
+- `file` and `credential` key sources open the credential once
+  (`O_NOFOLLOW | O_NONBLOCK` on Unix) and run the regular-file and mode
+  checks on the opened descriptor; checking the path and opening it again
+  let a swap in between be loaded as the key, and a FIFO could block the
+  open.
+
 - `maki check --deep` now probes the slots the allocation map does not list:
   a damaged header there reads as EIO, but the check walked only allocated
   units and reported such a volume `clean` (R4-004 follow-up;
