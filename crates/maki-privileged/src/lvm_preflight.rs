@@ -261,12 +261,7 @@ fn discover(record: &BoundDeviceRecord) -> io::Result<Vec<Device>> {
 }
 
 fn controlled_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("LC_ALL", "C");
-    command
+    crate::exec::command::controlled(program)
 }
 
 fn probe_label(output: &Output) -> io::Result<Option<String>> {

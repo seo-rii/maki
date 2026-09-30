@@ -34,6 +34,18 @@ impl Policy {
     };
 }
 
+/// A command with a controlled environment: nothing inherited from the
+/// caller (no `LD_*`, no hostile `PATH`), a fixed system `PATH`, and
+/// `LC_ALL=C` so parsed output never depends on the caller's locale.
+pub(crate) fn controlled(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C");
+    command
+}
+
 pub(super) fn capture(command: &mut Command, policy: Policy) -> io::Result<Output> {
     // Orphans must be reaped here even on hosts whose PID 1 does not promptly
     // reap. This process-wide setting remains enabled for the helper's short

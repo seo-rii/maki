@@ -238,12 +238,7 @@ fn force_deactivation_target_at(
 }
 
 fn controlled_dmsetup() -> Command {
-    let mut command = Command::new("dmsetup");
-    command
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("LC_ALL", "C");
-    command
+    crate::exec::command::controlled("dmsetup")
 }
 
 fn dmsetup_info_command(name: &str) -> Command {

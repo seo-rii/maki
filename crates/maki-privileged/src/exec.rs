@@ -9,11 +9,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[path = "command.rs"]
-mod command;
+pub(crate) mod command;
 
 #[path = "recover.rs"]
 pub(crate) mod recover;
@@ -124,7 +123,10 @@ pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecE
 
 fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError> {
     tracing::info!("maki-attach: {step}");
-    let out = command::capture(Command::new(program).args(args), command::Policy::STEP)?;
+    let out = command::capture(
+        command::controlled(program).args(args),
+        command::Policy::STEP,
+    )?;
     if !out.status.success() {
         return Err(ExecError::StepFailed {
             step: step.to_string(),
@@ -219,7 +221,7 @@ fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
 
 fn blkid_uuid(device: &str) -> Option<String> {
     let out = command::capture(
-        Command::new("blkid").args(["-o", "value", "-s", "UUID", device]),
+        command::controlled("blkid").args(["-o", "value", "-s", "UUID", device]),
         command::Policy::PROBE,
     )
     .ok()?;
@@ -483,7 +485,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
         PlannedStep::LvmDeactivate { vg_name } => run(step, "vgchange", &["-an", vg_name]),
         PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => {
             let output = command::capture(
-                Command::new("blkid").args([
+                command::controlled("blkid").args([
                     "--probe",
                     "--output",
                     "export",
@@ -713,7 +715,7 @@ impl System for LinuxSystem {
     }
     fn lv_size(&self, vg: &str, lv: &str) -> Result<u64, ExecError> {
         let out = command::capture(
-            Command::new("blockdev").args(["--getsize64", &format!("/dev/{vg}/{lv}")]),
+            command::controlled("blockdev").args(["--getsize64", &format!("/dev/{vg}/{lv}")]),
             command::Policy::PROBE,
         )?;
         if !out.status.success() {

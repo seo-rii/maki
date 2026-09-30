@@ -7,7 +7,6 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::process::Command;
 
 use super::{
     command, identity_error, recover, verify_filesystem_probe, ExecError, LinuxSystem, System,
@@ -122,7 +121,7 @@ impl WorkloadSystem for LinuxSystem {
         // /dev/VG/LV cannot redirect the probe after the device-number check.
         let pinned = format!("/proc/{}/fd/{}", std::process::id(), device.as_raw_fd());
         let output = command::capture(
-            Command::new("blkid").args([
+            crate::exec::command::controlled("blkid").args([
                 "--probe",
                 "--output",
                 "export",

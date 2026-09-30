@@ -6,8 +6,8 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-01 (after the R5-001…R5-022 fixes; see the
-[remediation log](review-remediation.md#fifth-review-2026-10-01-r5-001r5-022)).
+Last updated: 2026-10-01 (after the R5-001…R5-023 fixes; see the
+[remediation log](review-remediation.md#fifth-review-2026-10-01-r5-001r5-023)).
 
 ## Release state
 

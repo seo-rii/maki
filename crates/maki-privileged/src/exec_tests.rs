@@ -1638,3 +1638,25 @@ mod filesystem_tests;
 
 #[path = "workload_verify_tests.rs"]
 mod workload_verify_tests;
+
+/// Every external command the root helper runs gets a controlled
+/// environment: a fixed PATH, `LC_ALL=C`, nothing inherited from the caller
+/// (`LD_*`, a hostile PATH, locale-dependent output). `recover` and the LVM
+/// preflight already did; the attach/detach/grow steps and their probes
+/// inherited everything.
+#[test]
+fn step_commands_do_not_inherit_the_callers_environment() {
+    std::env::set_var("MAKI_ENV_PROBE_LEAK", "leaked");
+    let step = PlannedStep::ModprobeNbd;
+    run(
+        &step,
+        "sh",
+        &[
+            "-c",
+            "test -z \"$MAKI_ENV_PROBE_LEAK\" \
+             && test \"$PATH\" = /usr/sbin:/usr/bin:/sbin:/bin \
+             && test \"$LC_ALL\" = C",
+        ],
+    )
+    .expect("the step saw the caller's environment");
+}
