@@ -36,6 +36,8 @@ pub struct MountObservation {
     /// `/dev/...` names (partitions folded into their NBD device). Empty
     /// when the walk could not be done.
     pub backing_devices: Vec<String>,
+    /// The per-mount options from mountinfo; empty when nothing is mounted.
+    pub mount_options: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +70,18 @@ pub fn verify_mount_device(
             "the mounted filesystem is not stored only on {nbd_device}: its backing devices \
              are {:?}",
             observed.backing_devices
+        )));
+    }
+    // The filesystem's bytes come from the unprivileged daemon and an
+    // untrusted provider: a setuid binary or a device node in it must not
+    // take effect on the host (R5-002).
+    if !["nosuid", "nodev"]
+        .iter()
+        .all(|option| observed.mount_options.iter().any(|o| o == option))
+    {
+        return Err(MountVerifyError(format!(
+            "the volume must be mounted nosuid,nodev; its options are {:?}",
+            observed.mount_options
         )));
     }
     Ok(())

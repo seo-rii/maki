@@ -118,6 +118,7 @@ impl System for FilesystemSystem {
                         nbd_connected: self.inner.backend(nbd_device)?.is_some(),
                         rw_probe_ok: rw_probe(mountpoint),
                         backing_devices: vec![nbd_device.clone()],
+                        mount_options: vec!["nosuid".into(), "nodev".into()],
                     },
                 )?;
                 Ok(())

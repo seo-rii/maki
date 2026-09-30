@@ -25,7 +25,7 @@ mod workload_verify;
 mod lvm_preflight;
 
 use crate::detach::DetachObservation;
-use crate::plan::{Plan, PlannedStep, SENTINEL_FILE};
+use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
 use crate::probe::{
     choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
 };
@@ -428,6 +428,7 @@ fn observe(mountpoint: &str, nbd_device: &str, touch: bool) -> MountObservation 
         },
         nbd_connected: nbd_connected(nbd_device),
         rw_probe_ok: touch && entry.is_some() && rw_probe(mountpoint),
+        mount_options: entry.map(|e| e.mount_options).unwrap_or_default(),
         backing_devices,
     }
 }
@@ -501,7 +502,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             run(
                 step,
                 "mount",
-                &["-t", "xfs", "-o", "noatime", device, mountpoint],
+                &["-t", "xfs", "-o", MOUNT_OPTIONS, device, mountpoint],
             )
         }
         PlannedStep::VerifyMountDevice {

@@ -355,6 +355,7 @@ fn verifier_rejects_wrong_device_and_missing_sentinel() {
         nbd_connected: true,
         rw_probe_ok: true,
         backing_devices: vec!["/dev/nbd0".into()],
+        mount_options: vec!["nosuid".into(), "nodev".into()],
     };
     verify_mount_identity(&expected, &observed).unwrap();
     observed.sentinel_volume_uuid = None;
@@ -387,6 +388,7 @@ fn a_filesystem_not_stored_only_on_the_bound_nbd_device_is_refused_before_it_is_
         nbd_connected: true,
         rw_probe_ok: false,
         backing_devices: backing.into_iter().map(String::from).collect(),
+        mount_options: vec!["nosuid".into(), "nodev".into()],
     };
     verify_mount_device("/dev/nbd0", &observed(vec!["/dev/nbd0"])).unwrap();
     // A local disk, a volume group spanning the NBD device and a local
@@ -483,6 +485,7 @@ fn an_over_deep_topology_resolves_to_no_leaves_not_a_partial_set() {
             .into_iter()
             .map(|l| nbd_device_of(&l).unwrap_or_else(|| format!("/dev/{l}")))
             .collect(),
+        mount_options: vec!["nosuid".into(), "nodev".into()],
     };
     assert!(verify_mount_device("/dev/nbd0", &observed).is_err());
 }

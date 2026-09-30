@@ -11,6 +11,8 @@ pub struct MountEntry {
     /// The mounted block device's `major:minor` (field 3), the handle
     /// for walking its sysfs topology.
     pub major_minor: String,
+    /// The per-mount options (field 6), e.g. `rw`, `nosuid`, `nodev`.
+    pub mount_options: Vec<String>,
 }
 
 /// Follow the `slaves` relation (device-mapper, MD) from `start` down to
@@ -108,7 +110,7 @@ pub fn parse_mountinfo(text: &str, mountpoint: &str) -> Option<MountEntry> {
             None => continue,
         };
         let left: Vec<&str> = left.split_whitespace().collect();
-        if left.len() < 5 {
+        if left.len() < 6 {
             continue;
         }
         if unescape(left[4]) != mountpoint {
@@ -122,6 +124,7 @@ pub fn parse_mountinfo(text: &str, mountpoint: &str) -> Option<MountEntry> {
             fstype: right[0].to_string(),
             source: unescape(right[1]),
             major_minor: left[2].to_string(),
+            mount_options: left[5].split(',').map(str::to_string).collect(),
         });
     }
     found

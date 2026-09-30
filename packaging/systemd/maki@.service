@@ -44,6 +44,10 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
+# R5-002: the daemon never opens a device node (a crafted one inside a volume
+# included); only the pseudo devices remain. PrivateDevices= would also hide
+# the /dev nodes the swap policy check stats, so the cgroup policy is used.
+DevicePolicy=closed
 LockPersonality=yes
 
 # Top-level tmpfiles directories select who can enter each socket tree.

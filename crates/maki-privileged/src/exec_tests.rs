@@ -1170,6 +1170,7 @@ impl ReviewForeignMountSystem {
                 .join("pid")
                 .exists(),
             rw_probe_ok: touch && entry.is_some() && rw_probe(mountpoint),
+            mount_options: entry.map(|entry| entry.mount_options).unwrap_or_default(),
             backing_devices,
         }
     }
@@ -1286,7 +1287,7 @@ fn review_next_attach_rejects_a_logical_volume_backed_by_an_unrelated_disk() {
     let mut system = ReviewForeignMountSystem {
         inner: FakeSystem::default(),
         mountinfo: format!(
-            "50 1 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+            "50 1 253:0 / {} rw,nosuid,nodev - xfs /dev/mapper/vg_maki_pg-data rw\n",
             request.mountpoint
         ),
         sysfs,
@@ -1339,7 +1340,7 @@ impl ObservedSystem {
     fn mounts(&self, record: &BoundDeviceRecord) -> String {
         if self.fake.mounted {
             format!(
-                "40 25 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+                "40 25 253:0 / {} rw,nosuid,nodev - xfs /dev/mapper/vg_maki_pg-data rw\n",
                 record.attachment.mountpoint
             )
         } else {
@@ -1477,7 +1478,7 @@ impl System for ObservedSystem {
     ) -> io::Result<DetachObservation> {
         let mounts = if self.fake.mounted {
             format!(
-                "40 25 253:0 / {} rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
+                "40 25 253:0 / {} rw,nosuid,nodev - xfs /dev/mapper/vg_maki_pg-data rw\n",
                 record.attachment.mountpoint
             )
         } else {

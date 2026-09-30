@@ -398,11 +398,14 @@ Execution (Linux, root) then:
    the device reports a size, and verifies its kernel backend identifier;
 3. activates the VG and records its mapping identity, then verifies XFS TYPE
    and the optional configured `fs_uuid` with a bounded block probe before
-   mounting. It rechecks backend/mapping identity around that probe. After
+   mounting with `noatime,nosuid,nodev`: the filesystem's bytes come from the
+   unprivileged daemon and the provider, so a setuid binary or a device node
+   in it never takes effect on the host. Workloads that need setuid programs
+   or device nodes on the volume are not supported. It rechecks backend/mapping identity around that probe. After
    mounting, `--init-sentinel` (or `init_sentinel = true`, first boot only)
    creates `<mountpoint>/.maki-sentinel` holding the volume UUID, never
    overwriting a different value; see [attachment limits](storage-recovery.md);
-4. verifies the mount identity from `/proc/self/mountinfo`, `blkid`, sysfs NBD
+4. verifies the mount identity (including `nosuid` and `nodev`) from `/proc/self/mountinfo`, `blkid`, sysfs NBD
    state, the sentinel, and a read/write probe (the mount root belongs to the
    workload: the sentinel is opened without following symlinks and read to a
    4 KiB bound, the probe file is created exclusively under an unpredictable

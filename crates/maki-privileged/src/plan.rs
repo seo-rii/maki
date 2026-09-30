@@ -28,6 +28,11 @@ pub struct LvmIdentityPins {
 /// Name of the sentinel file the mount guard reads (SPEC §39).
 pub const SENTINEL_FILE: &str = ".maki-sentinel";
 
+/// Mount options of the volume's XFS filesystem. Its contents come from the
+/// unprivileged daemon and an untrusted provider, so setuid bits and device
+/// nodes in it are never honoured (R5-002).
+pub const MOUNT_OPTIONS: &str = "noatime,nosuid,nodev";
+
 #[derive(Debug, Clone)]
 pub struct AttachRequest {
     pub volume: String,
@@ -189,7 +194,7 @@ impl fmt::Display for PlannedStep {
                 fs_uuid.as_deref().unwrap_or("unpinned")
             ),
             PlannedStep::MountXfs { device, mountpoint } => {
-                write!(f, "mount -t xfs -o noatime {device} {mountpoint}")
+                write!(f, "mount -t xfs -o {MOUNT_OPTIONS} {device} {mountpoint}")
             }
             PlannedStep::VerifyMountDevice {
                 mountpoint,

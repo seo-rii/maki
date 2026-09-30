@@ -237,6 +237,7 @@ fn good_observation() -> MountObservation {
         nbd_connected: true,
         rw_probe_ok: true,
         backing_devices: vec!["/dev/nbd0".to_string()],
+        mount_options: vec!["nosuid".to_string(), "nodev".to_string()],
     }
 }
 
