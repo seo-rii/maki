@@ -79,8 +79,12 @@ fn main() -> ExitCode {
             };
             match created {
                 Ok(sb) => {
+                    // The superblock does not record the volume name.
+                    let name = maki_format::config::parse_config(&raw)
+                        .map(|cfg| cfg.volume.name)
+                        .unwrap_or_default();
                     println!(
-                        "created volume {} (uuid {}, {} bytes virtual, slot size {})",
+                        "created volume {name} (provider {}, uuid {}, {} bytes virtual, slot size {})",
                         sb.provider_type,
                         sb.volume_uuid,
                         sb.geometry.max_virtual_size,

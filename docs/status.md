@@ -6,8 +6,8 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-09-29 (after the R4-001…R4-007 fixes and their follow-ups; see the
-[remediation log](review-remediation.md#fourth-review-2026-09-23-r4-001r4-007)).
+Last updated: 2026-10-01 (after the R5-001…R5-022 fixes; see the
+[remediation log](review-remediation.md#fifth-review-2026-10-01-r5-001r5-022)).
 
 ## Release state
 
@@ -73,8 +73,14 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
 - Remote transport libraries may keep plaintext copies outside `SecretBuffer`,
   and stack temporaries of the local cipher implementations are outside the
   `secure-buffers` page lock ([transport memory](transport-memory.md)).
-- Recovery memory is bounded by a 1 MiB replay batch, but a total-RSS bound for
+- Recovery memory is bounded by a 1 MiB replay batch and the journaled overlay
+  by `limits.max_overlay_bytes`/`max_overlay_entries`, but a total-RSS bound for
   arbitrary geometry, provider and cache settings has not been established.
+- The volume's XFS filesystem is mounted `nosuid,nodev`; workloads that need
+  setuid programs or device nodes on it are not supported.
+- v3 discard fixes of 2026-10-01 (long trims, admission under space pressure,
+  punch ordering) passed the simulation and native libnbd tests only; no
+  kernel `fstrim` campaign has run against them yet.
 - Privileged attach supports the single-PV/single-data-LV XFS topology; other
   device-mapper layouts fail closed and need operator diagnosis
   ([storage recovery limits](storage-recovery.md#remaining-recovery-limits)).

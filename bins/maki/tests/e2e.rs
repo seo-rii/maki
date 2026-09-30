@@ -85,7 +85,17 @@ fn volume_lifecycle_create_inspect_check() {
 
     let out = maki(&["volume", "create", &vol.config_path], Some(key));
     assert!(out.status.success(), "create failed: {}", stderr(&out));
-    assert!(stdout(&out).contains("created volume"), "{}", stdout(&out));
+    // The line names the volume, not the provider type in its place.
+    assert!(
+        stdout(&out).contains("created volume e2evol "),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("provider local-aes"),
+        "{}",
+        stdout(&out)
+    );
 
     // A second create must refuse — never reinitialize an existing volume.
     let out = maki(&["volume", "create", &vol.config_path], Some(key));
