@@ -191,3 +191,24 @@ async fn extra_sessions_wait_in_the_backlog_until_a_slot_frees() {
     assert_eq!(response["ok"], json!(true));
     server.abort();
 }
+
+/// An error response must fit the protocol line limit the client enforces.
+/// Echoing an unknown command name in full (Debug-escaped, then JSON-escaped
+/// again) turned a request within MAX_LINE into a response far beyond it,
+/// so the client saw a protocol error instead of "unknown command".
+#[tokio::test(start_paused = true)]
+async fn an_unknown_command_error_fits_the_line_limit() {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let _task = tokio::spawn(serve_connection(server, Arc::new(Fake), limits()));
+    let (mut rd, mut wr) = tokio::io::split(client);
+    // 30,000 quotes: 60 KB on the wire as JSON, under MAX_LINE.
+    let name = "\"".repeat(30_000);
+    send_command(&mut wr, &Request::new(&name)).await.unwrap();
+    let response = read_response(&mut rd)
+        .await
+        .expect("the error response must be readable by the client");
+    assert_eq!(response["ok"], json!(false));
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("unknown command"), "{error}");
+    assert!(error.len() < 1024, "the echoed name is truncated: {} bytes", error.len());
+}

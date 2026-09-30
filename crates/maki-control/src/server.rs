@@ -143,10 +143,21 @@ async fn handle(backend: &Arc<dyn ControlBackend>, request: Request) -> Value {
                  privileged helper (maki attach/detach/grow), not the control socket"
             ),
         }),
-        other => json!({
-            "ok": false,
-            "error": format!("unknown command {other:?}"),
-        }),
+        other => {
+            // The echo must keep the response within the client's line
+            // limit: a name is Debug-escaped here and JSON-escaped again.
+            const ECHO_CHARS: usize = 64;
+            let shown: String = other.chars().take(ECHO_CHARS).collect();
+            let more = if other.chars().count() > ECHO_CHARS {
+                "…"
+            } else {
+                ""
+            };
+            json!({
+                "ok": false,
+                "error": format!("unknown command {shown:?}{more}"),
+            })
+        }
     }
 }
 
