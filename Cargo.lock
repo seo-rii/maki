@@ -883,6 +883,7 @@ dependencies = [
 name = "maki-benchmark"
 version = "0.1.0"
 dependencies = [
+ "maki-format",
  "maki-nbdkit",
  "tempfile",
  "tokio",

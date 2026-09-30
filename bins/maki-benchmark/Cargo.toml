@@ -10,6 +10,7 @@ name = "maki-benchmark"
 path = "src/main.rs"
 
 [dependencies]
+maki-format.workspace = true
 maki-nbdkit.workspace = true
 tokio.workspace = true
 

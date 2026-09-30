@@ -7,12 +7,17 @@ use std::process::{Command, Output};
 
 const KEY_HEX: &str = "8899aabbccddeeff00112233445566778899aabbccddeeff0011223344556677";
 
-fn run(config_path: &str) -> Output {
+fn run_with(config_path: &str, extra: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))
+        .args(extra)
         .args([config_path, "64", "4096"])
         .env("MAKI_CREDENTIAL_E2E_BENCH_KEY", KEY_HEX)
         .output()
         .expect("spawn maki-benchmark")
+}
+
+fn run(config_path: &str) -> Output {
+    run_with(config_path, &[])
 }
 
 #[test]
@@ -59,9 +64,49 @@ journal_emergency_reserve_bytes = "0B"
     assert!(text.contains("write:"), "{text}");
     assert!(text.contains("read:"), "{text}");
 
+    // R5-017: the benchmark overwrites the start of the volume, so a volume
+    // it did not create in this run is refused without `--destroy-data`.
+    let shards = || {
+        let mut shards: Vec<(String, Vec<u8>)> = std::fs::read_dir(format!("{root}/data"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        shards.sort();
+        shards
+    };
+    let journal_before = std::fs::read_dir(format!("{root}/journal"))
+        .unwrap()
+        .count();
+    let data_before = shards();
+    let out = run(&config_path);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--destroy-data"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(shards(), data_before, "a refused run changed the volume");
+    assert_eq!(
+        std::fs::read_dir(format!("{root}/journal"))
+            .unwrap()
+            .count(),
+        journal_before
+    );
+
     // The process exited without a checkpoint, so the second run must
     // recover the journal it left behind and serve I/O again.
-    let out = run(&config_path);
+    let out = run_with(&config_path, &["--destroy-data"]);
     assert!(
         out.status.success(),
         "re-attach over existing state failed: {}",

@@ -11,6 +11,10 @@ documents.
 
 ### Breaking changes
 
+- **`maki-benchmark` refuses an existing volume without `--destroy-data`**
+  (R5-017): it overwrites the start of the device (partition table,
+  filesystem superblock) and used to do so to whatever volume its
+  configuration named.
 - **Credential-like header names refuse literal values** (R5-007). An HTTP
   header or gRPC metadata name containing `auth`, `token`, `secret`,
   `passw`, `cookie`, `session`, `signature`, `credential`, `apikey`,

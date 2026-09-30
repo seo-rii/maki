@@ -1,13 +1,26 @@
 //! `maki-benchmark` — engine throughput measurement over a configured
-//! volume (creates it if missing).
+//! volume (creates it if missing). It overwrites the start of the volume,
+//! so an existing volume needs `--destroy-data` (R5-017).
 
 use std::process::ExitCode;
 use std::time::Instant;
 
+use maki_format::error::FormatError;
+use maki_nbdkit::daemon::DaemonError;
+
+const USAGE: &str = "usage: maki-benchmark [--destroy-data] <config.toml> [ops] [io-size]";
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let destroy_data = match args.iter().position(|arg| arg == "--destroy-data") {
+        Some(index) => {
+            args.remove(index);
+            true
+        }
+        None => false,
+    };
     let Some(config_path) = args.first() else {
-        eprintln!("usage: maki-benchmark <config.toml> [ops] [io-size]");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     let ops: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10_000);
@@ -27,8 +40,23 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Create the volume if it doesn't exist yet.
-    let _ = maki_nbdkit::daemon::create_volume_from_config_str(&raw);
+    // Create the volume if it doesn't exist yet; an existing one holds data
+    // the benchmark would overwrite.
+    match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
+        Ok(_) => {}
+        Err(DaemonError::Format(FormatError::AlreadyExists(_))) if destroy_data => {}
+        Err(DaemonError::Format(FormatError::AlreadyExists(_))) => {
+            eprintln!(
+                "error: {config_path} names an existing volume; the benchmark overwrites its \
+                 data. Pass --destroy-data to run it anyway."
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("error: cannot create the volume: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -56,6 +84,10 @@ fn main() -> ExitCode {
     }
     let size = engine.size();
     let slots = size / io_size as u64;
+    if slots == 0 {
+        eprintln!("io-size {io_size} is larger than the device ({size} bytes)");
+        return ExitCode::from(2);
+    }
     let data = vec![0xA5u8; io_size];
 
     let start = Instant::now();
