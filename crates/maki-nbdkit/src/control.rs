@@ -270,6 +270,16 @@ impl ControlBackend for EngineControlBackend {
                                 (`maki reload <config> cache --max-bytes N`)"
                         .to_string());
                 };
+                // The same rules as `cache.max_bytes` at startup: positive,
+                // and never more than the device, whose every unit it could
+                // then hold (R5-014).
+                if max_bytes == 0 || max_bytes > self.engine.size() {
+                    return Err(format!(
+                        "reload cache: max_bytes must be between 1 and the device size {} \
+                         bytes; the change was NOT applied",
+                        self.engine.size()
+                    ));
+                }
                 if !self.engine.resize_cache(max_bytes) {
                     return Err(
                         "reload cache: this daemon runs with cache.mode = off, so there is no \

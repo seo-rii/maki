@@ -102,6 +102,9 @@ documents.
 
 ### Fixed
 
+- A huge configured circuit-breaker duration no longer panics the
+  dispatcher on the first trip (R5-013); `reload cache` refuses a size of 0
+  or larger than the device (R5-014).
 - v3 discard works under space pressure and on damaged units (R5-011,
   R5-012): tombstones are admitted against the emergency reserve alone, not
   the checkpoint headroom, and a unit whose slot is damaged can be discarded

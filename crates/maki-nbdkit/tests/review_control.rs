@@ -124,6 +124,16 @@ mode = \"read\"
     assert_eq!(cache["ok"], json!(true), "{cache}");
     let bad = client.call("reload", Some("cache"), json!({}));
     assert_eq!(bad["ok"], json!(false), "{bad}");
+    // R5-014: the verb obeys the cache.max_bytes rules: positive, and no
+    // larger than the device, whose every unit it could then hold.
+    for max_bytes in [0, u64::MAX] {
+        let bad = client.call("reload", Some("cache"), json!({ "max_bytes": max_bytes }));
+        assert_eq!(bad["ok"], json!(false), "max_bytes {max_bytes}: {bad}");
+        assert!(
+            bad["error"].as_str().unwrap().contains("NOT applied"),
+            "{bad}"
+        );
+    }
 
     let attach = client.call("attach", None, Value::Null);
     assert_eq!(attach["ok"], json!(false));

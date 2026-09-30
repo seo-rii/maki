@@ -190,14 +190,19 @@ impl CircuitBreaker {
                 if inner.consecutive_failures >= self.config.failure_threshold {
                     inner.state = CircuitState::Open;
                     inner.generation += 1;
-                    inner.open_until = now + inner.open_duration;
+                    // Configured durations have no upper bound: saturate
+                    // rather than panic (R5-013).
+                    inner.open_until = now.saturating_add(inner.open_duration);
                 }
             }
             (CircuitState::HalfOpen, Some(false)) => {
-                inner.open_duration = (inner.open_duration * 2).min(self.config.open_max);
+                inner.open_duration = inner
+                    .open_duration
+                    .saturating_mul(2)
+                    .min(self.config.open_max);
                 inner.state = CircuitState::Open;
                 inner.generation += 1;
-                inner.open_until = now + inner.open_duration;
+                inner.open_until = now.saturating_add(inner.open_duration);
                 inner.half_open_inflight = 0;
             }
             (_, None) | (CircuitState::Open, _) => {}

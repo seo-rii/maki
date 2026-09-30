@@ -308,8 +308,9 @@ drain, its unload error is logged; the next attach performs recovery. Do not
 treat process cleanup or socket removal as proof that the failed barrier
 succeeded.
 
-`reload cache` needs the new size; it is refused (not silently accepted) on a
-daemon running with `cache.mode = "off"`.
+`reload cache` needs the new size, between 1 byte and the device size; it is
+refused (not silently accepted) outside that range and on a daemon running
+with `cache.mode = "off"`.
 
 Attach, detach, mount, unmount, NBD, and growth verbs are deliberately absent
 from the control socket.
