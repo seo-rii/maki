@@ -75,6 +75,10 @@ maki volume inspect /etc/maki/volumes/example.toml
 maki check /etc/maki/volumes/example.toml
 ```
 
+`volume create` needs an empty backing root: it refuses a root whose `data/`,
+`journal/` or `checkpoint/` directory still holds a file, because an earlier
+volume's shards would otherwise be adopted and served by the new one.
+
 The inspect output includes `maximum units`, `maximum shards`, `full slot span
 bytes`, `allocation map A/B bytes`, `discard map A/B bytes`, and `catalog A/B bytes`.
 The discard-map estimate is zero for v2 and equals the allocation-map estimate

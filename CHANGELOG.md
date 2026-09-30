@@ -106,6 +106,9 @@ documents.
 
 ### Fixed
 
+- `maki volume create` refuses a backing root that still holds an earlier
+  volume's `data/`, `journal/` or `checkpoint/` files (R5-018); they used to
+  be adopted and served by the new volume.
 - Package removal is also refused while a `maki-recover@` unit is active
   (R5-015).
 - A huge configured circuit-breaker duration no longer panics the

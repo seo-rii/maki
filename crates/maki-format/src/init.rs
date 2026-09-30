@@ -41,6 +41,26 @@ fn create_volume_with_metadata_version(
             "volume superblock already present".to_string(),
         ));
     }
+    // Any file left in the layout directories belongs to an earlier volume:
+    // slot headers carry no volume UUID, so the new volume would adopt its
+    // shards and serve their ciphertext instead of zeros (R5-018).
+    for dir in [
+        layout::DATA_DIR,
+        layout::JOURNAL_DIR,
+        layout::CHECKPOINT_DIR,
+    ] {
+        let entries = match backing.list(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(entry) = entries.first() {
+            return Err(FormatError::AlreadyExists(format!(
+                "backing root is not empty: {dir}/{entry} belongs to an earlier volume; \
+                 use an empty root"
+            )));
+        }
+    }
 
     for dir in [
         layout::DATA_DIR,
