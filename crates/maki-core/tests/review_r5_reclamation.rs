@@ -104,7 +104,7 @@ fn a_failed_shard_catalog_commit_does_not_break_reclamation() {
     // Reopen: recovery schedules reclamation of shard 0.
     let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
     backing.set_fault_hook(Some(Arc::new(|op| match op {
-        FaultOp::SyncDir { dir } if dir.is_empty() => Some(io::Error::other("root dirsync failed")),
+        FaultOp::SyncDir { dir: "" } => Some(io::Error::other("root dirsync failed")),
         _ => None,
     })));
     // Unit 9 lives in shard 1 (8 units per shard): its catalog commit fails.
