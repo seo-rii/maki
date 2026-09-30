@@ -1630,6 +1630,26 @@ impl VolumeConfig {
                 }
             }
         }
+        // Binding the control socket replaces whatever file is at its path,
+        // so it must never share one with the NBD export socket. Compare the
+        // effective paths (defaults included) component-wise, so `a//b` and
+        // `a/./b` name the same file.
+        let control_socket = self.control.socket.clone().unwrap_or_else(|| {
+            format!("/run/maki-control/{}/control.sock", self.volume.name)
+        });
+        let nbd_socket = self
+            .nbd
+            .socket
+            .clone()
+            .unwrap_or_else(|| format!("/run/maki/{}/nbd.sock", self.volume.name));
+        if std::path::Path::new(&control_socket)
+            .components()
+            .eq(std::path::Path::new(&nbd_socket).components())
+        {
+            return Err(invalid(format!(
+                "control.socket {control_socket:?} must differ from nbd.socket {nbd_socket:?}"
+            )));
+        }
         if let Some(group) = &self.control.group {
             if group.trim().is_empty() {
                 return Err(invalid("control.group must not be empty"));

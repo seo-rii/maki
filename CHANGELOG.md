@@ -96,6 +96,12 @@ documents.
 
 ### Fixed
 
+- Configuration validation refuses a `control.socket` that names the same
+  file as `nbd.socket` (defaults included); binding the control socket
+  replaces whatever is at its path.
+- The control server's "unknown command" error echoes at most 64 characters
+  of the name, so the response always fits the client's 64 KiB line limit.
+
 - `control.group` resolution retries `getgrnam_r` with a larger buffer on
   `ERANGE`; a directory group whose record exceeded 16 KiB made attach fail.
 

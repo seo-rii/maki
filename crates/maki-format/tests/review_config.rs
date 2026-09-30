@@ -618,3 +618,35 @@ fn followup_inflight_byte_budgets_must_cover_a_full_batch() {
     ));
     assert!(msg.contains("max_inflight_bytes_per_endpoint"), "{msg}");
 }
+
+/// The control socket and the NBD export socket must be different files:
+/// binding the control socket replaces whatever is at its path, so a shared
+/// path silently takes the NBD listener's name away (or the reverse).
+#[test]
+fn control_and_nbd_sockets_must_differ() {
+    let shared = format!(
+        "{}[control]\nsocket = \"/run/maki/t/nbd.sock\"\n[nbd]\nsocket = \"/run/maki/t/nbd.sock\"\n",
+        local()
+    );
+    let error = err(&shared);
+    assert!(
+        error.contains("control.socket") && error.contains("nbd.socket"),
+        "{error}"
+    );
+    // An explicit control socket equal to the default NBD socket collides
+    // too, and so does a spelling that names the same path.
+    let default_nbd = format!("{}[control]\nsocket = \"/run/maki/t/nbd.sock\"\n", local());
+    assert!(err(&default_nbd).contains("nbd.socket"));
+    let respelled = format!(
+        "{}[control]\nsocket = \"/run/maki/t//nbd.sock\"\n[nbd]\nsocket = \"/run/maki/t/./nbd.sock\"\n",
+        local()
+    );
+    assert!(err(&respelled).contains("nbd.socket"));
+    parse(&format!(
+        "{}[control]\nsocket = \"/run/maki-control/t/control.sock\"\n[nbd]\nsocket = \"/run/maki/t/nbd.sock\"\n",
+        local()
+    ))
+    .validate()
+    .unwrap();
+    parse(&local()).validate().unwrap();
+}
