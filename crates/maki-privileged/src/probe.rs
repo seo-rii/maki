@@ -129,9 +129,16 @@ pub fn parse_mountinfo(text: &str, mountpoint: &str) -> Option<MountEntry> {
 
 /// Index of a `/dev/nbdN` device.
 pub fn nbd_index(device: &str) -> Option<u32> {
-    device
-        .strip_prefix("/dev/nbd")
-        .and_then(|rest| rest.parse::<u32>().ok())
+    // Canonical spelling only (`/dev/nbd1`, never `/dev/nbd01` or `+1`):
+    // identity checks compare device names as strings.
+    let rest = device.strip_prefix("/dev/nbd")?;
+    if rest.is_empty()
+        || !rest.bytes().all(|b| b.is_ascii_digit())
+        || (rest.len() > 1 && rest.starts_with('0'))
+    {
+        return None;
+    }
+    rest.parse::<u32>().ok()
 }
 
 /// Choose the lowest-numbered device that is not connected.

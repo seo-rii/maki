@@ -100,7 +100,7 @@ impl AttachConfig {
             .unwrap_or_else(|| AUTO_NBD_DEVICE.to_string());
         if nbd_device != AUTO_NBD_DEVICE {
             check_abs_path("nbd_device", &nbd_device)?;
-            if !nbd_device.starts_with("/dev/nbd") {
+            if crate::probe::nbd_index(&nbd_device).is_none() {
                 return Err(ConfigError::Invalid(format!(
                     "nbd_device {nbd_device:?} must be a /dev/nbdN device"
                 )));

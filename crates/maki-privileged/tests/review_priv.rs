@@ -620,3 +620,28 @@ mod mount_root_hygiene {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A pinned NBD device must be spelled canonically: `nbd-client` connects
+/// `/dev/nbd01` as nbd1, but identity checks compare the configured string
+/// with kernel and mountinfo names, so a non-canonical spelling attached
+/// and then failed every verification.
+#[test]
+fn pinned_nbd_devices_must_be_canonical() {
+    assert_eq!(nbd_index("/dev/nbd0"), Some(0));
+    assert_eq!(nbd_index("/dev/nbd15"), Some(15));
+    for device in ["/dev/nbd01", "/dev/nbd+1", "/dev/nbd", "/dev/nbd1p1", "/dev/nbd 1"] {
+        assert_eq!(nbd_index(device), None, "{device}");
+    }
+    let cfg = parse(&config_text()).unwrap();
+    for device in ["/dev/nbd01", "/dev/nbd+1", "/dev/nbdx"] {
+        let result = cfg.clone().into_request(
+            "pg",
+            AttachOverrides {
+                nbd_device: Some(device.into()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(result.is_err(), "{device} must be refused");
+    }
+}
