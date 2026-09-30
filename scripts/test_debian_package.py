@@ -207,6 +207,27 @@ class DebianPackageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("maki@pg.service", result.stderr)
 
+    def test_prerm_refuses_removal_while_a_recovery_unit_runs(self):
+        # R5-015: maki-recover@ runs maki-attach from the package after a
+        # daemon failure, and keeps doing so after the record is gone.
+        package = self.build()
+        _, control = self.extract(package, "prerm-recover")
+        state = self.work / "state-recover"
+        state.mkdir()
+        recovering = self.work / "systemctl-recover"
+        recovering.write_text(
+            "#!/bin/sh\n"
+            "for pattern in \"$@\"; do\n"
+            "  [ \"$pattern\" = 'maki-recover@*.service' ] && "
+            "echo 'maki-recover@pg.service loaded activating start Maki fixture'\n"
+            "done\n"
+            "exit 0\n"
+        )
+        recovering.chmod(0o755)
+        result = self.run_prerm(control, "remove", state, recovering)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("maki-recover@pg.service", result.stderr)
+
     def test_prerm_fails_closed_when_systemd_cannot_be_queried(self):
         # A failed `systemctl list-units` proves nothing about the maki
         # units; treating its empty output as "idle" let removal proceed

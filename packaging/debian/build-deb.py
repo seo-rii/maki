@@ -276,8 +276,8 @@ case "$1" in
             # than read its empty output as "idle".
             if listed=$("$systemctl_bin" list-units --plain --no-legend \\
                 --state=active,activating,reloading,deactivating \\
-                'maki@*.service' 'maki-attach@*.service' 'maki-workload@*.target' \\
-                2>/dev/null); then
+                'maki@*.service' 'maki-attach@*.service' 'maki-recover@*.service' \\
+                'maki-workload@*.target' 2>/dev/null); then
                 for unit in $(printf '%s\\n' "$listed" | awk '{print $1}'); do
                     busy="$busy unit:$unit"
                 done
@@ -289,7 +289,8 @@ case "$1" in
             echo "maki: refusing to remove the package while volumes are attached:$busy" >&2
             echo "maki: for each volume run 'maki drain <config>' after the workload has" \\
                 "quiesced, deactivate its lifecycle target maki-workload@<volume>.target," \\
-                "wait for maki-attach@ and maki@ to become inactive, and retry the removal" >&2
+                "wait for maki-attach@, maki-recover@ and maki@ to become inactive, and retry" \\
+                "the removal" >&2
             exit 1
         fi
         ;;

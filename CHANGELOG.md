@@ -102,6 +102,8 @@ documents.
 
 ### Fixed
 
+- Package removal is also refused while a `maki-recover@` unit is active
+  (R5-015).
 - A huge configured circuit-breaker duration no longer panics the
   dispatcher on the first trip (R5-013); `reload cache` refuses a size of 0
   or larger than the device (R5-014).

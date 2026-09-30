@@ -641,8 +641,8 @@ missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
 Removing the package (`apt remove maki`) is refused by its `prerm` while any
-trusted attachment record exists or a `maki@`, `maki-attach@` or
-`maki-workload@` unit is active: the helper being removed is what the
+trusted attachment record exists or a `maki@`, `maki-attach@`,
+`maki-recover@` or `maki-workload@` unit is active: the helper being removed is what the
 lifecycle needs to detach. A failed `systemctl` query refuses the removal too. Drain and deactivate every volume first. Upgrades
 are not blocked and no maintainer script starts, stops or restarts a service
 ([package behaviour](../packaging/debian/README.md#removal-and-upgrade-behaviour)).
