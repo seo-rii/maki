@@ -102,33 +102,24 @@ fn depends_only_on(
     Ok(any)
 }
 
+/// Detach, attach rollback and recovery identify the mount from kernel
+/// metadata only: the recorded LV by device number, root `/`, XFS, and an
+/// exclusive dependency on the recorded NBD device. The sentinel inside the
+/// mount root is workload-controlled, so it proves nothing here and must not
+/// be able to block cleanup (R5-006); attach and `verify` still check it.
 pub(crate) fn observe(
     record: &BoundDeviceRecord,
     mountinfo: &str,
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
-    observe_rollback(record, mountinfo, sysfs, false)
+    observe_kernel(record, mountinfo, sysfs)
 }
 
-/// Only an attach that observed an empty target before connecting may allow
-/// an absent initial sentinel while undoing its own attempted mount. A wrong,
-/// unreadable, or non-regular sentinel is never evidence of an initial mount.
-pub(crate) fn observe_rollback(
-    record: &BoundDeviceRecord,
-    mountinfo: &str,
-    sysfs: &Path,
-    allow_missing_sentinel: bool,
-) -> io::Result<DetachObservation> {
-    observe_kernel(record, mountinfo, sysfs, allow_missing_sentinel, true)
-}
-
-/// Recovery observes only kernel metadata, never the disconnected filesystem.
+/// Kernel-only observation, shared by detach, rollback and recovery.
 pub(crate) fn observe_kernel(
     record: &BoundDeviceRecord,
     mountinfo: &str,
     sysfs: &Path,
-    allow_missing_sentinel: bool,
-    check_sentinel: bool,
 ) -> io::Result<DetachObservation> {
     let nbd_index = crate::probe::nbd_index(&record.device)
         .ok_or_else(|| invalid("invalid recorded NBD device"))?;
@@ -213,23 +204,6 @@ pub(crate) fn observe_kernel(
         }
     }
     let mounted = mounted_device.is_some();
-    if mounted
-        && check_sentinel
-        && crate::exec::read_sentinel(&record.attachment.mountpoint).as_deref()
-            != Some(&record.attachment.volume_uuid)
-    {
-        let missing = matches!(
-            std::fs::symlink_metadata(
-                Path::new(&record.attachment.mountpoint).join(crate::plan::SENTINEL_FILE)
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound
-        );
-        if !allow_missing_sentinel || !missing {
-            return Err(invalid(
-                "mounted volume sentinel no longer matches the attachment",
-            ));
-        }
-    }
     Ok(DetachObservation {
         mounted,
         vg_active,

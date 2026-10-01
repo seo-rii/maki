@@ -638,13 +638,6 @@ trait System {
     fn allocate(&mut self) -> Result<String, ExecError>;
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation>;
-    fn rollback_observation(
-        &self,
-        record: &BoundDeviceRecord,
-        _allow_missing_sentinel: bool,
-    ) -> io::Result<DetachObservation> {
-        self.detach_observation(record)
-    }
 }
 
 struct LinuxSystem;
@@ -750,19 +743,6 @@ impl System for LinuxSystem {
             Path::new("/sys/class/block"),
         )
     }
-
-    fn rollback_observation(
-        &self,
-        record: &BoundDeviceRecord,
-        allow_missing_sentinel: bool,
-    ) -> io::Result<DetachObservation> {
-        crate::detach::observe_rollback(
-            record,
-            &std::fs::read_to_string("/proc/self/mountinfo")?,
-            Path::new("/sys/class/block"),
-            allow_missing_sentinel,
-        )
-    }
 }
 
 fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
@@ -861,13 +841,12 @@ fn attach_rollback(
     record: &BoundDeviceRecord,
     system: &mut impl System,
     rolled_back: &mut usize,
-    allow_missing_sentinel: bool,
     activation: Option<&lvm_preflight::VerifiedLvm>,
 ) -> bool {
     // Each successful step removes one of at most three layers; the bound just
     // guards against an observation that never converges.
     for _ in 0..16 {
-        let observed = match system.rollback_observation(record, allow_missing_sentinel) {
+        let observed = match system.detach_observation(record) {
             Ok(o) => o,
             Err(e) => {
                 tracing::error!("maki-attach: rollback halted, live state unreadable: {e}");
@@ -1268,9 +1247,6 @@ fn execute_with_options(
                     record.as_ref().unwrap(),
                     system,
                     &mut rolled_back,
-                    plan.steps
-                        .iter()
-                        .any(|s| matches!(s, PlannedStep::WriteSentinel { .. })),
                     activation_identity
                         .as_ref()
                         .filter(|_| activation_attempted),

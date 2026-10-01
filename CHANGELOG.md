@@ -106,6 +106,11 @@ documents.
 
 ### Fixed
 
+- Detach, cleanup and attach rollback no longer require
+  `<mountpoint>/.maki-sentinel` (R5-006): a workload that deleted or
+  rewrote it blocked `maki-attach cleanup`. The mount is identified from
+  kernel metadata, as recovery already did; attach and `verify` still check
+  the sentinel.
 - `maki-attach` refuses `mountpoint = "/"` (R5-019).
 - `maki volume create` refuses a backing root that still holds an earlier
   volume's `data/`, `journal/` or `checkpoint/` files (R5-018); they used to

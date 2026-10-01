@@ -462,8 +462,11 @@ single-LV topology qualified on the disposable GCE host.
 
 Detach retries observe current mountinfo and sysfs state before each step.
 An already completed unmount or VG deactivation is skipped. A remaining mount
-must identify the expected LV device, XFS root, and volume sentinel, and active
-VG mappings must use the recorded NBD device. A different mount or backend,
+must identify the expected LV device and XFS root, and active VG mappings must
+use the recorded NBD device. Detach, cleanup and attach rollback identify the
+mount from kernel metadata only: the sentinel lives in the workload-owned mount
+root, so deleting or rewriting it must not be able to block cleanup (attach and
+`verify` still require it). A different mount or backend,
 unreadable observations, remaining device holders (including partition
 holders), and direct mounts of the NBD device or its partitions block unsafe
 deactivation or disconnect.

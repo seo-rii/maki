@@ -106,7 +106,7 @@ fn observation_distinguishes_complete_and_partial_detach() {
 }
 
 #[test]
-fn replacement_mount_device_filesystem_subtree_or_sentinel_is_rejected() {
+fn replacement_mount_device_filesystem_or_subtree_is_rejected() {
     let fixture = Fixture::new();
     fixture.mapping("vg--maki-data--lv", "nbd3");
     for (device, root, fs) in [
@@ -118,14 +118,6 @@ fn replacement_mount_device_filesystem_subtree_or_sentinel_is_rejected() {
             .observe(&fixture.mountinfo(device, root, fs))
             .is_err());
     }
-    std::fs::write(
-        Path::new(&fixture.record.attachment.mountpoint).join(crate::plan::SENTINEL_FILE),
-        "other-volume",
-    )
-    .unwrap();
-    assert!(fixture
-        .observe(&fixture.mountinfo("253:0", "/", "xfs"))
-        .is_err());
 }
 
 #[test]
@@ -189,40 +181,32 @@ fn direct_mounts_of_the_recorded_nbd_or_its_partition_prevent_disconnect() {
     }
 }
 
+/// R5-006: the mount root belongs to the workload, so the sentinel in it is
+/// workload-controlled. Detach and rollback identify the mount from the
+/// kernel (the recorded LV by device number, root `/`, XFS, an exclusive
+/// dependency on the recorded NBD device); deleting, rewriting or replacing
+/// the sentinel must not block the cleanup of a verified mount.
 #[test]
-fn initial_rollback_only_relaxes_a_missing_sentinel() {
+fn the_workload_cannot_block_detach_through_its_sentinel() {
     let fixture = Fixture::new();
     fixture.mapping("vg--maki-data--lv", "nbd3");
     let mounts = fixture.mountinfo("253:0", "/", "xfs");
     let sentinel =
         Path::new(&fixture.record.attachment.mountpoint).join(crate::plan::SENTINEL_FILE);
     std::fs::remove_file(&sentinel).unwrap();
-    assert!(
-        fixture.observe(&mounts).is_err(),
-        "ordinary detach remains strict"
-    );
-    assert!(
-        observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true)
-            .unwrap()
-            .mounted
-    );
-    for contents in ["wrong-uuid", "", "malformed\nvalue"] {
+    assert!(fixture.observe(&mounts).unwrap().mounted, "deleted");
+    for contents in ["other-volume", "", "malformed\nvalue"] {
         std::fs::write(&sentinel, contents).unwrap();
-        assert!(
-            observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true).is_err()
-        );
+        assert!(fixture.observe(&mounts).unwrap().mounted, "{contents:?}");
     }
     std::fs::remove_file(&sentinel).unwrap();
     std::os::unix::fs::symlink("absent-target", &sentinel).unwrap();
-    assert!(observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true).is_err());
+    assert!(fixture.observe(&mounts).unwrap().mounted, "symlink");
     std::fs::remove_file(&sentinel).unwrap();
     std::fs::create_dir(&sentinel).unwrap();
-    assert!(observe_rollback(&fixture.record, &mounts, &fixture.root.join("sys"), true).is_err());
-    assert!(observe_rollback(
-        &fixture.record,
-        &fixture.mountinfo("253:1", "/", "xfs"),
-        &fixture.root.join("sys"),
-        true
-    )
-    .is_err());
+    assert!(fixture.observe(&mounts).unwrap().mounted, "directory");
+    // The kernel identity still decides: another device is refused.
+    assert!(fixture
+        .observe(&fixture.mountinfo("253:1", "/", "xfs"))
+        .is_err());
 }

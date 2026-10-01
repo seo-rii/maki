@@ -1469,13 +1469,6 @@ impl System for ObservedSystem {
         self.fake.backend(d)
     }
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        self.rollback_observation(record, false)
-    }
-    fn rollback_observation(
-        &self,
-        record: &BoundDeviceRecord,
-        allow_missing: bool,
-    ) -> io::Result<DetachObservation> {
         let mounts = if self.fake.mounted {
             format!(
                 "40 25 253:0 / {} rw,nosuid,nodev - xfs /dev/mapper/vg_maki_pg-data rw\n",
@@ -1484,7 +1477,7 @@ impl System for ObservedSystem {
         } else {
             String::new()
         };
-        crate::detach::observe_rollback(record, &mounts, &self.sysfs, allow_missing)
+        crate::detach::observe(record, &mounts, &self.sysfs)
     }
 }
 

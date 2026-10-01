@@ -1108,10 +1108,8 @@ that failed before the change.
 | R5-022 (create output) | `maki volume create` printed `created volume <provider type>`, labelling the provider as the volume name. | The line names the volume and the provider separately. | `volume_lifecycle_create_inspect_check` (maki `e2e.rs`) |
 | R5-023 (command environment) | The attach, detach and grow steps (`mount`, `umount`, `nbd-client`, `lvextend`, `xfs_growfs`, `vgchange`, `modprobe`) and their `blkid`/`blockdev` probes ran through a bare `Command::new`, inheriting the caller's environment and `PATH`; only `recover` and the LVM preflight cleared it. | One `command::controlled` builder (cleared environment, fixed system `PATH`, `LC_ALL=C`) is used for every external command of the helper. | `step_commands_do_not_inherit_the_callers_environment` (maki-privileged `exec_tests.rs`) |
 
-Not changed in this pass, pending a decision: detach, cleanup and recover of a
-live backend still require `<mountpoint>/.maki-sentinel` to match (a
-workload that deletes it blocks `maki-attach cleanup`; the dead-backend
-recovery path already ignores it), and the mountpoint directory itself may
-still belong to the workload. `NbdAdapter::shutdown` has no panic guard of its
-own; storage and provider panics already become errors before it, and no
-reachable panic was found.
+| R5-006 (detach sentinel) | Detach, cleanup and attach rollback of a live backend required `<mountpoint>/.maki-sentinel` to match. The mount root belongs to the workload, which could delete, rewrite or replace the file and make every `maki-attach@` stop fail with XFS still mounted. The same observation already bound the mount to the recorded LV (device number, root `/`, XFS, exclusive NBD dependency), so the sentinel added no proof. | `detach::observe` is kernel-only, like recovery; the `allow_missing_sentinel` rollback flag is gone. Attach and `verify` keep the sentinel as an identity input. This supersedes the earlier design whose tests asserted that ordinary detach stays strict (`initial_rollback_only_relaxes_a_missing_sentinel` and the sentinel half of the replacement-mount test are replaced). | `the_workload_cannot_block_detach_through_its_sentinel` (maki-privileged `detach_tests.rs`: deleted, rewritten, symlinked and directory sentinels; another device is still refused) |
+
+`NbdAdapter::shutdown` has no panic guard of its own (R5-016, not changed):
+storage and provider panics already become errors before it, and no reachable
+panic was found.

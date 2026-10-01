@@ -142,14 +142,6 @@ impl System for FilesystemSystem {
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         self.inner.detach_observation(record)
     }
-
-    fn rollback_observation(
-        &self,
-        record: &BoundDeviceRecord,
-        allow_missing: bool,
-    ) -> io::Result<DetachObservation> {
-        self.inner.rollback_observation(record, allow_missing)
-    }
 }
 
 fn filesystem_fixture() -> (Fixture, TrustedState, AttachRequest, FilesystemSystem) {

@@ -345,7 +345,7 @@ pub(super) fn capture(
     mounts: &str,
     sysfs: &Path,
 ) -> io::Result<RecoveryProof> {
-    let observed = crate::detach::observe_kernel(record, mounts, sysfs, false, false)?;
+    let observed = crate::detach::observe_kernel(record, mounts, sysfs)?;
     if observed.mounted || !observed.vg_active {
         return Err(invalid(
             "cannot record recovery identity without an active VG and an empty mount target",
@@ -377,7 +377,7 @@ pub(super) fn observe(
     mounts: &str,
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
-    let observed = crate::detach::observe_kernel(record, mounts, sysfs, false, false)?;
+    let observed = crate::detach::observe_kernel(record, mounts, sysfs)?;
     let Some(proof) = &record.recovery else {
         if let Some(intent) = &record.recovery_intent {
             if observed.mounted {

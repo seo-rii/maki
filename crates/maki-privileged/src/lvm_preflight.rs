@@ -579,8 +579,6 @@ fn ensure_inactive(record: &BoundDeviceRecord) -> io::Result<()> {
         record,
         &std::fs::read_to_string("/proc/self/mountinfo")?,
         Path::new("/sys/class/block"),
-        false,
-        false,
     )?;
     if observed.mounted || observed.vg_active || observed.nbd_in_use {
         return Err(invalid(
