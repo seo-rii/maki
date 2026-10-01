@@ -11,6 +11,11 @@ documents.
 
 ### Breaking changes
 
+- **The mountpoint directory must be root-owned and not group/other
+  writable** (R5-024), like its ancestors: a workload-owned mountpoint let
+  the workload stack a FUSE mount over it before attach mounted the volume.
+  Recreate it with `install -d -m 0755 /srv/<volume>` (root) before attach;
+  the volume's own root directory keeps the workload's ownership.
 - **`maki-benchmark` refuses an existing volume without `--destroy-data`**
   (R5-017): it overwrites the start of the device (partition table,
   filesystem superblock) and used to do so to whatever volume its

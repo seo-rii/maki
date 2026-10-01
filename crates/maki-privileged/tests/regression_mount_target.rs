@@ -1,5 +1,5 @@
-//! The XFS mount runs as root onto a path the configuration names, and the
-//! directories along that path may belong to the workload (for example a
+//! The XFS mount runs as root onto a path the configuration names, and a
+//! workload could own directories along that path (for example a
 //! `postgres`-owned parent). `mount(8)` resolves symlinks, so a workload
 //! that replaced the mountpoint with a symlink to `/etc` got a filesystem
 //! it controls mounted over `/etc`, and neither rollback nor detach could
@@ -105,4 +105,31 @@ fn a_missing_or_non_directory_mountpoint_is_refused() {
     assert!(check_mount_target(root.join("absent").to_str().unwrap(), &trusted()).is_err());
     std::fs::write(root.join("file"), b"x").unwrap();
     assert!(check_mount_target(root.join("file").to_str().unwrap(), &trusted()).is_err());
+}
+
+/// R5-024: the mountpoint directory itself had no owner or mode rule, so a
+/// workload owning it could `fusermount` over it between the check and the
+/// mount: XFS then stacked on the FUSE mount, verification failed and the
+/// rollback halted with XFS mounted. The directory is hidden once the
+/// volume is mounted, so requiring it to be root-owned and not writable by
+/// group or others costs workloads nothing (the volume's own root carries
+/// their ownership).
+#[test]
+fn a_mountpoint_owned_or_writable_by_others_is_refused() {
+    let root = tree("mountpoint-owner");
+    if !ancestors_are_safe(&root) {
+        return;
+    }
+    let mountpoint = root.join("data");
+    std::fs::create_dir(&mountpoint).unwrap();
+    std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let error = check_mount_target(mountpoint.to_str().unwrap(), &trusted()).unwrap_err();
+    assert!(error.to_string().contains("writable"), "{error}");
+    std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o755)).unwrap();
+    check_mount_target(mountpoint.to_str().unwrap(), &trusted()).unwrap();
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        let error = check_mount_target(mountpoint.to_str().unwrap(), &[0, 0]).unwrap_err();
+        assert!(error.to_string().contains("owned by uid"), "{error}");
+    }
 }

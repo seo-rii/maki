@@ -70,7 +70,7 @@ pub enum ExecError {
 /// along it may belong to the workload. Every ancestor must therefore be a
 /// real directory (not a symlink) owned by a `trusted` uid and not writable
 /// by group or others, so the path cannot change between this check and the
-/// mount; the mountpoint itself must be a real directory. Rollback and
+/// mount; the mountpoint itself must be such a directory too. Rollback and
 /// detach look for the mount at the configured path, so a redirected mount
 /// (say over `/etc`) could never be undone.
 pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecError> {
@@ -99,12 +99,18 @@ pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecE
         if !meta.is_dir() {
             return Err(refuse(format!("{} is not a directory", prefix.display())));
         }
-        if index + 1 == components.len() {
-            break;
-        }
+        // The mountpoint itself follows the same rule (R5-024): a workload
+        // owning it could stack a FUSE mount there between this check and
+        // the mount. It is hidden once the volume is mounted, so this costs
+        // the workload nothing; the volume's own root carries its ownership.
+        let what = if index + 1 == components.len() {
+            "the mountpoint directory"
+        } else {
+            "every ancestor of the mountpoint"
+        };
         if !trusted.contains(&meta.uid()) {
             return Err(refuse(format!(
-                "{} is owned by uid {}; every ancestor of the mountpoint must be owned by root",
+                "{} is owned by uid {}; {what} must be owned by root",
                 prefix.display(),
                 meta.uid()
             )));
@@ -112,7 +118,7 @@ pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecE
         if meta.mode() & 0o022 != 0 {
             return Err(refuse(format!(
                 "{} is writable by group or others (mode {:04o}); the mountpoint path could \
-                 be replaced before the mount",
+                 be replaced or mounted over before the mount",
                 prefix.display(),
                 meta.mode() & 0o7777
             )));
