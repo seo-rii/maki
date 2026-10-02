@@ -519,7 +519,9 @@ example `packaging/examples/maki-workload.service.d/10-maki.conf`, replace `pg`
 with the volume name, and adapt it below the real workload unit. Its essential
 contract is:
 
-The gate proves current kernel identity, mapping and mount topology; it does not
+The gate proves current kernel identity, mapping and mount topology, including
+a read-write mount with `nosuid` and `nodev`; a volume mounted before that rule
+(or remounted without it) fails the gate until it is reattached. It does not
 perform data I/O or test nbdkit process liveness. In the qualified crash run it
 still returned success immediately after nbdkit was killed because the kernel
 NBD connection and mapping remained. The lifecycle must react to daemon failure

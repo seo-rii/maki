@@ -469,6 +469,18 @@ pub(super) fn observe_complete(
         {
             return Err(invalid("workload mount is read-only"));
         }
+        // The volume's bytes come from the unprivileged daemon and the
+        // provider: a mount honouring their setuid bits or device nodes (one
+        // made before R5-002, or remounted) is not opened to the workload.
+        // Reattach the volume to remount it `nosuid,nodev`.
+        if !["nosuid", "nodev"]
+            .iter()
+            .all(|required| fields[5].split(',').any(|option| option == *required))
+        {
+            return Err(invalid(
+                "workload mount is not nosuid,nodev; reattach the volume",
+            ));
+        }
         verified_mount = Some(VerifiedMount {
             device: device_number(fields[2])?,
             mountinfo: line.into(),

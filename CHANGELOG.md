@@ -162,7 +162,9 @@ documents.
   device node inside the volume no longer takes effect on the host; attach
   verification refuses a mount without both flags, and `maki@.service` sets
   `DevicePolicy=closed`. Workloads that need setuid programs or device nodes
-  on the volume are not supported.
+  on the volume are not supported. The `maki-attach verify` workload gate
+  refuses a mount without both flags as well: reattach volumes mounted by an
+  earlier build before restarting their workload.
 - `remote-http`: a combined certificate/private-key PEM (`client_cert_file`
   without `client_key`) now passes the `file` credential checks (no symlink,
   not group/other-readable); every TLS file must be a regular file, so a

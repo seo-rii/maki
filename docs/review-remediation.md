@@ -1151,9 +1151,12 @@ Follow-ups from a review of the R5 commits themselves:
   integrity failure in a coalesced decrypt batch fails every request in it
   (the error fans out, as before `1678e3e`). That is the cost of never
   sending a request twice.
-- **R5-002 scope:** the post-mount checks of `maki-attach attach` require
-  `nosuid,nodev`; the `maki-attach verify` workload gate does not, so a
-  volume mounted before this change still passes it until it is reattached.
+- **R5-002 scope:** the post-mount checks of `maki-attach attach` required
+  `nosuid,nodev` but the `maki-attach verify` workload gate did not, so a
+  volume mounted before the change (or remounted `suid`) still opened to the
+  workload. The gate now refuses such a mount and asks for a reattach
+  (`missing_read_only_subtree_stacked_or_extra_mounts_refuse_the_gate`,
+  cases `suid` and `dev`).
 
 Considered and left as is: the HTTP provider classifies TLS failures by
 searching the transport error's `Debug` text. A missed match makes a TLS

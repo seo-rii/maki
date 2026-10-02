@@ -209,7 +209,12 @@ fn cleanup_subset_evidence_does_not_authorize_a_workload_start() {
 
 #[test]
 fn missing_read_only_subtree_stacked_or_extra_mounts_refuse_the_gate() {
-    for case in ["missing", "ro", "subtree", "stacked", "extra"] {
+    // "suid"/"dev": a mount without `nosuid`/`nodev` (one made before
+    // R5-002, or remounted) honours setuid bits or device nodes from the
+    // untrusted volume and must not be opened to the workload.
+    for case in [
+        "missing", "ro", "subtree", "stacked", "extra", "suid", "dev",
+    ] {
         let (_fixture, state, req, mut system) = fixture();
         let record = state.read("pg").unwrap().unwrap();
         let mount = system.inner.mounts(&record);
@@ -219,6 +224,8 @@ fn missing_read_only_subtree_stacked_or_extra_mounts_refuse_the_gate() {
             "subtree" => mount.replace("253:0 / ", "253:0 /subdir "),
             "stacked" => format!("{mount}{mount}"),
             "extra" => format!("{mount}41 25 253:0 / /other rw - xfs /dev/dm-0 rw\n"),
+            "suid" => mount.replace("rw,nosuid,nodev -", "rw,nodev -"),
+            "dev" => mount.replace("rw,nosuid,nodev -", "rw,nosuid -"),
             _ => unreachable!(),
         });
         assert!(
@@ -247,7 +254,7 @@ fn foreign_descendant_mounts_refuse_the_gate_before_filesystem_reads() {
             record.attachment.mountpoint = req.mountpoint.clone();
             state.write(&record).unwrap();
             let root_mount = format!(
-                "40 25 253:0 / {} rw - xfs /dev/dm-0 rw\n",
+                "40 25 253:0 / {} rw,nosuid,nodev - xfs /dev/dm-0 rw\n",
                 mountinfo_path(&req.mountpoint)
             );
             let child_mount = format!(
@@ -298,7 +305,7 @@ fn root_mount_gate_treats_every_other_absolute_mount_as_a_descendant() {
     crate::config::check_abs_path("mountpoint", "/").unwrap();
     let mut record = state.read("pg").unwrap().unwrap();
     record.attachment.mountpoint = "/".into();
-    let root = "40 25 253:0 / / rw - xfs /dev/dm-0 rw\n";
+    let root = "40 25 253:0 / / rw,nosuid,nodev - xfs /dev/dm-0 rw\n";
     assert!(recover::observe_complete(&record, root, &system.inner.sysfs).is_ok());
     let nested = format!("{root}41 40 0:9 / /proc rw - proc proc rw\n");
     assert!(recover::observe_complete(&record, &nested, &system.inner.sysfs).is_err());
