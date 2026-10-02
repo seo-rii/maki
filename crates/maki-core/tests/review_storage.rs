@@ -372,22 +372,30 @@ fn recovery_truncates_torn_final_record_header() {
     assert!(vol.read_ct(1).unwrap().is_none());
 }
 
-/// A journal segment far larger than the writer can ever produce is
-/// rejected up front rather than read into memory.
+/// A journal segment far larger than any writer can produce is rejected up
+/// front rather than read. The bound follows the largest configurable
+/// segment size (R5-033), so the oversized file is a sparse one on a real
+/// filesystem; the simulator would hold it in memory.
+#[cfg(unix)]
 #[test]
 fn recovery_rejects_oversized_segment_before_allocation() {
-    let _guard = failpoints::test_lock();
-    let backing = Arc::new(CrashableBacking::new());
-    let mut vol = new_volume(&backing);
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn Backing> =
+        Arc::new(maki_backing::FileBacking::new(dir.path().join("volume")).unwrap());
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
+    let mut vol = Volume::recover(backing.clone(), options()).unwrap();
     vol.write_ct(0, &ct(1), true).unwrap();
     let seg = vol.journal_active_segment_path().unwrap();
     drop(vol);
 
     let f = backing.open(&seg, false).unwrap();
-    f.set_len(maki_format::journal::max_segment_file_size(SEGMENT_SIZE) + 1)
+    f.set_len(maki_format::journal::max_journal_segment_file_size() + 1)
         .unwrap();
     f.sync_data().unwrap();
-    let msg = expect_corrupt(recover(&backing));
+    let msg = match Volume::recover(backing, options()).map(|_| ()) {
+        Err(RecoveryError::Corrupt(msg)) => msg,
+        other => panic!("expected Corrupt, got {other:?}"),
+    };
     assert!(msg.contains("exceeds"), "{msg}");
 }
 

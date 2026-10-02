@@ -1077,7 +1077,7 @@ regression test that failed before the change.
 | R4-005 (overlay bound) | `limits.max_ciphertext_bytes` only bounds the remote scheduler's pending queue (local providers bypass it), while the overlay that holds journaled, uncheckpointed ciphertext had no bound of its own: with a slow or failing checkpoint it could grow toward the multi-GiB `journal_max_bytes`, a disk budget that is not an instance's RAM budget. | New `limits.max_overlay_bytes` (default 256 MiB) and `limits.max_overlay_entries` (default 262144) reach `EngineLimits`. Admission charges a request at its eventual size (`max(bytes, 2 × latest_bytes) + 2 × payload`, since every unit ends up with a durable copy); a write that would exceed a bound syncs and checkpoints inline like the journal hard limit and returns ENOSPC after a failed reclaim; the worker checkpoints at half of either bound. The overlay tracks `latest_bytes` (sanitizer-checked). Validation requires the byte bound to hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice and the entry bound to hold it in units; `0` disables. Library callers keep the unbounded default. Follow-up (2026-09-29): a write still over a bound after its reclaim was refused even when concurrent writers' volatile records were what kept it out (a checkpoint retires only up to the durable mark); it now syncs and takes another round while volatile records exist, up to `MAX_RECLAIM_ROUNDS` (4), for the journal hard limit too. | `review_r4_overlay_bound.rs` (maki-core: bytes and entries stay under their limits through 96/40 writes without journal pressure, the worker checkpoints on the watermark with a manual clock, a failed reclaim refuses the write and degrades, zero keeps library callers unbounded, `a_concurrent_volatile_write_during_inline_reclaim_does_not_cause_enospc`), `review_r4_overlay_limits.rs` (maki-format defaults, zero, minimums), `review_r4_overlay_options.rs` (maki-nbdkit mapping) |
 | R4-006 (cache-first reads) | `read_secret` called `read_ct` (slot header, full ciphertext, CRC) *before* consulting the plaintext cache, so a hit only saved the provider call: the cache was a decryption cache, not a read cache. | The read path first establishes the unit's current write sequence (`Volume::current_sequence`: overlay entry, else the 64-byte slot header through `SlotStore::slot_sequence`, which applies every header-level refusal of `read_slot`) and serves a `(unit, sequence)` hit without reading the payload; misses read and decrypt as before. Versioning is unchanged (a newer write changes the sequence). Documented trade-off: a hit does not re-verify the on-disk payload CRC of an already validated version until the entry is evicted; header damage still refuses the read and the deep check still finds payload damage. Follow-up (2026-09-29): `cache.verify_on_hit = true` re-reads and CRC-checks the payload on every hit and uses the cache only to skip decryption. `CrashableBacking::read_bytes()` counts served read bytes for tests. | `review_r4_cache_reads.rs` (maki-core: a hit reads ≤ 64 bytes and no provider call, an overlay hit reads nothing, newer versions miss, header damage is EIO despite a cached entry, payload damage is served until eviction then EIO, no-cache reads still verify, `verify_on_hit_rereads_the_payload_but_skips_decryption`; maki-nbdkit `review_r4_cache_verify_options.rs`: off by default, reaches the engine) |
 
-## Fifth review (2026-10-01): R5-001–R5-032
+## Fifth review (2026-10-01): R5-001–R5-033
 
 A whole-tree review of `10b0b25` found CI red on `main` and a set of
 privileged, transport and discard defects; none loses FLUSH-acknowledged data
@@ -1157,6 +1157,22 @@ Follow-ups from a review of the R5 commits themselves:
   workload. The gate now refuses such a mount and asks for a reattach
   (`missing_read_only_subtree_stacked_or_extra_mounts_refuse_the_gate`,
   cases `suid` and `dev`).
+
+A second hunt over the journal, recovery scan, rollback backing, WebSocket
+provider, control server and NBD adapter found two more:
+
+| Finding | Problem | Fix | Tests |
+|---|---|---|---|
+| R5-033 (lowered segment size) | Recovery capped each segment file at four times the *configured* `journal_segment_size`. A checkpoint never deletes the active segment, so after a clean stop a segment of up to the old size stays on disk: lowering the setting by about 4x (256 MiB to 16 MiB) made attach and `maki check` report the clean volume as corrupt. | The setting is bounded by `MAX_JOURNAL_SEGMENT_SIZE` (1 GiB) and recovery caps segment files by the largest file any configuration's writer can produce; a larger file is still refused before it is read. The oversize regression moved to a sparse file on `FileBacking`. | `review_r5_segment_size.rs` (maki-core: 20 MiB segment written at 64 MiB, recovered at 1 MiB), `review_r5_segment_limit.rs` (maki-format), `recovery_rejects_oversized_segment_before_allocation` (maki-core `review_storage.rs`, Unix) |
+
+Also found, not changed: the rollback-protected backing (experimental)
+recomputes its committed and working slot sets for every page write, so a
+write's cost grows with committed data (one 64 KiB write took 29, 55 and
+124 ms at 32, 64 and 128 MiB committed). It needs an incremental free-slot
+structure before it can be qualified at its 1 GiB capacity. And cancelling or
+timing out one WebSocket request retires its connection and fails the other
+requests in flight on it as retryable, which a provider that is not
+retry-safe turns into EIO.
 
 Considered and left as is: the HTTP provider classifies TLS failures by
 searching the transport error's `Debug` text. A missed match makes a TLS

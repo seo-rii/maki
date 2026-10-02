@@ -1132,6 +1132,12 @@ impl VolumeConfig {
                 "backing.journal_segment_size {seg} must be at least 4096 bytes"
             )));
         }
+        if seg > crate::journal::MAX_JOURNAL_SEGMENT_SIZE {
+            return Err(ConfigError::Invalid(format!(
+                "backing.journal_segment_size {seg} must be at most {} bytes (1 GiB)",
+                crate::journal::MAX_JOURNAL_SEGMENT_SIZE
+            )));
+        }
         if max < seg.saturating_mul(2) {
             return Err(ConfigError::Invalid(format!(
                 "backing.journal_max_bytes {max} must be at least twice journal_segment_size {seg}"

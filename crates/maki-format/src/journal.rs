@@ -40,6 +40,18 @@ pub const DURABLE_MARK_MAGIC: &[u8; 8] = b"MAKIJDM1";
 pub const DURABLE_MARK_VERSION: u32 = 1;
 pub const DURABLE_MARK_SIZE: usize = 32;
 
+/// Largest `backing.journal_segment_size` a configuration may use.
+pub const MAX_JOURNAL_SEGMENT_SIZE: u64 = 1 << 30;
+
+/// Largest segment file any configuration's writer can produce. Recovery
+/// bounds segment files by this, not by the currently configured size: a
+/// checkpoint never deletes the active segment, so after a clean stop a
+/// segment of an earlier, larger size remains, and lowering the setting must
+/// not turn it into "corruption" (R5-033).
+pub fn max_journal_segment_file_size() -> u64 {
+    max_segment_file_size(MAX_JOURNAL_SEGMENT_SIZE)
+}
+
 /// Largest segment file the writer can produce for a configured segment
 /// size: a segment only exceeds its size by the single record that would
 /// not fit an empty segment. The generous multiple tolerates a segment size

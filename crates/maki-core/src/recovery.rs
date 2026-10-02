@@ -593,7 +593,11 @@ fn scan_journal_with_proof(
         .collect();
     names.sort();
 
-    let max_file_size = max_segment_file_size(segment_size);
+    // Bounded by the largest size any configuration may use, so a segment
+    // written before `journal_segment_size` was lowered stays readable
+    // (R5-033); a library caller's larger size still counts.
+    let max_file_size = max_segment_file_size(segment_size)
+        .max(maki_format::journal::max_journal_segment_file_size());
     let mut segments: Vec<SegmentInfo> = Vec::new();
     let mut repairs: Vec<JournalRepair> = Vec::new();
     let mut prev_last_seq: Option<u64> = None;
@@ -610,7 +614,8 @@ fn scan_journal_with_proof(
 
         if len > max_file_size {
             return Err(RecoveryError::Corrupt(format!(
-                "journal segment {name}: size {len} exceeds maximum {max_file_size}"
+                "journal segment {name}: size {len} exceeds maximum {max_file_size}, larger than \
+                 any journal segment a writer can produce"
             )));
         }
 

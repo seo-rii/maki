@@ -116,6 +116,9 @@ documents.
 
 ### Fixed
 
+- Lowering `backing.journal_segment_size` no longer makes a cleanly stopped
+  volume fail recovery as corrupt (R5-033); the setting is now limited to
+  1 GiB.
 - `maki@.service` adds kernel-log, clock, hostname, realtime, namespace,
   syscall-ABI and address-family restrictions (R5-031).
 - `maki-check` no longer creates a missing root directory (R5-026), and the

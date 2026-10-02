@@ -338,7 +338,7 @@ The size and TTL are runtime settings (`maki reload <config> cache`).
 
 | Setting | Enforced as |
 |---|---|
-| `backing.journal_segment_size` | Size at which the journal writer starts a new segment (at least 4096 bytes) |
+| `backing.journal_segment_size` | Size at which the journal writer starts a new segment (4096 bytes to 1 GiB). It may be changed between attaches, lowered included: recovery accepts segments of any size up to that maximum |
 | `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
 | `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
 | `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
