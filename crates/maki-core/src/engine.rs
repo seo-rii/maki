@@ -843,32 +843,66 @@ impl Engine {
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
 
         // Build plaintext for each touched unit (RMW for partial coverage).
+        // A partial unit's current version comes from the plaintext cache
+        // when it holds `(unit, sequence)`, exactly as on the read path
+        // (R4-006, including `verify_on_hit`); the unit locks keep the
+        // sequence stable meanwhile (R5-032).
         let volume = self.inner.volume.clone().read_owned().await;
+        let inner = self.inner.clone();
         let io_admission = admission.clone();
         let io_guards = guards.clone();
         let data_len = data.len();
-        let (rmw_cts, need_rmw) = storage_task(move || {
+        let (rmw_cts, need_rmw, cached) = storage_task(move || {
             let (_admission, _guards) = (io_admission, io_guards);
             let mut rmw_cts = Vec::new();
             let mut need_rmw = Vec::new();
+            let mut cached = HashMap::new();
             for unit in first..=last {
                 let unit_start = unit * unit_size;
                 let full =
                     offset <= unit_start && offset + data_len as u64 >= unit_start + unit_size;
-                if !full {
-                    need_rmw.push(unit);
-                    if let Some((_seq, ct)) = volume.read_ct(unit)? {
-                        rmw_cts.push(CiphertextUnit {
-                            unit_index: unit,
-                            data: ct,
-                        });
+                if full {
+                    continue;
+                }
+                need_rmw.push(unit);
+                if let Some(cache) = &inner.cache {
+                    if !inner.cache_verify_on_hit {
+                        match volume.current_sequence(unit)? {
+                            None => continue,
+                            Some(seq) => {
+                                if let Some(buf) = cache.get(unit, seq) {
+                                    cached.insert(unit, buf);
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
+                if let Some((seq, ct)) = volume.read_ct(unit)? {
+                    // With `verify_on_hit` the payload was just read and
+                    // CRC-checked; the cache only saves the decryption.
+                    let hit = inner
+                        .cache
+                        .as_ref()
+                        .filter(|_| inner.cache_verify_on_hit)
+                        .and_then(|cache| cache.get(unit, seq));
+                    if let Some(buf) = hit {
+                        cached.insert(unit, buf);
+                        continue;
+                    }
+                    rmw_cts.push(CiphertextUnit {
+                        unit_index: unit,
+                        data: ct,
+                    });
+                }
             }
-            Ok::<_, CoreError>((rmw_cts, need_rmw))
+            Ok::<_, CoreError>((rmw_cts, need_rmw, cached))
         })
         .await??;
         let mut existing = self.decrypt_units(rmw_cts).await?;
+        for (unit, buf) in cached {
+            existing.insert(unit, buf.duplicate());
+        }
 
         let mut items = Vec::with_capacity((last - first + 1) as usize);
         for unit in first..=last {
