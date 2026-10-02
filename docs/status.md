@@ -6,8 +6,8 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-01 (after the R5-001…R5-030 fixes; see the
-[remediation log](review-remediation.md#fifth-review-2026-10-01-r5-001r5-030)).
+Last updated: 2026-10-01 (after the R5-001…R5-031 fixes; see the
+[remediation log](review-remediation.md#fifth-review-2026-10-01-r5-001r5-031)).
 
 ## Release state
 
@@ -80,7 +80,10 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   setuid programs or device nodes on it are not supported.
 - v3 discard fixes of 2026-10-01 (long trims, admission under space pressure,
   punch ordering) passed the simulation and native libnbd tests only; no
-  kernel `fstrim` campaign has run against them yet.
+  kernel `fstrim` campaign has run against them yet. Likewise the
+  `nosuid,nodev` mount, the root-owned mountpoint and attach-config rules
+  and the added `maki@.service` sandboxing have not yet run through the
+  packaged GCE lifecycle.
 - Privileged attach supports the single-PV/single-data-LV XFS topology; other
   device-mapper layouts fail closed and need operator diagnosis
   ([storage recovery limits](storage-recovery.md#remaining-recovery-limits)).

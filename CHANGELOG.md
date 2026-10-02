@@ -116,6 +116,8 @@ documents.
 
 ### Fixed
 
+- `maki@.service` adds kernel-log, clock, hostname, realtime, namespace,
+  syscall-ABI and address-family restrictions (R5-031).
 - `maki-check` no longer creates a missing root directory (R5-026), and the
   deep check no longer reports nonexistent units of a truncated partial last
   shard (R5-027).

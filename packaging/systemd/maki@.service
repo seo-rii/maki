@@ -48,6 +48,17 @@ RestrictSUIDSGID=yes
 # included); only the pseudo devices remain. PrivateDevices= would also hide
 # the /dev nodes the swap policy check stats, so the cgroup policy is used.
 DevicePolicy=closed
+# R5-031: nothing here needs kernel logs, the clock, the hostname, realtime
+# scheduling, new namespaces or a foreign syscall ABI; sockets are UNIX
+# (NBD, control, sd_notify), IP (remote providers) and netlink (glibc
+# getaddrinfo with AI_ADDRCONFIG).
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 
 # Top-level tmpfiles directories select who can enter each socket tree.

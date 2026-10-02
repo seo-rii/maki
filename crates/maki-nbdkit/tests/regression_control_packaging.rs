@@ -175,3 +175,28 @@ fn admin_reaches_control_without_access_to_nbd_or_helper_state() {
         .lines()
         .any(|line| line == "ReadWritePaths=/run/maki-control/%i"));
 }
+
+/// R5-031: the data-plane daemon handles plaintext and keys and needs no
+/// kernel log, clock, hostname, realtime or namespace access, no foreign
+/// syscall ABI, and only UNIX, IP and (for getaddrinfo) netlink sockets.
+/// R5-002's `DevicePolicy=closed` stays: no device node is ever opened.
+#[test]
+fn the_daemon_unit_is_sandboxed() {
+    for (name, value) in [
+        ("DevicePolicy", "closed"),
+        ("ProtectKernelLogs", "yes"),
+        ("ProtectClock", "yes"),
+        ("ProtectHostname", "yes"),
+        ("RestrictRealtime", "yes"),
+        ("RestrictNamespaces", "yes"),
+        ("SystemCallArchitectures", "native"),
+        (
+            "RestrictAddressFamilies",
+            "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        ),
+        ("NoNewPrivileges", "yes"),
+        ("RestrictSUIDSGID", "yes"),
+    ] {
+        assert_eq!(directive(UNIT, name), value, "{name}");
+    }
+}
