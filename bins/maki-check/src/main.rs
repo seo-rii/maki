@@ -43,6 +43,20 @@ fn main() -> ExitCode {
     let Some(root) = root else {
         return usage();
     };
+    // `FileBacking::new` creates a missing root; an offline checker must
+    // never mutate, so a root that is not an existing directory is refused
+    // first (R5-026).
+    match std::fs::metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            eprintln!("error: {root}: not a directory");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: {root}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     let backing = match maki_backing::FileBacking::new(root.as_str()) {
         Ok(b) => b,
         Err(e) => {

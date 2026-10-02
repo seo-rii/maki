@@ -111,6 +111,9 @@ documents.
 
 ### Fixed
 
+- `maki-check` no longer creates a missing root directory (R5-026), and the
+  deep check no longer reports nonexistent units of a truncated partial last
+  shard (R5-027).
 - Detach, cleanup and attach rollback no longer require
   `<mountpoint>/.maki-sentinel` (R5-006): a workload that deleted or
   rewrote it blocked `maki-attach cleanup`. The mount is identified from

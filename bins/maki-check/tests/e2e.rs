@@ -70,3 +70,25 @@ fn check_rejects_a_root_that_is_not_a_volume() {
     let out = run(&empty);
     assert!(!out.status.success(), "empty root must not pass");
 }
+
+/// R5-026: the checker opened the root with `FileBacking::new`, which
+/// creates missing directories (owner-only), so `maki-check /typo/path`
+/// silently created `/typo/path`. An offline checker never mutates.
+#[test]
+fn check_of_a_missing_root_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for deep in [false, true] {
+        let missing = dir.path().join("typo").join("volume");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_maki-check"));
+        command.arg(&missing);
+        if deep {
+            command.arg("--deep");
+        }
+        let out = command.output().expect("spawn maki-check");
+        assert!(!out.status.success(), "a missing root must not pass");
+        assert!(
+            !dir.path().join("typo").exists(),
+            "the checker created the missing root"
+        );
+    }
+}

@@ -432,8 +432,12 @@ impl SlotStore {
                 // Record the damage in the one place that persists — the
                 // allocation map: marked allocated, the slot reads as
                 // allocated-but-invalid (EIO) until it is rewritten.
+                // Positions past the device's last unit (a partial last
+                // shard) never held data and are never marked (R5-027).
                 let mut marked = 0u64;
-                for in_shard in 0..alloc.units() {
+                let base = shard_idx * geometry.units_per_shard();
+                let in_device = geometry.num_units().saturating_sub(base);
+                for in_shard in 0..alloc.units().min(in_device) {
                     if !alloc.get(in_shard) && geometry.slot_offset(in_shard) + 64 > len {
                         alloc.set(in_shard, true);
                         marked += 1;
@@ -628,10 +632,12 @@ impl SlotStore {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();
         shards.sort_unstable();
         let per_shard = self.geometry.units_per_shard();
+        let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
             (0..shard.alloc.units()).filter_map(move |in_shard| {
-                (shard.alloc.get(in_shard)
+                (shard_idx * per_shard + in_shard < units
+                    && shard.alloc.get(in_shard)
                     && !shard
                         .discard
                         .as_ref()
