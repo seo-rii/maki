@@ -60,6 +60,11 @@ impl AllocationMap {
         w.finish_with_crc()
     }
 
+    /// Exact encoded size of a map over `units` units (header, bitmap, CRC).
+    pub fn encoded_len(units: u64) -> u64 {
+        ENCODED_FIXED_BYTES + units.div_ceil(8)
+    }
+
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
         let payload = strip_verify_crc(data, "allocation map")?;
         let mut r = Reader::new(payload);

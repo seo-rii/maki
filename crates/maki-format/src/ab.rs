@@ -39,6 +39,10 @@ pub trait AbRecord: Sized {
 pub struct AbStore {
     a: String,
     b: String,
+    /// A tighter bound than the record type's `MAX_ENCODED_LEN` when the
+    /// valid size follows from context (a shard's geometry), applied to every
+    /// read through this store (R5-025).
+    max_len: Option<u64>,
 }
 
 impl AbStore {
@@ -46,7 +50,19 @@ impl AbStore {
         Self {
             a: a.into(),
             b: b.into(),
+            max_len: None,
         }
+    }
+
+    /// Treat a copy longer than `max_len` as invalid without reading it.
+    pub fn with_max_len(mut self, max_len: u64) -> Self {
+        self.max_len = Some(max_len);
+        self
+    }
+
+    fn bound<T: AbRecord>(&self) -> u64 {
+        self.max_len
+            .map_or(T::MAX_ENCODED_LEN, |max| max.min(T::MAX_ENCODED_LEN))
     }
 
     /// One side and its exact validated bytes: `Ok(None)` for an absent or
@@ -64,7 +80,7 @@ impl AbStore {
         let len = file.len()?;
         // Reject an over-long copy by its size before allocating for it: a
         // valid encoding never exceeds the record type's bound (MAKI-026).
-        if len == 0 || len > T::MAX_ENCODED_LEN {
+        if len == 0 || len > self.bound::<T>() {
             return Ok(None);
         }
         let mut buf = vec![0u8; len as usize];
@@ -135,7 +151,7 @@ impl AbStore {
         &self,
         backing: &dyn Backing,
     ) -> Result<(Option<u64>, Option<u64>), FormatError> {
-        let max = T::MAX_ENCODED_LEN;
+        let max = self.bound::<T>();
         Ok((
             self.raw_generation(backing, &self.a, max)?,
             self.raw_generation(backing, &self.b, max)?,

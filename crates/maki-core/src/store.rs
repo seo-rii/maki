@@ -179,6 +179,19 @@ pub struct SlotStore {
 
 /// Shard index of a `shard-XXXXXXXX.dat` file name, verified by
 /// round-tripping through [`layout::shard_data`].
+/// A/B store of one shard's allocation or discard map. A valid copy has
+/// exactly the size the geometry implies; a longer one is invalid by its
+/// length and never read into memory (R5-025).
+fn map_store(a: String, b: String, geometry: &Geometry) -> AbStore {
+    AbStore::new(a, b).with_max_len(AllocationMap::encoded_len(geometry.units_per_shard()))
+}
+
+/// The shard catalog's A/B store, bounded by the volume's shard count.
+fn catalog_store(geometry: &Geometry) -> AbStore {
+    AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B)
+        .with_max_len(ShardCatalog::max_encoded_len(geometry.num_shards()))
+}
+
 fn parse_shard_data_name(name: &str) -> Option<u64> {
     let hex = name.strip_prefix("shard-")?.strip_suffix(".dat")?;
     let idx = u64::from_str_radix(hex, 16).ok()?;
@@ -313,7 +326,7 @@ impl SlotStore {
     pub fn open(backing: Arc<dyn Backing>, geometry: Geometry) -> Result<Self, CoreError> {
         let discard_enabled =
             load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
-        let catalog_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B);
+        let catalog_ab = catalog_store(&geometry);
         let mut catalog = catalog_ab
             .load::<ShardCatalog>(backing.as_ref())?
             .ok_or_else(|| CoreError::Corrupt("no valid shard catalog".to_string()))?;
@@ -347,9 +360,10 @@ impl SlotStore {
                     "catalog shard {shard_idx} out of range"
                 )));
             }
-            let alloc_ab = AbStore::new(
+            let alloc_ab = map_store(
                 layout::shard_alloc_a(shard_idx),
                 layout::shard_alloc_b(shard_idx),
+                &geometry,
             );
             let (side_a, side_b) = alloc_ab.side_generations::<AllocationMap>(backing.as_ref())?;
             let (alloc, dirty_alloc, map_stored) =
@@ -449,9 +463,10 @@ impl SlotStore {
                 dirty_discard: false,
             };
             if discard_enabled {
-                let discard_ab = AbStore::new(
+                let discard_ab = map_store(
                     layout::shard_discard_a(shard_idx),
                     layout::shard_discard_b(shard_idx),
+                    &geometry,
                 );
                 let (discard_a, discard_b) =
                     discard_ab.side_generations::<AllocationMap>(backing.as_ref())?;
@@ -682,9 +697,10 @@ impl SlotStore {
         // first creation of the data file. A crash may leave maps alone;
         // they are harmless and a retry rewrites the same empty state.
         let (discard, discard_ab) = if self.discard_enabled {
-            let discard_ab = AbStore::new(
+            let discard_ab = map_store(
                 layout::shard_discard_a(shard_idx),
                 layout::shard_discard_b(shard_idx),
+                &self.geometry,
             );
             let mut discard = AllocationMap::new(self.geometry.units_per_shard());
             discard_ab.store(self.backing.as_ref(), &mut discard)?;
@@ -706,9 +722,10 @@ impl SlotStore {
         // 2. Both empty allocation-map copies, synced. Checkpoint alternates
         // between them, so publishing a journal record before the second
         // file exists would leave checkpoint completion exposed to ENOSPC.
-        let alloc_ab = AbStore::new(
+        let alloc_ab = map_store(
             layout::shard_alloc_a(shard_idx),
             layout::shard_alloc_b(shard_idx),
+            &self.geometry,
         );
         let mut alloc = AllocationMap::new(self.geometry.units_per_shard());
         alloc_ab.store(self.backing.as_ref(), &mut alloc)?;

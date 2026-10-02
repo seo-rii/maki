@@ -55,6 +55,11 @@ impl ShardCatalog {
         w.finish_with_crc()
     }
 
+    /// Largest encoded size of a catalog listing at most `shards` shards.
+    pub fn max_encoded_len(shards: u64) -> u64 {
+        ENCODED_FIXED_BYTES + shards.saturating_mul(8)
+    }
+
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
         let payload = strip_verify_crc(data, "shard catalog")?;
         let mut r = Reader::new(payload);

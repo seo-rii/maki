@@ -61,7 +61,12 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         superblock.volume_uuid, superblock.generation, superblock.geometry.slot_size
     ));
 
-    let cat_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B);
+    // Valid sizes follow from the geometry; longer copies are never read
+    // (R5-025).
+    let map_len = AllocationMap::encoded_len(superblock.geometry.units_per_shard());
+    let cat_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B).with_max_len(
+        ShardCatalog::max_encoded_len(superblock.geometry.num_shards()),
+    );
     let catalog = match cat_ab.load::<ShardCatalog>(backing)? {
         Some(c) => c,
         None => {
@@ -81,7 +86,8 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
                 .push(format!("catalog shard {shard} out of range"));
             continue;
         }
-        let alloc_ab = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard));
+        let alloc_ab = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
+            .with_max_len(map_len);
         match alloc_ab.load::<AllocationMap>(backing)? {
             None => report
                 .errors
@@ -100,7 +106,8 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             let discard_ab = AbStore::new(
                 layout::shard_discard_a(shard),
                 layout::shard_discard_b(shard),
-            );
+            )
+            .with_max_len(map_len);
             let sides = discard_ab.side_generations::<AllocationMap>(backing)?;
             match discard_ab.load::<AllocationMap>(backing)? {
                 None => report
