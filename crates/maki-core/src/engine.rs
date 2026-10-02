@@ -535,7 +535,9 @@ impl Engine {
                         ttl: c.ttl,
                         zeroize_on_evict: true,
                     },
-                    Arc::new(maki_crypto::SystemClock::new()),
+                    // The engine's injectable clock, so TTLs follow it
+                    // (R5-029).
+                    clock.clone(),
                 )
             }),
             policy: options.checkpoint,
