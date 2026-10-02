@@ -11,6 +11,8 @@ documents.
 
 ### Breaking changes
 
+- **A CA bundle or a WebSocket/gRPC `client_cert_file` containing a private
+  key is refused** (R5-028); supply the key through `client_key`.
 - **The mountpoint directory must be root-owned and not group/other
   writable** (R5-024), like its ancestors: a workload-owned mountpoint let
   the workload stack a FUSE mount over it before attach mounted the volume.

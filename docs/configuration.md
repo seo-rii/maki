@@ -73,7 +73,10 @@ certificate/private-key PEM in `client_cert_file`; such a file is a secret file
 like a `file` credential: it is opened without following a symlink and, when it
 holds a private key, must not be readable by group or others (0600 or 0400).
 Every TLS file must be a regular file of at most 1 MiB; CA bundles and
-certificates paired with `client_key` may be symlinks.
+certificates paired with `client_key` may be symlinks. A CA bundle, or a
+WebSocket/gRPC `client_cert_file`, that contains a private key is refused at
+attach: those files are read as public material, so the key must come through
+`client_key`.
 
 These transports have local certificate, hostname, mTLS and actual daemon I/O
 regressions. The cross-host reference-provider campaigns documented separately

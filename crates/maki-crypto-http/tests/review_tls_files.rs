@@ -81,3 +81,29 @@ fn a_fifo_is_refused_without_blocking() {
     assert!(read_tls_file("http", "ca_file", fifo.to_str().unwrap(), false).is_err());
     assert!(read_tls_file("http", "client_cert_file", fifo.to_str().unwrap(), true).is_err());
 }
+
+/// R5-028: a file read as a certificate or CA bundle (WebSocket and gRPC
+/// `client_cert_file`, every `ca_file`) skipped the credential checks and
+/// was never wiped, so a combined certificate/key PEM there put the mTLS
+/// private key, unchecked, into ordinary memory. Such a file is refused
+/// (and its bytes erased): the key belongs in its credential.
+#[test]
+fn a_private_key_in_a_certificate_only_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cert.pem");
+    write(&path, &identity_pem(), 0o600);
+    for (section, what) in [
+        ("websocket", "client_cert_file"),
+        ("grpc", "client_cert_file"),
+        ("http", "ca_file"),
+    ] {
+        // Never print the bytes on failure: they hold a private key.
+        let Err(error) = read_tls_file(section, what, path.to_str().unwrap(), false) else {
+            panic!("{section} {what}: a file holding a private key was accepted");
+        };
+        assert!(
+            error.to_string().contains("private key"),
+            "{section} {what}: {error}"
+        );
+    }
+}

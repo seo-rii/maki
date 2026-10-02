@@ -455,8 +455,20 @@ pub fn read_tls_file(
         bytes.zeroize();
         return Err(fail("exceeds 1 MiB".into()));
     }
+    let holds_key = bytes.windows(11).any(|w| w == b"PRIVATE KEY");
+    // A certificate or CA bundle is read without the credential checks and
+    // never wiped: a private key there would be both unchecked and left in
+    // ordinary memory. It belongs in its credential (R5-028).
+    if !may_hold_private_key && holds_key {
+        bytes.zeroize();
+        return Err(fail(
+            "holds a private key; supply only certificates here and the key through its \
+             credential (client_key)"
+                .into(),
+        ));
+    }
     #[cfg(unix)]
-    if may_hold_private_key && bytes.windows(11).any(|w| w == b"PRIVATE KEY") {
+    if may_hold_private_key && holds_key {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
