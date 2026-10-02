@@ -120,3 +120,34 @@ fn a_failed_shard_catalog_commit_does_not_break_reclamation() {
     volume.checkpoint().unwrap();
     assert_eq!(volume.read_ct(9).unwrap().unwrap().1, vec![0x43; CT]);
 }
+
+/// R5-008 follow-up: a punch that keeps failing must not fail the
+/// checkpoint that already published its state. The same call used to
+/// retry the just-failed units through the reclamation scan and return its
+/// error after the checkpoint state was stored, the journal deleted and the
+/// overlay retired, so the engine reported a successful checkpoint as
+/// failed (Degraded).
+#[test]
+fn a_persistently_failing_punch_does_not_fail_a_published_checkpoint() {
+    use maki_test_support::failpoints;
+    let _lock = failpoints::test_lock();
+    let (_backing, mut volume, _) = fixture();
+    volume.write_ct(2, &[0x41; CT], true).unwrap();
+    volume.checkpoint().unwrap();
+    volume.discard_ct(2, true).unwrap();
+    let before = volume.checkpoint_sequence();
+    let failing = failpoints::fail_n_times(
+        "discard.punch",
+        100,
+        io::ErrorKind::Other,
+        "punch persistently failing",
+    );
+    let published = volume.checkpoint();
+    drop(failing);
+    let published = published.expect("the checkpoint was published; reclamation is deferred");
+    assert!(published > before);
+    assert_eq!(volume.checkpoint_sequence(), published);
+    assert!(volume.read_ct(2).unwrap().is_none());
+    // The deferred release completes once punching works again.
+    volume.checkpoint().unwrap();
+}

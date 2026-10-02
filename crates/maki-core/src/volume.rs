@@ -539,13 +539,16 @@ impl Volume {
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
-        // Physical reclamation. A failure only leaves space unreclaimed (the
-        // discard map is durable and reads return zeros), so it does not
-        // fail the checkpoint; the reclamation scan retries it.
+        // Physical reclamation. The checkpoint is published from here on: a
+        // failure only leaves space unreclaimed (the discard map is durable
+        // and reads return zeros), so it never fails this call; the
+        // reclamation scan retries it (R5-008).
+        let mut reclamation_failed = false;
         if !punchable.is_empty() {
             if let Err(error) = self.store.punch_slots(punchable) {
                 tracing::warn!("checkpoint: slot reclamation deferred: {error}");
                 self.store.schedule_reclamation();
+                reclamation_failed = true;
             }
         }
         // 5. delete completed journal segments
@@ -555,8 +558,17 @@ impl Volume {
         self.backing.sync_dir(layout::JOURNAL_DIR)?;
 
         self.overlay.retire(horizon);
-        self.store
-            .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
+        // Not straight after a failed punch (the same units would fail
+        // again). A scan failure keeps its cursor; the next idle checkpoint
+        // retries it and reports a persistent failure there.
+        if !reclamation_failed {
+            if let Err(error) = self
+                .store
+                .retry_reclamation(|unit| self.overlay.get(unit).is_none())
+            {
+                tracing::warn!("checkpoint: slot reclamation deferred: {error}");
+            }
+        }
         self.sanitize();
         Ok(horizon)
     }

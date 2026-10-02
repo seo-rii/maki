@@ -82,8 +82,11 @@ fn v2_empty_ciphertext_keeps_legacy_slot_semantics_across_checkpoint() {
     assert_eq!(recovered.read_ct(0).unwrap(), Some((1, Vec::new())));
 }
 
+/// Slots are punched only after the checkpoint is published (R5-008): a
+/// failed punch completes the checkpoint and leaves the release to the
+/// reclamation scan, which a later checkpoint runs.
 #[test]
-fn failed_punch_keeps_journal_and_retries_even_when_bitmap_is_already_set() {
+fn failed_punch_is_retried_by_reclamation_even_when_bitmap_is_already_set() {
     let _serial = failpoints::test_lock();
     let backing = Arc::new(MemBacking::new());
     create_volume_with_discard(backing.as_ref(), superblock(0xfa11ed)).unwrap();
@@ -98,7 +101,7 @@ fn failed_punch_keeps_journal_and_retries_even_when_bitmap_is_already_set() {
             (std::thread::current().id() == owner).then(|| std::io::Error::other("punch failed"))
         })),
     );
-    assert!(volume.checkpoint().is_err());
+    volume.checkpoint().unwrap();
     assert!(volume.read_ct(3).unwrap().is_none());
     drop(failure);
     volume.checkpoint().unwrap();

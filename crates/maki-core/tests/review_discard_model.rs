@@ -135,15 +135,31 @@ fn mixed_discard_model_survives_failed_checkpoints_and_repeated_crashes() {
             };
             if let Some(name) = failpoint {
                 let owner = std::thread::current().id();
+                let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counted = hits.clone();
                 let guard = failpoints::set(
                     name,
                     failpoints::FailpointAction::Callback(Arc::new(move || {
-                        (std::thread::current().id() == owner)
-                            .then(|| std::io::Error::other("modeled checkpoint failure"))
+                        (std::thread::current().id() == owner).then(|| {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::io::Error::other("modeled checkpoint failure")
+                        })
                     })),
                 );
-                assert!(volume.checkpoint().is_err(), "{name} was not exercised");
+                let result = volume.checkpoint();
                 drop(guard);
+                assert!(
+                    hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    "{name} was not exercised"
+                );
+                if name == "discard.punch" {
+                    // Slots are punched only after the checkpoint is
+                    // published, so a failed punch defers reclamation
+                    // instead of failing the checkpoint (R5-008).
+                    result.expect("a failed punch must not fail a published checkpoint");
+                } else {
+                    assert!(result.is_err(), "{name} must fail the checkpoint");
+                }
             } else {
                 volume.checkpoint().unwrap();
             }

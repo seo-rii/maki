@@ -125,3 +125,38 @@ async fn a_single_endpoint_still_reports_the_contract_violation() {
     let err = set.encrypt_batch(&ctx(), &[pt(1)]).await.unwrap_err();
     assert!(matches!(err, CryptoError::Contract(_)), "{err:?}");
 }
+
+/// R5-005 follow-up: an endpoint that broke the contract for an operation is
+/// not retried for that operation on a later pass, even while its circuit
+/// is still closed.
+#[tokio::test]
+async fn a_contract_violating_endpoint_is_not_retried_on_a_later_pass() {
+    let clock = Arc::new(ManualClock::new());
+    let broken = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let flaky = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    broken.fail_next([contract()]);
+    flaky.fail_next((0..10).map(|_| CryptoError::Retryable("blip".into())));
+    let set = EndpointSet::new(
+        vec![
+            ("broken".into(), broken.clone()),
+            ("flaky".into(), flaky.clone()),
+        ],
+        cfg(true),
+        clock.clone(),
+    );
+    let task = tokio::spawn(async move { set.encrypt_batch(&ctx(), &[pt(1)]).await });
+    // Backoff between passes sleeps on the manual clock: drive it.
+    let result = loop {
+        if task.is_finished() {
+            break task.await.unwrap();
+        }
+        clock.advance(Duration::from_secs(10));
+        tokio::task::yield_now().await;
+    };
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(
+        broken.encrypt_calls(),
+        1,
+        "the request was sent again to the endpoint that violated the contract"
+    );
+}

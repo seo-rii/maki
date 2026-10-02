@@ -570,6 +570,9 @@ impl EndpointSet {
         // attempt on one of them is a retry charged to *its* budget; a first
         // attempt on another endpoint is a failover (a fresh request for it).
         let mut tried: Vec<Arc<Endpoint>> = Vec::new();
+        // Endpoints whose response broke the contract for this operation:
+        // never sent it again, on any pass (R5-005).
+        let mut contract_failed: Vec<Arc<Endpoint>> = Vec::new();
 
         loop {
             if let Some(max) = self.config.max_attempts {
@@ -593,8 +596,21 @@ impl EndpointSet {
             // One pass: try each admissible endpoint once, failing over
             // between them.
             let candidates = self.candidates();
+            if !candidates.is_empty()
+                && candidates
+                    .iter()
+                    .all(|e| contract_failed.iter().any(|f| Arc::ptr_eq(f, e)))
+            {
+                // Only endpoints that already broke the contract remain.
+                return Err(last_error.unwrap_or_else(|| {
+                    CryptoError::Contract("every admissible endpoint broke the contract".into())
+                }));
+            }
             let mut tried_any = false;
             for endpoint in candidates {
+                if contract_failed.iter().any(|f| Arc::ptr_eq(f, &endpoint)) {
+                    continue;
+                }
                 let Some(probe) = endpoint.breaker.acquire() else {
                     continue;
                 };
@@ -683,6 +699,7 @@ impl EndpointSet {
                                 if !retry_safe {
                                     return Err(err);
                                 }
+                                contract_failed.push(endpoint.clone());
                                 let untried = self.endpoints.iter().any(|e| {
                                     !tried.iter().any(|t| Arc::ptr_eq(t, e))
                                         && e.validated.load(Ordering::SeqCst)

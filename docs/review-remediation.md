@@ -1127,6 +1127,40 @@ that failed before the change.
 
 | R5-032 (RMW through the cache) | A partial-unit write always read and decrypted the unit, although reads serve a cached `(unit, sequence)` without the payload or the provider (R4-006): every small write over a cached unit cost a provider round trip. | The RMW path establishes the current sequence and uses a cache hit under the unit locks, honouring `verify_on_hit` like reads; misses read and decrypt as before. | `review_r5_rmw_cache.rs` (maki-core: no decryption for a cached unit with and without `verify_on_hit`; an uncached unit still decrypts once) |
 
+Follow-ups from a review of the R5 commits themselves:
+
+- **R5-008:** a punch that kept failing still failed the checkpoint, now
+  *after* publication. The same call retried the just-failed units through
+  the reclamation scan and returned its error once the state was stored,
+  the journal deleted and the overlay retired, so the engine reported a
+  durable checkpoint as failed (Degraded). After publication a reclamation
+  failure is now logged and leaves its cursor; the next idle checkpoint
+  retries it and still reports a persistent failure there, which keeps the
+  worker from spinning. Two older tests that expected a failed punch to fail
+  the checkpoint (`review_discard_model.rs`, and
+  `failed_punch_is_retried_by_reclamation_even_when_bitmap_is_already_set`,
+  formerly `failed_punch_keeps_journal_and_retries…`) now expect it to
+  succeed, and still check that the failpoint fired and the data survives.
+  Regression: `a_persistently_failing_punch_does_not_fail_a_published_checkpoint`.
+- **R5-005:** an endpoint that broke the contract was skipped for the rest
+  of the pass but sent the same request again on the next pass. It is now
+  excluded for the whole operation, and the violation is reported once only
+  such endpoints remain. Regression:
+  `a_contract_violating_endpoint_is_not_retried_on_a_later_pass`.
+- **R5-004 trade-off:** with a provider that is not retry-safe, one
+  integrity failure in a coalesced decrypt batch fails every request in it
+  (the error fans out, as before `1678e3e`). That is the cost of never
+  sending a request twice.
+- **R5-002 scope:** the post-mount checks of `maki-attach attach` require
+  `nosuid,nodev`; the `maki-attach verify` workload gate does not, so a
+  volume mounted before this change still passes it until it is reattached.
+
+Considered and left as is: the HTTP provider classifies TLS failures by
+searching the transport error's `Debug` text. A missed match makes a TLS
+failure `Retryable` instead of `EndpointFatal`; the dispatcher handles both
+the same way (failover, breaker charged), and the TLS suites pin the
+current classification.
+
 Considered and left as is: the gRPC provider's local size estimate omits
 the context strings; an under-estimate is refused by tonic's encoder as
 `OutOfRange`, which maps to the same `NonRetryableRequest`. Discard admission
