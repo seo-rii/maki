@@ -301,8 +301,8 @@ impl TrustedState {
     }
 }
 
-/// The workload gate accepts only an existing root-controlled config. Other
-/// verbs retain their historical loader and command-line override contracts.
+/// Every executing verb accepts only an existing root-controlled config: it
+/// runs as root on what the file says (R5-030). Plans read any file.
 pub(crate) fn read_verify_config(path: &Path) -> io::Result<String> {
     let relative = path
         .strip_prefix("/")
@@ -327,13 +327,13 @@ fn read_config_beneath(directory: File, relative: &Path, owner: u32) -> io::Resu
         || metadata.nlink() != 1
     {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-            "verify config must be a root-owned regular file without group/other write access and with one link"));
+            "attach config must be a root-owned regular file without group/other write access and with one link"));
     }
     let mut content = String::new();
     file.take(CONFIG_MAX_BYTES + 1)
         .read_to_string(&mut content)?;
     if content.len() as u64 > CONFIG_MAX_BYTES {
-        return Err(invalid("verify config exceeds size limit"));
+        return Err(invalid("attach config exceeds size limit"));
     }
     Ok(content)
 }

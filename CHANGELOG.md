@@ -11,6 +11,9 @@ documents.
 
 ### Breaking changes
 
+- **Executing `maki-attach` verbs require a root-controlled attach config**
+  (R5-030): a root-owned regular file with one link, not group/other
+  writable, below root-owned directories. `--plan` reads any file.
 - **A CA bundle or a WebSocket/gRPC `client_cert_file` containing a private
   key is refused** (R5-028); supply the key through `client_key`.
 - **The mountpoint directory must be root-owned and not group/other

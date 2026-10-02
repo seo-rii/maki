@@ -121,7 +121,18 @@ fn main() -> ExitCode {
     }
     let attach_config =
         if flag(&args, "--config").is_some() || std::path::Path::new(&config_path).exists() {
-            match config::load(&config_path) {
+            // An executing verb runs as root on what the file says: only a
+            // root-controlled file is accepted (R5-030). A plan executes
+            // nothing and reads any file.
+            #[cfg(target_os = "linux")]
+            let loaded = if plan_only {
+                config::load(&config_path).map_err(|e| e.to_string())
+            } else {
+                maki_privileged::exec::load_trusted_config(&config_path)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let loaded = config::load(&config_path).map_err(|e| e.to_string());
+            match loaded {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     eprintln!("error: {e}");

@@ -346,6 +346,10 @@ and systemd's [notification protocol](https://github.com/systemd/systemd/blob/v2
 volume UUID, the mountpoint, VG and LV names, an optional pinned NBD device and
 an optional expected XFS UUID. The production profile also provides the complete
 PV UUID set, VG UUID and configured target-LV UUID in `[lvm_identity]`.
+Every executing verb (attach, detach, cleanup, recover, grow, verify) reads
+this file only when it is a root-owned regular file with one link, not
+writable by group or others, below root-owned directories with the same
+restriction: the helper runs as root on what it says. `--plan` reads any file.
 Command-line flags override individual values other than those LVM pins.
 Every value is checked before it reaches a system utility: option-like values,
 relative or non-canonical paths, non-canonical pinned devices (`/dev/nbd01`)

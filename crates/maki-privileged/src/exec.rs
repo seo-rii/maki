@@ -143,6 +143,21 @@ fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError
     Ok(())
 }
 
+/// Load the attach configuration for a verb that executes: only an existing,
+/// root-owned file below root-owned directories without group/other write
+/// access, read through held descriptors. The verb runs as root on what the
+/// file says (mountpoint, VG, NBD socket), so a file a non-root user could
+/// write would hand them those choices (R5-030).
+pub fn load_trusted_config(path: &str) -> Result<crate::config::AttachConfig, String> {
+    let text = crate::state::read_verify_config(Path::new(path)).map_err(|error| {
+        format!(
+            "attach config {path:?} must be a root-owned regular file below root-owned \
+             directories without group/other write access: {error}"
+        )
+    })?;
+    crate::config::parse(&text).map_err(|error| error.to_string())
+}
+
 /// Held for the whole attach so two helpers cannot pick the same device;
 /// the file lock is released when this is dropped.
 pub struct AttachLock {

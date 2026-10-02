@@ -207,3 +207,51 @@ fn verify_rejects_identity_overrides_unknown_flags_and_duplicate_options() {
         );
     }
 }
+
+/// R5-030: executing verbs run as root on whatever the attach config says
+/// (mountpoint, VG, NBD socket), so a config a non-root user can write is a
+/// privilege boundary. Only `verify` used the root-owned, descriptor-anchored
+/// reader; attach, detach, grow, cleanup and recover now use it too. Plans
+/// (`--plan`) still read any file, since they execute nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn executing_verbs_refuse_an_attach_config_a_non_root_user_controls() {
+    let uid = Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        // As root the file would be trusted and the verb would really run.
+        eprintln!("skipping: running as root");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.toml");
+    std::fs::write(
+        &path,
+        "volume_uuid = \"0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c\"\nvg_name = \"vg_maki_v1\"\n",
+    )
+    .unwrap();
+    let config = path.to_str().unwrap();
+    for verb in ["attach", "detach", "cleanup", "recover"] {
+        let out = run(&[verb, "--volume", "v1", "--config", config]);
+        assert!(!out.status.success(), "{verb}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("root-owned"), "{verb}: {stderr}");
+    }
+    let out = run(&[
+        "grow",
+        "--volume",
+        "v1",
+        "--config",
+        config,
+        "--size-bytes",
+        "1048576",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("root-owned"));
+    // A plan reads the same file and still works.
+    let out = run(&["attach", "--volume", "v1", "--config", config, "--plan"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
