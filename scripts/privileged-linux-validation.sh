@@ -417,6 +417,20 @@ cleanup() {
         esac
     fi
 
+    if [[ -n "$mountpoint" && "$cleanup_safe" == true && "$mount_active" != true ]]; then
+        case "$mountpoint" in
+            /run/maki-validation-mnt.*)
+                if ! findmnt -rn -M "$mountpoint" >/dev/null 2>&1; then
+                    sudo -n rmdir "$mountpoint" 2>/dev/null || cleanup_rc=1
+                fi
+                ;;
+            *)
+                log "cleanup warning: refusing unexpected mountpoint $mountpoint"
+                cleanup_rc=1
+                ;;
+        esac
+    fi
+
     if [[ -n "$work_dir" && "$cleanup_safe" == true ]]; then
         case "$work_dir" in
             "$work_root"/maki-privileged-validation.*)
@@ -556,9 +570,13 @@ choose_work_root() {
 
 choose_work_root || die "no writable work root has at least $MIN_WORK_FREE_BYTES bytes free"
 work_dir="$(mktemp -d "$work_root/maki-privileged-validation.XXXXXX")"
-mountpoint="$work_dir/mnt"
-mkdir "$mountpoint"
-pass "disposable work tree allocated on $work_root"
+# maki-attach mounts only onto a root-owned directory whose every ancestor is
+# root-owned and not group/other writable (69514ea, R5-024): a user-owned
+# work tree or /var/tmp (1777) never qualifies, so the mountpoint is a
+# root-created directory under /run.
+mountpoint="$(sudo -n mktemp -d /run/maki-validation-mnt.XXXXXX)" ||
+    die "could not create a root-owned mountpoint under /run"
+pass "disposable work tree allocated on $work_root, mountpoint $mountpoint"
 
 if [[ -L /run/maki ]]; then
     die "/run/maki is a symlink; refusing to use it"

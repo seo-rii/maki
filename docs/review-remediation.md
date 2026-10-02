@@ -1112,6 +1112,13 @@ that failed before the change.
 
 | R5-024 (mountpoint ownership) | `check_mount_target` checked owner and mode of every ancestor but not of the mountpoint itself, which the documentation allowed to belong to the workload. A workload with FUSE access could `fusermount` over it between the check and `mount`: XFS stacked on the FUSE mount, `VerifyMountDevice` failed and `attach_rollback` halted with XFS mounted and the record kept. | The mountpoint directory must be owned by root and not group/other-writable, like its ancestors. It is hidden under the mounted volume, whose root carries the workload's ownership. | `a_mountpoint_owned_or_writable_by_others_is_refused` (maki-privileged `regression_mount_target.rs`) |
 
+`scripts/privileged-linux-validation.sh` created its mountpoint inside a
+user-owned `mktemp` tree (or under `/var/tmp`, mode 1777), which the
+mount-target rule of `69514ea` and R5-024 refuses. It now uses a root-created
+`/run/maki-validation-mnt.*` directory and removes it during cleanup. The
+script needs sudo and kernel NBD, so this change has been syntax-checked only;
+the next campaign is its first run.
+
 `NbdAdapter::shutdown` has no panic guard of its own (R5-016, not changed):
 storage and provider panics already become errors before it, and no reachable
 panic was found.
