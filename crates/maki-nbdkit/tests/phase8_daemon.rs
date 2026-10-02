@@ -37,11 +37,20 @@ fn flaky_handler(fail_n: u32) -> Handler {
     let remaining = Arc::new(AtomicU32::new(fail_n));
     let inner = xor_handler();
     Arc::new(move |req: &RecordedRequest| {
-        if remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
-            .is_ok()
-        {
-            return ResponseSpec::status(503);
+        // Decrement while positive. A compare-exchange loop rather than
+        // `fetch_update`, which newer toolchains deprecate (`try_update`
+        // does not exist on older ones).
+        let mut current = remaining.load(Ordering::SeqCst);
+        while current > 0 {
+            match remaining.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return ResponseSpec::status(503),
+                Err(actual) => current = actual,
+            }
         }
         inner(req)
     })
