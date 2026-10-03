@@ -116,6 +116,9 @@ documents.
 
 ### Fixed
 
+- `maki@.service` sets `SystemCallFilter=@system-service` with
+  `SystemCallErrorNumber=EPERM`, after three packaged PostgreSQL lifecycles
+  ran under it without a denial.
 - Rollback-protected backing (experimental): a write's cost no longer grows
   with committed data (R5-034); a 64 KiB write at 128 MiB committed went
   from about 150 ms to under 1 ms.

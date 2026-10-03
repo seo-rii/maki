@@ -196,6 +196,11 @@ fn the_daemon_unit_is_sandboxed() {
         ),
         ("NoNewPrivileges", "yes"),
         ("RestrictSUIDSGID", "yes"),
+        // Adopted after three packaged PostgreSQL lifecycles ran under it
+        // with no denial (2026-10-03); EPERM surfaces a missed syscall as an
+        // error rather than killing the daemon.
+        ("SystemCallFilter", "@system-service"),
+        ("SystemCallErrorNumber", "EPERM"),
     ] {
         assert_eq!(directive(UNIT, name), value, "{name}");
     }

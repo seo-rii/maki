@@ -59,6 +59,11 @@ RestrictRealtime=yes
 RestrictNamespaces=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Systemd's service baseline. Three packaged PostgreSQL lifecycles with the
+# local provider ran under it without a denial (2026-10-03); EPERM makes a
+# missed syscall an error rather than a SIGSYS kill.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 LockPersonality=yes
 
 # Top-level tmpfiles directories select who can enter each socket tree.

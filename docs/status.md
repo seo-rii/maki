@@ -24,7 +24,7 @@ Last updated: 2026-10-01 (after the R5-001…R5-034 fixes; see the
 | Format | Selection | Status |
 |---|---|---|
 | Superblock envelope v2, mirrored durable proofs | Default for `maki volume create` | Current default; all scoped campaigns below used it unless noted |
-| Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; scoped GCE whole-instance-reset campaigns passed (2026-09-20, and 2026-10-03 after the R5 fixes) and kernel `fstrim` reclaimed backing space through XFS/LVM/NBD; no database campaign yet ([details](space-reclamation.md)) |
+| Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; scoped GCE whole-instance-reset campaigns passed (2026-09-20, and 2026-10-03 after the R5 fixes), kernel `fstrim` reclaimed backing space through XFS/LVM/NBD, and one scoped PostgreSQL 15 crash and lifecycle campaign passed ([details](space-reclamation.md)) |
 | Rollback-protected backing (local witness) | `[backing.rollback_protection]` on a new volume | **Experimental.** Focused test suites only; not campaign-qualified ([details](rollback-protection.md)) |
 | Legacy envelope v1 | Existing volumes only | Read-only checks with a warning; writable recovery is refused; migrate through [durable recovery](durable-recovery.md) |
 
@@ -82,8 +82,14 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   ([record](qualification/r5-hardware-validation-2026-10-03.md)): ten v3
   discard resets, kernel `fstrim` reclamation through XFS/LVM/NBD, the
   `nosuid,nodev` mount, attach-config ownership, and the packaged quick start
-  under the `maki@.service` sandbox. No database workload has run on a v3
-  volume, and `fstrim` under space pressure has not been exercised.
+  under the `maki@.service` sandbox. A further campaign that day ran
+  PostgreSQL 15 crash and lifecycle tests on a v3 volume with `fstrim` under
+  load, and three lifecycles under the adopted syscall filter
+  ([record](qualification/database-discard-pressure-validation-2026-10-03.md)).
+- Below the backing's emergency reserve plus checkpoint headroom, writes are
+  refused. A filesystem on the volume can then neither delete files nor run
+  `fstrim` (XFS returned EIO for both); recover by freeing space on the
+  backing filesystem. Raw discards are still admitted there.
 - Privileged attach supports the single-PV/single-data-LV XFS topology; other
   device-mapper layouts fail closed and need operator diagnosis
   ([storage recovery limits](storage-recovery.md#remaining-recovery-limits)).
