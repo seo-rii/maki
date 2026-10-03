@@ -104,7 +104,7 @@ condensed:
 ```bash
 systemctl start maki@demo.service           # data plane only; the key is bound on this first start
 dev=/dev/nbd0
-nbd-client -unix /run/maki/demo/nbd.sock $dev -b 4096
+nbd-client -unix /run/maki/demo/nbd.sock ${dev#/dev/} -b 4096   # netlink: kernel name nbd0
 [ "$(blockdev --getsize64 $dev)" = 8589934592 ] || echo "unexpected device size"
 
 vg=vg_maki_demo; lv=data
@@ -120,7 +120,7 @@ fs_uuid=$(blkid --probe --cache-file /dev/null --match-tag UUID --output value /
 volume_uuid=$(maki volume inspect /etc/maki/volumes/demo.toml | awk '/^uuid:/ {print $2}')
 
 vgchange -an $vg
-nbd-client -d $dev
+nbd-client -d ${dev#/dev/}
 systemctl stop maki@demo.service
 ```
 

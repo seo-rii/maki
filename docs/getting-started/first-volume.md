@@ -42,12 +42,14 @@ so any free device works here.
 ```bash
 dev=/dev/nbd0
 [ "$(blockdev --getsize64 $dev)" = 0 ] || echo "$dev is in use; pick another"
-nbd-client -unix /run/maki/demo/nbd.sock $dev -b 4096
+nbd-client -unix /run/maki/demo/nbd.sock ${dev#/dev/} -b 4096
 blockdev --getsize64 $dev        # equals volume.max_virtual_size
 ```
 
 `-b 4096` must match `device_block_size` in both the volume and the attach
-configuration.
+configuration. `nbd-client` 3.27 connects over netlink and takes the kernel
+device name (`nbd0`); it refuses `/dev/nbd0` with "Invalid nbd device target".
+Block tools such as `blockdev` and `pvcreate` keep the `/dev` path.
 
 ## 3. Create PV, VG, LV and XFS
 
@@ -94,7 +96,7 @@ The helper must find the device unused:
 
 ```bash
 vgchange -an $vg
-nbd-client -d $dev
+nbd-client -d ${dev#/dev/}
 systemctl stop maki@demo.service
 ```
 

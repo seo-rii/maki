@@ -264,6 +264,10 @@ observable behaviour:
 
 ### Documentation
 
+- The quick start and first-volume bootstrap passed `/dev/nbd0` to
+  `nbd-client`; version 3.27, which Maki requires, connects over netlink and
+  refuses it ("Invalid nbd device target"). They now pass the kernel name
+  (`nbd0`); found by the 2026-10-03 packaged-lifecycle campaign.
 - Validation reports moved to `docs/qualification/`; the README now links to
   [status](docs/status.md) instead of carrying the campaign history.
 - `docs/architecture.md` now describes the experimental rollback-protected
