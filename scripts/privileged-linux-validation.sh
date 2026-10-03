@@ -906,10 +906,14 @@ if [[ "$discard" == true ]]; then
     sync -f "$mountpoint/work"
     "$maki_bin" checkpoint "$config_path" >"$run_dir/checkpoint-before-trim.txt"
     allocated_before="$(du -sB1 "$work_dir/backing/data" | awk '{print $1}')"
+    "$maki_bin" status "$config_path" >"$run_dir/status-before-trim.txt"
     sudo -n fstrim -v "$mountpoint" | tee "$run_dir/fstrim.txt"
-    # The kernel issues discards without FUA; a checkpoint applies only
-    # durable records, so flush the device (an NBD FLUSH) first.
-    sudo -n blockdev --flushbufs "$device"
+    # The kernel issues discards without FUA and a checkpoint applies only
+    # durable records: fsync the block device, which the kernel turns into a
+    # cache flush (an NBD FLUSH). `blockdev --flushbufs` only writes back and
+    # drops the page cache and sends no flush.
+    sudo -n sync "$device"
+    "$maki_bin" status "$config_path" >"$run_dir/status-after-trim.txt"
     "$maki_bin" checkpoint "$config_path" >"$run_dir/checkpoint-after-trim.txt"
     allocated_after="$(du -sB1 "$work_dir/backing/data" | awk '{print $1}')"
     log "backing data allocated: $allocated_before -> $allocated_after bytes"
