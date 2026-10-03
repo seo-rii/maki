@@ -28,13 +28,14 @@ run_dir=""
 background=false
 install_missing=false
 preflight=false
+discard=false
 
 usage() {
     cat <<'EOF'
 Usage:
   scripts/privileged-linux-validation.sh --preflight [--device /dev/nbdN]
   scripts/privileged-linux-validation.sh --background [--install-missing] \
-      --device /dev/nbdN --confirm-wipe /dev/nbdN [--work-root DIR]
+      --device /dev/nbdN --confirm-wipe /dev/nbdN [--work-root DIR] [--discard]
 
 Options:
   --device PATH          Dedicated kernel NBD device (default: /dev/nbd15).
@@ -44,6 +45,8 @@ Options:
                          By default, choose /data or /var/tmp with enough room.
   --install-missing      On Debian, apt-install the native test dependencies.
   --background           Run under nohup and write a stable latest-log link.
+  --discard              Create a v3 discard volume and check fstrim through
+                         XFS, LVM and kernel NBD, then physical reclamation.
   --preflight            Show checks and missing commands without sudo or I/O.
   -h, --help             Show this help.
 
@@ -94,6 +97,10 @@ while (($#)); do
             ;;
         --preflight)
             preflight=true
+            shift
+            ;;
+        --discard)
+            discard=true
             shift
             ;;
         --run-dir)
@@ -183,6 +190,7 @@ if [[ "$background" == true ]]; then
     )
     [[ -z "$work_root" ]] || child_args+=(--work-root "$work_root")
     [[ "$install_missing" == false ]] || child_args+=(--install-missing)
+    [[ "$discard" == false ]] || child_args+=(--discard)
 
     printf 'state=running\n' >"$run_dir/status"
     nohup "$SCRIPT_PATH" "${child_args[@]}" \
@@ -647,7 +655,11 @@ connections = 1
 socket = "$control_socket_path"
 EOF
 
-"$maki_bin" volume create "$config_path"
+if [[ "$discard" == true ]]; then
+    "$maki_bin" volume create "$config_path" --discard
+else
+    "$maki_bin" volume create "$config_path"
+fi
 "$maki_bin" volume inspect "$config_path" | tee "$run_dir/volume-inspect.txt"
 volume_uuid="$(awk '$1 == "uuid:" { print $2 }' "$run_dir/volume-inspect.txt")"
 [[ "$volume_uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
@@ -824,6 +836,29 @@ mounted_source="$(findmnt -n -o SOURCE -M "$mountpoint")"
     die "unexpected mount source: $mounted_source"
 pass "maki-attach activated LVM and mounted XFS"
 
+# R5-002: the volume's bytes come from the unprivileged daemon, so setuid
+# bits and device nodes on it must never take effect.
+mount_options="$(findmnt -n -o OPTIONS -M "$mountpoint")"
+for required in nosuid nodev; do
+    [[ ",$mount_options," == *",$required,"* ]] ||
+        die "mount options lack $required: $mount_options"
+done
+pass "XFS is mounted nosuid,nodev ($mount_options)"
+
+# R5-030: executing verbs refuse an attach config a non-root user controls,
+# before touching any state (a second attach would otherwise be refused for
+# the live record, not for the config).
+untrusted_config="$run_dir/untrusted-attach.toml"
+sudo -n cat "$attach_config_path" >"$untrusted_config"
+chmod 0600 "$untrusted_config"
+if sudo -n env PATH="$PATH" "$attach_bin" attach --volume "$volume_name" \
+    --config "$untrusted_config" >"$run_dir/maki-untrusted-config.txt" 2>&1; then
+    die "maki-attach accepted an attach config owned by $(id -un)"
+fi
+grep -q 'root-owned' "$run_dir/maki-untrusted-config.txt" ||
+    die "untrusted attach config was refused for another reason: $(cat "$run_dir/maki-untrusted-config.txt")"
+pass "maki-attach refuses an attach config a non-root user controls"
+
 sudo -n env PATH="$PATH" "$attach_bin" verify --volume "$volume_name" \
     --config "$attach_config_path" >"$run_dir/maki-verify-before-workload.txt" 2>&1
 pass "root-controlled workload gate verified pinned storage identity"
@@ -859,6 +894,31 @@ pass "SQLite FULL-synchronous WAL checkpoint and integrity_check"
 sudo -n env PATH="$PATH" "$attach_bin" verify --volume "$volume_name" \
     --config "$attach_config_path" >"$run_dir/maki-verify-after-workload.txt" 2>&1
 pass "workload gate still verifies the live attachment after database I/O"
+
+if [[ "$discard" == true ]]; then
+    # R5-010/R5-011: kernel discards are far longer than nbd.maximum_io and
+    # used to fail with EINVAL. Free the fio file, trim, checkpoint, and
+    # require the backing to release physical blocks.
+    discard_max="$(cat "/sys/block/$nbd_target/queue/discard_max_bytes")"
+    log "kernel discard_max_bytes for $nbd_target: $discard_max"
+    ((discard_max > 0)) || die "kernel NBD device does not accept discards"
+    rm -f "$mountpoint/work/fio.dat"
+    sync -f "$mountpoint/work"
+    "$maki_bin" checkpoint "$config_path" >"$run_dir/checkpoint-before-trim.txt"
+    allocated_before="$(du -sB1 "$work_dir/backing/data" | awk '{print $1}')"
+    sudo -n fstrim -v "$mountpoint" | tee "$run_dir/fstrim.txt"
+    # The kernel issues discards without FUA; a checkpoint applies only
+    # durable records, so flush the device (an NBD FLUSH) first.
+    sudo -n blockdev --flushbufs "$device"
+    "$maki_bin" checkpoint "$config_path" >"$run_dir/checkpoint-after-trim.txt"
+    allocated_after="$(du -sB1 "$work_dir/backing/data" | awk '{print $1}')"
+    log "backing data allocated: $allocated_before -> $allocated_after bytes"
+    ((allocated_before - allocated_after >= 32 << 20)) ||
+        die "fstrim released only $((allocated_before - allocated_after)) bytes of the 64 MiB fio file"
+    sudo -n env PATH="$PATH" "$attach_bin" verify --volume "$volume_name" \
+        --config "$attach_config_path" >"$run_dir/maki-verify-after-trim.txt" 2>&1
+    pass "fstrim through XFS, LVM and kernel NBD released backing space"
+fi
 
 log "running the real idempotent maki-attach cleanup helper"
 # The invoking user deliberately opens the log file.
