@@ -139,10 +139,12 @@ implemented; current Maki volume operations do not require them.
 Open authenticates the entire selected manifest and streams all referenced pages
 before exposing readiness. Metadata memory and commit cost grow with the number
 of allocated pages; each commit currently serializes the complete manifest.
-Each page write also recomputes the committed and working slot sets, so a
-write's cost grows with committed data (measured on a release build: a 64 KiB
-write took 29, 55 and 124 ms with 32, 64 and 128 MiB committed); near the
-1 GiB capacity a single journal append can approach a second.
+Page writes keep the committed and working slot sets incrementally, so a
+write into an already reserved range no longer scales with committed data (a
+release-build 64 KiB write at 128 MiB committed takes well under a
+millisecond, gated by `phase_r5_rollback_write_cost_gate_full`). A write that
+extends a reservation still commits, and each commit serializes the complete
+manifest.
 There are at most 4096 namespace entries, 4096 live file identities and 1024 bytes
 per path. This first implementation targets bounded experiments, not high-volume
 production I/O. Whole-process RSS, latency and hard-power-loss qualification on

@@ -193,6 +193,22 @@ struct State {
     next_id: u64,
     locks: BTreeSet<String>,
     poisoned: bool,
+    /// Arena slots the committed manifest references; recomputed only when
+    /// a commit succeeds.
+    committed_slots: BTreeSet<u64>,
+    /// Committed and working slots together, or `None` when an operation
+    /// that can free a slot made it stale. Allocation only adds to it, so it
+    /// is never smaller than the slots in use.
+    used_slots: Option<BTreeSet<u64>>,
+    /// Where the next free-slot search starts.
+    free_hint: u64,
+}
+
+/// Arena slots referenced by a set of file nodes.
+fn slots_of<'a>(nodes: impl Iterator<Item = &'a Node>) -> BTreeSet<u64> {
+    nodes
+        .flat_map(|node| node.pages.values().map(|page| page.slot))
+        .collect()
 }
 
 fn independent_paths(root: &Path, witness: &Path) -> io::Result<()> {
@@ -357,6 +373,9 @@ impl RollbackBacking {
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
+                committed_slots: slots_of(manifest.files.values()),
+                used_slots: None,
+                free_hint: 0,
                 entries: manifest.entries.clone(),
                 files: manifest.files.clone(),
                 next_id: manifest.next_id,
@@ -476,6 +495,8 @@ impl State {
         self.committed = candidate;
         self.manifest_slot = slot;
         self.files.retain(|id, _| retain.contains(id));
+        self.committed_slots = slots_of(self.committed.files.values());
+        self.used_slots = None;
         Ok(())
     }
 
@@ -491,6 +512,17 @@ impl State {
             || (range.end - range.start) > self.committed.capacity / PAGE
         {
             return Err(no_space());
+        }
+        // Already reserved in both views: nothing new to reserve or commit,
+        // so the capacity count cannot change (the common case of writes
+        // into a preallocated range).
+        let covered = |node: Option<&Node>| {
+            node.is_some_and(|node| range.clone().all(|index| node.reserved.contains(&index)))
+        };
+        if covered(self.committed.files.get(&id)) && covered(self.files.get(&id)) {
+            let node = self.files.get_mut(&id).ok_or_else(missing)?;
+            node.len = node.len.max(end);
+            return Ok(());
         }
         self.reclaim_closed_files()?;
         let mut coordinates = self.coordinates();
@@ -515,9 +547,20 @@ impl State {
         Ok(())
     }
 
-    fn page(&mut self, node: &Node, index: u64) -> io::Result<Vec<u8>> {
+    /// The working view's reference to one page of a file, if any.
+    fn page_ref(&self, id: u64, index: u64) -> io::Result<Option<PageRef>> {
+        Ok(self
+            .files
+            .get(&id)
+            .ok_or_else(missing)?
+            .pages
+            .get(&index)
+            .cloned())
+    }
+
+    fn page(&mut self, page: Option<PageRef>) -> io::Result<Vec<u8>> {
         let mut bytes = vec![0; PAGE as usize];
-        if let Some(page) = node.pages.get(&index) {
+        if let Some(page) = page {
             if let Err(error) = self.arena.read_at(page.slot * PAGE, &mut bytes) {
                 self.poisoned = true;
                 return Err(error);
@@ -530,26 +573,32 @@ impl State {
         Ok(bytes)
     }
 
+    /// A slot neither the committed manifest nor the working view uses.
+    fn allocate_slot(&mut self) -> io::Result<u64> {
+        let slots = 2 * self.committed.capacity / PAGE;
+        if self.used_slots.is_none() {
+            let mut used = self.committed_slots.clone();
+            used.extend(slots_of(self.files.values()));
+            self.used_slots = Some(used);
+            self.free_hint = 0;
+        }
+        let used = self.used_slots.as_mut().expect("just computed");
+        let start = self.free_hint.min(slots);
+        let slot = (start..slots)
+            .chain(0..start)
+            .find(|slot| !used.contains(slot))
+            .ok_or_else(|| invalid("rollback arena reservation invariant violated"))?;
+        used.insert(slot);
+        self.free_hint = slot + 1;
+        Ok(slot)
+    }
+
     fn write_page(&mut self, id: u64, index: u64, bytes: &[u8]) -> io::Result<()> {
-        let committed: BTreeSet<u64> = self
-            .committed
-            .files
-            .values()
-            .flat_map(|node| node.pages.values().map(|page| page.slot))
-            .collect();
-        let current = self.files[&id].pages.get(&index).map(|page| page.slot);
-        let slot = if let Some(slot) = current.filter(|slot| !committed.contains(slot)) {
-            slot
-        } else {
-            let mut used = committed;
-            used.extend(
-                self.files
-                    .values()
-                    .flat_map(|node| node.pages.values().map(|page| page.slot)),
-            );
-            (0..2 * self.committed.capacity / PAGE)
-                .find(|slot| !used.contains(slot))
-                .ok_or_else(|| invalid("rollback arena reservation invariant violated"))?
+        let current = self.page_ref(id, index)?.map(|page| page.slot);
+        let slot = match current.filter(|slot| !self.committed_slots.contains(slot)) {
+            // A page written since the last commit is rewritten in place.
+            Some(slot) => slot,
+            None => self.allocate_slot()?,
         };
         if let Err(error) = self.arena.write_at(slot * PAGE, bytes) {
             self.poisoned = true;
@@ -587,11 +636,11 @@ impl BackingFile for CowFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
-        let node = state.files.get(&self.id).ok_or_else(missing)?.clone();
+        let len = state.files.get(&self.id).ok_or_else(missing)?.len;
         let end = offset
             .checked_add(buf.len() as u64)
             .ok_or_else(|| input("read overflow"))?;
-        if end > node.len {
+        if end > len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "read beyond rollback file",
@@ -599,7 +648,8 @@ impl BackingFile for CowFile {
         }
         let mut at = offset;
         while at < end {
-            let bytes = state.page(&node, at / PAGE)?;
+            let page = state.page_ref(self.id, at / PAGE)?;
+            let bytes = state.page(page)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let start = (at % PAGE) as usize;
             let dest = (at - offset) as usize;
@@ -617,8 +667,8 @@ impl BackingFile for CowFile {
             .ok_or_else(|| input("write overflow"))?;
         let mut at = offset;
         while at < end {
-            let node = state.files[&self.id].clone();
-            let mut bytes = state.page(&node, at / PAGE)?;
+            let page = state.page_ref(self.id, at / PAGE)?;
+            let mut bytes = state.page(page)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let start = (at % PAGE) as usize;
             let src = (at - offset) as usize;
@@ -631,9 +681,10 @@ impl BackingFile for CowFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
-        let node = state.files[&self.id].clone();
-        if len < node.len && !len.is_multiple_of(PAGE) && node.pages.contains_key(&(len / PAGE)) {
-            let mut bytes = state.page(&node, len / PAGE)?;
+        let current_len = state.files.get(&self.id).ok_or_else(missing)?.len;
+        let tail = state.page_ref(self.id, len / PAGE)?;
+        if len < current_len && !len.is_multiple_of(PAGE) && tail.is_some() {
+            let mut bytes = state.page(tail)?;
             bytes[(len % PAGE) as usize..].fill(0);
             state.write_page(self.id, len / PAGE, &bytes)?;
         }
@@ -641,6 +692,8 @@ impl BackingFile for CowFile {
         node.len = len;
         node.pages.retain(|index, _| *index < len.div_ceil(PAGE));
         node.reserved.retain(|index| *index < len.div_ceil(PAGE));
+        // Dropped pages may free slots.
+        state.used_slots = None;
         Ok(())
     }
     fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
@@ -651,11 +704,11 @@ impl BackingFile for CowFile {
     fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
-        let node = state.files[&self.id].clone();
+        let file_len = state.files.get(&self.id).ok_or_else(missing)?.len;
         let end = offset
             .checked_add(len)
             .ok_or_else(|| input("hole range overflow"))?
-            .min(node.len);
+            .min(file_len);
         let mut at = offset;
         while at < end {
             let count = (PAGE - at % PAGE).min(end - at);
@@ -663,8 +716,10 @@ impl BackingFile for CowFile {
                 let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
                 node.pages.remove(&(at / PAGE));
                 node.reserved.remove(&(at / PAGE));
-            } else if node.pages.contains_key(&(at / PAGE)) {
-                let mut bytes = state.page(&node, at / PAGE)?;
+                // A dropped page may free its slot.
+                state.used_slots = None;
+            } else if let Some(page) = state.page_ref(self.id, at / PAGE)? {
+                let mut bytes = state.page(Some(page))?;
                 bytes[(at % PAGE) as usize..(at % PAGE + count) as usize].fill(0);
                 state.write_page(self.id, at / PAGE, &bytes)?;
             }

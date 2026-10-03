@@ -91,6 +91,7 @@ package suite and a fresh warning-denying audit passed locally.
 | `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
 | `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
+| `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on `/dev/shm`) |
 
 The job runs `cargo test --workspace --release --locked -- --ignored` without
 a name filter, so every ignored test runs, including any new gate; the

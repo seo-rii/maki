@@ -116,6 +116,9 @@ documents.
 
 ### Fixed
 
+- Rollback-protected backing (experimental): a write's cost no longer grows
+  with committed data (R5-034); a 64 KiB write at 128 MiB committed went
+  from about 150 ms to under 1 ms.
 - Lowering `backing.journal_segment_size` no longer makes a cleanly stopped
   volume fail recovery as corrupt (R5-033); the setting is now limited to
   1 GiB.
