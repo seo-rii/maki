@@ -1106,7 +1106,7 @@ that failed before the change.
 | R5-020 (cache order) | `VersionedLruCache::put` removed the unit's entry unconditionally and a `get` for a mismatching sequence evicted it. A reader that snapshotted `(U, S1)` and finished decrypting after another reader cached `(U, S2)` replaced (or evicted) the newer entry: never stale data, but a lost hit and another payload read and decryption. | `put` keeps a newer entry; a live newer entry survives a lookup for an older sequence. Stale and expired entries are still evicted on lookup. | `review_r5_cache_order.rs` (maki-cache); the randomized `review_cache_model.rs` reference model follows the same rule |
 | R5-021 (header name before credential) | `from_config` loaded and formatted a header's credential into a plain `String` before checking the header *name*; the invalid-name error path dropped it without wiping (only the invalid-value path zeroized). | The name is validated before any credential is loaded. | `an_invalid_header_name_is_refused_before_its_credential_is_loaded` (maki-crypto-http `review_header_values.rs`: a counting key source sees no load) |
 | R5-022 (create output) | `maki volume create` printed `created volume <provider type>`, labelling the provider as the volume name. | The line names the volume and the provider separately. | `volume_lifecycle_create_inspect_check` (maki `e2e.rs`) |
-| R5-023 (command environment) | The attach, detach and grow steps (`mount`, `umount`, `nbd-client`, `lvextend`, `xfs_growfs`, `vgchange`, `modprobe`) and their `blkid`/`blockdev` probes ran through a bare `Command::new`, inheriting the caller's environment and `PATH`; only `recover` and the LVM preflight cleared it. | One `command::controlled` builder (cleared environment, fixed system `PATH`, `LC_ALL=C`) is used for every external command of the helper. | `step_commands_do_not_inherit_the_callers_environment` (maki-privileged `exec_tests.rs`) |
+| R5-023 (command environment) | The attach, detach and grow steps (`mount`, `umount`, `nbd-client`, `lvextend`, `xfs_growfs`, `vgchange`, `modprobe`) and their `blkid`/`blockdev` probes ran through a bare `Command::new`, inheriting the caller's environment and `PATH`; only `recover` and the LVM preflight cleared it. | One `command::controlled` builder (cleared environment, systemd's default service `PATH` `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `LC_ALL=C`) is used for every external command of the helper. | `step_commands_do_not_inherit_the_callers_environment` (maki-privileged `exec_tests.rs`) |
 
 | R5-006 (detach sentinel) | Detach, cleanup and attach rollback of a live backend required `<mountpoint>/.maki-sentinel` to match. The mount root belongs to the workload, which could delete, rewrite or replace the file and make every `maki-attach@` stop fail with XFS still mounted. The same observation already bound the mount to the recorded LV (device number, root `/`, XFS, exclusive NBD dependency), so the sentinel added no proof. | `detach::observe` is kernel-only, like recovery; the `allow_missing_sentinel` rollback flag is gone. Attach and `verify` keep the sentinel as an identity input. This supersedes the earlier design whose tests asserted that ordinary detach stays strict (`initial_rollback_only_relaxes_a_missing_sentinel` and the sentinel half of the replacement-mount test are replaced). | `the_workload_cannot_block_detach_through_its_sentinel` (maki-privileged `detach_tests.rs`: deleted, rewritten, symlinked and directory sentinels; another device is still refused) |
 
@@ -1195,6 +1195,14 @@ repairs found at open (an adopted orphan shard, a rebuilt allocation map) when
 nothing else is pending. An unpersisted repair is redone at the next open and
 every write path persists it before any catalog commit (K-03), so this costs
 latency, not durability.
+
+The 2026-10-03 hardware campaign found that the first R5-023 `PATH`
+(`/usr/sbin:/usr/bin:/sbin:/bin`) hid a source-built `nbd-client` 3.27 in
+`/usr/local/sbin`, which the helper had found through the inherited
+environment before: `maki-attach attach` failed with "No such file or
+directory" at its first `nbd-client` step. The controlled environment now uses
+systemd's default service `PATH`, root-controlled locations only, including
+`/usr/local`.
 
 `scripts/privileged-linux-validation.sh` created its mountpoint inside a
 user-owned `mktemp` tree (or under `/var/tmp`, mode 1777), which the

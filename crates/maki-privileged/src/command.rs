@@ -41,7 +41,12 @@ pub(crate) fn controlled(program: &str) -> Command {
     let mut command = Command::new(program);
     command
         .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        // systemd's default service PATH: root-controlled locations only,
+        // /usr/local included, where a source-built nbd-client 3.27 lives.
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )
         .env("LC_ALL", "C");
     command
 }

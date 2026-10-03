@@ -1636,7 +1636,9 @@ mod workload_verify_tests;
 /// environment: a fixed PATH, `LC_ALL=C`, nothing inherited from the caller
 /// (`LD_*`, a hostile PATH, locale-dependent output). `recover` and the LVM
 /// preflight already did; the attach/detach/grow steps and their probes
-/// inherited everything.
+/// inherited everything. The PATH is systemd's default service PATH: a
+/// source-built nbd-client 3.27 lives in /usr/local/sbin (the 2026-10-03
+/// campaign found the first fixed PATH, without /usr/local, unable to find it).
 #[test]
 fn step_commands_do_not_inherit_the_callers_environment() {
     std::env::set_var("MAKI_ENV_PROBE_LEAK", "leaked");
@@ -1647,7 +1649,7 @@ fn step_commands_do_not_inherit_the_callers_environment() {
         &[
             "-c",
             "test -z \"$MAKI_ENV_PROBE_LEAK\" \
-             && test \"$PATH\" = /usr/sbin:/usr/bin:/sbin:/bin \
+             && test \"$PATH\" = /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
              && test \"$LC_ALL\" = C",
         ],
     )
