@@ -39,5 +39,8 @@ fn phase_r5_rollback_write_cost_gate_full() {
         per_write < Duration::from_millis(20),
         "a 64 KiB write took {per_write:?} with 128 MiB committed"
     );
-    assert!(fill < Duration::from_secs(60), "filling 128 MiB took {fill:?}");
+    assert!(
+        fill < Duration::from_secs(60),
+        "filling 128 MiB took {fill:?}"
+    );
 }
