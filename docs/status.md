@@ -24,7 +24,7 @@ Last updated: 2026-10-01 (after the R5-001…R5-034 fixes; see the
 | Format | Selection | Status |
 |---|---|---|
 | Superblock envelope v2, mirrored durable proofs | Default for `maki volume create` | Current default; all scoped campaigns below used it unless noted |
-| Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; one scoped GCE whole-instance-reset campaign passed; no database campaign yet ([details](space-reclamation.md)) |
+| Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; scoped GCE whole-instance-reset campaigns passed (2026-09-20, and 2026-10-03 after the R5 fixes) and kernel `fstrim` reclaimed backing space through XFS/LVM/NBD; no database campaign yet ([details](space-reclamation.md)) |
 | Rollback-protected backing (local witness) | `[backing.rollback_protection]` on a new volume | **Experimental.** Focused test suites only; not campaign-qualified ([details](rollback-protection.md)) |
 | Legacy envelope v1 | Existing volumes only | Read-only checks with a warning; writable recovery is refused; migrate through [durable recovery](durable-recovery.md) |
 
@@ -78,12 +78,12 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   arbitrary geometry, provider and cache settings has not been established.
 - The volume's XFS filesystem is mounted `nosuid,nodev`; workloads that need
   setuid programs or device nodes on it are not supported.
-- v3 discard fixes of 2026-10-01 (long trims, admission under space pressure,
-  punch ordering) passed the simulation and native libnbd tests only; no
-  kernel `fstrim` campaign has run against them yet. Likewise the
-  `nosuid,nodev` mount, the root-owned mountpoint and attach-config rules
-  and the added `maki@.service` sandboxing have not yet run through the
-  packaged GCE lifecycle.
+- The R5 changes passed one scoped GCE campaign on 2026-10-03
+  ([record](qualification/r5-hardware-validation-2026-10-03.md)): ten v3
+  discard resets, kernel `fstrim` reclamation through XFS/LVM/NBD, the
+  `nosuid,nodev` mount, attach-config ownership, and the packaged quick start
+  under the `maki@.service` sandbox. No database workload has run on a v3
+  volume, and `fstrim` under space pressure has not been exercised.
 - Privileged attach supports the single-PV/single-data-LV XFS topology; other
   device-mapper layouts fail closed and need operator diagnosis
   ([storage recovery limits](storage-recovery.md#remaining-recovery-limits)).
