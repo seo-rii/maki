@@ -192,7 +192,9 @@ secret there. Production
 deployments should use systemd credentials; environment-backed credentials are
 intended for development.
 
-The data-plane service receives credentials through `LoadCredential`. The
+The data-plane service receives credentials through `LoadCredential`;
+systemd 257 and later write those files `0440` for the service's group, which
+Maki accepts in the credentials directory only (R5-037). The
 privileged attach helper has no crypto dependency and no credential directive.
 
 Every credential reference is loaded from exactly the `source` it declares:

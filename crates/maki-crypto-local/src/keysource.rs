@@ -60,11 +60,30 @@ fn missing(name: &str) -> CryptoError {
 /// always returns the content raw.
 pub struct FileKeySource {
     dir: PathBuf,
+    /// Accept group read when the group is the process's own or root.
+    group_readable: bool,
 }
 
 impl FileKeySource {
+    /// A root-only secret directory: files must be 0600 or 0400.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            group_readable: false,
+        }
+    }
+
+    /// systemd's per-unit credentials directory (`$CREDENTIALS_DIRECTORY`).
+    /// systemd creates it for the one unit and, from version 257, writes
+    /// `LoadCredential=` files with mode 0440 for the service's group. Group
+    /// read is accepted when the file's group is the process's effective
+    /// group or root; group write and any access by others are still
+    /// refused (R5-037).
+    pub fn credentials_directory(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            group_readable: true,
+        }
     }
 }
 
@@ -187,11 +206,24 @@ impl FileKeySource {
                     "credential {name:?} is not a regular file"
                 )));
             }
+            use std::os::unix::fs::MetadataExt;
             let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
+            // SAFETY: getegid has no preconditions and cannot fail.
+            let own_group = meta.gid() == 0 || meta.gid() == unsafe { libc::getegid() };
+            let forbidden = if self.group_readable && own_group {
+                0o037
+            } else {
+                0o077
+            };
+            if mode & forbidden != 0 {
+                let rule = if self.group_readable {
+                    "a systemd credential may add read for the service's own group (0440)"
+                } else {
+                    "a secret file must be 0600 or 0400"
+                };
                 return Err(CryptoError::ProviderFatal(format!(
-                    "credential file {name:?} has mode {mode:04o}: it is readable by the group \
-                     or by others; a secret file must be 0600 or 0400 (SPEC 9)"
+                    "credential file {name:?} has mode {mode:04o}: it is readable or writable by \
+                     the group or by others; {rule} (SPEC 9)"
                 )));
             }
         }
@@ -241,7 +273,7 @@ impl KeySource for EnvKeySource {
 
 /// systemd credentials directory, when running under `LoadCredential`.
 pub fn systemd_credential_source() -> Option<FileKeySource> {
-    std::env::var_os("CREDENTIALS_DIRECTORY").map(FileKeySource::new)
+    std::env::var_os("CREDENTIALS_DIRECTORY").map(FileKeySource::credentials_directory)
 }
 
 #[cfg(all(test, unix))]

@@ -824,7 +824,9 @@ high-cardinality values as metric labels.
   it.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with mode `0600` or `0400`, or attach is
-  refused.
+  refused. A `credential` (systemd `LoadCredential=`) may also be `0440` when
+  its group is the daemon's own or root, as systemd 257 (Debian 13) writes
+  them; group write and any access by others are refused (R5-037).
 - The control socket is `0660` with `control.group`; administrators reach it
   through the `root:maki-admin` `/run/maki-control` tree, while the NBD
   socket stays behind `/run/maki` (`root:maki` 0750), which only the daemon
