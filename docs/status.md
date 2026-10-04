@@ -37,7 +37,7 @@ There is no in-place format upgrade between envelopes.
 | `local-aes-gcm-siv` | Supported and used by every kernel NBD/LVM/XFS campaign; authenticated and context-bound |
 | `local-aes-xts` | Supported; no authenticated integrity, wrong-key detection only through the key canary; not used in external campaigns |
 | `remote-http` | Supported; scoped campaigns against a reference provider (loopback, then cross-host TLS 1.2/1.3, mTLS, bearer, failover, credential and CA rotation). No commercial vendor endpoint qualified |
-| `remote-websocket`, `remote-grpc` | Supported; one scoped single-host campaign against a reference provider (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check). No commercial vendor endpoint qualified |
+| `remote-websocket`, `remote-grpc` | Supported; scoped single-host campaigns against a reference provider (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check; PostgreSQL over gRPC). No commercial vendor endpoint qualified |
 
 ## Deployment topology
 
@@ -90,6 +90,10 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   with mTLS, endpoint failover, a total-outage stall and resume, `fstrim`
   and a restart, with no syscall outside `@system-service`
   ([record](qualification/remote-transport-syscall-filter-validation-2026-10-04.md)).
+  PostgreSQL 15 then passed its crash and lifecycle scenario over remote gRPC,
+  with an endpoint outage under load, under the packaged unit including
+  `MemoryDenyWriteExecute=yes`
+  ([record](qualification/remote-database-zero-mdwe-validation-2026-10-04.md)).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the
