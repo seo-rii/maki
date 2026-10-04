@@ -201,6 +201,10 @@ fn the_daemon_unit_is_sandboxed() {
         // error rather than killing the daemon.
         ("SystemCallFilter", "@system-service"),
         ("SystemCallErrorNumber", "EPERM"),
+        // No JIT and no writable executable mappings: the local provider and
+        // the HTTP, WebSocket and gRPC providers round-tripped data under it
+        // (2026-10-04).
+        ("MemoryDenyWriteExecute", "yes"),
     ] {
         assert_eq!(directive(UNIT, name), value, "{name}");
     }

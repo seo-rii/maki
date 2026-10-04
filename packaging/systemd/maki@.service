@@ -65,6 +65,9 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # syscall an error rather than a SIGSYS kill.
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+# No JIT and no writable executable mapping; every provider round-tripped
+# data under it (2026-10-04).
+MemoryDenyWriteExecute=yes
 LockPersonality=yes
 
 # Top-level tmpfiles directories select who can enter each socket tree.
