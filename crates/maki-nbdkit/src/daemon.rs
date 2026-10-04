@@ -506,7 +506,7 @@ fn capabilities_from_config(
         retry_safe: caps_cfg.retry_safe,
         batch: maki_crypto::BatchCapability {
             supported: true,
-            max_items: config.crypto.batch.max_items,
+            max_items: config.effective_batch_max_items(),
             max_bytes: config.crypto.batch.max_bytes.0,
         },
         integrity: capability(&caps_cfg.integrity),
@@ -921,7 +921,11 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
             )
         };
     maki_crypto::scheduler::SchedulerConfig {
-        target_items: (batch.target_items as usize).min(max_items),
+        // A per-item provider gains nothing from coalescing: dispatch each
+        // single-unit call at once (R5-039).
+        target_items: (batch.target_items as usize)
+            .min(max_items)
+            .min(config.effective_batch_max_items() as usize),
         target_bytes: batch.target_bytes.0.min(max_bytes),
         max_items,
         max_bytes,

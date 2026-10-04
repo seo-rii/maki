@@ -116,6 +116,11 @@ documents.
 
 ### Fixed
 
+- A request's provider batches run concurrently within the
+  `max_active_callbacks` limit, and a per-item HTTP mapping (no
+  `items_path`) is batched one unit per call. Sequential I/O through such a
+  mapping with 10 ms of provider latency went from about 330 KiB/s to
+  2.8 MiB/s (R5-039).
 - **Writes longer than `nbd.maximum_io` were refused and, under buffered
   writeback, silently lost** (R5-038). Linux 6.12 (Debian 13) sends up to
   1280 KiB per request regardless of the advertised 1 MiB maximum; XFS made

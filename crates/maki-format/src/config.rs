@@ -781,6 +781,29 @@ pub fn is_sensitive_header(name: &str) -> bool {
 }
 
 impl VolumeConfig {
+    /// The batch size the provider can actually take. A `remote-http`
+    /// operation without `items_path` sends one request per unit, so
+    /// grouping units for it only serializes them: such a mapping counts as
+    /// one item per batch, and the engine runs a request's batches
+    /// concurrently under the callback and in-flight limits (R5-039).
+    /// Otherwise `[crypto.batch] max_items`.
+    pub fn effective_batch_max_items(&self) -> u32 {
+        let per_item = |op: &Option<HttpOpConfig>| {
+            op.as_ref()
+                .and_then(|op| op.body.as_ref())
+                .is_none_or(|body| body.items_path.is_none())
+        };
+        match &self.crypto.http {
+            Some(http)
+                if self.crypto.provider == "remote-http"
+                    && (per_item(&http.encrypt) || per_item(&http.decrypt)) =>
+            {
+                1
+            }
+            _ => self.crypto.batch.max_items,
+        }
+    }
+
     /// Every credential reference the configuration declares, with the
     /// source each one must be loaded from (the daemon's credential router
     /// dispatches on it, O-06).

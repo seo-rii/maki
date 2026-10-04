@@ -602,6 +602,39 @@ impl Engine {
         chunks
     }
 
+    /// Run one request's provider batches, in order. The request's own
+    /// admission permit covers its first batch; each further batch may run
+    /// at the same time under an idle callback slot taken without waiting,
+    /// so `max_active_callbacks` still bounds provider concurrency (SPEC
+    /// §30) and a request never waits on, or starves, another one's slots.
+    /// Results keep the order of `ranges`; the first error cancels the rest
+    /// (R5-039).
+    async fn run_batches<T, F, Fut>(
+        &self,
+        ranges: Vec<std::ops::Range<usize>>,
+        call: F,
+    ) -> Result<Vec<T>, CoreError>
+    where
+        F: FnMut(std::ops::Range<usize>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, CryptoError>>,
+    {
+        use futures_util::stream::{self, StreamExt, TryStreamExt};
+        let mut extra = Vec::new();
+        while extra.len() + 1 < ranges.len() {
+            match self.inner.admission.try_acquire(0) {
+                Some(permit) => extra.push(permit),
+                None => break,
+            }
+        }
+        let width = extra.len() + 1;
+        let results = stream::iter(ranges.into_iter().map(call))
+            .buffered(width)
+            .try_collect()
+            .await?;
+        drop(extra);
+        Ok(results)
+    }
+
     /// Virtual device size in bytes.
     pub fn size(&self) -> u64 {
         self.inner.geometry.max_virtual_size
@@ -693,12 +726,15 @@ impl Engine {
         }
         let mut out = HashMap::with_capacity(cts.len());
         let unit_size = self.inner.geometry.crypto_unit_size as usize;
-        for range in self.batch_chunks(cts.len(), |i| cts[i].data.len()) {
-            let pts = self
-                .inner
-                .provider
-                .decrypt_batch(&self.inner.context, &cts[range])
-                .await?;
+        let ranges = self.batch_chunks(cts.len(), |i| cts[i].data.len());
+        let batches = self
+            .run_batches(ranges, |range| {
+                self.inner
+                    .provider
+                    .decrypt_batch(&self.inner.context, &cts[range])
+            })
+            .await?;
+        for pts in batches {
             for pt in pts {
                 // The provider contract pins plaintext to *this volume's*
                 // unit size, not merely to a size the provider supports:
@@ -927,14 +963,17 @@ impl Engine {
         }
 
         // Encrypt outside the volume lock, chunked to the batch contract.
+        let ranges = self.batch_chunks(items.len(), |i| items[i].data.len());
         let mut cts = Vec::with_capacity(items.len());
-        for range in self.batch_chunks(items.len(), |i| items[i].data.len()) {
-            cts.extend(
+        for batch in self
+            .run_batches(ranges, |range| {
                 self.inner
                     .provider
                     .encrypt_batch(&self.inner.context, &items[range])
-                    .await?,
-            );
+            })
+            .await?
+        {
+            cts.extend(batch);
         }
         // A ciphertext the volume cannot hold must never reach the journal:
         // the slot store would refuse it at every checkpoint and recovery

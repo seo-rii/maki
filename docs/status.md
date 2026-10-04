@@ -98,9 +98,10 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   with all three remote transports under the shipped sandbox, with latency
   and packet loss, and NBD zeroing
   ([record](qualification/debian13-remote-transport-validation-2026-10-04.md)).
-  It needs `fc8d697` or later and nbd-client 3.27 built from source. A
-  per-item HTTP mapping is slow under latency (one round trip per 4 KiB
-  unit); prefer a batched mapping.
+  It needs `fc8d697` or later and nbd-client 3.27 built from source. That
+  campaign's per-item HTTP mapping was slow under latency (one round trip
+  per 4 KiB unit, in sequence); a request's units now go out concurrently
+  (R5-039), measured locally only, not yet in a campaign.
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the

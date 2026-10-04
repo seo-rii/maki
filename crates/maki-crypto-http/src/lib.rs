@@ -1072,7 +1072,7 @@ impl HttpCryptoProvider {
             retry_safe: caps_cfg.retry_safe,
             batch: maki_crypto::BatchCapability {
                 supported: true,
-                max_items: config.crypto.batch.max_items,
+                max_items: config.effective_batch_max_items(),
                 max_bytes: config.crypto.batch.max_bytes.0,
             },
             integrity: capability(&caps_cfg.integrity),

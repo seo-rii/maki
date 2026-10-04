@@ -422,6 +422,19 @@ coalescing an in-process cipher only adds latency. `maki status` reports the
 scheduler under `crypto`, and metrics expose `maki_crypto_pending_items`,
 `maki_crypto_pending_bytes`, and batch counters.
 
+The engine splits a request into batches of at most the provider's
+`max_items` and runs them concurrently: the request's own admission covers
+the first, and each further batch runs only under an idle
+`limits.max_active_callbacks` slot taken without waiting, so that limit still
+bounds provider calls and a waiting request is never starved (R5-039). A
+`remote-http` mapping without `items_path` sends one HTTP request per unit,
+so it counts as `max_items = 1` whatever `[crypto.batch]` says, and the
+scheduler dispatches each unit at once instead of coalescing it; the
+per-endpoint and in-flight limits bound how many reach the vendor. With
+10 ms of provider latency this took sequential 128 KiB reads and writes from
+about 330 KiB/s to 2.8 MiB/s. A batched mapping (`items_path`) is still
+cheaper per unit.
+
 ## Security settings
 
 The default administrative socket is
