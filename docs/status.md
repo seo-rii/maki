@@ -37,7 +37,7 @@ There is no in-place format upgrade between envelopes.
 | `local-aes-gcm-siv` | Supported and used by every kernel NBD/LVM/XFS campaign; authenticated and context-bound |
 | `local-aes-xts` | Supported; no authenticated integrity, wrong-key detection only through the key canary; not used in external campaigns |
 | `remote-http` | Supported; scoped campaigns against a reference provider (loopback, then cross-host TLS 1.2/1.3, mTLS, bearer, failover, credential and CA rotation). No commercial vendor endpoint qualified |
-| `remote-websocket`, `remote-grpc` | Supported with verified TLS/mTLS and daemon I/O tests; no external campaign |
+| `remote-websocket`, `remote-grpc` | Supported; one scoped single-host campaign against a reference provider (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check). No commercial vendor endpoint qualified |
 
 ## Deployment topology
 
@@ -86,6 +86,10 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   PostgreSQL 15 crash and lifecycle tests on a v3 volume with `fstrim` under
   load, and three lifecycles under the adopted syscall filter
   ([record](qualification/database-discard-pressure-validation-2026-10-03.md)).
+- All three remote transports ran under that filter on 2026-10-04, each
+  with mTLS, endpoint failover, a total-outage stall and resume, `fstrim`
+  and a restart, with no syscall outside `@system-service`
+  ([record](qualification/remote-transport-syscall-filter-validation-2026-10-04.md)).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the

@@ -271,6 +271,8 @@ observable behaviour:
 
 ### Documentation
 
+- [Remote transports under the syscall filter](docs/qualification/remote-transport-syscall-filter-validation-2026-10-04.md):
+  the first external campaign for WebSocket and gRPC.
 - The quick start and first-volume bootstrap passed `/dev/nbd0` to
   `nbd-client`; version 3.27, which Maki requires, connects over netlink and
   refuses it ("Invalid nbd device target"). They now pass the kernel name

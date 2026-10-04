@@ -28,6 +28,7 @@ do. Reports never claim current state. For the current state read
 | 2026-09-20 | [GCE discard/reset (v3)](gce-discard-reset-validation-2026-09-20.md) | `f5bde3e` | Ten whole-instance resets against an opt-in v3 discard volume with the local provider |
 | 2026-10-03 | [R5 hardware validation](r5-hardware-validation-2026-10-03.md) | `62f95ad`, `adcebfe` | Ten v3 discard resets after the R5 fixes; privileged run with `nosuid,nodev`, attach-config ownership and `fstrim` reclamation; packaged quick start under the R5 sandbox |
 | 2026-10-03 | [PostgreSQL on discard, space pressure, syscall filter](database-discard-pressure-validation-2026-10-03.md) | `ff79721`, `551db73` | PostgreSQL 15 crash and lifecycle on a v3 volume with `fstrim` under load; R5-011 at the block level and its XFS limit; three lifecycles under `SystemCallFilter=@system-service` |
+| 2026-10-04 | [Remote transports under the syscall filter](remote-transport-syscall-filter-validation-2026-10-04.md) | `f1d75f7` | HTTP, WebSocket and gRPC through an mTLS edge (TLS 1.2/1.3) under `@system-service`, syscall audit pass, failover, outage stall/resume, `fstrim`, restart; found R5-035 |
 
 Unattended repetition of the storage test suites on a local host is described
 in [background storage regression runs](../background-storage-validation.md).
