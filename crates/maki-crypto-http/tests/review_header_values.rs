@@ -52,6 +52,9 @@ fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(maki_crypto::SecretBuffer::from_slice(b"test-token"))
         }
+        fn load_text(&self, name: &str) -> Result<maki_crypto::SecretBuffer, CryptoError> {
+            self.load(name)
+        }
     }
 
     // Windows checkouts may carry CRLF line endings.

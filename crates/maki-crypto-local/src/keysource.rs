@@ -9,7 +9,14 @@ use std::path::PathBuf;
 use maki_crypto::{CryptoError, SecretBuffer};
 
 pub trait KeySource: Send + Sync {
+    /// Key material: a stored pure hex string is decoded (sources may keep
+    /// binary keys as hex).
     fn load(&self, name: &str) -> Result<SecretBuffer, CryptoError>;
+
+    /// A credential used as text (a header or metadata value, a PEM private
+    /// key): exactly the stored bytes, never hex-decoded. A token generated
+    /// as hex is still the hex text (R5-035).
+    fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError>;
 }
 
 /// In-memory source for tests.
@@ -35,6 +42,10 @@ impl KeySource for MapKeySource {
             .map(|b| SecretBuffer::from_slice(b))
             .ok_or_else(|| missing(name))
     }
+
+    fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
+        self.load(name)
+    }
 }
 
 fn missing(name: &str) -> CryptoError {
@@ -44,8 +55,9 @@ fn missing(name: &str) -> CryptoError {
 /// Reads credentials from a directory of files: systemd `LoadCredential`
 /// (`$CREDENTIALS_DIRECTORY`) or a root-only secret directory.
 ///
-/// File content is used raw, except when it is a pure even-length hex string
-/// (optionally newline-terminated), which is decoded.
+/// `load` uses file content raw, except when it is a pure even-length hex
+/// string (optionally newline-terminated), which is decoded; `load_text`
+/// always returns the content raw.
 pub struct FileKeySource {
     dir: PathBuf,
 }
@@ -133,6 +145,18 @@ pub fn open_credential(
 
 impl KeySource for FileKeySource {
     fn load(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
+        let raw = self.read(name)?;
+        Ok(key_from_bytes(raw.expose()))
+    }
+
+    fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
+        self.read(name)
+    }
+}
+
+impl FileKeySource {
+    /// The checked file's bytes, in a guarded buffer.
+    fn read(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
         if !valid_credential_name(name) {
             return Err(CryptoError::ProviderFatal(format!(
                 "invalid credential name {name:?}"
@@ -171,16 +195,15 @@ impl KeySource for FileKeySource {
                 )));
             }
         }
-        // The file bytes and the decoded key both live only in guarded
-        // buffers (R4-002); `raw` zeroizes when it goes out of scope.
+        // The file bytes live only in a guarded buffer (R4-002); `load`
+        // decodes a hex key into another one and drops this one zeroized.
         #[cfg(not(unix))]
         if !meta.file_type().is_file() {
             return Err(CryptoError::ProviderFatal(format!(
                 "credential {name:?} is not a regular file"
             )));
         }
-        let raw = read_guarded(file, meta.len()).map_err(|_| missing(name))?;
-        Ok(key_from_bytes(raw.expose()))
+        read_guarded(file, meta.len()).map_err(|_| missing(name))
     }
 }
 
@@ -188,12 +211,16 @@ impl KeySource for FileKeySource {
 /// (SPEC §9: not for production).
 pub struct EnvKeySource;
 
+fn env_var_name(name: &str) -> String {
+    format!(
+        "MAKI_CREDENTIAL_{}",
+        name.to_uppercase().replace(['-', '.'], "_")
+    )
+}
+
 impl KeySource for EnvKeySource {
     fn load(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
-        let var = format!(
-            "MAKI_CREDENTIAL_{}",
-            name.to_uppercase().replace(['-', '.'], "_")
-        );
+        let var = env_var_name(name);
         // The environment copy itself is outside our control (development
         // only, SPEC §9); the key is copied into guarded memory and the
         // intermediate string is erased.
@@ -201,6 +228,14 @@ impl KeySource for EnvKeySource {
         let key = key_from_bytes(value.as_bytes());
         zeroize::Zeroize::zeroize(&mut value);
         Ok(key)
+    }
+
+    fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
+        let var = env_var_name(name);
+        let mut value = std::env::var(&var).map_err(|_| missing(name))?;
+        let text = SecretBuffer::from_slice(value.as_bytes());
+        zeroize::Zeroize::zeroize(&mut value);
+        Ok(text)
     }
 }
 
@@ -269,5 +304,24 @@ mod tests {
             FileKeySource::new(dir.path()).load("loose").unwrap().len(),
             32
         );
+    }
+
+    /// R5-035: keys may be stored as hex, text credentials never are: a
+    /// hex-looking bearer token must load as exactly the bytes on disk.
+    #[test]
+    fn text_credentials_are_loaded_verbatim_while_keys_stay_hex_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, b"00ff10ab\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source = FileKeySource::new(dir.path());
+        assert_eq!(
+            source.load("token").unwrap().expose(),
+            &[0x00, 0xff, 0x10, 0xab]
+        );
+        assert_eq!(source.load_text("token").unwrap().expose(), b"00ff10ab\n");
+        let mut map = MapKeySource::new();
+        map.insert("token", b"00ff".to_vec());
+        assert_eq!(map.load_text("token").unwrap().expose(), b"00ff");
     }
 }

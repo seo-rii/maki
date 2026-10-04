@@ -962,7 +962,7 @@ impl HttpCryptoProvider {
                 let resolved = match value {
                     HeaderValue::Literal(v) => v.clone(),
                     HeaderValue::Credential(cred) => {
-                        let secret = keys.load(&cred.name)?;
+                        let secret = keys.load_text(&cred.name)?;
                         let text = std::str::from_utf8(secret.expose())
                             .map_err(|_| fatal("credential is not valid UTF-8"))?;
                         match &cred.format {
@@ -1110,7 +1110,7 @@ impl HttpCryptoProvider {
                         if let Some(key) = &t.client_key {
                             // Private key from its credential source, appended
                             // to the certificate PEM for the client identity.
-                            let secret = keys.load(&key.name)?;
+                            let secret = keys.load_text(&key.name)?;
                             if !pem.0.ends_with(b"\n") {
                                 pem.0.push(b'\n');
                             }

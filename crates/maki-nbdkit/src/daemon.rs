@@ -252,6 +252,20 @@ impl RoutedKeySource {
 
 impl KeySource for RoutedKeySource {
     fn load(&self, name: &str) -> Result<maki_crypto::SecretBuffer, maki_crypto::CryptoError> {
+        let (source, leaf) = self.route(name)?;
+        source.load(&leaf)
+    }
+
+    fn load_text(&self, name: &str) -> Result<maki_crypto::SecretBuffer, maki_crypto::CryptoError> {
+        let (source, leaf) = self.route(name)?;
+        source.load_text(&leaf)
+    }
+}
+
+impl RoutedKeySource {
+    /// The source a credential name is declared with, and the name to look
+    /// up in it.
+    fn route(&self, name: &str) -> Result<(Box<dyn KeySource>, String), maki_crypto::CryptoError> {
         let fatal = |m: String| maki_crypto::CryptoError::ProviderFatal(m);
         let Some(source) = self.sources.get(name) else {
             return Err(fatal(format!(
@@ -259,7 +273,7 @@ impl KeySource for RoutedKeySource {
             )));
         };
         match source.as_str() {
-            "env" => EnvKeySource.load(name),
+            "env" => Ok((Box::new(EnvKeySource), name.to_string())),
             "file" => {
                 let path = std::path::Path::new(name);
                 let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -268,15 +282,16 @@ impl KeySource for RoutedKeySource {
                     .ok_or_else(|| fatal(format!("credential path {name:?} has no file name")))?
                     .to_string_lossy()
                     .into_owned();
-                FileKeySource::new(dir).load(&file)
+                Ok((Box::new(FileKeySource::new(dir)), file))
             }
-            "credential" => systemd_credential_source()
-                .ok_or_else(|| {
+            "credential" => {
+                let source = systemd_credential_source().ok_or_else(|| {
                     fatal(format!(
                         "credential {name:?}: CREDENTIALS_DIRECTORY not set, failing closed"
                     ))
-                })?
-                .load(name),
+                })?;
+                Ok((Box::new(source), name.to_string()))
+            }
             other => Err(fatal(format!(
                 "credential {name:?}: unsupported source {other:?}"
             ))),
@@ -357,7 +372,7 @@ async fn remote_websocket_provider(
                 client_key_pem: tls
                     .client_key
                     .as_ref()
-                    .map(|key| RoutedKeySource::from_config(config).load(&key.name))
+                    .map(|key| RoutedKeySource::from_config(config).load_text(&key.name))
                     .transpose()?
                     .map(Arc::new),
             })
@@ -410,7 +425,7 @@ async fn remote_grpc_provider(
                 (Some(cert), Some(key)) => Some(maki_crypto_grpc::GrpcClientIdentity {
                     certificate_pem: read_tls_file("grpc", "client_cert_file", Some(cert))?
                         .expect("certificate path is present"),
-                    private_key_pem: RoutedKeySource::from_config(config).load(&key.name)?,
+                    private_key_pem: RoutedKeySource::from_config(config).load_text(&key.name)?,
                 }),
                 (None, None) => None,
                 _ => return Err(DaemonError::Unsupported(
@@ -509,7 +524,7 @@ fn resolve_metadata_value(
     match value {
         maki_format::config::HeaderValue::Literal(v) => Ok(v.clone()),
         maki_format::config::HeaderValue::Credential(cred) => {
-            let secret = keys.load(&cred.name)?;
+            let secret = keys.load_text(&cred.name)?;
             let text = String::from_utf8(secret.expose().to_vec()).map_err(|_| {
                 DaemonError::Unsupported("credential is not valid UTF-8".to_string())
             })?;

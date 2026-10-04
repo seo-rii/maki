@@ -200,6 +200,11 @@ Every credential reference is loaded from exactly the `source` it declares:
 directory is unset, `file` reads the named file, `env` reads
 `MAKI_CREDENTIAL_<NAME>`. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
+A local provider key may be stored raw or as a hex string (decoded on load).
+Every other credential (a header or metadata value, a `client_key` PEM) is
+text and is used exactly as stored, surrounding whitespace aside for header
+and metadata values, so a token generated with `openssl rand -hex 32` is sent
+as that hex text.
 Within one volume configuration, references may reuse a name only when they
 declare the same source. For example, `name = "token"` in both the encrypt and
 decrypt mappings is valid with `source = "credential"` on both. Combining that

@@ -116,6 +116,10 @@ documents.
 
 ### Fixed
 
+- A bearer token (HTTP header or gRPC metadata credential) or PEM private
+  key that happens to be an even-length hex string is used verbatim; the
+  daemon used to hex-decode it like a local key and refused to start
+  (R5-035). Tokens generated with `openssl rand -hex` were affected.
 - `maki@.service` sets `SystemCallFilter=@system-service` with
   `SystemCallErrorNumber=EPERM`, after three packaged PostgreSQL lifecycles
   ran under it without a denial.
