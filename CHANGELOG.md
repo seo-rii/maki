@@ -295,6 +295,7 @@ observable behaviour:
 - [PostgreSQL over gRPC, NBD zeroing, MemoryDenyWriteExecute](docs/qualification/remote-database-zero-mdwe-validation-2026-10-04.md).
 - [Debian 13: remote transports, sandbox, latency, zeroing](docs/qualification/debian13-remote-transport-validation-2026-10-04.md);
   the support matrix lists Debian 13 as campaign-passed (scoped).
+- [Debian 13: PostgreSQL 17 over per-item HTTP, R5-039 throughput](docs/qualification/debian13-postgresql-http-validation-2026-10-05.md).
 - The quick start and first-volume bootstrap passed `/dev/nbd0` to
   `nbd-client`; version 3.27, which Maki requires, connects over netlink and
   refuses it ("Invalid nbd device target"). They now pass the kernel name

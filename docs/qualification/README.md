@@ -31,6 +31,7 @@ do. Reports never claim current state. For the current state read
 | 2026-10-04 | [Remote transports under the syscall filter](remote-transport-syscall-filter-validation-2026-10-04.md) | `f1d75f7` | HTTP, WebSocket and gRPC through an mTLS edge (TLS 1.2/1.3) under `@system-service`, syscall audit pass, failover, outage stall/resume, `fstrim`, restart; found R5-035 |
 | 2026-10-04 | [PostgreSQL over gRPC, NBD zeroing, MemoryDenyWriteExecute](remote-database-zero-mdwe-validation-2026-10-04.md) | `c37e7e0` | PostgreSQL 15 crash and lifecycle over remote gRPC with an endpoint outage under the packaged unit with `MemoryDenyWriteExecute`; `nbdcopy` WRITE_ZEROES of 192/816 MiB (R5-036) on legacy and v3 volumes |
 | 2026-10-04 | [Debian 13: remote transports, sandbox, latency, zeroing](debian13-remote-transport-validation-2026-10-04.md) | `fc8d697` | Three remote transports with a syscall audit pass, the shipped sandbox and netem on systemd 257 / glibc 2.41 / Linux 6.12; kernel WRITE_ZEROES; found R5-037 and R5-038 |
+| 2026-10-05 | [Debian 13: PostgreSQL 17 over per-item HTTP, R5-039 throughput](debian13-postgresql-http-validation-2026-10-05.md) | `bd64553` | PostgreSQL crash and lifecycle with the packaged `maki-attach` LVM graph on Debian 13; per-item HTTP throughput with and without netem delay and loss |
 
 Unattended repetition of the storage test suites on a local host is described
 in [background storage regression runs](../background-storage-validation.md).

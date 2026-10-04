@@ -101,7 +101,12 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   It needs `fc8d697` or later and nbd-client 3.27 built from source. That
   campaign's per-item HTTP mapping was slow under latency (one round trip
   per 4 KiB unit, in sequence); a request's units now go out concurrently
-  (R5-039), measured locally only, not yet in a campaign.
+  (R5-039). On Debian 13 a per-item HTTP volume then did 0.61 MiB/s of
+  sequential direct I/O with 10 ms ± 5 ms of loopback latency and
+  0.16–0.17 MiB/s with 1 % loss added; prefer a batched mapping. PostgreSQL
+  17 passed its crash and lifecycle scenario over that mapping with the
+  packaged `maki-attach` LVM lifecycle
+  ([record](qualification/debian13-postgresql-http-validation-2026-10-05.md)).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the
