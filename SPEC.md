@@ -605,9 +605,12 @@ Block-related concepts are separated.
 
 The plugin MUST advertise the configured minimum, preferred, and maximum NBD
 I/O sizes. The minimum MUST be at most 64 KiB and the maximum MUST fit in the
-32-bit NBD field. Read and write callbacks MUST reject zero-length, oversized,
+32-bit NBD field. Read and write callbacks MUST reject zero-length,
 out-of-range, or minimum-misaligned requests before copying write plaintext or
-submitting engine work. The preferred size is a performance hint.
+submitting engine work. Clients may ignore the advertised maximum (the Linux
+NBD driver does), so a longer read or write MUST be served in chunks of at
+most the maximum, each copied and submitted separately, with FUA on the last.
+The preferred size is a performance hint.
 
 Recommended:
 

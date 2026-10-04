@@ -257,22 +257,18 @@ impl NbdAdapter {
         true
     }
 
-    /// Negotiation is advisory: clients may still send requests outside
-    /// these limits. Refuse them before copying plaintext or entering the
-    /// engine, whose journal headroom is sized for the configured maximum.
-    fn validate_request(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
-        let (_, _, maximum) = self.state()?.block_sizes;
-        if length as u64 > maximum as u64 {
-            return Err(AdapterError::new(
-                EINVAL,
-                "request exceeds NBD size or alignment constraints",
-            ));
-        }
-        self.validate_extent(offset, length)
+    /// The advertised maximum request size: requests above it are served
+    /// in chunks of at most this many bytes.
+    fn maximum(&self) -> Result<usize, AdapterError> {
+        Ok(self.state()?.block_sizes.2 as usize)
     }
 
-    /// Alignment and bounds only: the NBD maximum block size limits
-    /// payloads, and a trim has none (R5-010).
+    /// Alignment and bounds. Negotiation is advisory and the Linux NBD
+    /// client ignores the maximum block size (6.12 sends up to
+    /// `max_sectors_kb`), so a longer request is not refused: reads and
+    /// writes are split into chunks of at most `maximum_io`, each copied and
+    /// admitted on its own, which keeps the engine's per-request bound
+    /// (R5-038). A trim carries no payload at all (R5-010).
     fn validate_extent(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
         let state = self.state()?;
         let (minimum, _, _) = state.block_sizes;
@@ -296,13 +292,17 @@ impl NbdAdapter {
             .admission
             .enter()
             .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
-        self.validate_request(offset, buf.len())?;
-        let len = buf.len();
-        // Plaintext stays in zeroizing buffers until it is copied into the
-        // caller's (nbdkit's) buffer (SPEC §36).
-        let data =
-            self.run(move |engine| Box::pin(async move { engine.read_secret(offset, len).await }))?;
-        buf.copy_from_slice(data.expose());
+        self.validate_extent(offset, buf.len())?;
+        let maximum = self.maximum()?;
+        for (index, chunk) in buf.chunks_mut(maximum).enumerate() {
+            let at = offset + (index * maximum) as u64;
+            let len = chunk.len();
+            // Plaintext stays in zeroizing buffers until it is copied into
+            // the caller's (nbdkit's) buffer (SPEC §36).
+            let data =
+                self.run(move |engine| Box::pin(async move { engine.read_secret(at, len).await }))?;
+            chunk.copy_from_slice(data.expose());
+        }
         Ok(())
     }
 
@@ -311,11 +311,19 @@ impl NbdAdapter {
             .admission
             .enter()
             .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
-        self.validate_request(offset, data.len())?;
-        let owned = SecretBuffer::from_slice(data);
-        self.run(move |engine| {
-            Box::pin(async move { engine.write(offset, owned.expose(), fua).await })
-        })
+        self.validate_extent(offset, data.len())?;
+        let maximum = self.maximum()?;
+        let chunks = data.len().div_ceil(maximum);
+        for (index, chunk) in data.chunks(maximum).enumerate() {
+            let at = offset + (index * maximum) as u64;
+            // FUA on the last chunk: its journal sync covers the earlier ones.
+            let last = fua && index + 1 == chunks;
+            let owned = SecretBuffer::from_slice(chunk);
+            self.run(move |engine| {
+                Box::pin(async move { engine.write(at, owned.expose(), last).await })
+            })?;
+        }
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), AdapterError> {

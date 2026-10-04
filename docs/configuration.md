@@ -295,14 +295,18 @@ and `limits.max_plaintext_bytes`. Increasing the runtime worker count does
 not increase those limits or establish a tested throughput guarantee.
 
 The plugin advertises `minimum_io`, `preferred_io`, and `maximum_io` through
-nbdkit's block-size callback. The adapter also rejects read/write requests with
-zero length, invalid minimum-size alignment, an out-of-range end, or a length
-above `maximum_io` with EINVAL, before copying write plaintext or entering the
-engine. Clients that ignore negotiation therefore cannot bypass the bound used
-to validate journal headroom. A trim carries no payload, so `maximum_io` does
-not limit its length (the Linux nbd driver sends much larger discards); the
-engine journals a long trim in unit-aligned chunks of at most `maximum_io`.
-`preferred_io` remains a performance hint.
+nbdkit's block-size callback. The adapter rejects read/write requests with zero
+length, invalid minimum-size alignment or an out-of-range end with EINVAL,
+before copying write plaintext or entering the engine. Negotiation is advisory
+and the Linux NBD driver does not honour the maximum (Debian 13's 6.12 kernel
+sends writes up to `max_sectors_kb`, 1280 KiB by default), so a read or write
+longer than `maximum_io` is served in chunks of at most `maximum_io`, each
+copied and admitted on its own; FUA applies to the last chunk, whose journal
+sync covers the others (R5-038). The engine itself still refuses anything
+larger, so the value keeps bounding the plaintext and journal headroom of one
+engine request. A trim or zero request is chunked the same way (the Linux nbd
+driver sends much larger discards). `preferred_io` remains a performance
+hint.
 
 This negotiation path was verified with the installed nbdkit header and a real
 rootless nbdkit/libnbd connection. Older clients can still connect, but requests

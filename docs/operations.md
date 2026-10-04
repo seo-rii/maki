@@ -766,9 +766,11 @@ high-cardinality values as metric labels.
   truncation is synced; while the truncation itself fails, writes and
   barriers fail.
 - The NBD plugin advertises `nbd.minimum_io`, `preferred_io` and
-  `maximum_io` through nbdkit's block-size negotiation and refuses a request
-  outside them (EINVAL) before any plaintext is copied; the engine refuses a
-  larger request outright, so the value bounds the memory one request pins.
+  `maximum_io` through nbdkit's block-size negotiation. It refuses a
+  misaligned or out-of-range request (EINVAL) before any plaintext is copied,
+  and serves a longer one (the Linux NBD driver ignores the maximum) in
+  chunks of at most `maximum_io`; the engine refuses a larger request
+  outright, so the value bounds the memory one engine request pins (R5-038).
 - The control socket serves at most 64 sessions at once (further clients wait
   in the listen backlog), closes a session idle for 60 s or a client that does
   not drain a response within 10 s, and runs one `checkpoint`, `reload`, or

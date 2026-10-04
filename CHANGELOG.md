@@ -116,6 +116,11 @@ documents.
 
 ### Fixed
 
+- **Writes longer than `nbd.maximum_io` were refused and, under buffered
+  writeback, silently lost** (R5-038). Linux 6.12 (Debian 13) sends up to
+  1280 KiB per request regardless of the advertised 1 MiB maximum; XFS made
+  on such a volume could not be mounted. Longer reads and writes are now
+  served in `maximum_io` chunks.
 - `maki@.service` starts under systemd 257 (Debian 13), which writes
   `LoadCredential=` files with mode `0440`; the credentials directory now
   accepts group read for the service's own group (R5-037).
