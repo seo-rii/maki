@@ -61,6 +61,8 @@ fn missing(name: &str) -> CryptoError {
 pub struct FileKeySource {
     dir: PathBuf,
     /// Accept group read when the group is the process's own or root.
+    /// Modes exist on Unix only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     group_readable: bool,
 }
 
