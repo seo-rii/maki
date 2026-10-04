@@ -46,7 +46,7 @@ socket = {}
 }
 
 struct Fixture {
-    directory: tempfile::TempDir,
+    _directory: tempfile::TempDir,
     config_path: std::path::PathBuf,
 }
 
@@ -65,7 +65,7 @@ impl Fixture {
             maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         }
         Self {
-            directory,
+            _directory: directory,
             config_path,
         }
     }
@@ -220,7 +220,7 @@ finally:
 "#;
     for discard in [false, true] {
         let fixture = Fixture::new(discard);
-        let mut client = tempfile::NamedTempFile::new_in(&fixture.directory).unwrap();
+        let mut client = tempfile::NamedTempFile::new_in(&fixture._directory).unwrap();
         client.write_all(script.as_bytes()).unwrap();
         let output = Command::new("nbdkit")
             .args(["--foreground", "--exit-with-parent", "-U", "-"])
