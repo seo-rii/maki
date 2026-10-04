@@ -116,8 +116,8 @@ documents.
 
 ### Fixed
 
-- NBD WRITE_ZEROES longer than `nbd.maximum_io` (from `blkdiscard -z`,
-  `qemu-img`, nbdcopy) failed with EINVAL: the plugin left it to nbdkit's
+- NBD WRITE_ZEROES longer than `nbd.maximum_io` (sent by userspace clients
+  such as nbdcopy for the holes of a sparse image) failed with EINVAL: the plugin left it to nbdkit's
   single-`pwrite` emulation. Zeroing is now native and chunked, and may
   discard whole units on a `--discard` volume when the client allows it
   (R5-036).

@@ -48,6 +48,9 @@ fn fixture() -> (Arc<CrashableBacking>, Volume, Geometry) {
 
 #[test]
 fn a_slot_is_punched_only_after_the_checkpoint_that_retires_it_is_durable() {
+    // Punching consults the process-global `discard.punch` failpoint that
+    // the last test arms.
+    let _lock = maki_test_support::failpoints::test_lock();
     let (backing, mut volume, geometry) = fixture();
     volume.write_ct(1, &[0x41; CT], true).unwrap();
     volume.checkpoint().unwrap();
@@ -96,6 +99,9 @@ fn a_slot_is_punched_only_after_the_checkpoint_that_retires_it_is_durable() {
 
 #[test]
 fn a_failed_shard_catalog_commit_does_not_break_reclamation() {
+    // Punching consults the process-global `discard.punch` failpoint that
+    // the last test arms.
+    let _lock = maki_test_support::failpoints::test_lock();
     let (backing, mut volume, _) = fixture();
     volume.write_ct(1, &[0x41; CT], true).unwrap();
     volume.checkpoint().unwrap();

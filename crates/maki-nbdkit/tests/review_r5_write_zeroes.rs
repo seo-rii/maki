@@ -3,8 +3,9 @@
 //! The plugin left zeroing to nbdkit's emulation, which turns a zero
 //! request into one `pwrite` of the whole range. The NBD maximum block
 //! size limits payloads only, so clients send larger zero requests
-//! (nbdcopy sent 64 and 128 MiB, the kernel's `blkdev_issue_zeroout` and
-//! `qemu-img` do the same), and the adapter refused every one above
+//! (nbdcopy sent 64 and 128 MiB for the holes of a sparse image; the
+//! Debian 12 kernel's NBD driver sends none, it reports
+//! `write_zeroes_max_bytes` 0), and the adapter refused every one above
 //! `maximum_io` with EINVAL. Found while preparing the 2026-10-04
 //! follow-up campaign. The plugin now zeroes natively, in chunks, and
 //! discards whole units when the client allows it on a discard volume.
