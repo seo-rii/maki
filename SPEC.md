@@ -1870,10 +1870,12 @@ are release-blocking failures.
 
 # 48. nbdkit Adapter Verification
 
-The adapter MUST verify device geometry, read and write callbacks, emulated FUA,
+The adapter MUST verify device geometry, read and write callbacks, native FUA,
 FLUSH, parallel callbacks, panic containment, opt-in v3 TRIM (complete crypto
-units only), disabled native write-zeroes, disabled multi-connection, disconnect,
-and clean detach. Default v2 volumes continue to advertise no TRIM; see
+units only), native WRITE_ZEROES of any length (chunked to the maximum I/O
+size; complete units discarded only when the client permits trimming on a v3
+volume; no fast zero), disabled multi-connection, disconnect, and clean
+detach. Default v2 volumes continue to advertise no TRIM; see
 `docs/space-reclamation.md` for the v3 persistence contract.
 
 Linux qualification additionally covers the exported API-v2 prefix, libnbd

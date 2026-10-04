@@ -91,14 +91,14 @@ fn get_size_and_block_sizes() {
 // ---------- capability flags ----------
 
 #[test]
-fn trim_zero_and_multiconn_are_disabled() {
+fn trim_and_multiconn_are_disabled_and_zero_is_native() {
     let backing = Arc::new(CrashableBacking::new());
     let adapter = adapter_over(&backing);
     assert!(!adapter.can_trim(), "trim disabled (SPEC §48)");
     assert!(!adapter.can_multi_conn(), "multi-connection disabled");
     assert!(
-        !adapter.can_write_zeroes(),
-        "no zero callback: nbdkit falls back to pwrite"
+        adapter.can_write_zeroes(),
+        "native zero: nbdkit's fallback is one oversized pwrite (R5-036)"
     );
     assert!(adapter.can_flush());
     assert!(adapter.can_fua());

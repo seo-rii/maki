@@ -33,6 +33,14 @@ return space the filesystem freed before the backing ran low; it is not a way
 out of low space, because freeing more (deleting files) needs writes, which
 are refused inside the headroom.
 
+NBD WRITE_ZEROES is not a hint: every byte in its range reads as zero
+afterwards, on every volume. The plugin handles it natively in requests of at
+most `nbd.maximum_io` (nbdkit's emulation wrote the whole range in one
+oversized write and failed, R5-036). When the client allows trimming and the
+volume was created with `--discard`, the complete units inside the range are
+discarded instead and only partial edge units are written; otherwise zeros are
+written and encrypted like any data. Fast zero is not offered.
+
 After a complete unit is discarded, reads return zero. A normal discard may
 remain volatile; FLUSH and FUA use the same durable journal proof as writes.
 Physical release happens during checkpointing. Thus completion of `fstrim`

@@ -239,8 +239,10 @@ impl NbdAdapter {
             .is_some_and(|s| s.engine.can_trim())
     }
 
+    /// WRITE_ZEROES is handled natively ([`Self::zero`]); nbdkit's
+    /// emulation would turn a long zero into one oversized `pwrite`.
     pub fn can_write_zeroes(&self) -> bool {
-        false
+        true
     }
 
     pub fn can_multi_conn(&self) -> bool {
@@ -331,6 +333,67 @@ impl NbdAdapter {
             .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
         self.validate_extent(offset, len)?;
         self.run(move |engine| Box::pin(async move { engine.trim(offset, len, fua).await }))
+    }
+
+    /// WRITE_ZEROES. Like a trim it carries no payload, so it may be longer
+    /// than `nbd.maximum_io` (R5-036): zeros are written in chunks of at
+    /// most that size. With `may_trim` on a discard volume the whole units
+    /// inside the range are discarded instead (a discarded unit reads as
+    /// zeros) and only partial units at the edges are written. FUA applies
+    /// to the last step, whose journal sync covers the earlier ones.
+    pub fn zero(
+        &self,
+        offset: u64,
+        len: usize,
+        may_trim: bool,
+        fua: bool,
+    ) -> Result<(), AdapterError> {
+        let _callback = self
+            .admission
+            .enter()
+            .map_err(|e| AdapterError::new(ESHUTDOWN, e))?;
+        self.validate_extent(offset, len)?;
+        let state = self.state()?;
+        let maximum = u64::from(state.block_sizes.2);
+        let end = offset + len as u64;
+        let (trim_start, trim_end) = if may_trim && state.engine.can_trim() {
+            let unit = u64::from(state.engine.geometry().crypto_unit_size);
+            (offset.div_ceil(unit) * unit, end / unit * unit)
+        } else {
+            (end, end)
+        };
+        if trim_start >= trim_end {
+            return self.write_zeros(offset, end, maximum, fua);
+        }
+        self.write_zeros(offset, trim_start, maximum, false)?;
+        let tail_fua = fua && trim_end < end;
+        let trim_len = usize::try_from(trim_end - trim_start)
+            .map_err(|_| AdapterError::new(EINVAL, "zero request exceeds the address space"))?;
+        self.run(move |engine| {
+            Box::pin(async move { engine.trim(trim_start, trim_len, fua && !tail_fua).await })
+        })?;
+        self.write_zeros(trim_end, end, maximum, tail_fua)
+    }
+
+    /// Write zeros over `start..end` in requests of at most `maximum` bytes;
+    /// FUA on the last one.
+    fn write_zeros(
+        &self,
+        start: u64,
+        end: u64,
+        maximum: u64,
+        fua: bool,
+    ) -> Result<(), AdapterError> {
+        let mut at = start;
+        while at < end {
+            let count = (end - at).min(maximum) as usize;
+            let last = at + count as u64 == end;
+            self.run(move |engine| {
+                Box::pin(async move { engine.write(at, &vec![0u8; count], fua && last).await })
+            })?;
+            at += count as u64;
+        }
+        Ok(())
     }
 
     pub fn checkpoint(&self) -> Result<u64, AdapterError> {

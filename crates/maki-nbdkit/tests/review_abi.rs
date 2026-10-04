@@ -25,6 +25,8 @@ int main(void) {
   printf("NBDKIT_FUA_EMULATE %d\n", NBDKIT_FUA_EMULATE);
   printf("NBDKIT_FUA_NATIVE %d\n", NBDKIT_FUA_NATIVE);
   printf("NBDKIT_FLAG_FUA %d\n", NBDKIT_FLAG_FUA);
+  printf("NBDKIT_FLAG_MAY_TRIM %d\n", NBDKIT_FLAG_MAY_TRIM);
+  printf("NBDKIT_FLAG_FAST_ZERO %d\n", NBDKIT_FLAG_FAST_ZERO);
   OFF(_struct_size); OFF(_api_version); OFF(_thread_model);
   OFF(name); OFF(longname); OFF(version); OFF(description);
   OFF(load); OFF(unload); OFF(config); OFF(config_complete); OFF(config_help);

@@ -61,9 +61,10 @@ native FUA reach the engine, and the block-size callback advertises the
 configured I/O limits. TRIM is available for new volumes explicitly created with
 `--discard`; ordinary v2 volumes retain their existing behavior. Multi-connection
 is disabled. See [space reclamation](space-reclamation.md) for format selection,
-partial-unit behavior and checkpoint ordering. The plugin
-does not provide a native write-zeroes callback; nbdkit emulates zeroing with
-ordinary writes.
+partial-unit behavior and checkpoint ordering. WRITE_ZEROES is native and
+chunked to `nbd.maximum_io`, so a zero request of any length succeeds; on a
+`--discard` volume whole units may be discarded when the client allows it.
+Fast zero is not advertised.
 
 ## Volume lifecycle
 

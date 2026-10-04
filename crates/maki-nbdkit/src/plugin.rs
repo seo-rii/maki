@@ -5,8 +5,9 @@
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
 //!   populate; `_struct_size` includes the block_size callback so clients
 //!   can negotiate the configured limits. Other optional callbacks stay
-//!   NULL (multi-conn OFF, zero emulated via pwrite). TRIM is advertised
-//!   per connection only for opt-in v3 volumes.
+//!   NULL (multi-conn OFF). Zero is native and chunked (R5-036), fast zero
+//!   is not offered. TRIM is advertised per connection only for opt-in v3
+//!   volumes.
 //! - `after_fork` initializes recovery, provider verification and the control
 //!   listener before announcing readiness. `open` only uses this adapter;
 //!   it never starts a runtime or retries a failed startup.
@@ -36,6 +37,11 @@ pub const NBDKIT_FUA_EMULATE: c_int = 1;
 pub const NBDKIT_FUA_NATIVE: c_int = 2;
 /// `NBDKIT_FLAG_FUA` (`1 << 1`): the request flag on `pwrite`.
 pub const NBDKIT_FLAG_FUA: u32 = 1 << 1;
+/// `NBDKIT_FLAG_MAY_TRIM` (`1 << 0`): a zero request may discard.
+pub const NBDKIT_FLAG_MAY_TRIM: u32 = 1 << 0;
+/// `NBDKIT_FLAG_FAST_ZERO` (`1 << 3`): fail rather than be slower than a
+/// write of zeros.
+pub const NBDKIT_FLAG_FAST_ZERO: u32 = 1 << 3;
 
 const THREAD_MODEL_PARALLEL: c_int = NBDKIT_THREAD_MODEL_PARALLEL;
 const API_VERSION: c_int = NBDKIT_API_VERSION;
@@ -142,7 +148,15 @@ unsafe extern "C" fn can_trim(handle: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
-    0 // nbdkit falls back to pwrite of zeros
+    // Native `zero`: nbdkit's fallback writes the whole range in one
+    // `pwrite`, which a range above `maximum_io` fails (R5-036).
+    1
+}
+
+unsafe extern "C" fn can_fast_zero(_h: *mut c_void) -> c_int {
+    // Partial units are written, so a zero is never guaranteed faster
+    // than writing zeros.
+    0
 }
 
 unsafe extern "C" fn can_fua(_h: *mut c_void) -> c_int {
@@ -221,6 +235,28 @@ unsafe extern "C" fn flush_v2(handle: *mut c_void, _flags: u32) -> c_int {
 unsafe extern "C" fn trim_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
     let adapter = unsafe { &*(handle as *const NbdAdapter) };
     match adapter.trim(offset, count as usize, flags & NBDKIT_FLAG_FUA != 0) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error.errno);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn zero_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
+    if flags & NBDKIT_FLAG_FAST_ZERO != 0 {
+        // Not advertised; a client that sends it anyway asked to fail
+        // rather than wait for a write.
+        set_errno(libc::ENOTSUP);
+        return -1;
+    }
+    let adapter = unsafe { &*(handle as *const NbdAdapter) };
+    match adapter.zero(
+        offset,
+        count as usize,
+        flags & NBDKIT_FLAG_MAY_TRIM != 0,
+        flags & NBDKIT_FLAG_FUA != 0,
+    ) {
         Ok(()) => 0,
         Err(error) => {
             set_errno(error.errno);
@@ -335,7 +371,7 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     pwrite: Some(pwrite_v2),
     flush: Some(flush_v2),
     trim: Some(trim_v2),
-    zero: None,
+    zero: Some(zero_v2),
     magic_config_key: std::ptr::null(),
     can_multi_conn: None,
     can_extents: None,
@@ -343,7 +379,7 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     can_cache: None,
     cache: None,
     thread_model: None,
-    can_fast_zero: None,
+    can_fast_zero: Some(can_fast_zero),
     preconnect: None,
     get_ready: None,
     after_fork: Some(after_fork),
@@ -437,6 +473,8 @@ pub fn abi_layout() -> Vec<(&'static str, usize)> {
         ("NBDKIT_FUA_EMULATE", NBDKIT_FUA_EMULATE as usize),
         ("NBDKIT_FUA_NATIVE", NBDKIT_FUA_NATIVE as usize),
         ("NBDKIT_FLAG_FUA", NBDKIT_FLAG_FUA as usize),
+        ("NBDKIT_FLAG_MAY_TRIM", NBDKIT_FLAG_MAY_TRIM as usize),
+        ("NBDKIT_FLAG_FAST_ZERO", NBDKIT_FLAG_FAST_ZERO as usize),
     ]
 }
 

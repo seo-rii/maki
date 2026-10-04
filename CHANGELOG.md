@@ -116,6 +116,11 @@ documents.
 
 ### Fixed
 
+- NBD WRITE_ZEROES longer than `nbd.maximum_io` (from `blkdiscard -z`,
+  `qemu-img`, nbdcopy) failed with EINVAL: the plugin left it to nbdkit's
+  single-`pwrite` emulation. Zeroing is now native and chunked, and may
+  discard whole units on a `--discard` volume when the client allows it
+  (R5-036).
 - A bearer token (HTTP header or gRPC metadata credential) or PEM private
   key that happens to be an even-length hex string is used verbatim; the
   daemon used to hex-decode it like a local key and refused to start
