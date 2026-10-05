@@ -111,6 +111,10 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   internal DNS name, all three remote transports passed under the shipped
   sandbox on Debian 12
   ([record](qualification/cross-host-sandbox-validation-2026-10-05.md)).
+  Hard resets of that provider host during fsync'd writes stalled the
+  writer for 12–20 s per transport, with no failed write and no lost
+  acknowledged data
+  ([record](qualification/provider-host-reset-validation-2026-10-05.md)).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the

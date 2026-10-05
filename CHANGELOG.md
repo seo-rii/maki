@@ -297,6 +297,7 @@ observable behaviour:
   the support matrix lists Debian 13 as campaign-passed (scoped).
 - [Debian 13: PostgreSQL 17 over per-item HTTP, R5-039 throughput](docs/qualification/debian13-postgresql-http-validation-2026-10-05.md).
 - [Cross-host remote transports under the sandbox](docs/qualification/cross-host-sandbox-validation-2026-10-05.md).
+- [Provider host reset under a writing client](docs/qualification/provider-host-reset-validation-2026-10-05.md).
 - The quick start and first-volume bootstrap passed `/dev/nbd0` to
   `nbd-client`; version 3.27, which Maki requires, connects over netlink and
   refuses it ("Invalid nbd device target"). They now pass the kernel name

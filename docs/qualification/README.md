@@ -33,6 +33,7 @@ do. Reports never claim current state. For the current state read
 | 2026-10-04 | [Debian 13: remote transports, sandbox, latency, zeroing](debian13-remote-transport-validation-2026-10-04.md) | `fc8d697` | Three remote transports with a syscall audit pass, the shipped sandbox and netem on systemd 257 / glibc 2.41 / Linux 6.12; kernel WRITE_ZEROES; found R5-037 and R5-038 |
 | 2026-10-05 | [Debian 13: PostgreSQL 17 over per-item HTTP, R5-039 throughput](debian13-postgresql-http-validation-2026-10-05.md) | `bd64553` | PostgreSQL crash and lifecycle with the packaged `maki-attach` LVM graph on Debian 13; per-item HTTP throughput with and without netem delay and loss |
 | 2026-10-05 | [Cross-host remote transports under the sandbox](cross-host-sandbox-validation-2026-10-05.md) | `1a25e88` | Client and provider on separate VMs, provider reached by internal DNS name, HTTP/WebSocket/gRPC under the shipped sandbox with a syscall audit pass, failover, outage, trim, restart |
+| 2026-10-05 | [Provider host reset under a writing client](provider-host-reset-validation-2026-10-05.md) | `1a25e88` | Three hard resets of the provider VM, one per transport, during fsync'd writes: stall, reconnect, resume, every acknowledged write read back after restart |
 
 Unattended repetition of the storage test suites on a local host is described
 in [background storage regression runs](../background-storage-validation.md).
