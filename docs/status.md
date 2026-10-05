@@ -37,7 +37,7 @@ There is no in-place format upgrade between envelopes.
 | `local-aes-gcm-siv` | Supported and used by every kernel NBD/LVM/XFS campaign; authenticated and context-bound |
 | `local-aes-xts` | Supported; no authenticated integrity, wrong-key detection only through the key canary; not used in external campaigns |
 | `remote-http` | Supported; scoped campaigns against a reference provider (loopback, then cross-host TLS 1.2/1.3, mTLS, bearer, failover, credential and CA rotation). No commercial vendor endpoint qualified |
-| `remote-websocket`, `remote-grpc` | Supported; scoped single-host campaigns against a reference provider (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check; PostgreSQL over gRPC). No commercial vendor endpoint qualified |
+| `remote-websocket`, `remote-grpc` | Supported; scoped campaigns against a reference provider, single-host and cross-host (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check; PostgreSQL over gRPC). No commercial vendor endpoint qualified |
 
 ## Deployment topology
 
@@ -107,6 +107,10 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   17 passed its crash and lifecycle scenario over that mapping with the
   packaged `maki-attach` LVM lifecycle
   ([record](qualification/debian13-postgresql-http-validation-2026-10-05.md)).
+- With client and provider on separate VMs and the provider reached by its
+  internal DNS name, all three remote transports passed under the shipped
+  sandbox on Debian 12
+  ([record](qualification/cross-host-sandbox-validation-2026-10-05.md)).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the
