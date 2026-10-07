@@ -451,7 +451,8 @@ impl State {
             .any(|id| !retained.contains(id))
         {
             // Last-close cannot report commit errors. Defer reclamation until
-            // the next space query or reservation, where errors can propagate.
+            // the next space query, reservation or identity-limited creation,
+            // where errors can propagate.
             // Publish the pruned manifest before counting or reusing its pages;
             // a pending unlink still has a committed name and is retained.
             self.commit(self.committed.clone())?;
@@ -768,7 +769,13 @@ impl Backing for RollbackBacking {
             Some(Entry::File(id)) => *id,
             Some(Entry::Directory) => return Err(input("cannot open a directory as a file")),
             None if create => {
-                if state.entries.len() >= MAX_ENTRIES || state.files.len() >= MAX_ENTRIES {
+                if state.entries.len() >= MAX_ENTRIES {
+                    return Err(no_space());
+                }
+                if state.files.len() >= MAX_ENTRIES {
+                    state.reclaim_closed_files()?;
+                }
+                if state.files.len() >= MAX_ENTRIES {
                     return Err(no_space());
                 }
                 let id = state.next_id;
@@ -965,6 +972,69 @@ mod tests {
     }
 
     #[test]
+    fn creation_reclaims_closed_identities_at_the_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+        for _ in 0..MAX_ENTRIES {
+            let file = backing.open("temporary", true).unwrap();
+            backing.remove("temporary").unwrap();
+            drop(file);
+        }
+        assert!(backing.list("").unwrap().is_empty());
+        let replacement = backing.open("replacement", true).unwrap();
+        replacement.write_at(0, b"new").unwrap();
+        replacement.sync_data().unwrap();
+        // Reclamation must not publish this newly created name.
+        drop((replacement, backing));
+        let backing = RollbackBacking::open(root.path(), witness.path()).unwrap();
+        assert!(backing.list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn creation_preserves_live_handles_and_pending_unlinks_at_the_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+        let durable = backing.open("durable", true).unwrap();
+        durable.write_at(0, b"old").unwrap();
+        durable.sync_data().unwrap();
+        backing.sync_dir("").unwrap();
+        backing.remove("durable").unwrap();
+        drop(durable);
+        let mut handles = Vec::new();
+        for _ in 1..MAX_ENTRIES {
+            handles.push(backing.open("temporary", true).unwrap());
+            backing.remove("temporary").unwrap();
+        }
+        assert_eq!(
+            backing
+                .open("replacement", true)
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+        // One final close makes exactly one identity reusable.
+        handles.pop();
+        let replacement = backing.open("replacement", true).unwrap();
+        for handle in &handles {
+            assert_eq!(handle.len().unwrap(), 0);
+        }
+        assert_eq!(backing.state.lock().files.len(), MAX_ENTRIES);
+        drop((replacement, handles, backing));
+        let backing = RollbackBacking::open(root.path(), witness.path()).unwrap();
+        let mut bytes = [0; 3];
+        backing
+            .open("durable", false)
+            .unwrap()
+            .read_at(0, &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"old");
+        assert!(!backing.exists("replacement").unwrap());
+    }
+
+    #[test]
     fn persistence_failures_preserve_previous_root_and_stop_all_handles() {
         for boundary in ["arena", "manifest", "witness"] {
             let root = tempfile::tempdir().unwrap();
@@ -1016,7 +1086,7 @@ mod tests {
 
     #[test]
     fn reclamation_failures_preserve_witnessed_pages_until_retry() {
-        for trigger in ["free_bytes", "reservation"] {
+        for trigger in ["free_bytes", "reservation", "creation"] {
             for boundary in ["arena", "manifest", "witness"] {
                 let root = tempfile::tempdir().unwrap();
                 let witness = tempfile::tempdir_in("/dev/shm").unwrap();
@@ -1028,6 +1098,14 @@ mod tests {
                 backing.remove("old").unwrap();
                 backing.sync_dir("").unwrap();
                 drop(old);
+
+                if trigger == "creation" {
+                    for _ in 1..MAX_ENTRIES {
+                        let file = backing.open("temporary", true).unwrap();
+                        backing.remove("temporary").unwrap();
+                        drop(file);
+                    }
+                }
 
                 let (old_id, committed, coordinates) = {
                     let state = backing.state.lock();
@@ -1070,6 +1148,7 @@ mod tests {
                     (trigger == "reservation").then(|| backing.open("replacement", true).unwrap());
                 let result = match &replacement {
                     Some(file) => file.allocate_range(0, PAGE),
+                    None if trigger == "creation" => backing.open("replacement", true).map(|_| ()),
                     None => backing.free_bytes().map(|_| ()),
                 };
                 assert!(

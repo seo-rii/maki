@@ -1,6 +1,6 @@
 # Rollback-protected backing
 
-Status: experimental implementation, updated 2026-10-07. This is an explicitly selected
+Status: experimental implementation, updated 2026-10-08. This is an explicitly selected
 Linux storage format for new volumes. Default v2/v3 directory backings retain
 their existing rollback limitation. Production qualification of this new format
 is still pending; earlier v2/v3 GCE reset and RSS results do not qualify it.
@@ -125,8 +125,10 @@ lower the witness generation.
 
 V3 discard remains available. Fully punched pages and deleted files reclaim
 internal arena capacity after the corresponding commit and open-handle lifetime.
-After the last handle closes, the next space query or reservation commits a
-manifest without the deleted identity before reporting or reusing its capacity.
+After the last handle closes, the next space query, reservation or file creation
+at the identity limit commits a manifest without the deleted identity before
+reporting or reusing its capacity. Repeated create/unlink/close operations do not
+exhaust the identity limit; live handles and pending durable unlinks still count.
 Closing a handle performs no I/O. A pending namespace deletion still retains the
 durable name and its pages; an unsuccessful reclamation commit stops the session.
 Partial-page holes may retain their page reservation. The arena's physical
