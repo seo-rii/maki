@@ -97,7 +97,14 @@ on the backing filesystem, plus small files/filesystem metadata and witness
 storage. A slot reservation records its logical page coordinates durably before
 the journal can acknowledge a dependent write. Arena capacity therefore remains
 available for checkpoint after restart and external filesystem consumption.
-The witness filesystem must independently retain space for its atomic updates.
+Reopening authenticates the selected manifest and referenced pages, then
+reestablishes the arena and both manifest reservations before serving I/O. This
+also covers sparse backup/restore tools that preserve bytes and lengths but not
+physical allocation. A missing or incorrectly sized inactive manifest slot is
+recreated or resized; missing or corrupt selected evidence is still refused.
+Allocation, file-sync or directory-sync failure refuses attachment without
+advancing the witness. The witness filesystem must independently retain space
+for its atomic updates.
 
 Pages in the committed manifest are immutable until the witness has durably
 selected their successor. Writes use free arena pages, or their own uncommitted
@@ -164,8 +171,10 @@ complete recovery plan.
    Preserve the failed backing as evidence, recover the complete matching
    backing under its trusted configuration, and run `maki check <config.toml>
    --deep` offline. This acquires the witness lock and verifies structural
-   consistency; normal attach additionally verifies the crypto key and
-   provider. Require application-level readback before permitting writes.
+   consistency and restores physical reservations. Provide the complete fixed
+   footprint even when the restored copy is sparse; reservation failure keeps
+   it offline. Normal attach additionally verifies the crypto key and provider.
+   Require application-level readback before permitting writes.
    Never run two writable copies against one witness.
 5. A witness mismatch, missing witness or authentication failure leaves the
    volume offline. Do not edit generations, delete the witness, copy an older

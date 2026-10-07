@@ -1,6 +1,7 @@
 //! Opt-in, bounded copy-on-write backing with an independent local witness.
 //!
-//! The arena and both manifest slots are physically reserved at enrollment.
+//! The arena and both manifest slots are physically reserved at enrollment
+//! and before reopening an authenticated backing.
 //! A manifest authenticates the entire namespace and every referenced page.
 //! Only the independent witness selects a recoverable manifest. Unsynced
 //! bytes remain in a separately authenticated, process-local working view.
@@ -266,13 +267,7 @@ impl RollbackBacking {
         marker.sync_data()?;
         disk.sync_dir("")?;
         let arena = disk.open(ARENA, true)?;
-        arena.allocate_range(0, capacity_bytes * 2)?;
-        arena.sync_data()?;
-        for name in MANIFESTS {
-            let file = disk.open(name, true)?;
-            file.allocate_range(0, manifest_bound(capacity_bytes))?;
-            file.sync_data()?;
-        }
+        reserve_storage(&disk, arena.as_ref(), capacity_bytes)?;
         let manifest = Manifest {
             format: 1,
             identity: *uuid::Uuid::new_v4().as_bytes(),
@@ -358,6 +353,12 @@ impl RollbackBacking {
                 }
             }
         }
+        // File lengths and authenticated bytes do not prove that a sparse
+        // backup/restore preserved physical reservations. Reestablish them
+        // before any caller can depend on the recorded capacity promises.
+        // Only the inactive manifest may have been missing or the wrong size;
+        // selected evidence and arena length were validated above.
+        reserve_storage(&disk, arena.as_ref(), manifest.capacity)?;
         Ok(Self::assemble(
             disk, arena, witness, disk_lock, manifest, slot,
         ))
@@ -391,6 +392,21 @@ impl RollbackBacking {
             })),
         }
     }
+}
+
+fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -> io::Result<()> {
+    arena.allocate_range(0, capacity * 2)?;
+    arena.sync_data()?;
+    let bound = manifest_bound(capacity);
+    for name in MANIFESTS {
+        let file = disk.open(name, true)?;
+        if file.len()? != bound {
+            file.set_len(bound)?;
+        }
+        file.allocate_range(0, bound)?;
+        file.sync_data()?;
+    }
+    disk.sync_dir("")
 }
 
 fn write_manifest(disk: &FileBacking, slot: usize, bytes: &[u8]) -> io::Result<()> {
@@ -968,6 +984,280 @@ mod tests {
         }
         fn sync_data(&self) -> io::Result<()> {
             Err(io::Error::other("injected arena sync failure"))
+        }
+    }
+
+    #[test]
+    fn reopen_reestablishes_physical_reservations_after_sparse_restore() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let capacity = 64 * PAGE;
+        let backing = RollbackBacking::create(root.path(), witness.path(), capacity).unwrap();
+        let file = backing.open("evidence", true).unwrap();
+        file.write_at(0, &[0x42; PAGE as usize]).unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("").unwrap();
+        let committed_slots = backing.state.lock().committed_slots.clone();
+        let anchor = std::fs::read(witness.path().join("anchor")).unwrap();
+        drop((file, backing));
+
+        // A sparse copy preserves every byte but loses preallocated extents.
+        let disk = FileBacking::new(root.path()).unwrap();
+        let arena = disk.open(ARENA, false).unwrap();
+        for slot in 0..capacity * 2 / PAGE {
+            if !committed_slots.contains(&slot) {
+                arena.punch_hole(slot * PAGE, PAGE).unwrap();
+            }
+        }
+        arena.sync_data().unwrap();
+        for name in MANIFESTS {
+            let file = disk.open(name, false).unwrap();
+            let mut header = [0; 8];
+            file.read_at(0, &mut header).unwrap();
+            let tail = (8 + u64::from_le_bytes(header)).div_ceil(PAGE) * PAGE;
+            file.punch_hole(tail, file.len().unwrap() - tail).unwrap();
+            file.sync_data().unwrap();
+        }
+        for name in [ARENA, MANIFESTS[0], MANIFESTS[1]] {
+            let metadata = std::fs::metadata(root.path().join(name)).unwrap();
+            assert!(
+                metadata.blocks() * 512 < metadata.len(),
+                "{name} was not sparse"
+            );
+        }
+
+        let recovered = RollbackBacking::open(root.path(), witness.path()).unwrap();
+        for name in [ARENA, MANIFESTS[0], MANIFESTS[1]] {
+            let metadata = std::fs::metadata(root.path().join(name)).unwrap();
+            assert!(
+                metadata.blocks() * 512 >= metadata.len(),
+                "{name} remains sparse"
+            );
+        }
+        let mut bytes = [0; PAGE as usize];
+        recovered
+            .open("evidence", false)
+            .unwrap()
+            .read_at(0, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [0x42; PAGE as usize]);
+        assert_eq!(
+            std::fs::read(witness.path().join("anchor")).unwrap(),
+            anchor
+        );
+    }
+
+    #[test]
+    fn reopen_restores_only_the_inactive_manifest_slot() {
+        use std::os::unix::fs::MetadataExt;
+
+        for damage in ["missing", "short", "long", "directory"] {
+            let root = tempfile::tempdir().unwrap();
+            let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+            let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+            let slot = backing.state.lock().manifest_slot;
+            let selected = root.path().join(MANIFESTS[slot]);
+            let inactive = root.path().join(MANIFESTS[1 - slot]);
+            let evidence = std::fs::read(&selected).unwrap();
+            let anchor = std::fs::read(witness.path().join("anchor")).unwrap();
+            drop(backing);
+            match damage {
+                "missing" => std::fs::remove_file(&inactive).unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&inactive).unwrap();
+                    std::fs::create_dir(&inactive).unwrap();
+                    // The selected evidence remains usable, but readiness
+                    // requires a second reserved slot for the next commit.
+                    assert!(RollbackBacking::open(root.path(), witness.path()).is_err());
+                    std::fs::remove_dir(&inactive).unwrap();
+                }
+                _ => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&inactive)
+                    .unwrap()
+                    .set_len(if damage == "short" {
+                        0
+                    } else {
+                        manifest_bound(PAGE) * 2
+                    })
+                    .unwrap(),
+            }
+            let recovered = RollbackBacking::open(root.path(), witness.path()).unwrap();
+            let metadata = std::fs::metadata(&inactive).unwrap();
+            assert_eq!(metadata.len(), manifest_bound(PAGE), "{damage}");
+            assert!(metadata.blocks() * 512 >= metadata.len(), "{damage}");
+            assert_eq!(std::fs::read(&selected).unwrap(), evidence, "{damage}");
+            assert_eq!(
+                std::fs::read(witness.path().join("anchor")).unwrap(),
+                anchor,
+                "{damage}"
+            );
+            drop(recovered);
+            // A missing selected slot must never be manufactured from scratch.
+            std::fs::remove_file(&selected).unwrap();
+            assert!(RollbackBacking::open(root.path(), witness.path()).is_err());
+            assert!(!selected.exists());
+        }
+    }
+
+    #[test]
+    fn reopen_authenticates_selected_evidence_before_repairing_storage() {
+        for damage in ["short_manifest", "long_manifest", "page"] {
+            let root = tempfile::tempdir().unwrap();
+            let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+            let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+            let file = backing.open("evidence", true).unwrap();
+            file.write_at(0, b"evidence").unwrap();
+            file.sync_data().unwrap();
+            backing.sync_dir("").unwrap();
+            let slot = backing.state.lock().manifest_slot;
+            let selected = root.path().join(MANIFESTS[slot]);
+            let inactive = root.path().join(MANIFESTS[1 - slot]);
+            drop((file, backing));
+            std::fs::remove_file(&inactive).unwrap();
+            if damage == "page" {
+                FileBacking::new(root.path())
+                    .unwrap()
+                    .open(ARENA, false)
+                    .unwrap()
+                    .punch_hole(0, PAGE * 2)
+                    .unwrap();
+            } else {
+                let len = manifest_bound(PAGE) + if damage == "long_manifest" { PAGE } else { 0 };
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&selected)
+                    .unwrap()
+                    .set_len(if damage == "short_manifest" {
+                        len - PAGE
+                    } else {
+                        len
+                    })
+                    .unwrap();
+            }
+            let original_len = std::fs::metadata(&selected).unwrap().len();
+            assert!(
+                RollbackBacking::open(root.path(), witness.path()).is_err(),
+                "{damage}"
+            );
+            assert!(
+                !inactive.exists(),
+                "{damage} repaired storage before authentication"
+            );
+            assert_eq!(std::fs::metadata(&selected).unwrap().len(), original_len);
+        }
+    }
+
+    struct ReservationFaultBacking {
+        disk: FileBacking,
+        path: &'static str,
+        operation: &'static str,
+    }
+
+    struct ReservationFaultFile {
+        file: Arc<dyn BackingFile>,
+        operation: &'static str,
+    }
+
+    impl BackingFile for ReservationFaultFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.file.read_at(offset, buf)
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+            self.file.write_at(offset, buf)
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.file.set_len(len)
+        }
+        fn len(&self) -> io::Result<u64> {
+            self.file.len()
+        }
+        fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+            if self.operation == "allocate" {
+                return Err(no_space());
+            }
+            self.file.allocate_range(offset, len)
+        }
+        fn sync_data(&self) -> io::Result<()> {
+            if self.operation == "sync" {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            self.file.sync_data()
+        }
+    }
+
+    impl Backing for ReservationFaultBacking {
+        fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
+            let file = self.disk.open(name, create)?;
+            if name == self.path {
+                Ok(Arc::new(ReservationFaultFile {
+                    file,
+                    operation: self.operation,
+                }))
+            } else {
+                Ok(file)
+            }
+        }
+        fn exists(&self, name: &str) -> io::Result<bool> {
+            self.disk.exists(name)
+        }
+        fn remove(&self, name: &str) -> io::Result<()> {
+            self.disk.remove(name)
+        }
+        fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+            self.disk.rename(from, to)
+        }
+        fn create_dir_all(&self, name: &str) -> io::Result<()> {
+            self.disk.create_dir_all(name)
+        }
+        fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+            self.disk.list(dir)
+        }
+        fn try_lock(&self, name: &str) -> io::Result<Box<dyn VolumeLock>> {
+            self.disk.try_lock(name)
+        }
+        fn sync_dir(&self, dir: &str) -> io::Result<()> {
+            if self.path.is_empty() {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            self.disk.sync_dir(dir)
+        }
+    }
+
+    #[test]
+    fn storage_reservation_propagates_allocation_and_sync_failures() {
+        for path in [ARENA, MANIFESTS[0], MANIFESTS[1], ""] {
+            for operation in ["allocate", "sync"] {
+                let root = tempfile::tempdir().unwrap();
+                let disk = ReservationFaultBacking {
+                    disk: FileBacking::new(root.path()).unwrap(),
+                    path,
+                    operation,
+                };
+                let arena = disk.open(ARENA, true).unwrap();
+                let error = reserve_storage(&disk, arena.as_ref(), PAGE).unwrap_err();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(if operation == "allocate" && !path.is_empty() {
+                        libc::ENOSPC
+                    } else {
+                        libc::EIO
+                    }),
+                    "{path} {operation}"
+                );
+                // Retrying with storage healthy completes the whole footprint.
+                let arena = disk.disk.open(ARENA, false).unwrap();
+                reserve_storage(&disk.disk, arena.as_ref(), PAGE).unwrap();
+                assert_eq!(arena.len().unwrap(), 2 * PAGE);
+                for name in MANIFESTS {
+                    assert_eq!(
+                        disk.disk.open(name, false).unwrap().len().unwrap(),
+                        manifest_bound(PAGE)
+                    );
+                }
+            }
         }
     }
 
