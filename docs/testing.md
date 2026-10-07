@@ -142,9 +142,12 @@ also uses a TLS-1.2-only peer and checks the exact upgrade URI.
 construction, attach self-test/canary, adapter write/read and shutdown. The gRPC
 daemon fixture additionally rejects wrong CA, hostname and missing mTLS identity.
 
-These fixtures validate local integration. Earlier cross-host provider and
-database campaigns used HTTP; WSS/gRPC commercial services, target-network
-behavior and long-running database workloads still need separate qualification.
+These fixtures validate local integration. Subsequent campaigns covered all
+three transports [across hosts under the shipped sandbox](qualification/cross-host-sandbox-validation-2026-10-05.md),
+[provider-host hard resets](qualification/provider-host-reset-validation-2026-10-05.md)
+and [PostgreSQL 15 over gRPC](qualification/remote-database-zero-mdwe-validation-2026-10-04.md).
+Commercial services, the selected production network and long-running database
+workloads still need separate qualification.
 
 The HTTP response-tree regressions also check erasure of completed strings and
 keys after malformed JSON, duplicate replacement, successful parsing and batch
@@ -242,10 +245,27 @@ userspace ABI and negotiation, without operating a kernel NBD device.
 
 ## Current qualification status
 
-The current revision `448c0b2` passed a disposable Debian 12 GCE campaign with
+Each campaign qualifies its recorded revision and configuration. The evidence
+below runs through 2026-10-05; it does not claim that every later revision or
+production configuration has repeated those campaigns. Production approval is
+still pending, as stated in [status](status.md).
+
+The latest additions are:
+
+| Date | Scope | Result and evidence |
+|---|---|---|
+| 2026-10-03 | v3 discard after the R5 fixes | Ten workload-VM resets; XFS/LVM/NBD `fstrim`, mount and attach-config checks, and packaged quick start ([report](qualification/r5-hardware-validation-2026-10-03.md)) |
+| 2026-10-03 | PostgreSQL 15, discard and pressure | Crash/lifecycle with trim under load and the syscall filter passed; raw discard recovered space, while XFS deletion and trim failed below backing headroom ([report](qualification/database-discard-pressure-validation-2026-10-03.md)) |
+| 2026-10-04 | Remote transport sandbox and database | HTTP/WebSocket/gRPC passed mTLS, failover, outage/resume, trim and restart under the syscall filter ([report](qualification/remote-transport-syscall-filter-validation-2026-10-04.md)); PostgreSQL 15 over gRPC passed under the packaged unit including `MemoryDenyWriteExecute` ([report](qualification/remote-database-zero-mdwe-validation-2026-10-04.md)) |
+| 2026-10-04–05 | Debian 13 and PostgreSQL 17 | All three transports passed the shipped sandbox, injected latency/loss and kernel NBD zeroing ([report](qualification/debian13-remote-transport-validation-2026-10-04.md)); PostgreSQL 17 passed crash and packaged LVM lifecycle checks over per-item HTTP ([report](qualification/debian13-postgresql-http-validation-2026-10-05.md)) |
+| 2026-10-05 | Cross-host sandbox and provider reset | All three transports passed internal DNS, TLS/mTLS, failover, outage/resume, trim and restart across Debian 12 VMs ([report](qualification/cross-host-sandbox-validation-2026-10-05.md)); one hard reset per transport of the provider host preserved every acknowledged file ([report](qualification/provider-host-reset-validation-2026-10-05.md)) |
+
+Earlier campaigns establish the following scoped results.
+
+Revision `448c0b2` passed a disposable Debian 12 GCE campaign with
 nbd-client 3.27.1, actual Maki nbdkit, kernel NBD, pinned single-PV LVM/XFS,
 trusted attach/verify/cleanup, and a Docker SQLite external ACK oracle under the
-Installed shipped systemd graph. Two automatic nbdkit `SIGKILL` recoveries
+installed shipped systemd graph. Two automatic nbdkit `SIGKILL` recoveries
 advanced the fsynced ledger from 16 to 32 and 48 rows. A third crash while a
 root process held the LV open failed cleanup closed without restarting the
 workload; closing the descriptor and explicitly retrying recovery reached 64
@@ -365,7 +385,7 @@ Disk power-loss campaign.
 | Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
-| Packaged systemd lifecycle | Functional ordering and failure gates | Pass for one Debian 12 GCE topology | Installed shipped templates recreated the real daemon, attachment, workload, and Docker container twice, withheld restart on open-LV cleanup failure, then recovered on explicit retry |
+| Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
 | Debian package install and upgrade | Clean install, stopped-volume upgrade, and exact reattach | Pass for one generated-package Debian 12 profile | Pre-upgrade and current packages preserved volume/attach configs, all token hashes and two SQLite logical hashes, did not auto-start volumes, and reattached both after upgrade |
 | Multi-mapping and foreign-backend refusal | Refuse ambiguous fallback and changed backend identity before mutation | Pass for one two-LV and one same-NBD foreign-backend topology | Packaged recovery preserved both mappings and proof after daemon death; cleanup preserved a foreign backend identifier and trusted record until explicit disconnect |
 | DB-native and legacy-v1 migration | Reject corrupt restore; old-reader backup into a fresh v2 volume | Pass for stopped-source SQLite profiles | Corrupt native restore failed before clean retry; current writer refused byte-stable v1 superblocks and the old-reader backup restored with the exact logical hash |
@@ -373,14 +393,16 @@ Disk power-loss campaign.
 | Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
 | Remote HTTP provider database faults | Single-endpoint failover plus total-provider outage | Pass for one loopback two-provider/SQLite topology | A and B separately served after peer loss; a 4,094 ms total outage held the ledger at 24, then resumed exactly one commit and reached 32 exact rows before and after restart |
 | Cross-host HTTPS reference provider | TLS/mTLS/auth refusal, host failover, and total-provider outage | Pass for one three-host private-VPC/SQLite topology | TLS 1.2 and 1.3 health gates recorded the client subject; wrong CA, absent client identity and wrong bearer failed closed; 32 ACK rows survived provider-VM stop/start and Maki restart |
+| Cross-host HTTP/WebSocket/gRPC sandbox | Internal DNS, TLS/mTLS, failover, outage/resume, trim and restart | Pass for one Debian 12 private-VPC/reference-provider profile per transport | 33/33 checks passed under the shipped sandbox; deep checks were clean. XFS was directly on NBD in these transport campaigns |
+| Provider-host hard reset | Stall, reconnect and acknowledged-file readback | Pass for one reset per transport | HTTP/WebSocket/gRPC resumed after approximately 12–20 s stalls with no failed write or lost ACK file, including readback after daemon restart; minutes-long outages, changed return addresses and database workloads were not covered |
 | Stopped credentials and new-key migration | Replace bearer and mTLS client identity without changing the existing key; restore into a distinct provider key/volume | Pass for one three-host private-VPC/reference-provider/SQLite topology | Old bearer and client identity were refused, both peers validated the replacements, existing superblock/canary hashes matched, K1/K2 fingerprints and volume UUIDs differed, a wrong-key canary kept those hashes unchanged, and 24 ACK rows survived DB-native restore and restart |
 | Server CA and endpoint-address rotation | Overlap private roots, replace leaves, remove old trust, then replace an address with the same key/profile | Pass for one four-host private-VPC/reference-provider/SQLite topology | Both wrong-trust directions refused real NBD negotiation; A/B changed to C/B with A's listener stopped; both peers validated, superblock/canary hashes matched across each attach, and 48 ACK rows survived restart |
-| PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for one PostgreSQL 15.19/scale-3 topology | Postmaster SIGKILL interrupted pgbench after 590 transactions; WAL recovery preserved 16 ACK rows, four `pg_amcheck` runs passed, and the cluster retained 32 rows through Maki restart before reaching 48 |
-| Real databases | Required | Partial | SQLite WAL and one short checksummed PostgreSQL 15 profile passed scoped campaigns; production PostgreSQL profiles, ClickHouse, MinIO, and application recovery contracts remain open |
+| PostgreSQL process crash | Checksums, WAL recovery, logical check, and storage restart | Pass for scoped PostgreSQL 15/Debian 12 and PostgreSQL 17/Debian 13 profiles | Local-provider, gRPC and per-item HTTP scenarios preserved external ACK rows through postmaster SIGKILL and packaged lifecycle restart; `pg_amcheck` passed, including v3 discard and endpoint outage under load |
+| Real databases | Required | Partial | SQLite WAL and short checksummed PostgreSQL 15/17 profiles passed scoped campaigns; production profiles, database operation under backing-space pressure, ClickHouse, MinIO, and broader application recovery contracts remain open |
 | cgroup resource faults | Target-specific | Partial | Real AES userspace NBD passed CPU throttling, freeze/resume, SIGKILL and workload OOM readback. Four later constrained recoveries passed at 48/64 MiB; process `VmHWM` stayed at or below 11,415,552 bytes, while only 64 MiB avoided cgroup max events |
 | Physical checkpoint-space reservation | Linux filesystem ENOSPC before ACK | Pass on one Debian 12/ext4/GCE PD topology | A 4,608-byte slot owned 8,192 allocated bytes before FUA ACK; with zero free bytes, the next FUA returned ENOSPC without changing sequence, journal bytes, or slot allocation, then retried and survived restart |
 | Firecracker guest abrupt loss | Target-specific | Partial | 20 alternating FLUSH/FUA ACKs survived VMM SIGKILL and cold-boot authenticated readback on GCP nested KVM; L1 kernel and storage caches remained live |
-| GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE | 10 alternating FLUSH/FUA generations and 160 acknowledged write versions survived hard instance resets; 11 unique boots retained the same instance, data disk, filesystem UUID and authenticated readbacks |
+| GCE whole-instance reset | Target-specific | Pass on disposable Debian 12 GCE, v2 and v3 | External ACK readback survived the v2 campaign and ten-reset v3 campaigns, including the 2026-10-03 run after the R5 fixes; GCE Persistent Disk service and physical storage stayed operational |
 | QEMU hard power loss | 300+ cuts | Open | Simulation is not hardware evidence |
 | Mixed workload | 72 hours | Open | Dedicated hardware run not recorded |
 
@@ -560,27 +582,51 @@ these results for the new format.
 
 ## External qualification checklist
 
-- Repeat kernel `/dev/nbd`, LVM, XFS, and raw-device fio qualification on each
-  supported target distribution.
-- Effective capability, ACL, core-dump, mount, and service-restart checks under
-  installed systemd units.
-- Run the actual Maki daemon, kernel NBD/LVM/XFS, packaged systemd recovery, and
-  DB/container ACK oracle together in one crash/recovery campaign.
-- Vendor endpoint conformance with production mapping and credentials.
+Scoped campaigns already cover Debian 12 kernel NBD/LVM/XFS/fio, installed
+systemd recovery with a Docker SQLite ACK oracle, package install/upgrade,
+fresh-host backing restore and SQLite migration. PostgreSQL 15 on Debian 12
+and PostgreSQL 17 on Debian 13 passed short crash and packaged lifecycle
+scenarios. Reference-provider HTTP/WebSocket/gRPC passed cross-host sandbox
+and provider-host reset scenarios. These results and their exact configurations
+are recorded [above](#current-qualification-status); they do not qualify every
+target environment.
+
+Before production approval, complete the remaining coverage for the chosen
+configuration and acceptance thresholds:
+
+- Requalify kernel `/dev/nbd`, LVM, XFS, raw-device fio, effective capabilities,
+  ACLs, core dumps, mounts and service restarts on the selected image/package
+  and storage class. Combine the actual daemon, packaged recovery and the
+  application's external DB/container ACK oracle; extend the existing Debian
+  profiles only where their coverage matches the chosen configuration.
+- Validate commercial vendor endpoints with production mapping and credentials,
+  including the target network, extended total outages and recovery if a
+  provider returns at a changed address. Existing hard-reset evidence covers
+  a reference provider returning at the same address after a short outage.
 - Repeat the scoped bearer/mTLS-client, server-certificate/private-CA, and
   same-key/profile endpoint-address rotation procedures against the selected
   commercial vendor and target network, including shared-client coordination,
   rollback, and failures at each transition.
-- Real SQLite and PostgreSQL workloads before broader database qualification.
+- Extend SQLite/PostgreSQL checks to production workload settings, volume
+  capacity/fill ratio and backing-space pressure. Qualify other database or
+  object-store engines separately if they are selected for deployment.
 - Repeat the unchanged-backing fresh-host restore on each supported package and
   distribution, and separately exercise DB-native backup or logical migration
   with credentials protected outside the general backup.
 - Repeat GCE reset qualification on the selected deployment image and storage
-  class; run QEMU and bare-metal power cuts with an independent acknowledgement
-  ledger for the stronger storage-failure tiers.
+  class. For stronger storage-failure tiers, run at least 300 QEMU power cuts
+  and separately qualify bare-metal power loss with an independent
+  acknowledgement ledger and characterized disk write-cache behavior.
+- Establish total recovery RSS and memory headroom for the selected geometry,
+  provider, cache and database settings using the
+  [performance and memory profile](performance.md). The measured
+  constrained-recovery profile does not establish a general minimum-memory
+  recommendation.
+- If using experimental rollback-protected backing, qualify its independent
+  persistent witness as described [above](#experimental-rollback-backing).
 - Long-duration (24 CPU-hour-per-target) `cargo-fuzz` corpus runs (the
   targets exist in `fuzz/`; only short smoke runs have been done) and
-  long-duration provider and mixed-I/O soaks.
+  long-duration provider and 72-hour mixed-I/O soaks.
 
 These checks are privileged, destructive, externally credentialed, or
 long-running. Run them only in explicitly authorized environments.

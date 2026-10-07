@@ -31,7 +31,7 @@ Current overall state is in [status](../status.md).
 
 | Platform | Status | Notes |
 |---|---|---|
-| Debian 12 (bookworm) on Google Compute Engine, Linux `6.1.0-*-cloud-amd64` | **Campaign passed** | Every kernel NBD/LVM/XFS, systemd lifecycle, package, database and reset campaign ran here with `nbd-client` 3.27.1 |
+| Debian 12 (bookworm) on Google Compute Engine, Linux `6.1.0-*-cloud-amd64` | **Campaign passed** | Broadest coverage: kernel NBD/LVM/XFS, systemd lifecycle, package, database, workload-VM and provider-host reset campaigns with `nbd-client` 3.27.1 |
 | Debian 12 on KVM (other hypervisor) | **Campaign passed** (rootless data path only) | nbdkit/libnbd/fio path; kernel attachment not run there |
 | Firecracker microVM guest | **Campaign passed** (guest crash only) | 20 abrupt VMM kills; the L1 host and its caches stayed alive |
 | Debian 13 (trixie) on Google Compute Engine, Linux `6.12.*-cloud-amd64` | **Campaign passed** (scoped) | Remote HTTP/WebSocket/gRPC lifecycles under the shipped sandbox, netem latency and loss, NBD zeroing, with XFS directly on the NBD device ([record](../qualification/debian13-remote-transport-validation-2026-10-04.md)). Needs `fc8d697` or later (R5-037, R5-038). Debian 13 packages `nbd-client` 1:3.26.1, below the required 3.27.0: build 3.27 until a newer package exists. PostgreSQL 17 then passed its crash and lifecycle scenario under the packaged `maki-attach` LVM lifecycle ([record](../qualification/debian13-postgresql-http-validation-2026-10-05.md)) |
@@ -100,8 +100,9 @@ fixed at creation.
 | Workload | Status | Notes |
 |---|---|---|
 | SQLite WAL, `synchronous=FULL` | **Campaign passed** | Several campaigns with an external fsynced ACK ledger |
-| PostgreSQL 15 with checksums, `fsync`, `synchronous_commit`, `full_page_writes` | **Campaign passed** (one crash campaign) | [PostgreSQL deployment guide](postgres.md) |
-| PostgreSQL other versions and settings, MySQL/MariaDB, ClickHouse, MinIO | Not qualified | |
+| PostgreSQL 15 with checksums, `fsync`, `synchronous_commit`, `full_page_writes` | **Campaign passed** (scoped, Debian 12) | Local-provider and remote gRPC crash/lifecycle scenarios, including v3 discard under load; production profiles and long runs remain open. [PostgreSQL deployment guide](postgres.md) |
+| PostgreSQL 17 with the same durability settings | **Campaign passed** (scoped, Debian 13) | Per-item HTTP reference provider, packaged `maki-attach` LVM lifecycle, postmaster crash, endpoint outage, `fstrim`, ACK ledger and `pg_amcheck` ([record](../qualification/debian13-postgresql-http-validation-2026-10-05.md)); production profiles and long runs remain open |
+| PostgreSQL versions/settings beyond those scoped campaigns, MySQL/MariaDB, ClickHouse, MinIO | Not qualified | |
 | Docker containers with bind mounts of the mountpoint | **Campaign passed** | Containers must be recreated by the lifecycle, not restarted independently |
 | Plain file storage | Expected | |
 

@@ -79,8 +79,9 @@ attach: those files are read as public material, so the key must come through
 `client_key`.
 
 These transports have local certificate, hostname, mTLS and actual daemon I/O
-regressions. The cross-host reference-provider campaigns documented separately
-used HTTP; they do not qualify a commercial WSS/gRPC service or deployment.
+regressions. All three also passed scoped cross-host reference-provider
+campaigns under the shipped sandbox; see [current status](status.md#crypto-providers).
+Those results do not qualify a commercial service or a different deployment.
 
 ## Capability declarations and checks
 

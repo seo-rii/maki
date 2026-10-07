@@ -6,8 +6,9 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-01 (after the R5-001…R5-034 fixes; see the
-[remediation log](review-remediation.md#fifth-review-2026-10-01-r5-001r5-034)).
+Last updated: 2026-10-07. External campaign evidence below runs through
+2026-10-05; each report identifies the revision it exercised. See the
+[remediation log](review-remediation.md) for implementation changes.
 
 ## Release state
 
@@ -24,7 +25,7 @@ Last updated: 2026-10-01 (after the R5-001…R5-034 fixes; see the
 | Format | Selection | Status |
 |---|---|---|
 | Superblock envelope v2, mirrored durable proofs | Default for `maki volume create` | Current default; all scoped campaigns below used it unless noted |
-| Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; scoped GCE whole-instance-reset campaigns passed (2026-09-20, and 2026-10-03 after the R5 fixes), kernel `fstrim` reclaimed backing space through XFS/LVM/NBD, and one scoped PostgreSQL 15 crash and lifecycle campaign passed ([details](space-reclamation.md)) |
+| Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; scoped GCE whole-instance-reset campaigns passed (2026-09-20, and 2026-10-03 after the R5 fixes), kernel `fstrim` reclaimed backing space through XFS/LVM/NBD, and scoped PostgreSQL 15 and 17 crash and lifecycle campaigns passed ([details](space-reclamation.md)) |
 | Rollback-protected backing (local witness) | `[backing.rollback_protection]` on a new volume | **Experimental.** Focused test suites only; not campaign-qualified ([details](rollback-protection.md)) |
 | Legacy envelope v1 | Existing volumes only | Read-only checks with a warning; writable recovery is refused; migrate through [durable recovery](durable-recovery.md) |
 
@@ -34,15 +35,16 @@ There is no in-place format upgrade between envelopes.
 
 | Provider | Status |
 |---|---|
-| `local-aes-gcm-siv` | Supported and used by every kernel NBD/LVM/XFS campaign; authenticated and context-bound |
+| `local-aes-gcm-siv` | Supported and used by the local-provider kernel NBD/LVM/XFS campaigns; authenticated and context-bound |
 | `local-aes-xts` | Supported; no authenticated integrity, wrong-key detection only through the key canary; not used in external campaigns |
-| `remote-http` | Supported; scoped campaigns against a reference provider (loopback, then cross-host TLS 1.2/1.3, mTLS, bearer, failover, credential and CA rotation). No commercial vendor endpoint qualified |
-| `remote-websocket`, `remote-grpc` | Supported; scoped campaigns against a reference provider, single-host and cross-host (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check; PostgreSQL over gRPC). No commercial vendor endpoint qualified |
+| `remote-http` | Supported; scoped campaigns against a reference provider (loopback, then cross-host TLS 1.2/1.3, mTLS, bearer, failover, credential and CA rotation, shipped sandbox and provider-host reset; SQLite and PostgreSQL 17). No commercial vendor endpoint qualified |
+| `remote-websocket`, `remote-grpc` | Supported; scoped campaigns against a reference provider, single-host and cross-host (TLS 1.2/1.3, mTLS, failover, total-outage stall and resume, restart, deep check, shipped sandbox and provider-host reset; PostgreSQL 15 over gRPC). No commercial vendor endpoint qualified |
 
 ## Deployment topology
 
-The qualified attachment topology is one whole NBD device as a single LVM PV,
-one VG, one XFS data LV, attached through `maki-attach` with `fs_uuid` and
+The attachment topology covered by packaged recovery campaigns is one whole
+NBD device as a single LVM PV, one VG, one XFS data LV, attached through
+`maki-attach` with `fs_uuid` and
 `[lvm_identity]` pins, under the packaged systemd lifecycle. Everything else is
 enumerated, with its status, in the [support matrix](deployment/support-matrix.md).
 
@@ -51,7 +53,8 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
 | Workload | Status |
 |---|---|
 | SQLite WAL (`synchronous=FULL`) | Scoped campaigns: installed lifecycle with nbdkit crashes, fresh-host restore, package upgrade, migration, provider outage |
-| PostgreSQL 15 (checksums, `fsync`, `synchronous_commit`, `full_page_writes` on) | One scoped postmaster-`SIGKILL` crash campaign with `pg_amcheck`; production profiles and long runs open |
+| PostgreSQL 15 (checksums, `fsync`, `synchronous_commit`, `full_page_writes` on) | Scoped postmaster-`SIGKILL` crash and lifecycle campaigns on Debian 12, including v3 discard under load and a remote gRPC reference provider; `pg_amcheck` passed. Production profiles and long runs open |
+| PostgreSQL 17 (same durability settings) | One scoped crash and packaged LVM lifecycle campaign on Debian 13 over a per-item HTTP reference provider, with `fstrim` and an endpoint outage under load; `pg_amcheck` passed. Production profiles and long runs open |
 | Other databases and object stores | Not tested |
 
 ## Failure-injection evidence
@@ -61,6 +64,7 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
 | Deterministic simulation (model, crash, fault, chaos, fuzz) | Passing in CI and release gates |
 | Native nbdkit process kill, cgroup CPU/freeze/OOM | Scoped campaigns passed; constrained-recovery RSS measured for one profile |
 | Firecracker guest loss, GCE whole-instance hard reset | Scoped campaigns passed (v2 and v3) |
+| Remote provider-host hard reset | One scoped Debian 12 cross-host campaign passed for HTTP, WebSocket and gRPC; sequential fsync'd files, reference provider, approximately 12–20 s stalls |
 | Physical power loss, QEMU power cuts, 72-hour mixed soak | **Open** |
 
 ## Known limitations
@@ -119,8 +123,9 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the
   backing filesystem. Raw discards are still admitted there.
-- Privileged attach supports the single-PV/single-data-LV XFS topology; other
-  device-mapper layouts fail closed and need operator diagnosis
+- Automatic dead-daemon cleanup supports the pinned single-PV/single-data-LV
+  XFS topology. A sidecar LV passed attach/detach, but multi-mapping and other
+  device-mapper recovery layouts fail closed and need operator diagnosis
   ([storage recovery limits](storage-recovery.md#remaining-recovery-limits)).
 - Debian 12's stock `nbd-client` 3.24 is too old; 3.27.0 or later is required
   ([installation guide](getting-started/installation-debian.md#nbd-client-327-or-later)).

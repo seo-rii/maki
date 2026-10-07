@@ -16,13 +16,15 @@ use local AES-256-GCM-SIV or a remote HTTP, WebSocket or gRPC crypto service.
 
 ## Why Maki
 
-- Plaintext never reaches the backing store; keys and plaintext live in
-  zeroizing, page-locked buffers.
+- Plaintext never reaches the backing store. Maki protects owned key and
+  plaintext buffers with zeroization; page locking and library-owned copies
+  have documented [memory limits](docs/transport-memory.md).
 - Every acknowledged FLUSH and FUA survives a crash: journal, mirrored
   durable proofs and checkpoint ordering are verified by an executable
   durability model, crash simulation and fault injection.
-- Bounded everything: requests, queues, provider retries, circuit breakers,
-  memory during recovery.
+- Explicit request, queue, retry and overlay limits; recovery replays payloads
+  in bounded batches. Total process memory still needs qualification for the
+  selected geometry, provider and cache settings.
 - Privilege separation: the data plane runs without root; NBD, LVM and mount
   operations run in a separate helper that has no crypto code and pins the
   storage identity it manages.
@@ -34,8 +36,12 @@ use local AES-256-GCM-SIV or a remote HTTP, WebSocket or gRPC crypto service.
 Maki is **not production-qualified**. Its most-tested environment is Debian 12
 on Google Compute Engine with one XFS data LV on one NBD device; scoped
 campaigns there covered nbdkit crashes, whole-instance resets, package
-upgrades, SQLite and one PostgreSQL 15 crash. Physical power loss, commercial
-crypto vendors, other distributions and long soaks are open.
+upgrades, SQLite and PostgreSQL 15 crashes. Debian 13 also passed scoped
+remote-transport and PostgreSQL 17 campaigns under the packaged lifecycle.
+All three remote transports passed cross-host sandbox and provider-host reset
+campaigns with a reference provider. Physical power loss, commercial crypto
+vendors, additional platforms, production workload profiles and long soaks
+remain open.
 
 - [Current status](docs/status.md): the one page that states what is supported.
 - [Support matrix](docs/deployment/support-matrix.md): hosts, backing stores,

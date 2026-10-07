@@ -133,6 +133,10 @@ documents.
   batch responses share the guarded parser; serde scratch and transport-private
   allocations remain outside that ownership guarantee
   ([memory scope](docs/transport-memory.md)).
+- Current support documentation includes the scoped PostgreSQL 17/Debian 13
+  and cross-host provider-reset evidence; it no longer presents completed
+  reference-provider campaigns as unexecuted work. Production approval remains
+  pending.
 
 - A request's provider batches run concurrently within the
   `max_active_callbacks` limit, and a per-item HTTP mapping (no
