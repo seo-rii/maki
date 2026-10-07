@@ -146,6 +146,11 @@ These fixtures validate local integration. Earlier cross-host provider and
 database campaigns used HTTP; WSS/gRPC commercial services, target-network
 behavior and long-running database workloads still need separate qualification.
 
+The HTTP response-tree regressions also check erasure of completed strings and
+keys after malformed JSON, duplicate replacement, successful parsing and batch
+errors. Their owned-buffer scope and the remaining serde/transport-private
+copies are documented in [transport memory](transport-memory.md#http-decoded-payloads).
+
 The combined 2026-09-20 implementation passed `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
 `cargo test --workspace --locked`: 1,051 passing test invocations, zero failures

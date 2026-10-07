@@ -116,6 +116,13 @@ documents.
 
 ### Fixed
 
+- **HTTP response JSON ownership**: completed strings and object keys are
+  guarded before the full response is parsed, so malformed partial JSON and
+  duplicate replacement erase their owned plaintext too. Single-item and
+  batch responses share the guarded parser; serde scratch and transport-private
+  allocations remain outside that ownership guarantee
+  ([memory scope](docs/transport-memory.md)).
+
 - A request's provider batches run concurrently within the
   `max_active_callbacks` limit, and a per-item HTTP mapping (no
   `items_path`) is batched one unit per call. Sequential I/O through such a

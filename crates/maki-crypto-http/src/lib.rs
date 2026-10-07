@@ -21,6 +21,8 @@ use maki_crypto::{
     PlaintextUnit, SecretBuffer,
 };
 
+mod response;
+
 #[cfg(test)]
 mod sensitive_tests;
 
@@ -731,24 +733,20 @@ impl HttpCryptoProvider {
         match op.response.kind {
             RespKind::Raw => Ok(body),
             RespKind::Json => {
-                let mut value: Value = serde_json::from_slice(body.expose())
+                let value = response::parse(body.expose())
                     .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
-                let result = (|| {
-                    let path = op
-                        .response
-                        .data_path
-                        .as_deref()
-                        .ok_or_else(|| fatal("response data_path missing"))?;
-                    let data = value
-                        .pointer(path)
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            CryptoError::Contract(format!("response missing string at {path:?}"))
-                        })?;
-                    op.response.encoding.decode_secret(data)
-                })();
-                zeroize_json(&mut value);
-                result
+                let path = op
+                    .response
+                    .data_path
+                    .as_deref()
+                    .ok_or_else(|| fatal("response data_path missing"))?;
+                let data = value
+                    .pointer(path)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        CryptoError::Contract(format!("response missing string at {path:?}"))
+                    })?;
+                op.response.encoding.decode_secret(data)
             }
         }
     }
@@ -861,17 +859,15 @@ impl HttpCryptoProvider {
         let response = self
             .send(op, body_from(Self::encode_and_wipe(&mut root.0)?), true)
             .await?;
-        let mut value: Value = serde_json::from_slice(response.expose())
+        let value = response::parse(response.expose())
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
-        let result = Self::extract_batch(op, &value, items);
-        zeroize_json(&mut value);
-        result
+        Self::extract_batch(op, &value, items)
     }
 
     /// Pull the per-item payloads out of a parsed batch response.
     fn extract_batch(
         op: &OpSpec,
-        value: &Value,
+        value: &response::Value,
         items: &[(u64, SecretBuffer)],
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let resp_items_path = op

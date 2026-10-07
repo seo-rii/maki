@@ -40,14 +40,31 @@ copying, then erases and releases the old owner. `Bytes::from_owner` retains the
 request-body guard until the last HTTP body clone is released. Raw decryption
 responses transfer their owner directly to the caller.
 
-JSON trees, credential-value strings and combined identity PEMs still have
-zeroizing ownership without per-allocation page locks. Plain source
+Response JSON is deserialized directly into a guarded tree. Every completed
+string and object key is copied into a `SecretBuffer` allocated before its
+first byte is written, with page locking when enabled and successful. Both
+per-item and batched responses use that tree. Dropping an incomplete object or
+array after a syntax error erases its completed strings and keys; duplicate
+values and discarded duplicate keys are erased as they are replaced. The tree
+also owns cleanup after success, response-contract errors and unwinding, rather
+than relying on a wipe after parsing completes. JSON pointer lookup, duplicate
+last-value-wins behavior, number validation and recursion limits are unchanged.
+
+Request JSON trees, credential-value strings and combined identity PEMs still
+have zeroizing ownership without per-allocation page locks. Plain source
 configuration strings and copies made inside reqwest, hyper, rustls or the
-kernel remain outside this ownership. A malformed JSON response may make
-serde_json discard partial parser-owned allocations before it returns a Value
-that Maki can guard. Admission also does not account for simultaneous decoded,
-encoded and library copies. MAKI-015 and the total-memory work in MAKI-032
-therefore remain open.
+kernel remain outside this ownership. serde_json's internal escape-decoding
+scratch, including an unfinished string rejected before the visitor sees it,
+is also outside the guarded response tree. Admission does not account for
+simultaneous decoded, encoded and library copies. MAKI-015 and the total-memory
+work in MAKI-032 therefore remain open.
+
+The 2026-10-07 response-tree regressions first observed unzeroized deallocation
+of completed strings in malformed JSON and of duplicate keys and values through
+the real per-item response parser. They now require those allocations to be
+erased, together with successful response trees and a batch's earlier decoded
+payloads when a later item fails. Focused checks cover response key/value page
+locks, JSON pointer compatibility, malformed UTF-8 and recursion limits.
 
 The 2026-09-20 follow-up passed the complete `maki-crypto` and
 `maki-crypto-http` suites (175 passing invocations, two ignored) and strict
