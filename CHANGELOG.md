@@ -63,6 +63,13 @@ documents.
 
 ### Added
 
+- **Benchmark reports**: `maki-benchmark --json` records throughput, IOPS,
+  bounded-memory p50/p95/p99 latency estimates, final FLUSH time and verified
+  readback; `--fua` selects durable individual writes. Invalid workload
+  arguments are refused before creating a volume; recovered geometry is
+  rechecked before I/O. See
+  [performance profiles](docs/performance.md).
+
 - **Overlay memory bound**: `limits.max_overlay_bytes` (default 256 MiB)
   and `limits.max_overlay_entries` (default 262144) bound the in-memory
   ciphertext overlay independently of the on-disk journal; a write over the

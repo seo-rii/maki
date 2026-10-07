@@ -885,6 +885,8 @@ version = "0.1.0"
 dependencies = [
  "maki-format",
  "maki-nbdkit",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

@@ -228,6 +228,13 @@ provider contract errors. Response bodies are read under a hard size limit.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
 
+A per-item mapping without `body.items_path` sends one unit per HTTP call.
+Units within a parent request run concurrently only within the existing
+`limits.max_active_callbacks` budget. Declaring a larger batch size does not
+turn a single-item vendor API into a batched one. Prefer a real batch mapping
+when available, and establish throughput and tail latency with the
+[performance profile](performance.md#compare-remote-mappings).
+
 ## WebSocket and gRPC contracts
 
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
