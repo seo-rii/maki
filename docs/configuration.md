@@ -248,6 +248,11 @@ socket and reader/writer task. Reconnection uses a new generation; cleanup of
 the retired one cannot close it or fail its requests. Dropping the provider
 also closes an otherwise idle connection.
 
+Retiring a generation also fails its other in-flight requests as retryable.
+For a provider with `retry_safe = false`, those peers return EIO instead of
+being resent. Include that shared-connection failure scope in the application's
+availability contract; a per-request timeout does not isolate its peers.
+
 Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request has been
 sent, and the WebSocket transport does not resend over a fresh connection. With

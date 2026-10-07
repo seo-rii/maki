@@ -591,8 +591,9 @@ and provider-host reset scenarios. These results and their exact configurations
 are recorded [above](#current-qualification-status); they do not qualify every
 target environment.
 
-Before production approval, complete the remaining coverage for the chosen
-configuration and acceptance thresholds:
+Record the chosen configuration, acceptance thresholds and evidence using the
+[deployment qualification profile](deployment/qualification-profile.md).
+Before production approval, complete its remaining coverage:
 
 - Requalify kernel `/dev/nbd`, LVM, XFS, raw-device fio, effective capabilities,
   ACLs, core dumps, mounts and service restarts on the selected image/package

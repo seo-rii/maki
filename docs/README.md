@@ -25,6 +25,7 @@ hold everywhere:
 | Understand RAID below, across or above Maki | [RAID and Maki](deployment/raid.md) |
 | Deploy PostgreSQL with the production profile | [PostgreSQL deployment guide](deployment/postgres.md), [example bundle](../examples/postgres-local/README.md) |
 | Use a remote HTTP/WSS/gRPC crypto provider | [Configuration: providers](configuration.md#providers), [`postgres-prod.toml`](../packaging/examples/postgres-prod.toml) |
+| Define acceptance criteria for the actual host, provider and workload | [Deployment qualification profile](deployment/qualification-profile.md) |
 | Measure throughput, tail latency, memory and capacity | [Performance profiles](performance.md) |
 
 ## Operations

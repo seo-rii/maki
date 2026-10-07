@@ -1,6 +1,6 @@
 # Rollback-protected backing
 
-Status: experimental implementation, updated 2026-09-22. This is an explicitly selected
+Status: experimental implementation, updated 2026-10-07. This is an explicitly selected
 Linux storage format for new volumes. Default v2/v3 directory backings retain
 their existing rollback limitation. Production qualification of this new format
 is still pending; earlier v2/v3 GCE reset and RSS results do not qualify it.
@@ -133,6 +133,56 @@ Partial-page holes may retain their page reservation. The arena's physical
 allocation is retained, so this mode does not return its fixed footprint to the
 host filesystem. Cross-directory rename and directory removal/rename are not
 implemented; current Maki volume operations do not require them.
+
+## Backup and recovery procedure
+
+A protected backing snapshot is usable with its original identity only while
+it matches the authoritative witness generation. Subsequent commits can make a
+previously valid backup too old. Keep DB-native or logical backups for recovery
+to older application states; a collection of backing snapshots alone is not a
+complete recovery plan.
+
+1. Record the volume UUID, provider/key version reference, protected format,
+   backing and witness locations, and package/configuration versions. Confirm
+   that the witness is on an independently managed persistent filesystem and
+   excluded from backing snapshots and whole-host rollback automation. Preserve
+   secret material through its separate recovery process.
+2. Stop application writers and their supervisors. Follow the stopped sequence
+   in [key rotation](key-rotation.md#rotate-a-credential-while-retaining-the-encryption-key):
+   detach while the daemon is available, obtain the explicit drain
+   acknowledgement, then stop the daemon. Keep automatic restart disabled for
+   the maintenance window and confirm that no process holds the volume. A
+   live copy of the arena and manifest slots is not an atomic backup.
+3. Copy the complete protected backing tree while it is stopped and record
+   hashes. Keep the existing authoritative witness in place; do not copy it
+   into a bundle that will be rolled back with the backing. Document that the
+   copy will cease to be a usable same-identity restore point once commits
+   advance the witness. Retain a separately verified application backup.
+4. For same-identity recovery, keep writers and restart automation stopped.
+   Preserve the failed backing as evidence, recover the complete matching
+   backing under its trusted configuration, and run `maki check <config.toml>
+   --deep` offline. This acquires the witness lock and verifies structural
+   consistency; normal attach additionally verifies the crypto key and
+   provider. Require application-level readback before permitting writes.
+   Never run two writable copies against one witness.
+5. A witness mismatch, missing witness or authentication failure leaves the
+   volume offline. Do not edit generations, delete the witness, copy an older
+   witness over it, or remove the configuration stanza. No administrative
+   command reconstructs lost authoritative history. If only older data is
+   available, restore an application backup into a newly created volume with
+   a new witness identity, and validate cutover as a migration.
+
+For witness ENOSPC, retain all Maki files, restore space on that independent
+filesystem by removing unrelated data or through its established expansion
+procedure, and reopen the failed session. Reopen selects the exact witnessed
+old or new state; an unsuccessful commit was not an acknowledgement. Repeat
+the offline/attach/application checks before resuming. A witness that resides
+on unavailable storage is not repaired by moving a backing snapshot.
+
+The [deployment profile](deployment/qualification-profile.md) must name the
+backup owner, witness storage owner and tested restore path. These procedures
+describe the current fail-closed behavior; independent persistent-disk reset,
+capacity and latency qualification is still required.
 
 ## Recovery and validation limits
 

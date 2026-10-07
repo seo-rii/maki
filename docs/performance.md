@@ -1,7 +1,8 @@
 # Performance and memory profiles
 
 A performance result belongs to one revision, configuration and environment.
-Record the intended deployment before comparing results. Maki has no universal throughput, latency or RAM
+Record the profile in [deployment qualification](deployment/qualification-profile.md)
+before comparing results. Maki has no universal throughput, latency or RAM
 minimum. The scoped measurements in [status](status.md) are evidence for those
 profiles only.
 

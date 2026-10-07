@@ -73,6 +73,10 @@ documents.
   committed source in isolation and bundles the Debian package, source
   archive, host/toolchain provenance and SHA-256 checksums without publishing.
   See [release preparation](docs/releasing.md).
+- [Deployment qualification profiles](docs/deployment/qualification-profile.md)
+  define acceptance criteria for performance, memory, provider maintenance,
+  backup/restore and cutover; protected volumes have a separate
+  [witness backup/recovery procedure](docs/rollback-protection.md#backup-and-recovery-procedure).
 
 - **Overlay memory bound**: `limits.max_overlay_bytes` (default 256 MiB)
   and `limits.max_overlay_entries` (default 262144) bound the in-memory
