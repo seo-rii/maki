@@ -14,6 +14,10 @@ hex byte is written, and the fixed allocation cannot reallocate while decoding.
 A malformed symbol therefore erases partial output before returning the error;
 successful extraction moves the same guard into the provider result. Dropping a
 partly built batch also erases payloads decoded before a later item fails.
+After a per-item or batch JSON response has been parsed into its owned guarded
+tree, the original guarded HTTP body is dropped before payload decoding starts.
+This shortens the overlap between the wire representation and decoded outputs;
+the tree still holds its encoded strings until extraction finishes.
 
 Focused allocation regressions observe the selected output immediately before
 deallocation and show that malformed Base64 and hex inputs no longer release a
@@ -23,6 +27,15 @@ drop guard until serialization; recursive cleanup drains and wipes object keys
 and values, including pointer replacement and construction errors. The complete
 HTTP package passed 46 tests with three ignored network tests, and the changed
 packages passed scoped all-targets strict Clippy on 2026-09-13.
+
+HTTP request hex encoding preallocates its complete output and writes digits
+directly, without per-byte formatted strings or growing the output allocation.
+The request-tree guard wipes the resulting string after serialization or an
+error. This removes transient hex allocations that the guard could not reach;
+it does not page-lock the request tree or change the public encoder's `String`
+ownership. Allocation regressions require only the final allocation to exist
+for nonempty hex input and no allocations for empty input, with no intermediate
+deallocations. Wire checks cover both cases and every byte value.
 
 Resolved header and query values are erased when their operation specification
 is dropped. Header values are guarded while the specification is assembled, so
@@ -213,3 +226,43 @@ other `SecretBuffer` failure. `AesGcmSivProvider::key_schedule_locked()` and
 expanding the key, and stack or register state during encryption, are outside
 the page-lock claim; `memory_lock_mode = "all"` (`mlockall`) or the
 secure-swap policy covers them.
+
+## Further copy reduction options
+
+The HTTP hex and response-lifetime changes above remove avoidable allocations
+and shorten ownership without changing the wire contract. Further options,
+in implementation priority order, are not yet implemented:
+
+| Priority | Option | Benefit and cost |
+|---|---|---|
+| 1 | Adopt uniquely owned HTTP response chunks | Apply the WebSocket frame pattern to `reqwest::Response::chunk()` output: if `Bytes::try_into_mut` succeeds, move the allocation into a `SecretBuffer` before copying or rejecting it. This can erase a received chunk's complete capacity. Shared source allocations must remain untouched. The change is small but needs unique, sliced, shared and size-limit error ownership tests. |
+| 2 | Serialize HTTP requests from borrowed payloads | Use the WebSocket serializer's counting pass and fixed guarded output, eliminating the intermediate base64/hex `String` and request `Value` tree. This is a moderate change because HTTP supports dynamic JSON pointer mappings and replacement semantics. Preserve exact wire output, mapping errors, batch order and cancellation cleanup. |
+| 3 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing and parser scratch unchanged. |
+| 4 | Address JSON escape scratch with compatible parser support | Evaluate upstream support or a maintained parser change for bounded guarded scratch. A replacement in-place parser also requires compatibility and fuzz review. Both are larger changes than the provider-owned response visitor. |
+
+The pinned `serde_json` 1.0.151 slice/str parser borrows unescaped strings from
+the input. Escaped strings instead pass through a private `Vec<u8>` scratch
+buffer before reaching the visitor, including partial strings that never reach
+it. Its input trait is sealed, and the public API does not allow replacing or
+wiping that scratch. Wrapping completed visitor strings cannot erase it;
+wrapping a growing scratch vector only on drop would also leave earlier
+allocations released during growth.
+
+An optional restricted response mode could reject every backslash before
+invoking serde, preventing this string escape-decoding path. Base64 and hex
+payloads need no JSON escapes, but keys, unknown metadata and error strings must
+also pass the restriction. Valid JSON such as `\/` and `\u0041` would then be
+rejected. This is not a default-compatible fix and has not been enabled or
+implemented. Any general parser change must preserve Unicode and surrogate
+validation, duplicate-field behavior, JSON pointers, recursion limits and
+redacted errors, including malformed input cleanup.
+
+The daemon already uses `Engine::read_secret` through nbdkit's `pread`; replacing
+the convenience `Engine::read` API is not needed for that path. The final copy
+into nbdkit's caller-owned output remains outside `SecretBuffer` ownership.
+Likewise, TLS/framing and tonic allocations cannot all be erased by changes to
+provider-owned buffers. Process memory locking, core-dump suppression and the
+secure-swap policy mitigate disk exposure of residual copies; they do not erase
+those copies or establish a total memory bound. Using `memory_lock_mode = "all"`
+requires an adequate `LimitMEMLOCK` and measured peak memory, so it is a deployment
+choice rather than a substitute for reducing copies.

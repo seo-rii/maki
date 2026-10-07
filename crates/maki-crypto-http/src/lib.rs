@@ -160,8 +160,26 @@ impl PayloadEncoding {
         match self {
             Self::Base64 => base64::engine::general_purpose::STANDARD.encode(data),
             Self::Base64Url => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data),
-            Self::HexLower => data.iter().map(|b| format!("{b:02x}")).collect(),
-            Self::HexUpper => data.iter().map(|b| format!("{b:02X}")).collect(),
+            Self::HexLower | Self::HexUpper => {
+                let digits = if matches!(self, Self::HexUpper) {
+                    b"0123456789ABCDEF"
+                } else {
+                    b"0123456789abcdef"
+                };
+                let length = data
+                    .len()
+                    .checked_mul(2)
+                    .expect("hex payload size overflow");
+                // The request tree wipes the final string. Preallocate its
+                // whole length so neither temporary strings nor growth can
+                // release an intermediate reversible plaintext allocation.
+                let mut encoded = String::with_capacity(length);
+                for &byte in data {
+                    encoded.push(digits[usize::from(byte >> 4)] as char);
+                    encoded.push(digits[usize::from(byte & 0x0f)] as char);
+                }
+                encoded
+            }
         }
     }
 
@@ -735,6 +753,9 @@ impl HttpCryptoProvider {
             RespKind::Json => {
                 let value = response::parse(body.expose())
                     .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
+                // The tree owns its strings; release the duplicate wire body
+                // before allocating the decoded payload.
+                drop(body);
                 let path = op
                     .response
                     .data_path
@@ -861,6 +882,7 @@ impl HttpCryptoProvider {
             .await?;
         let value = response::parse(response.expose())
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
+        drop(response);
         Self::extract_batch(op, &value, items)
     }
 

@@ -21,6 +21,8 @@ const JSON_FILL: u8 = b'Q';
 #[derive(Clone, Copy, Default, Debug)]
 struct Inspection {
     enabled: bool,
+    total_allocations: usize,
+    total_deallocations: usize,
     allocations: usize,
     deallocations: usize,
     zeroized: usize,
@@ -30,6 +32,8 @@ struct Inspection {
 thread_local! {
     static INSPECTION: Cell<Inspection> = const { Cell::new(Inspection {
         enabled: false,
+        total_allocations: 0,
+        total_deallocations: 0,
         allocations: 0,
         deallocations: 0,
         zeroized: 0,
@@ -51,7 +55,7 @@ fn selected(layout: Layout) -> bool {
 // SAFETY: every operation delegates to System. Selected allocations are
 // zero-initialized, so the observer may read their complete live allocation
 // immediately before delegating deallocation. The thread-local counters do not
-// allocate and are disabled outside each focused decoder call.
+// allocate and are disabled outside each focused encoding or ownership check.
 unsafe impl GlobalAlloc for InspectDecodeAllocation {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let watching = INSPECTION
@@ -60,17 +64,28 @@ unsafe impl GlobalAlloc for InspectDecodeAllocation {
         if watching {
             unsafe { self.alloc_zeroed(layout) }
         } else {
-            unsafe { System.alloc(layout) }
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                let _ = INSPECTION.try_with(|cell| {
+                    let mut inspection = cell.get();
+                    if inspection.enabled {
+                        inspection.total_allocations += 1;
+                        cell.set(inspection);
+                    }
+                });
+            }
+            pointer
         }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
-        if !pointer.is_null() && selected(layout) {
+        if !pointer.is_null() {
             let _ = INSPECTION.try_with(|cell| {
                 let mut inspection = cell.get();
                 if inspection.enabled {
-                    inspection.allocations += 1;
+                    inspection.total_allocations += 1;
+                    inspection.allocations += usize::from(selected(layout));
                     cell.set(inspection);
                 }
             });
@@ -79,10 +94,11 @@ unsafe impl GlobalAlloc for InspectDecodeAllocation {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        if selected(layout) {
-            let _ = INSPECTION.try_with(|cell| {
-                let mut inspection = cell.get();
-                if inspection.enabled {
+        let _ = INSPECTION.try_with(|cell| {
+            let mut inspection = cell.get();
+            if inspection.enabled {
+                inspection.total_deallocations += 1;
+                if selected(layout) {
                     // SAFETY: `pointer` still names the selected live
                     // zero-initialized allocation and `layout.size()` bytes
                     // are readable until System.dealloc below.
@@ -94,10 +110,10 @@ unsafe impl GlobalAlloc for InspectDecodeAllocation {
                             && (bytes[..64].iter().all(|byte| *byte == FILL)
                                 || bytes[..64].iter().all(|byte| *byte == JSON_FILL)),
                     );
-                    cell.set(inspection);
                 }
-            });
-        }
+                cell.set(inspection);
+            }
+        });
         unsafe { System.dealloc(pointer, layout) }
     }
 }
@@ -158,6 +174,49 @@ fn assert_partial_output_wiped(inspection: Inspection) {
     assert!(
         inspection.zeroized > 0,
         "decoder output was not wiped before deallocation: {inspection:?}"
+    );
+}
+
+#[test]
+fn hex_encoding_keeps_only_its_final_allocation() {
+    for encoding in [PayloadEncoding::HexLower, PayloadEncoding::HexUpper] {
+        for payload in [&[][..], &[FILL][..], &[FILL; PAYLOAD_LEN][..]] {
+            begin_inspection();
+            let encoded = encoding.encode(payload);
+            let inspection = finish_inspection();
+
+            assert_eq!(
+                inspection.total_deallocations, 0,
+                "hex encoding freed an intermediate plaintext allocation: {inspection:?}"
+            );
+            assert_eq!(
+                inspection.total_allocations,
+                usize::from(!payload.is_empty()),
+                "hex encoding allocated storage beyond its final output: {inspection:?}"
+            );
+            assert_eq!(encoded.len(), payload.len() * 2);
+            assert_eq!(encoding.decode(&encoded).unwrap().as_slice(), payload);
+        }
+    }
+}
+
+#[test]
+fn hex_encoding_preserves_case_and_all_byte_values() {
+    let example = [0x00, 0x0f, 0x10, 0xab, 0xff];
+    assert_eq!(PayloadEncoding::HexLower.encode(&example), "000f10abff");
+    assert_eq!(PayloadEncoding::HexUpper.encode(&example), "000F10ABFF");
+
+    let all_bytes: Vec<u8> = (0..=255).collect();
+    let lower = PayloadEncoding::HexLower.encode(&all_bytes);
+    let upper = PayloadEncoding::HexUpper.encode(&all_bytes);
+    assert_eq!(lower.to_ascii_uppercase(), upper);
+    assert_eq!(
+        PayloadEncoding::HexLower.decode(&lower).unwrap().as_slice(),
+        all_bytes
+    );
+    assert_eq!(
+        PayloadEncoding::HexUpper.decode(&upper).unwrap().as_slice(),
+        all_bytes
     );
 }
 
