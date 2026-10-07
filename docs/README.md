@@ -65,6 +65,7 @@ hold everywhere:
 | Topic | Document |
 |---|---|
 | Build, test, TDD and documentation rules | [Contributing](../CONTRIBUTING.md) |
+| Prepare an auditable release candidate without publishing | [Release preparation](releasing.md) |
 | Reporting a vulnerability | [Security policy](../SECURITY.md) |
 | Repository-level development guide | [`CLAUDE.md`](../CLAUDE.md) |
 

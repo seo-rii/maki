@@ -1,5 +1,9 @@
 # Debian package build
 
+For a reviewable candidate with source provenance, host metadata and checksums,
+use [the release preparation command](../../docs/releasing.md). It builds from
+committed source and always retains the native dependency scan described below.
+
 Build the release binaries first, then create the package from that immutable
 artifact directory:
 

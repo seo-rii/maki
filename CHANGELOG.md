@@ -69,6 +69,10 @@ documents.
   arguments are refused before creating a volume; recovered geometry is
   rechecked before I/O. See
   [performance profiles](docs/performance.md).
+- **Release candidate preparation**: `scripts/prepare_release.py` builds
+  committed source in isolation and bundles the Debian package, source
+  archive, host/toolchain provenance and SHA-256 checksums without publishing.
+  See [release preparation](docs/releasing.md).
 
 - **Overlay memory bound**: `limits.max_overlay_bytes` (default 256 MiB)
   and `limits.max_overlay_entries` (default 262144) bound the in-memory
