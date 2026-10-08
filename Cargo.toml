@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/rustls", "vendor/serde_json", "vendor/maki-test-allocator", "vendor/bytes", "vendor/hyper"]
+exclude = ["vendor/rustls", "vendor/serde_json", "vendor/maki-test-allocator", "vendor/bytes", "vendor/hyper", "vendor/tungstenite"]
 members = [
     "crates/maki-core",
     "crates/maki-format",
@@ -72,3 +72,4 @@ bytes = { path = "vendor/bytes" }
 hyper = { path = "vendor/hyper" }
 rustls = { path = "vendor/rustls" }
 serde_json = { path = "vendor/serde_json" }
+tungstenite = { path = "vendor/tungstenite" }

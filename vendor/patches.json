@@ -100,6 +100,21 @@
         "src/scratch.rs": "198e74f5cdb1cb9e8fdb476b94dd46b9baa4dc3b6d2933226232dd2183eee58b",
         "tests/maki_scratch.rs": "4c9c561b904112c7173216f1e9f917d9feddf8e59eaf8eb9328653b27a1f51a4"
       }
+    },
+    "tungstenite": {
+      "files": {
+        "Cargo.lock": "418bfe24603ea2f737a364106162818e4eba167c4f0f2f33d2aed28fc03dcddf",
+        "Cargo.toml": "c0497558aed79c21a8656c1848a63b73eedbb5815b2565a5e0e4255ae62d8b0c",
+        "src/buffer.rs": "67102a9adde8421ce61e12da72d87ce4d920cf3de4ba4c8d7bb45d5e6eae506f",
+        "src/handshake/client.rs": "909326c12e65ca520c31a8291f643b4b1e1213046b8d3784212abe26ed4b57af",
+        "src/handshake/machine.rs": "45fd42992175c5fe5a374180d059b6ad03363d947018c26de5910fe7e8079cf6",
+        "src/handshake/server.rs": "36cf2a2ad528769d1095d2979c209883e2ca7f1515db9eba4ba1a99069799fda",
+        "src/lib.rs": "953e3d4faefd7a36ba665ade762b40bbaa47d52f606e2a665f4147847ca8ac83",
+        "src/maki_buffer.rs": "29a7ea15f2fb97d336c21c2b2825e8cfb240ad375677345f36805faa5ed525c8",
+        "src/protocol/frame/frame.rs": "b07b2f636bc1851790d534e22749e7868090f1753231a7677a098f0fc31c5edc",
+        "src/protocol/frame/mod.rs": "6b0421f5b6ceb0593775375bb3aa23f340f9753a2557a5bf9646dfaabf051700",
+        "src/protocol/message.rs": "030da939106fc01d480139e86f78862b62e7b4ade7986ff1f0e4a398addbc1d0"
+      }
     }
   },
   "schema": 1
