@@ -14,6 +14,14 @@ hex byte is written, and the fixed allocation cannot reallocate while decoding.
 A malformed symbol therefore erases partial output before returning the error;
 successful extraction moves the same guard into the provider result. Dropping a
 partly built batch also erases payloads decoded before a later item fails.
+Streamed HTTP chunks first attempt a unique ownership transfer. A unique
+allocation, including a sliced view's full backing capacity, becomes a
+page-lock-capable `SecretBuffer` before copying or size rejection. The first
+chunk reuses that allocation when its capacity fits `max_response_bytes`.
+Later chunks and backing allocations larger than the limit copy into bounded
+guarded storage, then erase the source owner. Shared chunks preserve surviving
+aliases and copy into guarded storage; their library backing is erased on its
+final release. An empty response allocates no aggregate buffer.
 After a per-item or batch JSON response has been parsed into its owned guarded
 tree, the original guarded HTTP body is dropped before payload decoding starts.
 This shortens the overlap between the wire representation and decoded outputs;
@@ -343,9 +351,8 @@ in implementation priority order, are not yet implemented:
 
 | Priority | Option | Benefit and cost |
 |---|---|---|
-| 1 | Adopt uniquely owned HTTP response chunks | Apply the WebSocket frame pattern to `reqwest::Response::chunk()` output: if `Bytes::try_into_mut` succeeds, move the allocation into a `SecretBuffer` before copying or rejecting it. The bytes patch already erases its managed backing; adoption would add the provider's optional page-lock policy and permit reuse of a first chunk's allocation. Shared sources keep their ownership lifetime. The change needs unique, sliced, shared and size-limit error ownership tests. |
-| 2 | Serialize HTTP requests from borrowed payloads | Use the WebSocket serializer's counting pass and fixed guarded output, eliminating the intermediate base64/hex `String` and request `Value` tree. This is a moderate change because HTTP supports dynamic JSON pointer mappings and replacement semantics. Preserve exact wire output, mapping errors, batch order and cancellation cleanup. |
-| 3 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
+| 1 | Serialize HTTP requests from borrowed payloads | Use the WebSocket serializer's counting pass and fixed guarded output, eliminating the intermediate base64/hex `String` and request `Value` tree. This is a moderate change because HTTP supports dynamic JSON pointer mappings and replacement semantics. Preserve exact wire output, mapping errors, batch order and cancellation cleanup. |
+| 2 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
 
 The daemon already uses `Engine::read_secret` through nbdkit's `pread`; replacing
 the convenience `Engine::read` API is not needed for that path. The final copy

@@ -86,12 +86,26 @@ fn append_response_chunk(
     Ok(())
 }
 
-fn new_response_buffer(limit: usize) -> Result<SecretBuffer, CryptoError> {
-    SecretBuffer::with_capacity(limit.min(8192)).map_err(|_| {
-        CryptoError::NonRetryableRequest(format!(
-            "response buffer cannot be allocated within limit {limit}"
-        ))
-    })
+fn append_owned_response_chunk(
+    out: &mut SecretBuffer,
+    chunk: bytes::Bytes,
+    limit: usize,
+) -> Result<(), CryptoError> {
+    match chunk.try_into_mut() {
+        Ok(unique) => {
+            // Adopt the full backing allocation before copying or rejecting
+            // its contents. Bytes normalizes a sliced view and wipes hidden
+            // ranges as it transfers the allocation into a Vec.
+            let chunk = SecretBuffer::from_vec(unique.into());
+            if out.is_empty() && chunk.capacity() <= limit {
+                *out = chunk;
+                Ok(())
+            } else {
+                append_response_chunk(out, chunk.expose(), limit)
+            }
+        }
+        Err(shared) => append_response_chunk(out, &shared, limit),
+    }
 }
 
 /// Wipe every string in a JSON document in place. Payload encodings are
@@ -740,10 +754,10 @@ impl HttpCryptoProvider {
             }
         }
         // Stream with a hard cap regardless of the declared length.
-        let mut out = new_response_buffer(self.spec.max_response_bytes)?;
+        let mut out = SecretBuffer::zeroed(0);
         let mut response = response;
         while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
-            append_response_chunk(&mut out, &chunk, self.spec.max_response_bytes)?;
+            append_owned_response_chunk(&mut out, chunk, self.spec.max_response_bytes)?;
         }
         Ok(out)
     }

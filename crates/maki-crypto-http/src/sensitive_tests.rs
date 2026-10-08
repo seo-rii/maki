@@ -262,12 +262,95 @@ fn response_growth_erases_the_replaced_plaintext_allocation() {
 }
 
 #[test]
+fn owned_response_unique_chunk_reuses_its_allocation() {
+    let mut out = SecretBuffer::zeroed(0);
+    begin_inspection();
+    let source = vec![FILL; PAYLOAD_LEN];
+    let address = source.as_ptr();
+    super::append_owned_response_chunk(&mut out, source.into(), PAYLOAD_LEN).unwrap();
+    let adopted = out.expose().as_ptr();
+    let capacity = out.capacity();
+    drop(out);
+    let inspection = finish_inspection();
+    assert_eq!(adopted, address, "unique response chunk was copied");
+    assert_eq!(capacity, PAYLOAD_LEN);
+    assert_eq!(inspection.allocations, 1, "{inspection:?}");
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn owned_response_unique_slice_reuses_and_erases_full_backing() {
+    let mut out = SecretBuffer::zeroed(0);
+    begin_inspection();
+    let source = vec![FILL; PAYLOAD_LEN + 1];
+    let address = source.as_ptr();
+    let chunk = bytes::Bytes::from(source).slice(1..PAYLOAD_LEN);
+    super::append_owned_response_chunk(&mut out, chunk, PAYLOAD_LEN + 1).unwrap();
+    let adopted = out.expose().as_ptr();
+    let capacity = out.capacity();
+    assert_eq!(out.expose(), &[FILL; PAYLOAD_LEN - 1]);
+    drop(out);
+    let inspection = finish_inspection();
+    assert_eq!(adopted, address, "unique sliced backing was copied");
+    assert_eq!(capacity, PAYLOAD_LEN + 1);
+    assert_eq!(inspection.allocations, 1, "{inspection:?}");
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn owned_response_shared_chunk_preserves_the_surviving_owner() {
+    let source = bytes::Bytes::from(vec![FILL; PAYLOAD_LEN]);
+    let alias = source.clone();
+    let mut out = SecretBuffer::zeroed(0);
+    super::append_owned_response_chunk(&mut out, source, PAYLOAD_LEN).unwrap();
+    assert_ne!(out.expose().as_ptr(), alias.as_ptr());
+    assert_eq!(out.expose(), alias.as_ref());
+    drop(out);
+    assert_eq!(alias.as_ref(), &[FILL; PAYLOAD_LEN]);
+}
+
+#[test]
+fn owned_response_rejection_erases_unique_chunk_and_preserves_aggregate() {
+    let mut out = SecretBuffer::from_slice(b"kept");
+    begin_inspection();
+    let chunk = bytes::Bytes::from(vec![FILL; PAYLOAD_LEN]);
+    let error = super::append_owned_response_chunk(&mut out, chunk, PAYLOAD_LEN).unwrap_err();
+    let inspection = finish_inspection();
+    assert!(matches!(
+        error,
+        maki_crypto::CryptoError::NonRetryableRequest(_)
+    ));
+    assert_eq!(out.expose(), b"kept");
+    assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+#[test]
+fn owned_response_does_not_retain_capacity_above_body_limit() {
+    let mut source = bytes::BytesMut::with_capacity(PAYLOAD_LEN);
+    source.extend_from_slice(b"ok");
+    let mut out = SecretBuffer::zeroed(0);
+    super::append_owned_response_chunk(&mut out, source.freeze(), 2).unwrap();
+    assert_eq!(out.expose(), b"ok");
+    assert!(out.capacity() <= 2);
+}
+
+#[test]
+fn owned_response_later_chunks_keep_order_through_growth() {
+    let mut out = SecretBuffer::zeroed(0);
+    for chunk in [b"first".as_slice(), b"second", b"third"] {
+        super::append_owned_response_chunk(&mut out, bytes::Bytes::copy_from_slice(chunk), 16)
+            .unwrap();
+    }
+    assert_eq!(out.expose(), b"firstsecondthird");
+}
+
+#[test]
 fn response_owner_is_page_lock_capable_before_plaintext_is_written() {
     use maki_crypto::secret::{page_lock_failures, set_page_locking};
 
     set_page_locking(true);
     let before = page_lock_failures();
-    let mut response = super::new_response_buffer(PAYLOAD_LEN).unwrap();
+    let mut response = SecretBuffer::with_capacity(PAYLOAD_LEN).unwrap();
     assert!(response.is_page_locked() || page_lock_failures() > before);
     append_response_chunk(&mut response, &[FILL; PAYLOAD_LEN], PAYLOAD_LEN).unwrap();
     assert_eq!(response.expose(), &[FILL; PAYLOAD_LEN]);
