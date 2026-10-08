@@ -29,9 +29,10 @@ mod sensitive_tests;
 /// Bytes wiped when dropped: every copy of plaintext this crate makes on
 /// the way to and from the wire (third review, F09) — payload copies, the
 /// serialized request body, the response body, and decoded payloads.
-/// Copies made inside reqwest, hyper, rustls and the kernel are outside
-/// this crate's reach; the daemon's no-swap and no-core-dump posture is
-/// what covers them.
+/// The pinned rustls/serde_json patches separately erase their owned
+/// application-data heap buffers. Other framing and kernel copies have
+/// independent lifetimes; no-swap and no-core-dump settings reduce disk
+/// exposure. See docs/transport-memory.md for the ownership boundaries.
 pub type Sensitive = Zeroizing<Vec<u8>>;
 
 /// A request body kept page-lock-capable until reqwest releases its last

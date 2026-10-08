@@ -1,0 +1,81 @@
+"""Dependency changes must not silently remove the plaintext-erasure patches."""
+
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from scripts.check_vendor_erasure import check
+
+
+class VendorErasureContract(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "vendor").mkdir()
+        upstream = {"schema": 1, "packages": {}}
+        patches = {"schema": 1, "packages": {}}
+        self.metadata = {"packages": []}
+        manifest = "[patch.crates-io]\n"
+        lock = "version = 4\n"
+        for name, version in (("serde_json", "1.0.151"), ("rustls", "0.23.45")):
+            path = self.root / "vendor" / name
+            path.mkdir()
+            text = f'[package]\nname = "{name}"\nversion = "{version}"\n'
+            (path / "Cargo.toml").write_text(text)
+            original = {"Cargo.toml": hashlib.sha256(text.encode()).hexdigest()}
+            upstream["packages"][name] = {
+                "version": version, "crate_sha256": "0" * 64, "upstream_files": original
+            }
+            patches["packages"][name] = {"files": {}}
+            manifest += f'{name} = {{ path = "vendor/{name}" }}\n'
+            lock += f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
+            self.metadata["packages"].append({
+                "name": name, "version": version, "source": None,
+                "manifest_path": str(path / "Cargo.toml"), "id": name,
+            })
+        self.metadata["resolve"] = {"nodes": [
+            {"id": "serde_json", "features": ["default", "std"]},
+            {"id": "rustls", "features": ["ring", "std", "tls12"]},
+        ]}
+        (self.root / "Cargo.toml").write_text(manifest)
+        (self.root / "Cargo.lock").write_text(lock)
+        (self.root / "vendor/upstream.json").write_text(json.dumps(upstream))
+        (self.root / "vendor/patches.json").write_text(json.dumps(patches))
+        (self.root / "vendor/test-ca-provenance.json").write_text(json.dumps({"files": {}}))
+
+    def test_known_local_dependencies_pass(self):
+        self.assertEqual(check(self.root, self.metadata), [])
+
+    def test_unrecorded_source_edit_is_rejected(self):
+        (self.root / "vendor/rustls/Cargo.toml").write_text("changed")
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_second_registry_version_is_rejected(self):
+        self.metadata["packages"].append({
+            "name": "rustls", "version": "0.23.46", "source": "registry", "id": "other"
+        })
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_unreviewed_parser_feature_is_rejected(self):
+        self.metadata["resolve"]["nodes"][0]["features"].append("raw_value")
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_dependency_patch_removal_is_rejected(self):
+        (self.root / "Cargo.toml").write_text("[patch.crates-io]\n")
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_public_test_fixture_changes_are_rejected(self):
+        path = self.root / "vendor/test-ca"
+        path.mkdir()
+        (path / "certificate.der").write_bytes(b"changed public fixture")
+        (self.root / "vendor/test-ca-provenance.json").write_text(json.dumps({
+            "files": {"test-ca/certificate.der": {"sha256": "0" * 64}}
+        }))
+        self.assertTrue(check(self.root, self.metadata))
+
+
+if __name__ == "__main__":
+    unittest.main()

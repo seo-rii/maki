@@ -65,11 +65,12 @@ last-value-wins behavior, number validation and recursion limits are unchanged.
 
 Request JSON trees, credential-value strings and combined identity PEMs still
 have zeroizing ownership without per-allocation page locks. Plain source
-configuration strings and copies made inside reqwest, hyper, rustls or the
-kernel remain outside this ownership. serde_json's internal escape-decoding
-scratch, including an unfinished string rejected before the visitor sees it,
-is also outside the guarded response tree. Admission does not account for
-simultaneous decoded, encoded and library copies. MAKI-015 and the total-memory
+configuration strings and copies made inside reqwest, hyper or the kernel
+remain separate owners. The pinned parser and TLS patches described below
+extend erasure to their application-data heap buffers, including unfinished
+escaped strings rejected before the visitor sees them. Admission does not
+account for simultaneous decoded, encoded and library copies. MAKI-015 and
+the total-memory
 work in MAKI-032 therefore remain open.
 
 The 2026-10-07 response-tree regressions first observed unzeroized deallocation
@@ -100,7 +101,7 @@ The encoded allocation remains owned through the WebSocket message queue and
 optional page lock. Cancellation before connecting also drops the owner. The
 existing wire order, escaping and payload encoding are preserved.
 
-This protects Maki's owned request storage. Serializer/base64 scratch and
+This protects Maki's owned request storage. Stack serializer/base64 scratch and
 tungstenite's internal output/framing copies are outside this guarantee.
 Incoming response ownership is described below. The final request unit passed all
 35 WebSocket package tests and strict Clippy on 2026-09-12, including actual
@@ -151,8 +152,9 @@ Allocation tests inspect initialized bytes immediately before deallocation,
 including unique sliced payloads whose original prefix and suffix become
 spare capacity. Drop erases the adopted vector's full capacity. Optional page
 locking covers the entire allocation, including pages of spare capacity.
-Shared source owners, tungstenite read/framing buffers and serde's private
-escape-decoding scratch retain library-controlled lifetimes. The response
+Shared source owners and tungstenite read/framing buffers retain
+library-controlled lifetimes. The pinned parser patch separately erases its
+private escape-decoding scratch. The response
 tree's container/number storage and many small values also remain outside any
 total resident-memory bound. These changes do not close MAKI-015 or MAKI-032.
 
@@ -178,7 +180,8 @@ for their own allocation lifetime.
 
 The private item is page-lock-capable before its first decoded byte is written,
 and retains that owner through rejection, cancellation and successful transfer.
-Tonic's encoded/decoded buffers and HTTP/TLS buffers remain separate allocations.
+Tonic's encoded/decoded buffers and HTTP framing buffers remain separate
+allocations. The pinned TLS patch separately erases rustls-owned plaintext.
 These changes do not establish complete transport zeroization, page locking, or
 a total resident-memory cap.
 
@@ -227,41 +230,76 @@ expanding the key, and stack or register state during encryption, are outside
 the page-lock claim; `memory_lock_mode = "all"` (`mlockall`) or the
 secure-swap policy covers them.
 
+## Parser and TLS library-owned copies
+
+Maki pins local patches of `serde_json` 1.0.151 and `rustls` 0.23.45 through
+workspace dependency overrides. All HTTP and WebSocket JSON parsing, and all
+rustls-based HTTP, WebSocket and gRPC TLS connections resolve to these patched
+sources. The [vendor guide](../vendor/README.md) records the covered owners and
+upgrade procedure. Published archive checksums record the original sources;
+source inventories, patch hashes, resolved dependency paths and permitted
+parser features are checked in
+CI; silently replacing a patch or resolving a second library version fails the
+contract.
+
+The JSON parser's escaped-string scratch, reader scratch, integer128 scanning
+and formatted error-message heap buffers erase removed bytes before reuse.
+Growth creates a guarded replacement before copying and wipes the old full
+allocation before release. Drop also wipes the full capacity, including an
+unfinished escape that never reaches a visitor. Valid JSON escapes, Unicode
+surrogates, duplicate keys, error text and locations retain upstream behavior.
+The optional `raw_value`, `arbitrary_precision` and `float_roundtrip` paths are
+refused at compile time until their additional owners have been reviewed;
+Maki's resolved default/std parser configuration does not use them.
+
+The convenience `from_slice`/`from_str` functions drop their parser before
+returning. A caller that keeps a `Deserializer` alive retains its latest
+scratch until reuse or Drop; a visitor can borrow that scratch during parsing.
+
+TLS plaintext queues erase consumed bytes immediately and wipe their complete
+allocations when replaced or dropped. Deframer compaction erases obsolete tails;
+growth and shrink copy into a replacement and erase the retired allocation.
+Encryption staging and owned record payloads retain guards through errors and
+unwinding. Inbound borrowed payloads erase data on decryption errors, and
+truncation or range extraction erases excluded bytes. Successful transfers to
+API callers retain the caller's buffer ownership. These changes apply to both
+the ring and aws-lc providers without changing their cryptographic algorithms.
+
+Allocation regressions observe initialized storage immediately before release,
+and inspect still-live tails after consumption/reuse. The observer initializes
+spare capacity and never reads freed storage. Existing upstream JSON and TLS
+unit tests and Maki's local HTTPS/WSS/gRPC TLS and mTLS tests provide protocol
+compatibility checks. This is local evidence, not a new external campaign.
+
+This covers library-owned application-data heap copies in these two patches.
+It does not establish complete process-wide plaintext erasure: hyper/h2,
+tungstenite and tonic keep their own reusable framing allocations; shared
+source buffers and caller-owned parsed values or output remain independent.
+Parser/crypto stack and registers, kernel buffers, and process termination
+that skips destructors also remain outside normal heap-owner cleanup. No
+production global allocator is installed. Wiping only on allocator release
+would miss stale plaintext in live reused framing buffers. These patches do
+not page-lock library buffers or establish a total resident-memory cap, so
+MAKI-015 and the total-memory work in MAKI-032 remain open.
+
 ## Further copy reduction options
 
 The HTTP hex and response-lifetime changes above remove avoidable allocations
-and shorten ownership without changing the wire contract. Further options,
+and shorten ownership without changing the wire contract. The remaining options,
 in implementation priority order, are not yet implemented:
 
 | Priority | Option | Benefit and cost |
 |---|---|---|
 | 1 | Adopt uniquely owned HTTP response chunks | Apply the WebSocket frame pattern to `reqwest::Response::chunk()` output: if `Bytes::try_into_mut` succeeds, move the allocation into a `SecretBuffer` before copying or rejecting it. This can erase a received chunk's complete capacity. Shared source allocations must remain untouched. The change is small but needs unique, sliced, shared and size-limit error ownership tests. |
 | 2 | Serialize HTTP requests from borrowed payloads | Use the WebSocket serializer's counting pass and fixed guarded output, eliminating the intermediate base64/hex `String` and request `Value` tree. This is a moderate change because HTTP supports dynamic JSON pointer mappings and replacement semantics. Preserve exact wire output, mapping errors, batch order and cancellation cleanup. |
-| 3 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing and parser scratch unchanged. |
-| 4 | Address JSON escape scratch with compatible parser support | Evaluate upstream support or a maintained parser change for bounded guarded scratch. A replacement in-place parser also requires compatibility and fuzz review. Both are larger changes than the provider-owned response visitor. |
-
-The pinned `serde_json` 1.0.151 slice/str parser borrows unescaped strings from
-the input. Escaped strings instead pass through a private `Vec<u8>` scratch
-buffer before reaching the visitor, including partial strings that never reach
-it. Its input trait is sealed, and the public API does not allow replacing or
-wiping that scratch. Wrapping completed visitor strings cannot erase it;
-wrapping a growing scratch vector only on drop would also leave earlier
-allocations released during growth.
-
-An optional restricted response mode could reject every backslash before
-invoking serde, preventing this string escape-decoding path. Base64 and hex
-payloads need no JSON escapes, but keys, unknown metadata and error strings must
-also pass the restriction. Valid JSON such as `\/` and `\u0041` would then be
-rejected. This is not a default-compatible fix and has not been enabled or
-implemented. Any general parser change must preserve Unicode and surrogate
-validation, duplicate-field behavior, JSON pointers, recursion limits and
-redacted errors, including malformed input cleanup.
+| 3 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
 
 The daemon already uses `Engine::read_secret` through nbdkit's `pread`; replacing
 the convenience `Engine::read` API is not needed for that path. The final copy
 into nbdkit's caller-owned output remains outside `SecretBuffer` ownership.
-Likewise, TLS/framing and tonic allocations cannot all be erased by changes to
-provider-owned buffers. Process memory locking, core-dump suppression and the
+Likewise, framing and tonic allocations cannot all be erased by changes to
+provider-owned buffers or the two library patches. Process memory locking,
+core-dump suppression and the
 secure-swap policy mitigate disk exposure of residual copies; they do not erase
 those copies or establish a total memory bound. Using `memory_lock_mode = "all"`
 requires an adequate `LimitMEMLOCK` and measured peak memory, so it is a deployment

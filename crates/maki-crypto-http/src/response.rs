@@ -1,6 +1,7 @@
 //! HTTP response JSON owns every completed string and key in guarded memory.
-//! serde_json's escape-decoding scratch and transport-private copies remain
-//! outside these owners; the original HTTP body has its own SecretBuffer.
+//! The pinned serde_json patch separately erases parser-private scratch;
+//! transport framing copies remain separate owners. The original HTTP body
+//! has its own SecretBuffer. See docs/transport-memory.md.
 
 use std::{borrow::Borrow, collections::BTreeMap, fmt};
 

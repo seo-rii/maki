@@ -1,5 +1,6 @@
 //! Provider-owned response payloads and JSON strings. Library read buffers and
-//! serde's escape-decoding scratch remain outside these owners.
+//! transport framing copies remain separate owners. The pinned serde_json
+//! patch separately erases escape-decoding scratch; see docs/transport-memory.md.
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
