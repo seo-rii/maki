@@ -20,7 +20,11 @@ class VendorErasureContract(unittest.TestCase):
         self.metadata = {"packages": []}
         manifest = "[patch.crates-io]\n"
         lock = "version = 4\n"
-        for name, version in (("serde_json", "1.0.151"), ("rustls", "0.23.45")):
+        for name, version in (
+            ("serde_json", "1.0.151"), ("rustls", "0.23.45"),
+            ("bytes", "1.12.1"), ("hyper", "1.11.1"),
+            ("tungstenite", "0.26.2"),
+        ):
             path = self.root / "vendor" / name
             path.mkdir()
             text = f'[package]\nname = "{name}"\nversion = "{version}"\n'
@@ -51,6 +55,18 @@ class VendorErasureContract(unittest.TestCase):
 
     def test_unrecorded_source_edit_is_rejected(self):
         (self.root / "vendor/rustls/Cargo.toml").write_text("changed")
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_transport_source_inventory_cannot_be_removed(self):
+        path = self.root / "vendor/upstream.json"
+        record = json.loads(path.read_text())
+        del record["packages"]["bytes"]
+        path.write_text(json.dumps(record))
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_transport_patch_cannot_be_bypassed_transitively(self):
+        package = next(p for p in self.metadata["packages"] if p["name"] == "bytes")
+        package["source"] = "registry"
         self.assertTrue(check(self.root, self.metadata))
 
     def test_second_registry_version_is_rejected(self):

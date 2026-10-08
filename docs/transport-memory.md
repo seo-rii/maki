@@ -101,8 +101,9 @@ The encoded allocation remains owned through the WebSocket message queue and
 optional page lock. Cancellation before connecting also drops the owner. The
 existing wire order, escaping and payload encoding are preserved.
 
-This protects Maki's owned request storage. Stack serializer/base64 scratch and
-tungstenite's internal output/framing copies are outside this guarantee.
+This protects Maki's owned request storage. Stack serializer/base64 scratch
+remains outside this guarantee. Tungstenite's internal output/framing copies
+have separate guarded owners described below.
 Incoming response ownership is described below. The final request unit passed all
 35 WebSocket package tests and strict Clippy on 2026-09-12, including actual
 request cancellation, rejection before output allocation, partial writer
@@ -136,7 +137,8 @@ UTF-8. When `Bytes` proves the allocation unique, it transfers that allocation
 into `SecretBuffer`; otherwise it copies into an already guarded buffer without
 modifying the shared source. Invalid UTF-8 therefore also drops the owned
 guard. Frames rejected inside tungstenite before reaching the reader remain
-outside this protection.
+outside the provider guard; their library-owned backing is separately erased
+by the framing patches described below.
 
 The private response tree stores every owned JSON string and object key in
 `SecretBuffer`, including base64 data, error text and unknown nested fields.
@@ -153,7 +155,8 @@ including unique sliced payloads whose original prefix and suffix become
 spare capacity. Drop erases the adopted vector's full capacity. Optional page
 locking covers the entire allocation, including pages of spare capacity.
 Shared source owners and tungstenite read/framing buffers retain
-library-controlled lifetimes. The pinned parser patch separately erases its
+library-controlled lifetimes, with backing erasure described below. The pinned
+parser patch separately erases its
 private escape-decoding scratch. The response
 tree's container/number storage and many small values also remain outside any
 total resident-memory bound. These changes do not close MAKI-015 or MAKI-032.
@@ -272,15 +275,65 @@ unit tests and Maki's local HTTPS/WSS/gRPC TLS and mTLS tests provide protocol
 compatibility checks. This is local evidence, not a new external campaign.
 
 This covers library-owned application-data heap copies in these two patches.
-It does not establish complete process-wide plaintext erasure: hyper/h2,
-tungstenite and tonic keep their own reusable framing allocations; shared
-source buffers and caller-owned parsed values or output remain independent.
+It does not establish complete process-wide plaintext erasure. The additional
+framing patches below cover hyper/h2, tungstenite and tonic byte storage;
+shared source buffers and caller-owned parsed values or output remain
+independent.
 Parser/crypto stack and registers, kernel buffers, and process termination
 that skips destructors also remain outside normal heap-owner cleanup. No
 production global allocator is installed. Wiping only on allocator release
 would miss stale plaintext in live reused framing buffers. These patches do
 not page-lock library buffers or establish a total resident-memory cap, so
 MAKI-015 and the total-memory work in MAKI-032 remain open.
+
+## Transport framing copies
+
+The pinned `bytes` 1.12.1 patch extends allocation cleanup to library-owned
+framing storage shared by hyper, h2, tokio-util, tonic and tungstenite. Mutable
+buffers erase discarded exclusive ranges before clear, truncate, consumption
+and reuse. Growth copies live bytes into a new allocation, then erases the
+retired storage. Compaction erases obsolete tails; split operations preserve
+transferred views. Drop erases mutable views and the complete backing allocation
+before its last owner releases it.
+Growing storage temporarily keeps both allocations alive and copies the
+retained bytes; these patches do not impose a peak-memory budget.
+
+Immutable `Bytes` clones and slices can overlap. Their backing allocation must
+remain intact while another owner is alive; it is erased on final release.
+This may retain stale bytes for the lifetime of a surviving shared response.
+Static data and `Bytes::from_owner` retain their original owner contract. The
+unsafe `BytesMut::set_len` API still performs no writes, as documented upstream;
+callers using it to discard data are responsible for that lifetime. Successful
+conversion into ordinary `Vec` output transfers the visible data to its caller.
+These distinctions prevent a wipe from corrupting an unrelated live message.
+
+The pinned `hyper` 1.11.1 patch uses this mutable backing for HTTP/1's serialized
+header/trailer buffer and flattened output body queue. Output consumption and
+cursor compaction erase discarded ranges. Header unfolding and internal error
+formatting also retain cleanup owners. HTTP/1 input is already `BytesMut`;
+HTTP/2 frame input/output and tonic's encoded/decoded protobuf buffers use the
+same patched backing. The gRPC provider's decoded fields retain their existing
+`SecretBuffer` ownership.
+
+The pinned `tungstenite` 0.26.2 patch guards its output queue, fragmented message
+collectors, masked-formatting temporaries and handshake read/write buffers.
+Guards exist before copying and survive growth, rejection, partial writes,
+cancellation and Drop. Incoming frame allocations use patched `BytesMut`;
+returned messages and shared frame views preserve caller ownership and wire
+contents.
+
+These changes cover application-data byte allocations on Maki's active framing
+paths. Public HTTP header/URI values, arbitrary user-supplied body buffers,
+optional compression libraries and hyper's unused HTTP/2 upgraded-tunnel
+`Cursor<Box<[u8]>>` storage remain outside this coverage. Application-owned
+results, stack/register and kernel copies still have separate lifetimes.
+Allocation guards do not track compiler-created copies of inline values or
+moved temporaries.
+The patches do not add page locks
+or a total resident-memory bound. Wiping a shared allocation on every clone
+Drop, or installing an allocator that only wipes on free, cannot safely provide
+immediate erasure of all live copies. The [vendor guide](../vendor/README.md)
+records the pinned owners and maintenance requirements.
 
 ## Further copy reduction options
 
@@ -290,16 +343,16 @@ in implementation priority order, are not yet implemented:
 
 | Priority | Option | Benefit and cost |
 |---|---|---|
-| 1 | Adopt uniquely owned HTTP response chunks | Apply the WebSocket frame pattern to `reqwest::Response::chunk()` output: if `Bytes::try_into_mut` succeeds, move the allocation into a `SecretBuffer` before copying or rejecting it. This can erase a received chunk's complete capacity. Shared source allocations must remain untouched. The change is small but needs unique, sliced, shared and size-limit error ownership tests. |
+| 1 | Adopt uniquely owned HTTP response chunks | Apply the WebSocket frame pattern to `reqwest::Response::chunk()` output: if `Bytes::try_into_mut` succeeds, move the allocation into a `SecretBuffer` before copying or rejecting it. The bytes patch already erases its managed backing; adoption would add the provider's optional page-lock policy and permit reuse of a first chunk's allocation. Shared sources keep their ownership lifetime. The change needs unique, sliced, shared and size-limit error ownership tests. |
 | 2 | Serialize HTTP requests from borrowed payloads | Use the WebSocket serializer's counting pass and fixed guarded output, eliminating the intermediate base64/hex `String` and request `Value` tree. This is a moderate change because HTTP supports dynamic JSON pointer mappings and replacement semantics. Preserve exact wire output, mapping errors, batch order and cancellation cleanup. |
 | 3 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
 
 The daemon already uses `Engine::read_secret` through nbdkit's `pread`; replacing
 the convenience `Engine::read` API is not needed for that path. The final copy
 into nbdkit's caller-owned output remains outside `SecretBuffer` ownership.
-Likewise, framing and tonic allocations cannot all be erased by changes to
-provider-owned buffers or the two library patches. Process memory locking,
-core-dump suppression and the
+Likewise, caller-owned transport values and stack/kernel copies cannot all
+be erased by provider-owned buffers or the library patches. Process memory
+locking, core-dump suppression and the
 secure-swap policy mitigate disk exposure of residual copies; they do not erase
 those copies or establish a total memory bound. Using `memory_lock_mode = "all"`
 requires an adequate `LimitMEMLOCK` and measured peak memory, so it is a deployment

@@ -19,6 +19,9 @@ def check(root: Path, metadata: dict) -> list[str]:
         fixtures = json.loads((root / "vendor/test-ca-provenance.json").read_text())
         if upstream["schema"] != 1 or patches["schema"] != 1:
             return ["unsupported vendor manifest schema"]
+        required = {"bytes", "hyper", "rustls", "serde_json", "tungstenite"}
+        if set(upstream["packages"]) != required or set(patches["packages"]) != required:
+            return ["required plaintext-erasure source inventory is missing"]
         for name, record in upstream["packages"].items():
             path = root / "vendor" / name
             expected = {**record["upstream_files"], **patches["packages"][name]["files"]}
