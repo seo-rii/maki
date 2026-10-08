@@ -21,7 +21,11 @@ use maki_crypto::{
     PlaintextUnit, SecretBuffer,
 };
 
+mod request;
 mod response;
+
+#[cfg(test)]
+mod request_tests;
 
 #[cfg(test)]
 mod sensitive_tests;
@@ -130,8 +134,10 @@ pub fn zeroize_json(value: &mut Value) {
 
 /// Own a JSON tree while it can still contain reversible plaintext. Any
 /// early return or unwind wipes the complete tree before releasing it.
+#[cfg(test)]
 struct WipedJson(Value);
 
+#[cfg(test)]
 impl WipedJson {
     fn new(value: Value) -> Self {
         Self(value)
@@ -142,6 +148,7 @@ impl WipedJson {
     }
 }
 
+#[cfg(test)]
 impl Drop for WipedJson {
     fn drop(&mut self) {
         zeroize_json(&mut self.0);
@@ -185,8 +192,8 @@ impl PayloadEncoding {
                     .len()
                     .checked_mul(2)
                     .expect("hex payload size overflow");
-                // The request tree wipes the final string. Preallocate its
-                // whole length so neither temporary strings nor growth can
+                // The caller owns the final string. Preallocate its whole
+                // length so neither temporary strings nor growth can
                 // release an intermediate reversible plaintext allocation.
                 let mut encoded = String::with_capacity(length);
                 for &byte in data {
@@ -562,10 +569,32 @@ impl Drop for PendingIdentityPem {
 /// request side must match it or a vendor field named `key/slot` is sent
 /// as the wrong field `key~1slot` (BUG-024).
 fn decode_pointer_token(token: &str) -> String {
-    token.replace("~1", "/").replace("~0", "~")
+    // A single allocation also avoids abandoning an intermediate decoded key
+    // before the request mapping takes over its wipe duty.
+    let mut decoded = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let replacement = if ch == '~' {
+            match chars.peek() {
+                Some('1') => Some('/'),
+                Some('0') => Some('~'),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            chars.next();
+            decoded.push(replacement);
+        } else {
+            decoded.push(ch);
+        }
+    }
+    decoded
 }
 
 /// Insert `value` at a JSON pointer, creating intermediate objects.
+#[cfg(test)]
 fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), CryptoError> {
     // Keep ownership under a wipe guard until insertion succeeds. This also
     // covers malformed pointers rejected before the tree is traversed.
@@ -703,6 +732,7 @@ impl HttpCryptoProvider {
         Ok(Self { client, spec })
     }
 
+    #[cfg(test)]
     fn scalar(
         source: &FieldSource,
         context: &CryptoContext,
@@ -788,6 +818,7 @@ impl HttpCryptoProvider {
     }
 
     /// Serialize a request document and wipe it.
+    #[cfg(test)]
     fn encode_and_wipe(root: &mut Value) -> Result<SecretBuffer, CryptoError> {
         struct Count(usize);
         impl std::io::Write for Count {
@@ -842,18 +873,14 @@ impl HttpCryptoProvider {
             let (body, json): (reqwest::Body, bool) = match &op.body {
                 BodySpec::Raw => (body_from(payload.duplicate()), false),
                 BodySpec::Json { fields, .. } => {
-                    let mut root = WipedJson::new(Value::Object(serde_json::Map::new()));
-                    for (pointer, source) in fields {
-                        let v = Self::scalar(
-                            source,
-                            context,
-                            *unit_index,
-                            batch_index,
-                            payload.expose(),
-                        );
-                        pointer_set(&mut root.0, pointer, v)?;
-                    }
-                    (body_from(Self::encode_and_wipe(&mut root.0)?), true)
+                    let encoded = request::encode_single(
+                        fields,
+                        context,
+                        *unit_index,
+                        batch_index,
+                        payload.expose(),
+                    )?;
+                    (body_from(encoded), true)
                 }
             };
             let response = self.send(op, body, json).await?;
@@ -872,29 +899,8 @@ impl HttpCryptoProvider {
         fields: &[(String, FieldSource)],
         item_fields: &[(String, FieldSource)],
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
-        let mut root = WipedJson::new(Value::Object(serde_json::Map::new()));
-        for (pointer, source) in fields {
-            let v = Self::scalar(source, context, 0, 0, &[]);
-            pointer_set(&mut root.0, pointer, v)?;
-        }
-        let mut array = WipedJson::new(Value::Array(Vec::with_capacity(items.len())));
-        for (batch_index, (unit_index, payload)) in items.iter().enumerate() {
-            let mut element = WipedJson::new(Value::Object(serde_json::Map::new()));
-            for (pointer, source) in item_fields {
-                let v = Self::scalar(source, context, *unit_index, batch_index, payload.expose());
-                pointer_set(&mut element.0, pointer, v)?;
-            }
-            array
-                .0
-                .as_array_mut()
-                .expect("batch request remains an array")
-                .push(element.take());
-        }
-        pointer_set(&mut root.0, items_path, array.take())?;
-
-        let response = self
-            .send(op, body_from(Self::encode_and_wipe(&mut root.0)?), true)
-            .await?;
+        let encoded = request::encode_batch(fields, items_path, item_fields, context, items)?;
+        let response = self.send(op, body_from(encoded), true).await?;
         let value = response::parse(response.expose())
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
         drop(response);
@@ -1270,5 +1276,15 @@ mod pointer_tests {
         assert_eq!(decode_pointer_token("~01"), "~1");
         assert_eq!(decode_pointer_token("~1~0"), "/~");
         assert_eq!(decode_pointer_token("plain"), "plain");
+        for first in ["", "~0", "~1", "~01", "~2", "~~", "/", "한글"] {
+            for second in ["", "~0", "~1", "~01", "~2", "~~", "/", "한글"] {
+                let token = format!("{first}{second}");
+                assert_eq!(
+                    decode_pointer_token(&token),
+                    token.replace("~1", "/").replace("~0", "~"),
+                    "{token:?}"
+                );
+            }
+        }
     }
 }

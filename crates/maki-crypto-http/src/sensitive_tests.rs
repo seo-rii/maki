@@ -5,6 +5,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use std::time::Duration;
+use std::{future::Future, task::Context};
 
 use super::{
     append_response_chunk, pointer_set, zeroize_json, BodySpec, FieldSource, HttpCryptoProvider,
@@ -30,6 +31,7 @@ struct Inspection {
 }
 
 thread_local! {
+    static SELECTED_SIZE: Cell<usize> = const { Cell::new(0) };
     static INSPECTION: Cell<Inspection> = const { Cell::new(Inspection {
         enabled: false,
         total_allocations: 0,
@@ -44,6 +46,10 @@ thread_local! {
 struct InspectDecodeAllocation;
 
 fn selected(layout: Layout) -> bool {
+    let selected_size = SELECTED_SIZE.try_with(Cell::get).unwrap_or(0);
+    if selected_size != 0 {
+        return layout.size() == selected_size;
+    }
     [
         PAYLOAD_LEN,
         PAYLOAD_LEN + 1,
@@ -139,7 +145,13 @@ fn begin_inspection() {
     });
 }
 
+fn begin_inspection_for_size(size: usize) {
+    SELECTED_SIZE.with(|cell| cell.set(size));
+    begin_inspection();
+}
+
 fn finish_inspection() -> Inspection {
+    SELECTED_SIZE.with(|cell| cell.set(0));
     INSPECTION.with(|cell| {
         let inspection = cell.get();
         cell.set(Inspection::default());
@@ -355,6 +367,9 @@ fn response_owner_is_page_lock_capable_before_plaintext_is_written() {
     append_response_chunk(&mut response, &[FILL; PAYLOAD_LEN], PAYLOAD_LEN).unwrap();
     assert_eq!(response.expose(), &[FILL; PAYLOAD_LEN]);
     super::response::check_json_page_locks();
+    let before = page_lock_failures();
+    let request = super::request::encode_single(&[], &test_context(), 0, 0, &[]).unwrap();
+    assert!(request.is_page_locked() || page_lock_failures() > before);
     set_page_locking(false);
 }
 
@@ -720,7 +735,7 @@ root = "/tmp/unused"
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn per_item_build_error_erases_the_partial_request_tree() {
+async fn per_item_build_error_does_not_copy_borrowed_request_metadata() {
     let op = test_op(BodySpec::Json {
         fields: vec![
             ("/secret".to_string(), FieldSource::CompatibilityId),
@@ -739,11 +754,15 @@ async fn per_item_build_error_erases_the_partial_request_tree() {
     drop(result);
     let inspection = finish_inspection();
 
-    assert_sensitive_allocations_wiped(inspection, 1);
+    assert_eq!(inspection.allocations, 0, "{inspection:?}");
+    assert!(context
+        .crypto_compatibility_id
+        .bytes()
+        .all(|byte| byte == JSON_FILL));
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn batch_build_error_erases_all_completed_item_trees() {
+async fn batch_build_error_does_not_copy_borrowed_item_metadata() {
     let op = test_op(BodySpec::Json {
         fields: Vec::new(),
         items_path: Some("invalid".to_string()),
@@ -771,5 +790,195 @@ async fn batch_build_error_erases_all_completed_item_trees() {
     drop(result);
     let inspection = finish_inspection();
 
-    assert_sensitive_allocations_wiped(inspection, 2);
+    assert_eq!(inspection.allocations, 0, "{inspection:?}");
+    assert!(context
+        .crypto_compatibility_id
+        .bytes()
+        .all(|byte| byte == JSON_FILL));
+}
+
+#[tokio::test]
+async fn http_request_borrows_compatibility_id_without_an_owned_copy() {
+    let op = test_op(BodySpec::Json {
+        fields: vec![("/profile".into(), FieldSource::CompatibilityId)],
+        items_path: None,
+        item_fields: Vec::new(),
+    });
+    let provider = test_provider(&op);
+    let context = test_context();
+    let items = [(3, SecretBuffer::zeroed(0))];
+    let mut operation = std::pin::pin!(provider.run_per_item(&op, &context, &items));
+    begin_inspection_for_size(PAYLOAD_LEN);
+    let result = operation.as_mut().poll(&mut Context::from_waker(
+        futures_util::task::noop_waker_ref(),
+    ));
+    drop(result);
+    let inspection = finish_inspection();
+    assert_eq!(
+        inspection.allocations, 0,
+        "request copied its borrowed compatibility id: {inspection:?}"
+    );
+}
+
+#[tokio::test]
+async fn http_request_streams_payload_encoding_without_an_owned_string() {
+    for encoding in [
+        PayloadEncoding::Base64,
+        PayloadEncoding::Base64Url,
+        PayloadEncoding::HexLower,
+        PayloadEncoding::HexUpper,
+    ] {
+        let op = test_op(BodySpec::Json {
+            fields: vec![("/data".into(), FieldSource::Payload(encoding))],
+            items_path: None,
+            item_fields: Vec::new(),
+        });
+        let provider = test_provider(&op);
+        let context = test_context();
+        let items = [(3, SecretBuffer::from_slice(&[FILL; PAYLOAD_LEN]))];
+        let length = encoding.encode(items[0].1.expose()).len();
+        let mut operation = std::pin::pin!(provider.run_per_item(&op, &context, &items));
+        begin_inspection_for_size(length);
+        let result = operation.as_mut().poll(&mut Context::from_waker(
+            futures_util::task::noop_waker_ref(),
+        ));
+        drop(result);
+        let inspection = finish_inspection();
+        assert_eq!(
+            inspection.allocations, 0,
+            "request allocated a reversible encoded payload: {encoding:?} {inspection:?}"
+        );
+    }
+}
+
+#[test]
+fn http_request_partial_fixed_serialization_erases_its_output() {
+    struct FailAfterSecret;
+    impl serde::Serialize for FailAfterSecret {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            sequence.serialize_element("encoded-plaintext-before-injected-error")?;
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    for mode in 0..3 {
+        begin_inspection_for_size(if mode == 1 { 20 } else { PAYLOAD_LEN });
+        let result = match mode {
+            0 => super::request::serialize_fixed(&FailAfterSecret, PAYLOAD_LEN),
+            // A fixed writer must reject both growth and a shorter second
+            // serialization pass, erasing anything already written.
+            1 => super::request::serialize_fixed(&["first-secret", "second-secret"], 20),
+            _ => super::request::serialize_fixed(&"short-secret", PAYLOAD_LEN),
+        };
+        let inspection = finish_inspection();
+        assert!(matches!(
+            result,
+            Err(maki_crypto::CryptoError::NonRetryableRequest(_))
+        ));
+        assert_eq!(inspection.allocations, 1, "{inspection:?}");
+        assert_eq!(inspection.deallocations, 1, "{inspection:?}");
+        assert_eq!(inspection.zeroized, 1, "{inspection:?}");
+    }
+}
+
+#[tokio::test]
+async fn http_request_cancellation_erases_the_guarded_wire_body() {
+    let op = test_op(BodySpec::Json {
+        fields: vec![(
+            "/data".into(),
+            FieldSource::Payload(PayloadEncoding::Base64),
+        )],
+        items_path: None,
+        item_fields: Vec::new(),
+    });
+    let provider = test_provider(&op);
+    let context = test_context();
+    let items = [(3, SecretBuffer::from_slice(&[FILL; PAYLOAD_LEN]))];
+    let wire_len = format!(
+        "{{\"data\":\"{}\"}}",
+        PayloadEncoding::Base64.encode(items[0].1.expose())
+    )
+    .len();
+    let mut operation = Box::pin(provider.run_per_item(&op, &context, &items));
+    begin_inspection_for_size(wire_len);
+    let result = operation.as_mut().poll(&mut Context::from_waker(
+        futures_util::task::noop_waker_ref(),
+    ));
+    assert!(
+        result.is_pending(),
+        "request did not reach its cancellable send"
+    );
+    drop(operation);
+    let inspection = finish_inspection();
+    assert_eq!(inspection.allocations, 1, "{inspection:?}");
+    assert_eq!(inspection.deallocations, 1, "{inspection:?}");
+    assert_eq!(
+        inspection.zeroized, 1,
+        "cancelled request body was not wiped: {inspection:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_per_item_request_does_not_evaluate_invalid_mapping() {
+    let op = test_op(BodySpec::Json {
+        fields: vec![(
+            "invalid-pointer".into(),
+            FieldSource::Payload(PayloadEncoding::HexLower),
+        )],
+        items_path: None,
+        item_fields: Vec::new(),
+    });
+    let provider = test_provider(&op);
+    assert!(provider
+        .run_per_item(&op, &test_context(), &[])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        provider
+            .run_per_item(&op, &test_context(), &[(1, SecretBuffer::zeroed(0))])
+            .await,
+        Err(maki_crypto::CryptoError::ProviderFatal(_))
+    ));
+}
+
+#[test]
+fn http_request_mapping_errors_and_duplicate_keys_erase_owned_key_storage() {
+    let key = sensitive_string();
+    let pointer = format!("/{key}");
+    let context = test_context();
+    for rejected in [false, true] {
+        let fields = vec![
+            (pointer.clone(), FieldSource::UnitIndex),
+            (
+                if rejected {
+                    "invalid".into()
+                } else {
+                    pointer.clone()
+                },
+                FieldSource::BatchIndex,
+            ),
+        ];
+        begin_inspection_for_size(PAYLOAD_LEN);
+        let result = super::request::encode_single(&fields, &context, 3, 1, b"payload");
+        let failed = result.is_err();
+        drop(result);
+        let inspection = finish_inspection();
+        assert_eq!(failed, rejected);
+        assert_eq!(
+            inspection.allocations,
+            if rejected { 1 } else { 2 },
+            "{inspection:?}"
+        );
+        assert_eq!(
+            inspection.deallocations, inspection.allocations,
+            "{inspection:?}"
+        );
+        assert_eq!(
+            inspection.zeroized, inspection.allocations,
+            "{inspection:?}"
+        );
+    }
 }

@@ -30,20 +30,28 @@ the tree still holds its encoded strings until extraction finishes.
 Focused allocation regressions observe the selected output immediately before
 deallocation and show that malformed Base64 and hex inputs no longer release a
 partial plaintext prefix. Response growth allocates a new guarded owner, copies
-into it, wipes the replaced owner, then swaps. Request JSON trees remain under a
-drop guard until serialization; recursive cleanup drains and wipes object keys
-and values, including pointer replacement and construction errors. The complete
-HTTP package passed 46 tests with three ignored network tests, and the changed
-packages passed scoped all-targets strict Clippy on 2026-09-13.
+into it, wipes the replaced owner, then swaps.
 
-HTTP request hex encoding preallocates its complete output and writes digits
-directly, without per-byte formatted strings or growing the output allocation.
-The request-tree guard wipes the resulting string after serialization or an
-error. This removes transient hex allocations that the guard could not reach;
-it does not page-lock the request tree or change the public encoder's `String`
-ownership. Allocation regressions require only the final allocation to exist
-for nonempty hex input and no allocations for empty input, with no intermediate
-deallocations. Wire checks cover both cases and every byte value.
+HTTP JSON requests use a mapping plan whose scalar leaves borrow payloads,
+compatibility identifiers and UUIDs from the input context. The plan owns only
+object keys and structural storage; it does not build a `serde_json::Value`
+request document or an owned base64/hex payload string. Dynamic JSON pointers
+retain their sequential replacement rules, decoded key ordering and batch
+insertion order. Owned decoded keys are erased on replacement, error and drop.
+
+A counting pass streams the same borrowed plan without allocating encoded
+output. Checked arithmetic rejects overflow and capacities beyond the
+addressable range. A second pass writes directly into a fixed `SecretBuffer`,
+with the optional page lock acquired before its first byte is written.
+Partial writer errors and cancellation erase the completed output owner.
+HTTP has no separate request-size limit; the response limit does not cap
+request serialization. Base64 formatter and hex encoder stack scratch remain
+outside the heap-owner erasure guarantee.
+
+The public `PayloadEncoding::encode` convenience API still returns a
+caller-owned `String`. Its hex implementation preallocates the complete output
+and writes digits without intermediate strings or growth. Provider requests
+use borrowed serialization instead of that convenience API.
 
 Resolved header and query values are erased when their operation specification
 is dropped. Header values are guarded while the specification is assembled, so
@@ -71,7 +79,7 @@ also owns cleanup after success, response-contract errors and unwinding, rather
 than relying on a wipe after parsing completes. JSON pointer lookup, duplicate
 last-value-wins behavior, number validation and recursion limits are unchanged.
 
-Request JSON trees, credential-value strings and combined identity PEMs still
+Request mapping keys, credential-value strings and combined identity PEMs still
 have zeroizing ownership without per-allocation page locks. Plain source
 configuration strings and copies made inside reqwest, hyper or the kernel
 remain separate owners. The pinned parser and TLS patches described below
@@ -345,14 +353,13 @@ records the pinned owners and maintenance requirements.
 
 ## Further copy reduction options
 
-The HTTP hex and response-lifetime changes above remove avoidable allocations
-and shorten ownership without changing the wire contract. The remaining options,
-in implementation priority order, are not yet implemented:
+The HTTP borrowed request, chunk adoption and response-lifetime changes above
+remove avoidable allocations and shorten ownership without changing the wire
+contract. The remaining option is not yet implemented:
 
 | Priority | Option | Benefit and cost |
 |---|---|---|
-| 1 | Serialize HTTP requests from borrowed payloads | Use the WebSocket serializer's counting pass and fixed guarded output, eliminating the intermediate base64/hex `String` and request `Value` tree. This is a moderate change because HTTP supports dynamic JSON pointer mappings and replacement semantics. Preserve exact wire output, mapping errors, batch order and cancellation cleanup. |
-| 2 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
+| 1 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
 
 The daemon already uses `Engine::read_secret` through nbdkit's `pread`; replacing
 the convenience `Engine::read` API is not needed for that path. The final copy
