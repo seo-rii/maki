@@ -1,2 +1,6 @@
 * text=auto
 *.crc -text
+# Vendored source inventories and upstream fixtures require exact bytes.
+vendor/** -text
+vendor/**/*.bin binary
+vendor/**/*.der binary
