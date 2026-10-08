@@ -1,5 +1,17 @@
 {
   "packages": {
+    "bytes": {
+      "files": {
+        "Cargo.lock": "3f487ea62661e0346ddbc6bbf73076368a3db35c2e87c393e8151a7a77845cbd",
+        "Cargo.toml": "b6f7faa5fc6a69b3931a5e7c718dc584beac192e838f87963af24d7026b7da23",
+        "src/bytes.rs": "a669df48fc4c9deb6a346f4e6d9f4d82e0117574c8a6be50e83ff64bfe1df529",
+        "src/bytes_mut.rs": "296a4891bdc92e92088d49680c1faf26b569dacfa6621099ba75f3f456eca190",
+        "src/erase.rs": "397559d4fcbb2bdfc86421978869bcc7f94c0c797e007ae83c64e9e7224848ed",
+        "src/lib.rs": "603bcadd3f963a6c43e2ffd91ee377dadee3a1aa157b2599dbb6566a71001218",
+        "src/maki_erasure.rs": "5cf45bf6877c0dc2a0de87570d59eebb3d42d003cb6d178da1bc6cf4fe6479eb",
+        "src/serde.rs": "e2054fb65f0505367968ae8c78b7e453945453b770a0031050689c634178f717"
+      }
+    },
     "rustls": {
       "files": {
         "Cargo.lock": "77525e36ecd956f6397eebfd7ef10da1803c67f604a20d8a7424ef0fda1684f9",

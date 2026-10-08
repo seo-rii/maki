@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/rustls", "vendor/serde_json", "vendor/maki-test-allocator"]
+exclude = ["vendor/rustls", "vendor/serde_json", "vendor/maki-test-allocator", "vendor/bytes"]
 members = [
     "crates/maki-core",
     "crates/maki-format",
@@ -50,7 +50,7 @@ crc32fast = "1"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util", "net", "fs", "test-util"] }
 async-trait = "0.1"
-bytes = "1"
+bytes = "=1.12.1"
 rand = "0.9"
 rand_chacha = "0.9"
 parking_lot = "0.12"
@@ -68,5 +68,6 @@ tracing-subscriber = "0.3"
 debug = true
 
 [patch.crates-io]
+bytes = { path = "vendor/bytes" }
 rustls = { path = "vendor/rustls" }
 serde_json = { path = "vendor/serde_json" }
