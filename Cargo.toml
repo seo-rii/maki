@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/serde_json"]
 members = [
     "crates/maki-core",
     "crates/maki-format",
@@ -43,7 +44,7 @@ maki-test-support = { path = "crates/maki-test-support" }
 
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "=1.0.151"
 toml = "0.8"
 crc32fast = "1"
 zeroize = { version = "1", features = ["zeroize_derive"] }
@@ -65,3 +66,6 @@ tracing-subscriber = "0.3"
 
 [profile.release]
 debug = true
+
+[patch.crates-io]
+serde_json = { path = "vendor/serde_json" }
