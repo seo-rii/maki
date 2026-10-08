@@ -79,7 +79,9 @@ jobs:
         run: python3 -B -m unittest scripts.test_release_preparation -v
       - name: documentation links (Linux)
         if: runner.os == 'Linux'
-        run: python3 -B scripts/check_docs_links.py
+        run: |
+          python3 -B -m unittest scripts.test_docs_links -v
+          python3 -B scripts/check_docs_links.py
 
   nightly-gates:
     if: github.event_name == 'schedule'

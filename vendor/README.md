@@ -70,3 +70,10 @@ features and new allocation/clear/consume/shrink paths; an unchanged public API
 does not prove the same internal lifetimes. Update the upstream inventory and
 patch manifest together. CI runs the dependency contract and the explicit vendor
 tests because these packages are excluded from workspace membership.
+
+Project documentation links are checked separately from preserved archive
+references. An original document with a matching SHA-256 in `upstream.json` may
+link to a package-local source file omitted from that published crate, such as
+hyper's `CONTRIBUTING.md`. The checker does not rewrite the archive or exempt
+modified vendor documents, this guide, or missing packaged files/directories.
+Nonignored new Markdown files are also checked before they are git-staged.

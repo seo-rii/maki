@@ -12,6 +12,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --workspace --release --locked -- --ignored   # extended release gates
+python3 -B -m unittest scripts.test_docs_links -v         # link checker regressions
 python3 -B scripts/check_docs_links.py                    # documentation links
 ```
 
@@ -75,6 +76,12 @@ in-place upgrade between envelopes; say so wherever the change is described.
 - Procedures belong in `docs/operations.md` or a getting-started/deployment
   page; keep them copy-pasteable and state what they do not cover.
 - Run `scripts/check_docs_links.py` before pushing.
+
+The link checker includes tracked and nonignored new Markdown files. An
+unchanged vendor document can reference a package-local path omitted from its
+published archive only when its raw-byte SHA-256 matches `vendor/upstream.json`.
+Edited vendor documents and project documentation keep the normal link checks;
+missing files or directories included in the archive remain errors.
 
 ## Commits and pull requests
 
