@@ -12,6 +12,19 @@
         "src/serde.rs": "e2054fb65f0505367968ae8c78b7e453945453b770a0031050689c634178f717"
       }
     },
+    "hyper": {
+      "files": {
+        "Cargo.lock": "106ba6ed2ad49a9c24588d56d45e8a82d0d6c6ce949065f40c22519aa9ad13ea",
+        "Cargo.toml": "bbb0fdb53bf741687878c824773a5489fea829ccb7089e05200f85155e857b8c",
+        "src/common/date.rs": "a0f90ed9115d766b450322ea57594610afc5411871d41cba8acc411ed4555c07",
+        "src/proto/h1/decode.rs": "157391efd33fcc163751b79015819c653c19f4e84cc288fc1d43d460a1cdd5b2",
+        "src/proto/h1/encode.rs": "e6e171161739ed09eabd6e48e4276d3974100b817454e6723b642877790dcccc",
+        "src/proto/h1/io.rs": "21422d6c8f08aa35b9a11d74e0c2eaca80c9d185c654caa759c0335d74067288",
+        "src/proto/h1/io/maki_erasure.rs": "21d836c8c84c1877e08373c87882effb4c36c0fd090d2ee3f53790ba5b5d3a55",
+        "src/proto/h1/mod.rs": "a9240fb4ed63d3d8423b3e748485d53d45e42d251508388e26b1ca9c5a89a820",
+        "src/proto/h1/role.rs": "988701b72ac180f3e1431eaa4f32cb7ba03c6ea6058116bb247a830d11badd51"
+      }
+    },
     "rustls": {
       "files": {
         "Cargo.lock": "77525e36ecd956f6397eebfd7ef10da1803c67f604a20d8a7424ef0fda1684f9",

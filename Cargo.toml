@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/rustls", "vendor/serde_json", "vendor/maki-test-allocator", "vendor/bytes"]
+exclude = ["vendor/rustls", "vendor/serde_json", "vendor/maki-test-allocator", "vendor/bytes", "vendor/hyper"]
 members = [
     "crates/maki-core",
     "crates/maki-format",
@@ -69,5 +69,6 @@ debug = true
 
 [patch.crates-io]
 bytes = { path = "vendor/bytes" }
+hyper = { path = "vendor/hyper" }
 rustls = { path = "vendor/rustls" }
 serde_json = { path = "vendor/serde_json" }
