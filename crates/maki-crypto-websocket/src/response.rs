@@ -17,6 +17,14 @@ impl Frame {
     pub(super) fn expose(&self) -> &[u8] {
         self.0.expose()
     }
+
+    // The returned tree owns its strings and keys. Consuming the source owner
+    // releases it before routing, payload decoding or a parse error reaches
+    // the caller, rather than retaining both representations in the reader.
+    pub(super) fn parse(self) -> serde_json::Result<Value> {
+        let text = std::str::from_utf8(self.expose()).expect("WebSocket text is UTF-8");
+        parse(text)
+    }
 }
 
 fn own_frame(bytes: Bytes) -> Frame {

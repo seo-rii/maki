@@ -4,6 +4,82 @@ use super::*;
 const SECRET_LEN: usize = 347;
 
 #[test]
+fn original_frame_is_erased_before_the_owned_response_tree_is_returned() {
+    let secret = "Q".repeat(SECRET_LEN);
+    for wire in [
+        json!({"id": 7, "unknown": secret}).to_string(),
+        json!({"unknown": secret}).to_string(),
+        format!(
+            "{{\"id\":7,\"id\":8,\"error\":{{\"class\":\"integrity\",\"reason\":\"{secret}\"}}}}"
+        ),
+    ] {
+        let frame = response::own_message(Message::Text(wire.into())).unwrap();
+        let watch = Watch::initialized(frame.expose());
+        let value = frame.parse().unwrap();
+        let inspection = watch.finish();
+        assert_eq!(inspection.freed, 1, "source frame retained: {inspection:?}");
+        assert!(inspection.all_zero, "source frame survived: {inspection:?}");
+        let text = value
+            .get("unknown")
+            .or_else(|| value.get("error").unwrap().get("reason"))
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(text, secret);
+        if value.get("error").is_some() {
+            assert!(!value.valid_probe_envelope());
+        }
+        let watch = Watch::initialized(text.as_bytes());
+        drop(value);
+        let inspection = watch.finish();
+        assert_eq!(inspection.freed, 1);
+        assert!(inspection.all_zero, "owned tree survived: {inspection:?}");
+    }
+}
+
+#[test]
+fn original_frame_is_erased_before_a_json_error_is_returned() {
+    let wire = format!("{{\"unknown\":\"{}\",\"broken\":", "Q".repeat(SECRET_LEN));
+    let frame = response::own_message(Message::Text(wire.into())).unwrap();
+    let watch = Watch::initialized(frame.expose());
+    let result = frame.parse();
+    let inspection = watch.finish();
+    assert!(result.is_err());
+    assert_eq!(
+        inspection.freed, 1,
+        "rejected frame retained: {inspection:?}"
+    );
+    assert!(
+        inspection.all_zero,
+        "rejected frame survived: {inspection:?}"
+    );
+}
+
+#[test]
+fn original_frame_copy_is_erased_while_a_shared_source_survives_parsing() {
+    let secret = "Q".repeat(SECRET_LEN);
+    let wire = json!({"id": 7, "unknown": secret}).to_string();
+    let source = tokio_tungstenite::tungstenite::Bytes::from(wire.clone());
+    let frame = response::own_message(Message::Binary(source.clone())).unwrap();
+    let watch = Watch::initialized(frame.expose());
+    let value = frame.parse().unwrap();
+    let inspection = watch.finish();
+    assert_eq!(
+        inspection.freed, 1,
+        "shared frame copy retained: {inspection:?}"
+    );
+    assert!(
+        inspection.all_zero,
+        "shared frame copy survived: {inspection:?}"
+    );
+    assert_eq!(source.as_ref(), wire.as_bytes());
+    assert_eq!(
+        value.get("unknown").unwrap().as_str(),
+        Some(secret.as_str())
+    );
+}
+
+#[test]
 fn response_value_strings_are_wiped_when_the_response_is_dropped() {
     let secret = "Q".repeat(SECRET_LEN);
     let wire = json!({"id": 1, "error": {"class": "bad-request", "message": secret}}).to_string();

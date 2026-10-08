@@ -355,9 +355,7 @@ impl WsCryptoProvider {
                         let Some(frame) = response::own_message(msg) else {
                             continue;
                         };
-                        let text =
-                            std::str::from_utf8(frame.expose()).expect("WebSocket text is UTF-8");
-                        let Ok(value) = response::parse(text) else {
+                        let Ok(value) = frame.parse() else {
                             tracing::warn!("websocket: unparseable frame dropped");
                             continue;
                         };

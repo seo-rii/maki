@@ -155,6 +155,11 @@ modifying the shared source. Invalid UTF-8 therefore also drops the owned
 guard. Frames rejected inside tungstenite before reaching the reader remain
 outside the provider guard; their library-owned backing is separately erased
 by the framing patches described below.
+The frame parser consumes this guard and releases the original frame before
+returning the fully owned response tree or a syntax error. Routing, probe
+envelope validation and payload decoding therefore retain the tree without
+also retaining the provider's source frame. A shared library source keeps its
+own lifetime; releasing the provider copy does not modify surviving aliases.
 
 The private response tree stores every owned JSON string and object key in
 `SecretBuffer`, including base64 data, error text and unknown nested fields.
@@ -353,13 +358,10 @@ records the pinned owners and maintenance requirements.
 
 ## Further copy reduction options
 
-The HTTP borrowed request, chunk adoption and response-lifetime changes above
-remove avoidable allocations and shorten ownership without changing the wire
-contract. The remaining option is not yet implemented:
-
-| Priority | Option | Benefit and cost |
-|---|---|---|
-| 1 | Shorten WebSocket frame ownership | Release the original guarded frame immediately after its fully owned response tree has been parsed, as HTTP now does. This reduces overlap during response routing but leaves framing ownership unchanged. |
+HTTP chunk adoption, borrowed HTTP request serialization and early release of
+the original HTTP/WebSocket response bodies are implemented above. These
+changes remove avoidable copies and shorten overlapping ownership while
+preserving the wire contract. They do not account for every process allocation.
 
 The daemon already uses `Engine::read_secret` through nbdkit's `pread`; replacing
 the convenience `Engine::read` API is not needed for that path. The final copy
@@ -368,6 +370,12 @@ Likewise, caller-owned transport values and stack/kernel copies cannot all
 be erased by provider-owned buffers or the library patches. Process memory
 locking, core-dump suppression and the
 secure-swap policy mitigate disk exposure of residual copies; they do not erase
-those copies or establish a total memory bound. Using `memory_lock_mode = "all"`
-requires an adequate `LimitMEMLOCK` and measured peak memory, so it is a deployment
-choice rather than a substitute for reducing copies.
+those copies or establish a total memory bound. On Linux the existing
+`memory_lock_mode = "all"` uses `mlockall(MCL_CURRENT | MCL_FUTURE)` and refuses
+attach if that call fails. It covers process mappings without adding locks to
+each library's allocation; `secure-buffers` instead locks registered owners on
+a best-effort basis. Neither mode imposes a total RSS bound. A deployment cgroup
+memory ceiling and an adequate `LimitMEMLOCK` are separate policies selected
+from measured peak memory and required headroom, as described in the
+[memory envelope procedure](performance.md). No memory default or deployment
+limit is changed by these copy reductions.
