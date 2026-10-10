@@ -25,9 +25,10 @@ temporaries. Consuming a `Number` as a deserializer adopts its owned string
 through conversion, errors and unwinding; borrowing a `Number` preserves its
 original storage. Visitor-created public `Number` values keep their ordinary
 Drop, including outputs discarded after a later trailing-input error.
-Maki's production parser does not enable either optional mode. The
-`float_roundtrip` path remains refused at compile time until its lexical
-owners are covered.
+The `float_roundtrip` lexical path guards 32-bit and 64-bit limb arrays,
+including growth, removed limbs, clones, multiplication/Karatsuba temporaries,
+result replacement and final full-capacity release. Float rounding behavior is
+preserved. Maki's production parser enables none of these optional modes.
 
 `rustls` erases consumed plaintext queues and deframer regions, including
 obsolete compaction tails. Replacing or releasing these buffers erases their

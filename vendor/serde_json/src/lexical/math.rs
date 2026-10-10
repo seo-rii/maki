@@ -10,7 +10,9 @@ use super::large_powers;
 use super::num::*;
 use super::small_powers::*;
 use alloc::vec::Vec;
-use core::{cmp, iter, mem};
+use core::ops::{Deref, DerefMut};
+use core::{cmp, mem};
+use zeroize::Zeroize;
 
 // ALIASES
 // -------
@@ -61,6 +63,133 @@ pub const POW10_LIMB: &[Limb] = &POW10_64;
 
 #[cfg(fast_arithmetic = "64")]
 type Wide = u128;
+
+/// Parser-private integer storage. Do not expose a mutable Vec: every growth
+/// replaces a guarded owner and erases the old full allocation before release.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LimbVec {
+    limbs: Vec<Limb>,
+}
+
+impl LimbVec {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        LimbVec {
+            limbs: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Limb] {
+        &self.limbs
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.limbs.capacity()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // The upstream lexical fixture does not inspect spare limbs.
+    pub(crate) fn allocation_ptr(&self) -> *const Limb {
+        // Vec::as_ptr does not create a length-limited slice reference. Tests
+        // use this fresh pointer to inspect removed, initialized spare limbs.
+        self.limbs.as_ptr()
+    }
+
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.reserve_owned(additional, false);
+    }
+
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        self.reserve_owned(additional, true);
+    }
+
+    fn reserve_owned(&mut self, additional: usize, exact: bool) {
+        let required = self
+            .len()
+            .checked_add(additional)
+            .expect("capacity overflow");
+        if required <= self.capacity() {
+            return;
+        }
+        let capacity = if exact {
+            required
+        } else {
+            required
+                .max(self.capacity().checked_mul(2).unwrap_or(required))
+                .max(8)
+        };
+        // The replacement owns its cleanup before receiving any private limbs.
+        // Its capacity covers the whole copy, so extend cannot reallocate.
+        let mut replacement = LimbVec::with_capacity(capacity);
+        replacement.limbs.extend_from_slice(&self.limbs);
+        mem::swap(self, &mut replacement);
+    }
+
+    pub(crate) fn push(&mut self, limb: Limb) {
+        self.reserve(1);
+        self.limbs.push(limb);
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, limbs: &[Limb]) {
+        self.reserve(limbs.len());
+        self.limbs.extend_from_slice(limbs);
+    }
+
+    pub(crate) fn resize(&mut self, len: usize, limb: Limb) {
+        if len < self.len() {
+            self.limbs[len..].zeroize();
+            self.limbs.truncate(len);
+        } else {
+            self.reserve(len - self.len());
+            self.limbs.resize(len, limb);
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Limb> {
+        let last = match self.limbs.last_mut() {
+            Some(last) => last,
+            None => return None,
+        };
+        let value = *last;
+        last.zeroize();
+        let _ = self.limbs.pop();
+        Some(value)
+    }
+}
+
+impl Default for LimbVec {
+    fn default() -> Self {
+        LimbVec::with_capacity(0)
+    }
+}
+
+impl Clone for LimbVec {
+    fn clone(&self) -> Self {
+        let mut cloned = LimbVec::with_capacity(self.len());
+        cloned.extend_from_slice(self);
+        cloned
+    }
+}
+
+impl Deref for LimbVec {
+    type Target = [Limb];
+
+    fn deref(&self) -> &[Limb] {
+        &self.limbs
+    }
+}
+
+impl DerefMut for LimbVec {
+    fn deref_mut(&mut self) -> &mut [Limb] {
+        &mut self.limbs
+    }
+}
+
+impl Drop for LimbVec {
+    fn drop(&mut self) {
+        // zeroize also writes the full spare capacity, including u32/u64 bytes.
+        self.limbs.zeroize();
+    }
+}
 
 /// Cast to limb type.
 #[inline]
@@ -279,7 +408,7 @@ mod small {
     /// Allows us to choose a start-index in x to store, to allow incrementing
     /// from a non-zero start.
     #[inline]
-    pub fn iadd_impl(x: &mut Vec<Limb>, y: Limb, xstart: usize) {
+    pub fn iadd_impl(x: &mut LimbVec, y: Limb, xstart: usize) {
         if x.len() <= xstart {
             x.push(y);
         } else {
@@ -303,7 +432,7 @@ mod small {
 
     /// AddAssign small integer to bigint.
     #[inline]
-    pub fn iadd(x: &mut Vec<Limb>, y: Limb) {
+    pub fn iadd(x: &mut LimbVec, y: Limb) {
         iadd_impl(x, y, 0);
     }
 
@@ -312,7 +441,7 @@ mod small {
     /// SubAssign small integer to bigint.
     /// Does not do overflowing subtraction.
     #[inline]
-    pub fn isub_impl(x: &mut Vec<Limb>, y: Limb, xstart: usize) {
+    pub fn isub_impl(x: &mut LimbVec, y: Limb, xstart: usize) {
         debug_assert!(x.len() > xstart && (x[xstart] >= y || x.len() > xstart + 1));
 
         // Initial subtraction
@@ -331,10 +460,10 @@ mod small {
 
     /// MulAssign small integer to bigint.
     #[inline]
-    pub fn imul(x: &mut Vec<Limb>, y: Limb) {
+    pub fn imul(x: &mut LimbVec, y: Limb) {
         // Multiply iteratively over all elements, adding the carry each time.
         let mut carry: Limb = 0;
-        for xi in &mut *x {
+        for xi in x.iter_mut() {
             carry = scalar::imul(xi, y, carry);
         }
 
@@ -346,8 +475,8 @@ mod small {
 
     /// Mul small integer to bigint.
     #[inline]
-    pub fn mul(x: &[Limb], y: Limb) -> Vec<Limb> {
-        let mut z = Vec::<Limb>::default();
+    pub fn mul(x: &[Limb], y: Limb) -> LimbVec {
+        let mut z = LimbVec::default();
         z.extend_from_slice(x);
         imul(&mut z, y);
         z
@@ -385,7 +514,7 @@ mod small {
     /// Even using worst-case scenarios, exponentiation by squaring is
     /// significantly slower for our workloads. Just multiply by small powers,
     /// in simple cases, and use precalculated large powers in other cases.
-    pub fn imul_pow5(x: &mut Vec<Limb>, n: u32) {
+    pub fn imul_pow5(x: &mut LimbVec, n: u32) {
         use super::large::KARATSUBA_CUTOFF;
 
         let small_powers = POW5_LIMB;
@@ -464,7 +593,7 @@ mod small {
     ///
     /// Assumes `n < Limb::BITS`, IE, internally shifting bits.
     #[inline]
-    pub fn ishl_bits(x: &mut Vec<Limb>, n: usize) {
+    pub fn ishl_bits(x: &mut LimbVec, n: usize) {
         // Need to shift by the number of `bits % Limb::BITS)`.
         let bits = mem::size_of::<Limb>() * 8;
         debug_assert!(n < bits);
@@ -480,7 +609,7 @@ mod small {
         let rshift = bits - n;
         let lshift = n;
         let mut prev: Limb = 0;
-        for xi in &mut *x {
+        for xi in x.iter_mut() {
             let tmp = *xi;
             *xi <<= lshift;
             *xi |= prev >> rshift;
@@ -498,17 +627,20 @@ mod small {
     ///
     /// Assumes `n` is not 0.
     #[inline]
-    pub fn ishl_limbs(x: &mut Vec<Limb>, n: usize) {
+    pub fn ishl_limbs(x: &mut LimbVec, n: usize) {
         debug_assert!(n != 0);
         if !x.is_empty() {
+            let old_len = x.len();
             x.reserve(n);
-            x.splice(..0, iter::repeat(0).take(n));
+            x.resize(old_len + n, 0);
+            x.copy_within(0..old_len, n);
+            x[..n].zeroize();
         }
     }
 
     /// Shift-left buffer by n bits.
     #[inline]
-    pub fn ishl(x: &mut Vec<Limb>, n: usize) {
+    pub fn ishl(x: &mut LimbVec, n: usize) {
         let bits = mem::size_of::<Limb>() * 8;
         // Need to pad with zeros for the number of `bits / Limb::BITS`,
         // and shift-left with carry for `bits % Limb::BITS`.
@@ -524,7 +656,7 @@ mod small {
 
     /// Normalize the container by popping any leading zeros.
     #[inline]
-    pub fn normalize(x: &mut Vec<Limb>) {
+    pub fn normalize(x: &mut LimbVec) {
         // Remove leading zero if we cause underflow. Since we're dividing
         // by a small power, we have at max 1 int removed.
         while x.last() == Some(&0) {
@@ -582,7 +714,7 @@ mod large {
     ///
     /// Allows us to choose a start-index in x to store, so we can avoid
     /// padding the buffer with zeros when not needed, optimized for vectors.
-    pub fn iadd_impl(x: &mut Vec<Limb>, y: &[Limb], xstart: usize) {
+    pub fn iadd_impl(x: &mut LimbVec, y: &[Limb], xstart: usize) {
         // The effective x buffer is from `xstart..x.len()`, so we need to treat
         // that as the current range. If the effective y buffer is longer, need
         // to resize to that, + the start index.
@@ -611,14 +743,14 @@ mod large {
 
     /// AddAssign bigint to bigint.
     #[inline]
-    pub fn iadd(x: &mut Vec<Limb>, y: &[Limb]) {
+    pub fn iadd(x: &mut LimbVec, y: &[Limb]) {
         iadd_impl(x, y, 0);
     }
 
     /// Add bigint to bigint.
     #[inline]
-    pub fn add(x: &[Limb], y: &[Limb]) -> Vec<Limb> {
-        let mut z = Vec::<Limb>::default();
+    pub fn add(x: &[Limb], y: &[Limb]) -> LimbVec {
+        let mut z = LimbVec::default();
         z.extend_from_slice(x);
         iadd(&mut z, y);
         z
@@ -627,7 +759,7 @@ mod large {
     // SUBTRACTION
 
     /// SubAssign bigint to bigint.
-    pub fn isub(x: &mut Vec<Limb>, y: &[Limb]) {
+    pub fn isub(x: &mut LimbVec, y: &[Limb]) {
         // Basic underflow checks.
         debug_assert!(greater_equal(x, y));
 
@@ -667,17 +799,17 @@ mod large {
     /// but it's extremely simple, and works in O(n*m) time, which is fine
     /// by me. Each iteration, of which there are `m` iterations, requires
     /// `n` multiplications, and `n` additions, or grade-school multiplication.
-    fn long_mul(x: &[Limb], y: &[Limb]) -> Vec<Limb> {
+    fn long_mul(x: &[Limb], y: &[Limb]) -> LimbVec {
         // Using the immutable value, multiply by all the scalars in y, using
         // the algorithm defined above. Use a single buffer to avoid
         // frequent reallocations. Handle the first case to avoid a redundant
         // addition, since we know y.len() >= 1.
-        let mut z: Vec<Limb> = small::mul(x, y[0]);
+        let mut z: LimbVec = small::mul(x, y[0]);
         z.resize(x.len() + y.len(), 0);
 
         // Handle the iterative cases.
         for (i, &yi) in y[1..].iter().enumerate() {
-            let zi: Vec<Limb> = small::mul(x, yi);
+            let zi: LimbVec = small::mul(x, yi);
             iadd_impl(&mut z, &zi, i + 1);
         }
 
@@ -695,7 +827,7 @@ mod large {
     /// Karatsuba multiplication algorithm with roughly equal input sizes.
     ///
     /// Assumes `y.len() >= x.len()`.
-    fn karatsuba_mul(x: &[Limb], y: &[Limb]) -> Vec<Limb> {
+    fn karatsuba_mul(x: &[Limb], y: &[Limb]) -> LimbVec {
         if y.len() <= KARATSUBA_CUTOFF {
             // Bottom-out to long division for small cases.
             long_mul(x, y)
@@ -732,8 +864,8 @@ mod large {
     /// Karatsuba multiplication algorithm where y is substantially larger than x.
     ///
     /// Assumes `y.len() >= x.len()`.
-    fn karatsuba_uneven_mul(x: &[Limb], mut y: &[Limb]) -> Vec<Limb> {
-        let mut result = Vec::<Limb>::default();
+    fn karatsuba_uneven_mul(x: &[Limb], mut y: &[Limb]) -> LimbVec {
+        let mut result = LimbVec::default();
         result.resize(x.len() + y.len(), 0);
 
         // This effectively is like grade-school multiplication between
@@ -755,7 +887,7 @@ mod large {
 
     /// Forwarder to the proper Karatsuba algorithm.
     #[inline]
-    fn karatsuba_mul_fwd(x: &[Limb], y: &[Limb]) -> Vec<Limb> {
+    fn karatsuba_mul_fwd(x: &[Limb], y: &[Limb]) -> LimbVec {
         if x.len() < y.len() {
             karatsuba_mul(x, y)
         } else {
@@ -765,7 +897,7 @@ mod large {
 
     /// MulAssign bigint to bigint.
     #[inline]
-    pub fn imul(x: &mut Vec<Limb>, y: &[Limb]) {
+    pub fn imul(x: &mut LimbVec, y: &[Limb]) {
         if y.len() == 1 {
             small::imul(x, y[0]);
         } else {
@@ -790,10 +922,10 @@ pub(crate) trait Math: Clone + Sized + Default {
     // DATA
 
     /// Get access to the underlying data
-    fn data(&self) -> &Vec<Limb>;
+    fn data(&self) -> &LimbVec;
 
     /// Get access to the underlying data
-    fn data_mut(&mut self) -> &mut Vec<Limb>;
+    fn data_mut(&mut self) -> &mut LimbVec;
 
     // RELATIVE OPERATIONS
 

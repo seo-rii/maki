@@ -48,10 +48,6 @@ def check(root: Path, metadata: dict) -> list[str]:
             locked = [p for p in lock["package"] if p["name"] == name]
             if len(locked) != 1 or locked[0]["version"] != record["version"] or locked[0].get("source"):
                 errors.append(f"{name}: lockfile bypasses the pinned patch")
-            if name == "serde_json":
-                features = next(n["features"] for n in metadata["resolve"]["nodes"] if n["id"] == package["id"])
-                if "float_roundtrip" in features:
-                    errors.append("serde_json: an unreviewed allocation feature is enabled")
         for rel, record in fixtures["files"].items():
             path = root / "vendor" / rel
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
@@ -74,7 +70,7 @@ def main() -> int:
     for error in errors:
         print(error, file=sys.stderr)
     if not errors:
-        print("Pinned erasure sources, dependency paths, features and public TLS fixtures verified.")
+        print("Pinned erasure sources, dependency paths and public TLS fixtures verified.")
     return int(bool(errors))
 
 

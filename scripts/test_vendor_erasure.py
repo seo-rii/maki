@@ -75,9 +75,14 @@ class VendorErasureContract(unittest.TestCase):
         })
         self.assertTrue(check(self.root, self.metadata))
 
-    def test_unreviewed_parser_feature_is_rejected(self):
-        self.metadata["resolve"]["nodes"][0]["features"].append("float_roundtrip")
-        self.assertTrue(check(self.root, self.metadata))
+    def test_reviewed_float_roundtrip_feature_is_allowed(self):
+        for features in (["std", "float_roundtrip"],
+                         ["std", "raw_value", "float_roundtrip"],
+                         ["std", "arbitrary_precision", "float_roundtrip"],
+                         ["std", "raw_value", "arbitrary_precision", "float_roundtrip"]):
+            with self.subTest(features=features):
+                self.metadata["resolve"]["nodes"][0]["features"] = features
+                self.assertEqual(check(self.root, self.metadata), [])
 
     def test_reviewed_raw_value_feature_is_allowed(self):
         self.metadata["resolve"]["nodes"][0]["features"].append("raw_value")

@@ -438,10 +438,5 @@ mod number;
 mod read;
 mod scratch;
 
-// This optional mode has separate lexical heap owners. Maki's audited
-// patch must not silently enable unguarded copies.
-#[cfg(feature = "float_roundtrip")]
-compile_error!("Maki's serde_json patch has not audited float_roundtrip heap ownership; this feature must remain disabled");
-
 #[cfg(feature = "raw_value")]
 mod raw;

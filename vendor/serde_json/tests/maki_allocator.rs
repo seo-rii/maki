@@ -18,6 +18,7 @@ pub struct Inspection {
 #[derive(Clone, Copy)]
 struct Tracking {
     enabled: bool,
+    alignment: usize,
     watched: usize,
     pointers: [usize; TRACKED],
     inspection: Inspection,
@@ -25,6 +26,7 @@ struct Tracking {
 
 const EMPTY: Tracking = Tracking {
     enabled: false,
+    alignment: 0,
     watched: 0,
     pointers: [0; TRACKED],
     inspection: Inspection {
@@ -42,17 +44,21 @@ thread_local! {
     static TRACKING: Cell<Tracking> = const { Cell::new(EMPTY) };
 }
 
-fn selected(layout: Layout) -> bool {
-    layout.align() == 1 && (8..=32768).contains(&layout.size())
+fn selected(layout: Layout, alignment: usize) -> bool {
+    if alignment == 0 {
+        layout.align() == 1 && (8..=32768).contains(&layout.size())
+    } else {
+        layout.align() == alignment && layout.size() != 0
+    }
 }
 
 fn track(pointer: *mut u8, layout: Layout) {
-    if pointer.is_null() || !selected(layout) {
+    if pointer.is_null() {
         return;
     }
     let _ = TRACKING.try_with(|cell| {
         let mut tracking = cell.get();
-        if tracking.enabled {
+        if tracking.enabled && selected(layout, tracking.alignment) {
             tracking.inspection.allocations += 1;
             if let Some(slot) = tracking.pointers.iter_mut().find(|slot| **slot == 0) {
                 *slot = pointer as usize;
@@ -97,7 +103,7 @@ unsafe impl GlobalAlloc for InspectAllocator {
                 tracking.watched = 0;
                 cell.set(tracking);
             }
-            if tracking.enabled && selected(layout) {
+            if tracking.enabled && selected(layout, tracking.alignment) {
                 if let Some(slot) = tracking
                     .pointers
                     .iter_mut()
@@ -124,10 +130,23 @@ unsafe impl GlobalAlloc for InspectAllocator {
 static ALLOCATOR: InspectAllocator = InspectAllocator;
 
 pub fn observe<T>(operation: impl FnOnce() -> T) -> (T, Inspection) {
+    observe_with_alignment(0, operation)
+}
+
+/// Inspect only allocations made in a pure arithmetic operation. The selected
+/// alignment must not include caller outputs or panic/runtime allocations.
+#[allow(dead_code)] // The string/number test binaries use the default mode.
+pub fn observe_aligned<T>(alignment: usize, operation: impl FnOnce() -> T) -> (T, Inspection) {
+    assert!(alignment.is_power_of_two());
+    observe_with_alignment(alignment, operation)
+}
+
+fn observe_with_alignment<T>(alignment: usize, operation: impl FnOnce() -> T) -> (T, Inspection) {
     TRACKING.with(|cell| {
         assert!(!cell.get().enabled);
         cell.set(Tracking {
             enabled: true,
+            alignment,
             ..EMPTY
         });
     });
@@ -148,6 +167,26 @@ pub fn assert_wiped(inspection: Inspection) {
     assert!(
         inspection.wiped_frees > 0,
         "no erased private allocation was observed: {inspection:?}",
+    );
+}
+
+#[allow(dead_code)] // Only the pure limb arithmetic tests assert every release.
+pub fn assert_all_wiped(inspection: Inspection) {
+    assert!(
+        !inspection.overflowed,
+        "observer exceeded its fixed storage"
+    );
+    assert!(
+        inspection.frees > 0,
+        "no arithmetic allocation was released"
+    );
+    assert_eq!(
+        inspection.allocations, inspection.frees,
+        "private allocation escaped: {inspection:?}"
+    );
+    assert_eq!(
+        inspection.frees, inspection.wiped_frees,
+        "private arithmetic allocation was not erased: {inspection:?}"
     );
 }
 

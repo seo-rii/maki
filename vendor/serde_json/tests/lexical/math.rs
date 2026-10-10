@@ -1,31 +1,35 @@
 // Adapted from https://github.com/Alexhuszagh/rust-lexical.
 
-use crate::lexical::math::{Limb, Math};
+use crate::lexical::math::{LimbVec, Math};
 use std::cmp;
 
 #[derive(Clone, Default)]
 struct Bigint {
-    data: Vec<Limb>,
+    data: LimbVec,
 }
 
 impl Math for Bigint {
-    fn data(&self) -> &Vec<Limb> {
+    fn data(&self) -> &LimbVec {
         &self.data
     }
 
-    fn data_mut(&mut self) -> &mut Vec<Limb> {
+    fn data_mut(&mut self) -> &mut LimbVec {
         &mut self.data
     }
 }
 
 #[cfg(fast_arithmetic = "32")]
-pub(crate) fn from_u32(x: &[u32]) -> Vec<Limb> {
-    x.iter().cloned().collect()
+pub(crate) fn from_u32(x: &[u32]) -> LimbVec {
+    let mut limbs = LimbVec::default();
+    for &limb in x {
+        limbs.push(limb);
+    }
+    limbs
 }
 
 #[cfg(fast_arithmetic = "64")]
-pub(crate) fn from_u32(x: &[u32]) -> Vec<Limb> {
-    let mut v = Vec::<Limb>::default();
+pub(crate) fn from_u32(x: &[u32]) -> LimbVec {
+    let mut v = LimbVec::default();
     for xi in x.chunks(2) {
         match xi.len() {
             1 => v.push(xi[0] as u64),

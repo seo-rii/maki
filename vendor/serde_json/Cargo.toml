@@ -122,6 +122,10 @@ path = "tests/maki_raw.rs"
 name = "maki_number"
 path = "tests/maki_number.rs"
 
+[[test]]
+name = "maki_float"
+path = "tests/maki_float.rs"
+
 [dependencies.indexmap]
 version = "2.2.3"
 optional = true
