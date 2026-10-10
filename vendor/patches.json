@@ -101,7 +101,7 @@
         "src/number.rs": "ef653b92e549ec560a7d4cd5541cf7701b647f9caa4bc3ce4580de4c75d4b566",
         "src/raw.rs": "6c1853751be12d657331874e8b4f38e3e6ae7b53e13f21049a4bcd6614e48ee6",
         "src/read.rs": "7cd326ed1445dbfdc4e8b7178cb729a939e5a5195e4db6e0e4b84e29fac6c84f",
-        "src/scratch.rs": "91baa4099b63a457d003ba7591c1d9e70e538fca5f9e8583e2c30ba5d9335c83",
+        "src/scratch.rs": "56404a6736f13bb39da8f80bf1652c93bcf14a63a804d1b574400ff49f518130",
         "src/ser.rs": "803ad007f7baf4fbcc09427ef43ac4027a8c9b537511c1957e71d51893b3380f",
         "src/value/de.rs": "8200de72b3505f390710c6be6d7530121de01997325158dd0cb2b939c5a9fc9b",
         "src/value/ser.rs": "3ecf73694723b97285b27a03e8183db34824fcee27c718fe4d49c7eae444db46",

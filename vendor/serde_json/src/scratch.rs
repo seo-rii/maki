@@ -197,7 +197,7 @@ impl GuardedString {
 
     #[cfg(feature = "raw_value")]
     pub(crate) fn from_utf8(bytes: Scratch) -> Result<Self, str::Utf8Error> {
-        str::from_utf8(&bytes)?;
+        tri!(str::from_utf8(&bytes));
         Ok(GuardedString(bytes))
     }
 
