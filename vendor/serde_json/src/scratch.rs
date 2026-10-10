@@ -7,15 +7,15 @@ use core::ops::Deref;
 use core::str;
 use zeroize::Zeroize;
 
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 use crate::error::Error;
 #[cfg(feature = "raw_value")]
 use alloc::boxed::Box;
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 use alloc::string::String;
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 use serde::de::{self, DeserializeSeed, EnumAccess, IntoDeserializer, VariantAccess, Visitor};
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 use serde::forward_to_deserialize_any;
 
 // Public only because the sealed Read trait names this type in hidden methods.
@@ -87,7 +87,7 @@ impl Scratch {
         Some(value)
     }
 
-    #[cfg(feature = "raw_value")]
+    #[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
     fn into_vec(mut self) -> Vec<u8> {
         mem::take(&mut self.bytes)
     }
@@ -150,11 +150,25 @@ impl Drop for Scratch {
     }
 }
 
-/// Error messages can contain decoded input. Format directly into a guarded
-/// owner so growth and error destruction erase every owned message copy.
+/// Parser-private text, raw values and error messages can contain decoded
+/// input. Growth and destruction erase every privately owned allocation.
 pub(crate) struct GuardedString(Scratch);
 
 impl GuardedString {
+    #[cfg(feature = "arbitrary_precision")]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        GuardedString(Scratch {
+            bytes: Vec::with_capacity(capacity),
+        })
+    }
+
+    #[cfg(feature = "arbitrary_precision")]
+    pub(crate) fn push(&mut self, value: char) {
+        let mut encoded = [0; 4];
+        self.0
+            .extend_from_slice(value.encode_utf8(&mut encoded).as_bytes());
+    }
+
     pub(crate) fn from_display(value: impl Display) -> Self {
         let mut message = GuardedString(Scratch::new());
         fmt::write(&mut message, format_args!("{}", value))
@@ -167,14 +181,14 @@ impl GuardedString {
         self.0.truncate(len);
     }
 
-    #[cfg(feature = "raw_value")]
+    #[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
     pub(crate) fn from_str(value: &str) -> Self {
         let mut bytes = Scratch::new();
         bytes.extend_from_slice(value.as_bytes());
         GuardedString(bytes)
     }
 
-    #[cfg(feature = "raw_value")]
+    #[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
     pub(crate) fn from_string(value: String) -> Self {
         GuardedString(Scratch {
             bytes: value.into_bytes(),
@@ -187,8 +201,8 @@ impl GuardedString {
         Ok(GuardedString(bytes))
     }
 
-    #[cfg(feature = "raw_value")]
-    fn into_string(self) -> String {
+    #[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
+    pub(crate) fn into_string(self) -> String {
         // SAFETY: construction and truncation preserve the UTF-8 invariant.
         unsafe { String::from_utf8_unchecked(self.0.into_vec()) }
     }
@@ -223,10 +237,10 @@ impl Write for GuardedString {
 /// Match Serde's StringDeserializer callbacks, handing off the ordinary String
 /// only when visit_string is actually called. The receiving visitor then owns
 /// that public value, including its errors, unwinding and eventual destruction.
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 pub(crate) struct GuardedStringDeserializer(GuardedString);
 
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 impl<'de> IntoDeserializer<'de, Error> for GuardedString {
     type Deserializer = GuardedStringDeserializer;
 
@@ -235,7 +249,7 @@ impl<'de> IntoDeserializer<'de, Error> for GuardedString {
     }
 }
 
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 impl<'de> de::Deserializer<'de> for GuardedStringDeserializer {
     type Error = Error;
 
@@ -265,7 +279,7 @@ impl<'de> de::Deserializer<'de> for GuardedStringDeserializer {
     }
 }
 
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 impl<'de> EnumAccess<'de> for GuardedStringDeserializer {
     type Error = Error;
     type Variant = GuardedUnitVariant;
@@ -279,10 +293,10 @@ impl<'de> EnumAccess<'de> for GuardedStringDeserializer {
     }
 }
 
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 pub(crate) struct GuardedUnitVariant;
 
-#[cfg(feature = "raw_value")]
+#[cfg(any(feature = "raw_value", feature = "arbitrary_precision"))]
 impl<'de> VariantAccess<'de> for GuardedUnitVariant {
     type Error = Error;
 

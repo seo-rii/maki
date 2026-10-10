@@ -3,6 +3,8 @@ use crate::error::Error;
 #[cfg(feature = "arbitrary_precision")]
 use crate::error::ErrorCode;
 #[cfg(feature = "arbitrary_precision")]
+use crate::scratch::GuardedString;
+#[cfg(feature = "arbitrary_precision")]
 use alloc::borrow::ToOwned;
 #[cfg(feature = "arbitrary_precision")]
 use alloc::string::{String, ToString};
@@ -521,6 +523,16 @@ impl<'de> de::Deserialize<'de> for NumberFromString {
                 let n = tri!(s.parse().map_err(de::Error::custom));
                 Ok(NumberFromString { value: n })
             }
+
+            fn visit_string<E>(self, s: String) -> Result<NumberFromString, E>
+            where
+                E: de::Error,
+            {
+                // This visitor is internal to serde_json. Reacquire private
+                // ownership after the StringDeserializer callback handoff.
+                let s = GuardedString::from_string(s);
+                self.visit_str(&s)
+            }
         }
 
         deserializer.deserialize_str(Visitor)
@@ -532,8 +544,27 @@ fn invalid_number() -> Error {
     Error::syntax(ErrorCode::InvalidNumber, 0, 0)
 }
 
+// A consumed public Number becomes private input until a callback transfers
+// ownership again. Borrowed inputs retain their original owner and are copied
+// directly into a guard only when an arbitrary-number map is required.
+#[cfg(feature = "arbitrary_precision")]
+macro_rules! number_string {
+    (owned $number:ident) => {
+        GuardedString::from_string($number.n)
+    };
+    (ref $number:ident) => {
+        $number.n.as_str()
+    };
+    (transfer owned $number:ident) => {
+        $number
+    };
+    (transfer ref $number:ident) => {
+        GuardedString::from_str($number)
+    };
+}
+
 macro_rules! deserialize_any {
-    (@expand [$($num_string:tt)*]) => {
+    ($ownership:ident) => {
         #[cfg(not(feature = "arbitrary_precision"))]
         fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Error>
         where
@@ -548,39 +579,36 @@ macro_rules! deserialize_any {
 
         #[cfg(feature = "arbitrary_precision")]
         fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Error>
-            where V: Visitor<'de>
+        where
+            V: Visitor<'de>,
         {
-            if let Some(u) = self.as_u64() {
+            let number = number_string!($ownership self);
+            let text = &*number;
+            if let Ok(u) = text.parse::<u64>() {
                 return visitor.visit_u64(u);
-            } else if let Some(i) = self.as_i64() {
+            } else if let Ok(i) = text.parse::<i64>() {
                 return visitor.visit_i64(i);
-            } else if let Some(u) = self.as_u128() {
+            } else if let Ok(u) = text.parse::<u128>() {
                 return visitor.visit_u128(u);
-            } else if let Some(i) = self.as_i128() {
+            } else if let Ok(i) = text.parse::<i128>() {
                 return visitor.visit_i128(i);
-            } else if let Some(f) = self.as_f64() {
-                if zmij::Buffer::new().format_finite(f) == self.n || f.to_string() == self.n {
+            } else if let Some(f) = text.parse::<f64>().ok().filter(|float| float.is_finite()) {
+                if zmij::Buffer::new().format_finite(f) == text
+                    || &*GuardedString::from_display(f) == text
+                {
                     return visitor.visit_f64(f);
                 }
             }
 
             visitor.visit_map(NumberDeserializer {
-                number: Some(self.$($num_string)*),
+                number: Some(number_string!(transfer $ownership number)),
             })
         }
-    };
-
-    (owned) => {
-        deserialize_any!(@expand [n]);
-    };
-
-    (ref) => {
-        deserialize_any!(@expand [n.clone()]);
     };
 }
 
 macro_rules! deserialize_number {
-    ($deserialize:ident => $visit:ident) => {
+    ($ownership:ident $deserialize:ident => $visit:ident) => {
         #[cfg(not(feature = "arbitrary_precision"))]
         fn $deserialize<V>(self, visitor: V) -> Result<V::Value, Error>
         where
@@ -594,7 +622,8 @@ macro_rules! deserialize_number {
         where
             V: de::Visitor<'de>,
         {
-            visitor.$visit(tri!(self.n.parse().map_err(|_| invalid_number())))
+            let number = number_string!($ownership self);
+            visitor.$visit(tri!(number.parse().map_err(|_| invalid_number())))
         }
     };
 }
@@ -604,18 +633,18 @@ impl<'de> Deserializer<'de> for Number {
 
     deserialize_any!(owned);
 
-    deserialize_number!(deserialize_i8 => visit_i8);
-    deserialize_number!(deserialize_i16 => visit_i16);
-    deserialize_number!(deserialize_i32 => visit_i32);
-    deserialize_number!(deserialize_i64 => visit_i64);
-    deserialize_number!(deserialize_i128 => visit_i128);
-    deserialize_number!(deserialize_u8 => visit_u8);
-    deserialize_number!(deserialize_u16 => visit_u16);
-    deserialize_number!(deserialize_u32 => visit_u32);
-    deserialize_number!(deserialize_u64 => visit_u64);
-    deserialize_number!(deserialize_u128 => visit_u128);
-    deserialize_number!(deserialize_f32 => visit_f32);
-    deserialize_number!(deserialize_f64 => visit_f64);
+    deserialize_number!(owned deserialize_i8 => visit_i8);
+    deserialize_number!(owned deserialize_i16 => visit_i16);
+    deserialize_number!(owned deserialize_i32 => visit_i32);
+    deserialize_number!(owned deserialize_i64 => visit_i64);
+    deserialize_number!(owned deserialize_i128 => visit_i128);
+    deserialize_number!(owned deserialize_u8 => visit_u8);
+    deserialize_number!(owned deserialize_u16 => visit_u16);
+    deserialize_number!(owned deserialize_u32 => visit_u32);
+    deserialize_number!(owned deserialize_u64 => visit_u64);
+    deserialize_number!(owned deserialize_u128 => visit_u128);
+    deserialize_number!(owned deserialize_f32 => visit_f32);
+    deserialize_number!(owned deserialize_f64 => visit_f64);
 
     forward_to_deserialize_any! {
         bool char str string bytes byte_buf option unit unit_struct
@@ -629,18 +658,18 @@ impl<'de> Deserializer<'de> for &Number {
 
     deserialize_any!(ref);
 
-    deserialize_number!(deserialize_i8 => visit_i8);
-    deserialize_number!(deserialize_i16 => visit_i16);
-    deserialize_number!(deserialize_i32 => visit_i32);
-    deserialize_number!(deserialize_i64 => visit_i64);
-    deserialize_number!(deserialize_i128 => visit_i128);
-    deserialize_number!(deserialize_u8 => visit_u8);
-    deserialize_number!(deserialize_u16 => visit_u16);
-    deserialize_number!(deserialize_u32 => visit_u32);
-    deserialize_number!(deserialize_u64 => visit_u64);
-    deserialize_number!(deserialize_u128 => visit_u128);
-    deserialize_number!(deserialize_f32 => visit_f32);
-    deserialize_number!(deserialize_f64 => visit_f64);
+    deserialize_number!(ref deserialize_i8 => visit_i8);
+    deserialize_number!(ref deserialize_i16 => visit_i16);
+    deserialize_number!(ref deserialize_i32 => visit_i32);
+    deserialize_number!(ref deserialize_i64 => visit_i64);
+    deserialize_number!(ref deserialize_i128 => visit_i128);
+    deserialize_number!(ref deserialize_u8 => visit_u8);
+    deserialize_number!(ref deserialize_u16 => visit_u16);
+    deserialize_number!(ref deserialize_u32 => visit_u32);
+    deserialize_number!(ref deserialize_u64 => visit_u64);
+    deserialize_number!(ref deserialize_u128 => visit_u128);
+    deserialize_number!(ref deserialize_f32 => visit_f32);
+    deserialize_number!(ref deserialize_f64 => visit_f64);
 
     forward_to_deserialize_any! {
         bool char str string bytes byte_buf option unit unit_struct
@@ -651,7 +680,7 @@ impl<'de> Deserializer<'de> for &Number {
 
 #[cfg(feature = "arbitrary_precision")]
 pub(crate) struct NumberDeserializer {
-    pub number: Option<String>,
+    pub number: Option<GuardedString>,
 }
 
 #[cfg(feature = "arbitrary_precision")]
@@ -731,7 +760,7 @@ impl From<ParserNumber> for Number {
                 }
             }
             #[cfg(feature = "arbitrary_precision")]
-            ParserNumber::String(s) => s,
+            ParserNumber::String(s) => s.into_string(),
         };
         Number { n }
     }

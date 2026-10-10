@@ -5,9 +5,9 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::lexical;
 use crate::number::Number;
 use crate::read::{self, Fused, Reference};
-use crate::scratch::Scratch;
 #[cfg(feature = "arbitrary_precision")]
-use alloc::string::String;
+use crate::scratch::GuardedString;
+use crate::scratch::Scratch;
 #[cfg(feature = "float_roundtrip")]
 use core::iter;
 use core::iter::FusedIterator;
@@ -112,7 +112,7 @@ pub(crate) enum ParserNumber {
     U64(u64),
     I64(i64),
     #[cfg(feature = "arbitrary_precision")]
-    String(String),
+    String(GuardedString),
 }
 
 impl ParserNumber {
@@ -943,7 +943,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
 
     #[cfg(feature = "arbitrary_precision")]
     fn parse_any_number(&mut self, positive: bool) -> Result<ParserNumber> {
-        let mut buf = String::with_capacity(16);
+        let mut buf = GuardedString::with_capacity(16);
         if !positive {
             buf.push('-');
         }
@@ -961,7 +961,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     }
 
     #[cfg(feature = "arbitrary_precision")]
-    fn scan_or_eof(&mut self, buf: &mut String) -> Result<u8> {
+    fn scan_or_eof(&mut self, buf: &mut GuardedString) -> Result<u8> {
         match tri!(self.next_char()) {
             Some(b) => {
                 buf.push(b as char);
@@ -972,7 +972,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     }
 
     #[cfg(feature = "arbitrary_precision")]
-    fn scan_integer(&mut self, buf: &mut String) -> Result<()> {
+    fn scan_integer(&mut self, buf: &mut GuardedString) -> Result<()> {
         match tri!(self.scan_or_eof(buf)) {
             b'0' => {
                 // There can be only one leading '0'.
@@ -997,7 +997,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     }
 
     #[cfg(feature = "arbitrary_precision")]
-    fn scan_number(&mut self, buf: &mut String) -> Result<()> {
+    fn scan_number(&mut self, buf: &mut GuardedString) -> Result<()> {
         match tri!(self.peek_or_null()) {
             b'.' => self.scan_decimal(buf),
             b'e' | b'E' => self.scan_exponent(buf),
@@ -1006,7 +1006,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     }
 
     #[cfg(feature = "arbitrary_precision")]
-    fn scan_decimal(&mut self, buf: &mut String) -> Result<()> {
+    fn scan_decimal(&mut self, buf: &mut GuardedString) -> Result<()> {
         self.eat_char();
         buf.push('.');
 
@@ -1031,7 +1031,7 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     }
 
     #[cfg(feature = "arbitrary_precision")]
-    fn scan_exponent(&mut self, buf: &mut String) -> Result<()> {
+    fn scan_exponent(&mut self, buf: &mut GuardedString) -> Result<()> {
         self.eat_char();
         buf.push('e');
 

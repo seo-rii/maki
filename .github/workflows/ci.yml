@@ -61,6 +61,11 @@ jobs:
           cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --features raw_value
           cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --release --features raw_value --test maki_raw
           cargo check --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --no-default-features --features alloc,raw_value --lib
+          cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --features arbitrary_precision
+          cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --features raw_value,arbitrary_precision
+          cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --release --features arbitrary_precision --test maki_number
+          cargo check --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --no-default-features --features alloc,arbitrary_precision --lib
+          cargo check --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --no-default-features --features alloc,raw_value,arbitrary_precision --lib
       - name: TLS erasure and upstream compatibility (Linux)
         if: runner.os == 'Linux'
         run: |

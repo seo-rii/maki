@@ -281,10 +281,19 @@ it. Borrowed raw slices and public returned `Box<RawValue>` keep their original
 ownership. An arbitrary visitor receives ownership when its `visit_string`
 callback is invoked; its subsequent cleanup is the caller's responsibility.
 The parser's own conversion visitors immediately adopt that String again.
-Owned-string and enum callbacks retain upstream behavior. Maki's resolved
-default/std configuration does not enable `raw_value`; `arbitrary_precision`
-and `float_roundtrip` remain refused at compile time until their separate
-owners are covered.
+Owned-string and enum callbacks retain upstream behavior.
+
+The `arbitrary_precision` path also guards scanned number text, owned number-map
+and seed storage, the library's internal number visitor and temporary float
+formatting. Consuming a `Number` as a deserializer adopts its string allocation
+through scalar conversion, type/parse errors and unwinding. A borrowed `Number`
+keeps its original allocation and guards only additional internal copies.
+Visitor-created public `Number` values retain their ordinary ownership and Drop,
+including parsed outputs discarded by a later trailing-input error. This is the
+same ownership boundary as other public parsed values.
+Maki's resolved default/std configuration enables neither optional mode;
+`float_roundtrip` remains refused at compile time until its lexical owners
+are covered.
 
 The convenience `from_slice`/`from_str` functions drop their parser before
 returning. A caller that keeps a `Deserializer` alive retains its latest

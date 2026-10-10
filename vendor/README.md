@@ -19,9 +19,15 @@ UTF-8, serializer and seed errors and normal unwinding. Borrowed raw input and
 public `Box<RawValue>` outputs keep their upstream ownership. Passing an owned
 String to an arbitrary visitor transfers cleanup responsibility at
 `visit_string`; the library's own visitors immediately adopt it again.
-Maki's production parser does not enable `raw_value`. The `arbitrary_precision`
-and `float_roundtrip` paths remain refused at compile time until their separate
-number and lexical owners are covered.
+The `arbitrary_precision` path guards scanned number text, owned number-map
+and seed storage, internal number-visitor handoffs and float display
+temporaries. Consuming a `Number` as a deserializer adopts its owned string
+through conversion, errors and unwinding; borrowing a `Number` preserves its
+original storage. Visitor-created public `Number` values keep their ordinary
+Drop, including outputs discarded after a later trailing-input error.
+Maki's production parser does not enable either optional mode. The
+`float_roundtrip` path remains refused at compile time until its lexical
+owners are covered.
 
 `rustls` erases consumed plaintext queues and deframer regions, including
 obsolete compaction tails. Replacing or releasing these buffers erases their
