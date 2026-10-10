@@ -75,3 +75,11 @@ construction; secrets are systemd credentials, never configuration literals;
 plaintext transports are refused to non-loopback hosts. Details:
 [architecture](docs/architecture.md), [configuration](docs/configuration.md#security-settings),
 [transport memory](docs/transport-memory.md).
+
+An explicit [measured memory budget](docs/configuration.md#measured-memory-budget)
+requires matching kernel cgroup-v2 limits and sufficient memlock/headroom at
+attach. The kernel ceiling applies to cgroup-charged memory, including charged
+file cache, rather than literal RSS. Headroom and lock admission are snapshots;
+they do not guarantee allocation success, eliminate OOM, or prove every plaintext
+copy is locked. Deployment must preserve the checked policy and service
+membership. The application does not provision or change host cgroups.

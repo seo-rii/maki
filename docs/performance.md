@@ -115,6 +115,32 @@ lock failures, OOM events and post-load retained memory. A low ceiling that was
 merely touched without an OOM is not an established minimum. External
 qualification remains required for that envelope.
 
+To enforce the selected envelope, opt into
+[`security.memory_budget`](configuration.md#measured-memory-budget) and render
+the [systemd memory template](../packaging/examples/maki@.service.d/20-memory-budget.conf)
+with the same decimal byte counts. `MemoryMax` sets the kernel cgroup charge
+ceiling; `LimitMEMLOCK` supplies the required soft and hard lock limit. The
+daemon checks the observed settings both before recovery and before readiness.
+This work does not choose production values or install the drop-in. Keep a
+dedicated service cgroup and include sibling consumption in parent-slice
+headroom measurements. Admission is a snapshot: a sibling can consume that
+headroom immediately afterwards. Kernel OOM behavior is still part of external
+qualification, even when the startup checks pass.
+
+The `cgroup-qualification` feature exposes the opt-in
+`delegated_cgroup_oom_enforces_memory_max` test. It requires
+`MAKI_MEMORY_TEST_CGROUP` to name a disposable, already delegated cgroup with
+the memory controller enabled for children. It creates only a unique child,
+sets a 32 MiB cap and zero swap on that child, and expects the allocating test
+process to be killed with an increment in `memory.events:oom_kill`. It never
+enables a host controller or alters its parent's limits. Run only in the
+dedicated qualification environment:
+
+```sh
+cargo test -p maki-nbdkit --locked --features cgroup-qualification --test memory_budget \
+  delegated_cgroup_oom_enforces_memory_max -- --ignored --exact
+```
+
 Use `maki volume inspect` offline for geometry capacity estimates. Keep journal
 and checkpoint reserves, filesystem overhead and DB temporary/WAL growth
 outside the usable-data budget. Set the backing-space alert threshold above

@@ -10,9 +10,11 @@
 //! | `memory_lock_mode = "secure-buffers"` | Every `SecretBuffer` is `mlock`ed for its lifetime (best effort, failures counted) |
 //! | `require_secure_swap_policy` | `/proc/swaps` must be readable and list only RAM-only zram devices (`/dev/zramN` with no `backing_dev`) or dm-crypt devices with independent physical backing (the same rule applies to zram writeback); anything else, an unreadable file, or an unparseable one refuses attach |
 //! | `cache.lock_memory` | Cache plaintext lives in `SecretBuffer`s, so it follows `memory_lock_mode` (validation refuses it with `off`) |
+//! | `memory_budget` | Requires matching finite cgroup-v2 ceiling, visible ancestor headroom and sufficient `RLIMIT_MEMLOCK`, before recovery and readiness |
 //!
-//! On non-Linux hosts nothing is enforced; the posture says so and a
-//! warning is logged. Production runs on Linux. The swap topology is checked
+//! On non-Linux hosts a requested memory budget refuses attach; otherwise
+//! nothing is enforced, the posture says so and a warning is logged.
+//! Production runs on Linux. The swap topology is checked
 //! at attach; operators must keep it fixed for the lifetime of the attachment.
 
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +24,8 @@ use serde_json::{json, Value};
 use maki_format::config::VolumeConfig;
 
 use crate::daemon::DaemonError;
+
+pub mod memory;
 
 /// What was actually applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +38,7 @@ pub struct SecurityPosture {
     pub process_locked: bool,
     /// Human-readable swap policy result.
     pub swap_policy: String,
+    pub memory_budget: Option<memory::MemoryBudgetPosture>,
 }
 
 fn posture_slot() -> &'static Mutex<Option<SecurityPosture>> {
@@ -59,6 +64,18 @@ pub fn posture_json() -> Value {
             "secret_buffer_lock_failures": maki_crypto::secret::page_lock_failures(),
             "process_locked": p.process_locked,
             "swap_policy": p.swap_policy,
+            "memory_budget": p.memory_budget.map(|m| json!({
+                "cgroup": m.cgroup,
+                "max_bytes": m.max_bytes,
+                "current_bytes": m.current_bytes,
+                "available_bytes": m.available_bytes,
+                "required_headroom_bytes": m.required_headroom_bytes,
+                "memlock_soft_bytes": m.memlock_soft_bytes,
+                "required_memlock_bytes": m.required_memlock_bytes,
+                "visible_ancestors": m.visible_ancestors,
+                "accounting": "cgroup-v2-charged-memory",
+                "observation": "attach-admission-snapshot",
+            })),
         }),
     }
 }
@@ -450,6 +467,7 @@ mod linux {
             secret_buffers_locked,
             process_locked,
             swap_policy,
+            memory_budget: None,
         })
     }
 }
@@ -458,10 +476,12 @@ mod linux {
 /// every setting (fail closed); other hosts record that nothing was
 /// enforced.
 pub fn apply(config: &VolumeConfig) -> Result<SecurityPosture, DaemonError> {
+    *posture_slot().lock().unwrap() = None;
+    let memory_budget = memory::verify(config)?;
     #[cfg(target_os = "linux")]
-    let posture = linux::apply(config)?;
+    let mut posture = linux::apply(config)?;
     #[cfg(not(target_os = "linux"))]
-    let posture = {
+    let mut posture = {
         tracing::warn!(
             "[security] settings are not enforced on this platform (development host); \
              production runs on Linux"
@@ -474,10 +494,22 @@ pub fn apply(config: &VolumeConfig) -> Result<SecurityPosture, DaemonError> {
             secret_buffers_locked: false,
             process_locked: false,
             swap_policy: "not enforced (platform)".to_string(),
+            memory_budget: None,
         }
     };
+    posture.memory_budget = memory_budget;
     *posture_slot().lock().unwrap() = Some(posture.clone());
     Ok(posture)
+}
+
+/// Recovery can consume substantial memory. Refuse readiness if the measured
+/// policy no longer leaves its required operating headroom.
+pub fn recheck_memory_budget(config: &VolumeConfig) -> Result<(), DaemonError> {
+    let observed = memory::verify(config)?;
+    if let Some(posture) = posture_slot().lock().unwrap().as_mut() {
+        posture.memory_budget = observed;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

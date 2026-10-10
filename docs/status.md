@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-07. External campaign evidence below runs through
+Last updated: 2026-10-11. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -80,6 +80,11 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
 - Recovery memory is bounded by a 1 MiB replay batch and the journaled overlay
   by `limits.max_overlay_bytes`/`max_overlay_entries`, but a total-RSS bound for
   arbitrary geometry, provider and cache settings has not been established.
+  Opt-in `security.memory_budget` now checks an explicitly measured cgroup-v2
+  ceiling, visible ancestor headroom and memlock before recovery and READY.
+  The service manager applies the kernel limit; this does not establish a
+  universal minimum RAM requirement or reserve runtime headroom
+  ([configuration](configuration.md#measured-memory-budget)).
 - The volume's XFS filesystem is mounted `nosuid,nodev`; workloads that need
   setuid programs or device nodes on it are not supported.
 - The R5 changes passed one scoped GCE campaign on 2026-10-03

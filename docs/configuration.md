@@ -474,8 +474,58 @@ buffer as a plain vector releases that buffer's ownership and transfers the
 zeroization obligation to the caller; other buffers sharing its pages retain
 their locks.
 
-On non-Linux hosts nothing is enforced; the status document reports
-`platform = "unsupported-platform"` and a warning is logged.
+Without an explicit memory budget, non-Linux hosts report
+`platform = "unsupported-platform"` and a warning; hardening is not enforced.
+An explicit memory budget requires Linux and refuses attach elsewhere.
+
+### Measured memory budget
+
+An optional `[security.memory_budget]` makes attach conditional on the actual
+Linux cgroup-v2 and memlock policy. All three fields are required. Values below
+illustrate the syntax; select them from measurements of the deployment's
+recovery, I/O, checkpoint and provider-stall peaks:
+
+```toml
+[security.memory_budget]
+max_bytes = "256MiB"
+startup_headroom_bytes = "16MiB"
+required_memlock_bytes = "32MiB"
+```
+
+`max_bytes` must be positive and exactly match the service cgroup's finite
+`memory.max`. Headroom must be positive and less than that ceiling. The daemon
+requires at least that much remaining charged memory in the leaf and every
+visible finite ancestor, before hardening/recovery and again before returning
+the recovered engine. A smaller ancestor ceiling is rejected because it changes
+the configured envelope. Missing, malformed, unreadable or unlimited leaf
+limits fail attach. Ancestors may be unlimited; the real hierarchy root has no
+`memory.max`. Paths come from `/proc/self/cgroup` and `/proc/self/mountinfo`,
+including mountinfo escaping. Ambiguous mounts, subtree mounts hiding ancestors,
+root membership, nested mounts shadowing controller files and escaping paths
+are refused. Run under the host cgroup
+namespace with the complete hierarchy visible; a container can hide further
+ancestors, and visibility is not a proof of their headroom.
+
+The actual soft `RLIMIT_MEMLOCK` must cover `required_memlock_bytes`. Use a
+positive requirement for `secure-buffers`; `all` requires at least `max_bytes`,
+and `off` requires zero. This admission check does not turn best-effort per-buffer
+locking into guaranteed success: mapping/page overhead, privileges and subsequent
+allocations can still cause failures. `mlockall` still must succeed in `all` mode,
+and its virtual-address-space accounting can require more than the cgroup cap.
+
+Set matching systemd limits with the
+[opt-in drop-in template](../packaging/examples/maki@.service.d/20-memory-budget.conf).
+Replace its placeholders before installation. The application reads kernel
+state; it never changes cgroups or resource limits for this policy. Existing
+configurations omit the section and retain their current behavior. On unsupported
+platforms an explicit budget refuses attach. `maki status` reports the observed
+limits and admission snapshot under `security.memory_budget`.
+
+`MemoryMax` bounds cgroup-charged memory (including charged file cache and
+descendants), not literal process RSS. Headroom is a startup snapshot, not a
+reservation or a promise against OOM. Keep service membership and limits fixed
+while attached; kernel enforcement continues after admission. Choose swap policy
+separately. See the [measurement procedure](performance.md#establish-a-memory-and-capacity-envelope).
 
 ## Capacity and limits
 

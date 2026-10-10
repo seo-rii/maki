@@ -713,6 +713,16 @@ pub struct SecuritySection {
     pub disable_core_dump: bool,
     pub madv_dontdump: bool,
     pub require_secure_swap_policy: bool,
+    pub memory_budget: Option<MemoryBudgetSection>,
+}
+
+/// Explicit measured deployment limits; omitted by default, with no guessed ceiling.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBudgetSection {
+    pub max_bytes: ByteSize,
+    pub startup_headroom_bytes: ByteSize,
+    pub required_memlock_bytes: ByteSize,
 }
 
 impl Default for SecuritySection {
@@ -722,6 +732,7 @@ impl Default for SecuritySection {
             disable_core_dump: true,
             madv_dontdump: true,
             require_secure_swap_policy: false,
+            memory_budget: None,
         }
     }
 }
@@ -1735,6 +1746,22 @@ impl VolumeConfig {
             return Err(invalid(
                 "cache.lock_memory requires security.memory_lock_mode = secure-buffers or all \n                 (cache plaintext lives in secret buffers)",
             ));
+        }
+        if let Some(budget) = &self.security.memory_budget {
+            if budget.max_bytes.0 == 0
+                || budget.startup_headroom_bytes.0 == 0
+                || budget.startup_headroom_bytes.0 >= budget.max_bytes.0
+            {
+                return Err(invalid(
+                    "security.memory_budget requires 0 < startup_headroom_bytes < max_bytes",
+                ));
+            }
+            if (lock == "off" && budget.required_memlock_bytes.0 != 0)
+                || (lock != "off" && budget.required_memlock_bytes.0 == 0)
+                || (lock == "all" && budget.required_memlock_bytes < budget.max_bytes)
+            {
+                return Err(invalid("security.memory_budget.required_memlock_bytes must be zero for off, positive for secure-buffers, and at least max_bytes for all"));
+            }
         }
         Ok(())
     }

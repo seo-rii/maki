@@ -48,6 +48,13 @@ with `fullreport`/`--devices` (2.03.16 tested), xfsprogs, systemd ≥ 249 for
 the recovery unit's `OnSuccess=`. Details are in the
 [installation guide](../getting-started/installation-debian.md).
 
+## Explicit memory admission
+
+| Policy | Status | Notes |
+|---|---|---|
+| Measured `security.memory_budget` with Linux cgroup v2 | Expected | Requires a finite matching leaf `memory.max`, adequate visible ancestor headroom and `RLIMIT_MEMLOCK`, checked before recovery and READY. The service manager applies the limit; full host cgroup visibility is required for ancestor assessment. No universal minimum RAM or sustained headroom guarantee ([configuration](../configuration.md#measured-memory-budget)) |
+| Budget with missing/mismatched/unlimited leaf cgroup policy | Refused | No guessed limit or silent downgrade; omit the optional stanza to retain existing behavior |
+
 ## Backing store (below Maki)
 
 The backing is an ordinary directory (`backing.root`). Maki relies on the

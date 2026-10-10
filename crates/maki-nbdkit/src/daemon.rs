@@ -888,6 +888,7 @@ pub async fn attach_from_config_with_stats(
         (provider, None)
     };
     let engine = Engine::attach_recovered(volume, provider, options).await?;
+    crate::security::recheck_memory_budget(config)?;
     Ok((engine, stats, endpoints))
 }
 

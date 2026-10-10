@@ -63,6 +63,13 @@ documents.
 
 ### Added
 
+- **Measured whole-process memory admission**: optional
+  `security.memory_budget` verifies the applied cgroup-v2 ceiling, visible
+  ancestor headroom and memlock before recovery and READY. The opt-in systemd
+  template sets operator-measured limits; defaults remain unchanged
+  ([configuration](docs/configuration.md#measured-memory-budget)).
+
+
 - **Benchmark reports**: `maki-benchmark --json` records throughput, IOPS,
   bounded-memory p50/p95/p99 latency estimates, final FLUSH time and verified
   readback; `--fua` selects durable individual writes. Invalid workload

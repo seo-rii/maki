@@ -12,6 +12,8 @@ crate-type = ["lib", "cdylib"]
 default = []
 # Development/benchmark provider selectable via `provider = "fake"`.
 fake-provider = ["dep:maki-test-support"]
+# Operator-only destructive memory gate; excluded from normal ignored gates.
+cgroup-qualification = []
 
 [dependencies]
 maki-core.workspace = true
