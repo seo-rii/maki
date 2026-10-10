@@ -12,9 +12,16 @@ allocation before growth or release. Integer128 scanning and error-message
 formatting use the same ownership. Parsed values, borrowed input and messages
 formatted by callers remain caller-owned. A caller-retained `Deserializer`
 keeps its latest scratch until reuse or Drop; a visitor may still borrow it.
-The `raw_value`, `arbitrary_precision`
-and `float_roundtrip` feature paths are refused at compile time because their
-additional raw-value and lexical owners have not been covered by this patch.
+The optional `raw_value` path also guards reader accumulation, owned map/seed
+storage, internal Value conversions, display/serialization temporaries and
+abandoned storage during String-to-Box conversion. Guards survive parsing,
+UTF-8, serializer and seed errors and normal unwinding. Borrowed raw input and
+public `Box<RawValue>` outputs keep their upstream ownership. Passing an owned
+String to an arbitrary visitor transfers cleanup responsibility at
+`visit_string`; the library's own visitors immediately adopt it again.
+Maki's production parser does not enable `raw_value`. The `arbitrary_precision`
+and `float_roundtrip` paths remain refused at compile time until their separate
+number and lexical owners are covered.
 
 `rustls` erases consumed plaintext queues and deframer regions, including
 obsolete compaction tails. Replacing or releasing these buffers erases their

@@ -438,14 +438,10 @@ mod number;
 mod read;
 mod scratch;
 
-// These optional modes have separate raw-value / arbitrary-number / lexical
+// These optional modes have separate arbitrary-number / lexical
 // heap owners. Maki's audited patch must not silently enable unguarded copies.
-#[cfg(any(
-    feature = "raw_value",
-    feature = "arbitrary_precision",
-    feature = "float_roundtrip"
-))]
-compile_error!("Maki's serde_json patch has not audited raw_value, arbitrary_precision, or float_roundtrip heap ownership; these features must remain disabled");
+#[cfg(any(feature = "arbitrary_precision", feature = "float_roundtrip"))]
+compile_error!("Maki's serde_json patch has not audited arbitrary_precision or float_roundtrip heap ownership; these features must remain disabled");
 
 #[cfg(feature = "raw_value")]
 mod raw;

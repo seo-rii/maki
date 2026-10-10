@@ -4,8 +4,6 @@ use crate::number::Number;
 use crate::value::Value;
 use alloc::borrow::{Cow, ToOwned};
 use alloc::string::String;
-#[cfg(feature = "raw_value")]
-use alloc::string::ToString;
 use alloc::vec::{self, Vec};
 use core::fmt;
 use core::slice;
@@ -130,8 +128,9 @@ impl<'de> Deserialize<'de> for Value {
                     }
                     #[cfg(feature = "raw_value")]
                     Some(KeyClass::RawValue) => {
-                        let value = tri!(visitor.next_value_seed(crate::raw::BoxedFromString));
-                        crate::from_str(value.get()).map_err(de::Error::custom)
+                        let value =
+                            tri!(visitor.next_value_seed(crate::raw::GuardedStringFromString));
+                        crate::from_str(&value).map_err(de::Error::custom)
                     }
                     Some(KeyClass::Map(first_key)) => {
                         let mut values = Map::new();
@@ -360,7 +359,7 @@ impl<'de> serde::Deserializer<'de> for Value {
         {
             if name == crate::raw::TOKEN {
                 return visitor.visit_map(crate::raw::OwnedRawDeserializer {
-                    raw_value: Some(self.to_string()),
+                    raw_value: Some(crate::scratch::GuardedString::from_display(&self)),
                 });
             }
         }
@@ -889,7 +888,7 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
         {
             if name == crate::raw::TOKEN {
                 return visitor.visit_map(crate::raw::OwnedRawDeserializer {
-                    raw_value: Some(self.to_string()),
+                    raw_value: Some(crate::scratch::GuardedString::from_display(self)),
                 });
             }
         }

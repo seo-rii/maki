@@ -76,8 +76,14 @@ class VendorErasureContract(unittest.TestCase):
         self.assertTrue(check(self.root, self.metadata))
 
     def test_unreviewed_parser_feature_is_rejected(self):
+        for feature in ("arbitrary_precision", "float_roundtrip"):
+            with self.subTest(feature=feature):
+                self.metadata["resolve"]["nodes"][0]["features"] = ["std", feature]
+                self.assertTrue(check(self.root, self.metadata))
+
+    def test_reviewed_raw_value_feature_is_allowed(self):
         self.metadata["resolve"]["nodes"][0]["features"].append("raw_value")
-        self.assertTrue(check(self.root, self.metadata))
+        self.assertEqual(check(self.root, self.metadata), [])
 
     def test_dependency_patch_removal_is_rejected(self):
         (self.root / "Cargo.toml").write_text("[patch.crates-io]\n")

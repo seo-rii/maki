@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::scratch::{GuardedString, Scratch};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -142,7 +143,7 @@ impl ToOwned for RawValue {
     type Owned = Box<RawValue>;
 
     fn to_owned(&self) -> Self::Owned {
-        RawValue::from_owned(self.json.to_owned().into_boxed_str())
+        RawValue::from_owned(Box::<str>::from(&self.json))
     }
 }
 
@@ -184,6 +185,7 @@ impl RawValue {
     /// - the input has no leading or trailing whitespace, and
     /// - the input has capacity equal to its length.
     pub fn from_string(json: String) -> Result<Box<Self>, Error> {
+        let json = GuardedString::from_string(json);
         let borrowed = tri!(crate::from_str::<&Self>(&json));
         if borrowed.json.len() < json.len() {
             return Ok(borrowed.to_owned());
@@ -197,7 +199,9 @@ impl RawValue {
     /// This is the unchecked counterpart of [`RawValue::from_string`], for
     /// strings that are already known to be valid JSON, such as the output of
     /// another JSON serializer. Unlike `from_string`, it does not re-parse the
-    /// string; the only cost is `String::into_boxed_str`.
+    /// string. If capacity equals length, the existing allocation is reused.
+    /// Otherwise the text is copied into an exactly sized allocation and the
+    /// complete original allocation is erased before being freed.
     ///
     /// # Safety
     ///
@@ -226,6 +230,7 @@ impl RawValue {
     /// # Ok::<(), serde_json::Error>(())
     /// ```
     pub unsafe fn from_string_unchecked(json: String) -> Box<Self> {
+        let json = GuardedString::from_string(json);
         debug_assert!(
             crate::from_str::<&Self>(&json).is_ok_and(|v| v.json.len() == json.len()),
             "from_string_unchecked: input is not a single well-formed JSON value \
@@ -335,7 +340,12 @@ pub fn to_raw_value<T>(value: &T) -> Result<Box<RawValue>, Error>
 where
     T: ?Sized + Serialize,
 {
-    let json_string = tri!(crate::to_string(value));
+    let mut bytes = Scratch::new();
+    tri!(crate::ser::to_writer(&mut bytes, value));
+    // The default serializer only emits UTF-8. Keep the complete write buffer
+    // protected on serialization errors and until its public Box handoff.
+    let json_string =
+        GuardedString::from_utf8(bytes).expect("the JSON serializer emitted invalid UTF-8");
     Ok(RawValue::from_owned(json_string.into_boxed_str()))
 }
 
@@ -497,7 +507,7 @@ impl<'de> Visitor<'de> for BoxedFromString {
     where
         E: de::Error,
     {
-        Ok(RawValue::from_owned(s.to_owned().into_boxed_str()))
+        Ok(RawValue::from_owned(Box::<str>::from(s)))
     }
 
     #[cfg(any(feature = "std", feature = "alloc"))]
@@ -505,7 +515,46 @@ impl<'de> Visitor<'de> for BoxedFromString {
     where
         E: de::Error,
     {
-        Ok(RawValue::from_owned(s.into_boxed_str()))
+        Ok(RawValue::from_owned(
+            GuardedString::from_string(s).into_boxed_str(),
+        ))
+    }
+}
+
+/// Value's raw-token branch parses another JSON value from this temporary.
+/// Return a protected private string instead of a caller-owned RawValue box.
+pub(crate) struct GuardedStringFromString;
+
+impl<'de> DeserializeSeed<'de> for GuardedStringFromString {
+    type Value = GuardedString;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for GuardedStringFromString {
+    type Value = GuardedString;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("raw value")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GuardedString::from_str(value))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GuardedString::from_string(value))
     }
 }
 
@@ -529,7 +578,7 @@ impl<'de> Deserializer<'de> for RawKeyDeserializer {
 }
 
 pub struct OwnedRawDeserializer {
-    pub raw_value: Option<String>,
+    pub raw_value: Option<GuardedString>,
 }
 
 impl<'de> MapAccess<'de> for OwnedRawDeserializer {

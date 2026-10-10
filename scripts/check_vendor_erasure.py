@@ -50,7 +50,7 @@ def check(root: Path, metadata: dict) -> list[str]:
                 errors.append(f"{name}: lockfile bypasses the pinned patch")
             if name == "serde_json":
                 features = next(n["features"] for n in metadata["resolve"]["nodes"] if n["id"] == package["id"])
-                if set(features) & {"raw_value", "arbitrary_precision", "float_roundtrip"}:
+                if set(features) & {"arbitrary_precision", "float_roundtrip"}:
                     errors.append("serde_json: an unreviewed allocation feature is enabled")
         for rel, record in fixtures["files"].items():
             path = root / "vendor" / rel

@@ -1,7 +1,7 @@
 use crate::error::{Error, ErrorCode, Result};
+#[cfg(all(feature = "raw_value", feature = "std"))]
+use crate::scratch::GuardedString;
 use crate::scratch::Scratch;
-#[cfg(feature = "raw_value")]
-use alloc::vec::Vec;
 use core::cmp;
 use core::mem;
 use core::ops::Deref;
@@ -16,8 +16,6 @@ use crate::iter::LineColIterator;
 use crate::raw::BorrowedRawDeserializer;
 #[cfg(all(feature = "raw_value", feature = "std"))]
 use crate::raw::OwnedRawDeserializer;
-#[cfg(all(feature = "raw_value", feature = "std"))]
-use alloc::string::String;
 #[cfg(feature = "raw_value")]
 use serde::de::Visitor;
 
@@ -156,7 +154,7 @@ where
     /// Temporary storage of peeked byte.
     ch: Option<u8>,
     #[cfg(feature = "raw_value")]
-    raw_buffer: Option<Vec<u8>>,
+    raw_buffer: Option<Scratch>,
 }
 
 /// JSON input source that reads from a slice of bytes.
@@ -380,7 +378,7 @@ where
 
     #[cfg(feature = "raw_value")]
     fn begin_raw_buffering(&mut self) {
-        self.raw_buffer = Some(Vec::new());
+        self.raw_buffer = Some(Scratch::new());
     }
 
     #[cfg(feature = "raw_value")]
@@ -389,7 +387,7 @@ where
         V: Visitor<'de>,
     {
         let raw = self.raw_buffer.take().unwrap();
-        let raw = match String::from_utf8(raw) {
+        let raw = match GuardedString::from_utf8(raw) {
             Ok(raw) => raw,
             Err(_) => return error(self, ErrorCode::InvalidUnicodeCodePoint),
         };

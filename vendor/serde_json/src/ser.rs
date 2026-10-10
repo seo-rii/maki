@@ -3,8 +3,6 @@
 use crate::error::{Error, ErrorCode, Result};
 use crate::io;
 use alloc::string::String;
-#[cfg(feature = "raw_value")]
-use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::fmt::{self, Display};
 use core::hint;
@@ -1509,7 +1507,7 @@ impl<'a, W: io::Write, F: Formatter> ser::Serializer for RawValueStrEmitter<'a, 
     where
         T: ?Sized + Display,
     {
-        self.serialize_str(&value.to_string())
+        self.serialize_str(&crate::scratch::GuardedString::from_display(value))
     }
 }
 

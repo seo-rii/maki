@@ -114,6 +114,10 @@ path = "tests/test.rs"
 name = "maki_scratch"
 path = "tests/maki_scratch.rs"
 
+[[test]]
+name = "maki_raw"
+path = "tests/maki_raw.rs"
+
 [dependencies.indexmap]
 version = "2.2.3"
 optional = true

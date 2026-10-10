@@ -272,9 +272,19 @@ Growth creates a guarded replacement before copying and wipes the old full
 allocation before release. Drop also wipes the full capacity, including an
 unfinished escape that never reaches a visitor. Valid JSON escapes, Unicode
 surrogates, duplicate keys, error text and locations retain upstream behavior.
-The optional `raw_value`, `arbitrary_precision` and `float_roundtrip` paths are
-refused at compile time until their additional owners have been reviewed;
-Maki's resolved default/std parser configuration does not use them.
+The optional `raw_value` path guards reader accumulation, owned map and seed
+storage, internal conversions to/from `Value`, display/serialization
+temporaries and discarded source storage during String-to-Box conversion.
+Growth and error cleanup retain the guard, including invalid UTF-8, partially
+serialized output and a seed that rejects its deserializer before consuming
+it. Borrowed raw slices and public returned `Box<RawValue>` keep their original
+ownership. An arbitrary visitor receives ownership when its `visit_string`
+callback is invoked; its subsequent cleanup is the caller's responsibility.
+The parser's own conversion visitors immediately adopt that String again.
+Owned-string and enum callbacks retain upstream behavior. Maki's resolved
+default/std configuration does not enable `raw_value`; `arbitrary_precision`
+and `float_roundtrip` remain refused at compile time until their separate
+owners are covered.
 
 The convenience `from_slice`/`from_str` functions drop their parser before
 returning. A caller that keeps a `Deserializer` alive retains its latest

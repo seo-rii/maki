@@ -56,7 +56,11 @@ jobs:
           python3 -B scripts/check_vendor_erasure.py
       - name: parser erasure and upstream compatibility (Linux)
         if: runner.os == 'Linux'
-        run: cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked
+        run: |
+          cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked
+          cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --features raw_value
+          cargo test --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --release --features raw_value --test maki_raw
+          cargo check --manifest-path vendor/serde_json/Cargo.toml --target-dir target --locked --no-default-features --features alloc,raw_value --lib
       - name: TLS erasure and upstream compatibility (Linux)
         if: runner.os == 'Linux'
         run: |

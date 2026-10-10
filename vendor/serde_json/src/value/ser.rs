@@ -1058,6 +1058,6 @@ impl serde::ser::Serializer for RawValueEmitter {
     where
         T: ?Sized + Display,
     {
-        self.serialize_str(&value.to_string())
+        self.serialize_str(&crate::scratch::GuardedString::from_display(value))
     }
 }
