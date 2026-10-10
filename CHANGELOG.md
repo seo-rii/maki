@@ -63,12 +63,18 @@ documents.
 
 ### Added
 
+- **Remote rollback witness (experimental)**: a TLS 1.3 mTLS service persists
+  exact compare-and-swap state, monotonic writer fences and restore epochs.
+  A new remote outer backing V2 gives every session a separate reserved
+  namespace. Offline snapshot, exact-current takeover and approved-root restore
+  commands never lower the witness. Existing local format bytes are unchanged;
+  no in-place conversion is supported ([operations](docs/remote-witness-service.md),
+  [migration](docs/durable-recovery.md#protected-outer-backing-formats)).
 - **Measured whole-process memory admission**: optional
   `security.memory_budget` verifies the applied cgroup-v2 ceiling, visible
   ancestor headroom and memlock before recovery and READY. The opt-in systemd
   template sets operator-measured limits; defaults remain unchanged
   ([configuration](docs/configuration.md#measured-memory-budget)).
-
 
 - **Benchmark reports**: `maki-benchmark --json` records throughput, IOPS,
   bounded-memory p50/p95/p99 latency estimates, final FLUSH time and verified

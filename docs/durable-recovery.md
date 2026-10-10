@@ -43,6 +43,30 @@ the unchanged v1 superblocks, and restoring into a fresh v2 volume matched the
 source logical hash. That result does not certify an ambiguous v1 tail, a live
 snapshot, another database engine or production cutover.
 
+## Protected outer backing formats
+
+The optional local-witness outer format remains unchanged. Remote witnesses
+select a distinct outer marker, `MAKI-REMOTE-WITNESS-COW-V2\n`, with a new
+physical namespace for each writer fence/session. Its inner flat manifest
+remains version 1; the independent witness state has its own version 1
+canonical encoding and checksum. These versions are separate from the volume's
+superblock envelope and crypto context. Older binaries and mismatched local
+or remote configurations refuse the remote marker.
+
+There is no in-place conversion between plain, local-witness and remote-witness
+backings. Create a separate empty destination with a fresh witness identity,
+then perform and verify a logical migration. Never change marker bytes or copy
+an old witness record over the current authority.
+
+Remote same-identity restoration is an explicit administrator operation: approve
+the current fence/root and the independently recorded snapshot root, verify and
+synchronize the copy, then advance the authority's generation and restore epoch.
+It deliberately replaces application history with the approved older snapshot;
+normal FLUSH/FUA crash guarantees do not mean that later acknowledged writes
+survive this operator-directed restore. Ordinary attach never accepts old roots.
+See [remote witness operations](remote-witness-service.md) for commands,
+retention costs and interrupted enrollment/recovery behavior.
+
 ## Required horizon and acknowledgement ordering
 
 Each proof is a fixed 64-byte CRC-protected record containing its generation,

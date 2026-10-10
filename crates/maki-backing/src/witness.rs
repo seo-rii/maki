@@ -24,7 +24,8 @@ const ANCHOR_FILE: &str = "anchor";
 const TEMP_FILE: &str = "anchor.next";
 const LOCK_FILE: &str = "witness.lock";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Anchor {
     pub identity: [u8; 16],
     pub generation: u64,

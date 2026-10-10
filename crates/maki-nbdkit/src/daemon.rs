@@ -64,10 +64,37 @@ pub fn check_provider_available(
     Ok(())
 }
 
+/// Construct the authenticated remote authority shared by volume lifecycle
+/// operations and explicit administrative recovery commands.
+pub fn remote_witness_client(
+    remote: &maki_format::config::RemoteWitnessSection,
+) -> Result<Arc<dyn maki_backing::remote_witness::Rpc>, DaemonError> {
+    Ok(Arc::new(maki_witness::Client::new(
+        maki_witness::ClientOptions {
+            address: remote.address.parse().map_err(|_| {
+                DaemonError::Unsupported("remote witness requires a numeric socket address".into())
+            })?,
+            server_name: remote.server_name.clone(),
+            timeout_ms: remote.timeout_ms,
+            tls: maki_witness::TlsFiles {
+                ca_file: (&remote.ca_file).into(),
+                cert_file: (&remote.client_cert_file).into(),
+                key_file: (&remote.client_key_file).into(),
+            },
+        },
+    )?))
+}
+
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
     if let Some(rollback) = &config.backing.rollback_protection {
         #[cfg(target_os = "linux")]
         {
+            if let Some(remote) = &rollback.remote {
+                return Ok(Arc::new(RollbackBacking::open_remote(
+                    Path::new(&config.backing.root),
+                    remote_witness_client(remote)?,
+                )?));
+            }
             return Ok(Arc::new(RollbackBacking::open(
                 Path::new(&config.backing.root),
                 Path::new(&rollback.witness_root),
@@ -956,11 +983,18 @@ fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, Dae
         Some(rollback) => {
             #[cfg(target_os = "linux")]
             {
-                Arc::new(RollbackBacking::create(
-                    Path::new(&config.backing.root),
-                    Path::new(&rollback.witness_root),
-                    rollback.capacity.0,
-                )?)
+                match &rollback.remote {
+                    Some(remote) => Arc::new(RollbackBacking::create_remote(
+                        Path::new(&config.backing.root),
+                        remote_witness_client(remote)?,
+                        rollback.capacity.0,
+                    )?),
+                    None => Arc::new(RollbackBacking::create(
+                        Path::new(&config.backing.root),
+                        Path::new(&rollback.witness_root),
+                        rollback.capacity.0,
+                    )?),
+                }
             }
             #[cfg(not(target_os = "linux"))]
             {

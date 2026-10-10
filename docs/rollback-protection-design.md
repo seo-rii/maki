@@ -1,12 +1,23 @@
 # Rollback protection proposal
 
-Status: extended design, updated 2026-09-21. An experimental, bounded
-[local-witness backing](rollback-protection.md) now implements an independent
-authenticated root, retained copy-on-write generations and fail-closed recovery.
-It uses a flat authenticated manifest and an exclusive local writer lock; the
-remote witness, distributed fencing and explicit epoch-restore protocol below
-remain proposals. Default V2/V3 backings still cannot detect every restoration
-of an older, internally valid volume image or ciphertext for the same unit.
+Status: extended design, updated 2026-10-11. Experimental bounded
+[local and remote witness backings](rollback-protection.md) implement an
+independent authenticated root, copy-on-write pages and fail-closed recovery.
+The remote V2 implementation uses TLS 1.3 mutual authentication, durable exact
+compare-and-swap, monotonic fencing and explicit administrator restore epochs.
+It retains the flat authenticated manifest: the Merkle tree and consensus/HA
+extensions described below remain design proposals. Default V2/V3 directory
+backings still cannot detect every restoration of an older valid image.
+
+The implemented remote writer claim leaves the current descriptor unchanged,
+then copies its authenticated pages to a newly reserved physical namespace
+identified by the fresh fence and session. Only a fully synchronized copy may
+be activated. A revoked writer can finish an in-flight physical write in its
+old namespace, but cannot publish a new root or reclaim the pages referenced
+by the selected descriptor. Every cache/overlay read consults the authority.
+An administrator restore verifies a separately approved snapshot root and
+publishes it with both generation and epoch increased; it never rewinds the
+witness. See the [service and recovery guide](remote-witness-service.md).
 
 ## Recommended boundary
 

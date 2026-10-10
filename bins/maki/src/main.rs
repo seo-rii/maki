@@ -13,6 +13,10 @@ fn usage() -> ExitCode {
         "usage:
   maki volume create <config.toml> [--discard]  initialize a volume (opt-in v3 discard)
   maki volume inspect <config.toml>    print volume metadata
+  maki volume witness <config.toml>    inspect remote authority without claiming a writer
+  maki volume snapshot <config.toml> <backup-dir>  capture an offline remote backing
+  maki volume takeover <admin-config> <fence> <current-root-hex>
+  maki volume restore <admin-config> <backup-dir> <fence> <current-root-hex> <snapshot-root-hex>
   maki check <config.toml> [--deep]    offline format check (--deep: journal, checkpoint, slots)
   maki status <config.toml>            daemon status (control socket)
   maki metrics <config.toml>           metrics snapshot (control socket)
@@ -96,6 +100,14 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e.to_string()),
+            }
+        }
+        ["volume", command, ..]
+            if matches!(*command, "witness" | "snapshot" | "takeover" | "restore") =>
+        {
+            match remote_volume(&argv[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(error),
             }
         }
         ["volume", "inspect", config] => match inspect(config) {
@@ -209,6 +221,209 @@ fn running_as_root() -> bool {
 fn fail(message: String) -> ExitCode {
     eprintln!("error: {message}");
     ExitCode::FAILURE
+}
+
+fn witness_record(
+    rpc: &dyn maki_backing::remote_witness::Rpc,
+) -> Result<maki_backing::remote_witness::Record, String> {
+    use maki_backing::remote_witness::{Action, Request};
+    let record = rpc
+        .call(&Request {
+            operation_id: *uuid::Uuid::new_v4().as_bytes(),
+            expected: None,
+            action: Action::Inspect,
+        })
+        .map_err(|e| e.to_string())?;
+    record.validate().map_err(|e| e.to_string())?;
+    Ok(record)
+}
+
+fn approved_hash(text: &str) -> Result<[u8; 32], String> {
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("approved roots must be 64 lower-case hexadecimal characters".into());
+    }
+    let mut hash = [0; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid approved root")?;
+    }
+    Ok(hash)
+}
+
+fn approved_record(
+    rpc: &dyn maki_backing::remote_witness::Rpc,
+    fence: &str,
+    root: &str,
+) -> Result<maki_backing::remote_witness::Record, String> {
+    let fence: u64 = fence
+        .parse()
+        .map_err(|_| "expected fence must be an unsigned integer")?;
+    let root = approved_hash(root)?;
+    let record = witness_record(rpc)?;
+    if record.fence != fence
+        || record.current.as_ref().map(|current| current.anchor.root) != Some(root)
+    {
+        return Err("authority changed or approval does not match its current fence/root; inspect and obtain a new approval".into());
+    }
+    Ok(record)
+}
+
+fn confirm_released(
+    rpc: &dyn maki_backing::remote_witness::Rpc,
+    before: &maki_backing::remote_witness::Record,
+    restored: bool,
+) -> Result<maki_backing::remote_witness::Record, String> {
+    use maki_backing::remote_witness::Phase;
+    let after = witness_record(rpc)?;
+    let old = before.current.as_ref().ok_or("uninitialized authority")?;
+    let current = after
+        .current
+        .as_ref()
+        .ok_or("authority lost its current descriptor")?;
+    if after.identity != before.identity
+        || after.phase != Phase::Released
+        || Some(after.fence) != before.fence.checked_add(1)
+        || Some(current.anchor.generation) != old.anchor.generation.checked_add(u64::from(restored))
+        || Some(current.epoch) != old.epoch.checked_add(u64::from(restored))
+        || (!restored && current.anchor.root != old.anchor.root)
+    {
+        return Err("transition or writer release could not be confirmed; inspect authority before proceeding".into());
+    }
+    Ok(after)
+}
+
+const SNAPSHOT_DESCRIPTOR_LIMIT: u64 = 64 * 1024;
+
+fn read_snapshot(
+    directory: &std::path::Path,
+) -> Result<maki_backing::remote_witness::Descriptor, String> {
+    use maki_backing::{Backing, FileBacking};
+    if !directory.is_dir() {
+        return Err("snapshot directory does not exist".into());
+    }
+    let disk = FileBacking::new(directory).map_err(|e| e.to_string())?;
+    let file = disk
+        .open("snapshot.json", false)
+        .map_err(|e| e.to_string())?;
+    let length = file.len().map_err(|e| e.to_string())?;
+    if length == 0 || length > SNAPSHOT_DESCRIPTOR_LIMIT {
+        return Err("invalid snapshot descriptor size".into());
+    }
+    let mut bytes = vec![0; length as usize];
+    file.read_at(0, &mut bytes).map_err(|e| e.to_string())?;
+    let descriptor: maki_backing::remote_witness::Descriptor =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid snapshot descriptor")?;
+    descriptor.validate().map_err(|e| e.to_string())?;
+    if serde_json::to_vec(&descriptor).map_err(|e| e.to_string())? != bytes
+        || file.len().map_err(|e| e.to_string())? != length
+    {
+        return Err("snapshot descriptor is not canonical or changed while being read".into());
+    }
+    Ok(descriptor)
+}
+
+fn remote_volume(args: &[&str]) -> Result<(), String> {
+    use maki_backing::remote_witness::Phase;
+    use maki_backing::{Backing, FileBacking, RollbackBacking};
+    use std::path::Path;
+    #[cfg(not(target_os = "linux"))]
+    if args.first() != Some(&"witness") {
+        return Err("remote rollback volume operations are supported only on Linux".into());
+    }
+    let config = args
+        .get(1)
+        .ok_or("remote volume command requires a configuration file")?;
+    let cfg = read_config(config)?;
+    let remote = cfg
+        .backing
+        .rollback_protection
+        .as_ref()
+        .and_then(|rollback| rollback.remote.as_ref())
+        .ok_or("command requires remote rollback protection")?;
+    let rpc = maki_nbdkit::daemon::remote_witness_client(remote).map_err(|e| e.to_string())?;
+    match args {
+        ["witness", _] => {
+            println!(
+                "{}",
+                serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
+            );
+        }
+        ["snapshot", _, directory] => {
+            let target = Path::new(directory);
+            let backing = RollbackBacking::open_remote(Path::new(&cfg.backing.root), rpc.clone())
+                .map_err(|e| e.to_string())?;
+            let descriptor = backing.snapshot_remote(target).map_err(|e| e.to_string())?;
+            let bytes = serde_json::to_vec(&descriptor).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > SNAPSHOT_DESCRIPTOR_LIMIT {
+                return Err("snapshot descriptor exceeds bound".into());
+            }
+            let disk = FileBacking::new(target).map_err(|e| e.to_string())?;
+            let _lock = disk.try_lock("snapshot.lock").map_err(|e| e.to_string())?;
+            if disk.exists("snapshot.json").map_err(|e| e.to_string())? {
+                return Err("snapshot descriptor already exists".into());
+            }
+            let file = disk
+                .open("snapshot.json", true)
+                .map_err(|e| e.to_string())?;
+            file.write_at(0, &bytes).map_err(|e| e.to_string())?;
+            file.set_len(bytes.len() as u64)
+                .map_err(|e| e.to_string())?;
+            file.sync_data().map_err(|e| e.to_string())?;
+            disk.sync_dir("").map_err(|e| e.to_string())?;
+            drop(backing);
+            let released = witness_record(rpc.as_ref())?;
+            if released.phase != Phase::Released || released.current.as_ref() != Some(&descriptor) {
+                return Err("snapshot was copied but writer release could not be confirmed".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
+            );
+        }
+        ["takeover", _, fence, root] => {
+            let before = approved_record(rpc.as_ref(), fence, root)?;
+            let backing = RollbackBacking::takeover_remote(
+                Path::new(&cfg.backing.root),
+                rpc.clone(),
+                &before,
+            )
+            .map_err(|e| e.to_string())?;
+            drop(backing);
+            let record = confirm_released(rpc.as_ref(), &before, false)?;
+            println!(
+                "{}",
+                serde_json::to_string(&record).map_err(|e| e.to_string())?
+            );
+        }
+        ["restore", _, directory, fence, root, approved_source] => {
+            let approved_source = approved_hash(approved_source)?;
+            let source = read_snapshot(Path::new(directory))?;
+            if source.anchor.root != approved_source {
+                return Err("snapshot root does not match the independently approved root".into());
+            }
+            let before = approved_record(rpc.as_ref(), fence, root)?;
+            let backing = RollbackBacking::restore_remote(
+                Path::new(&cfg.backing.root),
+                Path::new(directory),
+                &source,
+                rpc.clone(),
+                &before,
+            )
+            .map_err(|e| e.to_string())?;
+            drop(backing);
+            let record = confirm_released(rpc.as_ref(), &before, true)?;
+            println!(
+                "{}",
+                serde_json::to_string(&record).map_err(|e| e.to_string())?
+            );
+        }
+        _ => return Err("invalid remote volume command arguments; see maki usage".into()),
+    }
+    Ok(())
 }
 
 fn inspect(config: &str) -> Result<(), String> {

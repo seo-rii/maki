@@ -611,9 +611,24 @@ pub struct BackingSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackProtectionSection {
+    #[serde(default)]
     pub witness_root: String,
+    #[serde(default)]
+    pub remote: Option<RemoteWitnessSection>,
     /// Space reserved for the protected outer backing format at creation.
     pub capacity: ByteSize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteWitnessSection {
+    /// Numeric socket address; TLS authenticates server_name independently.
+    pub address: String,
+    pub server_name: String,
+    pub timeout_ms: u64,
+    pub ca_file: String,
+    pub client_cert_file: String,
+    pub client_key_file: String,
 }
 
 fn d_512() -> u32 {
@@ -944,25 +959,60 @@ impl VolumeConfig {
             )));
         }
         if let Some(rollback) = &self.backing.rollback_protection {
-            let witness = rollback.witness_root.as_str();
-            if witness.trim().is_empty()
-                || !(witness.starts_with('/') || std::path::Path::new(witness).is_absolute())
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "backing.rollback_protection.witness_root {witness:?} must be an absolute path"
-                )));
-            }
-            let root_path = std::path::Path::new(root);
-            let witness_path = std::path::Path::new(witness);
-            if root_path == witness_path {
-                return Err(ConfigError::Invalid(
-                    "rollback witness and backing root must be distinct".to_string(),
-                ));
-            }
-            if root_path.starts_with(witness_path) || witness_path.starts_with(root_path) {
-                return Err(ConfigError::Invalid(
-                    "rollback witness and backing root must not be nested".to_string(),
-                ));
+            if let Some(remote) = &rollback.remote {
+                if !rollback.witness_root.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "rollback protection selects exactly one local or remote witness".into(),
+                    ));
+                }
+                if remote
+                    .address
+                    .parse::<std::net::SocketAddr>()
+                    .map_or(true, |a| a.port() == 0)
+                    || remote.server_name.is_empty()
+                    || remote.server_name.len() > 253
+                    || remote
+                        .server_name
+                        .bytes()
+                        .any(|b| !b.is_ascii_alphanumeric() && !b".-:".contains(&b))
+                    || !(1..=60_000).contains(&remote.timeout_ms)
+                {
+                    return Err(ConfigError::Invalid(
+                        "remote witness requires a numeric address, TLS server name and timeout_ms in 1..=60000".into(),
+                    ));
+                }
+                for path in [
+                    &remote.ca_file,
+                    &remote.client_cert_file,
+                    &remote.client_key_file,
+                ] {
+                    if !std::path::Path::new(path).is_absolute() || path.contains('\0') {
+                        return Err(ConfigError::Invalid(
+                            "remote witness TLS credentials require absolute file paths".into(),
+                        ));
+                    }
+                }
+            } else {
+                let witness = rollback.witness_root.as_str();
+                if witness.trim().is_empty()
+                    || !(witness.starts_with('/') || std::path::Path::new(witness).is_absolute())
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path"
+                    )));
+                }
+                let root_path = std::path::Path::new(root);
+                let witness_path = std::path::Path::new(witness);
+                if root_path == witness_path {
+                    return Err(ConfigError::Invalid(
+                        "rollback witness and backing root must be distinct".to_string(),
+                    ));
+                }
+                if root_path.starts_with(witness_path) || witness_path.starts_with(root_path) {
+                    return Err(ConfigError::Invalid(
+                        "rollback witness and backing root must not be nested".to_string(),
+                    ));
+                }
             }
             let capacity = rollback.capacity.0;
             if capacity == 0 || capacity % 4096 != 0 {

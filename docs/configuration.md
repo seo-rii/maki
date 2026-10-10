@@ -19,7 +19,7 @@ HTTP example is available at
 | `crypto.grpc` | gRPC endpoints, TLS, method paths, metadata, and message-size limit |
 | `limits` | Request, byte, queue, batch, endpoint concurrency, and in-memory overlay bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
-| `backing.rollback_protection` | Experimental Linux COW format: independent `witness_root` and preallocated logical-page `capacity` (new volumes only) |
+| `backing.rollback_protection` | Experimental Linux COW format: preallocated logical-page `capacity` and exactly one independent local `witness_root` or mTLS `remote` authority (new volumes only; [remote service](remote-witness-service.md)) |
 | `cache` | Read-cache mode, size, TTL, locking, and zeroization |
 | `nbd` | Socket, negotiated I/O geometry, and Tokio runtime worker count |
 | `control` | Administrative socket and group |

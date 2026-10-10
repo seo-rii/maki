@@ -24,6 +24,7 @@ maki-crypto-http.workspace = true
 maki-crypto-websocket.workspace = true
 maki-crypto-grpc.workspace = true
 maki-backing.workspace = true
+maki-witness.workspace = true
 maki-control.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

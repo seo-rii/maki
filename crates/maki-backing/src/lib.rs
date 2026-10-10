@@ -15,6 +15,7 @@
 pub mod file;
 pub mod mem;
 pub mod path;
+pub mod remote_witness;
 mod rollback;
 pub mod witness;
 pub use rollback::RollbackBacking;

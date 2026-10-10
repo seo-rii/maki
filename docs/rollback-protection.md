@@ -1,19 +1,23 @@
 # Rollback-protected backing
 
-Status: experimental implementation, updated 2026-10-08. This is an explicitly selected
+Status: experimental implementation, updated 2026-10-11. This is an explicitly selected
 Linux storage format for new volumes. Default v2/v3 directory backings retain
 their existing rollback limitation. Production qualification of this new format
 is still pending; earlier v2/v3 GCE reset and RSS results do not qualify it.
 
+There are two explicitly selected modes. The local mode uses a separate trusted
+filesystem and retains its existing on-disk layout. The remote mode uses a
+separate mTLS service and the new outer V2 format. Both are experimental.
+
 ## Trust boundary
 
-The protected backing keeps its current authenticated manifest root in a
+The **local mode** keeps its current authenticated manifest root in a
 separate **trusted witness directory**. A lifetime exclusive witness lock allows
 one writer. The witness contains a storage identity, monotonically increasing
 generation and SHA-256 manifest root. It must survive independently of backing
 snapshots and must not be restored, replaced or deleted with them.
 
-The implementation rejects nested directories and a witness on the same
+Local mode rejects nested directories and a witness on the same
 filesystem (`st_dev`) as the backing. Different filesystems alone do not prove
 independent administration or snapshot policies. Use a separately managed,
 durable local filesystem with working file locks, atomic rename and directory
@@ -29,7 +33,57 @@ Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.
 
-## Configuration and creation
+## Remote witness mode
+
+Replace `witness_root` with a remote section; configuring both is refused:
+
+```toml
+[backing.rollback_protection]
+capacity = "128MiB"
+
+[backing.rollback_protection.remote]
+address = "192.0.2.10:9443"
+server_name = "witness.example.net"
+timeout_ms = 5000
+ca_file = "/etc/maki/witness/ca.pem"
+client_cert_file = "/etc/maki/witness/writer.pem"
+client_key_file = "/etc/maki/witness/writer.key"
+```
+
+Provision the independently managed authority and its writer/admin certificate
+allowlist as described in [remote witness operations](remote-witness-service.md).
+Private key files must be owner-only regular files. Requests use TLS 1.3 mutual
+authentication, bounded frames and deadlines. There is no offline fallback.
+The metadata service is single-node with durable exact compare-and-swap and an
+exclusive state lock, not a replicated consensus service. Its storage and
+restore authority must remain independent of the backing's administration.
+
+Every attach claims a higher fence, authenticates the current manifest and
+copies its committed pages into a fresh, fully reserved namespace before
+activation. The old session cannot publish, and any in-flight physical write
+stays within its old namespace. Normal attach requires a released session;
+crashes, ambiguous responses and failed copies require explicit administrator
+intervention. Cached and overlay reads also consult the remote authority.
+
+Each retained namespace reserves the same arena and manifest footprint described
+below. At 128 MiB capacity this is approximately 288 MiB **per session**, including
+normal offline checks and reattachments. Old namespaces are retained; automatic
+GC is not implemented. Budget disk usage and retain old writer data until it
+cannot still be accessed. No latency claim from the local mode applies to this
+per-operation remote protocol.
+
+The remote CLI can create an offline committed snapshot, take over a writer,
+and intentionally restore an approved older snapshot under the same identity.
+Restore requires administrator credentials, an exact current fence/root and a
+separately approved snapshot hash. It increases generation and epoch; it never
+lowers the authority. See the service guide for copy-pasteable commands.
+If initial creation stops before the authority has any current descriptor,
+this build refuses to resume that enrollment. Preserve the failed artifacts,
+confirm it never activated, and provision a separate fresh authority identity
+and empty backing. Never delete or reinitialize an existing authority to make
+an old backing attach.
+
+## Local configuration and creation
 
 Merge these sections into a valid small-volume configuration, retaining the
 provider, credentials and other required sections:
@@ -145,6 +199,9 @@ implemented; current Maki volume operations do not require them.
 
 ## Backup and recovery procedure
 
+This section describes **local-witness** recovery. Remote snapshots and explicit
+restore epochs use the [remote service procedure](remote-witness-service.md).
+
 A protected backing snapshot is usable with its original identity only while
 it matches the authoritative witness generation. Subsequent commits can make a
 previously valid backup too old. Keep DB-native or logical backups for recovery
@@ -211,14 +268,18 @@ per path. This first implementation targets bounded experiments, not high-volume
 production I/O. Whole-process RSS, latency and hard-power-loss qualification on
 independent persistent disks remain outstanding.
 
-If backing data is behind the witness, restore the exact current generation or
-keep the volume offline. To intentionally use older data, restore a DB-native or
-logical backup into a newly created volume and witness identity. An offline
-reader for an older
-protected backing without its current witness is not provided. There is no
-same-identity rollback override or restore-epoch reset. A remote transactional
-witness, multi-host fencing and controlled epoch restore are future work
-described in the [design](rollback-protection-design.md).
+If backing data is behind the witness, normal attach refuses it. Local mode
+requires the exact current generation or a logical migration to a new identity.
+Remote mode additionally provides explicit administrator-approved restoration
+with increasing generation and epoch. Neither mode offers an offline reader
+that claims freshness without its authority. The [extended design](rollback-protection-design.md)
+still describes future Merkle-tree and replicated-service work.
+
+Remote automated tests cover exact CAS contention, state persistence faults,
+real TLS role and certificate enforcement, lost commit/claim/activation/release
+replies, writer takeover at in-flight write and commit boundaries, authenticated
+snapshot restoration, and revocation of actual Engine cache and overlay reads.
+These are local fault tests, not multi-host or physical power-loss campaigns.
 
 The automated suites cover whole-backing replay, changed arena pages, missing
 witnesses, conflicting writers, file/directory durability separation, stale open

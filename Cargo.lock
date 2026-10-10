@@ -849,9 +849,12 @@ dependencies = [
  "maki-core",
  "maki-format",
  "maki-nbdkit",
+ "maki-witness",
+ "rcgen",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1094,6 +1097,7 @@ dependencies = [
  "maki-format",
  "maki-nbdkit",
  "maki-test-support",
+ "maki-witness",
  "parking_lot",
  "prost",
  "rcgen",
@@ -1137,6 +1141,38 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "maki-witness"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "maki-backing",
+ "maki-crypto",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "maki-witness-cli"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "maki-backing",
+ "maki-witness",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
  "uuid",
 ]
 
@@ -1737,8 +1773,8 @@ dependencies = [
  "memchr",
  "serde",
  "serde_core",
- "zmij",
  "zeroize",
+ "zmij",
 ]
 
 [[package]]

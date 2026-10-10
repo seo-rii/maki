@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::witness::FileWitness;
+
+mod remote;
 use crate::{path, Backing, BackingFile, FileBacking, VolumeLock};
+use remote::Witness;
 
 const PAGE: u64 = 4096;
 const MAX_CAPACITY: u64 = 1 << 30;
@@ -182,9 +185,9 @@ pub struct RollbackBacking {
 }
 
 struct State {
-    disk: FileBacking,
+    disk: Arc<dyn Backing>,
     arena: Arc<dyn BackingFile>,
-    witness: FileWitness,
+    witness: Witness,
     _disk_lock: Box<dyn VolumeLock>,
     committed: Manifest,
     manifest_slot: usize,
@@ -372,6 +375,24 @@ impl RollbackBacking {
         manifest: Manifest,
         slot: usize,
     ) -> Self {
+        Self::assemble_witness(
+            Arc::new(disk),
+            arena,
+            Witness::Local(witness),
+            disk_lock,
+            manifest,
+            slot,
+        )
+    }
+
+    fn assemble_witness(
+        disk: Arc<dyn Backing>,
+        arena: Arc<dyn BackingFile>,
+        witness: Witness,
+        disk_lock: Box<dyn VolumeLock>,
+        manifest: Manifest,
+        slot: usize,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
                 committed_slots: slots_of(manifest.files.values()),
@@ -409,7 +430,7 @@ fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -
     disk.sync_dir("")
 }
 
-fn write_manifest(disk: &FileBacking, slot: usize, bytes: &[u8]) -> io::Result<()> {
+fn write_manifest(disk: &dyn Backing, slot: usize, bytes: &[u8]) -> io::Result<()> {
     let file = disk.open(MANIFESTS[slot], false)?;
     file.write_at(8, bytes)?;
     file.write_at(0, &(bytes.len() as u64).to_le_bytes())?;
@@ -501,7 +522,7 @@ impl State {
         let slot = 1 - self.manifest_slot;
         let result = (|| {
             self.arena.sync_data()?;
-            write_manifest(&self.disk, slot, &bytes)?;
+            write_manifest(self.disk.as_ref(), slot, &bytes)?;
             self.witness
                 .advance(digest(b"maki.rollback.manifest.v1\0", &bytes))
         })();

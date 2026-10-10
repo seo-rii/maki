@@ -1,0 +1,22 @@
+[package]
+name = "maki-witness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+maki-backing.workspace = true
+maki-crypto.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2 = "0.10"
+base64.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
