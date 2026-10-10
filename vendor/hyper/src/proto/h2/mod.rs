@@ -1,10 +1,10 @@
 use std::error::Error as StdError;
 use std::future::Future;
-use std::io::{Cursor, IoSlice};
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use futures_core::ready;
 use h2::SendStream;
 use http::header::{HeaderName, CONNECTION, TRANSFER_ENCODING, UPGRADE};
@@ -287,7 +287,7 @@ impl<B: Buf> SendStreamExt for SendStream<SendBuf<B>> {
 #[repr(usize)]
 enum SendBuf<B> {
     Buf(B),
-    Cursor(Cursor<Box<[u8]>>),
+    Owned(BytesMut),
     None,
 }
 
@@ -296,7 +296,7 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn remaining(&self) -> usize {
         match self {
             Self::Buf(b) => b.remaining(),
-            Self::Cursor(c) => Buf::remaining(c),
+            Self::Owned(c) => Buf::remaining(c),
             Self::None => 0,
         }
     }
@@ -305,7 +305,7 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn chunk(&self) -> &[u8] {
         match self {
             Self::Buf(b) => b.chunk(),
-            Self::Cursor(c) => c.chunk(),
+            Self::Owned(c) => c.chunk(),
             Self::None => &[],
         }
     }
@@ -314,7 +314,7 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn advance(&mut self, cnt: usize) {
         match self {
             Self::Buf(b) => b.advance(cnt),
-            Self::Cursor(c) => c.advance(cnt),
+            Self::Owned(c) => c.advance(cnt),
             Self::None => {}
         }
     }
@@ -322,7 +322,7 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
         match self {
             Self::Buf(b) => b.chunks_vectored(dst),
-            Self::Cursor(c) => c.chunks_vectored(dst),
+            Self::Owned(c) => c.chunks_vectored(dst),
             Self::None => 0,
         }
     }

@@ -42,8 +42,11 @@ HTTP/2's h2/tokio-util frame storage and tonic's gRPC encode/decode buffers use
 the patched `BytesMut`/`Bytes` backing. They do not require a separate protocol
 fork. These guarantees cover those byte allocations, not every container,
 header table, optional compressor or caller-supplied body type in a transport.
-Hyper's HTTP/2 upgraded tunnels use a separate boxed cursor that Maki does not
-use; that allocation is outside this patch's coverage.
+Hyper's HTTP/2 upgraded-tunnel send queue also uses the patched mutable owner.
+The owner exists before copying, erases consumed prefixes, and wipes its full
+backing on failed send, queued cancellation, unwinding or final release. Maki
+does not currently use upgraded tunnels; this coverage preserves their existing
+flow-control and wire behavior without enabling them in a provider.
 
 The test-only `maki-test-allocator` observes initialized live allocations just
 before release. It initializes spare capacity so observation is defined, stores

@@ -1,12 +1,11 @@
 use std::future::Future;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use atomic_waker::AtomicWaker;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_channel::{mpsc, oneshot};
 use futures_core::{ready, Stream};
 use h2::{Reason, RecvStream, SendStream};
@@ -53,9 +52,17 @@ pub(super) struct H2Upgraded {
 }
 
 struct UpgradedSendStreamBridge {
-    tx: mpsc::Sender<Cursor<Box<[u8]>>>,
+    tx: mpsc::Sender<BytesMut>,
     error_rx: oneshot::Receiver<crate::Error>,
     close_notify: Arc<UpgradedCloseNotify>,
+}
+
+fn copy_send_data(buf: &[u8]) -> BytesMut {
+    // The patched mutable owner exists before copying. It erases consumed
+    // bytes and its full backing on release, including rejected queued writes.
+    let mut data = BytesMut::with_capacity(buf.len());
+    data.extend_from_slice(buf);
+    data
 }
 
 impl Drop for UpgradedSendStreamBridge {
@@ -103,7 +110,7 @@ pin_project! {
         #[pin]
         h2_tx: SendStream<SendBuf<B>>,
         #[pin]
-        rx: mpsc::Receiver<Cursor<Box<[u8]>>>,
+        rx: mpsc::Receiver<BytesMut>,
         close_notify: Arc<UpgradedCloseNotify>,
         error_tx: Option<oneshot::Sender<crate::Error>>,
     }
@@ -187,7 +194,7 @@ where
             match me.rx.as_mut().poll_next(cx) {
                 Poll::Ready(Some(cursor)) => {
                     me.h2_tx
-                        .send_data(SendBuf::Cursor(cursor), false)
+                        .send_data(SendBuf::Owned(cursor), false)
                         .map_err(crate::Error::new_body_write)?;
                 }
                 Poll::Ready(None) => {
@@ -288,7 +295,7 @@ impl Write for H2Upgraded {
         }
 
         let n = buf.len();
-        match self.send_stream.tx.start_send(Cursor::new(buf.into())) {
+        match self.send_stream.tx.start_send(copy_send_data(buf)) {
             Ok(()) => Poll::Ready(Ok(n)),
             Err(_task_dropped) => {
                 // if the task dropped, check if there was an error
@@ -347,5 +354,154 @@ fn h2_to_io_error(e: h2::Error) -> std::io::Error {
             .expect("h2 error reported io cause without an underlying io error")
     } else {
         std::io::Error::new(std::io::ErrorKind::Other, e)
+    }
+}
+
+#[cfg(test)]
+mod maki_erasure {
+    use super::*;
+    use maki_test_allocator::watch;
+    use std::io::IoSlice;
+
+    const SECRET: &[u8] = b"maki HTTP2 tunnel plaintext before sending";
+
+    #[test]
+    fn maki_h2_upgrade_abandoned_send_erases_its_allocation() {
+        let data = copy_send_data(SECRET);
+        let allocation = watch(data.chunk().as_ptr());
+        drop(data);
+        allocation.assert_zeroized();
+    }
+
+    #[test]
+    fn maki_h2_upgrade_partial_send_erases_consumed_bytes() {
+        let mut data = SendBuf::<Bytes>::Owned(copy_send_data(SECRET));
+        let address = data.chunk().as_ptr();
+        let allocation = watch(address);
+        data.advance(7);
+        assert_eq!(data.remaining(), SECRET.len() - 7);
+        assert_eq!(data.chunk(), &SECRET[7..]);
+        let mut slices = [IoSlice::new(&[])];
+        assert_eq!(data.chunks_vectored(&mut slices), 1);
+        assert_eq!(&*slices[0], &SECRET[7..]);
+        // SAFETY: consuming this non-final prefix keeps the initialized
+        // backing allocation owned by data. Read only its still-live prefix.
+        assert_eq!(unsafe { std::slice::from_raw_parts(address, 7) }, &[0; 7]);
+        drop(data);
+        allocation.assert_zeroized();
+    }
+
+    #[test]
+    fn maki_h2_upgrade_completed_send_erases_its_allocation() {
+        let mut data = SendBuf::<Bytes>::Owned(copy_send_data(SECRET));
+        let allocation = watch(data.chunk().as_ptr());
+        data.advance(SECRET.len());
+        assert!(!data.has_remaining());
+        assert!(data.chunk().is_empty());
+        drop(data);
+        allocation.assert_zeroized();
+    }
+
+    #[test]
+    fn maki_h2_upgrade_cancelled_queue_erases_pending_send() {
+        let (mut tx, rx) = mpsc::channel(1);
+        let data = copy_send_data(SECRET);
+        let allocation = watch(data.chunk().as_ptr());
+        tx.try_send(data).unwrap();
+        drop(rx);
+        drop(tx);
+        allocation.assert_zeroized();
+    }
+
+    #[test]
+    fn maki_h2_upgrade_closed_queue_erases_rejected_send() {
+        let (mut tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let data = copy_send_data(SECRET);
+        let allocation = watch(data.chunk().as_ptr());
+        let error = tx.try_send(data).unwrap_err();
+        assert!(error.is_disconnected());
+        drop(error);
+        allocation.assert_zeroized();
+    }
+
+    #[test]
+    fn maki_h2_upgrade_send_erases_on_unwind() {
+        let data = SendBuf::<Bytes>::Owned(copy_send_data(SECRET));
+        let allocation = watch(data.chunk().as_ptr());
+        let result = std::panic::catch_unwind(move || {
+            let mut data = data;
+            data.advance(SECRET.len() + 1);
+        });
+        assert!(result.is_err());
+        allocation.assert_zeroized();
+    }
+
+    #[tokio::test]
+    async fn maki_h2_upgrade_preserves_wire_data_across_flow_control() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client_builder = h2::client::Builder::new();
+        let mut server_builder = h2::server::Builder::new();
+        server_builder.initial_window_size(1024);
+        let (client, server) = tokio::join!(
+            client_builder.handshake::<_, SendBuf<Bytes>>(client_io),
+            server_builder.handshake::<_, Bytes>(server_io)
+        );
+        let (mut client, connection) = client.unwrap();
+        let client_task = tokio::spawn(connection);
+        let mut server = server.unwrap();
+        let (received_tx, received_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let mut response = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let handler = tokio::spawn(async move {
+                let mut body = request.into_body();
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.unwrap();
+                    received.extend_from_slice(&chunk);
+                    body.flow_control().release_capacity(chunk.len()).unwrap();
+                }
+                response.send_data(Bytes::from_static(b"OK"), true).unwrap();
+                received_tx.send(received).unwrap();
+            });
+            while server.accept().await.is_some() {}
+            handler.await.unwrap();
+        });
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.invalid:443")
+            .body(())
+            .unwrap();
+        let (response, send) = client.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        let (mut upgraded, sender) =
+            pair(send, response.into_body(), super::super::ping::disabled());
+        let sender_task = tokio::spawn(sender);
+        let payload = vec![b'Q'; 100_000];
+        std::future::poll_fn(|cx| Pin::new(&mut upgraded).poll_write(cx, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::future::poll_fn(|cx| Pin::new(&mut upgraded).poll_write(cx, &payload))
+                .await
+                .unwrap(),
+            payload.len()
+        );
+        std::future::poll_fn(|cx| Pin::new(&mut upgraded).poll_shutdown(cx))
+            .await
+            .unwrap();
+        assert_eq!(received_rx.await.unwrap(), payload);
+        let mut ack = [0; 2];
+        let mut read = crate::rt::ReadBuf::new(&mut ack);
+        std::future::poll_fn(|cx| Pin::new(&mut upgraded).poll_read(cx, read.unfilled()))
+            .await
+            .unwrap();
+        assert_eq!(read.filled(), b"OK");
+        sender_task.await.unwrap();
+        client_task.abort();
+        server_task.abort();
     }
 }

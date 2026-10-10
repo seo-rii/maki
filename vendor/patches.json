@@ -22,7 +22,9 @@
         "src/proto/h1/io.rs": "21422d6c8f08aa35b9a11d74e0c2eaca80c9d185c654caa759c0335d74067288",
         "src/proto/h1/io/maki_erasure.rs": "21d836c8c84c1877e08373c87882effb4c36c0fd090d2ee3f53790ba5b5d3a55",
         "src/proto/h1/mod.rs": "a9240fb4ed63d3d8423b3e748485d53d45e42d251508388e26b1ca9c5a89a820",
-        "src/proto/h1/role.rs": "988701b72ac180f3e1431eaa4f32cb7ba03c6ea6058116bb247a830d11badd51"
+        "src/proto/h1/role.rs": "988701b72ac180f3e1431eaa4f32cb7ba03c6ea6058116bb247a830d11badd51",
+        "src/proto/h2/mod.rs": "81102d566349af893bb8526f1a2d1673c69d3148c00c65c70f183e6ae01b7c83",
+        "src/proto/h2/upgrade.rs": "61eb7d531aa31d48e1fa26cd3571d761d6db627290a49116c758bf944f2c586b"
       }
     },
     "rustls": {

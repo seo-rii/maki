@@ -333,8 +333,12 @@ header/trailer buffer and flattened output body queue. Output consumption and
 cursor compaction erase discarded ranges. Header unfolding and internal error
 formatting also retain cleanup owners. HTTP/1 input is already `BytesMut`;
 HTTP/2 frame input/output and tonic's encoded/decoded protobuf buffers use the
-same patched backing. The gRPC provider's decoded fields retain their existing
-`SecretBuffer` ownership.
+same patched backing. HTTP/2 upgraded tunnels now use it for their owned
+send queue too, replacing the separate boxed cursor. The owner exists before
+copying and survives queued cancellation, failed sends and unwinding; consuming
+data erases its exclusive prefix and final release wipes the entire backing.
+Maki providers do not enable upgraded tunnels. The gRPC provider's decoded
+fields retain their existing `SecretBuffer` ownership.
 
 The pinned `tungstenite` 0.26.2 patch guards its output queue, fragmented message
 collectors, masked-formatting temporaries and handshake read/write buffers.
@@ -345,8 +349,7 @@ contents.
 
 These changes cover application-data byte allocations on Maki's active framing
 paths. Public HTTP header/URI values, arbitrary user-supplied body buffers,
-optional compression libraries and hyper's unused HTTP/2 upgraded-tunnel
-`Cursor<Box<[u8]>>` storage remain outside this coverage. Application-owned
+optional compression libraries remain outside this coverage. Application-owned
 results, stack/register and kernel copies still have separate lifetimes.
 Allocation guards do not track compiler-created copies of inline values or
 moved temporaries.
