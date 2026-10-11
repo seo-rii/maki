@@ -48,6 +48,54 @@ impl FileBacking {
         }
     }
 
+    /// GC uses a bounded list and a pinned-directory retirement operation;
+    /// neither operation is available on pathname-only development backends.
+    pub(crate) fn gc_entries(&self) -> io::Result<Vec<String>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.directory.gc_entries()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote GC requires Linux",
+            ))
+        }
+    }
+
+    pub(crate) fn gc_retire(&self, original: &str, retired: bool) -> io::Result<GcRemoval> {
+        #[cfg(target_os = "linux")]
+        {
+            self.directory.gc_retire(original, retired)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (original, retired);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote GC requires Linux",
+            ))
+        }
+    }
+
+    pub(crate) fn gc_scope(&self, namespace: &str) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                directory: self.directory.gc_scope(namespace)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = namespace;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote GC requires Linux",
+            ))
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn resolve(&self, rel: &str, allow_empty: bool) -> io::Result<PathBuf> {
         validate(rel, allow_empty)?;
@@ -69,6 +117,12 @@ impl FileBacking {
         }
         Ok(p)
     }
+}
+
+pub(crate) enum GcRemoval {
+    Removed,
+    Live,
+    Unrecognized,
 }
 
 /// `OpenOptions` that never follow a symlink at the final component and

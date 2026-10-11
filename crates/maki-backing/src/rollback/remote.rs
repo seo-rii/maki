@@ -5,6 +5,8 @@ use super::*;
 use crate::remote_witness::{namespace, Action, Descriptor, Phase, Record, Request, Rpc};
 use crate::witness::Anchor;
 
+use super::gc::{GcReport, OperationGuard};
+
 const REMOTE_MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
 
 pub(super) enum Witness {
@@ -69,6 +71,7 @@ impl Witness {
 }
 
 pub(super) struct RemoteSession {
+    root: Arc<FileBacking>,
     rpc: Arc<dyn Rpc>,
     record: Record,
     descriptor: Descriptor,
@@ -167,7 +170,7 @@ impl Backing for Scope {
     }
 }
 
-fn remote_root(root: &Path, create: bool) -> io::Result<Arc<dyn Backing>> {
+fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -177,21 +180,8 @@ fn remote_root(root: &Path, create: bool) -> io::Result<Arc<dyn Backing>> {
     if !create && !root.is_dir() {
         return Err(missing());
     }
-    let disk: Arc<dyn Backing> = Arc::new(FileBacking::new(root)?);
-    if create {
-        let _lock = disk.try_lock("remote.enroll.lock")?;
-        if disk
-            .list("")?
-            .iter()
-            .any(|name| name != "remote.enroll.lock")
-        {
-            return Err(input("remote enrollment requires an empty backing"));
-        }
-        let marker = disk.open(MARKER, true)?;
-        marker.write_at(0, REMOTE_MAGIC)?;
-        marker.sync_data()?;
-        disk.sync_dir("")?;
-    } else {
+    let disk = Arc::new(FileBacking::new(root)?);
+    if !create {
         let marker = disk.open(MARKER, false)?;
         let mut bytes = vec![0; REMOTE_MAGIC.len()];
         if marker.len()? != bytes.len() as u64 {
@@ -205,7 +195,30 @@ fn remote_root(root: &Path, create: bool) -> io::Result<Arc<dyn Backing>> {
     Ok(disk)
 }
 
-fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Backing>> {
+/// Called with both root operation and enrollment locks held.
+fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+    if disk.list("")?.iter().any(|name| {
+        !matches!(
+            name.as_str(),
+            "remote.enroll.lock" | "remote.operation.lock"
+        )
+    }) {
+        return Err(input("remote enrollment requires an empty backing"));
+    }
+    let marker = disk.open(MARKER, true)?;
+    marker.write_at(0, REMOTE_MAGIC)?;
+    marker.set_len(REMOTE_MAGIC.len() as u64)?;
+    marker.sync_data()?;
+    disk.sync_dir("")
+}
+
+fn collect_after_activation(guard: &OperationGuard<'_>, rpc: &dyn Rpc) {
+    // An accepted root is already durable. GC failure postpones reclamation;
+    // it must not turn a successful activation into an ambiguous writer loss.
+    let _ = guard.collect(rpc);
+}
+
+pub(super) fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Backing>> {
     path::validate(name, false)?;
     if name.contains('/') || !name.starts_with("remote-") {
         return Err(invalid("invalid remote namespace"));
@@ -216,7 +229,10 @@ fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Backing>> {
     }))
 }
 
-fn load_generation(disk: &dyn Backing, descriptor: &Descriptor) -> io::Result<(Manifest, Vec<u8>)> {
+pub(super) fn load_generation(
+    disk: &dyn Backing,
+    descriptor: &Descriptor,
+) -> io::Result<(Manifest, Vec<u8>)> {
     for name in MANIFESTS {
         let candidate = (|| {
             let file = disk.open(name, false)?;
@@ -283,6 +299,11 @@ fn copy_generation(
 }
 
 impl RollbackBacking {
+    pub fn collect_remote(root: &Path, rpc: &dyn Rpc) -> io::Result<GcReport> {
+        let disk = remote_root(root, false)?;
+        OperationGuard::acquire(disk.as_ref())?.collect(rpc)
+    }
+
     pub fn create_remote(root: &Path, rpc: Arc<dyn Rpc>, capacity: u64) -> io::Result<Self> {
         validate_capacity(capacity)?;
         let expected = inspect(rpc.as_ref())?;
@@ -290,6 +311,9 @@ impl RollbackBacking {
             return Err(input("remote witness already enrolled or occupied"));
         }
         let disk = remote_root(root, true)?;
+        let guard = OperationGuard::acquire(disk.as_ref())?;
+        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        initialize_remote_root(disk.as_ref())?;
         let claim = transact(rpc.as_ref(), &expected, Action::Claim)?;
         let manifest = Manifest {
             format: 1,
@@ -300,23 +324,31 @@ impl RollbackBacking {
             entries: BTreeMap::new(),
             files: BTreeMap::new(),
         };
-        Self::activate_fork(disk, None, manifest, 0, claim, rpc)
+        let result = Self::activate_fork(disk.clone(), None, manifest, 0, claim, rpc.clone())?;
+        collect_after_activation(&guard, rpc.as_ref());
+        Ok(result)
     }
 
     pub fn open_remote(root: &Path, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
+        let guard = OperationGuard::acquire(disk.as_ref())?;
         let expected = inspect(rpc.as_ref())?;
         let claim = transact(rpc.as_ref(), &expected, Action::Claim)?;
-        Self::fork_current(disk, claim, rpc)
+        let result = Self::fork_current(disk.clone(), claim, rpc.clone())?;
+        collect_after_activation(&guard, rpc.as_ref());
+        Ok(result)
     }
 
     pub fn takeover_remote(root: &Path, rpc: Arc<dyn Rpc>, expected: &Record) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
+        let guard = OperationGuard::acquire(disk.as_ref())?;
         let claim = transact(rpc.as_ref(), expected, Action::Takeover)?;
-        Self::fork_current(disk, claim, rpc)
+        let result = Self::fork_current(disk.clone(), claim, rpc.clone())?;
+        collect_after_activation(&guard, rpc.as_ref());
+        Ok(result)
     }
 
-    fn fork_current(disk: Arc<dyn Backing>, claim: Record, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
+    fn fork_current(disk: Arc<FileBacking>, claim: Record, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
         let source = claim
             .current
             .as_ref()
@@ -327,7 +359,7 @@ impl RollbackBacking {
     }
 
     fn activate_fork(
-        disk: Arc<dyn Backing>,
+        disk: Arc<FileBacking>,
         source: Option<Arc<dyn Backing>>,
         manifest: Manifest,
         epoch: u64,
@@ -378,6 +410,7 @@ impl RollbackBacking {
             target,
             arena,
             Witness::Remote(Box::new(RemoteSession {
+                root: disk,
                 rpc,
                 record,
                 descriptor,
@@ -398,8 +431,10 @@ impl RollbackBacking {
         expected: &Record,
     ) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
+        let guard = OperationGuard::acquire(disk.as_ref())?;
         let backup = remote_root(source_root, false)?;
-        let source_disk = scope(backup, &source.namespace)?;
+        let _source_guard = OperationGuard::acquire(backup.as_ref())?;
+        let source_disk = scope(backup.clone(), &source.namespace)?;
         let (mut manifest, _) = load_generation(source_disk.as_ref(), source)?;
         let current = expected
             .current
@@ -422,7 +457,16 @@ impl RollbackBacking {
             },
         )?;
         manifest.generation = generation;
-        Self::activate_fork(disk, Some(source_disk), manifest, epoch, claim, rpc)
+        let result = Self::activate_fork(
+            disk.clone(),
+            Some(source_disk),
+            manifest,
+            epoch,
+            claim,
+            rpc.clone(),
+        )?;
+        collect_after_activation(&guard, rpc.as_ref());
+        Ok(result)
     }
 
     /// Copy the committed state under the session mutex. The caller must keep
@@ -430,11 +474,15 @@ impl RollbackBacking {
     pub fn snapshot_remote(&self, target: &Path) -> io::Result<Descriptor> {
         let mut state = self.state.lock();
         state.check()?;
-        let descriptor = match &state.witness {
-            Witness::Remote(witness) => witness.descriptor.clone(),
+        let (descriptor, source_root) = match &state.witness {
+            Witness::Remote(witness) => (witness.descriptor.clone(), witness.root.clone()),
             Witness::Local(_) => return Err(input("snapshot requires remote witness backing")),
         };
+        let _source_guard = OperationGuard::acquire(source_root.as_ref())?;
         let disk = remote_root(target, true)?;
+        let _target_guard = OperationGuard::acquire(disk.as_ref())?;
+        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        initialize_remote_root(disk.as_ref())?;
         disk.create_dir_all(&descriptor.namespace)?;
         disk.sync_dir("")?;
         let scope = scope(disk.clone(), &descriptor.namespace)?;

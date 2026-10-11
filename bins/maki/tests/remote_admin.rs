@@ -505,3 +505,24 @@ fn admin_approval_syntax_and_nonremote_configs_fail_before_mutation() {
         .success());
     drop(backing);
 }
+
+#[test]
+fn gc_keeps_live_revoked_writer_and_reclaims_it_after_drop() {
+    let f = Fixture::new();
+    let old = f.create();
+    let before = inspect(f.writer.as_ref());
+    success(&[
+        "volume",
+        "takeover",
+        f.path(true),
+        &before.fence.to_string(),
+        &root_hex(&before),
+    ]);
+    let output = success(&["volume", "gc", f.path(false)]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["skipped_live"].as_array().unwrap().len(), 1);
+    drop(old);
+    let output = success(&["volume", "gc", f.path(false)]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["removed"].as_array().unwrap().len(), 1);
+}

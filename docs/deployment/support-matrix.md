@@ -73,7 +73,7 @@ locks and atomic rename.
 | Network filesystems (NFS, SMB/CIFS) | Unsupported | Locking, `fsync` and directory-sync semantics are not honest enough for the durability model |
 | FUSE filesystems, 9p/WSL mounts | Unsupported for durability claims | Development only |
 | tmpfs, RAM disks | Unsupported for production | Tests use RAM filesystems deliberately; data does not survive a reboot |
-| Remote-witness protected backing V2 | Expected (experimental) | Separate durable TLS authority, exact compare-and-swap and physically separate writer namespaces; single service, no automatic failover or namespace garbage collection. Admin-only same-identity restore advances epoch/generation. No external qualification ([service guide](../remote-witness-service.md)) |
+| Remote-witness protected backing V2 | Expected (experimental) | Separate durable TLS authority, exact compare-and-swap and physically separate writer namespaces; single service with safe automatic namespace GC (Linux statx mount IDs and consistent lifetime locks required), no automatic failover. Admin-only same-identity restore advances epoch/generation. No external qualification ([service guide](../remote-witness-service.md)) |
 | Snapshot- or restore-managed filesystems | See limitation | Restoring an older backing image is not detected by default formats ([rollback protection](../rollback-protection.md)) |
 
 The backing directory and its ancestors must be real directories (no

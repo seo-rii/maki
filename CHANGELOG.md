@@ -63,6 +63,12 @@ documents.
 
 ### Added
 
+- **Safe automatic remote-writer namespace reclamation**: authenticate the
+  current physical root, retain authority sources and live file handles, then
+  durably retire quiescent lower-fence namespaces before confined deletion.
+  `maki volume gc` retries cleanup without claiming a writer
+  ([rollback protection](docs/rollback-protection.md#remote-namespace-reclamation)).
+
 - **Remote rollback witness (experimental)**: a TLS 1.3 mTLS service persists
   exact compare-and-swap state, monotonic writer fences and restore epochs.
   A new remote outer backing V2 gives every session a separate reserved

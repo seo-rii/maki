@@ -996,12 +996,19 @@ authenticate metadata, prevent coordinated valid rollback, or provide separate
 physical failure domains.
 
 An optional, experimental outer backing format can anchor the authenticated
-namespace and retained COW pages in an independent trusted local witness.
-`backing.rollback_protection` requires `witness_root` and `capacity`; it is Linux
+namespace and retained COW pages in an independent trusted local or remote
+witness.
+`backing.rollback_protection` requires `capacity` and exactly one independent
+local `witness_root` or authenticated `remote` witness; it is Linux
 only, restricted to new volumes, and does not reinterpret ordinary v2/v3 roots.
 Its bounded capacity, commit protocol and explicit threat model are specified in
 [Rollback-protected backing](docs/rollback-protection.md). This storage option
 does not upgrade the crypto provider's declared replay capability.
+
+Remote namespace GC MUST authenticate the current physical root, coordinate
+with forks and snapshots, retain authority sources and live lifetime locks,
+and durably retire a namespace before deleting its known files. Cleanup
+failures MAY defer reclamation but MUST NOT weaken the accepted root.
 
 Older envelope-v1-only binaries reject v2. Current writable recovery MUST refuse
 v1 before changing recovery metadata; acquiring or creating the advisory lock

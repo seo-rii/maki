@@ -222,3 +222,32 @@ service CLI. The state and volume suites separately exercise persistence,
 conflicting sessions, takeover, restoration and crash boundaries. These local
 suites do not replace independent-host, persistent-disk or disruptive campaign
 qualification.
+
+## Retire old writer namespaces
+
+A GC pass runs automatically after successful remote activation. To collect
+again after old processes have exited, run:
+
+```sh
+maki volume gc /etc/maki/volume-writer.toml
+```
+
+The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
+and `retained` namespace arrays. GC authenticates the current physical root against its authority,
+retains current/pending/restore-source namespaces and unknown entries, and only
+considers namespaces with a lower fence. An old writer's lifetime lock keeps
+its namespace live even after revocation; GC skips it until every handle has
+closed. The current arena's fixed footprint remains allocated.
+
+A root operation lock excludes source-copy races. A retired namespace is
+renamed without replacement to a tombstone and the root directory is synced
+before unlinking its contents. Later passes can finish partial tombstones.
+Authority failure, a changed record, unsafe paths, unexpected files or storage
+errors postpone reclamation; a failed automatic pass does not turn successful
+activation into an unacknowledged commit. GC never removes external backups.
+
+The confined retirement path requires Linux kernel 5.8 or later with `statx`
+mount identity support, a local backing filesystem and same-host lifetime
+locks. Do not use it across hosts on a filesystem whose lock semantics do not
+provide this exclusion. See [format compatibility](durable-recovery.md#protected-outer-backing-formats)
+for tombstone durability details.

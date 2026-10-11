@@ -67,9 +67,10 @@ intervention. Cached and overlay reads also consult the remote authority.
 
 Each retained namespace reserves the same arena and manifest footprint described
 below. At 128 MiB capacity this is approximately 288 MiB **per session**, including
-normal offline checks and reattachments. Old namespaces are retained; automatic
-GC is not implemented. Budget disk usage and retain old writer data until it
-cannot still be accessed. No latency claim from the local mode applies to this
+normal offline checks and reattachments. After activation, automatic GC reclaims lower-fence namespaces whose lifetime
+locks are free. Current roots, pending forks and restore sources remain
+protected; live handles retain their old namespace until a later cleanup.
+Budget copy headroom and retained live data. No latency claim from the local mode applies to this
 per-operation remote protocol.
 
 The remote CLI can create an offline committed snapshot, take over a writer,
@@ -323,3 +324,37 @@ For repeat runs that can be left unattended, use the
 [background runner's rollback profile](background-storage-validation.md).
 Repetition exercises the same fixed seeds with potentially different scheduling;
 it does not extend the persistent-disk qualification claim.
+
+## Remote namespace reclamation
+
+After successful creation, attach, takeover, enrollment recovery or restore,
+Maki attempts cleanup while holding the root operation lock used by every
+physical fork and snapshot. Cleanup authenticates the authority's exact current
+manifest in the pinned backing before using its fence. Each candidate must be
+canonical, have a lower fence and pass a fresh unchanged-authority check.
+Current, pending and restore-source namespaces are always retained.
+
+A namespace's existing `rollback.lock` must be available. Open file handles keep
+the session and this lock alive even after their volume object drops. Cleanup
+skips unknown files, symlinks, hardlinks, mount boundaries and original
+namespaces missing their lock file. A Linux kernel supporting statx mount IDs
+(5.8+) and consistent advisory locks for every writer are required; unsupported
+or failed automatic cleanup postpones reclamation without revoking the accepted
+new root. There is no fallback that deletes based only on a fence or filename.
+
+Quiescent namespaces are exclusively renamed into a durable `.remote-gc-`
+tombstone before unlinking known files. Interrupted retirement resumes on a
+later cleanup; the lock is removed last. The current directory and independent
+external snapshot directories are never cleanup targets. See
+[durable recovery](durable-recovery.md) for the persistence boundary.
+
+To retry cleanup after old handles close, without claiming a writer:
+
+```sh
+maki volume gc /etc/maki/protected-writer.toml
+```
+
+The command prints `removed`, `skipped_live`, `skipped_unrecognized` and
+`retained` namespace arrays as JSON. Authority outages or changes fail closed;
+inspect the cause and retry after recovery. Do not manually delete a live
+writer's namespace to recover space.

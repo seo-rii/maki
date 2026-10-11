@@ -67,6 +67,16 @@ survive this operator-directed restore. Ordinary attach never accepts old roots.
 See [remote witness operations](remote-witness-service.md) for commands,
 retention costs and interrupted enrollment/recovery behavior.
 
+Remote namespace retirement preserves the same outer format. GC first takes
+the exclusive lifetime lock of an old lower-fence namespace, retaining the
+current, pending and restore-source namespaces. It renames a retired namespace
+without replacement to `.remote-gc-{namespace}` and synchronizes the root
+directory before removing its contents. These supplementary tombstones let a
+later GC pass resume interrupted removal. A root operation lock serializes
+retirement with copying a selected source; a namespace still held by an old
+writer is skipped. GC does not remove external backups or recreate any witness
+history.
+
 ## Required horizon and acknowledgement ordering
 
 Each proof is a fixed 64-byte CRC-protected record containing its generation,

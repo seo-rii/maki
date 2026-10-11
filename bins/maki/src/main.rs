@@ -14,6 +14,7 @@ fn usage() -> ExitCode {
   maki volume create <config.toml> [--discard]  initialize a volume (opt-in v3 discard)
   maki volume inspect <config.toml>    print volume metadata
   maki volume witness <config.toml>    inspect remote authority without claiming a writer
+  maki volume gc <config.toml>         reclaim quiescent remote writer namespaces
   maki volume snapshot <config.toml> <backup-dir>  capture an offline remote backing
   maki volume takeover <admin-config> <fence> <current-root-hex>
   maki volume restore <admin-config> <backup-dir> <fence> <current-root-hex> <snapshot-root-hex>
@@ -103,7 +104,10 @@ fn main() -> ExitCode {
             }
         }
         ["volume", command, ..]
-            if matches!(*command, "witness" | "snapshot" | "takeover" | "restore") =>
+            if matches!(
+                *command,
+                "witness" | "snapshot" | "takeover" | "restore" | "gc"
+            ) =>
         {
             match remote_volume(&argv[1..]) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -350,6 +354,20 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
             println!(
                 "{}",
                 serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
+            );
+        }
+        ["gc", _] => {
+            let report =
+                RollbackBacking::collect_remote(Path::new(&cfg.backing.root), rpc.as_ref())
+                    .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "removed": report.removed,
+                    "skipped_live": report.skipped_live,
+                    "skipped_unrecognized": report.skipped_unrecognized,
+                    "retained": report.retained,
+                })
             );
         }
         ["snapshot", _, directory] => {
