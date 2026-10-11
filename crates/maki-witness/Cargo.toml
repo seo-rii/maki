@@ -13,6 +13,7 @@ serde_json.workspace = true
 uuid.workspace = true
 sha2 = "0.10"
 base64.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

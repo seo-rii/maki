@@ -55,8 +55,12 @@ or remote configurations refuse the remote marker.
 
 There is no in-place conversion between plain, local-witness and remote-witness
 backings. Create a separate empty destination with a fresh witness identity,
-then perform and verify a logical migration. Never change marker bytes or copy
-an old witness record over the current authority.
+then perform and verify a logical migration. Moving an existing file-backed
+remote authority to quorum-backed service also requires a separate destination
+with a fresh storage identity and verified logical copy; duplicating its
+authority value while the old service can still run would fork trusted history.
+Never change marker bytes or copy an old witness record over the current
+authority.
 
 Remote same-identity restoration is an explicit administrator operation: approve
 the current fence/root and the independently recorded snapshot root, verify and
@@ -83,7 +87,8 @@ storage identity and configuration capacity. Recovery uses full-record CAS
 and a higher fence/session, verifies or explicitly creates the missing
 identity/capacity binding, and synchronizes a fresh namespace before activation.
 This covers a valid marker-only legacy attempt, an uncertain initial claim and
-partially reserved unactivated namespaces. Subsequent GC may retire recognized quiescent lower-fence candidates, while
+partially reserved unactivated namespaces. Subsequent GC may retire recognized
+quiescent lower-fence candidates, while
 live handles and unknown artifacts remain protected. Recovery does not accept
 corrupt or differently bound enrollment metadata. A successful
 activation, even when its reply was lost, permanently rules out enrollment

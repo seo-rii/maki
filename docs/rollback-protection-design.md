@@ -5,9 +5,12 @@ Status: extended design, updated 2026-10-11. Experimental bounded
 independent authenticated root, copy-on-write pages and fail-closed recovery.
 The remote V2 implementation uses TLS 1.3 mutual authentication, durable exact
 compare-and-swap, monotonic fencing and explicit administrator restore epochs.
-It retains the flat authenticated manifest: the Merkle tree and consensus/HA
-extensions described below remain design proposals. Default V2/V3 directory
-backings still cannot detect every restoration of an older valid image.
+It retains the flat authenticated manifest; a Merkle-tree representation remains
+a design proposal. Optional etcd v3 quorum transactions now replicate the same
+canonical authority state, and identity-pinned clients fail over across shared
+frontends. Automatic retirement GC and same-identity initial-enrollment recovery
+are implemented with explicit physical and administrative guards. Default
+V2/V3 directory backings still cannot detect every restoration of an older valid image.
 
 The implemented remote writer claim leaves the current descriptor unchanged,
 then copies its authenticated pages to a newly reserved physical namespace
@@ -18,6 +21,23 @@ by the selected descriptor. Every cache/overlay read consults the authority.
 An administrator restore verifies a separately approved snapshot root and
 publishes it with both generation and epoch increased; it never rewinds the
 witness. See the [service and recovery guide](remote-witness-service.md).
+
+The etcd backend uses linearizable range reads and exact value/modification-
+revision transactions on one key, never leases or a local witness fallback.
+Every response must identify the independently pinned cluster and storage UUID;
+a new frontend verifies the cluster before sending a transaction there. A
+lost result retries the same role-bound operation. Replicas require quorum for
+freshness; restoring an older etcd snapshot or weakening its pin is outside the
+freshness guarantee. Witness clients share one deadline across bounded frontend
+attempts, stopping on comparison or identity failures.
+
+GC authenticates the physical current root, takes the root fork/snapshot lock,
+retains every authority source, and obtains an old namespace's existing lifetime
+lock before durable exclusive tombstone retirement. It never reuses the old
+lock path or deletes an unlocked-looking pathname without fd/mount checks.
+Enrollment recovery requires an administrator-approved exact never-activated
+record and durable immutable identity/capacity binding before claiming a higher
+fence. A descriptor that activated once can never be reset by this operation.
 
 ## Recommended boundary
 
@@ -157,4 +177,7 @@ generation disappears and that missing evidence stops readiness.
 
 The local implementation's remaining gates are persistent-disk crash campaigns,
 resource/latency qualification and independent witness operational procedures.
-The broader remote and restore protocol above requires separate implementation.
+Remote restore, initial-enrollment recovery, namespace reclamation and etcd HA
+now have automated protocol, physical-filesystem and local quorum tests. Their
+external deployment, persistent-disk crash and resource qualification remain
+required; local tests do not establish those operational properties.

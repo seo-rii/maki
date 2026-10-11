@@ -54,9 +54,11 @@ Provision the independently managed authority and its writer/admin certificate
 allowlist as described in [remote witness operations](remote-witness-service.md).
 Private key files must be owner-only regular files. Requests use TLS 1.3 mutual
 authentication, bounded frames and deadlines. There is no offline fallback.
-The metadata service is single-node with durable exact compare-and-swap and an
-exclusive state lock, not a replicated consensus service. Its storage and
-restore authority must remain independent of the backing's administration.
+The metadata service can use a local state directory with an exclusive lock or
+a replicated etcd quorum shared by stateless frontends. Identity-pinned endpoint
+sets provide frontend failover; independent copied local directories cannot.
+Its storage and restore authority must remain independent of the backing's
+administration.
 
 Every attach claims a higher fence, authenticates the current manifest and
 copies its committed pages into a fresh, fully reserved namespace before

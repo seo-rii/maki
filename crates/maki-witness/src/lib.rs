@@ -1,7 +1,12 @@
 //! Authenticated, bounded remote freshness authority transport.
 //!
 //! Each TLS 1.3 connection carries one versioned, request-id-bound RPC. The
-//! client never retries: an I/O failure can follow a durable server mutation.
+//! A single client call never retries. Identity-pinned endpoint sets retry the
+//! same operation after transport failures, resolving possible durable commits.
+
+pub mod failover;
+
+pub mod etcd;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -290,7 +295,14 @@ impl Client {
     }
 
     pub fn call<Q: Serialize, R: DeserializeOwned>(&self, request: &Q) -> io::Result<R> {
-        let deadline = Instant::now() + self.timeout;
+        self.call_until(request, Instant::now() + self.timeout)
+    }
+
+    pub(crate) fn call_until<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        request: &Q,
+        deadline: Instant,
+    ) -> io::Result<R> {
         let id = Uuid::new_v4();
         let bytes = serialize_frame(&WireRequest {
             version: WIRE_VERSION,

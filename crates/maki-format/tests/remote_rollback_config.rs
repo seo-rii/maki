@@ -61,3 +61,29 @@ fn remote_witness_requires_bounded_authenticated_transport() {
         assert!(parsed.validate().is_err(), "accepted {old} -> {new}");
     }
 }
+
+#[test]
+fn multiple_witness_addresses_require_an_explicit_storage_identity() {
+    let section = remote().replace("address = \"127.0.0.1:9443\"", "addresses = [\"127.0.0.1:9443\", \"127.0.0.1:9444\"]\nstorage_identity = \"11111111-1111-4111-8111-111111111111\"");
+    let parsed = parse_config(&config(&section)).expect("HA endpoint schema");
+    parsed.validate().expect("valid identity-pinned HA config");
+    for bad in [
+        section.replace(
+            "storage_identity = \"11111111-1111-4111-8111-111111111111\"",
+            "",
+        ),
+        section.replace("127.0.0.1:9444", "127.0.0.1:9443"),
+        section.replace(
+            "11111111-1111-4111-8111-111111111111",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        format!("address = \"127.0.0.1:9445\"\n{section}"),
+    ] {
+        assert!(
+            parse_config(&config(&bad))
+                .and_then(|cfg| cfg.validate())
+                .is_err(),
+            "accepted {bad}"
+        );
+    }
+}

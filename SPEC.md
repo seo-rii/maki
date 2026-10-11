@@ -1005,14 +1005,23 @@ Its bounded capacity, commit protocol and explicit threat model are specified in
 [Rollback-protected backing](docs/rollback-protection.md). This storage option
 does not upgrade the crypto provider's declared replay capability.
 
+A remote witness configuration MUST select exactly one numeric `address` or
+`addresses` set (1–8 distinct nonzero socket ports). A set MUST include the
+independently approved nonzero `storage_identity`; every returned authority
+record MUST match it. TLS 1.3 mutual authentication, verified `server_name`,
+absolute credential paths and `timeout_ms` in 1–60000 are required. Endpoint
+attempts share one overall deadline and MUST retry the same operation ID and
+exact predecessor; comparison or identity failures MUST NOT trigger failover.
+Quorum-backed authority frontends MUST use linearizable reads and exact-state
+transactions on a pinned cluster/key, without leases or local fallback.
+
 Initial enrollment recovery MUST require administrator approval of the exact
 never-activated authority record and original storage identity/capacity. It MUST
-advance fencing without resetting any previously activated descriptor.
-
-Remote namespace GC MUST authenticate the current physical root, coordinate
-with forks and snapshots, retain authority sources and live lifetime locks,
-and durably retire a namespace before deleting its known files. Cleanup
-failures MAY defer reclamation but MUST NOT weaken the accepted root.
+advance fencing without resetting any previously activated descriptor. Remote
+namespace GC MUST authenticate the current physical root, coordinate with forks
+and snapshots, retain authority sources and live lifetime locks, and durably
+retire a namespace before deleting its known files. Cleanup failures MAY defer
+reclamation but MUST NOT weaken an accepted root's freshness guarantee.
 
 Older envelope-v1-only binaries reject v2. Current writable recovery MUST refuse
 v1 before changing recovery metadata; acquiring or creating the advisory lock

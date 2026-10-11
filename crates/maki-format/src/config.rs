@@ -623,7 +623,13 @@ pub struct RollbackProtectionSection {
 #[serde(deny_unknown_fields)]
 pub struct RemoteWitnessSection {
     /// Numeric socket address; TLS authenticates server_name independently.
+    #[serde(default)]
     pub address: String,
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    /// Mandatory for endpoint failover; every response must match this identity.
+    #[serde(default)]
+    pub storage_identity: Option<uuid::Uuid>,
     pub server_name: String,
     pub timeout_ms: u64,
     pub ca_file: String,
@@ -965,10 +971,23 @@ impl VolumeConfig {
                         "rollback protection selects exactly one local or remote witness".into(),
                     ));
                 }
-                if remote
-                    .address
-                    .parse::<std::net::SocketAddr>()
-                    .map_or(true, |a| a.port() == 0)
+                let addresses = if remote.addresses.is_empty() {
+                    std::slice::from_ref(&remote.address)
+                } else {
+                    remote.addresses.as_slice()
+                };
+                let mut unique = std::collections::HashSet::new();
+                if addresses.len() > 8
+                    || (!remote.addresses.is_empty() && !remote.address.is_empty())
+                    || (!remote.addresses.is_empty() && remote.storage_identity.is_none())
+                    || remote
+                        .storage_identity
+                        .is_some_and(|identity| identity.is_nil())
+                    || addresses.iter().any(|address| {
+                        address
+                            .parse::<std::net::SocketAddr>()
+                            .map_or(true, |a| a.port() == 0 || !unique.insert(a))
+                    })
                     || remote.server_name.is_empty()
                     || remote.server_name.len() > 253
                     || remote
@@ -978,7 +997,7 @@ impl VolumeConfig {
                     || !(1..=60_000).contains(&remote.timeout_ms)
                 {
                     return Err(ConfigError::Invalid(
-                        "remote witness requires a numeric address, TLS server name and timeout_ms in 1..=60000".into(),
+                        "remote witness requires one address or 1..=8 unique addresses with storage_identity, a TLS server name and timeout_ms in 1..=60000".into(),
                     ));
                 }
                 for path in [

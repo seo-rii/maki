@@ -29,7 +29,7 @@ fn help_describes_explicit_init_and_separate_serve() {
     let output = command(&["--help"]);
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for name in ["init", "serve", "inspect", "fingerprint"] {
+    for name in ["init", "init-etcd", "serve", "inspect", "fingerprint"] {
         assert!(help.contains(name));
     }
 }

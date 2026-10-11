@@ -69,20 +69,45 @@ pub fn check_provider_available(
 pub fn remote_witness_client(
     remote: &maki_format::config::RemoteWitnessSection,
 ) -> Result<Arc<dyn maki_backing::remote_witness::Rpc>, DaemonError> {
-    Ok(Arc::new(maki_witness::Client::new(
-        maki_witness::ClientOptions {
-            address: remote.address.parse().map_err(|_| {
-                DaemonError::Unsupported("remote witness requires a numeric socket address".into())
-            })?,
-            server_name: remote.server_name.clone(),
-            timeout_ms: remote.timeout_ms,
-            tls: maki_witness::TlsFiles {
-                ca_file: (&remote.ca_file).into(),
-                cert_file: (&remote.client_cert_file).into(),
-                key_file: (&remote.client_key_file).into(),
-            },
-        },
-    )?))
+    let addresses = if remote.addresses.is_empty() {
+        std::slice::from_ref(&remote.address)
+    } else {
+        remote.addresses.as_slice()
+    };
+    let options = addresses
+        .iter()
+        .map(|address| {
+            Ok(maki_witness::ClientOptions {
+                address: address.parse().map_err(|_| {
+                    DaemonError::Unsupported(
+                        "remote witness requires a numeric socket address".into(),
+                    )
+                })?,
+                server_name: remote.server_name.clone(),
+                timeout_ms: remote.timeout_ms,
+                tls: maki_witness::TlsFiles {
+                    ca_file: (&remote.ca_file).into(),
+                    cert_file: (&remote.client_cert_file).into(),
+                    key_file: (&remote.client_key_file).into(),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, DaemonError>>()?;
+    if let Some(identity) = remote.storage_identity {
+        Ok(Arc::new(maki_witness::failover::FailoverClient::new(
+            options,
+            *identity.as_bytes(),
+            remote.timeout_ms,
+        )?))
+    } else if options.len() == 1 && remote.addresses.is_empty() {
+        Ok(Arc::new(maki_witness::Client::new(
+            options.into_iter().next().expect("checked singleton"),
+        )?))
+    } else {
+        Err(DaemonError::Unsupported(
+            "witness failover requires an explicit storage_identity".into(),
+        ))
+    }
 }
 
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {

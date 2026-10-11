@@ -32,6 +32,39 @@ See [Rollback-protected backing](rollback-protection.md) for the witness trust
 boundary, capacity/reserve sizing, creation and systemd access requirements.
 This option is off by default and does not upgrade existing volumes.
 
+
+## Remote witness endpoint sets
+
+A single authority retains the existing numeric `address` field. To share one
+etcd-backed authority through several frontends, replace it with an explicit
+endpoint set and independently approved outer storage identity:
+
+```toml
+[backing.rollback_protection.remote]
+addresses = ["192.0.2.10:9443", "192.0.2.11:9443"]
+storage_identity = "01234567-89ab-cdef-0123-456789abcdef"
+server_name = "witness.example.test"
+timeout_ms = 5000
+ca_file = "/etc/maki/witness-ca.pem"
+client_cert_file = "/etc/maki/writer.cert.pem"
+client_key_file = "/run/credentials/maki/writer.key.pem"
+```
+
+Select exactly one of `address` or `addresses`; an endpoint set contains 1–8
+unique numeric socket addresses with nonzero ports. `storage_identity` is
+mandatory for a set, optional for a single address, and cannot be nil. It pins
+the outer witness identity, distinct from the inner superblock UUID. All
+frontends use the same verified `server_name`, approved identity and shared
+etcd key. Independently copied local witness directories cannot provide HA.
+
+One deadline of `timeout_ms` (1–60000 ms) covers the entire endpoint attempt
+sequence. A stalled frontend receives a bounded share, leaving time for later
+frontends. Transport failures retry the identical operation ID and predecessor;
+permission, identity, malformed-response and comparison errors stop immediately.
+Backend quorum loss refuses freshness checks and durable advances. See the
+[service guide](remote-witness-service.md) for backend initialization and TLS
+configuration; this configuration creates no infrastructure.
+
 ## Providers
 
 | `crypto.provider` | Transport | Integrity | TLS status |

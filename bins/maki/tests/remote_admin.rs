@@ -589,3 +589,37 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
         assert!(!run(&args).status.success());
     }
 }
+
+#[test]
+fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_inspect() {
+    let f = Fixture::new();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable = closed.local_addr().unwrap();
+    drop(closed);
+    let identity = uuid::Uuid::from_bytes([1; 16]).to_string();
+    let raw = std::fs::read_to_string(&f.writer_config).unwrap().replace(
+        &format!("address=\"{}\"", f._service.address),
+        &format!(
+            "addresses=[\"{unavailable}\",\"{}\"]\nstorage_identity=\"{identity}\"",
+            f._service.address
+        ),
+    );
+    let config = f.dir.path().join("ha.toml");
+    std::fs::write(&config, &raw).unwrap();
+    let path = config.to_str().unwrap();
+    success(&["volume", "create", path]);
+    success(&["volume", "inspect", path]);
+    let output = success(&["volume", "witness", path]);
+    let before: Record = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(before.identity, [1; 16]);
+    assert_eq!(before.phase, Phase::Released);
+    assert!(before.current.is_some());
+    std::fs::write(
+        &config,
+        raw.replace(&identity, &uuid::Uuid::from_bytes([2; 16]).to_string()),
+    )
+    .unwrap();
+    assert!(!run(&["volume", "witness", path]).status.success());
+    assert!(!run(&["volume", "create", path]).status.success());
+    assert_eq!(inspect(f.writer.as_ref()), before);
+}

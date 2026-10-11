@@ -78,6 +78,13 @@ documents.
   `maki volume gc` retries cleanup without claiming a writer
   ([rollback protection](docs/rollback-protection.md#remote-namespace-reclamation)).
 
+- **Optional etcd-quorum witness HA**: stateless TLS frontends share a pinned
+  cluster/key through linearizable reads and exact canonical-state transactions;
+  identity-pinned endpoint sets retry identical operations within one deadline.
+  Explicit `maki-witness init-etcd` initializes new authorities; there is no
+  automatic local fallback or restore of rolled-back witness state
+  ([service guide](docs/remote-witness-service.md)).
+
 - **Remote rollback witness (experimental)**: a TLS 1.3 mTLS service persists
   exact compare-and-swap state, monotonic writer fences and restore epochs.
   A new remote outer backing V2 gives every session a separate reserved
