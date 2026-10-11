@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use maki_backing::remote_gc::OperationGuard;
 use maki_backing::remote_witness::{namespace, Action, Descriptor, Phase, Record, Request, Rpc};
@@ -9,6 +9,12 @@ use maki_backing::witness::Anchor;
 use maki_backing::{Backing, FileBacking};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+// fork temporarily inherits every open file description, including flock
+// locks, until exec closes CLOEXEC descriptors. Exclude process creation from
+// tests that expect dropping the final local lock to release it immediately;
+// ordinary GC tests still run concurrently.
+static PROCESS_SPAWN: RwLock<()> = RwLock::new(());
 
 #[derive(Serialize)]
 struct EmptyManifest {
@@ -121,6 +127,9 @@ fn authority(disk: &FileBacking, state: Record) -> Authority {
 
 #[test]
 fn removes_only_quiescent_lower_fences_and_keeps_authority_root() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     let live = descriptor(2).namespace;
@@ -157,6 +166,9 @@ fn removes_only_quiescent_lower_fences_and_keeps_authority_root() {
 
 #[test]
 fn restore_and_pending_fork_sources_are_retained() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let mut state = record(5);
     state.current = Some(descriptor(3));
@@ -179,6 +191,9 @@ fn restore_and_pending_fork_sources_are_retained() {
 
 #[test]
 fn operation_guard_excludes_a_second_process_view_of_same_pinned_root() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (dir, disk) = root();
     let second = FileBacking::new(dir.path()).unwrap();
     let guard = OperationGuard::acquire(&disk).unwrap();
@@ -191,6 +206,9 @@ fn operation_guard_excludes_a_second_process_view_of_same_pinned_root() {
 
 #[test]
 fn unavailable_or_invalid_authority_cannot_delete_anything() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     populate(&disk, &old);
@@ -215,6 +233,9 @@ fn unavailable_or_invalid_authority_cannot_delete_anything() {
 
 #[test]
 fn unexpected_contents_and_missing_original_lock_are_preserved() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let extra = descriptor(1).namespace;
     let missing_lock = descriptor(2).namespace;
@@ -241,6 +262,9 @@ fn unexpected_contents_and_missing_original_lock_are_preserved() {
 
 #[test]
 fn resumes_each_durable_tombstone_unlink_prefix_without_recreating_lock() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let files = [
         "rollback.arena",
@@ -269,6 +293,9 @@ fn resumes_each_durable_tombstone_unlink_prefix_without_recreating_lock() {
 
 #[test]
 fn symlinks_hardlinks_and_foreign_names_never_escape_or_partially_delete() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::symlink;
     let (dir, disk) = root();
     let outside = tempfile::tempdir().unwrap();
@@ -305,6 +332,9 @@ fn symlinks_hardlinks_and_foreign_names_never_escape_or_partially_delete() {
 
 #[test]
 fn pinned_root_rename_cannot_redirect_gc_to_a_replacement_directory() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = tempfile::tempdir().unwrap();
     let original = parent.path().join("volume");
     let renamed = parent.path().join("original");
@@ -329,6 +359,9 @@ fn pinned_root_rename_cannot_redirect_gc_to_a_replacement_directory() {
 
 #[test]
 fn planted_current_tombstone_and_original_collision_are_preserved() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let current = descriptor(3).namespace;
     let current_tombstone = format!(".remote-gc-{current}");
@@ -350,6 +383,9 @@ fn planted_current_tombstone_and_original_collision_are_preserved() {
 
 #[test]
 fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let (dir, disk) = root();
     let old = descriptor(1).namespace;
@@ -385,6 +421,9 @@ fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current
 
 #[test]
 fn operation_guard_is_exclusive_across_actual_processes() {
+    let _process = PROCESS_SPAWN
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     const CHILD_ROOT: &str = "MAKI_GC_CHILD_ROOT";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let disk = FileBacking::new(root).unwrap();
@@ -423,6 +462,9 @@ fn operation_guard_is_exclusive_across_actual_processes() {
 
 #[test]
 fn authority_change_aborts_before_deleting_a_newly_selected_source() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct ChangedAuthority {
         calls: AtomicUsize,
@@ -457,6 +499,9 @@ fn authority_change_aborts_before_deleting_a_newly_selected_source() {
 
 #[test]
 fn wrong_backing_format_and_oversized_root_fail_before_reclamation() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     populate(&disk, &old);
@@ -481,6 +526,9 @@ fn wrong_backing_format_and_oversized_root_fail_before_reclamation() {
 
 #[test]
 fn valid_authority_for_another_identity_cannot_reclaim_this_backing() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     let newer = descriptor(5).namespace;
@@ -500,6 +548,9 @@ fn valid_authority_for_another_identity_cannot_reclaim_this_backing() {
 
 #[test]
 fn retired_namespace_with_a_live_lifetime_lock_is_never_unlinked() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let original = descriptor(1).namespace;
     let retired = format!(".remote-gc-{original}");
@@ -513,18 +564,114 @@ fn retired_namespace_with_a_live_lifetime_lock_is_never_unlinked() {
     assert_eq!(report.skipped_live, std::slice::from_ref(&retired));
     assert!(disk.exists(&format!("{retired}/rollback.arena")).unwrap());
     drop(lock);
+    let report = OperationGuard::acquire(&disk)
+        .unwrap()
+        .collect(&rpc)
+        .unwrap();
     assert_eq!(
-        OperationGuard::acquire(&disk)
-            .unwrap()
-            .collect(&rpc)
-            .unwrap()
-            .removed,
-        [original]
+        report.removed,
+        [original],
+        "GC report after the lifetime lock is dropped: {report:?}"
     );
 }
 
 #[test]
+fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let _process = PROCESS_SPAWN
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, disk) = root();
+    let original = descriptor(1).namespace;
+    let retired = format!(".remote-gc-{original}");
+    populate(&disk, &retired);
+    let rpc = authority(&disk, record(3));
+    let lock = disk.try_lock(&format!("{retired}/rollback.lock")).unwrap();
+
+    let mut ready = [-1; 2];
+    let mut release = [-1; 2];
+    // SAFETY: each array has space for the two newly owned descriptors.
+    assert_eq!(
+        unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let [ready_read, ready_write] = ready.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+    assert_eq!(
+        unsafe { libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let [release_read, release_write] = release.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+
+    struct Child(libc::pid_t);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                // SAFETY: this is our unreaped child. Clean up even if a parent
+                // assertion fails, so it cannot retain a volume lock forever.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+
+    // SAFETY: the child performs only async-signal-safe libc calls and _exit;
+    // it never runs Rust destructors or touches inherited allocator/test locks.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe {
+            libc::close(ready_read.as_raw_fd());
+            libc::close(release_write.as_raw_fd());
+            let mut byte = 1_u8;
+            if libc::write(ready_write.as_raw_fd(), (&byte as *const u8).cast(), 1) != 1 {
+                libc::_exit(91);
+            }
+            if libc::read(release_read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) != 1 {
+                libc::_exit(92);
+            }
+            libc::_exit(0);
+        }
+    }
+    let mut child = Child(pid);
+    drop(ready_write);
+    drop(release_read);
+    let mut ready_read = std::fs::File::from(ready_read);
+    let mut release_write = std::fs::File::from(release_write);
+    ready_read.read_exact(&mut [0]).unwrap();
+    drop(lock);
+
+    let report = OperationGuard::acquire(&disk)
+        .unwrap()
+        .collect(&rpc)
+        .unwrap();
+    assert_eq!(report.skipped_live, std::slice::from_ref(&retired));
+    assert!(report.removed.is_empty());
+    assert!(disk.exists(&format!("{retired}/rollback.arena")).unwrap());
+
+    release_write.write_all(&[1]).unwrap();
+    let mut status = 0;
+    // SAFETY: wait for our own child into valid status storage.
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    child.0 = 0;
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    let report = OperationGuard::acquire(&disk)
+        .unwrap()
+        .collect(&rpc)
+        .unwrap();
+    assert_eq!(report.removed, [original]);
+    assert!(!disk.exists(&retired).unwrap());
+}
+
+#[test]
 fn seeded_retention_oracle_covers_live_originals_and_every_retirement_prefix() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::collections::BTreeSet;
     let (_dir, disk) = root();
     let files = [
