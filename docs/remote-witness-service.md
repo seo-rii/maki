@@ -177,11 +177,37 @@ Malformed, truncated, oversized, noncanonical or symlinked descriptors are
 refused. Wrong approval values and writer-role credentials cannot authorize a
 restore or takeover. Volume snapshot/takeover/restore operations require Linux.
 
-If initial enrollment fails after claiming an empty authority, no provided CLI
-command resumes a claim that has no current descriptor. Preserve the failed
-artifacts for diagnosis. Use a fresh storage identity and new empty backing and
-authority directories after checking that no acknowledged volume was enrolled;
-never overwrite or reinitialize the existing authority as a recovery shortcut.
+## Resume interrupted initial enrollment
+
+An initialized descriptor can never be cleared through enrollment recovery,
+including when its activation reply was lost. If authority inspection shows
+`current = null`, preserve the failed backing and review its exact fence,
+storage identity and original configuration capacity. In Python, after
+`import uuid`, format the inspected identity as
+`str(uuid.UUID(bytes=bytes(record["identity"])))`. Then use administrator
+credentials:
+
+```sh
+maki volume resume-enrollment /etc/maki/volume-admin.toml EXPECTED_FENCE APPROVED_STORAGE_UUID
+```
+
+Add `--discard` for an inner v3 volume; the default initializes inner v2. The
+command compares the full authority record, recovers the same storage identity
+under a higher fence/session, synchronizes a fresh namespace, and completes
+normal initial volume creation. Earlier claim candidates remain fenced out.
+A durable `remote.enrollment` binding fixes the approved identity and capacity
+before the claim. Explicit recovery can create a missing binding for a valid
+legacy marker-only attempt; a different or corrupt existing binding refuses
+rather than being silently replaced. Recognized quiescent lower-fence candidates may be retired by the subsequent
+GC pass; live handles and unknown artifacts are preserved. Quarantine damaged binding evidence for explicit
+operator investigation.
+
+If activation actually succeeded, use exact-current takeover and inspect the
+selected state. This command does not reset it or automatically finish inner
+volume initialization that stopped after outer activation. See
+[enrollment recovery](rollback-protection.md#resume-interrupted-initial-enrollment)
+for the compatibility and initialization limits.
+
 
 The nbdkit process's opt-in memory policy is separate from this service process.
 Choose service-manager memory and locked-memory limits (`MemoryMax` and

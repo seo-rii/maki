@@ -526,3 +526,66 @@ fn gc_keeps_live_revoked_writer_and_reclaims_it_after_drop() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["removed"].as_array().unwrap().len(), 1);
 }
+struct LoseClaims(Arc<dyn Rpc>);
+impl Rpc for LoseClaims {
+    fn call(&self, request: &Request) -> std::io::Result<Record> {
+        let result = self.0.call(request)?;
+        if request.action == Action::Claim {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "lost claim reply",
+            ))
+        } else {
+            Ok(result)
+        }
+    }
+}
+#[test]
+fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initialization() {
+    for discard in [false, true] {
+        let f = Fixture::new();
+        assert!(RollbackBacking::create_remote(
+            &f.root,
+            Arc::new(LoseClaims(f.writer.clone())),
+            64 * 1024
+        )
+        .is_err());
+        let before = inspect(f.writer.as_ref());
+        let identity = uuid::Uuid::from_bytes(before.identity).to_string();
+        let fence = before.fence.to_string();
+        for (admin, approved_fence, approved_identity) in [
+            (false, fence.clone(), identity.clone()),
+            (true, (before.fence + 1).to_string(), identity.clone()),
+            (true, fence.clone(), uuid::Uuid::new_v4().to_string()),
+        ] {
+            assert!(!run(&[
+                "volume",
+                "resume-enrollment",
+                f.path(admin),
+                &approved_fence,
+                &approved_identity
+            ])
+            .status
+            .success());
+            assert_eq!(inspect(f.writer.as_ref()), before);
+        }
+        let mut args = vec![
+            "volume",
+            "resume-enrollment",
+            f.path(true),
+            &fence,
+            &identity,
+        ];
+        if discard {
+            args.push("--discard");
+        }
+        let output = success(&args);
+        let after: Record = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.fence, before.fence + 1);
+        assert_eq!(after.phase, Phase::Released);
+        assert!(after.current.is_some());
+        success(&["volume", "inspect", f.path(false)]);
+        assert!(!run(&args).status.success());
+    }
+}

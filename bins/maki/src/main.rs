@@ -15,6 +15,7 @@ fn usage() -> ExitCode {
   maki volume inspect <config.toml>    print volume metadata
   maki volume witness <config.toml>    inspect remote authority without claiming a writer
   maki volume gc <config.toml>         reclaim quiescent remote writer namespaces
+  maki volume resume-enrollment <admin-config> <fence> <storage-uuid> [--discard]
   maki volume snapshot <config.toml> <backup-dir>  capture an offline remote backing
   maki volume takeover <admin-config> <fence> <current-root-hex>
   maki volume restore <admin-config> <backup-dir> <fence> <current-root-hex> <snapshot-root-hex>
@@ -106,7 +107,7 @@ fn main() -> ExitCode {
         ["volume", command, ..]
             if matches!(
                 *command,
-                "witness" | "snapshot" | "takeover" | "restore" | "gc"
+                "witness" | "snapshot" | "takeover" | "restore" | "resume-enrollment" | "gc"
             ) =>
         {
             match remote_volume(&argv[1..]) {
@@ -368,6 +369,45 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                     "skipped_unrecognized": report.skipped_unrecognized,
                     "retained": report.retained,
                 })
+            );
+        }
+        ["resume-enrollment", _, fence, identity]
+        | ["resume-enrollment", _, fence, identity, "--discard"] => {
+            let fence: u64 = fence
+                .parse()
+                .map_err(|_| "approved fence must be an unsigned integer")?;
+            let identity = uuid::Uuid::parse_str(identity)
+                .map_err(|_| "approved storage identity must be a UUID")?;
+            if identity.is_nil() {
+                return Err("approved storage identity must be nonzero".into());
+            }
+            let before = witness_record(rpc.as_ref())?;
+            if before.identity != *identity.as_bytes()
+                || before.fence != fence
+                || before.current.is_some()
+            {
+                return Err(
+                    "enrollment approval does not match a never-activated authority".into(),
+                );
+            }
+            maki_nbdkit::daemon::resume_enrollment_from_config(
+                &cfg,
+                rpc.clone(),
+                &before,
+                args.len() == 5,
+            )
+            .map_err(|e| e.to_string())?;
+            let after = witness_record(rpc.as_ref())?;
+            if after.identity != before.identity
+                || Some(after.fence) != before.fence.checked_add(1)
+                || after.phase != Phase::Released
+                || after.current.is_none()
+            {
+                return Err("enrollment initialized but writer release could not be confirmed; inspect authority before proceeding".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&after).map_err(|e| e.to_string())?
             );
         }
         ["snapshot", _, directory] => {

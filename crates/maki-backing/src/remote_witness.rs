@@ -183,6 +183,7 @@ pub enum Action {
     Inspect,
     Claim,
     Takeover,
+    RecoverEnrollment,
     ClaimRestore { source: Descriptor },
     Activate { descriptor: Descriptor },
     Advance { anchor: Anchor },
@@ -230,6 +231,98 @@ impl Stored {
     }
 }
 
+/// Canonical deterministic authority state shared by durable storage adapters.
+///
+/// The bytes are exactly the existing file-authority v1 envelope. Adapters must
+/// compare the entire accepted state and durably commit the returned candidate
+/// before returning its record. A rejected operation leaves this value intact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalState {
+    stored: Stored,
+}
+
+impl CanonicalState {
+    pub fn initial(identity: [u8; 16]) -> io::Result<Self> {
+        if identity == [0; 16] {
+            return Err(input("nil remote witness identity"));
+        }
+        Ok(Self {
+            stored: Stored {
+                format: 1,
+                record: Record {
+                    identity,
+                    current: None,
+                    fence: 0,
+                    session: [0; 16],
+                    phase: Phase::Released,
+                    restore_source: None,
+                    last_operation: [0; 16],
+                },
+                last_request_hash: None,
+            },
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        Ok(Self {
+            stored: decode(bytes)?,
+        })
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        encode(&self.stored)
+    }
+
+    pub fn record(&self) -> &Record {
+        &self.stored.record
+    }
+
+    /// Apply an exact full-record CAS, including authenticated-role-bound replay.
+    pub fn apply(&self, role: Role, request: &Request) -> io::Result<Self> {
+        if request.action == Action::Inspect {
+            if request
+                .expected
+                .as_ref()
+                .is_some_and(|r| r != self.record())
+            {
+                return Err(conflict());
+            }
+            return Ok(self.clone());
+        }
+        if request.operation_id == [0; 16] {
+            return Err(input("nil remote witness operation id"));
+        }
+        let encoded = serde_json::to_vec(&(role, request)).map_err(io::Error::other)?;
+        if encoded.len() > MAX_BYTES {
+            return Err(input("remote witness request too large"));
+        }
+        let request_hash = digest(REQUEST_DOMAIN, &encoded);
+        if request.operation_id == self.record().last_operation {
+            return if self.stored.last_request_hash == Some(request_hash) {
+                Ok(self.clone())
+            } else {
+                Err(input(
+                    "remote witness operation id reused with different request or role",
+                ))
+            };
+        }
+        if request.expected.as_ref() != Some(self.record()) {
+            return Err(conflict());
+        }
+        let mut next = self.record().clone();
+        transition(&mut next, role, request)?;
+        next.last_operation = request.operation_id;
+        next.validate()?;
+        Ok(Self {
+            stored: Stored {
+                format: 1,
+                record: next,
+                last_request_hash: Some(request_hash),
+            },
+        })
+    }
+}
+
 /// A separately persisted freshness authority for exactly one volume.
 ///
 /// Its stable lock covers every request and must outlive the server. Errors
@@ -271,19 +364,7 @@ impl StateStore {
                 "remote witness already enrolled",
             ));
         }
-        let stored = Stored {
-            format: 1,
-            record: Record {
-                identity,
-                current: None,
-                fence: 0,
-                session: [0; 16],
-                phase: Phase::Released,
-                restore_source: None,
-                last_operation: [0; 16],
-            },
-            last_request_hash: None,
-        };
+        let stored = CanonicalState::initial(identity)?.stored;
         // Confined rename requires an existing destination. The synced empty
         // sentinel makes interrupted enrollment invalid, never silently usable.
         let placeholder = backing.open(STATE_FILE, true)?;
@@ -335,45 +416,14 @@ impl StateStore {
                 return Err(error);
             }
         }
-        if request.action == Action::Inspect {
-            if request
-                .expected
-                .as_ref()
-                .is_some_and(|r| r != &self.stored.record)
-            {
-                return Err(conflict());
-            }
+        let candidate = CanonicalState {
+            stored: self.stored.clone(),
+        }
+        .apply(role, request)?;
+        let stored = candidate.stored;
+        if stored == self.stored {
             return Ok(self.stored.record.clone());
         }
-        if request.operation_id == [0; 16] {
-            return Err(input("nil remote witness operation id"));
-        }
-        let encoded = serde_json::to_vec(&(role, request)).map_err(io::Error::other)?;
-        if encoded.len() > MAX_BYTES {
-            return Err(input("remote witness request too large"));
-        }
-        let request_hash = digest(REQUEST_DOMAIN, &encoded);
-        if request.operation_id == self.stored.record.last_operation {
-            return if self.stored.last_request_hash == Some(request_hash) {
-                Ok(self.stored.record.clone())
-            } else {
-                Err(input(
-                    "remote witness operation id reused with different request or role",
-                ))
-            };
-        }
-        if request.expected.as_ref() != Some(&self.stored.record) {
-            return Err(conflict());
-        }
-        let mut next = self.stored.record.clone();
-        transition(&mut next, role, request)?;
-        next.last_operation = request.operation_id;
-        next.validate()?;
-        let stored = Stored {
-            format: 1,
-            record: next,
-            last_request_hash: Some(request_hash),
-        };
         if let Err(error) = publish(self.backing.as_ref(), &stored) {
             self.poisoned = true;
             return Err(error);
@@ -386,13 +436,31 @@ impl StateStore {
 fn transition(next: &mut Record, role: Role, request: &Request) -> io::Result<()> {
     match &request.action {
         Action::Inspect => unreachable!("inspect handled before transition"),
-        Action::Claim | Action::Takeover | Action::ClaimRestore { .. } => {
+        Action::Claim
+        | Action::Takeover
+        | Action::RecoverEnrollment
+        | Action::ClaimRestore { .. } => {
             match &request.action {
                 Action::Claim if next.phase != Phase::Released => return Err(conflict()),
-                Action::Takeover | Action::ClaimRestore { .. } if role != Role::Admin => {
+                Action::Takeover | Action::RecoverEnrollment | Action::ClaimRestore { .. }
+                    if role != Role::Admin =>
+                {
                     return Err(denied())
                 }
                 _ => {}
+            }
+            if request.action == Action::Takeover && next.current.is_none() {
+                return Err(input(
+                    "uninitialized backing requires explicit enrollment recovery",
+                ));
+            }
+            if request.action == Action::RecoverEnrollment
+                && (next.current.is_some()
+                    || !matches!(next.phase, Phase::Released | Phase::Claimed))
+            {
+                return Err(input(
+                    "cannot recover enrollment after its first activation",
+                ));
             }
             if let Action::ClaimRestore { source } = &request.action {
                 source.validate()?;

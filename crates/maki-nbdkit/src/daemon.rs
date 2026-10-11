@@ -1006,6 +1006,42 @@ fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, Dae
         }
         None => build_backing(&config)?,
     };
+    initialize_volume(&config, backing.as_ref(), discard)
+}
+
+/// Finish initial registration only after an explicitly approved, never-active
+/// witness recovery. Existing witnessed roots are never reset by this entrypoint.
+pub fn resume_enrollment_from_config(
+    config: &VolumeConfig,
+    rpc: Arc<dyn maki_backing::remote_witness::Rpc>,
+    expected: &maki_backing::remote_witness::Record,
+    discard: bool,
+) -> Result<Superblock, DaemonError> {
+    config.validate()?;
+    let rollback = config
+        .backing
+        .rollback_protection
+        .as_ref()
+        .filter(|rollback| rollback.remote.is_some())
+        .ok_or_else(|| {
+            DaemonError::Unsupported(
+                "enrollment recovery requires remote rollback protection".into(),
+            )
+        })?;
+    let backing = maki_backing::RollbackBacking::recover_enrollment_remote(
+        Path::new(&config.backing.root),
+        rpc,
+        rollback.capacity.0,
+        expected,
+    )?;
+    initialize_volume(config, &backing, discard)
+}
+
+fn initialize_volume(
+    config: &VolumeConfig,
+    backing: &dyn Backing,
+    discard: bool,
+) -> Result<Superblock, DaemonError> {
     let geometry = config.geometry()?;
     let superblock = Superblock {
         generation: 0,
@@ -1026,9 +1062,9 @@ fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, Dae
             .unwrap_or(0),
     };
     Ok(if discard {
-        init::create_volume_with_discard(backing.as_ref(), superblock)?
+        init::create_volume_with_discard(backing, superblock)?
     } else {
-        init::create_volume(backing.as_ref(), superblock)?
+        init::create_volume(backing, superblock)?
     })
 }
 

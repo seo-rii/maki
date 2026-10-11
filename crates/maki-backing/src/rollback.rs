@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::witness::FileWitness;
 
+mod enrollment;
 pub mod gc;
 mod remote;
 use crate::{path, Backing, BackingFile, FileBacking, VolumeLock};

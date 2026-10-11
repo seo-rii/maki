@@ -67,6 +67,30 @@ survive this operator-directed restore. Ordinary attach never accepts old roots.
 See [remote witness operations](remote-witness-service.md) for commands,
 retention costs and interrupted enrollment/recovery behavior.
 
+New remote creation also writes `remote.enrollment` before its first claim.
+This supplementary immutable envelope is exactly 64 bytes: eight-byte
+`MAKIRE01` marker, 16-byte storage identity, little-endian 64-bit approved
+capacity, and a domain-separated SHA-256 checksum of the preceding 32 bytes.
+It has its own version 1 encoding. It does not change the remote COW marker,
+flat manifest encoding, witness state envelope, inner superblock or crypto
+context. Already activated remote volumes without this supplementary file
+remain readable; there is no in-place conversion or authority recreation.
+
+Interrupted initial enrollment can be explicitly resumed under the same
+storage identity only when the independent authority has never selected any
+current descriptor. An administrator approves the exact observed fence,
+storage identity and configuration capacity. Recovery uses full-record CAS
+and a higher fence/session, verifies or explicitly creates the missing
+identity/capacity binding, and synchronizes a fresh namespace before activation.
+This covers a valid marker-only legacy attempt, an uncertain initial claim and
+partially reserved unactivated namespaces. Subsequent GC may retire recognized quiescent lower-fence candidates, while
+live handles and unknown artifacts remain protected. Recovery does not accept
+corrupt or differently bound enrollment metadata. A successful
+activation, even when its reply was lost, permanently rules out enrollment
+reset. Ordinary takeover retains that selected manifest; incomplete inner
+volume initialization after activation still requires explicit inspection and
+recovery. See [initial enrollment recovery](rollback-protection.md#resume-interrupted-initial-enrollment).
+
 Remote namespace retirement preserves the same outer format. GC first takes
 the exclusive lifetime lock of an old lower-fence namespace, retaining the
 current, pending and restore-source namespaces. It renames a retired namespace

@@ -67,22 +67,65 @@ intervention. Cached and overlay reads also consult the remote authority.
 
 Each retained namespace reserves the same arena and manifest footprint described
 below. At 128 MiB capacity this is approximately 288 MiB **per session**, including
-normal offline checks and reattachments. After activation, automatic GC reclaims lower-fence namespaces whose lifetime
+normal offline checks and reattachments. After activation, automatic GC reclaims
+lower-fence namespaces whose lifetime
 locks are free. Current roots, pending forks and restore sources remain
 protected; live handles retain their old namespace until a later cleanup.
-Budget copy headroom and retained live data. No latency claim from the local mode applies to this
-per-operation remote protocol.
+Budget copy headroom and retained live data. No latency claim from the local
+mode applies to this per-operation remote protocol.
 
 The remote CLI can create an offline committed snapshot, take over a writer,
 and intentionally restore an approved older snapshot under the same identity.
 Restore requires administrator credentials, an exact current fence/root and a
 separately approved snapshot hash. It increases generation and epoch; it never
 lowers the authority. See the service guide for copy-pasteable commands.
-If initial creation stops before the authority has any current descriptor,
-this build refuses to resume that enrollment. Preserve the failed artifacts,
-confirm it never activated, and provision a separate fresh authority identity
-and empty backing. Never delete or reinitialize an existing authority to make
-an old backing attach.
+An administrator can resume initial enrollment while the authority has never
+activated a descriptor, using the procedure below. An initialized descriptor
+cannot be reset through enrollment recovery, including when its activation
+reply was lost. Never delete or reinitialize an existing authority to make an
+old backing attach.
+
+### Resume interrupted initial enrollment
+
+Keep the volume detached and automatic restarts disabled. Preserve the failed
+backing and inspect the independently managed authority:
+
+```sh
+maki volume witness /etc/maki/protected-admin.toml
+maki volume resume-enrollment /etc/maki/protected-admin.toml 1 11111111-1111-1111-1111-111111111111
+```
+
+Replace `1` with the exact inspected fence and the example UUID with the
+approved **storage identity** from the authority, not the inner volume UUID.
+The administrator configuration uses an administrator certificate and the
+original backing root, provider, geometry and approved capacity. Add `--discard`
+to create an inner v3 volume; the default initializes an inner v2 volume.
+This command completes normal initial volume creation after recovering the
+outer backing's enrollment.
+
+The authority must have `current = null`; successful first activation makes
+that condition permanently unavailable. Recovery compares the full inspected
+record, requires administrator credentials and selects a higher fence with a
+fresh physical namespace. Old claim candidates and late replies cannot publish
+over that namespace. The original storage identity is retained. A stale fence,
+different approved identity, writer credential or initialized descriptor
+refuses the command.
+
+New creation synchronizes `remote.enrollment`, a versioned identity/capacity
+binding, before claiming the authority. Resume validates an existing binding
+against the approved configuration. A valid marker-only backing created by an
+older binary can acquire the missing binding through this explicit operation
+only while its authority has never activated. Recognized quiescent lower-fence candidates may be retired by the subsequent
+GC pass; live handles and unknown artifacts are preserved. An existing corrupt or truncated binding is
+refused; preserve or quarantine it for explicit operator investigation rather
+than automatically overwriting it or changing capacity to force progress.
+
+If inspection shows a current descriptor after an uncertain activation, use
+the ordinary exact-current takeover/recovery procedure and preserve its
+manifest. Enrollment recovery never clears it. If inner volume initialization
+itself stopped after outer activation, this command does not automatically
+complete or reset that initialized backing; inspect its existing volume
+evidence before choosing an explicit recovery procedure.
 
 ## Local configuration and creation
 

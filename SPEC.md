@@ -1005,6 +1005,10 @@ Its bounded capacity, commit protocol and explicit threat model are specified in
 [Rollback-protected backing](docs/rollback-protection.md). This storage option
 does not upgrade the crypto provider's declared replay capability.
 
+Initial enrollment recovery MUST require administrator approval of the exact
+never-activated authority record and original storage identity/capacity. It MUST
+advance fencing without resetting any previously activated descriptor.
+
 Remote namespace GC MUST authenticate the current physical root, coordinate
 with forks and snapshots, retain authority sources and live lifetime locks,
 and durably retire a namespace before deleting its known files. Cleanup

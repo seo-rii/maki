@@ -63,6 +63,15 @@ documents.
 
 ### Added
 
+- **Same-identity initial remote enrollment recovery**: an administrator can
+  resume a never-activated authority using an approved storage identity and
+  exact current fence. A durable supplementary v1 identity/capacity binding
+  and a fresh writer namespace preserve interrupted artifacts; successful
+  activation permanently prevents enrollment reset. Existing remote COW and
+  witness-state bytes are unchanged
+  ([procedure](docs/rollback-protection.md#resume-interrupted-initial-enrollment),
+  [compatibility](docs/durable-recovery.md#protected-outer-backing-formats)).
+
 - **Safe automatic remote-writer namespace reclamation**: authenticate the
   current physical root, retain authority sources and live file handles, then
   durably retire quiescent lower-fence namespaces before confined deletion.

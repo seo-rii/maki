@@ -620,7 +620,7 @@ fn state_rpc_enforces_authenticated_roles_and_preserves_cas_conflicts() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let worker = std::thread::spawn(move || {
-        for _ in 0..6 {
+        for _ in 0..8 {
             let (stream, _) = listener.accept().unwrap();
             server.handle_connection(stream, handler.as_ref()).unwrap();
         }
@@ -638,15 +638,28 @@ fn state_rpc_enforces_authenticated_roles_and_preserves_cas_conflicts() {
         &request(3, Some(claimed.clone()), Action::Takeover),
     )
     .unwrap_err();
-    assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+    let denied_recovery = Rpc::call(
+        &client,
+        &request(4, Some(claimed.clone()), Action::RecoverEnrollment),
+    )
+    .unwrap_err();
     // Keep going before asserting the conflict so a failed assertion cannot leak the worker.
-    let conflict = Rpc::call(&client, &request(4, Some(released), Action::Claim)).unwrap_err();
+    let conflict = Rpc::call(&client, &request(5, Some(released), Action::Claim)).unwrap_err();
     let mut options = fixture.client(address);
     options.tls = fixture.bob.clone();
     let admin = Client::new(options).unwrap();
-    let replaced = Rpc::call(&admin, &request(5, Some(claimed.clone()), Action::Takeover)).unwrap();
-    let inspected = Rpc::call(&client, &request(6, None, Action::Inspect)).unwrap();
+    let invalid_takeover =
+        Rpc::call(&admin, &request(6, Some(claimed.clone()), Action::Takeover)).unwrap_err();
+    let replaced = Rpc::call(
+        &admin,
+        &request(7, Some(claimed.clone()), Action::RecoverEnrollment),
+    )
+    .unwrap();
+    let inspected = Rpc::call(&client, &request(8, None, Action::Inspect)).unwrap();
     worker.join().unwrap();
+    assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(denied_recovery.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(invalid_takeover.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(conflict.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(replaced, inspected);
     assert_eq!(replaced.fence, claimed.fence + 1);

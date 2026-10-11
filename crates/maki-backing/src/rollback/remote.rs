@@ -5,6 +5,7 @@ use super::*;
 use crate::remote_witness::{namespace, Action, Descriptor, Phase, Record, Request, Rpc};
 use crate::witness::Anchor;
 
+use super::enrollment::Enrollment;
 use super::gc::{GcReport, OperationGuard};
 
 const REMOTE_MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
@@ -299,6 +300,41 @@ fn copy_generation(
 }
 
 impl RollbackBacking {
+    /// Resume only an independently approved, never-activated authority.
+    /// The immutable local identity/capacity binding cannot be replaced.
+    pub fn recover_enrollment_remote(
+        root: &Path,
+        rpc: Arc<dyn Rpc>,
+        capacity: u64,
+        expected: &Record,
+    ) -> io::Result<Self> {
+        validate_capacity(capacity)?;
+        expected.validate()?;
+        if expected.current.is_some() || !matches!(expected.phase, Phase::Released | Phase::Claimed)
+        {
+            return Err(input(
+                "cannot recover enrollment after its first activation",
+            ));
+        }
+        let disk = remote_root(root, false)?;
+        let guard = OperationGuard::acquire(disk.as_ref())?;
+        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        if inspect(rpc.as_ref())? != *expected {
+            return Err(invalid("enrollment approval is stale"));
+        }
+        // Re-publish the validated marker before the independent authority
+        // can accept enrollment. A readable legacy marker may be cache-only.
+        let marker = disk.open(MARKER, false)?;
+        marker.write_at(0, REMOTE_MAGIC)?;
+        marker.set_len(REMOTE_MAGIC.len() as u64)?;
+        marker.sync_data()?;
+        Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
+        let claim = transact(rpc.as_ref(), expected, Action::RecoverEnrollment)?;
+        let result = Self::activate_empty(disk.clone(), capacity, claim, rpc.clone())?;
+        collect_after_activation(&guard, rpc.as_ref());
+        Ok(result)
+    }
+
     pub fn collect_remote(root: &Path, rpc: &dyn Rpc) -> io::Result<GcReport> {
         let disk = remote_root(root, false)?;
         OperationGuard::acquire(disk.as_ref())?.collect(rpc)
@@ -314,7 +350,19 @@ impl RollbackBacking {
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock("remote.enroll.lock")?;
         initialize_remote_root(disk.as_ref())?;
+        Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
         let claim = transact(rpc.as_ref(), &expected, Action::Claim)?;
+        let result = Self::activate_empty(disk.clone(), capacity, claim, rpc.clone())?;
+        collect_after_activation(&guard, rpc.as_ref());
+        Ok(result)
+    }
+
+    fn activate_empty(
+        disk: Arc<FileBacking>,
+        capacity: u64,
+        claim: Record,
+        rpc: Arc<dyn Rpc>,
+    ) -> io::Result<Self> {
         let manifest = Manifest {
             format: 1,
             identity: claim.identity,
@@ -324,9 +372,7 @@ impl RollbackBacking {
             entries: BTreeMap::new(),
             files: BTreeMap::new(),
         };
-        let result = Self::activate_fork(disk.clone(), None, manifest, 0, claim, rpc.clone())?;
-        collect_after_activation(&guard, rpc.as_ref());
-        Ok(result)
+        Self::activate_fork(disk, None, manifest, 0, claim, rpc)
     }
 
     pub fn open_remote(root: &Path, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
