@@ -9,7 +9,6 @@ use maki_crypto::{
 use maki_format::{geometry::Geometry, init, superblock::Superblock};
 use maki_test_support::{fake_provider::FakeCryptoProvider, CrashableBacking, ManualClock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const UNIT: u32 = 4096;
@@ -32,7 +31,18 @@ impl CryptoProvider for ShortProvider {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         let mut result = self.fake.encrypt_batch(ctx, items).await?;
         let mut stored = self.encoded.lock().unwrap();
-        for item in &mut result {
+        for (item, plain) in result.iter_mut().zip(items) {
+            // Only the workload's patterns have short encodings. Attach
+            // probes use full-size ciphertext, so the real scheduler can
+            // stay enabled throughout attach and every subsequent request.
+            if !plain
+                .data
+                .expose()
+                .iter()
+                .all(|byte| matches!(*byte, 0x49 | 0x91 | 0x77))
+            {
+                continue;
+            }
             let mut token = vec![0; 512];
             token[..8].copy_from_slice(&(stored.len() as u64).to_le_bytes());
             stored.insert(token.clone(), std::mem::replace(&mut item.data, token));
@@ -51,10 +61,14 @@ impl CryptoProvider for ShortProvider {
                 .map(|item| {
                     Ok(CiphertextUnit {
                         unit_index: item.unit_index,
-                        data: stored
-                            .get(&item.data)
-                            .cloned()
-                            .ok_or_else(|| CryptoError::Integrity("unknown token".into()))?,
+                        data: if item.data.len() == 512 {
+                            stored
+                                .get(&item.data)
+                                .cloned()
+                                .ok_or_else(|| CryptoError::Integrity("unknown token".into()))?
+                        } else {
+                            item.data.clone()
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, CryptoError>>()?
@@ -63,41 +77,6 @@ impl CryptoProvider for ShortProvider {
     }
 }
 
-// Isolate the Engine read path from attach's separate self-test splitting:
-// enable the scheduler's admission checks only after attach completes.
-struct AfterAttachScheduler {
-    raw: Arc<ShortProvider>,
-    scheduler: BatchScheduler,
-    active: AtomicBool,
-}
-#[async_trait]
-impl CryptoProvider for AfterAttachScheduler {
-    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        self.scheduler.capabilities().await
-    }
-    async fn encrypt_batch(
-        &self,
-        ctx: &CryptoContext,
-        items: &[PlaintextUnit],
-    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        if self.active.load(Ordering::SeqCst) {
-            self.scheduler.encrypt_batch(ctx, items).await
-        } else {
-            self.raw.encrypt_batch(ctx, items).await
-        }
-    }
-    async fn decrypt_batch(
-        &self,
-        ctx: &CryptoContext,
-        items: &[CiphertextUnit],
-    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        if self.active.load(Ordering::SeqCst) {
-            self.scheduler.decrypt_batch(ctx, items).await
-        } else {
-            self.raw.decrypt_batch(ctx, items).await
-        }
-    }
-}
 fn config(resident: u64) -> SchedulerConfig {
     SchedulerConfig {
         target_items: 1,
@@ -154,18 +133,13 @@ async fn small_ciphertexts_support_individual_combined_and_partial_reads() {
         fake: FakeCryptoProvider::new(UNIT).with_max_batch(2, UNIT as u64),
         encoded: Mutex::default(),
     });
-    let provider = Arc::new(AfterAttachScheduler {
-        raw: short.clone(),
-        scheduler: BatchScheduler::with_unit_size(
-            short,
-            config(16 * 1024),
-            Arc::new(ManualClock::new()),
-            UNIT,
-        ),
-        active: AtomicBool::new(false),
-    });
-    let engine = engine(provider.clone()).await;
-    provider.active.store(true, Ordering::SeqCst);
+    let provider = Arc::new(BatchScheduler::with_unit_size(
+        short,
+        config(16 * 1024),
+        Arc::new(ManualClock::new()),
+        UNIT,
+    ));
+    let engine = engine(provider).await;
     let mut data = vec![0x49; UNIT as usize];
     data.extend(vec![0x91; UNIT as usize]);
     engine.write(0, &data, true).await.unwrap();
