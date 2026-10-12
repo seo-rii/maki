@@ -1440,9 +1440,9 @@ bounded queue
  ↓
 batch scheduler
  ↓
-global semaphore
+FIFO endpoint admission (reselect after capacity changes)
  ↓
-endpoint semaphore
+nonblocking global + endpoint count/byte permits
  ↓
 RPC
  ↓
@@ -1450,6 +1450,12 @@ journal queue
 ```
 
 ---
+
+An endpoint admission waiter MUST NOT hold a global or endpoint permit.
+Admission MUST re-evaluate validated, breaker-admissible candidates whenever
+capacity is returned. The oldest capacity waiter is served first; cancellation
+releases its queue position. Both count and byte budgets are held only for the
+actual RPC, and the breaker is rechecked immediately before dispatch.
 
 # 31. Retry Policy
 

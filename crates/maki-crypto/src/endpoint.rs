@@ -31,13 +31,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
 
 use crate::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
 use crate::checked::{validate_decrypt_result, validate_encrypt_result};
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
-use crate::flow::DualSemaphore;
+use crate::flow::{DualPermit, DualSemaphore};
 use crate::provider::CryptoProvider;
 use crate::retry::{full_jitter_delay, RetryBudget, RetryBudgetConfig, RetryPolicy};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
@@ -158,12 +158,31 @@ pub struct EndpointStatus {
 pub struct EndpointSet {
     endpoints: Vec<Arc<Endpoint>>,
     global: DualSemaphore,
+    admission_gate: AsyncMutex<()>,
+    capacity_changed: Notify,
     policy: RetryPolicy,
     clock: Arc<dyn Clock>,
     config: DispatchConfig,
     metrics: DispatchMetrics,
     validator: Option<EndpointValidator>,
     caps: OnceCell<CryptoCapabilities>,
+}
+
+/// Both budgets are acquired without waiting, then retained only for the RPC.
+/// Release capacity before notifying the FIFO admission waiter.
+struct EndpointAdmission<'a> {
+    endpoint: Arc<Endpoint>,
+    global: Option<DualPermit>,
+    local: Option<DualPermit>,
+    changed: &'a Notify,
+}
+
+impl Drop for EndpointAdmission<'_> {
+    fn drop(&mut self) {
+        drop(self.global.take());
+        drop(self.local.take());
+        self.changed.notify_waiters();
+    }
 }
 
 enum Request<'a> {
@@ -256,6 +275,8 @@ impl EndpointSet {
                 config.global_max_inflight_batches,
                 config.global_max_inflight_bytes,
             ),
+            admission_gate: AsyncMutex::new(()),
+            capacity_changed: Notify::new(),
             policy: config.retry.clone(),
             clock,
             config,
@@ -491,16 +512,79 @@ impl EndpointSet {
         }
     }
 
+    /// Serialize capacity admission, not RPC execution. A queued caller owns
+    /// no global/local permit and recomputes the least-inflight candidates
+    /// after every release. Tokio's FIFO mutex prevents new callers bypassing
+    /// the oldest capacity waiter; cancellation releases its place.
+    async fn admit_endpoint(
+        &self,
+        excluded: &[Arc<Endpoint>],
+        bytes: u64,
+        deadline: Option<Duration>,
+    ) -> Result<Option<EndpointAdmission<'_>>, CryptoError> {
+        let admit = async {
+            let _turn = self.admission_gate.lock().await;
+            loop {
+                let changed = self.capacity_changed.notified();
+                tokio::pin!(changed);
+                // Register before inspecting permits to avoid a release
+                // between the failed try-acquire and awaiting notification.
+                changed.as_mut().enable();
+                let candidates: Vec<_> = self
+                    .candidates()
+                    .into_iter()
+                    .filter(|endpoint| !excluded.iter().any(|e| Arc::ptr_eq(e, endpoint)))
+                    .collect();
+                if candidates.is_empty() {
+                    return None;
+                }
+                for endpoint in candidates {
+                    let Some(local) = endpoint.semaphore.try_acquire(bytes) else {
+                        continue;
+                    };
+                    let Some(global) = self.global.try_acquire(bytes) else {
+                        continue;
+                    };
+                    // Recheck the breaker just before dispatch; its probe
+                    // permit is acquired by the caller without another await.
+                    if !endpoint.breaker.would_allow() {
+                        continue;
+                    }
+                    return Some(EndpointAdmission {
+                        endpoint,
+                        global: Some(global),
+                        local: Some(local),
+                        changed: &self.capacity_changed,
+                    });
+                }
+                changed.await;
+            }
+        };
+        match deadline {
+            None => Ok(admit.await),
+            Some(deadline) => {
+                let remaining = deadline.saturating_sub(self.clock.now());
+                if remaining.is_zero() {
+                    return Err(deadline_error());
+                }
+                tokio::select! {
+                    result = admit => Ok(result),
+                    _ = self.clock.sleep(remaining) => {
+                        self.metrics.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
+                        Err(deadline_error())
+                    }
+                }
+            }
+        }
+    }
+
     async fn call_endpoint(
         &self,
         endpoint: &Endpoint,
         context: &CryptoContext,
         request: &Request<'_>,
-        bytes: u64,
     ) -> Result<Response, CryptoError> {
-        // Permits live only for the duration of the RPC.
-        let _global = self.global.acquire(bytes).await?;
-        let _local = endpoint.semaphore.acquire(bytes).await?;
+        // The dispatcher already holds both permits for this RPC.
         endpoint.inflight.fetch_add(1, Ordering::SeqCst);
         let _inflight = InflightGuard(&endpoint.inflight);
         let started = self.clock.now();
@@ -532,10 +616,9 @@ impl EndpointSet {
         endpoint: &Endpoint,
         context: &CryptoContext,
         request: &Request<'_>,
-        bytes: u64,
         deadline: Option<Duration>,
     ) -> Result<Response, CryptoError> {
-        let call = self.call_endpoint(endpoint, context, request, bytes);
+        let call = self.call_endpoint(endpoint, context, request);
         match deadline {
             None => call.await,
             Some(deadline) => {
@@ -563,6 +646,15 @@ impl EndpointSet {
         retry_safe: bool,
     ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
+        if self.global.max_items() == 0
+            || self.endpoints[0].semaphore.max_items() == 0
+            || bytes > self.global.max_bytes()
+            || bytes > self.endpoints[0].semaphore.max_bytes()
+        {
+            return Err(CryptoError::NonRetryableRequest(
+                "request exceeds global or endpoint admission capacity".into(),
+            ));
+        }
         let mut calls_made = 0u32;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
@@ -607,10 +699,10 @@ impl EndpointSet {
                 }));
             }
             let mut tried_any = false;
-            for endpoint in candidates {
-                if contract_failed.iter().any(|f| Arc::ptr_eq(f, &endpoint)) {
-                    continue;
-                }
+            let mut excluded = contract_failed.clone();
+            while let Some(admission) = self.admit_endpoint(&excluded, bytes, deadline).await? {
+                let endpoint = admission.endpoint.clone();
+                excluded.push(endpoint.clone());
                 let Some(probe) = endpoint.breaker.acquire() else {
                     continue;
                 };
@@ -646,7 +738,7 @@ impl EndpointSet {
                 tried_any = true;
                 calls_made += 1;
                 match self
-                    .call_with_deadline(&endpoint, context, &request, bytes, deadline)
+                    .call_with_deadline(&endpoint, context, &request, deadline)
                     .await
                 {
                     Ok(response) => {
