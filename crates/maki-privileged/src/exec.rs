@@ -332,33 +332,175 @@ pub fn read_sentinel(mountpoint: &str) -> Option<String> {
     }
 }
 
-/// Create the sentinel if absent; refuse to change an existing one.
+/// Publish only a fully written, synced sentinel, without replacing an
+/// existing name. An identical sentinel is rewritten before every retry sync:
+/// failed fsync may have cleared its dirty pages while leaving readable bytes.
 fn write_sentinel(
     step: &PlannedStep,
     mountpoint: &str,
     volume_uuid: &str,
 ) -> Result<(), ExecError> {
-    match read_sentinel(mountpoint) {
-        Some(existing) if existing == volume_uuid => Ok(()),
-        Some(existing) => Err(ExecError::Step {
-            step: step.to_string(),
-            message: format!(
-                "sentinel already holds a different volume uuid {existing:?}; refusing to overwrite"
-            ),
-        }),
-        None => {
-            let path = Path::new(mountpoint).join(SENTINEL_FILE);
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            file.write_all(volume_uuid.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            File::open(mountpoint)?.sync_all()?;
-            Ok(())
+    write_sentinel_with_boundary(step, mountpoint, volume_uuid, |_| Ok(()))
+}
+
+fn write_sentinel_with_boundary(
+    step: &PlannedStep,
+    mountpoint: &str,
+    volume_uuid: &str,
+    mut boundary: impl FnMut(&'static str) -> io::Result<()>,
+) -> Result<(), ExecError> {
+    use std::ffi::CString;
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(mountpoint)?;
+    let name = CString::new(SENTINEL_FILE).expect("constant contains no NUL");
+    let open_existing = || -> io::Result<File> {
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(descriptor) })
         }
+    };
+    let payload = format!("{volume_uuid}\n");
+    let persist = |file: &mut File,
+                   boundary: &mut dyn FnMut(&'static str) -> io::Result<()>|
+     -> io::Result<()> {
+        boundary("write")?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(payload.as_bytes())?;
+        file.set_len(payload.len() as u64)?;
+        boundary("file-sync")?;
+        file.sync_all()
+    };
+    let persist_existing = |mut file: File,
+                            boundary: &mut dyn FnMut(&'static str) -> io::Result<()>|
+     -> Result<(), ExecError> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > SENTINEL_MAX_BYTES {
+            return Err(identity_error("sentinel is not a single regular file"));
+        }
+        let mut existing = String::new();
+        (&mut file)
+            .take(SENTINEL_MAX_BYTES)
+            .read_to_string(&mut existing)?;
+        if existing.trim() != volume_uuid {
+            return Err(ExecError::Step {
+                step: step.to_string(),
+                message: format!(
+                    "sentinel already holds a different volume uuid {:?}; refusing to overwrite",
+                    existing.trim()
+                ),
+            });
+        }
+        persist(&mut file, boundary)?;
+        Ok(())
+    };
+    match open_existing() {
+        Ok(file) => persist_existing(file, &mut boundary)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Names are unguessable and operations stay below the pinned
+            // directory descriptor even if the mountpoint path is renamed.
+            let mut nonce = [0u8; 16];
+            let mut filled = 0;
+            while filled < nonce.len() {
+                let amount = unsafe {
+                    libc::getrandom(nonce[filled..].as_mut_ptr().cast(), nonce.len() - filled, 0)
+                };
+                if amount < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                if amount == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "empty random source",
+                    )
+                    .into());
+                }
+                filled += amount as usize;
+            }
+            let temporary = CString::new(format!(
+                ".maki-sentinel.tmp-{:032x}",
+                u128::from_le_bytes(nonce)
+            ))
+            .unwrap();
+            let descriptor = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_RDWR
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            struct Pending<'a> {
+                directory: &'a File,
+                name: CString,
+            }
+            impl Drop for Pending<'_> {
+                fn drop(&mut self) {
+                    unsafe {
+                        libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+                    }
+                }
+            }
+            let pending = Pending {
+                directory: &directory,
+                name: temporary,
+            };
+            let mut file = unsafe { File::from_raw_fd(descriptor) };
+            persist(&mut file, &mut boundary)?;
+            boundary("publish")?;
+            let result = unsafe {
+                libc::renameat2(
+                    directory.as_raw_fd(),
+                    pending.name.as_ptr(),
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    // A concurrent publisher is validated and re-synced by
+                    // the same existing-file path; never replace its inode.
+                    persist_existing(open_existing()?, &mut boundary)?;
+                } else {
+                    return Err(error.into());
+                }
+            } else {
+                boundary("published")?;
+            }
+            // The temporary name is now absent. Its guard also cleans up
+            // unpublished partial writes and every failure before rename.
+            drop(pending);
+        }
+        Err(error) => return Err(error.into()),
     }
+    boundary("directory-sync")?;
+    directory.sync_all()?;
+    Ok(())
 }
 
 /// Write, fsync, read back and remove a probe file under the mountpoint.
@@ -1361,3 +1503,7 @@ fn cleanup_with(
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "sentinel_tests.rs"]
+mod sentinel_tests;
