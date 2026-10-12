@@ -602,7 +602,7 @@ impl Engine {
         chunks
     }
 
-    /// Run one request's provider batches, in order. The request's own
+    /// Run one request's provider batches concurrently. The request's own
     /// admission permit covers its first batch; each further batch may run
     /// at the same time under an idle callback slot taken without waiting,
     /// so `max_active_callbacks` still bounds provider concurrency (SPEC
@@ -612,7 +612,7 @@ impl Engine {
     async fn run_batches<T, F, Fut>(
         &self,
         ranges: Vec<std::ops::Range<usize>>,
-        call: F,
+        mut call: F,
     ) -> Result<Vec<T>, CoreError>
     where
         F: FnMut(std::ops::Range<usize>) -> Fut,
@@ -627,12 +627,19 @@ impl Engine {
             }
         }
         let width = extra.len() + 1;
-        let results = stream::iter(ranges.into_iter().map(call))
-            .buffered(width)
-            .try_collect()
-            .await?;
+        // Observe failures in completion order: an earlier stalled batch must
+        // not hide a later permanent error. Index only the successful outputs
+        // so callers still receive them in the original unit order.
+        let mut results = stream::iter(ranges.into_iter().enumerate().map(|(index, range)| {
+            let future = call(range);
+            async move { future.await.map(|result| (index, result)) }
+        }))
+        .buffer_unordered(width)
+        .try_collect::<Vec<_>>()
+        .await?;
         drop(extra);
-        Ok(results)
+        results.sort_unstable_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, result)| result).collect())
     }
 
     /// Virtual device size in bytes.
