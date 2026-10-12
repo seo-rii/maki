@@ -2,9 +2,9 @@
 //! An existing volume needs --destroy-data: its working set is overwritten.
 
 mod latency;
+mod workload;
 
 use std::process::ExitCode;
-use std::time::Instant;
 
 use maki_format::error::FormatError;
 use maki_nbdkit::daemon::DaemonError;
@@ -12,8 +12,8 @@ use serde::Serialize;
 
 use latency::{Latencies, LatencyReport};
 
-const USAGE: &str =
-    "usage: maki-benchmark [--destroy-data] [--json] [--fua] <config.toml> [ops] [io-size]";
+const USAGE: &str = "usage: maki-benchmark [--destroy-data] [--json] [--fua] [--concurrency 1..256]\n  [--access sequential|random] [--read-percent 0..100] [--working-set bytes]\n  [--flush-every operations] [--seed integer] <config.toml> [ops] [io-size]";
+const MAX_OPERATIONS: u64 = 1_000_000_000;
 
 struct Options {
     config_path: String,
@@ -22,61 +22,125 @@ struct Options {
     fua: bool,
     ops: u64,
     io_size: usize,
+    concurrency: usize,
+    random: bool,
+    read_percent: Option<u64>,
+    working_set: Option<u64>,
+    flush_every: Option<u64>,
+    seed: u64,
 }
 
 fn parse_args() -> Result<Options, String> {
     let mut positional = Vec::new();
-    let mut destroy_data = false;
-    let mut json = false;
-    let mut fua = false;
+    let mut options = Options {
+        config_path: String::new(),
+        destroy_data: false,
+        json: false,
+        fua: false,
+        ops: 10_000,
+        io_size: 4096,
+        concurrency: 1,
+        random: false,
+        read_percent: None,
+        working_set: None,
+        flush_every: None,
+        seed: 1,
+    };
     let mut literal = false;
-    for arg in std::env::args().skip(1) {
+    let mut seen = std::collections::HashSet::new();
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
         if literal {
-            positional.push(arg);
+            positional.push(argument);
             continue;
         }
-        let flag = match arg.as_str() {
-            "--destroy-data" => Some(&mut destroy_data),
-            "--json" => Some(&mut json),
-            "--fua" => Some(&mut fua),
-            "--" => {
-                literal = true;
-                continue;
+        if argument == "--" {
+            literal = true;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            positional.push(argument);
+            continue;
+        }
+        if !seen.insert(argument.clone()) {
+            return Err(format!("duplicate option: {argument}"));
+        }
+        match argument.as_str() {
+            "--destroy-data" => options.destroy_data = true,
+            "--json" => options.json = true,
+            "--fua" => options.fua = true,
+            "--concurrency" | "--access" | "--read-percent" | "--working-set" | "--flush-every"
+            | "--seed" => {
+                let value = arguments
+                    .next()
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("missing value for {argument}"))?;
+                match argument.as_str() {
+                    "--concurrency" => {
+                        options.concurrency =
+                            value.parse().map_err(|_| "concurrency must be in 1..256")?;
+                        if !(1..=256).contains(&options.concurrency) {
+                            return Err("concurrency must be in 1..256".into());
+                        }
+                    }
+                    "--access" => {
+                        options.random = match value.as_str() {
+                            "sequential" => false,
+                            "random" => true,
+                            _ => return Err("access must be sequential or random".into()),
+                        }
+                    }
+                    "--read-percent" => {
+                        let percent = value
+                            .parse::<u64>()
+                            .map_err(|_| "read-percent must be in 0..100")?;
+                        if percent > 100 {
+                            return Err("read-percent must be in 0..100".into());
+                        }
+                        options.read_percent = Some(percent);
+                    }
+                    "--working-set" => {
+                        options.working_set =
+                            Some(value.parse::<maki_format::config::ByteSize>()?.0)
+                    }
+                    "--flush-every" => {
+                        let every = value
+                            .parse::<u64>()
+                            .map_err(|_| "flush-every must be positive")?;
+                        if every == 0 {
+                            return Err("flush-every must be positive".into());
+                        }
+                        options.flush_every = Some(every);
+                    }
+                    "--seed" => {
+                        options.seed = value
+                            .parse()
+                            .map_err(|_| "seed must be a nonnegative integer")?
+                    }
+                    _ => unreachable!(),
+                }
             }
-            _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
-            _ => None,
-        };
-        if let Some(flag) = flag {
-            if *flag {
-                return Err(format!("duplicate option: {arg}"));
-            }
-            *flag = true;
-        } else {
-            positional.push(arg);
+            _ => return Err(format!("unknown option: {argument}")),
         }
     }
     if positional.is_empty() || positional.len() > 3 {
         return Err("expected a config and at most two workload arguments".into());
     }
-    let ops = positional
-        .get(1)
-        .map_or(Ok(10_000), |v| v.parse::<u64>())
-        .map_err(|_| "ops must be a positive integer")?;
-    if ops == 0 {
-        return Err("ops must be a positive integer".into());
+    if let Some(ops) = positional.get(1) {
+        options.ops = ops
+            .parse::<u64>()
+            .map_err(|_| "ops must be a positive integer")?;
     }
-    let io_size = positional
-        .get(2)
-        .map_or(Ok(4096), |v| v.parse::<usize>())
-        .map_err(|_| "io-size must be a positive integer")?;
-    Ok(Options {
-        config_path: positional.remove(0),
-        destroy_data,
-        json,
-        fua,
-        ops,
-        io_size,
-    })
+    if options.ops == 0 || options.ops > MAX_OPERATIONS {
+        return Err(format!("ops must be in 1..{MAX_OPERATIONS}"));
+    }
+    if let Some(size) = positional.get(2) {
+        options.io_size = size
+            .parse::<usize>()
+            .map_err(|_| "io-size must be a positive integer")?;
+    }
+    options.config_path = positional.remove(0);
+    Ok(options)
 }
 
 #[derive(Serialize)]
@@ -108,12 +172,16 @@ struct Report {
     provider: String,
     operations: u64,
     io_size_bytes: usize,
-    concurrency: u32,
+    concurrency: usize,
     fua: bool,
     read_verified: bool,
     flush_us: f64,
     write: OperationReport,
     read: OperationReport,
+    flush: OperationReport,
+    workload: workload::Description,
+    setup: workload::SetupReport,
+    resources: workload::ResourceReport,
 }
 
 fn main() -> ExitCode {
@@ -157,6 +225,19 @@ fn main() -> ExitCode {
              nbd.maximum_io ({}) or the device ({} bytes)",
             config.nbd.maximum_io.0, config.volume.max_virtual_size.0
         );
+        return ExitCode::from(2);
+    }
+    let working_set_bytes = options.working_set.unwrap_or_else(|| {
+        options
+            .ops
+            .min(config.volume.max_virtual_size.0 / io_size as u64)
+            * io_size as u64
+    });
+    if working_set_bytes == 0
+        || working_set_bytes > config.volume.max_virtual_size.0
+        || !working_set_bytes.is_multiple_of(io_size as u64)
+    {
+        eprintln!("working-set must be a positive multiple of io-size no larger than the volume");
         return ExitCode::from(2);
     }
     match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
@@ -208,56 +289,38 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let ops = options.ops;
     let result: Result<Report, String> = runtime.block_on(async {
-        let mut data = vec![0xA5u8; io_size];
-        let mut writes = Latencies::new();
-        let start = Instant::now();
-        for i in 0..ops {
-            let offset = (i % slots) * io_size as u64;
-            data[..8].copy_from_slice(&offset.to_le_bytes());
-            let began = Instant::now();
-            engine
-                .write(offset, &data, options.fua)
-                .await
-                .map_err(|error| format!("write at offset {offset} failed: {error}"))?;
-            writes.record(began.elapsed());
-        }
-        let began = Instant::now();
-        engine
-            .flush()
-            .await
-            .map_err(|error| format!("final flush failed: {error}"))?;
-        let flush_us = began.elapsed().as_secs_f64() * 1e6;
-        let write = OperationReport::new(start.elapsed(), io_size, &writes);
-
-        let mut reads = Latencies::new();
-        let start = Instant::now();
-        for i in 0..ops {
-            let offset = (i % slots) * io_size as u64;
-            let began = Instant::now();
-            let actual = engine
-                .read(offset, io_size)
-                .await
-                .map_err(|error| format!("read at offset {offset} failed: {error}"))?;
-            reads.record(began.elapsed());
-            data[..8].copy_from_slice(&offset.to_le_bytes());
-            if actual != data {
-                return Err(format!("read verification failed at offset {offset}"));
-            }
-        }
-        let read = OperationReport::new(start.elapsed(), io_size, &reads);
+        let measured = workload::run(engine, &options, working_set_bytes).await?;
         Ok(Report {
             schema_version: 1,
             provider: config.crypto.provider.clone(),
-            operations: ops,
+            operations: options.ops,
             io_size_bytes: io_size,
-            concurrency: 1,
+            concurrency: options.concurrency,
             fua: options.fua,
             read_verified: true,
-            flush_us,
-            write,
-            read,
+            flush_us: measured.final_flush_us,
+            write: OperationReport::new(measured.write_elapsed, io_size, &measured.writes),
+            read: OperationReport::new(measured.read_elapsed, io_size, &measured.reads),
+            flush: OperationReport::new(measured.elapsed, 0, &measured.flushes),
+            workload: workload::Description {
+                mode: if options.read_percent.is_some() {
+                    "mixed"
+                } else {
+                    "phased"
+                },
+                access: if options.random {
+                    "random"
+                } else {
+                    "sequential"
+                },
+                read_percent: options.read_percent,
+                working_set_bytes,
+                flush_every_operations: options.flush_every,
+                seed: options.seed,
+            },
+            setup: measured.setup,
+            resources: measured.resources,
         })
     });
     let report = match result {
@@ -278,8 +341,9 @@ fn main() -> ExitCode {
     } else {
         for (name, stats) in [("write", &report.write), ("read", &report.read)] {
             println!(
-                "{name}: {ops} x {io_size}B in {:.3}s ({:.1} MiB/s, {:.0} IOPS); \
+                "{name}: {} x {io_size}B in {:.3}s ({:.1} MiB/s, {:.0} IOPS); \
                  latency us: mean {:.1}, p50 <= {:.1}, p95 <= {:.1}, p99 <= {:.1}, max {:.1}",
+                stats.latency.samples,
                 stats.elapsed_seconds,
                 stats.mib_per_second,
                 stats.iops,
@@ -290,6 +354,14 @@ fn main() -> ExitCode {
                 stats.latency.max_us,
             );
         }
+        let rss = report
+            .resources
+            .process_peak_rss_bytes
+            .map(|bytes| format!("{bytes}B"))
+            .unwrap_or_else(|| "unavailable".into());
+        println!("concurrency: {}; access: {}; mode: {}; working set: {}B; peak pending: {}; process peak RSS: {rss}",
+            report.concurrency, report.workload.access, report.workload.mode,
+            report.workload.working_set_bytes, report.resources.peak_pending_operations);
         println!(
             "FUA: {}; final FLUSH: {:.1} us (included in write throughput); read verification: passed",
             report.fua, report.flush_us

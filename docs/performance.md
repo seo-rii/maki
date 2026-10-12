@@ -27,18 +27,38 @@ maki-benchmark --json --fua benchmark-fua.toml 10000 131072 > benchmark-fua.json
 Positional defaults remain 10,000 operations and 4,096 bytes. Operations must
 be positive; I/O size must be block-aligned and fit both the volume and
 `nbd.maximum_io`. Invalid arguments are rejected before volume creation.
-The working set wraps at the largest whole I/O slot in the device. Reads check
+The default working set covers the smaller of the operation count and the
+whole I/O slots in the device; `--working-set` selects an explicit span. Reads check
 the benchmark pattern and its offset; a failed operation or mismatch exits
 unsuccessfully without a success report.
 
 Both text and JSON report throughput, IOPS and request latency. JSON schema
-version 1 records provider type, operation count, I/O size, concurrency (one),
+version 1 records provider type, operation count, I/O size, selected concurrency,
 FUA selection, successful read verification, and the final FLUSH time.
 The write throughput interval includes the final FLUSH; write latency samples
 measure individual writes (including FUA when selected), and exclude that final
 FLUSH. Read throughput includes verification; individual read latencies end
 when the engine returns the buffer. Attach/self-tests, recovery, formatting
 and report serialization are outside the timed I/O intervals.
+
+Concurrent and mixed workloads use `--concurrency`, `--access`,
+`--read-percent`, `--working-set`, `--flush-every` and `--seed`. For example,
+with a separate empty benchmark configuration:
+
+```sh
+maki-benchmark --json --concurrency 8 --access random --read-percent 70 \
+  --working-set 64MiB --flush-every 1000 --seed 12 \
+  benchmark-concurrent.toml 100000 4096 > benchmark-concurrent.json
+```
+
+Compare concurrency 1, 2, 8 and 32 while holding the other parameters fixed.
+Mixed workloads initialize the whole working set before timing and report that
+cost separately. Reports add per-class counts/barrier latency, exact submitted
+pending-work peaks, sampled engine resource peaks and optional Linux process
+RSS high-water evidence. See [benchmark options and report boundaries](benchmark.md)
+for read/write ratios, random-address verification, cohort barriers, unavailable
+RSS and the repeatable virtual-time endpoint outage/recovery scenario. Virtual
+time is behavioral evidence, not real throughput.
 
 `p50_upper_us`, `p95_upper_us` and `p99_upper_us` are nearest-rank histogram
 upper bounds in microseconds, capped at the observed maximum. Each histogram

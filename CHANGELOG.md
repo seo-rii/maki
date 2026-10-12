@@ -73,6 +73,13 @@ documents.
 
 ### Added
 
+- **Concurrent and mixed benchmark workloads**: configurable concurrency,
+  sequential/random access, read ratio, working set, FUA and periodic drained
+  FLUSH; setup is separate from measurement. Reports preserve existing schema-1
+  fields and add per-class/barrier latency, pending/resource peaks and optional
+  Linux RSS. A deterministic endpoint outage/recovery harness compares 1/2/8/32
+  callers ([benchmark guide](docs/benchmark.md)).
+
 - **Complete Engine request metrics**: actual active requests are separate from
   retained admission slots. Full read/write/trim/FLUSH/FUA latency includes
   admission, provider and storage waits plus errors and cancellation; exactly

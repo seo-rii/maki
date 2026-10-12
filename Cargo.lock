@@ -894,8 +894,12 @@ dependencies = [
 name = "maki-benchmark"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "maki-core",
+ "maki-crypto",
  "maki-format",
  "maki-nbdkit",
+ "maki-test-support",
  "serde",
  "serde_json",
  "tempfile",
