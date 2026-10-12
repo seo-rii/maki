@@ -1635,13 +1635,18 @@ impl EngineInner {
             let mut volume = inner.volume.clone().write_owned().await;
             let publishing = inner.clone();
             storage_task(move || {
+                let checkpoint_before = volume.checkpoint_sequence();
                 let outcome = completed.and_then(|plan| volume.finish_checkpoint(plan));
                 // Publish the counters and state under the same lock as the
                 // new horizon, so a coherent stats snapshot includes both.
                 match &outcome {
-                    Ok(_) => {
+                    Ok(sequence) => {
                         publishing.checkpoints_total.fetch_add(1, Ordering::Relaxed);
-                        *publishing.last_checkpoint_at.lock() = publishing.clock.now();
+                        // A no-op administrative checkpoint must not postpone
+                        // the worker's deadline for syncing volatile records.
+                        if *sequence > checkpoint_before {
+                            *publishing.last_checkpoint_at.lock() = publishing.clock.now();
+                        }
                         *publishing.state.lock() = EngineState::Ready;
                     }
                     Err(e) => {
