@@ -217,7 +217,10 @@ fn same_entry(parent: &File, name: &CStr, file: &File) -> io::Result<bool> {
         };
     }
     let metadata = file.metadata()?;
-    Ok(stat.st_dev as u64 == metadata.dev() && stat.st_ino as u64 == metadata.ino())
+    // libc identity fields can be narrower than MetadataExt's u64 on Linux ABIs.
+    #[allow(clippy::unnecessary_cast)]
+    let matches = stat.st_dev as u64 == metadata.dev() && stat.st_ino as u64 == metadata.ino();
+    Ok(matches)
 }
 
 fn mount_id(file: &File) -> io::Result<u64> {
@@ -554,8 +557,9 @@ impl Backing for FileBacking {
         if unsafe { libc::fstatvfs(self.directory.0.as_raw_fd(), &mut stat) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Some(
-            (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64),
-        ))
+        // libc counter widths vary by ABI; widen before the saturating product.
+        #[allow(clippy::unnecessary_cast)]
+        let available = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+        Ok(Some(available))
     }
 }
