@@ -1755,6 +1755,19 @@ Required metrics include:
 
 ```text
 maki_active_callbacks
+maki_admission_slots
+maki_active_requests
+maki_requests_success_total
+maki_requests_error_total
+maki_requests_cancelled_total
+
+maki_request_seconds
+maki_read_request_seconds
+maki_write_request_seconds
+maki_trim_request_seconds
+maki_flush_request_seconds
+maki_fua_request_seconds
+maki_journal_sync_seconds
 
 maki_plaintext_bytes
 maki_ciphertext_bytes
@@ -1794,6 +1807,22 @@ maki_backing_free_bytes
 
 maki_volume_state
 ```
+
+`maki_active_requests` MUST count public Engine read/write/trim/flush calls from
+first poll through return or cancellation, including admission and lock waits.
+Internal batches/chunks MUST NOT count as additional requests. Request latency
+series MUST include success, error and cancellation; every started request MUST
+record exactly one outcome. `maki_admission_slots` counts retained resource
+permits, including parallel batches and detached storage after cancellation;
+`maki_active_callbacks` remains its compatibility alias.
+
+`maki_*_request_seconds` measures complete Engine call duration. These clocks
+exclude adapter work before Engine entry. `maki_journal_sync_seconds` measures
+explicit storage barriers, including failures and background/inline barriers;
+automatic segment-roll syncs remain inside overall request duration. Existing
+`maki_flush_seconds` and `maki_fua_seconds` retain successful storage-only sample
+semantics. Latency series expose sum/count/max; monitoring samples need not be
+transactional across independent counters.
 
 High-cardinality identifiers such as LBA and request IDs MUST NOT be used as metric labels.
 

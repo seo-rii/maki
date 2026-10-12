@@ -248,6 +248,35 @@ impl ControlBackend for EngineControlBackend {
         if let (Some(into), Value::Object(from)) = (doc.as_object_mut(), spec) {
             into.extend(from);
         }
+        if let Some(into) = doc.as_object_mut() {
+            into.insert("maki_active_requests".into(), json!(stats.active_requests));
+            into.insert("maki_admission_slots".into(), json!(stats.admission_slots));
+            into.insert(
+                "maki_requests_success_total".into(),
+                json!(stats.requests_success_total),
+            );
+            into.insert(
+                "maki_requests_error_total".into(),
+                json!(stats.requests_error_total),
+            );
+            into.insert(
+                "maki_requests_cancelled_total".into(),
+                json!(stats.requests_cancelled_total),
+            );
+            for (name, latency) in [
+                ("maki_request_seconds", stats.request_latency),
+                ("maki_read_request_seconds", stats.read_request_latency),
+                ("maki_write_request_seconds", stats.write_request_latency),
+                ("maki_trim_request_seconds", stats.trim_request_latency),
+                ("maki_flush_request_seconds", stats.flush_request_latency),
+                ("maki_fua_request_seconds", stats.fua_request_latency),
+                ("maki_journal_sync_seconds", stats.journal_sync_latency),
+            ] {
+                into.insert(format!("{name}_sum"), json!(latency.seconds_sum));
+                into.insert(format!("{name}_count"), json!(latency.count));
+                into.insert(format!("{name}_max"), json!(latency.seconds_max));
+            }
+        }
         doc
     }
 

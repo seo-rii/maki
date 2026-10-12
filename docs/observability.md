@@ -52,6 +52,42 @@ status and metrics return before either is released, and then release and
 join every fixture worker. They also verify that a first status request does
 not invent a free-space observation.
 
+## Request counts and latency boundaries
+
+| Metric | Meaning |
+|---|---|
+| `maki_active_requests` | Public Engine read, write, trim and flush calls still waiting or executing; one request may run multiple provider batches |
+| `maki_admission_slots` | Retained admission permits, including extra parallel batches and storage that continues after its caller is cancelled |
+| `maki_active_callbacks` | Compatibility alias of `maki_admission_slots`; it is not the number of public requests |
+| `maki_requests_success_total`, `maki_requests_error_total`, `maki_requests_cancelled_total` | Exactly one completed outcome per started Engine call; unwinding counts as an error |
+| `maki_request_seconds` | All public Engine calls from first poll through return or cancellation, including validation, provider, admission, unit/volume locks and blocking-pool waits |
+| `maki_read_request_seconds`, `maki_write_request_seconds`, `maki_trim_request_seconds`, `maki_flush_request_seconds` | The same complete interval split by operation |
+| `maki_fua_request_seconds` | Complete write/trim calls submitted with FUA, including unsuccessful outcomes |
+| `maki_journal_sync_seconds` | Actual explicit storage-barrier time, including failed FLUSH/FUA, inline admission barriers and the background checkpoint worker |
+| `maki_flush_seconds`, `maki_fua_seconds` | Existing successful storage-only series; their names and sample semantics remain compatible |
+
+Latency series export `_sum`, `_count` and `_max`. Complete request series
+include successful, failed and cancelled calls. For example, an FUA write that
+spends 2s at the provider and 4s in a failed sync contributes 6s to complete FUA
+request time and 4s to journal sync time, while the legacy successful-FUA count
+stays unchanged. A FLUSH waiting 3s for the volume before a 4s failed sync
+records 7s of complete request time.
+
+A caller cancellation can leave `maki_active_requests = 0` and
+`maki_admission_slots = 1` while already-dispatched storage finishes. This is
+retained work, not a request or permit leak. Internal trim chunks and its
+barrier count as one trim; the convenience `Engine::read` counts once through
+`read_secret`.
+
+These request clocks begin at Engine entry. Adapter validation, buffer copies
+and NBD chunks before/around that entry are outside the interval; a larger NBD
+callback may issue several Engine calls. Automatic journal segment rolls are
+inside complete request latency but are not separate explicit journal-sync
+samples. Provider processing remains the dispatcher's
+`maki_crypto_latency_seconds` completed-attempt series. Use these boundaries
+when attributing a wait; the series do not form an additive partition of a
+request.
+
 ## Logs
 
 Status and metrics answer "what is the state now"; the log answers "why".

@@ -735,8 +735,14 @@ sequences, journal sync failures (`maki_journal_sync_failures_total`,
 `maki_journal_writeback_uncertain`), checkpoint lag, FLUSH and FUA latency
 (`_sum`/`_count`/`_max`), cache hits and misses, backing free space, and volume
 state. Per-endpoint values are objects keyed by endpoint name (empty for local
-providers). Do not add unit indexes, LBAs, request IDs, or other
-high-cardinality values as metric labels.
+providers). Actual Engine requests and retained admission slots are separate:
+`maki_active_requests` counts public calls, while `maki_admission_slots` and its
+legacy alias `maki_active_callbacks` count resource permits. Complete request
+latencies and success/error/cancellation totals include resource waits and
+unsuccessful outcomes; explicit journal-sync time is separate. See
+[metric boundaries](observability.md#request-counts-and-latency-boundaries).
+Do not add unit indexes, LBAs, request IDs, or other high-cardinality values as
+metric labels.
 
 ## Failure handling
 

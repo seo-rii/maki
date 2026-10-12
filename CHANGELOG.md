@@ -73,6 +73,13 @@ documents.
 
 ### Added
 
+- **Complete Engine request metrics**: actual active requests are separate from
+  retained admission slots. Full read/write/trim/FLUSH/FUA latency includes
+  admission, provider and storage waits plus errors and cancellation; exactly
+  one outcome is recorded per public Engine call. Explicit journal-sync timing
+  includes failed and background barriers; legacy successful storage series
+  retain their meaning ([metric boundaries](docs/observability.md#request-counts-and-latency-boundaries)).
+
 - **Same-identity initial remote enrollment recovery**: an administrator can
   resume a never-activated authority using an approved storage identity and
   exact current fence. A durable supplementary v1 identity/capacity binding

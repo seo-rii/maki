@@ -331,6 +331,70 @@ struct EngineInner {
     /// `maki_fua_seconds`), measured on the engine clock.
     flush_latency: LatencyStats,
     fua_latency: LatencyStats,
+    /// Callback lifetime is independent of admission permits, which can be
+    /// held by parallel batches or detached storage after cancellation.
+    active_requests: AtomicU64,
+    requests_success_total: AtomicU64,
+    requests_error_total: AtomicU64,
+    requests_cancelled_total: AtomicU64,
+    request_latency: LatencyStats,
+    read_request_latency: LatencyStats,
+    write_request_latency: LatencyStats,
+    trim_request_latency: LatencyStats,
+    flush_request_latency: LatencyStats,
+    fua_request_latency: LatencyStats,
+    journal_sync_latency: LatencyStats,
+}
+
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Read,
+    Write,
+    Trim,
+    Flush,
+}
+
+enum RequestOutcome {
+    Success,
+    Error,
+    Cancelled,
+}
+
+/// Every started callback records one outcome and one complete latency,
+/// even if its future is dropped while waiting for admission or storage.
+struct RequestGuard<'a> {
+    inner: &'a EngineInner,
+    kind: RequestKind,
+    fua: bool,
+    started: Duration,
+    outcome: RequestOutcome,
+}
+
+impl Drop for RequestGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.inner.clock.now().saturating_sub(self.started);
+        self.inner.request_latency.record(elapsed);
+        match self.kind {
+            RequestKind::Read => &self.inner.read_request_latency,
+            RequestKind::Write => &self.inner.write_request_latency,
+            RequestKind::Trim => &self.inner.trim_request_latency,
+            RequestKind::Flush => &self.inner.flush_request_latency,
+        }
+        .record(elapsed);
+        if self.fua {
+            self.inner.fua_request_latency.record(elapsed);
+        }
+        let counter = match self.outcome {
+            RequestOutcome::Success => &self.inner.requests_success_total,
+            RequestOutcome::Error => &self.inner.requests_error_total,
+            RequestOutcome::Cancelled if std::thread::panicking() => {
+                &self.inner.requests_error_total
+            }
+            RequestOutcome::Cancelled => &self.inner.requests_cancelled_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.inner.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Sum, count and maximum of a latency series, in nanoseconds.
@@ -556,6 +620,17 @@ impl Engine {
             journal_uncertain: AtomicBool::new(false),
             flush_latency: LatencyStats::default(),
             fua_latency: LatencyStats::default(),
+            active_requests: AtomicU64::new(0),
+            requests_success_total: AtomicU64::new(0),
+            requests_error_total: AtomicU64::new(0),
+            requests_cancelled_total: AtomicU64::new(0),
+            request_latency: LatencyStats::default(),
+            read_request_latency: LatencyStats::default(),
+            write_request_latency: LatencyStats::default(),
+            trim_request_latency: LatencyStats::default(),
+            flush_request_latency: LatencyStats::default(),
+            fua_request_latency: LatencyStats::default(),
+            journal_sync_latency: LatencyStats::default(),
         });
         let worker = spawn_checkpoint_worker(Arc::downgrade(&inner), notify, inner.clock.clone());
         *inner.checkpoint_worker.lock().await = Some(worker);
@@ -763,6 +838,15 @@ impl Engine {
     /// Read `len` bytes at `offset` into a zeroizing buffer (the data
     /// path; SPEC §36).
     pub async fn read_secret(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
+        self.observe_request(
+            RequestKind::Read,
+            false,
+            self.read_secret_inner(offset, len),
+        )
+        .await
+    }
+
+    async fn read_secret_inner(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
         self.check_freshness().await?;
         let admission = Arc::new(
@@ -870,6 +954,11 @@ impl Engine {
     /// Write `data` at `offset`; with `fua`, all of the request's records are
     /// durable before returning.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
+        self.observe_request(RequestKind::Write, fua, self.write_inner(offset, data, fua))
+            .await
+    }
+
+    async fn write_inner(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
         self.check_freshness().await?;
         let admission = Arc::new(
@@ -1010,6 +1099,11 @@ impl Engine {
     /// own admission and unit locks. FUA applies to the last chunk, whose
     /// journal sync also makes every earlier chunk durable (R5-010).
     pub async fn trim(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
+        self.observe_request(RequestKind::Trim, fua, self.trim_inner(offset, len, fua))
+            .await
+    }
+
+    async fn trim_inner(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
         self.check_extent(offset, len)?;
         self.check_freshness().await?;
         if !self.can_trim() {
@@ -1021,7 +1115,11 @@ impl Engine {
         let first = offset.div_ceil(unit_size);
         let end = (offset + len as u64) / unit_size;
         if first >= end {
-            return if fua { self.flush().await } else { Ok(()) };
+            return if fua {
+                self.flush_inner().await
+            } else {
+                Ok(())
+            };
         }
         let per_chunk = (self.inner.max_request_bytes / unit_size).max(1);
         let mut start = first;
@@ -1151,7 +1249,7 @@ impl Engine {
         }
         if fua {
             let started = self.inner.clock.now();
-            volume.flush()?;
+            self.inner.sync_journal(volume)?;
             self.inner
                 .fua_latency
                 .record(self.inner.clock.now().saturating_sub(started));
@@ -1234,7 +1332,7 @@ impl Engine {
         }
         let pending = volume.journal_pending_bytes();
         if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
-            volume.flush()?;
+            self.inner.sync_journal(volume)?;
         }
         // Overlay bound (R4-005): the RAM held by uncheckpointed records is
         // independent of the disk journal limit. Charge the request at its
@@ -1264,7 +1362,7 @@ impl Engine {
                     self.inner.max_overlay_entries
                 )));
             }
-            volume.flush()?;
+            self.inner.sync_journal(volume)?;
             return Ok(false);
         }
         if volume
@@ -1281,7 +1379,7 @@ impl Engine {
             // Everything sealed becomes reclaimable once it is durable.
             // The caller drops volume before acquiring the checkpoint gate,
             // then repeats admission against current space and footprint.
-            volume.flush()?;
+            self.inner.sync_journal(volume)?;
             return Ok(false);
         }
         Ok(true)
@@ -1327,13 +1425,17 @@ impl Engine {
     /// FLUSH barrier: everything acknowledged before this call is durable
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
+        self.observe_request(RequestKind::Flush, false, self.flush_inner())
+            .await
+    }
+
+    async fn flush_inner(&self) -> Result<(), CoreError> {
         self.check_freshness().await?;
         let mut volume = self.inner.volume.clone().write_owned().await;
         let inner = self.inner.clone();
         storage_task(move || {
             let started = inner.clock.now();
-            let outcome = volume.flush();
-            inner.note_journal(&volume);
+            let outcome = inner.sync_journal(&mut volume);
             outcome?;
             inner
                 .flush_latency
@@ -1341,6 +1443,32 @@ impl Engine {
             Ok(())
         })
         .await?
+    }
+
+    /// Observe only public callbacks. Internal batches, trim chunks and an
+    /// internal trim barrier share their caller's guard instead of counting
+    /// as extra requests. The guard is live before validation/admission.
+    async fn observe_request<T>(
+        &self,
+        kind: RequestKind,
+        fua: bool,
+        operation: impl std::future::Future<Output = Result<T, CoreError>>,
+    ) -> Result<T, CoreError> {
+        self.inner.active_requests.fetch_add(1, Ordering::Relaxed);
+        let mut request = RequestGuard {
+            inner: &self.inner,
+            kind,
+            fua,
+            started: self.inner.clock.now(),
+            outcome: RequestOutcome::Cancelled,
+        };
+        let result = operation.await;
+        request.outcome = if result.is_ok() {
+            RequestOutcome::Success
+        } else {
+            RequestOutcome::Error
+        };
+        result
     }
 
     pub async fn checkpoint(&self) -> Result<u64, CoreError> {
@@ -1402,11 +1530,24 @@ impl Engine {
         backing_free_bytes: Option<u64>,
     ) -> EngineStats {
         let admission = &self.inner.admission;
+        let admission_slots = (admission.max_items() - admission.available_items()) as u64;
         EngineStats {
-            active_callbacks: (admission.max_items() - admission.available_items()) as u64,
+            active_callbacks: admission_slots,
+            admission_slots,
+            active_requests: self.inner.active_requests.load(Ordering::Relaxed),
+            requests_success_total: self.inner.requests_success_total.load(Ordering::Relaxed),
+            requests_error_total: self.inner.requests_error_total.load(Ordering::Relaxed),
+            requests_cancelled_total: self.inner.requests_cancelled_total.load(Ordering::Relaxed),
             plaintext_bytes_in_flight: admission.max_bytes() - admission.available_bytes(),
             flush_latency: self.inner.flush_latency.snapshot(),
             fua_latency: self.inner.fua_latency.snapshot(),
+            request_latency: self.inner.request_latency.snapshot(),
+            read_request_latency: self.inner.read_request_latency.snapshot(),
+            write_request_latency: self.inner.write_request_latency.snapshot(),
+            trim_request_latency: self.inner.trim_request_latency.snapshot(),
+            flush_request_latency: self.inner.flush_request_latency.snapshot(),
+            fua_request_latency: self.inner.fua_request_latency.snapshot(),
+            journal_sync_latency: self.inner.journal_sync_latency.snapshot(),
             durable_sequence: volume.durable_sequence,
             appended_sequence: volume.appended_sequence,
             checkpoint_sequence: volume.checkpoint_sequence,
@@ -1430,6 +1571,18 @@ impl Engine {
 }
 
 impl EngineInner {
+    /// Explicit journal barriers, including failed syncs. This excludes
+    /// provider, volume-lock and blocking-pool wait; public callback guards
+    /// measure those waits in the full request latency instead.
+    fn sync_journal(&self, volume: &mut Volume) -> Result<(), CoreError> {
+        let started = self.clock.now();
+        let result = volume.flush();
+        self.journal_sync_latency
+            .record(self.clock.now().saturating_sub(started));
+        self.note_journal(volume);
+        result
+    }
+
     /// Remember whether the journal has unsynced bytes a failed sync left
     /// in an unknown state (read under the volume lock the caller holds).
     fn note_journal(&self, volume: &Volume) {
@@ -1567,12 +1720,7 @@ impl EngineInner {
                 return;
             }
             let inner = self.clone();
-            let flushed = storage_task(move || {
-                let flushed = volume.flush();
-                inner.note_journal(&volume);
-                flushed
-            })
-            .await;
+            let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
             if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
                 return;
@@ -1826,8 +1974,18 @@ pub struct MonitoringSnapshot {
 
 #[derive(Debug, Clone, Default)]
 pub struct EngineStats {
-    /// Requests currently admitted (SPEC §40 `maki_active_callbacks`).
+    /// Occupied admission slots, including extra parallel batches and
+    /// storage retaining its permit after callback cancellation (legacy
+    /// SPEC §40 `maki_active_callbacks`).
     pub active_callbacks: u64,
+    /// Same resource count as `active_callbacks`, named explicitly.
+    pub admission_slots: u64,
+    /// Public callbacks still waiting or executing, before admission as
+    /// well as after it. Internal batches/chunks do not increment this.
+    pub active_requests: u64,
+    pub requests_success_total: u64,
+    pub requests_error_total: u64,
+    pub requests_cancelled_total: u64,
     /// Plaintext bytes currently charged against the admission budget
     /// (`maki_plaintext_bytes`).
     pub plaintext_bytes_in_flight: u64,
@@ -1835,6 +1993,19 @@ pub struct EngineStats {
     pub flush_latency: LatencySnapshot,
     /// Successful FUA syncs (`maki_fua_seconds`).
     pub fua_latency: LatencySnapshot,
+    /// Full callback latencies, including validation and resource waits;
+    /// successful, failed and cancelled callbacks all contribute.
+    pub request_latency: LatencySnapshot,
+    pub read_request_latency: LatencySnapshot,
+    pub write_request_latency: LatencySnapshot,
+    pub trim_request_latency: LatencySnapshot,
+    pub flush_request_latency: LatencySnapshot,
+    /// Complete write/trim callbacks submitted with FUA, regardless of
+    /// outcome. Separate from successful storage-only `fua_latency`.
+    pub fua_request_latency: LatencySnapshot,
+    /// Explicit journal FLUSH/FUA/admission barriers, including failures;
+    /// automatic segment-roll syncs are inside the broader request latency.
+    pub journal_sync_latency: LatencySnapshot,
     pub durable_sequence: u64,
     pub appended_sequence: u64,
     pub checkpoint_sequence: u64,
