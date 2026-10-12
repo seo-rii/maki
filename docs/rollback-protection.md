@@ -217,6 +217,17 @@ Allocation, file-sync or directory-sync failure refuses attachment without
 advancing the witness. The witness filesystem must independently retain space
 for its atomic updates.
 
+Local mode also reestablishes the durability of the authenticated restore
+before exposing readiness. Reopen rereads and rewrites every referenced arena
+page, republishes the selected manifest and format marker, and reasserts file
+lengths before synchronizing the files and directory. This covers a failed
+writeback followed by a process restart, where valid restored bytes can still
+be readable in the page cache although they are no longer dirty. It adds one
+read and one write per referenced page on each local reopen, using a 4 KiB page
+buffer; it does not change the on-disk format or advance the witness. Remote
+mode establishes durability by copying the selected generation into its new
+namespace.
+
 Pages in the committed manifest are immutable until the witness has durably
 selected their successor. Writes use free arena pages, or their own uncommitted
 pages. Every disk page read checks its SHA-256 hash; the canonical manifest binds

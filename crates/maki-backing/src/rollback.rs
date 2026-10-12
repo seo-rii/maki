@@ -20,6 +20,8 @@ use crate::witness::FileWitness;
 mod enrollment;
 pub mod gc;
 mod remote;
+#[cfg(all(test, target_os = "linux"))]
+mod review_restore;
 use crate::{path, Backing, BackingFile, FileBacking, VolumeLock};
 use remote::Witness;
 
@@ -296,7 +298,12 @@ impl RollbackBacking {
     /// Open only the exact manifest selected by the existing witness.
     pub fn open(root: &Path, witness: &Path) -> io::Result<Self> {
         independent_paths(root, witness)?;
-        let disk = FileBacking::new(root)?;
+        Self::open_backing(Arc::new(FileBacking::new(root)?), witness)
+    }
+
+    // Keep authentication and readiness barriers on one path for the real
+    // backing and the executable crash model.
+    fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
         let disk_lock = disk.try_lock("rollback.lock")?;
         let marker = disk.open(MARKER, false)?;
         let mut magic = vec![0; MAGIC.len()];
@@ -363,9 +370,37 @@ impl RollbackBacking {
         // before any caller can depend on the recorded capacity promises.
         // Only the inactive manifest may have been missing or the wrong size;
         // selected evidence and arena length were validated above.
-        reserve_storage(&disk, arena.as_ref(), manifest.capacity)?;
-        Ok(Self::assemble(
-            disk, arena, witness, disk_lock, manifest, slot,
+        reserve_storage(disk.as_ref(), arena.as_ref(), manifest.capacity)?;
+        // A failed restore/reopen writeback can leave authenticated bytes
+        // readable but clean and absent from disk, even in a new process.
+        // Re-dirty every selected page before admitting another writer. Keep
+        // the buffer bounded, and recheck each page immediately before the
+        // rewrite; all pages were authenticated before any mutation above.
+        for node in manifest.files.values() {
+            for page in node.pages.values() {
+                arena.read_at(page.slot * PAGE, &mut bytes)?;
+                if page_digest(&manifest.identity, &bytes) != page.hash {
+                    return Err(invalid("rollback arena changed during restore"));
+                }
+                arena.write_at(page.slot * PAGE, &bytes)?;
+            }
+        }
+        arena.sync_data()?;
+        // The exact selected envelope and marker can also be cache-only after
+        // failed writeback. Re-publish the already authenticated bytes without
+        // advancing the independent witness or changing the on-disk format.
+        write_manifest(disk.as_ref(), slot, &manifest.encode()?)?;
+        marker.write_at(0, MAGIC)?;
+        marker.set_len(MAGIC.len() as u64)?;
+        marker.sync_data()?;
+        disk.sync_dir("")?;
+        Ok(Self::assemble_witness(
+            disk,
+            arena,
+            Witness::Local(witness),
+            disk_lock,
+            manifest,
+            slot,
         ))
     }
 
@@ -418,14 +453,15 @@ impl RollbackBacking {
 }
 
 fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -> io::Result<()> {
+    // Matching cached lengths do not prove that an earlier set_len survived
+    // failed writeback. Reassert them before the successful reservation sync.
+    arena.set_len(capacity * 2)?;
     arena.allocate_range(0, capacity * 2)?;
     arena.sync_data()?;
     let bound = manifest_bound(capacity);
     for name in MANIFESTS {
         let file = disk.open(name, true)?;
-        if file.len()? != bound {
-            file.set_len(bound)?;
-        }
+        file.set_len(bound)?;
         file.allocate_range(0, bound)?;
         file.sync_data()?;
     }

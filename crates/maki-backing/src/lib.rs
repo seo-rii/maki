@@ -24,6 +24,11 @@ pub use rollback::RollbackBacking;
 pub use file::FileBacking;
 pub use mem::MemBacking;
 
+// Share the executable crash model with this crate's unit tests without a
+// dependency cycle through maki-test-support.
+#[cfg(test)]
+extern crate self as maki_backing;
+
 use std::io;
 use std::sync::Arc;
 
