@@ -10,6 +10,9 @@
 //! The provider's private wire items erase their owned data on drop and field
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -67,6 +70,14 @@ pub struct CryptoBatchResponse {
 /// gRPC status → Maki error class (SPEC §31, §51 "status mapping").
 pub fn map_status(status: &tonic::Status) -> CryptoError {
     use tonic::Code;
+    // Local receive failures never crossed the wire. Only our private typed
+    // source establishes that provenance; remote status text or metadata
+    // cannot impersonate it (BUG-057).
+    if let Some(local) = std::error::Error::source(status)
+        .and_then(|source| source.downcast_ref::<ReceiveContractError>())
+    {
+        return CryptoError::Contract(local.0.into());
+    }
     // FailedPrecondition alone is a request error. Integrity additionally
     // requires exactly one allowlisted ASCII metadata value, never free text.
     if status.code() == Code::FailedPrecondition {
@@ -117,6 +128,302 @@ pub fn map_status(status: &tonic::Status) -> CryptoError {
 /// Convenience for tests/docs: class of a mapped code.
 pub fn class_of_code(code: tonic::Code) -> ErrorClass {
     map_status(&tonic::Status::new(code, "x")).class()
+}
+
+// Tonic rejects oversized gRPC frames before calling the protobuf decoder,
+// using the same OutOfRange code a server can legitimately return for a bad
+// request. Observe only the five-byte framing header before tonic consumes
+// the body, so local receive errors have a private, unforgeable source. The
+// payload stays in tonic's existing erased Bytes allocation and both tonic
+// size limits remain enabled.
+#[derive(Debug)]
+struct ReceiveContractError(&'static str);
+
+impl std::fmt::Display for ReceiveContractError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ReceiveContractError {}
+
+fn receive_contract_status(message: &'static str) -> tonic::Status {
+    let mut status = tonic::Status::internal(message);
+    status.set_source(Arc::new(ReceiveContractError(message)));
+    status
+}
+
+struct ResponseFraming {
+    header: [u8; 5],
+    header_bytes: usize,
+    remaining: usize,
+    limit: usize,
+}
+
+impl ResponseFraming {
+    fn new(limit: usize) -> Self {
+        Self {
+            header: [0; 5],
+            header_bytes: 0,
+            remaining: 0,
+            limit,
+        }
+    }
+
+    fn observe(&mut self, mut bytes: &[u8]) -> Result<(), &'static str> {
+        while !bytes.is_empty() {
+            if self.remaining > 0 {
+                let consumed = self.remaining.min(bytes.len());
+                self.remaining -= consumed;
+                bytes = &bytes[consumed..];
+                continue;
+            }
+            let consumed = (self.header.len() - self.header_bytes).min(bytes.len());
+            self.header[self.header_bytes..self.header_bytes + consumed]
+                .copy_from_slice(&bytes[..consumed]);
+            self.header_bytes += consumed;
+            bytes = &bytes[consumed..];
+            if self.header_bytes == self.header.len() {
+                // This provider does not enable response compression.
+                if self.header[0] != 0 {
+                    return Err("grpc response has an unsupported compression flag");
+                }
+                let length = u32::from_be_bytes(self.header[1..].try_into().unwrap()) as usize;
+                if length > self.limit {
+                    return Err("grpc response exceeds the message-size limit");
+                }
+                self.remaining = length;
+                self.header_bytes = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct BoundedResponseBody {
+    inner: tonic::body::Body,
+    framing: ResponseFraming,
+}
+
+impl http_body::Body for BoundedResponseBody {
+    type Data = tonic::codegen::Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        if let Some(Ok(frame)) = &frame {
+            if let Some(bytes) = frame.data_ref() {
+                if let Err(message) = self.framing.observe(bytes) {
+                    return Poll::Ready(Some(Err(receive_contract_status(message))));
+                }
+            }
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+struct BoundedResponseChannel {
+    inner: Channel,
+    limit: usize,
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
+    for BoundedResponseChannel
+{
+    type Response = tonic::codegen::http::Response<BoundedResponseBody>;
+    type Error = tonic::transport::Error;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        tonic::codegen::Service::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+        let response = tonic::codegen::Service::call(&mut self.inner, request);
+        let limit = self.limit;
+        Box::pin(async move {
+            Ok(response.await?.map(|inner| BoundedResponseBody {
+                inner,
+                framing: ResponseFraming::new(limit),
+            }))
+        })
+    }
+}
+
+#[derive(Default)]
+struct ResponseCodec(tonic::codec::ProstCodec<WireRequest, WireResponse>);
+
+struct ResponseDecoder(
+    <tonic::codec::ProstCodec<WireRequest, WireResponse> as tonic::codec::Codec>::Decoder,
+);
+
+impl tonic::codec::Codec for ResponseCodec {
+    type Encode = WireRequest;
+    type Decode = WireResponse;
+    type Encoder =
+        <tonic::codec::ProstCodec<WireRequest, WireResponse> as tonic::codec::Codec>::Encoder;
+    type Decoder = ResponseDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        self.0.encoder()
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        ResponseDecoder(self.0.decoder())
+    }
+}
+
+impl tonic::codec::Decoder for ResponseDecoder {
+    type Item = WireResponse;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        source: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        self.0
+            .decode(source)
+            .map_err(|_| receive_contract_status("grpc response protobuf decoding failed"))
+    }
+
+    fn buffer_settings(&self) -> tonic::codec::BufferSettings {
+        self.0.buffer_settings()
+    }
+}
+
+#[cfg(test)]
+mod receive_contract_tests {
+    use super::{BoundedResponseBody, ResponseFraming};
+    use http_body::Body;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tonic::codegen::Bytes;
+
+    #[test]
+    fn size_check_handles_every_header_split_and_exact_limit() {
+        for split in 0..=5 {
+            let header = [0, 0, 0, 4, 1]; // 1025 bytes.
+            let mut framing = ResponseFraming::new(1024);
+            let first = framing.observe(&header[..split]);
+            if split == 5 {
+                assert!(first.is_err());
+            } else {
+                first.unwrap();
+                assert!(framing.observe(&header[split..]).is_err());
+            }
+            let mut framing = ResponseFraming::new(1024);
+            let header = [0, 0, 0, 4, 0]; // Exactly 1024 bytes.
+            framing.observe(&header[..split]).unwrap();
+            framing.observe(&header[split..]).unwrap();
+        }
+    }
+
+    #[test]
+    fn payload_is_skipped_and_each_later_message_has_its_own_limit() {
+        let mut framing = ResponseFraming::new(8);
+        framing.observe(&[0, 0, 0, 0, 8]).unwrap();
+        framing.observe(&[255; 3]).unwrap();
+        framing.observe(&[255; 5]).unwrap();
+        framing.observe(&[0, 0, 0, 0, 8]).unwrap();
+        framing.observe(&[255; 8]).unwrap();
+        assert!(framing.observe(&[0, 0, 0, 0, 9]).is_err());
+    }
+
+    #[test]
+    fn unsupported_compression_is_also_local_receive_provenance() {
+        for flag in [1, 2, 255] {
+            assert!(ResponseFraming::new(8)
+                .observe(&[flag, 0, 0, 0, 1])
+                .is_err());
+        }
+    }
+
+    struct Frames {
+        frames: VecDeque<http_body::Frame<Bytes>>,
+        dropped: super::Arc<AtomicBool>,
+    }
+
+    impl Drop for Frames {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Body for Frames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: super::Pin<&mut Self>,
+            _: &mut super::Context<'_>,
+        ) -> super::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            super::Poll::Ready(self.frames.pop_front().map(Ok))
+        }
+    }
+
+    #[tokio::test]
+    async fn split_frames_and_remote_trailers_pass_through_without_reclassification() {
+        let mut trailers = tonic::codegen::http::HeaderMap::new();
+        trailers.insert("grpc-status", "11".parse().unwrap());
+        let dropped = super::Arc::new(AtomicBool::new(false));
+        let frames = Frames {
+            frames: VecDeque::from([
+                http_body::Frame::data(Bytes::from_static(&[0, 0])),
+                http_body::Frame::data(Bytes::from_static(&[0, 0, 1])),
+                http_body::Frame::data(Bytes::from_static(&[0x11])),
+                http_body::Frame::trailers(trailers),
+            ]),
+            dropped: dropped.clone(),
+        };
+        let mut body = BoundedResponseBody {
+            inner: tonic::body::Body::new(frames),
+            framing: ResponseFraming::new(1),
+        };
+        for _ in 0..3 {
+            let frame = std::future::poll_fn(|cx| super::Pin::new(&mut body).poll_frame(cx))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(frame.is_data());
+        }
+        let frame = std::future::poll_fn(|cx| super::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.trailers_ref().unwrap()["grpc-status"], "11");
+        drop(body);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_incomplete_frame_drops_its_transport_body() {
+        let dropped = super::Arc::new(AtomicBool::new(false));
+        let frames = Frames {
+            frames: VecDeque::from([http_body::Frame::data(Bytes::from_static(&[0, 0]))]),
+            dropped: dropped.clone(),
+        };
+        let mut body = BoundedResponseBody {
+            inner: tonic::body::Body::new(frames),
+            framing: ResponseFraming::new(1),
+        };
+        std::future::poll_fn(|cx| super::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(body);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 }
 
 // ---------------------------------------------------------------- provider
@@ -354,9 +661,12 @@ impl GrpcCryptoProvider {
             format_version: context.format_version,
         };
 
-        let mut grpc = tonic::client::Grpc::new(self.channel.clone())
-            .max_decoding_message_size(self.spec.max_message_bytes)
-            .max_encoding_message_size(self.spec.max_message_bytes);
+        let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
+            inner: self.channel.clone(),
+            limit: self.spec.max_message_bytes,
+        })
+        .max_decoding_message_size(self.spec.max_message_bytes)
+        .max_encoding_message_size(self.spec.max_message_bytes);
 
         let mut request = tonic::Request::new(message);
         for (key, value) in &self.spec.metadata {
@@ -368,8 +678,7 @@ impl GrpcCryptoProvider {
             request.metadata_mut().insert(key, value);
         }
 
-        let codec: tonic::codec::ProstCodec<WireRequest, WireResponse> =
-            tonic::codec::ProstCodec::default();
+        let codec = ResponseCodec::default();
 
         // `Channel::timeout` bounds the connection, not the whole exchange:
         // a server that stalls after the response headers, or between the

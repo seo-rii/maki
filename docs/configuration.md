@@ -324,6 +324,11 @@ The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
 Service method paths are configurable, but request and response messages must
 match that contract and responses must preserve unit identity and order.
+The message-size limit bounds each received gRPC frame before decoding.
+Locally rejected oversized frames and invalid protobuf results are endpoint
+contract failures: their breaker is charged, and only retry-safe requests may
+move to another peer. An actual remote `OutOfRange` status remains a request
+error, regardless of its message text.
 
 ## Backing directory identity
 
