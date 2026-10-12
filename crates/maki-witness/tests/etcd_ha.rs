@@ -19,6 +19,7 @@ fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+#[cfg(unix)]
 fn inspect() -> Request {
     Request {
         authorization: None,
@@ -31,6 +32,7 @@ fn inspect() -> Request {
 struct Credentials {
     _dir: tempfile::TempDir,
     client: TlsFiles,
+    #[cfg(unix)]
     server_files: TlsFiles,
     server: Arc<rustls::ServerConfig>,
 }
@@ -58,6 +60,7 @@ impl Credentials {
         let server = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let client = rcgen::generate_simple_self_signed(vec!["witness-backend".into()]).unwrap();
         let client_files = write_identity(dir.path(), "client", &client, &server.cert.pem());
+        #[cfg(unix)]
         let server_files = write_identity(dir.path(), "server", &server, &client.cert.pem());
         let mut roots = rustls::RootCertStore::empty();
         roots.add(client.cert.der().clone()).unwrap();
@@ -82,6 +85,7 @@ impl Credentials {
         Self {
             _dir: dir,
             client: client_files,
+            #[cfg(unix)]
             server_files,
             server: Arc::new(config),
         }

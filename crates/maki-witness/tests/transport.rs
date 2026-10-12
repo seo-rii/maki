@@ -190,6 +190,7 @@ fn stalled_handshake_expires_and_does_not_retry() {
     worker.join().unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn tls_key_permissions_and_symlinks_are_refused() {
     let fixture = Fixture::new();
