@@ -44,6 +44,7 @@ struct BudgetState {
 /// Token-bucket retry budget.
 pub struct RetryBudget {
     config: RetryBudgetConfig,
+    probe_interval: Option<Duration>,
     clock: Arc<dyn Clock>,
     state: Mutex<BudgetState>,
 }
@@ -51,8 +52,18 @@ pub struct RetryBudget {
 impl RetryBudget {
     pub fn new(config: RetryBudgetConfig, clock: Arc<dyn Clock>) -> Self {
         let now = clock.now();
+        // Direct library callers can bypass configuration validation. Invalid
+        // or unrepresentable rates disable free probes; earned tokens still
+        // work. Compute once, using the fallible conversion to avoid a panic
+        // in the request path.
+        let probe_interval = (config.min_probe_per_sec.is_finite()
+            && config.min_probe_per_sec > 0.0)
+            .then(|| Duration::try_from_secs_f64(1.0 / config.min_probe_per_sec).ok())
+            .flatten()
+            .filter(|interval| !interval.is_zero());
         Self {
             config,
+            probe_interval,
             clock,
             state: Mutex::new(BudgetState {
                 tokens: 0.0,
@@ -75,10 +86,9 @@ impl RetryBudget {
             state.tokens -= 1.0;
             return true;
         }
-        if self.config.min_probe_per_sec <= 0.0 {
+        let Some(interval) = self.probe_interval else {
             return false;
-        }
-        let interval = Duration::from_secs_f64(1.0 / self.config.min_probe_per_sec);
+        };
         let now = self.clock.now();
         if now.saturating_sub(state.last_probe) >= interval {
             state.last_probe = now;

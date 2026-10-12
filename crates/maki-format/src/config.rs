@@ -1560,9 +1560,13 @@ impl VolumeConfig {
             return Err(invalid("crypto.retry_budget.burst must be positive"));
         }
         let probe = b.minimum_probe_rate.0;
-        if !probe.is_finite() || probe <= 0.0 || probe > 1000.0 {
+        if !probe.is_finite()
+            || probe <= 0.0
+            || probe > 1000.0
+            || std::time::Duration::try_from_secs_f64(1.0 / probe).is_err()
+        {
             return Err(invalid(
-                "crypto.retry_budget.minimum_probe_rate must be finite and within (0, 1000]/s",
+                "crypto.retry_budget.minimum_probe_rate must be within (0, 1000]/s with a finite, representable probe interval",
             ));
         }
 
