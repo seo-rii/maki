@@ -68,9 +68,13 @@ async fn decrypt_chunked(
     context: &CryptoContext,
     items: &[CiphertextUnit],
     caps: &CryptoCapabilities,
+    unit_size: usize,
 ) -> Result<Vec<PlaintextUnit>, CryptoError> {
     let mut out = Vec::with_capacity(items.len());
-    for range in batch_ranges(items, caps, |c| c.data.len() as u64) {
+    // BatchCapability counts the original plaintext, not encoded bytes.
+    // The caller knows the size of every probe unit; resident ciphertext
+    // limits remain independently enforced by the provider/scheduler.
+    for range in batch_ranges(items, caps, |_| unit_size as u64) {
         let chunk = &items[range];
         let pts = provider.decrypt_batch(context, chunk).await?;
         validate_decrypt_result(chunk, &pts, caps)?;
@@ -194,7 +198,7 @@ pub async fn provider_self_test(
     }
     let items = patterns(unit_size);
     let cts = encrypt_chunked(provider, context, &items, &caps).await?;
-    let pts = decrypt_chunked(provider, context, &cts, &caps).await?;
+    let pts = decrypt_chunked(provider, context, &cts, &caps, unit_size).await?;
     for (orig, got) in items.iter().zip(pts.iter()) {
         if orig.data != got.data {
             return Err(CryptoError::ProviderFatal(
@@ -328,7 +332,7 @@ pub async fn provider_conformance(
         })
         .collect();
     let cts = encrypt_chunked(provider, context, &items, &caps).await?;
-    let pts = decrypt_chunked(provider, context, &cts, &caps).await?;
+    let pts = decrypt_chunked(provider, context, &cts, &caps, unit_size).await?;
     for (orig, got) in items.iter().zip(pts.iter()) {
         if orig.data != got.data {
             return Err(CryptoError::ProviderFatal(
@@ -341,7 +345,7 @@ pub async fn provider_conformance(
     // identically both times.
     let repeated = std::slice::from_ref(&items[0]);
     let again = encrypt_chunked(provider, context, repeated, &caps).await?;
-    let back = decrypt_chunked(provider, context, &again, &caps).await?;
+    let back = decrypt_chunked(provider, context, &again, &caps, unit_size).await?;
     if back[0].data != items[0].data {
         return Err(CryptoError::ProviderFatal(
             "conformance: repeated encryption round trip mismatch".to_string(),
@@ -377,7 +381,7 @@ pub async fn cross_endpoint_self_test(
         // endpoint is not spuriously rejected (MAKI-010).
         let cts = encrypt_chunked(enc, context, &items, caps_enc).await?;
         let mut pts = Vec::with_capacity(cts.len());
-        for range in batch_ranges(&cts, caps_dec, |c| c.data.len() as u64) {
+        for range in batch_ranges(&cts, caps_dec, |_| unit_size as u64) {
             let chunk = &cts[range];
             let got = dec.decrypt_batch(context, chunk).await.map_err(|e| {
                 // A transport-level failure is not proof of incompatibility —

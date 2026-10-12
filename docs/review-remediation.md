@@ -1320,12 +1320,26 @@ regressions against the current code before implementation.
 | BUG-051, ignored cache TTL | Validate the whole payload, including positive TTL and supported field names, before applying byte limit and TTL together. Size-only reloads preserve TTL; the CLI accepts `--ttl` in either option order. | maki-nbdkit `review_cache_ttl_reload.rs` with ManualClock; maki `review_cache_reload_cli.rs` with a real control request |
 | BUG-052, false read-verification claim | Derive `read_verified` from actual compared read samples. Add `verified_read_operations` and `read_verification`, and print skipped when no reads ran. Read failures still exit without a success report. | maki-benchmark `review_read_verdict.rs`: zero-percent and short mixed workloads, actual reads, default phases and text output |
 
-The variable-length Engine fixture keeps attach-probe ciphertext full-sized,
-then exercises short workload encodings with scheduler admission enabled
-throughout attach, reads and RMW. It does not qualify the separate attach
-self-test batching path when those probe encodings are also short.
-Focused success remains separate from the
-complete workspace, ignored release gates and exact-revision Linux/Windows CI.
+The shared stateless Engine/provider fixture encodes uniform plaintext as a
+compact packet with the fake's integrity/context checks and retains full-size
+ciphertext for other data.
+Its zero and all-one attach probes are short too; scheduler admission stays
+enabled throughout attach, reads and RMW. Independent fixture instances decode
+one another's ciphertext without a shared dictionary.
+
+**BUG-053, attach self-test byte basis.** The positive decrypt probes in
+`provider_self_test`, wide/repeated `provider_conformance` probes, and both
+directions of `cross_endpoint_self_test` now split by the caller's actual
+plaintext unit size. Using encoded lengths previously sent two short units
+against a one-unit byte limit, refusing an otherwise valid attach; ciphertext
+overhead also caused unnecessarily small batches. Item limits, result-shape
+validation, negative probes and independent resident-memory admission remain
+enforced. `maki-crypto/tests/review_selftest_logical_batches.rs` covers those
+paths and exact byte/item boundaries; `maki-core` exercises real scheduler
+attach and subsequent reads/RMW with the same fixture.
+
+Focused success remains separate from the complete workspace, ignored release
+gates and exact-revision Linux/Windows CI.
 
 The prior Windows CI reached workspace tests after all four Clippy matrix
 steps passed. Its remote-witness configuration fixtures still used Unix TLS

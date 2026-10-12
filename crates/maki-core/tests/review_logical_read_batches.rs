@@ -1,81 +1,15 @@
 //! BUG-049: batch bytes mean plaintext bytes, independently of encoded size.
-use async_trait::async_trait;
 use maki_backing::Backing;
 use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
 use maki_crypto::scheduler::{BatchScheduler, SchedulerConfig};
-use maki_crypto::{
-    CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
-};
+use maki_crypto::{CryptoContext, CryptoError, CryptoProvider, PlaintextUnit};
 use maki_format::{geometry::Geometry, init, superblock::Superblock};
 use maki_test_support::{fake_provider::FakeCryptoProvider, CrashableBacking, ManualClock};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-const UNIT: u32 = 4096;
-
-// The fake's complete bound ciphertext is retained under a short token. This
-// models reversible variable-length encoding without weakening its checks.
-struct ShortProvider {
-    fake: FakeCryptoProvider,
-    encoded: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
-}
-#[async_trait]
-impl CryptoProvider for ShortProvider {
-    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        self.fake.capabilities().await
-    }
-    async fn encrypt_batch(
-        &self,
-        ctx: &CryptoContext,
-        items: &[PlaintextUnit],
-    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let mut result = self.fake.encrypt_batch(ctx, items).await?;
-        let mut stored = self.encoded.lock().unwrap();
-        for (item, plain) in result.iter_mut().zip(items) {
-            // Only the workload's patterns have short encodings. Attach
-            // probes use full-size ciphertext, so the real scheduler can
-            // stay enabled throughout attach and every subsequent request.
-            if !plain
-                .data
-                .expose()
-                .iter()
-                .all(|byte| matches!(*byte, 0x49 | 0x91 | 0x77))
-            {
-                continue;
-            }
-            let mut token = vec![0; 512];
-            token[..8].copy_from_slice(&(stored.len() as u64).to_le_bytes());
-            stored.insert(token.clone(), std::mem::replace(&mut item.data, token));
-        }
-        Ok(result)
-    }
-    async fn decrypt_batch(
-        &self,
-        ctx: &CryptoContext,
-        items: &[CiphertextUnit],
-    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let expanded = {
-            let stored = self.encoded.lock().unwrap();
-            items
-                .iter()
-                .map(|item| {
-                    Ok(CiphertextUnit {
-                        unit_index: item.unit_index,
-                        data: if item.data.len() == 512 {
-                            stored
-                                .get(&item.data)
-                                .cloned()
-                                .ok_or_else(|| CryptoError::Integrity("unknown token".into()))?
-                        } else {
-                            item.data.clone()
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, CryptoError>>()?
-        };
-        self.fake.decrypt_batch(ctx, &expanded).await
-    }
-}
+#[path = "../../maki-crypto/tests/common/compact_provider.rs"]
+mod compact;
+use compact::{CompactProvider, UNIT};
 
 fn config(resident: u64) -> SchedulerConfig {
     SchedulerConfig {
@@ -129,12 +63,9 @@ async fn engine(provider: Arc<dyn CryptoProvider>) -> Engine {
 
 #[tokio::test]
 async fn small_ciphertexts_support_individual_combined_and_partial_reads() {
-    let short = Arc::new(ShortProvider {
-        fake: FakeCryptoProvider::new(UNIT).with_max_batch(2, UNIT as u64),
-        encoded: Mutex::default(),
-    });
+    let short = Arc::new(CompactProvider::new(2, UNIT as u64, true));
     let provider = Arc::new(BatchScheduler::with_unit_size(
-        short,
+        short.clone(),
         config(16 * 1024),
         Arc::new(ManualClock::new()),
         UNIT,
@@ -163,6 +94,8 @@ async fn small_ciphertexts_support_individual_combined_and_partial_reads() {
         .unwrap();
     data[512..512 + UNIT as usize].fill(0x77);
     assert_eq!(engine.read(0, data.len()).await.unwrap(), data);
+    assert!(short.encrypt_groups().iter().all(|count| *count == 1));
+    assert!(short.decrypt_groups().iter().all(|count| *count == 1));
     engine.stop_checkpoint_worker().await;
 }
 
