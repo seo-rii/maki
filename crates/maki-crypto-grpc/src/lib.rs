@@ -109,7 +109,7 @@ pub fn map_status(status: &tonic::Status) -> CryptoError {
         Code::InvalidArgument | Code::NotFound | Code::OutOfRange | Code::FailedPrecondition => {
             CryptoError::NonRetryableRequest(message)
         }
-        Code::Unimplemented => CryptoError::ProviderFatal(message),
+        Code::Unimplemented => CryptoError::EndpointFatal(message),
         _ => CryptoError::Retryable(message),
     }
 }

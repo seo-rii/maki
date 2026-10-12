@@ -55,6 +55,7 @@ struct ServerState {
     require_token: Option<String>,
     fail_with: parking_lot_lite::Mutex<Option<Code>>,
     reorder: std::sync::atomic::AtomicBool,
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 // tiny local mutex shim to avoid a dev-dependency
@@ -83,6 +84,9 @@ struct CryptoServer {
 impl CryptoServer {
     #[allow(clippy::result_large_err)] // tonic::Status is the natural error type for a gRPC handler
     fn handle(&self, request: Request<CryptoBatchRequest>) -> Result<CryptoBatchResponse, Status> {
+        self.state
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(token) = &self.state.require_token {
             match request
                 .metadata()
@@ -282,7 +286,7 @@ async fn status_mapping_covers_grpc_codes() {
     );
     assert_eq!(
         class_of_code(Code::Unimplemented),
-        ErrorClass::ProviderFatal
+        ErrorClass::EndpointFatal
     );
 
     // And over the wire:
@@ -369,4 +373,66 @@ fn followup_remote_status_does_not_expose_reflected_secrets() {
         "remote status text must not reach the error: {text}"
     );
     assert_eq!(error.class(), ErrorClass::Retryable);
+}
+
+#[tokio::test]
+async fn unimplemented_only_poisoned_endpoint_and_respects_retry_safety() {
+    use maki_crypto::breaker::{BreakerConfig, CircuitState};
+    use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
+    use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
+    use std::sync::atomic::Ordering;
+    for (retry_safe, all_failed) in [(true, false), (false, false), (true, true)] {
+        let left = Arc::new(ServerState::default());
+        let right = Arc::new(ServerState::default());
+        let left_url = grpc_server(left.clone()).await;
+        let right_url = grpc_server(right.clone()).await;
+        let config = DispatchConfig {
+            retry: RetryPolicy {
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            budget: RetryBudgetConfig {
+                retry_ratio: 1.0,
+                burst: 10,
+                min_probe_per_sec: 1.0,
+            },
+            breaker: BreakerConfig {
+                failure_threshold: 1,
+                ..BreakerConfig::default()
+            },
+            global_max_inflight_batches: 2,
+            global_max_inflight_bytes: 1 << 20,
+            per_endpoint_max_inflight: 1,
+            per_endpoint_max_bytes: 1 << 20,
+            max_attempts: Some(1),
+            max_operation_time: Some(Duration::from_secs(2)),
+            retry_safe,
+            validation_interval: Duration::from_secs(1),
+        };
+        let set = EndpointSet::new(
+            vec![
+                ("left".into(), Arc::new(provider(&left_url, vec![]))),
+                ("right".into(), Arc::new(provider(&right_url, vec![]))),
+            ],
+            config,
+            Arc::new(maki_crypto::SystemClock::new()),
+        );
+        set.encrypt_batch(&ctx(), &[pt(1, 1)]).await.unwrap();
+        *left.fail_with.lock() = Some(Code::Unimplemented);
+        if all_failed {
+            *right.fail_with.lock() = Some(Code::Unimplemented);
+        }
+        let result = set.encrypt_batch(&ctx(), &[pt(2, 2)]).await;
+        if retry_safe && !all_failed {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(set.endpoint_states()[0].1, CircuitState::Open);
+        assert_eq!(right.calls.load(Ordering::SeqCst), usize::from(retry_safe));
+        assert_eq!(set.global_inflight(), (0, 0));
+        if all_failed {
+            assert_eq!(set.endpoint_states()[1].1, CircuitState::Open);
+        }
+    }
 }
