@@ -83,11 +83,13 @@ struct ActiveSegment {
     /// File offset up to which this segment has been fdatasync'd.
     synced_offset: u64,
     unsynced: bool,
-    /// A failed write may have extended the physical file beyond the last
-    /// accepted record. Keep cleanup pending until its truncation is synced.
+    /// The visible file may extend beyond the last accepted record after a
+    /// failed allocation/write. A complete retry removes the visible tail;
+    /// a sync error separately requires reasserting the length below.
     needs_tail_cleanup: bool,
-    /// Linux may clear dirty page-cache bits after writeback EIO. Retrying
-    /// sync alone cannot make those bytes durable; rewrite them first.
+    /// Linux may clear dirty page-cache bits after writeback EIO, including
+    /// a pending truncation. Reassert the accepted length and rewrite the
+    /// accepted bytes before retrying sync; either alone is insufficient.
     needs_redirty: bool,
     /// Fingerprint of exactly the records accepted after synced_offset.
     /// Ephemeral state only: CRC32 cannot fingerprint self-checksummed
@@ -277,10 +279,12 @@ impl JournalWriter {
         if !active.unsynced && !active.needs_tail_cleanup {
             return Ok(());
         }
-        if active.needs_tail_cleanup {
+        if active.needs_tail_cleanup || active.needs_redirty {
             // Even a segment with no new accepted records can have a torn
             // append. Its removal must be durable before a roll makes this
             // segment non-final, where recovery rejects every damaged byte.
+            // A failed sync can also lose an earlier truncation while the
+            // page cache still reports the accepted length (BUG-020).
             fp("journal.tail.truncate")?;
             active.file.set_len(active.write_offset)?;
         }
@@ -464,7 +468,8 @@ impl JournalWriter {
         let active = self.active.as_mut().expect("active segment after roll");
         if active.needs_tail_cleanup {
             // A shorter retry cannot overwrite the whole failed prefix.
-            // Retain the flag until fdatasync also persists this truncation.
+            // A complete record removes the visible tail below. If its
+            // later sync fails, needs_redirty also reasserts this length.
             fp("journal.tail.truncate")?;
             active.file.set_len(active.write_offset)?;
         }

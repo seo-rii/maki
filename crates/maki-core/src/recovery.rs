@@ -253,9 +253,14 @@ fn recover_with_replay(
     //    their torn tail into "corruption" after a real power loss (S-06).
     //    A writeback EIO may also have cleared the cached pages' dirty bits:
     //    plain fsync can then succeed without writing them. Rewrite each
-    //    accepted prefix, verify it against the scan, and only then sync it.
+    //    accepted prefix and its exact length, verify it against the scan,
+    //    and only then sync it. A prior recovery may have truncated a tail
+    //    before a failed sync: its next scan sees the short cached length,
+    //    so no explicit Truncate repair is emitted, while disk still holds
+    //    the old tail (BUG-020).
     for prefix in &scan.verified_prefixes {
         let file = backing.open(&prefix.path, false)?;
+        file.set_len(prefix.len)?;
         rewrite_verified_range(file.as_ref(), 0..prefix.len, prefix.fingerprint)?;
         file.sync_data()?;
     }
