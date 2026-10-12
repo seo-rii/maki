@@ -257,6 +257,14 @@ the vendor cipher. Supported mappings include raw single-item payloads and JSON
 objects containing payload, unit index, volume ID, compatibility ID, or batch
 index. Binary data may use base64, base64url, or hexadecimal encoding.
 
+The endpoint URL's path is a prefix for each operation path. For example,
+`https://crypto.example/gateway?tenant=demo` with `/encrypt` requests
+`/gateway/encrypt?tenant=demo`. Endpoint and operation-path queries are preserved,
+then `[crypto.http.*.query]` is appended. Trailing slash removal applies only to
+the endpoint path, and URL fragments are not sent. Configuration accepts `POST`
+and `PUT` in any ASCII case and sends their uppercase spelling; programmatic
+`OpSpec` methods retain their explicit spelling.
+
 Responses can be single-item or batched. If an item index is returned, Maki
 validates it; missing, duplicate, reordered, oversized, or partial responses are
 provider contract errors. Response bodies are read under a hard size limit.
@@ -400,9 +408,18 @@ The size and TTL are runtime settings (`maki reload <config> cache`).
 | `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
 | `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
 | `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
-| `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; the write path forces a journal sync before exceeding it |
+| `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; checked before every record, including inside one request. Must hold a maximum ciphertext plus its 32-byte record header |
 | `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when a reclaim round can make no more room (up to four rounds: records other writers append during a round are synced and reclaimed in the next); the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
 | `limits.max_overlay_entries` (default 262144) | Units the overlay may hold, whatever their payload (a v3 discard tombstone has none but still costs an entry). Same inline-checkpoint and ENOSPC behaviour; must hold the largest request in crypto units, or be `0` to disable |
+
+A request may contain more record bytes than the pending budget: the engine
+syncs between records to keep the tail bounded. Configuration validation and
+direct core attach both reject a budget smaller than one maximum framed record.
+An intermediate sync failure stops further appends and is returned to the caller.
+
+The default checkpoint worker interval is 30 seconds. An administrative
+checkpoint applies durable records; a successful call that advances no sequence
+does not postpone the worker's periodic sync of pending writes.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole

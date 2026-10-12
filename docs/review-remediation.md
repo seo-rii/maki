@@ -1280,3 +1280,29 @@ and latest stable. Journal/recovery changes additionally require the complete
 ignored release gates before release acceptance. Push success is separate from
 the exact-SHA GitHub Actions result; local Rust 1.94 results do not establish
 Rust 1.99 or Windows CI success.
+
+## Additional functional findings — 2026-10-12
+
+The six additional findings were reproduced against the current implementation
+before their fixes. Permanent regressions run the real Engine, deterministic
+restart/power-loss model, local HTTP server, or CLI process as appropriate.
+
+| Finding | Implementation | Permanent regression |
+|---|---|---|
+| BUG-043, recovered shard readiness | Treat loaded allocation copies as unproven in each session. Establish both copies and directory durability before reserving a slot or publishing the whole adopted catalog; failed preparation remains retryable. Reads defer this metadata work. | maki-core `review_shard_readiness.rs`: initial ENOSPC, v2/v3 retry, empty checkpoint, cached B after failed sync, second-copy/directory failures, and multiple adopted shards |
+| BUG-044, per-request pending overflow | Enforce the tail budget before every record, and share the maximum framed-record size between configuration validation and core attach. Intermediate sync failure stops append. | maki-core `review_journal_pending.rs`; maki-format `review_pending_record_limit.rs` |
+| BUG-045, no-progress checkpoint starvation | Update the periodic checkpoint reference time only when the checkpoint sequence advances. Preserve explicit checkpoint's durable-only behavior. | maki-core `review_checkpoint_progress.rs`: six administrative calls and four completed worker passes through 120 seconds, plus controls |
+| BUG-046, HTTP URL components | Compose the endpoint path prefix and operation path separately from their queries. Preserve escapes and query-value slashes, append configured query pairs, and omit fragments from the wire. | maki-crypto-http `review_url_composition.rs`: actual received request targets |
+| BUG-047, HTTP method spelling | Normalize validated configuration methods to uppercase in `from_config`, retaining explicit programmatic `OpSpec` methods. | maki-crypto-http `review_method_normalization.rs`: encrypt/decrypt with POST/post/PUT/pUt |
+| BUG-048, missing-root CLI mutation | Inspect/check reject a missing or non-directory backing root before invoking its constructor; volume creation still accepts a new path. | maki `review_existing_repository.rs`: real inspect/check/deep, regular-file rejection, creation and existing-volume controls |
+
+The lazy shard proof adds metadata I/O once per store session when reservation
+or checkpoint first needs it, proportional to the loaded shard count. In the
+single-shard controlled fixture, recovery alone adds no allocation I/O; the first
+subsequent FUA adds four allocation writes, four allocation syncs and three data
+directory syncs. This is an operation-count observation, not a throughput claim.
+
+The new suites contain 30 regression functions. Their test-first results and
+focused success do not replace the full workspace, complete ignored release
+gates, or exact-revision Linux/Windows CI required above. Hardware power loss and
+external kernel-NBD qualification remain separate.

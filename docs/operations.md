@@ -80,6 +80,11 @@ maki check /etc/maki/volumes/example.toml
 `journal/` or `checkpoint/` directory still holds a file, because an earlier
 volume's shards would otherwise be adopted and served by the new one.
 
+`volume inspect` and `check`, including `check --deep`, require an existing
+backing-root directory. A missing root or parent is rejected before constructing
+the backing and is not created by these commands. New paths remain supported by
+`volume create`.
+
 The inspect output includes `maximum units`, `maximum shards`, `full slot span
 bytes`, `allocation map A/B bytes`, `discard map A/B bytes`, and `catalog A/B bytes`.
 The discard-map estimate is zero for v2 and equals the allocation-map estimate
