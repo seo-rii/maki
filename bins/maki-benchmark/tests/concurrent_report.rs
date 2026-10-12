@@ -189,6 +189,6 @@ fn entirely_read_or_write_mixed_workloads_have_finite_empty_operation_reports() 
         assert_eq!(report[empty]["latency"]["samples"], 0);
         assert_eq!(report[empty]["latency"]["p99_upper_us"], 0.0);
         assert_eq!(report[empty]["iops"], 0.0);
-        assert_eq!(report["read_verified"], true);
+        assert_eq!(report["read_verified"], percent != "0");
     }
 }

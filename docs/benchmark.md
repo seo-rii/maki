@@ -11,6 +11,14 @@ verified sequential reads. `ops` is the count in each phase; the JSON report
 keeps `schema_version = 1` and the existing `write`, `read`, `flush_us`,
 `concurrency`, `fua`, and `read_verified` fields.
 
+`read_verified` is true only when at least one measured read passed its data
+comparison. The additive `verified_read_operations` field counts those reads,
+and `read_verification` is `"passed"` or `"skipped"`. A zero-read mixed run,
+including `--read-percent 0` or a short run rounded down to zero reads, reports
+`false`, `0`, and `"skipped"`; text output says `skipped: no read operations`.
+Read or comparison failures exit unsuccessfully without a success report.
+Working-set setup writes and attach self-tests are not measured read verification.
+
 ```sh
 maki-benchmark --json /path/to/disposable-volume.toml 10000 4096
 maki-benchmark --json --concurrency 32 --access random --read-percent 70 \

@@ -175,6 +175,8 @@ struct Report {
     concurrency: usize,
     fua: bool,
     read_verified: bool,
+    read_verification: &'static str,
+    verified_read_operations: u64,
     flush_us: f64,
     write: OperationReport,
     read: OperationReport,
@@ -291,6 +293,9 @@ fn main() -> ExitCode {
     }
     let result: Result<Report, String> = runtime.block_on(async {
         let measured = workload::run(engine, &options, working_set_bytes).await?;
+        // Each recorded read has already passed the workload's comparison.
+        // A successful run without any reads has not checked readback.
+        let verified_read_operations = measured.reads.report().samples;
         Ok(Report {
             schema_version: 1,
             provider: config.crypto.provider.clone(),
@@ -298,7 +303,13 @@ fn main() -> ExitCode {
             io_size_bytes: io_size,
             concurrency: options.concurrency,
             fua: options.fua,
-            read_verified: true,
+            read_verified: verified_read_operations > 0,
+            read_verification: if verified_read_operations > 0 {
+                "passed"
+            } else {
+                "skipped"
+            },
+            verified_read_operations,
             flush_us: measured.final_flush_us,
             write: OperationReport::new(measured.write_elapsed, io_size, &measured.writes),
             read: OperationReport::new(measured.read_elapsed, io_size, &measured.reads),
@@ -363,8 +374,14 @@ fn main() -> ExitCode {
             report.concurrency, report.workload.access, report.workload.mode,
             report.workload.working_set_bytes, report.resources.peak_pending_operations);
         println!(
-            "FUA: {}; final FLUSH: {:.1} us (included in write throughput); read verification: passed",
-            report.fua, report.flush_us
+            "FUA: {}; final FLUSH: {:.1} us (included in write throughput); read verification: {}",
+            report.fua,
+            report.flush_us,
+            if report.read_verified {
+                "passed"
+            } else {
+                "skipped: no read operations"
+            }
         );
     }
     ExitCode::SUCCESS

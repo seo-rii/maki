@@ -34,7 +34,9 @@ unsuccessfully without a success report.
 
 Both text and JSON report throughput, IOPS and request latency. JSON schema
 version 1 records provider type, operation count, I/O size, selected concurrency,
-FUA selection, successful read verification, and the final FLUSH time.
+FUA selection, the actual read-verification status and count, and the final
+FLUSH time. A mixed run with no reads reports verification as skipped; see the
+[report fields](benchmark.md).
 The write throughput interval includes the final FLUSH; write latency samples
 measure individual writes (including FUA when selected), and exclude that final
 FLUSH. Read throughput includes verification; individual read latencies end
