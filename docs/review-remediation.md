@@ -1306,3 +1306,29 @@ The new suites contain 30 regression functions. Their test-first results and
 focused success do not replace the full workspace, complete ignored release
 gates, or exact-revision Linux/Windows CI required above. Hardware power loss and
 external kernel-NBD qualification remain separate.
+
+## Batch, runtime reload and benchmark findings — 2026-10-12
+
+The follow-up report inspected `11c5a66` without a Rust toolchain. Its models
+were treated as proposed reproductions, then checked with compiled Rust
+regressions against the current code before implementation.
+
+| Finding | Correction | Permanent regression |
+|---|---|---|
+| BUG-049, decrypt batch byte basis | Split Engine reads and RMW decrypts by the original volume unit size. Preserve the scheduler's separate resident-ciphertext admission. | maki-core `review_logical_read_batches.rs`: short reversible encodings, individual/combined/partial reads and RMW, expanded ciphertext resident limits |
+| BUG-050, serialized split retries | Give each retry-safe caller an independent verdict under the same lane semaphore. Retain the failed batch's input reservation and reuse its first slot; extra retries acquire shared capacity. Observe cancellation of waiting and running callers. | maki-crypto `review_scheduler_split_retry.rs`: encrypt/decrypt progress, item order, width-one reuse, shared bounds, cancellation and retry-safety controls |
+| BUG-051, ignored cache TTL | Validate the whole payload, including positive TTL and supported field names, before applying byte limit and TTL together. Size-only reloads preserve TTL; the CLI accepts `--ttl` in either option order. | maki-nbdkit `review_cache_ttl_reload.rs` with ManualClock; maki `review_cache_reload_cli.rs` with a real control request |
+| BUG-052, false read-verification claim | Derive `read_verified` from actual compared read samples. Add `verified_read_operations` and `read_verification`, and print skipped when no reads ran. Read failures still exit without a success report. | maki-benchmark `review_read_verdict.rs`: zero-percent and short mixed workloads, actual reads, default phases and text output |
+
+The variable-length Engine fixture keeps attach-probe ciphertext full-sized,
+then exercises short workload encodings with scheduler admission enabled
+throughout attach, reads and RMW. It does not qualify the separate attach
+self-test batching path when those probe encodings are also short.
+Focused success remains separate from the
+complete workspace, ignored release gates and exact-revision Linux/Windows CI.
+
+The prior Windows CI reached workspace tests after all four Clippy matrix
+steps passed. Its remote-witness configuration fixtures still used Unix TLS
+paths, which Windows correctly rejects as nonabsolute. The fixtures now use
+drive-qualified absolute paths there while keeping their invalid-path checks.
+Linux tests are local evidence; Windows execution must be confirmed in CI.
