@@ -212,3 +212,424 @@ async fn cancelling_a_capacity_waiter_leaves_both_budgets_free() {
     assert_eq!(set.endpoint_status()[0].inflight, 0);
     assert!(set.encrypt_batch(&ctx, &second).await.is_ok());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn capacity_waiter_reselects_a_recovered_open_peer_without_an_rpc_release() {
+    use maki_crypto::breaker::CircuitState;
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(None));
+    let mut config = cfg();
+    config.breaker.failure_threshold = 1;
+    config.retry_safe = false;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock.clone(),
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ib = [pt(11)];
+    let ic = [pt(12)];
+    let id = [pt(13)];
+    let mut active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    assert!(once(active.as_mut()).await.is_pending());
+    right
+        .inner
+        .fail_next([CryptoError::Retryable("outage".into())]);
+    assert!(set.encrypt_batch(&ctx, &ib).await.is_err());
+    assert_eq!(set.endpoint_states()[1].1, CircuitState::Open);
+    let mut queued = Box::pin(set.encrypt_batch(&ctx, &ic));
+    let mut later = Box::pin(set.encrypt_batch(&ctx, &id));
+    assert!(once(queued.as_mut()).await.is_pending());
+    assert!(once(later.as_mut()).await.is_pending());
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    clock.advance(Duration::from_secs(1));
+    assert!(
+        matches!(once(queued.as_mut()).await, Poll::Ready(Ok(_))),
+        "the open peer's probe deadline must wake the oldest capacity waiter"
+    );
+    assert!(matches!(once(later.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(right.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(set.endpoint_states()[1].1, CircuitState::Closed);
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    left.release.notify_one();
+    assert!(matches!(once(active.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(set.global_inflight(), (0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quarantine_promotion_wakes_capacity_waiters_without_an_rpc_release() {
+    use maki_crypto::endpoint::EndpointValidator;
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(None));
+    let ready = Arc::new(Notify::new());
+    let validator: EndpointValidator = Arc::new({
+        let ready = ready.clone();
+        move |_, _, _| {
+            let ready = ready.clone();
+            Box::pin(async move {
+                ready.notified().await;
+                Ok(())
+            })
+        }
+    });
+    let set = EndpointSet::with_quarantine(
+        vec![
+            ("left".into(), left.clone(), true),
+            ("right".into(), right.clone(), false),
+        ],
+        Some(validator),
+        cfg(),
+        Arc::new(ManualClock::new()),
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ic = [pt(12)];
+    let id = [pt(13)];
+    let mut active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    let mut queued = Box::pin(set.encrypt_batch(&ctx, &ic));
+    let mut later = Box::pin(set.encrypt_batch(&ctx, &id));
+    assert!(once(active.as_mut()).await.is_pending());
+    assert!(once(queued.as_mut()).await.is_pending());
+    assert!(once(later.as_mut()).await.is_pending());
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    ready.notify_one();
+    for _ in 0..32 {
+        if set.endpoint_status()[1].validated {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(set.endpoint_status()[1].validated);
+    assert!(
+        matches!(once(queued.as_mut()).await, Poll::Ready(Ok(_))),
+        "newly eligible peer must wake the existing FIFO capacity waiter"
+    );
+    assert!(matches!(once(later.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(right.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    left.release.notify_one();
+    assert!(matches!(once(active.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(set.global_inflight(), (0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_head_returns_its_probe_timer_and_fifo_turn_to_the_next_waiter() {
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(None));
+    let mut config = cfg();
+    config.breaker.failure_threshold = 1;
+    config.retry_safe = false;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock.clone(),
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ib = [pt(11)];
+    let ic = [pt(12)];
+    let id = [pt(13)];
+    let mut active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    assert!(once(active.as_mut()).await.is_pending());
+    right
+        .inner
+        .fail_next([CryptoError::Retryable("outage".into())]);
+    assert!(set.encrypt_batch(&ctx, &ib).await.is_err());
+    let mut first = Box::pin(set.encrypt_batch(&ctx, &ic));
+    let mut second = Box::pin(set.encrypt_batch(&ctx, &id));
+    assert!(once(first.as_mut()).await.is_pending());
+    assert!(once(second.as_mut()).await.is_pending());
+    assert_eq!(
+        clock.sleeper_count(),
+        1,
+        "only the FIFO head has a probe timer"
+    );
+    drop(first);
+    assert_eq!(
+        clock.sleeper_count(),
+        0,
+        "cancellation unregisters the head timer"
+    );
+    assert!(once(second.as_mut()).await.is_pending());
+    assert_eq!(clock.sleeper_count(), 1);
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    clock.advance(Duration::from_secs(1));
+    assert!(matches!(once(second.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(clock.sleeper_count(), 0);
+    assert_eq!(right.calls.load(Ordering::SeqCst), 2);
+    drop(active);
+    assert_eq!(set.global_inflight(), (0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fifo_and_full_half_open_window_do_not_spin_on_an_expired_probe_timer() {
+    use maki_crypto::breaker::CircuitState;
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(Some(12)));
+    let mut config = cfg();
+    config.breaker.failure_threshold = 1;
+    config.breaker.half_open_max_requests = 1;
+    config.global_max_inflight_batches = 4;
+    config.per_endpoint_max_inflight = 2;
+    config.retry_safe = false;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock.clone(),
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ib = [pt(11)];
+    let ic = [pt(12)];
+    let id = [pt(13)];
+    let mut active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    assert!(once(active.as_mut()).await.is_pending());
+    right
+        .inner
+        .fail_next([CryptoError::Retryable("outage".into())]);
+    assert!(set.encrypt_batch(&ctx, &ib).await.is_err());
+    // Fill both left local slots while the right is OPEN. Once the right
+    // starts its probe, its spare local/global slots must not bypass the
+    // independent half-open limit.
+    let mut second_active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    assert!(once(second_active.as_mut()).await.is_pending());
+    let mut head = Box::pin(set.encrypt_batch(&ctx, &ic));
+    let mut later = Box::pin(set.encrypt_batch(&ctx, &id));
+    assert!(once(head.as_mut()).await.is_pending());
+    assert!(once(later.as_mut()).await.is_pending());
+    clock.advance(Duration::from_secs(1));
+    assert!(
+        once(later.as_mut()).await.is_pending(),
+        "later caller must not steal the ready peer from the FIFO head"
+    );
+    assert!(once(head.as_mut()).await.is_pending());
+    assert_eq!(set.endpoint_states()[1].1, CircuitState::HalfOpen);
+    assert_eq!(right.calls.load(Ordering::SeqCst), 2);
+    assert!(once(later.as_mut()).await.is_pending());
+    assert_eq!(
+        clock.sleeper_count(),
+        0,
+        "a full probe window waits for a release, never a past timestamp"
+    );
+    assert_eq!(set.global_inflight(), (3, 3 * UNIT as u64));
+    clock.advance(Duration::from_secs(100));
+    assert!(once(later.as_mut()).await.is_pending());
+    assert_eq!(right.calls.load(Ordering::SeqCst), 2);
+    right.release.notify_one();
+    assert!(matches!(once(head.as_mut()).await, Poll::Ready(Ok(_))));
+    assert!(matches!(once(later.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(set.endpoint_states()[1].1, CircuitState::Closed);
+    assert_eq!(right.calls.load(Ordering::SeqCst), 3);
+    drop(active);
+    drop(second_active);
+    assert_eq!(set.global_inflight(), (0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admission_and_fifo_waiters_keep_their_deadlines_without_charging_a_probe() {
+    use maki_crypto::breaker::CircuitState;
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(None));
+    let mut config = cfg();
+    config.breaker.failure_threshold = 1;
+    config.max_operation_time = Some(Duration::from_millis(100));
+    config.retry_safe = false;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock.clone(),
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ib = [pt(11)];
+    let ic = [pt(12)];
+    let id = [pt(13)];
+    let mut active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    assert!(once(active.as_mut()).await.is_pending());
+    right
+        .inner
+        .fail_next([CryptoError::Retryable("outage".into())]);
+    assert!(set.encrypt_batch(&ctx, &ib).await.is_err());
+    let tokens = set.endpoint_budget_tokens();
+    clock.advance(Duration::from_millis(50));
+    let mut head = Box::pin(set.encrypt_batch(&ctx, &ic));
+    assert!(once(head.as_mut()).await.is_pending());
+    clock.advance(Duration::from_millis(30));
+    let mut later = Box::pin(set.encrypt_batch(&ctx, &id));
+    assert!(once(later.as_mut()).await.is_pending());
+    // Keep the manually polled active future parked so no capacity-release
+    // notification can make this a test of RPC expiry instead of admission.
+    clock.advance(Duration::from_millis(70));
+    let head_error = match once(head.as_mut()).await {
+        Poll::Ready(Err(error)) => error,
+        _ => panic!("head's own deadline was restarted"),
+    };
+    assert!(head_error.to_string().contains("deadline"));
+    assert!(once(later.as_mut()).await.is_pending());
+    clock.advance(Duration::from_millis(30));
+    let later_error = match once(later.as_mut()).await {
+        Poll::Ready(Err(error)) => error,
+        _ => panic!("FIFO mutex wait lost the later caller's deadline"),
+    };
+    assert!(later_error.to_string().contains("deadline"));
+    assert_eq!(set.metrics().deadline_exceeded_total(), 2);
+    assert_eq!(set.endpoint_states()[1].1, CircuitState::Open);
+    assert_eq!(right.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(set.endpoint_budget_tokens(), tokens);
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    drop(active);
+    assert_eq!(set.global_inflight(), (0, 0));
+    assert_eq!(clock.sleeper_count(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn byte_capacity_wait_returns_partial_permits_and_preserves_fifo() {
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(Some(11)));
+    let mut config = cfg();
+    config.global_max_inflight_batches = 4;
+    config.per_endpoint_max_inflight = 3;
+    config.global_max_inflight_bytes = 2 * UNIT as u64;
+    config.per_endpoint_max_bytes = UNIT as u64;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock,
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ib = [pt(11)];
+    let ic = [pt(12)];
+    let id = [pt(13)];
+    let mut a = Box::pin(set.encrypt_batch(&ctx, &ia));
+    let mut b = Box::pin(set.encrypt_batch(&ctx, &ib));
+    let mut head = Box::pin(set.encrypt_batch(&ctx, &ic));
+    let mut later = Box::pin(set.encrypt_batch(&ctx, &id));
+    assert!(once(a.as_mut()).await.is_pending());
+    assert!(once(b.as_mut()).await.is_pending());
+    assert!(once(head.as_mut()).await.is_pending());
+    assert!(once(later.as_mut()).await.is_pending());
+    assert_eq!(set.global_inflight(), (2, 2 * UNIT as u64));
+    right.release.notify_one();
+    assert!(matches!(once(b.as_mut()).await, Poll::Ready(Ok(_))));
+    assert!(once(later.as_mut()).await.is_pending());
+    assert!(matches!(once(head.as_mut()).await, Poll::Ready(Ok(_))));
+    assert!(matches!(once(later.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(set.global_inflight(), (1, UNIT as u64));
+    drop(a);
+    assert_eq!(set.global_inflight(), (0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn global_byte_shortage_returns_a_tentative_idle_peers_local_permit() {
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(Some(10)));
+    let right = Arc::new(GatedProvider::new(None));
+    let mut config = cfg();
+    config.global_max_inflight_batches = 4;
+    config.global_max_inflight_bytes = UNIT as u64;
+    config.per_endpoint_max_bytes = UNIT as u64;
+    config.breaker.failure_threshold = 1;
+    config.retry_safe = false;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock,
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    let ia = [pt(10)];
+    let ib = [pt(11)];
+    left.inner
+        .fail_next([CryptoError::Retryable("left outage".into())]);
+    let mut active = Box::pin(set.encrypt_batch(&ctx, &ia));
+    let mut queued = Box::pin(set.encrypt_batch(&ctx, &ib));
+    assert!(once(active.as_mut()).await.is_pending());
+    assert!(once(queued.as_mut()).await.is_pending());
+    assert_eq!(
+        set.global_inflight(),
+        (1, UNIT as u64),
+        "failed byte admission must also return its tentative count permit"
+    );
+    assert_eq!(right.calls.load(Ordering::SeqCst), 0);
+    left.release.notify_one();
+    assert!(matches!(once(active.as_mut()).await, Poll::Ready(Err(_))));
+    assert!(
+        matches!(once(queued.as_mut()).await, Poll::Ready(Ok(_))),
+        "left is now OPEN, so the idle right peer's tentative local permit must have been returned"
+    );
+    assert_eq!(right.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(set.global_inflight(), (0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_open_peers_keep_backoff_and_do_not_consume_capacity_before_recovery() {
+    let clock = Arc::new(ManualClock::new());
+    let left = Arc::new(GatedProvider::new(None));
+    let right = Arc::new(GatedProvider::new(None));
+    let mut config = cfg();
+    config.breaker.failure_threshold = 1;
+    config.retry_safe = false;
+    let set = EndpointSet::new(
+        vec![
+            ("left".into(), left.clone()),
+            ("right".into(), right.clone()),
+        ],
+        config,
+        clock.clone(),
+    );
+    set.capabilities().await.unwrap();
+    let ctx = context();
+    left.inner
+        .fail_next([CryptoError::Retryable("left outage".into())]);
+    right
+        .inner
+        .fail_next([CryptoError::Retryable("right outage".into())]);
+    assert!(set.encrypt_batch(&ctx, &[pt(10)]).await.is_err());
+    assert!(set.encrypt_batch(&ctx, &[pt(11)]).await.is_err());
+    let items = [pt(12)];
+    let mut request = Box::pin(set.encrypt_batch(&ctx, &items));
+    assert!(once(request.as_mut()).await.is_pending());
+    assert_eq!(set.global_inflight(), (0, 0));
+    assert_eq!(left.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(right.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        clock.sleeper_count(),
+        1,
+        "normal all-open backoff remains active"
+    );
+    clock.advance(Duration::from_secs(1));
+    assert!(matches!(once(request.as_mut()).await, Poll::Ready(Ok(_))));
+    assert_eq!(set.global_inflight(), (0, 0));
+    assert_eq!(clock.sleeper_count(), 0);
+}

@@ -104,11 +104,22 @@ impl CircuitBreaker {
     /// probe returns its slot (C-07: `success_threshold` above the slot
     /// count used to wedge the circuit half-open forever).
     pub fn would_allow(&self) -> bool {
+        self.next_admission_time()
+            .is_some_and(|ready| self.clock.now() >= ready)
+    }
+
+    /// Ready now is zero; an open circuit has an absolute probe deadline.
+    /// A full half-open window needs a permit release, not a timer. This
+    /// snapshot lets capacity waiters schedule a wakeup without consuming
+    /// a probe or missing a deadline that expires while selecting peers.
+    pub(crate) fn next_admission_time(&self) -> Option<Duration> {
         let inner = self.inner.lock();
         match inner.state {
-            CircuitState::Closed => true,
-            CircuitState::Open => self.clock.now() >= inner.open_until,
-            CircuitState::HalfOpen => inner.half_open_inflight < self.config.half_open_max_requests,
+            CircuitState::Closed => Some(Duration::ZERO),
+            CircuitState::Open => Some(inner.open_until),
+            CircuitState::HalfOpen => (inner.half_open_inflight
+                < self.config.half_open_max_requests)
+                .then_some(Duration::ZERO),
         }
     }
 

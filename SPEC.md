@@ -1465,7 +1465,10 @@ journal queue
 
 An endpoint admission waiter MUST NOT hold a global or endpoint permit.
 Admission MUST re-evaluate validated, breaker-admissible candidates whenever
-capacity is returned. The oldest capacity waiter is served first; cancellation
+capacity is returned, a quarantined endpoint is promoted, or the earliest
+OPEN circuit becomes eligible for its next probe. Waiting for those events
+MUST use capacity/validation notifications and the injectable monotonic clock,
+without consuming a half-open probe or holding RPC permits. The oldest capacity waiter is served first; cancellation
 releases its queue position. Both count and byte budgets are held only for the
 actual RPC, and the breaker is rechecked immediately before dispatch.
 

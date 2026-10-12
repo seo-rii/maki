@@ -159,7 +159,7 @@ pub struct EndpointSet {
     endpoints: Vec<Arc<Endpoint>>,
     global: DualSemaphore,
     admission_gate: AsyncMutex<()>,
-    capacity_changed: Notify,
+    capacity_changed: Arc<Notify>,
     policy: RetryPolicy,
     clock: Arc<dyn Clock>,
     config: DispatchConfig,
@@ -276,7 +276,7 @@ impl EndpointSet {
                 config.global_max_inflight_bytes,
             ),
             admission_gate: AsyncMutex::new(()),
-            capacity_changed: Notify::new(),
+            capacity_changed: Arc::new(Notify::new()),
             policy: config.retry.clone(),
             clock,
             config,
@@ -484,11 +484,13 @@ impl EndpointSet {
                 endpoint.provider.clone(),
                 context.clone(),
             );
+            let changed = self.capacity_changed.clone();
             tokio::spawn(async move {
                 let result = attempt.await;
                 match result {
                     Ok(()) => {
                         endpoint.validated.store(true, Ordering::SeqCst);
+                        changed.notify_waiters();
                         tracing::info!("endpoint {:?} validated and admitted", endpoint.name);
                     }
                     Err(e) if matches!(e.class(), ErrorClass::ProviderFatal) => {
@@ -514,7 +516,8 @@ impl EndpointSet {
 
     /// Serialize capacity admission, not RPC execution. A queued caller owns
     /// no global/local permit and recomputes the least-inflight candidates
-    /// after every release. Tokio's FIFO mutex prevents new callers bypassing
+    /// after releases, promotion and the next open-circuit probe deadline.
+    /// Tokio's FIFO mutex prevents new callers bypassing
     /// the oldest capacity waiter; cancellation releases its place.
     async fn admit_endpoint(
         &self,
@@ -530,11 +533,28 @@ impl EndpointSet {
                 // Register before inspecting permits to avoid a release
                 // between the failed try-acquire and awaiting notification.
                 changed.as_mut().enable();
-                let candidates: Vec<_> = self
-                    .candidates()
-                    .into_iter()
-                    .filter(|endpoint| !excluded.iter().any(|e| Arc::ptr_eq(e, endpoint)))
+                let now = self.clock.now();
+                let mut next_ready: Option<Duration> = None;
+                let mut candidates: Vec<_> = self
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| {
+                        if !endpoint.validated.load(Ordering::SeqCst)
+                            || excluded.iter().any(|e| Arc::ptr_eq(e, endpoint))
+                        {
+                            return None;
+                        }
+                        match endpoint.breaker.next_admission_time() {
+                            Some(ready) if ready <= now => Some(endpoint.clone()),
+                            Some(ready) => {
+                                next_ready = Some(next_ready.map_or(ready, |next| next.min(ready)));
+                                None
+                            }
+                            None => None,
+                        }
+                    })
                     .collect();
+                candidates.sort_by_key(|e| e.inflight.load(Ordering::SeqCst));
                 if candidates.is_empty() {
                     return None;
                 }
@@ -557,7 +577,15 @@ impl EndpointSet {
                         changed: &self.capacity_changed,
                     });
                 }
-                changed.await;
+                match next_ready {
+                    Some(ready) => {
+                        tokio::select! {
+                            _ = changed => {},
+                            _ = self.clock.sleep(ready.saturating_sub(self.clock.now())) => {},
+                        }
+                    }
+                    None => changed.await,
+                }
             }
         };
         match deadline {
