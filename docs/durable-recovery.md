@@ -178,7 +178,10 @@ Journal scanning streams segment contents. Volume attach first validates the
 complete accepted journal while discarding replay payloads. After durable
 prefix rewrite, proof publication and metadata repair, it scans the journal a
 second time and applies accepted records to checkpoint slots through a
-ciphertext batch capped at 1 MiB. Shard data and allocation metadata are
+ciphertext batch capped at 1 MiB. Within each batch, only the final sequence
+for each unit writes slot data; a final discard skips earlier writes. All
+records still contribute allocation/discard evidence in sequence order, and
+batch boundaries are unchanged. Shard data and allocation metadata are
 synchronized before checkpoint state advances, and covered segments are
 removed only afterward. A crash anywhere in that replay can retry from the
 still-durable journal. Every record still undergoes sequence, CRC, geometry and

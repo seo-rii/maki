@@ -418,20 +418,29 @@ fn apply_replay_batch(
     if records.is_empty() {
         return Ok(());
     }
-    for record in records
+    // The scanner already validated every record in sequence order. Keep
+    // the existing byte-bounded batch and metadata evidence, but avoid
+    // writing superseded ciphertext to the same slot within this batch.
+    // A latest discard suppresses earlier slot writes as well.
+    let latest_sequences: std::collections::HashMap<_, _> = records
         .iter()
-        .filter(|record| !allow_discard || !record.payload.is_empty())
-    {
+        .map(|record| (record.unit_index, record.sequence))
+        .collect();
+    let latest_writes = || {
+        records.iter().filter(|record| {
+            latest_sequences.get(&record.unit_index) == Some(&record.sequence)
+                && (!allow_discard || !record.payload.is_empty())
+        })
+    };
+    for record in latest_writes() {
         store.write_slot(record.unit_index, record.sequence, &record.payload)?;
     }
-    for shard in store.shards_of_units(
-        records
-            .iter()
-            .filter(|record| !allow_discard || !record.payload.is_empty())
-            .map(|record| &record.unit_index),
-    ) {
+    for shard in store.shards_of_units(latest_writes().map(|record| &record.unit_index)) {
         store.sync_shard_data(shard)?;
     }
+    // Preserve evidence of every accepted write, even when a later discard
+    // skipped its slot data. This also creates any required shard before
+    // publishing its final discard state; metadata ordering is unchanged.
     for record in records.iter() {
         if !allow_discard || !record.payload.is_empty() {
             store.mark_allocated(record.unit_index)?;
