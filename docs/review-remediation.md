@@ -1346,3 +1346,33 @@ steps passed. Its remote-witness configuration fixtures still used Unix TLS
 paths, which Windows correctly rejects as nonabsolute. The fixtures now use
 drive-qualified absolute paths there while keeping their invalid-path checks.
 Linux tests are local evidence; Windows execution must be confirmed in CI.
+
+## Additional functional corrections — 2026-10-12
+
+The six findings were reproduced against `8d2b2fa` without changing product
+code. Each correction has a permanent regression that failed before its fix;
+the changes keep the existing on-disk formats and wire messages.
+
+| Finding | Correction | Permanent regression |
+|---|---|---|
+| BUG-054, local restore after failed writeback | Authenticate all selected evidence before mutation, then rewrite referenced arena pages, the selected manifest and marker, and reassert reserved file lengths before local readiness. Do not advance the witness. | maki-backing `rollback/review_restore.rs`: failed sync, plain restart, later acknowledged write, torn power loss, manifest/marker/length failures, partial rewrite, repeated failures and authentication controls |
+| BUG-055, live control address replacement | Serialize publication and cleanup with a short directory lock. Refuse live or backlogged addresses; preserve stale-address recovery. Remove only the listener's own inode and eliminate adapter's duplicate unlink. | maki-control `review_socket_ownership.rs` and maki-nbdkit `review_control_collision.rs`: concurrent binds, stale sockets, full backlog, two volumes, predecessor shutdown and successor ownership |
+| BUG-056, result validation after a success verdict | Validate both the peer and common result contracts inside the RPC attempt, before breaker success. Attribute bad successful payloads to that peer and use failover only when retransmission is safe. | maki-crypto `review_endpoint_result_contract.rs` and maki-crypto-http `review_endpoint_payload_contract.rs`: actual HTTP 200 size violations, shape/order/index errors, peer-specific limits, breaker state, permits and unsafe/single-peer controls |
+| BUG-057, local gRPC receive errors | Bound incoming frame headers and mark local response decoding errors with private typed provenance. Classify those as `Contract`; preserve actual remote `OutOfRange` request semantics and the original protected wire decoder. | maki-crypto-grpc `review_receive_contract.rs` plus framing unit tests: actual TCP/HTTP2 failover, malformed protobuf, exact bounds, unsafe retransmission, remote status text, split headers, trailers and cancellation |
+| BUG-058, unrelated maximum supported unit | Bind daemon dispatch to `crypto_unit_size + random_prefix_bytes`. Split decrypt calls using that logical size and reject a result of another supported size inside the endpoint attempt. Preserve the advertised capability intersection and actual ciphertext admission. | maki-crypto `review_pinned_endpoint_unit.rs` and maki-nbdkit `review_endpoint_volume_unit.rs`: actual scheduler attach, FUA/read/checkpoint/reconnect, prefix settings, wrong-size failover, cached capabilities and input controls |
+| BUG-059, oversized configured volume name | Require a 1–64 ASCII-byte operational name before opening backing storage; preserve `[A-Za-z0-9_-]`. Align the configuration guide and SPEC with the boundary. | maki-format `review_volume_name_bound.rs` and maki-nbdkit `review_volume_name_status.rs`: 64/65-byte boundary, 65536-byte rejection without backing side effects, maximum-name FUA and official status response |
+
+There are 51 new regression cases across these fixes. Focused checks also ran
+the complete backing and gRPC package suites, existing control/configuration
+and daemon cases, and endpoint admission, capability, identity and batching
+regressions. Rust 1.94 and 1.99 workspace strict Clippy and formatting passed.
+Full workspace tests, the extended ignored release gates, and exact-revision
+Linux/Windows CI are recorded separately; focused passes are not a substitute
+for those results or for physical power-cut qualification.
+
+Local reopen now adds a read and rewrite for every referenced arena page,
+using a bounded 4 KiB page buffer. This cost is documented in
+[rollback capacity and durability](rollback-protection.md#capacity-and-durability).
+The remote restore path still copies a selected generation into a new
+namespace. No hardware power-loss, kernel NBD or real mount campaign was
+performed for these regressions.
