@@ -24,6 +24,7 @@ fn usage() -> ExitCode {
   maki metrics <config.toml>           metrics snapshot (control socket)
   maki checkpoint <config.toml>        graceful checkpoint (control socket)
   maki drain <config.toml>             close I/O admission, flush and checkpoint
+  maki reload <config.toml> cache --max-bytes <bytes> [--ttl <duration>]
   maki reload <config.toml> <section>  hot config reload (control socket)
   maki attach|detach|grow ...          delegated to maki-attach (privileged)"
     );
@@ -167,22 +168,9 @@ fn main() -> ExitCode {
             serde_json::Value::Null,
             timeout.unwrap_or(CHECKPOINT_TIMEOUT),
         ),
-        // The cache is the one section the daemon applies at runtime; it
-        // needs the new size (O-09: without it the verb could never succeed).
-        ["reload", config, "cache", "--max-bytes", max_bytes] => match max_bytes.parse::<u64>() {
-            Ok(max_bytes) => control(
-                config,
-                "reload",
-                Some("cache"),
-                serde_json::json!({ "max_bytes": max_bytes }),
-                timeout.unwrap_or(CONTROL_TIMEOUT),
-            ),
-            Err(_) => fail(format!("--max-bytes: {max_bytes:?} is not an integer")),
-        },
-        ["reload", _config, "cache"] => fail(
-            "reload cache needs the new size: maki reload <config> cache --max-bytes <bytes>"
-                .to_string(),
-        ),
+        ["reload", config, "cache", flags @ ..] => {
+            reload_cache(config, flags, timeout.unwrap_or(CONTROL_TIMEOUT))
+        }
         ["reload", config, section] => control(
             config,
             "reload",
@@ -200,6 +188,49 @@ fn main() -> ExitCode {
         }
         _ => usage(),
     }
+}
+
+fn reload_cache(config: &str, flags: &[&str], timeout: Duration) -> ExitCode {
+    let mut max_bytes = None;
+    let mut ttl = None;
+    let mut args = flags.iter();
+    while let Some(flag) = args.next() {
+        if !matches!(*flag, "--max-bytes" | "--ttl") {
+            return fail(format!("reload cache: unknown option {flag:?}"));
+        }
+        let Some(value) = args.next() else {
+            return fail(format!("reload cache: {flag} needs a value"));
+        };
+        match *flag {
+            "--max-bytes" => {
+                if max_bytes.is_some() {
+                    return fail("reload cache: duplicate --max-bytes".into());
+                }
+                let Ok(value) = value.parse::<u64>() else {
+                    return fail(format!("--max-bytes: {value:?} is not an integer"));
+                };
+                max_bytes = Some(value);
+            }
+            "--ttl" => {
+                if ttl.is_some() {
+                    return fail("reload cache: duplicate --ttl".into());
+                }
+                match value.parse::<maki_format::config::MakiDuration>() {
+                    Ok(duration) if !duration.0.is_zero() => ttl = Some(*value),
+                    _ => return fail(format!("--ttl: {value:?} is not a positive duration")),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    let Some(max_bytes) = max_bytes else {
+        return fail("reload cache needs the new size: maki reload <config> cache --max-bytes <bytes> [--ttl <duration>]".into());
+    };
+    let mut payload = serde_json::json!({ "max_bytes": max_bytes });
+    if let Some(ttl) = ttl {
+        payload["ttl"] = serde_json::json!(ttl);
+    }
+    control(config, "reload", Some("cache"), payload, timeout)
 }
 
 /// The backing tree is created owner-only; a root-created volume is

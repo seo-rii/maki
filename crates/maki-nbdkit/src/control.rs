@@ -294,6 +294,18 @@ impl ControlBackend for EngineControlBackend {
         match section {
             // Hot-reloadable and actually applied (SPEC §20).
             "cache" => {
+                let fields = payload.as_object().ok_or_else(|| {
+                    "reload cache: payload must be an object; the change was NOT applied"
+                        .to_string()
+                })?;
+                if let Some(field) = fields
+                    .keys()
+                    .find(|field| !matches!(field.as_str(), "max_bytes" | "ttl"))
+                {
+                    return Err(format!(
+                        "reload cache: unknown field {field:?}; the change was NOT applied"
+                    ));
+                }
                 let Some(max_bytes) = payload.get("max_bytes").and_then(|v| v.as_u64()) else {
                     return Err("reload cache: payload.max_bytes (integer) is required \
                                 (`maki reload <config> cache --max-bytes N`)"
@@ -309,7 +321,20 @@ impl ControlBackend for EngineControlBackend {
                         self.engine.size()
                     ));
                 }
-                if !self.engine.resize_cache(max_bytes) {
+                // Parse and validate every requested setting before mutation.
+                // A malformed TTL must not shrink or evict from the cache.
+                let ttl = fields.get("ttl").map(|value| {
+                    serde_json::from_value::<maki_format::config::MakiDuration>(value.clone())
+                        .map_err(|error| format!("reload cache: invalid ttl: {error}; the change was NOT applied"))
+                        .and_then(|ttl| {
+                            if ttl.0.is_zero() {
+                                Err("reload cache: ttl must be positive; the change was NOT applied".to_string())
+                            } else {
+                                Ok(ttl.0)
+                            }
+                        })
+                }).transpose()?;
+                if !self.engine.configure_cache(max_bytes, ttl) {
                     return Err(
                         "reload cache: this daemon runs with cache.mode = off, so there is no \
                          cache to resize; the change was NOT applied (restart with cache.mode = read)"

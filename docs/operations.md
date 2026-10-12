@@ -300,6 +300,7 @@ maki metrics /etc/maki/volumes/example.toml
 maki checkpoint /etc/maki/volumes/example.toml
 maki drain /etc/maki/volumes/example.toml
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
+maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456 --ttl 1s
 ```
 
 `drain` permanently closes admission to reads, writes, flushes, checkpoints,
@@ -320,7 +321,10 @@ succeeded.
 
 `reload cache` needs the new size, between 1 byte and the device size; it is
 refused (not silently accepted) outside that range and on a daemon running
-with `cache.mode = "off"`.
+with `cache.mode = "off"`. Optional `--ttl` uses the configuration duration
+syntax and must be positive; omitting it keeps the current TTL. The daemon
+validates the complete payload before applying size and TTL together. Invalid
+TTL and unknown fields leave both settings unchanged.
 
 Attach, detach, mount, unmount, NBD, and growth verbs are deliberately absent
 from the control socket.
@@ -720,9 +724,13 @@ Maki allocates backing shards lazily within the configured virtual capacity.
 Growing the mounted filesystem is a privileged LVM and XFS operation exposed by
 `maki-attach grow`. The configured maximum virtual size does not change.
 
-The read-cache size and TTL are runtime settings. Reload the `cache` section
-through the control socket after changing them. Reducing the byte limit evicts
-entries immediately; setting it to zero disables caching.
+The read-cache size and TTL are runtime settings. Send the desired values
+through the control socket with `maki reload <config> cache --max-bytes N
+[--ttl DURATION]`; editing the configuration file alone does not apply them.
+Reducing the byte limit evicts entries immediately. The control command
+requires a positive limit; `cache.mode = "off"` remains an attach-time setting.
+Changing TTL retains insertion times, so a shorter TTL can expire entries on
+their next lookup.
 
 ## Metrics and health
 

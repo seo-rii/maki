@@ -68,6 +68,14 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
 | Remote provider-host hard reset | One scoped Debian 12 cross-host campaign passed for HTTP, WebSocket and gRPC; sequential fsync'd files, reference provider, approximately 12–20 s stalls |
 | Physical power loss, QEMU power cuts, 72-hour mixed soak | **Open** |
 
+## Runtime cache settings
+
+An enabled read cache accepts byte-limit and TTL updates through the control
+socket and `maki reload <config> cache --max-bytes N [--ttl DURATION]`.
+Omitting TTL preserves it. Invalid fields leave both settings unchanged;
+cache mode and payload verification still require a restart.
+See [cache reload](operations.md#growth-and-cache-reload).
+
 ## Known limitations
 
 - Default v2/v3 backings cannot detect restoration of an older, internally

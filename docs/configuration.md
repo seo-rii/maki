@@ -398,7 +398,18 @@ decryption, not the storage read, is the cost you want the cache to remove
 (a remote provider, for example). It is read at attach; changing it needs a
 restart.
 
-The size and TTL are runtime settings (`maki reload <config> cache`).
+The size and TTL are runtime settings:
+
+```sh
+maki reload <config> cache --max-bytes 1048576 --ttl 1s
+```
+
+Omitting `--ttl` preserves the current TTL. The control payload requires
+`max_bytes` and accepts an optional `ttl` string using the same duration syntax
+as this configuration. Both settings are validated before either changes;
+unknown fields, zero or invalid TTL, invalid size, and a disabled cache are
+refused. A new TTL applies to existing entries using their original insertion
+times; it does not refresh them.
 
 ## Journal bounds
 

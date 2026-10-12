@@ -163,12 +163,12 @@ impl VersionedLruCache {
     /// misses.
     pub fn get(&self, unit: u64, write_sequence: u64) -> Option<Arc<SecretBuffer>> {
         let now = self.clock.now();
-        let ttl = *self.ttl.lock();
+        let ttl = self.ttl.lock();
         let mut inner = self.inner.lock();
         let result = match inner.map.get(&unit) {
             Some(entry)
                 if entry.write_sequence == write_sequence
-                    && now.saturating_sub(entry.inserted_at) < ttl =>
+                    && now.saturating_sub(entry.inserted_at) < *ttl =>
             {
                 Some(entry.data.clone())
             }
@@ -176,7 +176,7 @@ impl VersionedLruCache {
             // newer entry in place (R5-020).
             Some(entry)
                 if entry.write_sequence > write_sequence
-                    && now.saturating_sub(entry.inserted_at) < ttl =>
+                    && now.saturating_sub(entry.inserted_at) < *ttl =>
             {
                 None
             }
@@ -209,7 +209,18 @@ impl VersionedLruCache {
     /// Runtime resize (hot-reloadable, SPEC §20). Shrinking evicts
     /// immediately; zero disables caching.
     pub fn set_max_bytes(&self, max_bytes: u64) {
+        self.reconfigure(max_bytes, None);
+    }
+
+    /// Apply a byte limit and optional TTL as one configuration change.
+    /// Lookups use the same TTL-then-entries lock order and cannot observe a
+    /// mixture. TTL changes retain the entries' original insertion times.
+    pub fn reconfigure(&self, max_bytes: u64, ttl: Option<Duration>) {
+        let mut current_ttl = self.ttl.lock();
         let mut inner = self.inner.lock();
+        if let Some(ttl) = ttl {
+            *current_ttl = ttl;
+        }
         inner.max_bytes = max_bytes;
         if max_bytes == 0 {
             inner.clear();

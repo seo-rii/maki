@@ -114,6 +114,13 @@ fixed at creation.
 | Docker containers with bind mounts of the mountpoint | **Campaign passed** | Containers must be recreated by the lifecycle, not restarted independently |
 | Plain file storage | Expected | |
 
+## Runtime cache configuration
+
+| Change | Status | Notes |
+|---|---|---|
+| Read-cache byte limit and TTL | Expected | Applied together after complete validation through the control socket. Existing entries retain insertion times. `maki reload <config> cache --max-bytes N [--ttl DURATION]`; [procedure](../operations.md#growth-and-cache-reload) |
+| Cache mode and `verify_on_hit` | Restart required | The live reload accepts only `max_bytes` and optional `ttl`; unsupported fields are refused |
+
 ## Crypto providers and formats
 
 See [status](../status.md#crypto-providers) and

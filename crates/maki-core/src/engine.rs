@@ -1424,9 +1424,15 @@ impl Engine {
     /// without a cache (`cache.mode = off`): there is nothing to apply, and
     /// a caller must not report the change as applied (O-09).
     pub fn resize_cache(&self, max_bytes: u64) -> bool {
+        self.configure_cache(max_bytes, None)
+    }
+
+    /// Apply an already validated read-cache size and optional TTL together.
+    /// Omitting TTL preserves its current value.
+    pub fn configure_cache(&self, max_bytes: u64, ttl: Option<Duration>) -> bool {
         match &self.inner.cache {
             Some(cache) => {
-                cache.set_max_bytes(max_bytes);
+                cache.reconfigure(max_bytes, ttl);
                 true
             }
             None => false,
