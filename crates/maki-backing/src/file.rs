@@ -119,6 +119,9 @@ impl FileBacking {
     }
 }
 
+// The shared GC dispatcher uses this result type, but only Linux constructs
+// successful outcomes; other platforms return Unsupported before doing GC.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum GcRemoval {
     Removed,
     Live,
