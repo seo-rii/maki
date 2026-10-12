@@ -36,6 +36,11 @@ fn create_volume_with_metadata_version(
     mut superblock: Superblock,
     metadata_version: u32,
 ) -> Result<Superblock, FormatError> {
+    // Serialize the empty-root checks with initialization and attach. The
+    // guard remains live through the final directory sync: a lock file's
+    // presence alone does not prevent another creator from publishing a
+    // different UUID over this volume's metadata (BUG-039).
+    let _volume_lock = backing.try_lock(layout::VOLUME_LOCK)?;
     if backing.exists(layout::SUPERBLOCK_A)? || backing.exists(layout::SUPERBLOCK_B)? {
         return Err(FormatError::AlreadyExists(
             "volume superblock already present".to_string(),
@@ -70,7 +75,8 @@ fn create_volume_with_metadata_version(
         backing.create_dir_all(dir)?;
     }
 
-    // Lock file (contents unused; presence + advisory lock semantics).
+    // The exclusion API does not promise that its lock file is durable.
+    // Persist it explicitly; the root sync below stabilizes its dirent.
     let lock_file = backing.open(layout::VOLUME_LOCK, true)?;
     lock_file.sync_data()?;
 
