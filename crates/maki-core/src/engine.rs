@@ -501,6 +501,13 @@ impl Engine {
         let supports_discard = volume.supports_discard();
         let superblock = volume.superblock().clone();
         let geometry = superblock.geometry.clone();
+        let required_pending = maki_format::journal::max_record_len(geometry.max_ciphertext_size);
+        if options.checkpoint.max_pending_bytes < required_pending {
+            return Err(AttachError::Config(format!(
+                "max_pending_bytes {} must hold one maximum journal record ({required_pending} bytes)",
+                options.checkpoint.max_pending_bytes
+            )));
+        }
 
         if let Some(identity) = &options.identity {
             if identity.provider_type != superblock.provider_type {
@@ -1230,11 +1237,17 @@ impl Engine {
         } else {
             cts
         };
-        let incoming = cts.iter().map(record_len).sum();
-        if !cts.is_empty() && !self.admit_journal(volume, incoming, cts, reclaimed, last_round)? {
+        if !cts.is_empty() && !self.admit_journal(volume, cts, reclaimed, last_round)? {
             return Ok(false);
         }
         for ct in cts {
+            if volume
+                .journal_pending_bytes()
+                .saturating_add(record_len(ct))
+                > self.inner.policy.max_pending_bytes
+            {
+                self.inner.sync_journal(volume)?;
+            }
             if ct.data.is_empty() {
                 volume.discard_ct(ct.unit_index, false)?;
             } else {
@@ -1258,14 +1271,14 @@ impl Engine {
     }
 
     /// Journal admission for one request (SPEC §30 "journal queue"; review
-    /// M-004): emergency free-space reserve, unsynced-bytes barrier, and the
-    /// hard journal limit with inline reclaim.
+    /// M-004): emergency free-space reserve and the hard journal limit with
+    /// inline reclaim. The pending-bytes barrier is enforced before each
+    /// record in `journal_request`, including inside a multi-unit request.
     ///
-    /// `incoming` is the record bytes (headers + payloads) the request adds;
-    /// it drives the pending-barrier flush, whose unsynced tail never includes
-    /// a roll's segment header (a roll syncs both the sealed segment and the
-    /// new header immediately). The hard limit, though, bounds the on-disk
-    /// *total*, which does count those headers, so it is checked against the
+    /// The unsynced tail never includes a roll's segment header (a roll
+    /// syncs both the sealed segment and the new header immediately). The
+    /// hard limit bounds the on-disk *total*, which counts those headers,
+    /// so it is checked against the
     /// exact append footprint (records + any new segment headers), recomputed
     /// after reclaim because reclaim can change the active segment (R08).
     ///
@@ -1277,7 +1290,6 @@ impl Engine {
     fn admit_journal(
         &self,
         volume: &mut Volume,
-        incoming: u64,
         cts: &[CiphertextUnit],
         reclaimed: bool,
         last_round: bool,
@@ -1329,10 +1341,6 @@ impl Engine {
                     policy.emergency_reserve_bytes
                 )));
             }
-        }
-        let pending = volume.journal_pending_bytes();
-        if pending > 0 && pending.saturating_add(incoming) > policy.max_pending_bytes {
-            self.inner.sync_journal(volume)?;
         }
         // Overlay bound (R4-005): the RAM held by uncheckpointed records is
         // independent of the disk journal limit. Charge the request at its

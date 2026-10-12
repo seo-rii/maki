@@ -29,6 +29,11 @@ use crate::error::FormatError;
 
 pub const RECORD_MAGIC: &[u8; 4] = b"MJR1";
 pub const RECORD_HEADER_SIZE: usize = 32;
+/// Byte budget for one largest framed record, excluding the synced segment header.
+pub fn max_record_len(max_payload_size: u32) -> u64 {
+    RECORD_HEADER_SIZE as u64 + u64::from(max_payload_size)
+}
+
 /// Sanity cap on a single record payload (a crypto unit's ciphertext).
 pub const MAX_PAYLOAD: u32 = 16 << 20;
 

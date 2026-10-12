@@ -1249,7 +1249,7 @@ impl VolumeConfig {
         // Progress guarantee: after an inline reclaim only the active segment
         // remains, and the largest single request must still fit under the
         // hard limit, or the journal could refuse writes forever.
-        let record = 32u64 + self.crypto.capabilities.max_ciphertext_size as u64;
+        let record = crate::journal::max_record_len(self.crypto.capabilities.max_ciphertext_size);
         let units_per_request = self
             .nbd
             .maximum_io
@@ -1265,10 +1265,10 @@ impl VolumeConfig {
                  reclaim can always make room"
             )));
         }
-        if self.limits.max_journal_pending_bytes.0 == 0 {
-            return Err(ConfigError::Invalid(
-                "limits.max_journal_pending_bytes must be positive".to_string(),
-            ));
+        if self.limits.max_journal_pending_bytes.0 < record {
+            return Err(ConfigError::Invalid(format!(
+                "limits.max_journal_pending_bytes must hold one maximum journal record ({record} bytes)"
+            )));
         }
         Ok(())
     }
