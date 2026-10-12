@@ -637,6 +637,7 @@ async fn dispatch_endpoint_set(
             &recovered
         }
     };
+    validate_recovered_geometry(config, volume)?;
     use maki_crypto::checked::CheckedProvider;
     use maki_crypto::clock::SystemClock;
     use maki_crypto::endpoint::{DispatchConfig, EndpointValidator};
@@ -925,6 +926,54 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
     }
 }
 
+/// Recovered storage fields are immutable even when both individual
+/// configurations are valid. Compare before constructing any provider.
+fn validate_recovered_geometry(config: &VolumeConfig, volume: &Volume) -> Result<(), DaemonError> {
+    let expected = config.geometry()?;
+    let stored = &volume.superblock().geometry;
+    for (field, configured, recovered) in [
+        (
+            "device_block_size",
+            u64::from(expected.device_block_size),
+            u64::from(stored.device_block_size),
+        ),
+        (
+            "crypto_unit_size",
+            u64::from(expected.crypto_unit_size),
+            u64::from(stored.crypto_unit_size),
+        ),
+        (
+            "shard_logical_size",
+            expected.shard_logical_size,
+            stored.shard_logical_size,
+        ),
+        (
+            "slot_alignment",
+            u64::from(expected.slot_alignment),
+            u64::from(stored.slot_alignment),
+        ),
+        (
+            "max_ciphertext_size",
+            u64::from(expected.max_ciphertext_size),
+            u64::from(stored.max_ciphertext_size),
+        ),
+        (
+            "max_virtual_size",
+            expected.max_virtual_size,
+            stored.max_virtual_size,
+        ),
+    ] {
+        if configured != recovered {
+            return Err(DaemonError::Unsupported(format!("volume geometry {field} mismatch: configuration {configured}, stored {recovered}; migration is required")));
+        }
+    }
+    let block = stored.device_block_size;
+    if config.nbd.minimum_io < block || !config.nbd.minimum_io.is_multiple_of(block) {
+        return Err(DaemonError::Unsupported(format!("NBD minimum_io {} is incompatible with stored volume geometry device_block_size {block}", config.nbd.minimum_io)));
+    }
+    Ok(())
+}
+
 /// Recovery + provider verification + ready engine (SPEC §27).
 pub async fn attach_from_config(config: &VolumeConfig) -> Result<Engine, DaemonError> {
     Ok(attach_from_config_with_stats(config).await?.0)
@@ -949,6 +998,7 @@ pub async fn attach_from_config_with_stats(
     let backing = build_backing(config)?;
     let options = engine_options(config);
     let volume = Volume::recover(backing, options.volume.clone()).map_err(AttachError::from)?;
+    validate_recovered_geometry(config, &volume)?;
     let (provider, endpoints) = build_provider_for_volume(config, Some(&volume)).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
