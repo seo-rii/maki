@@ -156,6 +156,84 @@ fn stalled_handshake_leaves_deadline_for_other_frontend() {
 }
 
 #[test]
+fn successful_frontend_is_reused_without_revisiting_stalled_tls_peer() {
+    let f = Fixture::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = f.service(handler(f.state("state", [1; 16]), calls.clone()));
+    let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+    stalled.set_nonblocking(true).unwrap();
+    let client = FailoverClient::new(
+        vec![
+            f.options(stalled.local_addr().unwrap()),
+            f.options(service.address),
+        ],
+        [1; 16],
+        300,
+    )
+    .unwrap();
+    let mut stalled_connections = Vec::new();
+    let mut elapsed_micros = Vec::new();
+    for _ in 0..4 {
+        let start = Instant::now();
+        assert_eq!(client.call(&inspect()).unwrap().identity, [1; 16]);
+        elapsed_micros.push(start.elapsed().as_micros());
+        while let Ok((socket, _)) = stalled.accept() {
+            // Keeping the accepted socket open models a silent TLS peer.
+            stalled_connections.push(socket);
+        }
+    }
+    eprintln!("witness failover request elapsed_us={elapsed_micros:?}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "every call reads the authority anew"
+    );
+    assert_eq!(
+        stalled_connections.len(),
+        1,
+        "later calls should start with the successful peer"
+    );
+}
+
+#[test]
+fn failed_preferred_frontend_returns_to_recovered_peer_and_updates_hint() {
+    let f = Fixture::new();
+    let store = f.state("state", [1; 16]);
+    let left_live = Arc::new(AtomicBool::new(false));
+    let right_live = Arc::new(AtomicBool::new(true));
+    let left_calls = Arc::new(AtomicUsize::new(0));
+    let right_calls = Arc::new(AtomicUsize::new(0));
+    let health_handler = |live: Arc<AtomicBool>, calls: Arc<AtomicUsize>| -> Arc<Handler> {
+        let success = handler(store.clone(), calls.clone());
+        Arc::new(move |role, request| {
+            if !live.load(Ordering::SeqCst) {
+                calls.fetch_add(1, Ordering::SeqCst);
+                return Err(io::Error::other("frontend temporarily unavailable"));
+            }
+            success(role, request)
+        })
+    };
+    let left = f.service(health_handler(left_live.clone(), left_calls.clone()));
+    let right = f.service(health_handler(right_live.clone(), right_calls.clone()));
+    let client = FailoverClient::new(
+        vec![f.options(left.address), f.options(right.address)],
+        [1; 16],
+        1000,
+    )
+    .unwrap();
+    client.call(&inspect()).unwrap();
+    client.call(&inspect()).unwrap();
+    assert_eq!(left_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(right_calls.load(Ordering::SeqCst), 2);
+    left_live.store(true, Ordering::SeqCst);
+    right_live.store(false, Ordering::SeqCst);
+    client.call(&inspect()).unwrap();
+    client.call(&inspect()).unwrap();
+    assert_eq!(left_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(right_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn lost_durable_mutation_result_retries_identical_operation_on_other_frontend() {
     let f = Fixture::new();
     let store = f.state("state", [1; 16]);
@@ -239,6 +317,52 @@ fn permission_and_comparison_errors_are_terminal() {
         .unwrap();
         assert_eq!(client.call(&inspect()).unwrap_err().kind(), kind);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn terminal_error_on_preferred_frontend_does_not_retry_a_former_peer() {
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::WouldBlock,
+        io::ErrorKind::InvalidInput,
+    ] {
+        let f = Fixture::new();
+        let public = f.state("state", [1; 16]);
+        let left_calls = Arc::new(AtomicUsize::new(0));
+        let left = f.service({
+            let calls = left_calls.clone();
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("temporary transport failure"))
+            })
+        });
+        let denied = Arc::new(AtomicBool::new(false));
+        let right = f.service({
+            let denied = denied.clone();
+            let success = handler(public, Arc::new(AtomicUsize::new(0)));
+            Arc::new(move |role, request| {
+                if denied.load(Ordering::SeqCst) {
+                    Err(io::Error::new(kind, "terminal error"))
+                } else {
+                    success(role, request)
+                }
+            })
+        });
+        let client = FailoverClient::new(
+            vec![f.options(left.address), f.options(right.address)],
+            [1; 16],
+            1000,
+        )
+        .unwrap();
+        client.call(&inspect()).unwrap();
+        denied.store(true, Ordering::SeqCst);
+        assert_eq!(client.call(&inspect()).unwrap_err().kind(), kind);
+        assert_eq!(
+            left_calls.load(Ordering::SeqCst),
+            1,
+            "a terminal outcome must not revisit the former peer"
+        );
     }
 }
 

@@ -1,6 +1,7 @@
 //! Identity-pinned endpoint failover for one shared freshness authority.
 use std::collections::HashSet;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::{Client, ClientOptions};
@@ -12,6 +13,8 @@ pub struct FailoverClient {
     endpoints: Vec<Client>,
     identity: [u8; 16],
     timeout: std::time::Duration,
+    // A routing hint only: no authoritative records or outcomes are cached.
+    preferred: AtomicUsize,
 }
 impl FailoverClient {
     pub fn new(
@@ -40,6 +43,7 @@ impl FailoverClient {
             endpoints,
             identity,
             timeout,
+            preferred: AtomicUsize::new(0),
         })
     }
 }
@@ -56,10 +60,13 @@ impl Rpc for FailoverClient {
         }
         let deadline = Instant::now() + self.timeout;
         let mut last = io::Error::new(io::ErrorKind::TimedOut, "witness endpoints unavailable");
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
+        let preferred = self.preferred.load(Ordering::Acquire);
+        for attempt in 0..self.endpoints.len() {
+            let index = (preferred + attempt) % self.endpoints.len();
+            let endpoint = &self.endpoints[index];
             let remaining = crate::remaining(deadline)?;
             // Reserve time for every untried endpoint, including a stalled TLS handshake.
-            let slice = remaining / (self.endpoints.len() - index) as u32;
+            let slice = remaining / (self.endpoints.len() - attempt) as u32;
             let attempt_deadline = Instant::now() + slice;
             match endpoint.call_until::<_, Record>(request, attempt_deadline.min(deadline)) {
                 Ok(record) => {
@@ -69,6 +76,7 @@ impl Rpc for FailoverClient {
                             "response differs from pinned witness identity",
                         ));
                     }
+                    self.preferred.store(index, Ordering::Release);
                     return Ok(record);
                 }
                 Err(error)

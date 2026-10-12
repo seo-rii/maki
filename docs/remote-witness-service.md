@@ -287,6 +287,15 @@ from a different storage identity is refused. A list of independent local
 state directories does not provide safe HA, even when they share an identity;
 use a shared pinned quorum backend.
 
+The client starts each call with the last frontend that returned a validated
+record. This is only a routing hint: every call still reads the authority, and
+all mutation retries preserve their exact operation and session authorization.
+If the preferred frontend fails, the remaining frontends share the original
+overall deadline and a successful alternate becomes the next preferred address.
+Authentication failures, malformed records and predecessor conflicts remain
+terminal. A stalled former first address therefore consumes time once during
+failover rather than on every later successful call.
+
 Inspect through the configured client without claiming a session:
 
 ```sh
