@@ -1219,3 +1219,64 @@ the next campaign is its first run.
 `NbdAdapter::shutdown` has no panic guard of its own (R5-016, not changed):
 storage and provider panics already become errors before it, and no reachable
 panic was found.
+
+
+## Correctness and recovery review — 2026-10-12
+
+The review used `1c1e64f`. Each functional fix starts with a failing permanent
+regression and retains existing success, retry, cancellation and persistence
+contracts. The two journal paths use `CrashableBacking` with sector tearing;
+concurrent initialization uses actual `FileBacking`; transport failover uses
+real local HTTP/gRPC/TLS servers; sentinel partial writes use an isolated child
+with an OS file-size limit. These are automated regressions, not a new external
+kernel-NBD or hardware-power-loss campaign.
+
+| Finding | Result | Permanent regression |
+|---|---|---|
+| BUG-020, journal length retries | Reassert accepted length together with verified bytes before retry sync, including recovery restarts | maki-core `review_journal_length_retry.rs` |
+| BUG-033, writer ownership bypass | Authority/wire v2 private capability gates current-session mutations, including older sessions using the same credential; v1 requires explicit migration | maki-backing `remote_session_authorization.rs`; maki-witness `transport.rs`, `session_erasure.rs`, `etcd_ha.rs` |
+| BUG-034, gRPC credential copies | Guard original resolved metadata, endpoint clones and constructor/error/drop paths; format from guarded bytes without intermediate copies | maki-crypto-grpc `review_credentials_erasure.rs`; maki-nbdkit `review_grpc_credential_erasure.rs` |
+| BUG-035, later batch error | Consume completions immediately, cancel remaining work on error and restore successful input order | maki-core `review_batch_liveness.rs` |
+| BUG-036, HTTP oversized response | Classify response bounds and arithmetic overflow as peer contract violations; preserve unsafe no-resend | maki-crypto-http `review_response_contract.rs`, `phase8.rs` |
+| BUG-037, persisted geometry | Compare immutable saved fields and advertised minimum I/O before provider construction/readiness | maki-nbdkit `review_persisted_geometry.rs` |
+| BUG-038, tiny probe rate | Configuration rejects unrepresentable intervals; direct library invalid rates disable free probes without panicking | maki-crypto `review_probe_interval.rs`; maki-format `review_probe_interval_config.rs` |
+| BUG-039, concurrent create | Lock before the first root check through the final directory sync; preserve explicit lock-file durability | maki-core `review_create_concurrency.rs`; maki-format `review_create_lock.rs` |
+| BUG-040, sentinel retry | Atomically publish fully synced bytes without replacement; rewrite/resync identical existing content and synchronize the directory | maki-privileged `review_atomic_sentinel.rs`, `sentinel_tests.rs` |
+| BUG-041, gRPC unsupported method | Treat `Unimplemented` as endpoint-scoped; record breaker failure and route safe requests to a healthy peer | maki-crypto-grpc `phase9_grpc.rs` |
+| BUG-042, attach CLI options | Reject missing values, unknown/duplicate options and extra positionals before loading configuration | maki-attach `review_strict_arguments.rs` |
+| PERF-001, endpoint admission | FIFO capacity admission reselects after capacity release, validation promotion and open-circuit probe readiness, holding no RPC permits while waiting | maki-crypto `review_endpoint_admission.rs`, existing flow/dispatch/probe-lifetime suites |
+| PERF-002, repeated witness failover | Prefer the last validated successful address, retaining one deadline, identical requests and terminal identity/authorization/conflict failures | maki-witness `failover.rs` |
+| TOOL-001, new compiler warnings | Compatible CAS and fixed-array chunk APIs; pinned 1.94 baseline and separate latest stable jobs, with matrix cancellation disabled | Strict Clippy on Rust 1.99; exact-revision Linux/Windows CI |
+
+Recovery also reduces slot writes within each existing 1 MiB batch to the
+latest sequence per unit. All historical validation and allocation/discard
+publication order remain. `review_recovery_batch_latest.rs` covers overwrites,
+discard ordering, batch boundaries, allocation evidence, superseded corruption
+and 96 restart/power-loss fault cases. The controlled fixtures reduced 24/4/300
+slot writes to 2/1/2; this is a write-count result, not a throughput claim.
+
+Request observability now separates actual Engine calls from retained admission
+slots, records success/error/cancellation and measures complete per-operation
+latency alongside explicit storage-sync time. The legacy gauges and successful
+storage-only series retain their meanings; `review_request_metrics.rs` verifies
+provider and storage cancellation separately and failed full-FLUSH/FUA timing.
+See [measurement boundaries](observability.md#request-counts-and-latency-boundaries).
+
+The benchmark adds bounded parallel jobs, deterministic random access, mixed
+read/write ratios, configurable working sets and periodic drained barriers.
+Setup, real latency, exact pending work, sampled resource peaks and optional
+process RSS are reported separately. `concurrent_report.rs` exercises actual
+AES at 1/2/8/32 callers; `synthetic_recovery.rs` verifies 768 requests across
+12 virtual-time healthy/outage/recovery phases. These simulations are not a
+hardware throughput result. See [benchmark guide](benchmark.md).
+
+The state boundaries are isolated where they carry testable invariants:
+indexed batch completions, FIFO endpoint admission, current-session capabilities,
+recovered geometry comparison and request-lifetime guards. No arbitrary file
+split is needed to establish these contracts.
+
+Default tests, strict Clippy and formatting must pass on the pinned baseline
+and latest stable. Journal/recovery changes additionally require the complete
+ignored release gates before release acceptance. Push success is separate from
+the exact-SHA GitHub Actions result; local Rust 1.94 results do not establish
+Rust 1.99 or Windows CI success.

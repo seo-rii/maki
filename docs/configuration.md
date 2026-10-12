@@ -143,7 +143,8 @@ schema, geometry, and secret-literal checks it rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
   `[crypto.circuit_breaker]`, and `[crypto.retry_budget]`, a non-finite or
-  negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s`, an
+  negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s` or whose reciprocal cannot
+  be represented by `Duration`, an
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
   targets above their maxima, or a batch byte limit smaller than one crypto
   unit;
@@ -564,7 +565,13 @@ separately. See the [measurement procedure](performance.md#establish-a-memory-an
 
 `volume.max_virtual_size`, `crypto_unit_size`, provider ciphertext bounds, slot
 alignment, and NBD block sizes jointly define immutable volume geometry. Treat
-geometry or on-disk format changes as migrations, not hot reloads.
+geometry or on-disk format changes as migrations, not hot reloads. Attach
+compares configured device block size, crypto unit size, shard logical size,
+slot alignment, maximum ciphertext size and virtual size with the recovered
+superblock before provider initialization. A mismatch refuses readiness with
+the field and both values. Advertised NBD minimum I/O must also be a multiple
+of, and at least as large as, the stored device block size. Mutable request and
+resource limits remain independently validated operational settings.
 
 `maki volume inspect` reports maximum units and shards, the full slot-file span,
 and the A/B allocation-map and catalog bytes calculated from that geometry. For

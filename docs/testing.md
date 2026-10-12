@@ -38,8 +38,16 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 
 | Tier | Trigger | Platform | Enforcement |
 |---|---|---|---|
-| Baseline | Pull requests and pushes | Ubuntu and Windows | Formatting, strict Clippy, and workspace tests block |
-| Extended | Scheduled run | Ubuntu | Ignored model, crash, HA, database, and power-loss gates block |
+| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block |
+| Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
+| Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
+
+Both platform matrices set `fail-fast: false`, so a Linux failure cannot
+cancel the Windows evidence. The pinned baseline is reproducible; latest stable
+checks compiler changes separately. A local pass on one compiler or a successful
+push does not establish the final commit's remote CI result. Use
+`cargo +1.94.0` for baseline checks and an updated stable toolchain for
+compatibility checks.
 
 The baseline workspace suite includes unit tests, parser mutation smokes,
 golden format vectors, provider conformance, transport chaos, failpoints,

@@ -190,6 +190,25 @@ documents.
 
 ### Fixed
 
+- **2026-10-12 correctness and recovery review**: journal sync/recovery retries
+  reassert accepted file lengths and verified bytes; volume creation holds its
+  exclusive lock through final directory sync. Completed batch errors cancel
+  earlier pending batches while successful outputs keep unit order. HTTP
+  oversized responses and gRPC `Unimplemented` are endpoint failures for
+  breaker/failover, with unsafe no-resend preserved. Resolved gRPC metadata and
+  daemon intermediates are erased on all ownership paths. Sentinel publication
+  is atomic without replacement, and identical retries rewrite then synchronize
+  bytes and length. Attach compares stored geometry before provider setup;
+  malformed attach CLI options are usage errors; unrepresentable retry probe
+  intervals are rejected without library panics. Admission waits without holding
+  global capacity and reselects available peers. Rust 1.99 warnings are fixed;
+  reproducible Rust 1.94 and latest-stable Linux/Windows jobs run independently.
+  See [regressions](docs/review-remediation.md#correctness-and-recovery-review-2026-10-12).
+- **Bounded recovery slot-write amplification**: every historical record stays
+  validated, while only each unit's latest sequence within the existing batch
+  writes slot data; a last discard skips superseded writes. Allocation evidence,
+  metadata publication order and batch boundaries are preserved.
+
 - **HTTP response JSON ownership**: completed strings and object keys are
   guarded before the full response is parsed, so malformed partial JSON and
   duplicate replacement erase their owned plaintext too. Single-item and
