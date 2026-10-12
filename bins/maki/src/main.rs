@@ -485,9 +485,21 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+fn existing_backing(
+    cfg: &maki_format::config::VolumeConfig,
+) -> Result<std::sync::Arc<dyn maki_backing::Backing>, String> {
+    let root = std::path::Path::new(&cfg.backing.root);
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("{}: not a directory", root.display())),
+        Err(error) => return Err(format!("{}: {error}", root.display())),
+    }
+    maki_nbdkit::daemon::build_backing(cfg).map_err(|error| error.to_string())
+}
+
 fn inspect(config: &str) -> Result<(), String> {
     let cfg = read_config(config)?;
-    let backing = maki_nbdkit::daemon::build_backing(&cfg).map_err(|e| e.to_string())?;
+    let backing = existing_backing(&cfg)?;
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
         .map_err(|e| e.to_string())?;
     let sb = envelope.superblock;
@@ -519,7 +531,7 @@ fn inspect(config: &str) -> Result<(), String> {
 
 fn check(config: &str, deep: bool) -> Result<bool, String> {
     let cfg = read_config(config)?;
-    let backing = maki_nbdkit::daemon::build_backing(&cfg).map_err(|e| e.to_string())?;
+    let backing = existing_backing(&cfg)?;
     let report = if deep {
         maki_core::check::deep_check(backing, cfg.backing.journal_segment_size.0)
             .map_err(|e| e.to_string())?
