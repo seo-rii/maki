@@ -122,7 +122,8 @@ fn existing_volume_geometry_still_bounds_a_changed_config() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("volume geometry max_virtual_size mismatch"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("volume geometry max_virtual_size mismatch"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
     assert!(output.stdout.is_empty());
     assert_eq!(std::fs::read(&superblock).unwrap(), original);
