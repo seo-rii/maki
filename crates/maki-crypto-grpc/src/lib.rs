@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::metadata::{MetadataKey, MetadataValue};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use zeroize::Zeroize;
 
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
@@ -131,6 +132,16 @@ pub struct GrpcProviderSpec {
     pub capabilities: CryptoCapabilities,
     pub timeout: Duration,
     pub max_message_bytes: usize,
+}
+
+impl Drop for GrpcProviderSpec {
+    fn drop(&mut self) {
+        // Every endpoint clone owns a separate resolved credential. Erase
+        // both normal provider lifetimes and specs rejected during setup.
+        for (_, value) in &mut self.metadata {
+            value.zeroize();
+        }
+    }
 }
 
 impl Clone for GrpcProviderSpec {

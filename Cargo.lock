@@ -993,6 +993,7 @@ dependencies = [
  "tonic",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

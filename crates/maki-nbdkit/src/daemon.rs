@@ -490,36 +490,39 @@ async fn remote_grpc_provider(
             })
         })
         .transpose()?;
-    let mut metadata = Vec::new();
+    // The template owns and erases the original resolved metadata, including
+    // early errors while resolving later keys or building another endpoint.
+    let mut template = maki_crypto_grpc::GrpcProviderSpec {
+        url: String::new(),
+        encrypt_path: grpc
+            .encrypt_path
+            .clone()
+            .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
+        decrypt_path: grpc
+            .decrypt_path
+            .clone()
+            .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
+        metadata: Vec::new(),
+        capabilities: capabilities_from_config(config, "remote-grpc"),
+        timeout: grpc
+            .timeout
+            .map(|d| d.0)
+            .unwrap_or(std::time::Duration::from_secs(10)),
+        max_message_bytes: grpc
+            .max_message_bytes
+            .map(|b| b.0 as usize)
+            .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
+    };
     for (name, value) in &grpc.metadata {
-        metadata.push((
+        template.metadata.push((
             name.clone(),
             resolve_metadata_value(&RoutedKeySource::from_config(config), value)?,
         ));
     }
     let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     for endpoint in &grpc.endpoint {
-        let spec = maki_crypto_grpc::GrpcProviderSpec {
-            url: endpoint.url.clone(),
-            encrypt_path: grpc
-                .encrypt_path
-                .clone()
-                .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
-            decrypt_path: grpc
-                .decrypt_path
-                .clone()
-                .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
-            metadata: metadata.clone(),
-            capabilities: capabilities_from_config(config, "remote-grpc"),
-            timeout: grpc
-                .timeout
-                .map(|d| d.0)
-                .unwrap_or(std::time::Duration::from_secs(10)),
-            max_message_bytes: grpc
-                .max_message_bytes
-                .map(|b| b.0 as usize)
-                .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
-        };
+        let mut spec = template.clone();
+        spec.url = endpoint.url.clone();
         let encrypted = endpoint
             .url
             .split_once("://")
@@ -577,13 +580,33 @@ fn resolve_metadata_value(
         maki_format::config::HeaderValue::Literal(v) => Ok(v.clone()),
         maki_format::config::HeaderValue::Credential(cred) => {
             let secret = keys.load_text(&cred.name)?;
-            let text = String::from_utf8(secret.expose().to_vec()).map_err(|_| {
-                DaemonError::Unsupported("credential is not valid UTF-8".to_string())
-            })?;
-            Ok(match &cred.format {
-                Some(template) => template.replace("{}", text.trim()),
-                None => text.trim().to_string(),
-            })
+            // Borrow the guarded key bytes, including on invalid UTF-8. A
+            // temporary String/from_utf8 error would release an unguarded copy.
+            let text = std::str::from_utf8(secret.expose())
+                .map_err(|_| DaemonError::Unsupported("credential is not valid UTF-8".to_string()))?
+                .trim();
+            match &cred.format {
+                Some(template) => {
+                    let replacements = template.matches("{}").count();
+                    let length = replacements
+                        .checked_mul(text.len())
+                        .and_then(|bytes| bytes.checked_add(template.len() - replacements * 2))
+                        .ok_or_else(|| {
+                            DaemonError::Unsupported("formatted credential is too large".into())
+                        })?;
+                    // Allocate the final size once: growing String::replace
+                    // can free earlier allocations containing credential bytes.
+                    let mut value = String::with_capacity(length);
+                    for (index, part) in template.split("{}").enumerate() {
+                        if index != 0 {
+                            value.push_str(text);
+                        }
+                        value.push_str(part);
+                    }
+                    Ok(value)
+                }
+                None => Ok(text.to_string()),
+            }
         }
     }
 }
