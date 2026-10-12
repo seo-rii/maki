@@ -815,7 +815,10 @@ impl Engine {
         }
         let mut out = HashMap::with_capacity(cts.len());
         let unit_size = self.inner.geometry.crypto_unit_size as usize;
-        let ranges = self.batch_chunks(cts.len(), |i| cts[i].data.len());
+        // BatchCapability counts original plaintext bytes. The scheduler
+        // separately charges the actual ciphertext bytes to its resident
+        // budget, including variable-length encodings smaller than a unit.
+        let ranges = self.batch_chunks(cts.len(), |_| unit_size);
         let batches = self
             .run_batches(ranges, |range| {
                 self.inner
