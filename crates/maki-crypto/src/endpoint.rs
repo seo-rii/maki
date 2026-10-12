@@ -166,6 +166,10 @@ pub struct EndpointSet {
     metrics: DispatchMetrics,
     validator: Option<EndpointValidator>,
     caps: OnceCell<CryptoCapabilities>,
+    /// The provider plaintext unit selected by this volume, including any
+    /// prefix added before dispatch. Unbound sets conservatively use the
+    /// largest common size when splitting decrypt calls.
+    plaintext_size: Option<u32>,
 }
 
 /// Both budgets are acquired without waiting, then retained only for the RPC.
@@ -285,7 +289,18 @@ impl EndpointSet {
             metrics: DispatchMetrics::default(),
             validator,
             caps: OnceCell::new(),
+            plaintext_size: None,
         }
+    }
+
+    /// Bind a serving set to the volume's actual provider plaintext size.
+    /// Ciphertext lengths cannot establish this logical size (BUG-058).
+    /// Configure this before serving; capabilities and batch calls reject a
+    /// size that no common peer can accept within its batch byte limit.
+    pub fn with_plaintext_size(mut self, plaintext_size: u32) -> Self {
+        self.plaintext_size = Some(plaintext_size);
+        self.caps = OnceCell::new();
+        self
     }
 
     /// Freeze the contract across all configured peers, including ones that
@@ -343,6 +358,15 @@ impl EndpointSet {
                 common.supported_plaintext_sizes.dedup();
                 if !common.batch.supported {
                     common.batch.max_items = 1;
+                }
+                if let Some(size) = self.plaintext_size {
+                    if !common.supported_plaintext_sizes.contains(&size)
+                        || u64::from(size) > common.batch.max_bytes
+                    {
+                        return Err(CryptoError::NonRetryableRequest(
+                            "selected plaintext unit exceeds the common endpoint contract".into(),
+                        ));
+                    }
                 }
                 Ok(common)
             })
@@ -642,6 +666,16 @@ impl EndpointSet {
                 }
                 (Request::Decrypt(items), Response::Decrypted(output)) => {
                     validate_decrypt_result(items, output, caps)?;
+                    if let Some(size) = self.plaintext_size {
+                        if let Some(unit) = output.iter().find(|unit| unit.data.len() != size as usize)
+                        {
+                            return Err(CryptoError::Contract(format!(
+                                "decrypt of unit {} returned {} bytes, selected plaintext unit is {size}",
+                                unit.unit_index,
+                                unit.data.len()
+                            )));
+                        }
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -901,6 +935,9 @@ impl CryptoProvider for EndpointSet {
         if items.iter().any(|item| {
             !caps.accepts_plaintext_size(item.data.len())
                 || item.data.len() as u64 > caps.batch.max_bytes
+                || self
+                    .plaintext_size
+                    .is_some_and(|size| item.data.len() != size as usize)
         }) {
             return Err(CryptoError::NonRetryableRequest(
                 "plaintext unit exceeds the common endpoint contract".into(),
@@ -960,9 +997,15 @@ impl CryptoProvider for EndpointSet {
         }
         // Ciphertext length is not plaintext length. Without a pinned volume
         // size, reserve the largest common plaintext size for every item.
-        let logical_size = u64::from(*caps.supported_plaintext_sizes.last().ok_or_else(|| {
-            CryptoError::NonRetryableRequest("endpoints have no common plaintext unit size".into())
-        })?);
+        let logical_size = u64::from(
+            self.plaintext_size
+                .or_else(|| caps.supported_plaintext_sizes.last().copied())
+                .ok_or_else(|| {
+                    CryptoError::NonRetryableRequest(
+                        "endpoints have no common plaintext unit size".into(),
+                    )
+                })?,
+        );
         let chunk_size =
             (caps.batch.max_bytes / logical_size).min(u64::from(caps.batch.max_items)) as usize;
         if chunk_size == 0 {

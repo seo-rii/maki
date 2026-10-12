@@ -490,6 +490,14 @@ space.
 
 ## Batching and pending bounds
 
+The serving endpoint set is bound to the selected provider plaintext unit:
+`volume.crypto_unit_size + crypto.random_prefix_bytes`. Encrypt inputs and
+decrypt results must match that size even when the provider profile advertises
+other supported sizes. Decrypt batching uses the selected logical plaintext
+size; actual ciphertext bytes still count toward memory and dispatch admission
+limits. A larger unused supported size does not prevent a smaller volume from
+using its valid batch limit.
+
 Remote providers are called through a batch scheduler (SPEC §30). Concurrent
 requests are coalesced into one provider call when their items fit
 `crypto.batch.max_items` / `max_bytes`; a batch is dispatched as soon as

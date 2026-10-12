@@ -877,12 +877,15 @@ async fn dispatch_endpoint_set(
         retry_safe: config.crypto.capabilities.retry_safe,
         validation_interval: breaker.open_initial.0,
     };
-    Ok(Arc::new(EndpointSet::with_quarantine(
-        flagged,
-        Some(validator),
-        dispatch,
-        Arc::new(SystemClock::new()),
-    )))
+    Ok(Arc::new(
+        EndpointSet::with_quarantine(
+            flagged,
+            Some(validator),
+            dispatch,
+            Arc::new(SystemClock::new()),
+        )
+        .with_plaintext_size(config.provider_plaintext_size()?),
+    ))
 }
 
 pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
