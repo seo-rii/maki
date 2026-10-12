@@ -36,12 +36,63 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+/// Validate the complete command before reading configuration or printing a
+/// plan. Missing values, duplicates and flags belonging to another verb are
+/// usage errors; an omitted flag alone may select a default.
+fn validate_arguments(args: &[String]) -> Result<(), String> {
+    let verb = args.first().map(String::as_str).ok_or("missing command")?;
+    if !matches!(
+        verb,
+        "attach" | "detach" | "recover" | "cleanup" | "grow" | "verify"
+    ) {
+        return Err(format!("unknown command {verb:?}"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut arguments = args.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if !seen.insert(argument.as_str()) {
+            return Err(format!("duplicate option {argument}"));
+        }
+        let takes_value = match argument.as_str() {
+            "--volume" | "--config" => true,
+            "--plan" => false,
+            "--init-sentinel" if verb == "attach" => false,
+            "--size-bytes" if verb == "grow" => true,
+            "--nbd-device" | "--vg" | "--lv" | "--mountpoint" | "--socket" | "--uuid"
+            | "--fs-uuid"
+                if verb != "verify" =>
+            {
+                true
+            }
+            _ => return Err(format!("unsupported argument {argument:?} for {verb}")),
+        };
+        if takes_value {
+            let value = arguments
+                .next()
+                .filter(|value| !value.starts_with('-'))
+                .ok_or_else(|| format!("missing value for {argument}"))?;
+            config::check_argument(argument, value).map_err(|error| error.to_string())?;
+        }
+    }
+    if !seen.contains("--volume") {
+        return Err("missing --volume".into());
+    }
+    if verb == "grow" && !seen.contains("--size-bytes") {
+        return Err("missing --size-bytes".into());
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     // Executed steps and every halted rollback are reported through
     // `tracing`; without a sink they vanish and the operator sees only the
     // exit status.
     maki_privileged::logging::install_default_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(error) = validate_arguments(&args) {
+        eprintln!("error: {error}");
+        return usage();
+    }
     let Some(verb) = args.first().cloned() else {
         return usage();
     };
@@ -50,45 +101,10 @@ fn main() -> ExitCode {
     };
     let plan_only = args.iter().any(|a| a == "--plan");
 
-    // Every flag value is checked before it can reach a system utility.
-    for name in [
-        "--volume",
-        "--config",
-        "--nbd-device",
-        "--vg",
-        "--lv",
-        "--mountpoint",
-        "--socket",
-        "--uuid",
-        "--fs-uuid",
-        "--size-bytes",
-    ] {
-        if let Some(value) = flag(&args, name) {
-            if let Err(e) = config::check_argument(name, &value) {
-                eprintln!("error: {e}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
     let config_path = flag(&args, "--config").unwrap_or_else(|| config::default_path(&volume));
     if verb == "verify" {
         // Workload gates use only the root-controlled config. An argument
         // cannot replace its filesystem pin or any stored attachment identity.
-        let mut seen = std::collections::HashSet::new();
-        let mut flags = args.iter().skip(1);
-        while let Some(argument) = flags.next() {
-            if !seen.insert(argument.as_str())
-                || match argument.as_str() {
-                    "--volume" | "--config" => flags.next().is_none(),
-                    "--plan" => false,
-                    _ => true,
-                }
-            {
-                eprintln!("error: verify accepts only --volume, --config and --plan; identity overrides are forbidden");
-                return ExitCode::from(2);
-            }
-        }
         if let Err(error) = config::check_abs_path("config", &config_path) {
             eprintln!("error: {error}");
             return ExitCode::from(2);
