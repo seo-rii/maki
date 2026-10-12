@@ -28,6 +28,11 @@ HTTP example is available at
 Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
 Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
 
+`volume.name` is an operational identifier of 1–64 ASCII bytes, using only
+letters, digits, `_` and `-`. Validation rejects longer names before creating
+or opening the backing. The bound leaves room for the default control socket
+pathname and the name in the official bounded status response.
+
 See [Rollback-protected backing](rollback-protection.md) for the witness trust
 boundary, capacity/reserve sizing, creation and systemd access requirements.
 This option is off by default and does not upgrade existing volumes.

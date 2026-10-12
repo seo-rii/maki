@@ -18,6 +18,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::error::FormatError;
 use crate::geometry::Geometry;
 
+/// Operational volume identifiers fit the default Unix socket paths and
+/// leave room for the rest of a bounded control-protocol status response.
+pub const MAX_VOLUME_NAME_BYTES: usize = 64;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config parse error: {0}")]
@@ -933,6 +937,12 @@ impl VolumeConfig {
             return Err(ConfigError::Invalid(format!(
                 "unsupported config_schema_version {}",
                 self.config_schema_version
+            )));
+        }
+        if self.volume.name.len() > MAX_VOLUME_NAME_BYTES {
+            return Err(ConfigError::Invalid(format!(
+                "volume name must be at most {MAX_VOLUME_NAME_BYTES} ASCII bytes (got {})",
+                self.volume.name.len()
             )));
         }
         if self.volume.name.is_empty()
