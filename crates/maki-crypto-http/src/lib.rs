@@ -58,15 +58,7 @@ fn append_response_chunk(
     chunk: &[u8],
     limit: usize,
 ) -> Result<(), CryptoError> {
-    let length = out
-        .len()
-        .checked_add(chunk.len())
-        .ok_or_else(|| CryptoError::NonRetryableRequest("response size overflow".into()))?;
-    if length > limit {
-        return Err(CryptoError::NonRetryableRequest(format!(
-            "response exceeds limit {limit}"
-        )));
-    }
+    let length = checked_response_length(out.len(), chunk.len(), limit)?;
     if length <= out.capacity() {
         out.try_extend_from_slice(chunk)
             .expect("capacity was checked");
@@ -88,6 +80,24 @@ fn append_response_chunk(
         .expect("new response capacity was checked");
     *out = grown;
     Ok(())
+}
+
+/// Response sizes describe the peer's contract, including arithmetic
+/// overflow. Local request/allocation failures keep their own error class.
+fn checked_response_length(
+    current: usize,
+    incoming: usize,
+    limit: usize,
+) -> Result<usize, CryptoError> {
+    let length = current
+        .checked_add(incoming)
+        .ok_or_else(|| CryptoError::Contract("response size overflow".into()))?;
+    if length > limit {
+        return Err(CryptoError::Contract(format!(
+            "response exceeds limit {limit}"
+        )));
+    }
+    Ok(length)
 }
 
 fn append_owned_response_chunk(
@@ -776,12 +786,9 @@ impl HttpCryptoProvider {
             return Err(err);
         }
         if let Some(len) = response.content_length() {
-            if len as usize > self.spec.max_response_bytes {
-                return Err(CryptoError::NonRetryableRequest(format!(
-                    "response of {len} bytes exceeds limit {}",
-                    self.spec.max_response_bytes
-                )));
-            }
+            let len = usize::try_from(len)
+                .map_err(|_| CryptoError::Contract("response size overflow".into()))?;
+            checked_response_length(0, len, self.spec.max_response_bytes)?;
         }
         // Stream with a hard cap regardless of the declared length.
         let mut out = SecretBuffer::zeroed(0);
@@ -1285,6 +1292,25 @@ mod pointer_tests {
                     "{token:?}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_size_tests {
+    use super::*;
+    #[test]
+    fn response_size_boundary_and_overflow_are_peer_contract_errors() {
+        assert_eq!(checked_response_length(256, 768, 1024).unwrap(), 1024);
+        for (current, incoming, limit) in [
+            (0, 1025, 1024),
+            (256, 769, 1024),
+            (usize::MAX, 1, usize::MAX),
+        ] {
+            assert!(matches!(
+                checked_response_length(current, incoming, limit),
+                Err(CryptoError::Contract(_))
+            ));
         }
     }
 }

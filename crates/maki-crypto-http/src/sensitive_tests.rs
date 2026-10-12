@@ -328,10 +328,7 @@ fn owned_response_rejection_erases_unique_chunk_and_preserves_aggregate() {
     let chunk = bytes::Bytes::from(vec![FILL; PAYLOAD_LEN]);
     let error = super::append_owned_response_chunk(&mut out, chunk, PAYLOAD_LEN).unwrap_err();
     let inspection = finish_inspection();
-    assert!(matches!(
-        error,
-        maki_crypto::CryptoError::NonRetryableRequest(_)
-    ));
+    assert!(matches!(error, maki_crypto::CryptoError::Contract(_)));
     assert_eq!(out.expose(), b"kept");
     assert_sensitive_allocations_wiped(inspection, 1);
 }

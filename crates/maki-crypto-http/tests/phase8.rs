@@ -342,7 +342,7 @@ async fn oversized_response_is_refused() {
         .encrypt_batch(&ctx(), &[pt(1, 5)])
         .await
         .unwrap_err();
-    assert_eq!(err.class(), ErrorClass::NonRetryableRequest, "{err:?}");
+    assert!(matches!(err, CryptoError::Contract(_)), "{err:?}");
 }
 
 // ---------- HTTP status classification ----------
