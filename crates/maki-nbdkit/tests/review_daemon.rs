@@ -109,7 +109,14 @@ async fn provider_type_change_is_refused_at_attach() {
     drop(attach_from_config(&config).await.unwrap());
 
     let xts_key = fx.key_file("siv.key", XTS_KEY_A);
-    let xts = parse_and_validate(&fx.config("local-aes-xts", &xts_key, 4096)).unwrap();
+    // Keep the stored geometry identical so this isolates provider identity.
+    // Changing max_ct too would correctly fail the earlier geometry check.
+    let xts = parse_and_validate(&fx.config(
+        "local-aes-xts",
+        &xts_key,
+        config.crypto.capabilities.max_ciphertext_size,
+    ))
+    .unwrap();
     let err = attach_from_config(&xts).await.unwrap_err();
     assert!(identity_mismatch(err));
 }
