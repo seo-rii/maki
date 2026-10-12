@@ -1097,7 +1097,7 @@ impl HttpCryptoProvider {
                 },
             };
             Ok(OpSpec {
-                method: op_cfg.method.clone(),
+                method: op_cfg.method.to_ascii_uppercase(),
                 path: op_cfg.path.clone(),
                 headers: headers.take(),
                 query: op_cfg
