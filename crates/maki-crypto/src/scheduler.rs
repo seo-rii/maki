@@ -17,8 +17,8 @@
 //!
 //! A transport-class provider error reaches every request of the batch.
 //! An integrity or other request-specific rejection of a coalesced batch
-//! may concern one request only, so the batch is then re-sent one request
-//! at a time and each gets its own verdict: a tampered unit read by one
+//! may concern one request only, so each request is then re-sent independently
+//! within the lane's inflight limit and gets its own verdict: a tampered unit read by one
 //! client never turns another client's healthy read into EIO.
 //!
 //! Costs: a request pays at most `max_wait` of extra latency when it is
@@ -148,6 +148,22 @@ impl Drop for PendingCharge {
     }
 }
 
+/// Cancellation drops a provider future and its in-flight charge together.
+struct InflightCall(Arc<SchedulerStats>);
+
+impl InflightCall {
+    fn enter(stats: Arc<SchedulerStats>) -> Self {
+        stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
+        Self(stats)
+    }
+}
+
+impl Drop for InflightCall {
+    fn drop(&mut self) {
+        self.0.inflight_batches.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// A shared provider call remains necessary until its last caller leaves.
 async fn all_replies_closed<'a, O: 'a>(replies: impl Iterator<Item = &'a mut Reply<O>>) {
     for reply in replies {
@@ -180,6 +196,116 @@ type LaneCall<I, O> = Arc<dyn Fn(CryptoContext, Vec<I>) -> CallFuture<I, O> + Se
 type ResendSafe = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
 >;
+
+struct RetryGroup<I, O> {
+    items: Vec<I>,
+    reply: Reply<O>,
+}
+
+async fn retry_caller_closed<I, O>(pending: &mut VecDeque<RetryGroup<I, O>>) {
+    std::future::poll_fn(|cx| {
+        for group in pending.iter_mut() {
+            if group.reply.poll_closed(cx).is_ready() {
+                return std::task::Poll::Ready(());
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await;
+}
+
+/// The failed batch's permit reserves its remaining input while one retry
+/// borrows it. Extra retries acquire the same lane's permits, so ordinary
+/// batches and retries share one bound. Reusing the original permit also
+/// guarantees progress when the lane has only one slot.
+async fn run_retries<I: Send + 'static, O: Send + 'static>(
+    context: CryptoContext,
+    mut pending: VecDeque<RetryGroup<I, O>>,
+    call: LaneCall<I, O>,
+    stats: Arc<SchedulerStats>,
+    inflight: Arc<tokio::sync::Semaphore>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    type RetryFuture = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+    // A true result returns use of the original slot. Other futures own
+    // their extra slot and release it on completion or cancellation.
+    let make_retry = |group: RetryGroup<I, O>, extra_slot, original| -> RetryFuture {
+        let context = context.clone();
+        let call = call.clone();
+        let stats = stats.clone();
+        Box::pin(async move {
+            let _extra_slot: Option<tokio::sync::OwnedSemaphorePermit> = extra_slot;
+            let len = group.items.len();
+            let mut reply = group.reply;
+            if reply.is_closed() {
+                return original;
+            }
+            let result = {
+                let _call = InflightCall::enter(stats);
+                tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    result = call(context, group.items) => Some(result),
+                }
+            };
+            if let Some((_, result)) = result {
+                deliver(result, len, vec![len], vec![reply]);
+            }
+            original
+        })
+    };
+    let mut original_slot = Some(slot);
+    let mut original_available = true;
+    let mut active: Vec<RetryFuture> = Vec::new();
+
+    loop {
+        // Observe every unstarted caller as well: its input must not stay
+        // resident behind an unrelated running retry after cancellation.
+        pending.retain(|group| !group.reply.is_closed());
+        while !pending.is_empty() {
+            let (extra_slot, original) = if original_available {
+                original_available = false;
+                (None, true)
+            } else if let Ok(slot) = inflight.clone().try_acquire_owned() {
+                (Some(slot), false)
+            } else {
+                break;
+            };
+            let group = pending.pop_front().expect("pending retry");
+            active.push(make_retry(group, extra_slot, original));
+        }
+        if original_available && pending.is_empty() {
+            // Remaining active retries each own an extra permit; no input
+            // or provider call relies on the original reservation now.
+            drop(original_slot.take());
+        }
+        if active.is_empty() && pending.is_empty() {
+            return;
+        }
+
+        tokio::select! {
+            biased;
+            _ = retry_caller_closed(&mut pending), if !pending.is_empty() => {},
+            (index, original) = std::future::poll_fn(|cx| {
+                for (index, retry) in active.iter_mut().enumerate() {
+                    if let std::task::Poll::Ready(original) = retry.as_mut().poll(cx) {
+                        return std::task::Poll::Ready((index, original));
+                    }
+                }
+                std::task::Poll::Pending
+            }) => {
+                drop(active.swap_remove(index));
+                if original { original_available = true; }
+            },
+            slot = inflight.clone().acquire_owned(), if !pending.is_empty() => {
+                let slot = slot.expect("semaphore closed");
+                let group = pending.pop_front().expect("pending retry");
+                active.push(make_retry(group, Some(slot), false));
+            },
+        }
+    }
+}
 
 struct Lane<I, O> {
     tx: mpsc::Sender<Group<I, O>>,
@@ -413,18 +539,19 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
         let call = call.clone();
         let stats = stats.clone();
         let resend_safe = resend_safe.clone();
+        let inflight = inflight.clone();
         tokio::spawn(async move {
-            let _slot = slot;
             // `inflight_batches` counts provider calls dispatched and not
             // yet answered (SPEC 40), abandoned ones included until they
             // are dropped.
-            stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
-            let result = tokio::select! {
-                biased;
-                _ = all_replies_closed(replies.iter_mut()) => None,
-                result = call(context.clone(), all_items) => Some(result),
+            let result = {
+                let _call = InflightCall::enter(stats.clone());
+                tokio::select! {
+                    biased;
+                    _ = all_replies_closed(replies.iter_mut()) => None,
+                    result = call(context.clone(), all_items) => Some(result),
+                }
             };
-            stats.inflight_batches.fetch_sub(1, Ordering::SeqCst);
             let Some((all_items, result)) = result else {
                 return;
             };
@@ -444,27 +571,16 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
                 deliver(result, items, lengths, replies);
                 return;
             }
-            let mut rest = all_items;
-            for (len, mut reply) in lengths.into_iter().zip(replies) {
-                let tail = rest.split_off(len);
-                let group = std::mem::replace(&mut rest, tail);
-                if reply.is_closed() {
-                    continue;
-                }
-                // Each re-send is a provider call of its own: counted in
-                // flight and abandoned once its caller has left, so it can
-                // never hold the lane slot for nobody (BUG-012).
-                stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
-                let result = tokio::select! {
-                    biased;
-                    _ = reply.closed() => None,
-                    result = call(context.clone(), group) => Some(result),
-                };
-                stats.inflight_batches.fetch_sub(1, Ordering::SeqCst);
-                if let Some((_, result)) = result {
-                    deliver(result, len, vec![len], vec![reply]);
-                }
-            }
+            let mut input = all_items.into_iter();
+            let pending = lengths
+                .into_iter()
+                .zip(replies)
+                .map(|(len, reply)| RetryGroup {
+                    items: input.by_ref().take(len).collect(),
+                    reply,
+                })
+                .collect();
+            run_retries(context, pending, call, stats, inflight, slot).await;
         });
     }
 }
