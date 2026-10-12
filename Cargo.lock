@@ -878,6 +878,7 @@ dependencies = [
 name = "maki-backing"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "parking_lot",
  "serde",
@@ -886,6 +887,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -67,6 +67,17 @@ stays within its old namespace. Normal attach requires a released session;
 crashes, ambiguous responses and failed copies require explicit administrator
 intervention. Cached and overlay reads also consult the remote authority.
 
+Remote authority and transport v2 bind each claim to a random private session
+capability. Activation, advance and release require both that capability and the
+exact public predecessor; another process cannot gain ownership by inspecting
+the current record, even with the same writer certificate. Capabilities stay in
+zeroizing memory and are absent from inspection output and backing snapshots.
+Authority v1 is rejected by new binaries; migrating it requires an independent
+destination identity and verified logical data copy with matching old binaries.
+See [authority compatibility](remote-witness-service.md#authority-protocol-compatibility)
+before updating an existing deployment. Outer COW and inner volume bytes are
+unchanged.
+
 Each retained namespace reserves the same arena and manifest footprint described
 below. At 128 MiB capacity this is approximately 288 MiB **per session**, including
 normal offline checks and reattachments. After activation, automatic GC reclaims

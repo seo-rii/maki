@@ -11,6 +11,16 @@ documents.
 
 ### Breaking changes
 
+- **Remote witness authority and wire v2 require private session ownership**
+  (2026-10-12). `MAKIRW02` authority state stores a digest of a random 256-bit
+  session capability. Writers must prove the current capability for activation,
+  advancement and release; public inspection cannot authorize another writer or
+  an older session under the same credential. Authority/wire v1 is refused;
+  preserve the old source, create a fresh independent identity and verify a
+  logical copy. The outer remote COW marker, enrollment and inner volume bytes
+  remain unchanged. See [migration](docs/durable-recovery.md#protected-outer-backing-formats)
+  and [service upgrade](docs/remote-witness-service.md#authority-protocol-compatibility).
+
 - **Executing `maki-attach` verbs require a root-controlled attach config**
   (R5-030): a root-owned regular file with one link, not group/other
   writable, below root-owned directories. `--plan` reads any file.

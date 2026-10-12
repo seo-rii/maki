@@ -75,6 +75,7 @@ impl Fixture {
     fn current(&self) -> Record {
         self.admin
             .call(&Request {
+                authorization: None,
                 operation_id: [0; 16],
                 expected: None,
                 action: Action::Inspect,

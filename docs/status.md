@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-11. External campaign evidence below runs through
+Last updated: 2026-10-12. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -27,7 +27,7 @@ Last updated: 2026-10-11. External campaign evidence below runs through
 | Superblock envelope v2, mirrored durable proofs | Default for `maki volume create` | Current default; all scoped campaigns below used it unless noted |
 | Envelope v3 with durable TRIM and space reclamation | `maki volume create <config> --discard` | Implemented; scoped GCE whole-instance-reset campaigns passed (2026-09-20, and 2026-10-03 after the R5 fixes), kernel `fstrim` reclaimed backing space through XFS/LVM/NBD, and scoped PostgreSQL 15 and 17 crash and lifecycle campaigns passed ([details](space-reclamation.md)) |
 | Rollback-protected backing (local witness) | `[backing.rollback_protection]` on a new volume | **Experimental.** Focused test suites only; not campaign-qualified ([details](rollback-protection.md)) |
-| Rollback-protected backing (remote witness V2) | `[backing.rollback_protection.remote]` on a new volume | **Experimental.** TLS 1.3 mutual authentication, durable compare-and-swap, separate writer namespaces, automatic safe namespace GC and administrator restore/enrollment recovery; optional etcd-quorum replication and identity-pinned frontend failover; automated fault, real-TLS and local 3-member etcd tests, no external campaign ([service guide](remote-witness-service.md)) |
+| Rollback-protected backing (remote witness V2) | `[backing.rollback_protection.remote]` on a new volume | **Experimental.** TLS 1.3 mutual authentication, authority/wire v2 with private session capabilities, durable compare-and-swap, separate writer namespaces, automatic safe namespace GC and administrator restore/enrollment recovery; optional etcd-quorum replication and identity-pinned frontend failover; automated fault, real-TLS and local 3-member etcd tests, no external campaign ([service guide](remote-witness-service.md)) |
 | Legacy envelope v1 | Existing volumes only | Read-only checks with a warning; writable recovery is refused; migrate through [durable recovery](durable-recovery.md) |
 
 There is no in-place format upgrade between envelopes.

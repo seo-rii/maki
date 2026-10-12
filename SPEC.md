@@ -1015,6 +1015,18 @@ exact predecessor; comparison or identity failures MUST NOT trigger failover.
 Quorum-backed authority frontends MUST use linearizable reads and exact-state
 transactions on a pinned cluster/key, without leases or local fallback.
 
+Remote authority and TLS wire version 2 MUST bind each writer claim to a fresh
+256-bit private session capability. The authority MUST retain only its digest;
+public inspection MUST NOT disclose it. Activate, Advance and Release MUST
+require the current capability in addition to exact predecessor comparison.
+Knowing public state, possessing another writer certificate, or retaining an
+older session under the same certificate MUST NOT authorize a new session's
+mutations. Administrator takeover, restore and initial-enrollment recovery MUST
+install a fresh capability. Capabilities and their serialized request copies
+MUST be zeroized on drop and redacted from diagnostics. Authority/wire v1 MUST
+be refused; a fresh independent identity and verified logical copy are required
+for migration. The outer COW and inner volume format bytes are unchanged.
+
 Initial enrollment recovery MUST require administrator approval of the exact
 never-activated authority record and original storage identity/capacity. It MUST
 advance fencing without resetting any previously activated descriptor. Remote

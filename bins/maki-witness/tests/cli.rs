@@ -59,6 +59,7 @@ fn init_is_explicit_durable_and_refuses_reinitialization() {
         .handle(
             Role::Admin,
             &Request {
+                authorization: None,
                 operation_id: [1; 16],
                 expected: None,
                 action: Action::Inspect,

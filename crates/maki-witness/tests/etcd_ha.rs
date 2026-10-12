@@ -21,6 +21,7 @@ fn encode(bytes: &[u8]) -> String {
 
 fn inspect() -> Request {
     Request {
+        authorization: None,
         operation_id: [1; 16],
         expected: None,
         action: Action::Inspect,
@@ -181,6 +182,9 @@ fn lost_cas_reply_is_resolved_by_exact_role_bound_latest_operation() {
     let credentials = Credentials::new();
     let initial = CanonicalState::initial(IDENTITY).unwrap();
     let request = Request {
+        authorization: Some(
+            maki_backing::remote_witness::SessionAuthorization::from_bytes([2; 32]),
+        ),
         operation_id: [2; 16],
         expected: Some(initial.record().clone()),
         action: Action::Claim,
@@ -280,6 +284,9 @@ fn protobuf_gateway_omits_false_succeeded_on_a_conflicting_transaction() {
     let credentials = Credentials::new();
     let initial = CanonicalState::initial(IDENTITY).unwrap();
     let request = Request {
+        authorization: Some(
+            maki_backing::remote_witness::SessionAuthorization::from_bytes([2; 32]),
+        ),
         operation_id: [2; 16],
         expected: Some(initial.record().clone()),
         action: Action::Claim,
@@ -1007,6 +1014,11 @@ mod quorum {
                     store.handle(
                         Role::Writer,
                         &Request {
+                            authorization: Some(
+                                maki_backing::remote_witness::SessionAuthorization::from_bytes(
+                                    [i + 2; 32],
+                                ),
+                            ),
                             operation_id: [i + 2; 16],
                             expected: Some(expected),
                             action: Action::Claim,
@@ -1026,6 +1038,11 @@ mod quorum {
         }
         let claim = results.into_iter().find_map(Result::ok).unwrap();
         let activate = Request {
+            authorization: Some(
+                maki_backing::remote_witness::SessionAuthorization::from_bytes(
+                    [claim.session[0]; 32],
+                ),
+            ),
             operation_id: [40; 16],
             expected: Some(claim.clone()),
             action: Action::Activate {
@@ -1059,6 +1076,11 @@ mod quorum {
         cluster.members[leader].process.wait().unwrap();
         drop(first_frontend); // Independent frontend failure cannot elect a new writer.
         let advance = Request {
+            authorization: Some(
+                maki_backing::remote_witness::SessionAuthorization::from_bytes(
+                    [active.session[0]; 32],
+                ),
+            ),
             operation_id: [41; 16],
             expected: Some(active),
             action: Action::Advance {

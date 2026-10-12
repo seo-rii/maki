@@ -9,7 +9,7 @@ maki-backing.workspace = true
 maki-crypto.workspace = true
 rustls.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 uuid.workspace = true
 sha2 = "0.10"
 base64.workspace = true

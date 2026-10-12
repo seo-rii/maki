@@ -3,6 +3,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 
+use maki_backing::remote_witness::Action;
 use maki_witness::{
     certificate_fingerprint, Client, ClientOptions, Principal, Role, Server, ServerOptions,
     TlsFiles,
@@ -80,12 +81,36 @@ fn serve_once(server: Server) -> (SocketAddr, std::thread::JoinHandle<io::Result
     let address = listener.local_addr().unwrap();
     let thread = std::thread::spawn(move || {
         let (stream, _) = listener.accept()?;
-        server.handle_connection(stream, &|role, request: Value| {
+        server.handle_connection(stream, &|role, request: &[u8]| {
             assert_eq!(role, Role::Writer);
-            Ok(request)
+            serde_json::from_slice(request).map_err(io::Error::other)
         })
     });
     (address, thread)
+}
+
+// Deterministic keys are confined to these protocol fixtures. Production keys
+// are random and cannot be derived from the public operation/session ids.
+fn test_authorization(
+    id: [u8; 16],
+    expected: Option<&maki_backing::remote_witness::Record>,
+    action: &Action,
+) -> Option<maki_backing::remote_witness::SessionAuthorization> {
+    if *action == Action::Inspect {
+        return None;
+    }
+    let session = if matches!(
+        action,
+        Action::Claim | Action::Takeover | Action::RecoverEnrollment | Action::ClaimRestore { .. }
+    ) {
+        id
+    } else {
+        expected.map_or(id, |record| record.session)
+    };
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&session);
+    bytes[16..].copy_from_slice(&session);
+    Some(maki_backing::remote_witness::SessionAuthorization::from_bytes(bytes))
 }
 
 #[test]
@@ -312,7 +337,7 @@ fn malformed_frames_and_wrong_version_are_refused_over_real_tls() {
     use std::io::Write;
     let fixture = Fixture::new();
     let wrong_version =
-        br#"{"version":2,"id":"00000000-0000-0000-0000-000000000001","request":{}}"#;
+        br#"{"version":1,"id":"00000000-0000-0000-0000-000000000001","request":{}}"#;
     let unknown_field =
         br#"{"version":1,"id":"00000000-0000-0000-0000-000000000001","request":{},"extra":true}"#;
     let invalid_json = b"not-json";
@@ -381,7 +406,7 @@ fn response_stall_uses_total_deadline_and_does_not_retry() {
         let result = server.handle_connection(stream, &move |_, request| {
             entered.send(()).unwrap();
             wait.lock().unwrap().recv().unwrap();
-            Ok(request)
+            serde_json::from_slice(request).map_err(io::Error::other)
         });
         listener.set_nonblocking(true).unwrap();
         assert_eq!(
@@ -420,7 +445,7 @@ fn lost_reply_after_mutation_is_not_retried() {
         let result = server.handle_connection(stream, &move |_, request| {
             seen.fetch_add(1, Ordering::SeqCst);
             disconnect.shutdown(std::net::Shutdown::Both).unwrap();
-            Ok(request)
+            serde_json::from_slice(request).map_err(io::Error::other)
         });
         assert!(result.is_err());
         listener.set_nonblocking(true).unwrap();
@@ -527,9 +552,9 @@ fn response_id_version_and_exclusive_result_are_checked() {
             let mut body = vec![0; u32::from_be_bytes(header) as usize];
             stream.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
-            let mut response = json!({"version":1,"id":request["id"],"response":true,"error":null});
+            let mut response = json!({"version":2,"id":request["id"],"response":true,"error":null});
             match case {
-                0 => response["version"] = json!(2),
+                0 => response["version"] = json!(1),
                 1 => response["id"] = json!("00000000-0000-0000-0000-000000000000"),
                 2 => response["error"] = json!("permission_denied"),
                 3 => response["response"] = Value::Null,
@@ -626,11 +651,13 @@ fn state_rpc_enforces_authenticated_roles_and_preserves_cas_conflicts() {
         }
     });
     let client = Client::new(fixture.client(address)).unwrap();
-    let request = |operation, expected, action| Request {
-        operation_id: [operation; 16],
-        expected,
-        action,
-    };
+    let request =
+        |operation, expected: Option<maki_backing::remote_witness::Record>, action| Request {
+            authorization: test_authorization([operation; 16], expected.as_ref(), &action),
+            operation_id: [operation; 16],
+            expected,
+            action,
+        };
     let released = Rpc::call(&client, &request(1, None, Action::Inspect)).unwrap();
     let claimed = Rpc::call(&client, &request(2, Some(released.clone()), Action::Claim)).unwrap();
     let denied = Rpc::call(
@@ -673,12 +700,14 @@ fn exact_state_operation_can_be_resolved_after_lost_tls_reply() {
     let fixture = Fixture::new();
     let mut state = StateStore::create(&fixture.dir.path().join("authority"), [1; 16]).unwrap();
     let inspect = Request {
+        authorization: None,
         operation_id: [1; 16],
         expected: None,
         action: Action::Inspect,
     };
     let released = state.handle(Role::Writer, &inspect).unwrap();
     let request = Request {
+        authorization: test_authorization([2; 16], Some(&released), &Action::Claim),
         operation_id: [2; 16],
         expected: Some(released),
         action: Action::Claim,
@@ -722,4 +751,181 @@ fn exact_state_operation_can_be_resolved_after_lost_tls_reply() {
     drop(handler);
     let mut reopened = StateStore::open(&fixture.dir.path().join("authority")).unwrap();
     assert_eq!(reopened.handle(Role::Writer, &inspect).unwrap(), resolved);
+}
+
+#[test]
+fn different_writer_certificate_cannot_release_the_inspected_active_session() {
+    use maki_backing::remote_witness::{
+        Descriptor, Phase, Request, Rpc, SessionAuthorization, StateStore,
+    };
+    use maki_backing::witness::Anchor;
+    let fixture = Fixture::new();
+    let directory = fixture.dir.path().join("session-authority");
+    let handler = maki_witness::state_handler(StateStore::create(&directory, [1; 16]).unwrap());
+    let server = Server::new(ServerOptions {
+        tls: fixture.server.clone(),
+        principals: vec![
+            Principal {
+                certificate_sha256: fixture.fingerprint.clone(),
+                role: Role::Writer,
+            },
+            Principal {
+                certificate_sha256: maki_witness::certificate_file_fingerprint(
+                    &fixture.bob.cert_file,
+                )
+                .unwrap(),
+                role: Role::Writer,
+            },
+        ],
+        timeout_ms: 2000,
+        max_connections: 4,
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        for _ in 0..6 {
+            let (socket, _) = listener.accept().unwrap();
+            server.handle_connection(socket, handler.as_ref()).unwrap();
+        }
+    });
+    let owner = Client::new(fixture.client(address)).unwrap();
+    let mut other_options = fixture.client(address);
+    other_options.tls = fixture.bob.clone();
+    let other = Client::new(other_options).unwrap();
+    let public = Request {
+        operation_id: [1; 16],
+        expected: None,
+        action: Action::Inspect,
+        authorization: None,
+    };
+    let initial = Rpc::call(&owner, &public).unwrap();
+    let key = SessionAuthorization::generate().unwrap();
+    let claim = Request {
+        operation_id: [2; 16],
+        expected: Some(initial),
+        action: Action::Claim,
+        authorization: Some(key.clone()),
+    };
+    let claimed = Rpc::call(&owner, &claim).unwrap();
+    let descriptor = Descriptor {
+        anchor: Anchor {
+            identity: [1; 16],
+            generation: 0,
+            root: [7; 32],
+        },
+        epoch: 0,
+        namespace: maki_backing::remote_witness::namespace(claimed.fence, claimed.session),
+    };
+    let activate = Request {
+        operation_id: [3; 16],
+        expected: Some(claimed),
+        action: Action::Activate { descriptor },
+        authorization: Some(key.clone()),
+    };
+    let active = Rpc::call(&owner, &activate).unwrap();
+    let observed = Rpc::call(&other, &public).unwrap();
+    let unauthorized = Request {
+        operation_id: [4; 16],
+        expected: Some(observed),
+        action: Action::Release,
+        authorization: Some(SessionAuthorization::generate().unwrap()),
+    };
+    let denied = Rpc::call(&other, &unauthorized).unwrap_err();
+    let release = Request {
+        operation_id: [5; 16],
+        expected: Some(active.clone()),
+        action: Action::Release,
+        authorization: Some(key),
+    };
+    let released = Rpc::call(&owner, &release).unwrap();
+    worker.join().unwrap();
+    assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(released.phase, Phase::Released);
+    assert_eq!(released.current, active.current);
+    let mut reopened = StateStore::open(&directory).unwrap();
+    assert_eq!(reopened.handle(Role::Writer, &public).unwrap(), released);
+}
+
+#[test]
+fn same_writer_certificate_cannot_reuse_its_old_key_after_admin_enrollment_recovery() {
+    use maki_backing::remote_witness::{Request, Rpc, SessionAuthorization, StateStore};
+    let fixture = Fixture::new();
+    let directory = fixture.dir.path().join("recovered-authority");
+    let handler = maki_witness::state_handler(StateStore::create(&directory, [1; 16]).unwrap());
+    let server = Server::new(ServerOptions {
+        tls: fixture.server.clone(),
+        principals: vec![
+            Principal {
+                certificate_sha256: fixture.fingerprint.clone(),
+                role: Role::Writer,
+            },
+            Principal {
+                certificate_sha256: maki_witness::certificate_file_fingerprint(
+                    &fixture.bob.cert_file,
+                )
+                .unwrap(),
+                role: Role::Admin,
+            },
+        ],
+        timeout_ms: 2000,
+        max_connections: 4,
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        for _ in 0..6 {
+            let (socket, _) = listener.accept().unwrap();
+            server.handle_connection(socket, handler.as_ref()).unwrap();
+        }
+    });
+    let writer = Client::new(fixture.client(address)).unwrap();
+    let mut admin_options = fixture.client(address);
+    admin_options.tls = fixture.bob.clone();
+    let admin = Client::new(admin_options).unwrap();
+    let public = Request {
+        operation_id: [1; 16],
+        expected: None,
+        action: Action::Inspect,
+        authorization: None,
+    };
+    let initial = Rpc::call(&writer, &public).unwrap();
+    let old_key = SessionAuthorization::generate().unwrap();
+    let claim = Request {
+        operation_id: [2; 16],
+        expected: Some(initial),
+        action: Action::Claim,
+        authorization: Some(old_key.clone()),
+    };
+    let claimed = Rpc::call(&writer, &claim).unwrap();
+    let new_key = SessionAuthorization::generate().unwrap();
+    let recovery = Request {
+        operation_id: [3; 16],
+        expected: Some(claimed.clone()),
+        action: Action::RecoverEnrollment,
+        authorization: Some(new_key.clone()),
+    };
+    let recovered = Rpc::call(&admin, &recovery).unwrap();
+    let observed = Rpc::call(&writer, &public).unwrap();
+    let stale = Request {
+        operation_id: [4; 16],
+        expected: Some(observed),
+        action: Action::Release,
+        authorization: Some(old_key),
+    };
+    let denied = Rpc::call(&writer, &stale).unwrap_err();
+    let release = Request {
+        operation_id: [5; 16],
+        expected: Some(recovered.clone()),
+        action: Action::Release,
+        authorization: Some(new_key),
+    };
+    let released = Rpc::call(&admin, &release).unwrap();
+    worker.join().unwrap();
+    assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(recovered.fence, claimed.fence + 1);
+    assert_eq!(released.fence, recovered.fence);
+    let mut reopened = StateStore::open(&directory).unwrap();
+    assert_eq!(reopened.handle(Role::Writer, &public).unwrap(), released);
 }

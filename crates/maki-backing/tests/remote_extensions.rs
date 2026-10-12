@@ -69,6 +69,7 @@ impl Fixture {
 }
 fn inspect(rpc: &dyn Rpc) -> Record {
     rpc.call(&Request {
+        authorization: None,
         operation_id: *uuid::Uuid::new_v4().as_bytes(),
         expected: None,
         action: Action::Inspect,
@@ -310,6 +311,7 @@ fn abandoned_initial_candidate_is_retired_but_a_live_candidate_is_preserved() {
     assert!(f
         .writer
         .call(&Request {
+            authorization: None,
             operation_id: [33; 16],
             expected: Some(before),
             action: Action::Activate {

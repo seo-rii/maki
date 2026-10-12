@@ -68,6 +68,7 @@ fn read_config<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
 
 fn inspect_request() -> Request {
     Request {
+        authorization: None,
         operation_id: *Uuid::new_v4().as_bytes(),
         expected: None,
         action: Action::Inspect,

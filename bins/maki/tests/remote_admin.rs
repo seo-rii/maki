@@ -34,6 +34,7 @@ struct Fixture {
 }
 fn inspect(rpc: &dyn Rpc) -> Record {
     rpc.call(&Request {
+        authorization: None,
         operation_id: *uuid::Uuid::new_v4().as_bytes(),
         expected: None,
         action: Action::Inspect,

@@ -12,6 +12,8 @@ sha2 = "0.10"
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true

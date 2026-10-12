@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::witness::Anchor;
 use sha2::{Digest, Sha256};
@@ -17,11 +18,12 @@ use crate::{Backing, FileBacking, VolumeLock};
 const STATE_FILE: &str = "remote.state";
 const TEMP_FILE: &str = "remote.next";
 const LOCK_FILE: &str = "remote.lock";
-const MAGIC: &[u8; 8] = b"MAKIRW01";
+const MAGIC: &[u8; 8] = b"MAKIRW02";
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_GENERATION: u64 = i64::MAX as u64;
-const STATE_DOMAIN: &[u8] = b"maki-remote-witness-state-v1\0";
-const REQUEST_DOMAIN: &[u8] = b"maki-remote-witness-request-v1\0";
+const STATE_DOMAIN: &[u8] = b"maki-remote-witness-state-v2\0";
+const REQUEST_DOMAIN: &[u8] = b"maki-remote-witness-request-v2\0";
+const AUTHORIZATION_DOMAIN: &[u8] = b"maki-remote-witness-session-authorization-v2\0";
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -190,12 +192,80 @@ pub enum Action {
     Release,
 }
 
+/// A bearer capability for one session, independent of its public record.
+/// Never persist or log it; the authority retains only a domain-separated hash.
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct SessionAuthorization([u8; 32]);
+
+impl SessionAuthorization {
+    pub fn generate() -> io::Result<Self> {
+        let mut authorization = Self([0; 32]);
+        getrandom::fill(&mut authorization.0)
+            .map_err(|_| io::Error::other("session authorization randomness unavailable"))?;
+        Ok(authorization)
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn hash(&self) -> io::Result<[u8; 32]> {
+        if self.0 == [0; 32] {
+            return Err(input("nil session authorization"));
+        }
+        Ok(digest(AUTHORIZATION_DOMAIN, &self.0))
+    }
+}
+
+impl std::fmt::Debug for SessionAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionAuthorization(<redacted>)")
+    }
+}
+
+impl Serialize for SessionAuthorization {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionAuthorization {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = SessionAuthorization;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("32 authorization bytes")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                // Own the wipe obligation before even a partial key is decoded.
+                let mut value = SessionAuthorization([0; 32]);
+                for byte in &mut value.0 {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::custom("truncated authorization"))?;
+                }
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom("oversized authorization"));
+                }
+                Ok(value)
+            }
+        }
+        deserializer.deserialize_tuple(32, Visitor)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub operation_id: [u8; 16],
     pub expected: Option<Record>,
     pub action: Action,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<SessionAuthorization>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,17 +284,30 @@ pub fn namespace(fence: u64, session: [u8; 16]) -> String {
     format!("remote-{fence:016x}-{suffix}")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stored {
     format: u32,
     record: Record,
     last_request_hash: Option<[u8; 32]>,
+    session_authorization_hash: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for Stored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stored")
+            .field("format", &self.format)
+            .field("record", &self.record)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Stored {
     fn validate(&self) -> io::Result<()> {
-        if self.format != 1 || self.last_request_hash.is_some() != (self.record.fence != 0) {
+        if self.format != 2
+            || self.last_request_hash.is_some() != (self.record.fence != 0)
+            || self.session_authorization_hash.is_some() != (self.record.fence != 0)
+        {
             return Err(invalid("unsupported or inconsistent remote witness format"));
         }
         self.record.validate()
@@ -233,7 +316,7 @@ impl Stored {
 
 /// Canonical deterministic authority state shared by durable storage adapters.
 ///
-/// The bytes are exactly the existing file-authority v1 envelope. Adapters must
+/// The bytes use the authorization-bound file-authority v2 envelope. Adapters must
 /// compare the entire accepted state and durably commit the returned candidate
 /// before returning its record. A rejected operation leaves this value intact.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,7 +331,7 @@ impl CanonicalState {
         }
         Ok(Self {
             stored: Stored {
-                format: 1,
+                format: 2,
                 record: Record {
                     identity,
                     current: None,
@@ -259,6 +342,7 @@ impl CanonicalState {
                     last_operation: [0; 16],
                 },
                 last_request_hash: None,
+                session_authorization_hash: None,
             },
         })
     }
@@ -280,6 +364,9 @@ impl CanonicalState {
     /// Apply an exact full-record CAS, including authenticated-role-bound replay.
     pub fn apply(&self, role: Role, request: &Request) -> io::Result<Self> {
         if request.action == Action::Inspect {
+            if request.authorization.is_some() {
+                return Err(input("inspection must not carry session authorization"));
+            }
             if request
                 .expected
                 .as_ref()
@@ -292,11 +379,32 @@ impl CanonicalState {
         if request.operation_id == [0; 16] {
             return Err(input("nil remote witness operation id"));
         }
-        let encoded = serde_json::to_vec(&(role, request)).map_err(io::Error::other)?;
-        if encoded.len() > MAX_BYTES {
-            return Err(input("remote witness request too large"));
+        // Hash directly: an ordinary serialization Vec would retain the secret.
+        struct RequestHash {
+            hash: Sha256,
+            len: usize,
         }
-        let request_hash = digest(REQUEST_DOMAIN, &encoded);
+        impl io::Write for RequestHash {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() > MAX_BYTES - self.len {
+                    return Err(input("remote witness request too large"));
+                }
+                self.hash.update(bytes);
+                self.len += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut encoded = RequestHash {
+            hash: Sha256::new(),
+            len: 0,
+        };
+        encoded.hash.update(REQUEST_DOMAIN);
+        serde_json::to_writer(&mut encoded, &(role, request))
+            .map_err(|_| input("invalid or oversized remote witness request"))?;
+        let request_hash: [u8; 32] = encoded.hash.finalize().into();
         if request.operation_id == self.record().last_operation {
             return if self.stored.last_request_hash == Some(request_hash) {
                 Ok(self.clone())
@@ -309,15 +417,55 @@ impl CanonicalState {
         if request.expected.as_ref() != Some(self.record()) {
             return Err(conflict());
         }
+        let authorization = request
+            .authorization
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session authorization required",
+                )
+            })?
+            .hash()?;
+        let installs_session = matches!(
+            request.action,
+            Action::Claim
+                | Action::Takeover
+                | Action::RecoverEnrollment
+                | Action::ClaimRestore { .. }
+        );
+        if !installs_session {
+            let expected = self
+                .stored
+                .session_authorization_hash
+                .ok_or_else(|| invalid("session authorization absent"))?;
+            let mismatch = authorization
+                .iter()
+                .zip(expected.iter())
+                .fold(0u8, |difference, (a, b)| difference | (a ^ b));
+            if mismatch != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session authorization differs",
+                ));
+            }
+        }
         let mut next = self.record().clone();
         transition(&mut next, role, request)?;
         next.last_operation = request.operation_id;
         next.validate()?;
         Ok(Self {
             stored: Stored {
-                format: 1,
+                format: 2,
                 record: next,
                 last_request_hash: Some(request_hash),
+                session_authorization_hash: Some(if installs_session {
+                    authorization
+                } else {
+                    self.stored
+                        .session_authorization_hash
+                        .expect("validated session authorization")
+                }),
             },
         })
     }
@@ -630,7 +778,7 @@ mod tests {
 
     fn initial() -> Stored {
         Stored {
-            format: 1,
+            format: 2,
             record: Record {
                 identity: [1; 16],
                 current: None,
@@ -641,6 +789,7 @@ mod tests {
                 last_operation: [0; 16],
             },
             last_request_hash: None,
+            session_authorization_hash: None,
         }
     }
 
@@ -660,6 +809,7 @@ mod tests {
             namespace: namespace(1, [2; 16]),
         });
         s.last_request_hash = Some([5; 32]);
+        s.session_authorization_hash = Some([6; 32]);
         s
     }
 
@@ -681,7 +831,7 @@ mod tests {
             .collect();
         assert_eq!(
             hash,
-            "ea09320612df918579eb6cb2c2527bc1b4884348dd9f4f00b3b89551ece992c8"
+            "d6caaa2b7087b8690a0dab71ae105e49a26da4dc9479cd865a1078942eff0738"
         );
         assert_eq!(decode(&bytes).unwrap(), initial());
     }
@@ -699,7 +849,7 @@ mod tests {
         for field in 0..10 {
             let mut s = active();
             match field {
-                0 => s.format = 2,
+                0 => s.format = 1,
                 1 => s.record.identity = [0; 16],
                 2 => s.record.current.as_mut().unwrap().anchor.identity = [9; 16],
                 3 => s.record.current.as_mut().unwrap().anchor.generation = u64::MAX,
@@ -723,6 +873,7 @@ mod tests {
         s.record.fence = u64::MAX;
         s.record.current.as_mut().unwrap().namespace = namespace(u64::MAX, s.record.session);
         let req = Request {
+            authorization: None,
             operation_id: [7; 16],
             expected: Some(s.record.clone()),
             action: Action::Takeover,
@@ -742,6 +893,7 @@ mod tests {
             Action::ClaimRestore { source },
         ] {
             let req = Request {
+                authorization: None,
                 operation_id: [7; 16],
                 expected: Some(s.record.clone()),
                 action,

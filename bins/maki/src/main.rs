@@ -234,6 +234,7 @@ fn witness_record(
     use maki_backing::remote_witness::{Action, Request};
     let record = rpc
         .call(&Request {
+            authorization: None,
             operation_id: *uuid::Uuid::new_v4().as_bytes(),
             expected: None,
             action: Action::Inspect,

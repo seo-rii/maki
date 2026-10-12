@@ -64,8 +64,8 @@ fn configured_remote_volume_uses_authenticated_service_and_refuses_offline_fallb
     let stop = Arc::new(AtomicBool::new(false));
     let ending = stop.clone();
     let worker = std::thread::spawn(move || {
-        let handler = move |role, value| {
-            let request = serde_json::from_value(value).map_err(std::io::Error::other)?;
+        let handler = move |role, value: &[u8]| {
+            let request = serde_json::from_slice(value).map_err(std::io::Error::other)?;
             let result = state.lock().unwrap().handle(role, &request)?;
             serde_json::to_value(result).map_err(std::io::Error::other)
         };

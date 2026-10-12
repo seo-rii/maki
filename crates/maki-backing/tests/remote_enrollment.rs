@@ -7,6 +7,7 @@ use tempfile::tempdir;
 const ID: [u8; 16] = [11; 16];
 fn request(n: u8, expected: &Record, action: Action) -> Request {
     Request {
+        authorization: test_authorization([n; 16], Some(expected), &action),
         operation_id: [n; 16],
         expected: Some(expected.clone()),
         action,
@@ -17,6 +18,7 @@ fn inspect(store: &mut StateStore) -> Record {
         .handle(
             Role::Writer,
             &Request {
+                authorization: None,
                 operation_id: [0; 16],
                 expected: None,
                 action: Action::Inspect,
@@ -44,6 +46,30 @@ fn activate(store: &mut StateStore, claimed: &Record, n: u8) -> Record {
             &request(n, claimed, Action::Activate { descriptor }),
         )
         .unwrap()
+}
+
+// Deterministic keys are confined to these protocol fixtures. Production keys
+// are random and cannot be derived from the public operation/session ids.
+fn test_authorization(
+    id: [u8; 16],
+    expected: Option<&maki_backing::remote_witness::Record>,
+    action: &Action,
+) -> Option<maki_backing::remote_witness::SessionAuthorization> {
+    if *action == Action::Inspect {
+        return None;
+    }
+    let session = if matches!(
+        action,
+        Action::Claim | Action::Takeover | Action::RecoverEnrollment | Action::ClaimRestore { .. }
+    ) {
+        id
+    } else {
+        expected.map_or(id, |record| record.session)
+    };
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&session);
+    bytes[16..].copy_from_slice(&session);
+    Some(maki_backing::remote_witness::SessionAuthorization::from_bytes(bytes))
 }
 
 #[test]
@@ -304,6 +330,7 @@ fn canonical_machine_and_file_authority_match_bytes_and_failures_through_all_pha
             }
         };
         let request = Request {
+            authorization: test_authorization(operation_id, Some(&current), &action),
             operation_id,
             expected: Some(current),
             action,
@@ -368,6 +395,7 @@ fn canonical_initialization_and_role_bound_replay_fail_closed() {
         .apply(
             Role::Admin,
             &Request {
+                authorization: None,
                 operation_id: [0; 16],
                 expected: Some(initial.record().clone()),
                 action: Action::RecoverEnrollment
@@ -390,11 +418,11 @@ fn enrollment_fence_exhaustion_cannot_wrap_to_a_reusable_initial_session() {
     let body = std::str::from_utf8(&bytes[12..bytes.len() - 32])
         .unwrap()
         .replace("\"fence\":1", "\"fence\":18446744073709551615");
-    let mut envelope = b"MAKIRW01".to_vec();
+    let mut envelope = b"MAKIRW02".to_vec();
     envelope.extend_from_slice(&(body.len() as u32).to_le_bytes());
     envelope.extend_from_slice(body.as_bytes());
     let mut checksum = Sha256::new();
-    checksum.update(b"maki-remote-witness-state-v1\0");
+    checksum.update(b"maki-remote-witness-state-v2\0");
     checksum.update(&envelope);
     envelope.extend_from_slice(&checksum.finalize());
     let exhausted = CanonicalState::decode(&envelope).unwrap();

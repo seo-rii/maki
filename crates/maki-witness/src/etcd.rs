@@ -507,7 +507,7 @@ impl EtcdStore {
 pub fn state_handler(store: EtcdStore) -> Arc<Handler> {
     Arc::new(move |role, value| {
         let request: Request =
-            serde_json::from_value(value).map_err(|_| invalid("invalid witness operation"))?;
+            serde_json::from_slice(value).map_err(|_| invalid("invalid witness operation"))?;
         serde_json::to_value(store.handle(role, &request)?)
             .map_err(|_| corrupt("invalid witness state"))
     })

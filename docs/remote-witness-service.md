@@ -167,7 +167,7 @@ key_file = "/etc/maki-witness/etcd-service.key.pem"
 Exactly one of `state_dir` and `[etcd]` is required. `serve` opens and verifies
 existing quorum state before binding its listener. Multiple frontends can serve
 this shared key; etcd serializes their concurrent full-state CAS transactions.
-The same deterministic state machine and canonical version 1 value serve both
+The same deterministic state machine and canonical version 2 value serve both
 backends. Each transaction compares its predecessor's complete bytes and
 modification revision. Each response verifies the pinned cluster ID, and every
 selected record verifies the pinned storage identity. An endpoint's cluster
@@ -225,6 +225,37 @@ the metadata record as JSON without claiming a writer session. Writer
 certificates cannot authorize takeover, enrollment recovery or restoration.
 Use the volume commands for administrative transitions so physical storage
 preparation remains coordinated with authority activation.
+
+Each successful claim installs a fresh random 256-bit session authorization
+capability. The owning process keeps it only in zeroizing memory; the authority
+stores its domain-separated digest separately from the public record. Activation,
+advance and release require that capability in addition to the exact public
+predecessor and authenticated role. Inspection never returns the capability or
+its digest. Knowing the current session ID or sharing a writer certificate does
+not authorize another process to release or modify that session. Administrative
+takeover, enrollment recovery and restore install new capabilities and retain
+their existing role and predecessor checks. Ambiguous commits resolve only the
+same request, including its capability; losing the process's capability requires
+the normal explicit administrative recovery procedure.
+
+## Authority protocol compatibility
+
+The authorization boundary uses wire version 2 and the `MAKIRW02` canonical
+authority envelope (`format = 2`) for both local files and etcd. Version 1
+requests and authority envelopes are refused, including an already active v1
+session. There is no in-place upgrade: v1 has no private session authorization
+that can be safely assigned to a v2 process. The outer remote COW marker and
+manifest format, enrollment binding and inner volume formats are unchanged.
+
+For an existing v1 deployment, keep its old service and client binaries together
+and use them to read the exact trusted source. Initialize an independent v2
+destination with a fresh storage identity, copy logical data with a trusted
+reader/writer, and verify that destination before retiring the old service and
+credentials. Do not copy or rewrite an authority record, clear its active claim,
+reuse its identity, or convert a backing snapshot into fresh enrollment. A
+new frontend refuses legacy state before binding its listener. Upgrade every
+frontend and client for a given destination together; mixed wire versions do not
+silently downgrade.
 
 ## Configure frontend failover
 

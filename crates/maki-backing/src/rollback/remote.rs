@@ -2,7 +2,9 @@
 //! session may finish an already-started write, but cannot publish or reclaim
 //! any page of the root the next session copies.
 use super::*;
-use crate::remote_witness::{namespace, Action, Descriptor, Phase, Record, Request, Rpc};
+use crate::remote_witness::{
+    namespace, Action, Descriptor, Phase, Record, Request, Rpc, SessionAuthorization,
+};
 use crate::witness::Anchor;
 
 use super::enrollment::Enrollment;
@@ -50,6 +52,7 @@ impl Witness {
                 let record = transact(
                     witness.rpc.as_ref(),
                     &witness.record,
+                    &witness.authorization,
                     Action::Advance {
                         anchor: anchor.clone(),
                     },
@@ -76,13 +79,19 @@ pub(super) struct RemoteSession {
     rpc: Arc<dyn Rpc>,
     record: Record,
     descriptor: Descriptor,
+    authorization: SessionAuthorization,
 }
 
 impl Drop for RemoteSession {
     fn drop(&mut self) {
         // A failed or ambiguous release leaves the authority occupied. The
         // operator must explicitly take over; Drop never lowers its fence.
-        let _ = transact(self.rpc.as_ref(), &self.record, Action::Release);
+        let _ = transact(
+            self.rpc.as_ref(),
+            &self.record,
+            &self.authorization,
+            Action::Release,
+        );
     }
 }
 
@@ -91,16 +100,23 @@ fn inspect(rpc: &dyn Rpc) -> io::Result<Record> {
         operation_id: *uuid::Uuid::new_v4().as_bytes(),
         expected: None,
         action: Action::Inspect,
+        authorization: None,
     })?;
     record.validate()?;
     Ok(record)
 }
 
-fn transact(rpc: &dyn Rpc, expected: &Record, action: Action) -> io::Result<Record> {
+fn transact(
+    rpc: &dyn Rpc,
+    expected: &Record,
+    authorization: &SessionAuthorization,
+    action: Action,
+) -> io::Result<Record> {
     let request = Request {
         operation_id: *uuid::Uuid::new_v4().as_bytes(),
         expected: Some(expected.clone()),
         action,
+        authorization: Some(authorization.clone()),
     };
     let record = match rpc.call(&request) {
         Ok(record) => record,
@@ -329,8 +345,15 @@ impl RollbackBacking {
         marker.set_len(REMOTE_MAGIC.len() as u64)?;
         marker.sync_data()?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
-        let claim = transact(rpc.as_ref(), expected, Action::RecoverEnrollment)?;
-        let result = Self::activate_empty(disk.clone(), capacity, claim, rpc.clone())?;
+        let authorization = SessionAuthorization::generate()?;
+        let claim = transact(
+            rpc.as_ref(),
+            expected,
+            &authorization,
+            Action::RecoverEnrollment,
+        )?;
+        let result =
+            Self::activate_empty(disk.clone(), capacity, claim, rpc.clone(), authorization)?;
         collect_after_activation(&guard, rpc.as_ref());
         Ok(result)
     }
@@ -351,8 +374,10 @@ impl RollbackBacking {
         let _enrollment = disk.try_lock("remote.enroll.lock")?;
         initialize_remote_root(disk.as_ref())?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
-        let claim = transact(rpc.as_ref(), &expected, Action::Claim)?;
-        let result = Self::activate_empty(disk.clone(), capacity, claim, rpc.clone())?;
+        let authorization = SessionAuthorization::generate()?;
+        let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
+        let result =
+            Self::activate_empty(disk.clone(), capacity, claim, rpc.clone(), authorization)?;
         collect_after_activation(&guard, rpc.as_ref());
         Ok(result)
     }
@@ -362,6 +387,7 @@ impl RollbackBacking {
         capacity: u64,
         claim: Record,
         rpc: Arc<dyn Rpc>,
+        authorization: SessionAuthorization,
     ) -> io::Result<Self> {
         let manifest = Manifest {
             format: 1,
@@ -372,15 +398,16 @@ impl RollbackBacking {
             entries: BTreeMap::new(),
             files: BTreeMap::new(),
         };
-        Self::activate_fork(disk, None, manifest, 0, claim, rpc)
+        Self::activate_fork(disk, None, manifest, 0, claim, rpc, authorization)
     }
 
     pub fn open_remote(root: &Path, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let expected = inspect(rpc.as_ref())?;
-        let claim = transact(rpc.as_ref(), &expected, Action::Claim)?;
-        let result = Self::fork_current(disk.clone(), claim, rpc.clone())?;
+        let authorization = SessionAuthorization::generate()?;
+        let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
+        let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
         collect_after_activation(&guard, rpc.as_ref());
         Ok(result)
     }
@@ -388,20 +415,34 @@ impl RollbackBacking {
     pub fn takeover_remote(root: &Path, rpc: Arc<dyn Rpc>, expected: &Record) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let claim = transact(rpc.as_ref(), expected, Action::Takeover)?;
-        let result = Self::fork_current(disk.clone(), claim, rpc.clone())?;
+        let authorization = SessionAuthorization::generate()?;
+        let claim = transact(rpc.as_ref(), expected, &authorization, Action::Takeover)?;
+        let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
         collect_after_activation(&guard, rpc.as_ref());
         Ok(result)
     }
 
-    fn fork_current(disk: Arc<FileBacking>, claim: Record, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
+    fn fork_current(
+        disk: Arc<FileBacking>,
+        claim: Record,
+        rpc: Arc<dyn Rpc>,
+        authorization: SessionAuthorization,
+    ) -> io::Result<Self> {
         let source = claim
             .current
             .as_ref()
             .ok_or_else(|| invalid("uninitialized remote backing"))?;
         let source_disk = scope(disk.clone(), &source.namespace)?;
         let (manifest, _) = load_generation(source_disk.as_ref(), source)?;
-        Self::activate_fork(disk, Some(source_disk), manifest, source.epoch, claim, rpc)
+        Self::activate_fork(
+            disk,
+            Some(source_disk),
+            manifest,
+            source.epoch,
+            claim,
+            rpc,
+            authorization,
+        )
     }
 
     fn activate_fork(
@@ -411,6 +452,7 @@ impl RollbackBacking {
         epoch: u64,
         claim: Record,
         rpc: Arc<dyn Rpc>,
+        authorization: SessionAuthorization,
     ) -> io::Result<Self> {
         claim.validate()?;
         if !matches!(claim.phase, Phase::Claimed | Phase::RestoreClaimed) {
@@ -439,6 +481,7 @@ impl RollbackBacking {
         let record = transact(
             rpc.as_ref(),
             &claim,
+            &authorization,
             Action::Activate {
                 descriptor: descriptor.clone(),
             },
@@ -460,6 +503,7 @@ impl RollbackBacking {
                 rpc,
                 record,
                 descriptor,
+                authorization,
             })),
             disk_lock,
             manifest,
@@ -495,9 +539,11 @@ impl RollbackBacking {
             .epoch
             .checked_add(1)
             .ok_or_else(|| invalid("restore epoch exhausted"))?;
+        let authorization = SessionAuthorization::generate()?;
         let claim = transact(
             rpc.as_ref(),
             expected,
+            &authorization,
             Action::ClaimRestore {
                 source: source.clone(),
             },
@@ -510,6 +556,7 @@ impl RollbackBacking {
             epoch,
             claim,
             rpc.clone(),
+            authorization,
         )?;
         collect_after_activation(&guard, rpc.as_ref());
         Ok(result)

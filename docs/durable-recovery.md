@@ -48,8 +48,9 @@ snapshot, another database engine or production cutover.
 The optional local-witness outer format remains unchanged. Remote witnesses
 select a distinct outer marker, `MAKI-REMOTE-WITNESS-COW-V2\n`, with a new
 physical namespace for each writer fence/session. Its inner flat manifest
-remains version 1; the independent witness state has its own version 1
-canonical encoding and checksum. These versions are separate from the volume's
+remains version 1; the independent witness state uses the version 2
+`MAKIRW02` canonical envelope and checksum, with a private session-authorization
+digest. The TLS request protocol is version 2. These versions are separate from the volume's
 superblock envelope and crypto context. Older binaries and mismatched local
 or remote configurations refuse the remote marker.
 
@@ -61,6 +62,17 @@ with a fresh storage identity and verified logical copy; duplicating its
 authority value while the old service can still run would fork trusted history.
 Never change marker bytes or copy an old witness record over the current
 authority.
+
+Remote authority/wire v1 is refused before a server binds or serves requests.
+There is no automatic or in-place v1-to-v2 authority upgrade: v1 never stored
+private session ownership. Preserve the old authority and backing as evidence;
+use the matching old software with isolated access to read the exact trusted
+source. Create a separate v2 authority with a fresh identity and destination,
+then perform and verify a logical copy before cutover. Do not replace magic
+bytes, reset a fence, or copy the old authority into the destination. The local
+witness, remote COW marker, manifest and supplementary enrollment v1 bytes,
+inner superblock envelopes and crypto AAD are unchanged. See the
+[service upgrade procedure](remote-witness-service.md#authority-protocol-compatibility).
 
 Remote same-identity restoration is an explicit administrator operation: approve
 the current fence/root and the independently recorded snapshot root, verify and

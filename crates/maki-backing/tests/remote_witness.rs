@@ -16,6 +16,7 @@ const ID: [u8; 16] = [1; 16];
 static PROCESS_FIXTURES: Mutex<()> = Mutex::new(());
 fn op(n: u8, current: &Record, action: Action) -> Request {
     Request {
+        authorization: test_authorization([n; 16], Some(current), &action),
         operation_id: [n; 16],
         expected: Some(current.clone()),
         action,
@@ -26,6 +27,7 @@ fn inspect(store: &mut StateStore) -> Record {
         .handle(
             Role::Writer,
             &Request {
+                authorization: None,
                 operation_id: [0; 16],
                 expected: None,
                 action: Action::Inspect,
@@ -60,6 +62,30 @@ fn activate(store: &mut StateStore, n: u8, claimed: &Record) -> Record {
 fn active(store: &mut StateStore) -> Record {
     let claimed = claim(store, 1);
     activate(store, 2, &claimed)
+}
+
+// Deterministic keys are confined to these protocol fixtures. Production keys
+// are random and cannot be derived from the public operation/session ids.
+fn test_authorization(
+    id: [u8; 16],
+    expected: Option<&maki_backing::remote_witness::Record>,
+    action: &Action,
+) -> Option<maki_backing::remote_witness::SessionAuthorization> {
+    if *action == Action::Inspect {
+        return None;
+    }
+    let session = if matches!(
+        action,
+        Action::Claim | Action::Takeover | Action::RecoverEnrollment | Action::ClaimRestore { .. }
+    ) {
+        id
+    } else {
+        expected.map_or(id, |record| record.session)
+    };
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&session);
+    bytes[16..].copy_from_slice(&session);
+    Some(maki_backing::remote_witness::SessionAuthorization::from_bytes(bytes))
 }
 
 #[test]
@@ -293,6 +319,7 @@ fn mutation_requires_nonzero_id_and_exact_full_expected_record() {
     let current = inspect(&mut store);
     for request in [
         Request {
+            authorization: None,
             operation_id: [1; 16],
             expected: None,
             action: Action::Claim,
@@ -336,6 +363,7 @@ fn external_state_change_permanently_poisons_open_handle() {
     let bytes = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"corrupt").unwrap();
     let request = Request {
+        authorization: None,
         operation_id: [0; 16],
         expected: None,
         action: Action::Inspect,
@@ -463,6 +491,7 @@ fn every_publication_failure_poisons_and_reopen_resolves_exact_old_or_new() {
             .handle(
                 Role::Writer,
                 &Request {
+                    authorization: None,
                     operation_id: [0; 16],
                     expected: None,
                     action: Action::Inspect
@@ -618,6 +647,7 @@ fn deterministic_sequence_preserves_monotone_fences_generations_and_stale_reject
             _ => {}
         }
         let request = Request {
+            authorization: test_authorization(id, Some(&current), &action),
             operation_id: id,
             expected: Some(current.clone()),
             action,

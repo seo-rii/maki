@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TLS_FILE_BYTES: usize = 1024 * 1024;
-const WIRE_VERSION: u32 = 1;
+const WIRE_VERSION: u32 = 2;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +80,15 @@ struct WireRequest<Q> {
     version: u32,
     id: Uuid,
     request: Q,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingRequest<'a> {
+    version: u32,
+    id: Uuid,
+    #[serde(borrow)]
+    request: &'a serde_json::value::RawValue,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -320,8 +329,8 @@ impl Client {
             rustls::ClientConnection::new(self.config.clone(), self.server_name.clone())
                 .map_err(tls_error)?;
         let mut tls = rustls::StreamOwned::new(connection, io);
-        write_frame(&mut tls, &bytes)?;
-        let response: WireResponse<R> = serde_json::from_slice(&read_frame(&mut tls)?)
+        write_frame(&mut tls, bytes.expose())?;
+        let response: WireResponse<R> = serde_json::from_slice(read_frame(&mut tls)?.expose())
             .map_err(|_| corrupt("invalid witness response"))?;
         remaining(deadline)?;
         if response.version != WIRE_VERSION || response.id != id {
@@ -360,7 +369,7 @@ pub fn state_handler(store: StateStore) -> Arc<Handler> {
     let store = Mutex::new(store);
     Arc::new(move |role, request| {
         let request: Request =
-            serde_json::from_value(request).map_err(|_| invalid("invalid witness operation"))?;
+            serde_json::from_slice(request).map_err(|_| invalid("invalid witness operation"))?;
         let mut store = store
             .lock()
             .map_err(|_| io::Error::other("witness store poisoned"))?;
@@ -405,7 +414,9 @@ fn deadline_error(error: io::Error) -> io::Error {
     }
 }
 
-pub type Handler = dyn Fn(Role, serde_json::Value) -> io::Result<serde_json::Value> + Send + Sync;
+/// Request bytes borrow guarded frame storage; parse capabilities directly into
+/// their zeroizing type, never through an ordinary `serde_json::Value` tree.
+pub type Handler = dyn Fn(Role, &[u8]) -> io::Result<serde_json::Value> + Send + Sync;
 
 pub struct Server {
     config: Arc<rustls::ServerConfig>,
@@ -535,14 +546,14 @@ impl Server {
                 )
             })?;
         let mut tls = rustls::StreamOwned::new(connection, io);
-        let request: WireRequest<serde_json::Value> =
-            serde_json::from_slice(&read_frame(&mut tls)?)
-                .map_err(|_| corrupt("invalid witness request"))?;
+        let frame = read_frame(&mut tls)?;
+        let request: IncomingRequest<'_> = serde_json::from_slice(frame.expose())
+            .map_err(|_| corrupt("invalid witness request"))?;
         if request.version != WIRE_VERSION {
             return Err(corrupt("unsupported witness wire version"));
         }
         remaining(deadline)?;
-        let (response, error) = match handler(role, request.request) {
+        let (response, error) = match handler(role, request.request.get().as_bytes()) {
             Ok(response) => (Some(response), None),
             Err(error) => (
                 None,
@@ -564,7 +575,7 @@ impl Server {
             error,
         })
         .map_err(|_| corrupt("witness response serialization failed"))?;
-        write_frame(&mut tls, &bytes)
+        write_frame(&mut tls, bytes.expose())
     }
 
     pub fn serve(self: Arc<Self>, listener: TcpListener, handler: Arc<Handler>) -> io::Result<()> {
@@ -594,35 +605,40 @@ impl Server {
 
 // The limit applies while serializing, before any allocation can grow to the
 // size of a caller's unbounded request or response.
-fn serialize_frame(value: &impl Serialize) -> io::Result<Vec<u8>> {
-    struct Bounded(Vec<u8>);
+fn serialize_frame(value: &impl Serialize) -> io::Result<SecretBuffer> {
+    struct Bounded(SecretBuffer);
     impl Write for Bounded {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.len() > MAX_FRAME_BYTES - self.0.len() {
                 return Err(invalid("witness serialization exceeds frame limit"));
             }
-            self.0.extend_from_slice(bytes);
+            self.0
+                .try_extend_from_slice(bytes)
+                .map_err(|_| invalid("witness serialization exceeds frame limit"))?;
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-    let mut output = Bounded(Vec::with_capacity(MAX_FRAME_BYTES));
+    let mut output = Bounded(
+        SecretBuffer::with_capacity(MAX_FRAME_BYTES)
+            .map_err(|_| io::Error::other("witness frame allocation failed"))?,
+    );
     serde_json::to_writer(&mut output, value)
         .map_err(|_| invalid("witness serialization failed or exceeded frame limit"))?;
     Ok(output.0)
 }
 
-fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
+fn read_frame(input: &mut impl Read) -> io::Result<SecretBuffer> {
     let mut header = [0; 4];
     input.read_exact(&mut header)?;
     let len = u32::from_be_bytes(header) as usize;
     if len == 0 || len > MAX_FRAME_BYTES {
         return Err(corrupt("invalid witness frame size"));
     }
-    let mut bytes = vec![0; len];
-    input.read_exact(&mut bytes)?;
+    let mut bytes = SecretBuffer::zeroed(len);
+    input.read_exact(bytes.expose_mut())?;
     Ok(bytes)
 }
 
@@ -643,7 +659,10 @@ mod tests {
     fn frame_roundtrip() {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, b"metadata").unwrap();
-        assert_eq!(read_frame(&mut bytes.as_slice()).unwrap(), b"metadata");
+        assert_eq!(
+            read_frame(&mut bytes.as_slice()).unwrap().expose(),
+            b"metadata"
+        );
     }
 
     #[test]

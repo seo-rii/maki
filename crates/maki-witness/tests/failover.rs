@@ -104,13 +104,14 @@ impl Fixture {
 fn handler(store: Arc<Mutex<StateStore>>, calls: Arc<AtomicUsize>) -> Arc<Handler> {
     Arc::new(move |role, value| {
         calls.fetch_add(1, Ordering::SeqCst);
-        let request: Request = serde_json::from_value(value).map_err(io::Error::other)?;
+        let request: Request = serde_json::from_slice(value).map_err(io::Error::other)?;
         let record = store.lock().unwrap().handle(role, &request)?;
         serde_json::to_value(record).map_err(io::Error::other)
     })
 }
 fn inspect() -> Request {
     Request {
+        authorization: None,
         operation_id: [9; 16],
         expected: None,
         action: Action::Inspect,
@@ -162,7 +163,7 @@ fn lost_durable_mutation_result_retries_identical_operation_on_other_frontend() 
     let first = f.service({
         let store = store.clone();
         Arc::new(move |role, value| {
-            let request: Request = serde_json::from_value(value).map_err(io::Error::other)?;
+            let request: Request = serde_json::from_slice(value).map_err(io::Error::other)?;
             store.lock().unwrap().handle(role, &request)?;
             Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
@@ -179,6 +180,9 @@ fn lost_durable_mutation_result_retries_identical_operation_on_other_frontend() 
     .unwrap();
     let before = client.call(&inspect()).unwrap();
     let request = Request {
+        authorization: Some(
+            maki_backing::remote_witness::SessionAuthorization::from_bytes([7; 32]),
+        ),
         operation_id: [7; 16],
         expected: Some(before),
         action: Action::Claim,
