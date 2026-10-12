@@ -6,7 +6,7 @@
 //! - bit 1, slot invalid/missing → EIO (never fabricated data)
 //! - bit 1, slot valid → ciphertext
 //!
-//! Shard creation protocol: data file + allocation map are created, synced,
+//! Shard creation protocol: data file + both allocation maps are created, synced,
 //! and their dirents made durable *before* the catalog commits the shard —
 //! a crash in between leaves harmless orphans, never a cataloged shard with
 //! missing metadata. Every catalog commit publishes the whole in-memory
@@ -89,9 +89,10 @@ struct Shard {
     alloc_ab: AbStore,
     data: Arc<dyn BackingFile>,
     dirty_alloc: bool,
-    /// At least one allocation-map copy of this shard is on disk. False only
-    /// for a shard adopted at open with no valid copy: the catalog must not
-    /// name it until `commit_adopted_maps` has stored one (K-03).
+    /// Both allocation copies are proven durable in this store session.
+    /// Loaded copies may be cache-only after a failed sync and a restart:
+    /// first reservation or metadata persistence reestablishes both copies
+    /// and their dirents before this flag is set.
     map_stored: bool,
     /// The data file's physical size is not proven durable (short at open,
     /// or never checkpointed into). `prove_data_file` re-establishes and
@@ -368,11 +369,11 @@ impl SlotStore {
             let (side_a, side_b) = alloc_ab.side_generations::<AllocationMap>(backing.as_ref())?;
             let (alloc, dirty_alloc, map_stored) =
                 match alloc_ab.load::<AllocationMap>(backing.as_ref())? {
-                    // An adopted shard's copy may be readable only from the
-                    // page cache (its sync failed, then the process
-                    // restarted — K-01): nothing proves it durable, so it is
-                    // re-stored before any catalog commit names the shard.
-                    Some(alloc) => (alloc, false, !adopted.contains(&shard_idx)),
+                    // Even a cataloged shard's valid copies may be cache-only
+                    // after sync failure and a plain restart (K-01). Defer
+                    // persistence until reservation or checkpoint, then
+                    // establish both copies before accepting a new record.
+                    Some(alloc) => (alloc, false, false),
                     // A shard the catalog never committed may have died before
                     // its (empty) map was stored: start it empty.
                     None if adopted.contains(&shard_idx) => {
@@ -546,13 +547,14 @@ impl SlotStore {
     }
 
     /// True when a checkpoint should persist metadata even with nothing new
-    /// to apply: an adopted shard or a repaired allocation map is pending.
+    /// to apply: an adopted shard, repaired map, or loaded pair awaiting
+    /// durability proof in this store session is pending.
     pub fn has_pending_repairs(&self) -> bool {
         self.catalog_dirty
             || self
                 .shards
                 .values()
-                .any(|s| s.dirty_alloc || s.dirty_discard)
+                .any(|s| s.dirty_alloc || !s.map_stored || s.dirty_discard)
     }
 
     pub(crate) fn supports_discard(&self) -> bool {
@@ -695,6 +697,12 @@ impl SlotStore {
 
     fn ensure_shard(&mut self, shard_idx: u64) -> Result<(), CoreError> {
         if self.shards.contains_key(&shard_idx) {
+            if !self.shards[&shard_idx].map_stored || self.catalog_dirty {
+                // The catalog publishes every adopted shard together: each
+                // pair must be prepared, including shards this write skips.
+                self.commit_adopted_maps()?;
+                self.persist_allocations()?;
+            }
             return Ok(());
         }
         // A v3 data-file orphan cannot be interpreted safely without its
@@ -802,10 +810,10 @@ impl SlotStore {
         Ok(())
     }
 
-    /// Store the allocation map of every adopted shard that has no copy on
-    /// disk yet and make the data-directory dirents durable, so that a
-    /// catalog commit can never name a shard without an allocation copy.
-    /// Their in-memory map holds only what open proved from slot headers.
+    /// Establish both allocation copies of every loaded shard awaiting proof
+    /// in this store session, then make the data-directory dirents durable.
+    /// A whole-catalog publication must not name any incomplete pair.
+    /// Their in-memory maps hold only what open proved from maps and slots.
     fn commit_adopted_maps(&mut self) -> Result<(), CoreError> {
         let pending: Vec<u64> = self
             .shards
@@ -822,6 +830,9 @@ impl SlotStore {
             self.prove_data_file(*idx)?;
             fp("store.adopted_alloc_store")?;
             let shard = self.shards.get_mut(idx).unwrap();
+            shard
+                .alloc_ab
+                .store(self.backing.as_ref(), &mut shard.alloc)?;
             shard
                 .alloc_ab
                 .store(self.backing.as_ref(), &mut shard.alloc)?;
@@ -893,8 +904,8 @@ impl SlotStore {
     /// any step leaves every affected shard dirty so a retry redoes the
     /// whole step.
     pub fn persist_allocations(&mut self) -> Result<(), CoreError> {
-        // Adopted shards whose map is not proven on disk are stored here
-        // too, before the catalog commit below can name them (K-03).
+        // Loaded pairs awaiting proof are stored here too, before the catalog
+        // commit below can name an adopted shard (K-03 / BUG-043).
         let dirty: Vec<u64> = self
             .shards
             .iter()
@@ -908,6 +919,11 @@ impl SlotStore {
                 shard
                     .alloc_ab
                     .store(self.backing.as_ref(), &mut shard.alloc)?;
+                if !shard.map_stored {
+                    shard
+                        .alloc_ab
+                        .store(self.backing.as_ref(), &mut shard.alloc)?;
+                }
             }
             fp("checkpoint.alloc_dirsync")?;
             self.backing.sync_dir(layout::DATA_DIR)?;
