@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
 
 use crate::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
-use crate::checked::{validate_decrypt_result, validate_encrypt_result};
+use crate::checked::{validate_decrypt_result, validate_encrypt_result, CheckedProvider};
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
 use crate::flow::{DualPermit, DualSemaphore};
@@ -254,7 +254,9 @@ impl EndpointSet {
             .map(|(name, provider, validated)| {
                 Arc::new(Endpoint {
                     name,
-                    provider,
+                    // Validate each peer's own result contract inside the
+                    // attempt, before dispatch charges a successful verdict.
+                    provider: Arc::new(CheckedProvider::new(provider)),
                     breaker: CircuitBreaker::new(config.breaker.clone(), clock.clone()),
                     budget: RetryBudget::new(config.budget.clone(), clock.clone()),
                     semaphore: DualSemaphore::new(
@@ -611,6 +613,7 @@ impl EndpointSet {
         endpoint: &Endpoint,
         context: &CryptoContext,
         request: &Request<'_>,
+        caps: &CryptoCapabilities,
     ) -> Result<Response, CryptoError> {
         // The dispatcher already holds both permits for this RPC.
         endpoint.inflight.fetch_add(1, Ordering::SeqCst);
@@ -628,6 +631,22 @@ impl EndpointSet {
                 .await
                 .map(Response::Decrypted),
         };
+        // A peer may support sizes that are outside the common contract.
+        // Validate that contract in the same attempt as the transport and
+        // per-peer checks, so an invalid Ok response charges its breaker and
+        // follows the existing retry-safe failover path (BUG-056).
+        let result = result.and_then(|response| {
+            match (request, &response) {
+                (Request::Encrypt(items), Response::Encrypted(output)) => {
+                    validate_encrypt_result(items, output, caps)?;
+                }
+                (Request::Decrypt(items), Response::Decrypted(output)) => {
+                    validate_decrypt_result(items, output, caps)?;
+                }
+                _ => unreachable!(),
+            }
+            Ok(response)
+        });
         let elapsed = self.clock.now().saturating_sub(started);
         self.metrics.rpc_count.fetch_add(1, Ordering::SeqCst);
         self.metrics.rpc_nanos.fetch_add(
@@ -645,8 +664,9 @@ impl EndpointSet {
         context: &CryptoContext,
         request: &Request<'_>,
         deadline: Option<Duration>,
+        caps: &CryptoCapabilities,
     ) -> Result<Response, CryptoError> {
-        let call = self.call_endpoint(endpoint, context, request);
+        let call = self.call_endpoint(endpoint, context, request, caps);
         match deadline {
             None => call.await,
             Some(deadline) => {
@@ -672,6 +692,7 @@ impl EndpointSet {
         request: Request<'_>,
         deadline: Option<Duration>,
         retry_safe: bool,
+        caps: &CryptoCapabilities,
     ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
         if self.global.max_items() == 0
@@ -766,7 +787,7 @@ impl EndpointSet {
                 tried_any = true;
                 calls_made += 1;
                 match self
-                    .call_with_deadline(&endpoint, context, &request, deadline)
+                    .call_with_deadline(&endpoint, context, &request, deadline, caps)
                     .await
                 {
                     Ok(response) => {
@@ -905,11 +926,11 @@ impl CryptoProvider for EndpointSet {
                     Request::Encrypt(chunk),
                     deadline,
                     self.config.retry_safe && caps.retry_safe,
+                    caps,
                 )
                 .await?
             {
                 Response::Encrypted(mut result) => {
-                    validate_encrypt_result(chunk, &result, caps)?;
                     out.append(&mut result);
                 }
                 Response::Decrypted(_) => unreachable!(),
@@ -957,11 +978,11 @@ impl CryptoProvider for EndpointSet {
                     Request::Decrypt(chunk),
                     deadline,
                     self.config.retry_safe && caps.retry_safe,
+                    caps,
                 )
                 .await?
             {
                 Response::Decrypted(mut result) => {
-                    validate_decrypt_result(chunk, &result, caps)?;
                     out.append(&mut result);
                 }
                 Response::Encrypted(_) => unreachable!(),
