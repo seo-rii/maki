@@ -475,16 +475,24 @@ impl Server {
     }
 
     pub fn try_reserve_connection(&self) -> io::Result<ConnectionPermit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.max_connections).then_some(current + 1)
-            })
-            .map_err(|_| {
-                io::Error::new(
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_connections {
+                return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "witness connection limit reached",
-                )
-            })?;
+                ));
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         Ok(ConnectionPermit(self.active.clone()))
     }
 

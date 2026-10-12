@@ -16,11 +16,12 @@ jobs:
   pr:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -99,12 +100,39 @@ jobs:
           python3 -B -m unittest scripts.test_docs_links -v
           python3 -B scripts/check_docs_links.py
 
+  latest-stable:
+    # The baseline is reproducible; new stable warnings are checked separately.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: latest-stable
+      - name: native NBD test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: workspace tests
+        run: cargo test --workspace --locked
+
   nightly-gates:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
       # SPEC §55 nightly tier: full property tests, crash cycles, queue
       # saturation, retry storm — every ignored release gate. No name filter:

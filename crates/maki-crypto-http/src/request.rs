@@ -147,7 +147,7 @@ impl fmt::Display for HexDisplay<'_> {
         };
         let mut encoded = [0; 128];
         for chunk in self.bytes.chunks(encoded.len() / 2) {
-            for (byte, pair) in chunk.iter().zip(encoded.chunks_exact_mut(2)) {
+            for (byte, pair) in chunk.iter().zip(encoded.as_chunks_mut::<2>().0.iter_mut()) {
                 pair[0] = digits[usize::from(byte >> 4)];
                 pair[1] = digits[usize::from(byte & 0x0f)];
             }

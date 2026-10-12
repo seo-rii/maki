@@ -16,6 +16,12 @@ python3 -B -m unittest scripts.test_docs_links -v         # link checker regress
 python3 -B scripts/check_docs_links.py                    # documentation links
 ```
 
+CI uses Rust 1.94.0 as its reproducible baseline on Linux and Windows. A
+separate job checks the latest stable compiler on both platforms, with strict
+Clippy and the workspace tests. Matrix jobs do not cancel one another after a
+failure. Use `cargo +1.94.0` for the baseline and `cargo +stable` after updating
+the local stable toolchain for compatibility checks.
+
 Formatting and strict Clippy block CI. The release gates are expensive; run
 them after touching recovery, journal, overlay, store or checkpoint code (the
 default suite did not catch every ordering bug in the past).
