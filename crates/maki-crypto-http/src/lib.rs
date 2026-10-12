@@ -768,8 +768,26 @@ impl HttpCryptoProvider {
     ) -> Result<SecretBuffer, CryptoError> {
         let method = reqwest::Method::from_bytes(op.method.as_bytes())
             .map_err(|_| fatal(format!("bad method {:?}", op.method)))?;
-        let url = format!("{}{}", self.spec.base_url, op.path);
-        let mut request = self.client.request(method, &url).query(&op.query);
+        let mut url = reqwest::Url::parse(&self.spec.base_url)
+            .map_err(|_| fatal("invalid HTTP endpoint URL"))?;
+        // Parse operation components separately, retaining the base path prefix.
+        // Joining an absolute path directly would discard that prefix.
+        let operation = reqwest::Url::parse(&format!("http://maki-operation.invalid{}", op.path))
+            .map_err(|_| fatal("invalid HTTP operation path"))?;
+        let combined_path = format!("{}{}", url.path().trim_end_matches('/'), operation.path());
+        url.set_path(&combined_path);
+        let combined_query = match (
+            url.query().filter(|query| !query.is_empty()),
+            operation.query().filter(|query| !query.is_empty()),
+        ) {
+            (Some(base), Some(operation)) => Some(format!("{base}&{operation}")),
+            (Some(base), None) => Some(base.to_string()),
+            (None, Some(operation)) => Some(operation.to_string()),
+            (None, None) => None,
+        };
+        url.set_query(combined_query.as_deref());
+        url.set_fragment(None);
+        let mut request = self.client.request(method, url).query(&op.query);
         for (name, value) in &op.headers {
             request = request.header(name, value);
         }
@@ -1181,7 +1199,7 @@ impl HttpCryptoProvider {
         };
 
         Self::new(HttpProviderSpec {
-            base_url: endpoint_url.trim_end_matches('/').to_string(),
+            base_url: endpoint_url.to_string(),
             encrypt,
             decrypt,
             capabilities,
