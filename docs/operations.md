@@ -280,7 +280,11 @@ The data plane binds the per-volume control socket while attaching, at
 example configuration; `sysusers.d` makes `maki` a member so the unprivileged daemon can apply
 it). A socket that cannot be bound fails attach: a daemon without its control
 socket is not operable. Rootless runs must therefore set `control.socket` to a
-writable path. The socket is removed on clean detach.
+writable path. An address with a live listener, including a full connection
+backlog, is refused instead of replaced. Stale sockets can be reclaimed;
+concurrent publishers serialize the address check and publication. Clean
+detach removes only the socket inode owned by that listener, so an older
+daemon cannot remove a successor that reused its pathname.
 
 The packaged `/run/maki-control` directory is `root:maki-admin` 0750; its
 per-volume children are `maki:maki` 0711. This lets administrators traverse

@@ -8,10 +8,13 @@
 //! with `chown`, which the unprivileged daemon may do for any group it is a
 //! member of — `packaging/sysusers.d` adds `maki` to `maki-admin`).
 
+use std::future::Future;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
@@ -19,10 +22,11 @@ use tokio::sync::Semaphore;
 use crate::server::{serve_connection, ControlBackend, ControlLimits, SerializedBackend};
 
 /// A bound control socket: accepts connections until dropped, and removes
-/// its path when dropped.
+/// its own socket inode when dropped.
 pub struct ControlListener {
     listener: UnixListener,
     path: PathBuf,
+    identity: (u64, u64),
 }
 
 impl ControlListener {
@@ -41,7 +45,58 @@ impl std::fmt::Debug for ControlListener {
 
 impl Drop for ControlListener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // BUG-055: an address can have been unlinked and reused while this
+        // listener was alive. Serialize with publication, and only remove
+        // the filesystem inode this listener originally published.
+        if let Ok(_directory) = lock_socket_directory(&self.path) {
+            if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+                if metadata.file_type().is_socket()
+                    && (metadata.dev(), metadata.ino()) == self.identity
+                {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+}
+
+/// A directory lock serializes socket publication and ownership checks
+/// across processes without leaving another persistent filesystem entry.
+fn lock_socket_directory(path: &Path) -> io::Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = std::fs::File::open(parent)?;
+    loop {
+        // SAFETY: the descriptor stays open in the returned File. Closing
+        // it releases this advisory lock after the synchronous operation.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(directory);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// A full listener backlog must not make attach block while holding the
+/// directory lock. Only connection refusal proves an existing socket stale.
+fn socket_is_live(path: &Path) -> io::Result<bool> {
+    // A single poll starts Tokio's nonblocking connect. Pending, including
+    // an unfinished connection, cannot prove this address safe to replace.
+    // Dropping the future closes the probe; no asynchronous wait or stale
+    // reactor registration remains while the directory lock is held.
+    let mut connect = std::pin::pin!(tokio::net::UnixStream::connect(path));
+    let mut context = Context::from_waker(Waker::noop());
+    match connect.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(_)) | Poll::Pending => Ok(true),
+        Poll::Ready(Err(error)) => match error.raw_os_error() {
+            Some(libc::ECONNREFUSED | libc::ENOENT) => Ok(false),
+            Some(libc::EAGAIN | libc::EINPROGRESS | libc::EALREADY) => Ok(true),
+            _ => Err(error),
+        },
     }
 }
 
@@ -93,7 +148,7 @@ pub fn resolve_gid_with_capacity(name: &str, initial: usize) -> io::Result<u32> 
     Ok(grp.gr_gid)
 }
 
-/// Bind the control socket (replacing a stale file), apply `group` if
+/// Bind the control socket (replacing a stale file, refusing live sockets), apply `group` if
 /// given, and restrict the mode to 0660 before publishing its path. Must
 /// be called inside a tokio runtime.
 pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<ControlListener> {
@@ -141,9 +196,12 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
         let directory = std::fs::File::open(staging.path())?;
         UnixListener::bind(format!("/proc/self/fd/{}/socket", directory.as_raw_fd()))
     });
+    let listener = listener?;
+    let metadata = std::fs::symlink_metadata(&staged_path)?;
     let mut bound = ControlListener {
-        listener: listener?,
+        listener,
         path: staged_path.clone(),
+        identity: (metadata.dev(), metadata.ino()),
     };
     if let Some(gid) = gid {
         std::os::unix::fs::chown(&staged_path, None, Some(gid)).map_err(|e| {
@@ -154,6 +212,22 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
         })?;
     }
     std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o660))?;
+    // Both binders and dropping predecessors take this lock, so checking
+    // an existing address and publishing the prepared socket is one step.
+    let _directory = lock_socket_directory(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() && socket_is_live(path)? => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "control socket {} already has a live listener",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     std::fs::rename(&staged_path, path)?;
     bound.path = path.to_path_buf();
     Ok(bound)

@@ -424,7 +424,8 @@ impl NbdAdapter {
             // (JoinSet::shutdown); joining the task here makes that drain
             // complete before we return.
             let _ = self.runtime.block_on(control.task);
-            let _ = std::fs::remove_file(&control.path);
+            // ControlListener removes only its own inode. An unconditional
+            // unlink here could delete a successor at the reused address.
         }
     }
 
