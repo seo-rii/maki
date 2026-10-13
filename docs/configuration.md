@@ -257,6 +257,17 @@ operation plans.
 
 ## Remote HTTP mapping
 
+HTTP, WebSocket and gRPC endpoint lists must fit the control plane's aggregate
+output budget. The endpoint allowance is 48 KiB; each entry costs a conservative
+384 bytes plus four times its JSON-encoded name length. The remaining 16 KiB
+is reserved for fixed fields and the response envelope. Validation accounts for
+all endpoint names, their JSON escaping and their repeated appearances in
+status and metrics. Excessive lists or long
+names are rejected before the volume opens; reducing only one name may not
+make a large list fit. Accepted lists retain complete endpoint reports within
+the existing 64 KiB control line limit. The server returns an explicit error
+if a backend's runtime data produces a larger response.
+
 The HTTP provider maps logical fields into a vendor request without interpreting
 the vendor cipher. Supported mappings include raw single-item payloads and JSON
 objects containing payload, unit index, volume ID, compatibility ID, or batch
@@ -438,6 +449,12 @@ times; it does not refresh them.
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; checked before every record, including inside one request. Must hold a maximum ciphertext plus its 32-byte record header |
 | `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when a reclaim round can make no more room (up to four rounds: records other writers append during a round are synced and reclaimed in the next); the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
 | `limits.max_overlay_entries` (default 262144) | Units the overlay may hold, whatever their payload (a v3 discard tombstone has none but still costs an entry). Same inline-checkpoint and ENOSPC behaviour; must hold the largest request in crypto units, or be `0` to disable |
+
+The hard journal limit also has a configuration-dependent minimum for forward
+progress after reclaim. It includes the largest request, the retained active
+segment and every segment header that appending the request can create.
+Small segment sizes can require many headers for one large request; twice the
+segment size plus record bytes alone is not a sufficient minimum.
 
 A request may contain more record bytes than the pending budget: the engine
 syncs between records to keep the tail bounded. Configuration validation and

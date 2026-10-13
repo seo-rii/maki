@@ -415,6 +415,15 @@ including a failure after `lvextend` already changed the LV. The former
 a retry. Growth revalidates the live attachment before each mutation and
 never shrinks the LV or filesystem.
 
+For attachments with a stored mapping proof, packaged growth requires direct
+mappings to the qualified whole-device single-PV layout. Partition-PV and
+layered mapper layouts are refused before either `lvextend` or `xfs_growfs`:
+extending into another partition can change the mapper's slave list and
+invalidate the recorded attachment proof. Attach's partition inventory does
+not establish support for growing that layout.
+New attachments capture this proof; legacy records without one retain their
+existing checks and do not establish qualification for other layouts.
+
 Execution (Linux, root) then:
 
 1. opens `/run/maki-attach` through verified root-owned directory descriptors,

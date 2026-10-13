@@ -1433,3 +1433,35 @@ ambiguous cross-endpoint round-trip mismatch; the reference-error correction
 above covers the reproduced contract and explicit-error attribution paths.
 The storage regressions use the executable crash model, rather than physical
 power-loss qualification.
+
+## Functional follow-up: journal progress and operational bounds
+
+The six findings below were reproduced against local `main` at `7551a54`.
+Their corrections retain the existing on-disk formats and 64 KiB control
+framing. Each fix has permanent regressions that failed before implementation.
+
+| Finding | Correction | Permanent regression |
+|---|---|---|
+| BUG-074, journal minimum progress budget | Include repeated segment headers and the retained active segment when validating room for the largest request after reclaim. Share checked append accounting with the writer. | maki-format and maki-core `review_journal_progress.rs`: exact boundary, many rolls, retained large records and maximum-request FUA/readback |
+| BUG-075, aggregate endpoint output | Validate an aggregate endpoint report budget, including escaped names and repeated metrics. Refuse an oversized backend response explicitly before writing it. | maki-format `review_endpoint_control_budget.rs`; maki-control `review_response_bound.rs`: cardinality, escaped names, exact framing boundaries and subsequent commands on the same connection |
+| BUG-076, stale mapping proof after growth | With a stored mapping proof, refuse unqualified partition-PV or layered growth layouts before either LV or filesystem mutation. Preserve exact mapping identity checks, legacy checks and qualified whole-device growth. | maki-privileged `review_growth_topology.rs`: partition refusal, unchanged whole-device mapping, already-extended retry and foreign-mapping controls |
+| BUG-077, truncated exponential backoff | Grow the jitter cap with checked wide arithmetic until the actual maximum delay is reached. Sample over the complete capped duration. | maki-crypto `review_jitter_progress.rs`: attempts 31/32, extreme attempts, zero delays and the full Duration range |
+| BUG-078, omitted unsafe contract refusal | Count the contract-error branch that refuses retransmission, without sending to another endpoint. | maki-crypto `review_contract_refusal_metrics.rs`: single/multiple peers, safe failover and request/provider-error controls |
+| BUG-079, transient queue length underflow | Publish a pushed item's occupancy under the same queue lock that removes it. Keep notification and permit release outside that critical section. | maki-crypto `review_queue_accounting.rs`: concurrent FIFO transfers with occupancy observation, capacity reuse and serial controls |
+
+The growth tests use the original executor with a simulated system and sysfs;
+they do not establish new LVM/kernel or partition-PV qualification. The queue
+finding concerns the public library's occupancy API; current volume paths do
+not use that queue. Focused test results, full workspace and complete ignored
+release gates, main push and exact-revision Linux/Windows CI are recorded
+separately.
+
+There are 42 new permanent regression functions. Test-first runs produced
+18 expected-behavior failures and 15 passing controls before implementation.
+Focused verification passes all new cases, 44 journal-related tests, the
+complete crypto suite (229 passing tests), control suite (33 passing tests)
+and privileged suite (201 passing tests), plus admitted endpoint snapshot
+controls. Strict Clippy passes for the affected packages on Rust 1.94.0.
+
+Repeated witness observations remain a measured optimization candidate
+(PERF-003). These fixes preserve the existing authority freshness checks.

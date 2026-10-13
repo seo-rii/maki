@@ -89,7 +89,7 @@ identity of each layer before and after every change.
 |---|---|---|
 | Whole device as one PV → one VG → one XFS data LV | **Campaign passed** | The qualified topology; pin `fs_uuid` and `[lvm_identity]` |
 | Same VG with an additional LV (for example a sidecar LV) | **Campaign passed** (attach and fail-closed cleanup) | Attach and detach work. The narrow dead-`nbdkit` cleanup fallback applies only to a single mapping, so recovery of a multi-LV VG needs operator diagnosis |
-| PV on a partition of the NBD device | Not qualified | Partitions are inventoried and mixed whole-device/partition PVs are refused; read [LVM activation checks](../storage-recovery.md#checking-lvm-before-activation) first |
+| PV on a partition of the NBD device | Not qualified; packaged growth refused before mutation | Partitions are inventoried and mixed whole-device/partition PVs are refused; read [LVM activation checks](../storage-recovery.md#checking-lvm-before-activation) first |
 | VG that also spans other block devices | **Refused** | The filesystem must be stored only on the NBD device Maki connected |
 | LVM cache (`cachevol`) layouts | **Refused** at activation | |
 | LVM thin pools, LVM RAID LVs, other internal device-mapper layers | Not qualified; fail closed in cleanup | Activation may succeed, but recovery paths refuse anything except the single-target mapping |
