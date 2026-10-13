@@ -741,6 +741,9 @@ impl EndpointSet {
         let mut calls_made = 0u32;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
+        // The previous actual RPC survives retry-pass boundaries. A newly
+        // recovered endpoint is still a failover from the last peer called.
+        let mut last_endpoint: Option<Arc<Endpoint>> = None;
         // Endpoints this operation has already been sent to: a repeat
         // attempt on one of them is a retry charged to *its* budget; a first
         // attempt on another endpoint is a failover (a fresh request for it).
@@ -781,7 +784,6 @@ impl EndpointSet {
                     CryptoError::Contract("every admissible endpoint broke the contract".into())
                 }));
             }
-            let mut tried_any = false;
             let mut excluded = contract_failed.clone();
             while let Some(admission) = self.admit_endpoint(&excluded, bytes, deadline).await? {
                 let endpoint = admission.endpoint.clone();
@@ -809,7 +811,10 @@ impl EndpointSet {
                         endpoint.budget.note_request();
                     }
                     self.metrics.retries.fetch_add(1, Ordering::SeqCst);
-                    if tried_any {
+                    if last_endpoint
+                        .as_ref()
+                        .is_some_and(|last| !Arc::ptr_eq(last, &endpoint))
+                    {
                         self.metrics.failovers.fetch_add(1, Ordering::SeqCst);
                     }
                 } else {
@@ -818,7 +823,7 @@ impl EndpointSet {
                 if !tried.iter().any(|t| Arc::ptr_eq(t, &endpoint)) {
                     tried.push(endpoint.clone());
                 }
-                tried_any = true;
+                last_endpoint = Some(endpoint.clone());
                 calls_made += 1;
                 match self
                     .call_with_deadline(&endpoint, context, &request, deadline, caps)
