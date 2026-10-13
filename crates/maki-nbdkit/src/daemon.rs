@@ -114,16 +114,24 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
     if let Some(rollback) = &config.backing.rollback_protection {
         #[cfg(target_os = "linux")]
         {
-            if let Some(remote) = &rollback.remote {
-                return Ok(Arc::new(RollbackBacking::open_remote(
+            let backing = match &rollback.remote {
+                Some(remote) => RollbackBacking::open_remote(
                     Path::new(&config.backing.root),
                     remote_witness_client(remote)?,
-                )?));
+                )?,
+                None => RollbackBacking::open(
+                    Path::new(&config.backing.root),
+                    Path::new(&rollback.witness_root),
+                )?,
+            };
+            let stored = backing.capacity()?;
+            if rollback.capacity.0 != stored {
+                return Err(DaemonError::Unsupported(format!(
+                    "protected backing capacity mismatch: configuration {}, stored {stored}; migration is required",
+                    rollback.capacity.0
+                )));
             }
-            return Ok(Arc::new(RollbackBacking::open(
-                Path::new(&config.backing.root),
-                Path::new(&rollback.witness_root),
-            )?));
+            return Ok(Arc::new(backing));
         }
         #[cfg(not(target_os = "linux"))]
         {

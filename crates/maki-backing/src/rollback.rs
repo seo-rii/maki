@@ -246,6 +246,14 @@ fn independent_paths(root: &Path, witness: &Path) -> io::Result<()> {
 }
 
 impl RollbackBacking {
+    /// The immutable logical-page capacity in the authenticated manifest.
+    /// A revoked or uncertain session cannot supply usable format geometry.
+    pub fn capacity(&self) -> io::Result<u64> {
+        let mut state = self.state.lock();
+        state.check()?;
+        Ok(state.committed.capacity)
+    }
+
     /// Enroll an empty backing and a previously unused independent witness.
     /// Interrupted enrollment is deliberately not resumed implicitly.
     pub fn create(root: &Path, witness: &Path, capacity_bytes: u64) -> io::Result<Self> {
