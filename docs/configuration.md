@@ -273,6 +273,11 @@ the vendor cipher. Supported mappings include raw single-item payloads and JSON
 objects containing payload, unit index, volume ID, compatibility ID, or batch
 index. Binary data may use base64, base64url, or hexadecimal encoding.
 
+JSON requests default to `Content-Type: application/json`. An explicitly
+configured `Content-Type` overrides that default, including vendor media types;
+header-name matching is case-insensitive. This applies to single-item and batch
+operations. Raw requests retain their configured headers without a JSON default.
+
 The endpoint URL's path is a prefix for each operation path. For example,
 `https://crypto.example/gateway?tenant=demo` with `/encrypt` requests
 `/gateway/encrypt?tenant=demo`. Endpoint and operation-path queries are preserved,
