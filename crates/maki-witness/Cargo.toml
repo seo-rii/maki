@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Operator-only gate: launches a disposable three-member etcd quorum from
+# MAKI_ETCD_BIN and refuses to skip without it, so it is excluded from the
+# unfiltered nightly `-- --ignored` run (see docs/testing.md).
+etcd-qualification = []
+
 [dependencies]
 maki-backing.workspace = true
 maki-crypto.workspace = true
