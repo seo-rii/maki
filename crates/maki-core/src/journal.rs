@@ -114,6 +114,10 @@ pub struct JournalWriter {
     sealed: Vec<SegmentInfo>,
     active: Option<ActiveSegment>,
     next_segment_index: u64,
+    /// A failed creation can leave a durable partial header even after its
+    /// visible unlink. Keep its absence pending until the journal directory
+    /// is synced, including when no active segment exists (BUG-060).
+    creation_cleanup: Option<u64>,
     /// `journal/durable-mark`, opened lazily on the first successful sync.
     mark: Option<Arc<dyn BackingFile>>,
     /// Required v2 evidence, validated before the writer can be constructed.
@@ -149,6 +153,7 @@ impl JournalWriter {
             sealed,
             active: None,
             next_segment_index,
+            creation_cleanup: None,
             mark: None,
             proof,
             holes_allowed_below: 0,
@@ -156,14 +161,15 @@ impl JournalWriter {
         }
     }
 
-    /// Whether the active segment holds bytes a failed sync left in an
-    /// unknown state; no barrier succeeds until they are rewritten and
-    /// synced.
+    /// Whether accepted bytes or a failed creation's cleanup await a durable
+    /// retry. No barrier succeeds until these obligations are completed.
     pub fn writeback_uncertain(&self) -> bool {
-        self.active
-            .as_ref()
-            .map(|a| a.needs_redirty)
-            .unwrap_or(false)
+        self.creation_cleanup.is_some()
+            || self
+                .active
+                .as_ref()
+                .map(|a| a.needs_redirty)
+                .unwrap_or(false)
     }
 
     /// Segment syncs that failed since the writer resumed.
@@ -373,6 +379,23 @@ impl JournalWriter {
         Ok(())
     }
 
+    /// Make a failed creation's removal durable before a barrier or index
+    /// reuse. A prior attempt may already have removed the visible file but
+    /// failed its directory sync; absence alone does not complete cleanup.
+    fn cleanup_failed_creation(&mut self) -> Result<(), CoreError> {
+        let Some(index) = self.creation_cleanup else {
+            return Ok(());
+        };
+        match self.backing.remove(&layout::journal_segment(index)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.backing.sync_dir(layout::JOURNAL_DIR)?;
+        self.creation_cleanup = None;
+        Ok(())
+    }
+
     fn roll(&mut self) -> Result<(), CoreError> {
         let index = self.next_segment_index;
         // Refuse exhaustion before syncing the previous segment or creating
@@ -380,6 +403,7 @@ impl JournalWriter {
         let next_segment_index = index
             .checked_add(1)
             .ok_or_else(|| CoreError::Corrupt("journal segment index exhausted".into()))?;
+        self.cleanup_failed_creation()?;
         self.seal_active()?;
         let path = layout::journal_segment(index);
         let base_sequence = self.next_sequence;
@@ -431,8 +455,13 @@ impl JournalWriter {
                 Ok(())
             }
             Err(e) => {
-                // Best-effort cleanup; the retry recreates the same index.
-                let _ = self.backing.remove(&path);
+                // Background writeback may already have persisted a partial
+                // header and its inode. Preserve the original creation error,
+                // but retain any cleanup failure for FLUSH/FUA and index reuse.
+                self.creation_cleanup = Some(index);
+                if let Err(error) = self.cleanup_failed_creation() {
+                    tracing::warn!("journal failed-creation cleanup deferred: {error}");
+                }
                 self.sanitize();
                 Err(e)
             }
@@ -503,6 +532,7 @@ impl JournalWriter {
 
     /// Make all appended records durable (FLUSH barrier / FUA tail).
     pub fn sync(&mut self) -> Result<u64, CoreError> {
+        self.cleanup_failed_creation()?;
         self.sync_active()?;
         // Every sealed segment was synced before it was sealed (a failed
         // seal keeps the segment active), so the active segment is the only
@@ -529,6 +559,12 @@ impl JournalWriter {
     ///   below `durable_sequence`.
     /// * `next_segment_index` is above every segment index in use.
     pub fn check_invariants(&self) {
+        if let Some(index) = self.creation_cleanup {
+            assert!(
+                self.active.is_none() && index == self.next_segment_index,
+                "journal sanitizer: failed creation cleanup does not name the inactive next index"
+            );
+        }
         assert!(
             self.durable_sequence <= self.appended_sequence,
             "journal sanitizer: durable {} > appended {}",
@@ -650,6 +686,7 @@ impl JournalWriter {
     /// Delete sealed segments fully covered by `checkpoint_sequence`.
     /// Returns how many were deleted. The caller fsyncs the journal dir.
     pub fn delete_covered(&mut self, checkpoint_sequence: u64) -> Result<usize, CoreError> {
+        self.cleanup_failed_creation()?;
         let mut kept = Vec::new();
         let mut deleted = 0usize;
         let mut error: Option<CoreError> = None;
