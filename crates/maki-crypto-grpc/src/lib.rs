@@ -16,6 +16,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use prost::Message as _;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::metadata::{MetadataKey, MetadataValue};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
@@ -637,22 +638,12 @@ impl GrpcCryptoProvider {
         })
     }
 
-    fn request_bytes(items: &[WireItem]) -> usize {
-        items.iter().map(|i| i.data.len() + 16).sum::<usize>() + 64
-    }
-
     async fn call(
         &self,
         path: PathAndQuery,
         context: &CryptoContext,
         items: Vec<WireItem>,
     ) -> Result<Vec<WireItem>, CryptoError> {
-        if Self::request_bytes(&items) > self.spec.max_message_bytes {
-            return Err(CryptoError::NonRetryableRequest(format!(
-                "request exceeds message-size limit {}",
-                self.spec.max_message_bytes
-            )));
-        }
         let expected: Vec<u64> = items.iter().map(|i| i.unit_index).collect();
         let message = WireRequest {
             volume_id: context.volume_uuid.to_string(),
@@ -660,6 +651,15 @@ impl GrpcCryptoProvider {
             items,
             format_version: context.format_version,
         };
+        // Include context strings, nested lengths and varints in the local
+        // bound. A rough payload estimate could reject a fitting request or
+        // let the encoder report a local overflow as a retryable peer error.
+        if message.encoded_len() > self.spec.max_message_bytes {
+            return Err(CryptoError::NonRetryableRequest(format!(
+                "request exceeds message-size limit {}",
+                self.spec.max_message_bytes
+            )));
+        }
 
         let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
             inner: self.channel.clone(),
