@@ -17,11 +17,21 @@ pub struct RetryPolicy {
 
 /// `delay = random(0, min(max_delay, initial_delay × 2^attempt))` (SPEC §31).
 pub fn full_jitter_delay(policy: &RetryPolicy, attempt: u32, rng: &mut impl Rng) -> Duration {
-    let factor = 2u32.saturating_pow(attempt.min(31));
-    let cap = policy
-        .max_delay
-        .min(policy.initial_delay.saturating_mul(factor));
-    Duration::from_nanos(rng.random_range(0..=cap.as_nanos().min(u64::MAX as u128) as u64))
+    // Keep the exponent and sampling range wide enough for Duration's full
+    // range. Saturating the factor to u32 stops growth at attempt 31 even
+    // when the configured maximum has not yet been reached.
+    let factor = 1u128.checked_shl(attempt).unwrap_or(u128::MAX);
+    let cap_nanos = policy
+        .initial_delay
+        .as_nanos()
+        .saturating_mul(factor)
+        .min(policy.max_delay.as_nanos());
+    let nanos = rng.random_range(0..=cap_nanos);
+    // cap_nanos is bounded by a Duration, so its seconds always fit u64.
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
 }
 
 #[derive(Debug, Clone)]
