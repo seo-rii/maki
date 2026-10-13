@@ -234,9 +234,13 @@ impl AbStore {
             // not overwrite the last durable copy until this one is safe.
             // Redirty the exact validated image: after writeback EIO a
             // plain fsync retry may succeed without persisting clean cache
-            // pages. Do not truncate or re-encode the preserved copy.
+            // pages. Reassert its exact validated length too: a failed sync
+            // of an earlier shrink can leave a longer durable file even when
+            // the page cache already reports the shorter length (BUG-066).
+            // Preserve the validated bytes without re-encoding them.
             // Its dirent may also be new if the caller's dirsync failed.
             let file = backing.open(preserved, false)?;
+            file.set_len(bytes.len() as u64)?;
             file.write_at(0, &bytes)?;
             file.sync_data()?;
             backing.sync_dir(maki_backing::path::parent(preserved))?;
