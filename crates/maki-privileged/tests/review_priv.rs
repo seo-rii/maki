@@ -343,14 +343,14 @@ fn free_nbd_allocation_picks_the_lowest_unconnected_device() {
 #[test]
 fn verifier_rejects_wrong_device_and_missing_sentinel() {
     let expected = MountExpectation {
-        fs_uuid: Some("f".repeat(8)),
+        fs_uuid: Some(UUID.into()),
         volume_uuid: UUID.to_string(),
         nbd_device: "/dev/nbd0".to_string(),
     };
     let mut observed = MountObservation {
         mountpoint_exists: true,
         fstype: Some("xfs".into()),
-        fs_uuid: Some("f".repeat(8)),
+        fs_uuid: Some(UUID.into()),
         sentinel_volume_uuid: Some(UUID.into()),
         nbd_connected: true,
         rw_probe_ok: true,
@@ -363,7 +363,7 @@ fn verifier_rejects_wrong_device_and_missing_sentinel() {
     observed.sentinel_volume_uuid = Some(UUID.into());
     observed.fs_uuid = Some("other".into());
     assert!(verify_mount_identity(&expected, &observed).is_err());
-    observed.fs_uuid = Some("f".repeat(8));
+    observed.fs_uuid = Some(UUID.into());
     observed.backing_devices = vec!["/dev/nbd1".into()];
     assert!(
         verify_mount_identity(&expected, &observed).is_err(),

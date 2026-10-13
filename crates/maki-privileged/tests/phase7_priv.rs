@@ -232,7 +232,7 @@ fn good_observation() -> MountObservation {
     MountObservation {
         mountpoint_exists: true,
         fstype: Some("xfs".to_string()),
-        fs_uuid: Some("AAAA-BBBB".to_string()),
+        fs_uuid: Some("abcdef12-3456-4789-abcd-0123456789ab".to_string()),
         sentinel_volume_uuid: Some("0123-4567".to_string()),
         nbd_connected: true,
         rw_probe_ok: true,
@@ -243,7 +243,7 @@ fn good_observation() -> MountObservation {
 
 fn expectation() -> MountExpectation {
     MountExpectation {
-        fs_uuid: Some("AAAA-BBBB".to_string()),
+        fs_uuid: Some("abcdef12-3456-4789-abcd-0123456789ab".to_string()),
         volume_uuid: "0123-4567".to_string(),
         nbd_device: "/dev/nbd0".to_string(),
     }

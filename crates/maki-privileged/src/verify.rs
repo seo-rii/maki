@@ -102,7 +102,16 @@ pub fn verify_filesystem_identity(
         }
     }
     if let Some(expected_fs_uuid) = expected_fs_uuid {
-        if filesystem_uuid != Some(expected_fs_uuid) {
+        // Config accepts either case of canonical hex UUIDs. Validate both
+        // sides before comparing their spelling so malformed observations
+        // cannot become identities merely by matching a caller's input.
+        crate::config::check_uuid("expected filesystem UUID", expected_fs_uuid)
+            .map_err(|error| MountVerifyError(error.to_string()))?;
+        if let Some(filesystem_uuid) = filesystem_uuid {
+            crate::config::check_uuid("observed filesystem UUID", filesystem_uuid)
+                .map_err(|error| MountVerifyError(error.to_string()))?;
+        }
+        if !filesystem_uuid.is_some_and(|uuid| uuid.eq_ignore_ascii_case(expected_fs_uuid)) {
             return Err(MountVerifyError(format!(
                 "filesystem UUID mismatch: {:?} != expected {:?}",
                 filesystem_uuid, expected_fs_uuid
