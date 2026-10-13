@@ -1819,7 +1819,7 @@ pub async fn verify_key_canary(
     let expected = canary_plaintext(&superblock.volume_uuid, unit_size);
     let ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
 
-    if let Some(canary) = ab.load::<KeyCanary>(backing.as_ref())? {
+    if let Some(mut canary) = ab.load::<KeyCanary>(backing.as_ref())? {
         if canary.volume_uuid != superblock.volume_uuid {
             return Err(AttachError::KeyMismatch(
                 "canary belongs to a different volume".to_string(),
@@ -1830,7 +1830,7 @@ pub async fn verify_key_canary(
             context,
             CiphertextUnit {
                 unit_index: canary.unit_index,
-                data: canary.ciphertext,
+                data: canary.ciphertext.clone(),
             },
         )
         .await?;
@@ -1839,6 +1839,14 @@ pub async fn verify_key_canary(
                 "canary decrypted to unexpected plaintext (wrong key or provider)".to_string(),
             ));
         }
+        // A failed first publication can leave a valid canary only in the
+        // page cache. Verification proves the key, not durability: restore
+        // both copies and their dirents before accepting data that needs
+        // this canary to reopen after a power loss (BUG-085). Keep this
+        // after the identity/plaintext checks so a wrong key cannot publish.
+        ab.store(backing.as_ref(), &mut canary)?;
+        ab.store(backing.as_ref(), &mut canary)?;
+        backing.sync_dir("")?;
         return Ok(());
     }
 
