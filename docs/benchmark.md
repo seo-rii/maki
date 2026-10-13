@@ -5,6 +5,9 @@ real engine on a disposable volume. A new volume is initialized automatically;
 an existing volume requires `--destroy-data` because the benchmark overwrites
 its working set. Configuration and workload bounds are checked before creation.
 An existing volume must retain its stored geometry.
+This also applies to local and remote rollback-protected volumes: reuse opens
+the existing witness-backed format rather than starting enrollment again.
+Incomplete or invalid formats are rejected even with `--destroy-data`.
 
 The default remains one caller, sequential writes, one final FLUSH, then
 verified sequential reads. `ops` is the count in each phase; the JSON report

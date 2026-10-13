@@ -1403,3 +1403,33 @@ The preceding Linux CI was blocked by the RustSec audit of `quinn-proto`
 0.11.17. The lockfile now selects its fixed 0.11.18 patch while retaining other
 dependency choices. The local dependency audit and pinned erasure contract pass;
 the audit remains enabled in CI.
+
+## Functional follow-up: metadata retries and endpoint validation
+
+The eight findings below were reproduced against `fbbdbb4`. The fixes preserve
+the on-disk formats, wire messages and public endpoint validator API.
+
+| Finding | Correction | Permanent regression |
+|---|---|---|
+| BUG-066, preserved metadata length | Reassert the exact validated preserved A/B file length before rewriting its bytes and syncing it, then update the other copy. A failed preservation step leaves the other copy untouched. | maki-format `review_ab_length_retry.rs`; maki-core `review_catalog_length_retry.rs`: shrinking/empty/same-size/growing metadata, failed length change, partial target write, restart, v2/v3 and preservation of earlier FUA data |
+| BUG-067, uncharged validation RPCs | Wrap each validation capabilities/encrypt/decrypt call in the same global and endpoint admission as serving calls. Hold only one peer's permits per RPC and narrow probe batches to count and resident-byte capacity. | maki-crypto `review_endpoint_validation.rs`: independent global/local/count/byte limits, single-slot cross-test progress, large advertised batches and ordinary serving controls |
+| BUG-068, reference failure attribution | Preserve the reference peer and operation stage before cross-test error conversion. Its contract/fatal/context errors defer candidate validation; candidate errors and actual cross-key failures remain conclusive. | Same validation suite: malformed reference encrypt/decrypt, later reference recovery, malformed candidate and different-key candidate |
+| BUG-069, nested metadata ENOSPC | Map storage-full I/O nested in a format error to ENOSPC at the NBD boundary. Keep other I/O and semantic format errors as EIO. | maki-nbdkit `review_metadata_enospc.rs`: public pwrite forcing checkpoint, metadata write/resize/sync failures, slot control, successful retry and generation exhaustion |
+| BUG-070, protected benchmark reuse | Detect and open an existing validated volume before creation. Require explicit destruction authorization, reuse its identity/witness and retain normal attach geometry, capacity and key checks. | maki-benchmark `review_rollback_reuse.rs`: actual CLI, UUID/witness preservation, refusal and invalid/partial layouts; maki-nbdkit `review_rollback_capacity.rs`: actual mTLS identity/data preservation and session release |
+| BUG-071, UUID spelling | Validate both filesystem UUID shapes and compare hex case independently. | maki-privileged `review_filesystem_uuid.rs`: configuration/full mount identity, both case directions and malformed/different/missing controls |
+| BUG-072, validation task lifetime | Retain validation task handles in the dispatcher and abort them on final owner drop; cancellation guards return validation state and RPC permits. | Validation suite: final dispatcher drop, cancelled waiting caller, live-set validation ownership and capacity return |
+| BUG-073, cross-pass failover metric | Track the previous actually called endpoint across retry passes and count peer identity changes. | maki-crypto `review_failover_metrics.rs`: later-pass recovery, same-pass failover and same-peer retry |
+
+There are 49 new permanent regression functions. The test-first runs produced
+25 expected-behavior failures and 18 passing controls before implementation;
+the final focused suites pass. These include 39 A/B/catalog durability tests,
+the complete crypto suite (215 passing tests), the complete privileged suite
+(195 passing tests), benchmark tests and real mTLS daemon controls. Final
+workspace, complete ignored release gates and exact-revision Linux/Windows CI
+are recorded separately.
+
+Reference responses with valid shape but wrong plaintext contents remain an
+ambiguous cross-endpoint round-trip mismatch; the reference-error correction
+above covers the reproduced contract and explicit-error attribution paths.
+The storage regressions use the executable crash model, rather than physical
+power-loss qualification.

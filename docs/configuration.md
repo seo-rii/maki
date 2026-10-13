@@ -309,6 +309,12 @@ an error. A shared RPC remains active while it still has a live caller.
 Endpoints that could not be cross-validated at attach
 (unreachable at the time) are quarantined and start serving only after the
 cross-endpoint check succeeds against a validated endpoint.
+Each background validation RPC shares the serving RPC count and resident-byte
+budgets, and its probe batches are narrowed to fit those budgets. The dispatcher
+owns these validation tasks and cancels them when its final owner is dropped.
+A reference endpoint's contract error defers candidate validation; it does not
+prove that the candidate is incompatible. Candidate contract errors and actual
+cross-key incompatibility still exclude that candidate.
 HalfOpen breaker probes return their admission slots on every exit, including
 operation deadlines, cancellation, request/provider errors, and refusal by the
 retry budget. These neutral outcomes leave the endpoint's failure count
