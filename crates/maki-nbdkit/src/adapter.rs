@@ -50,7 +50,11 @@ impl AdapterError {
 fn map_core_error(e: &CoreError) -> AdapterError {
     let errno = match e {
         CoreError::Invalid(_) => EINVAL,
-        CoreError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull => ENOSPC,
+        CoreError::Io(io) | CoreError::Format(maki_format::FormatError::Io(io))
+            if io.kind() == std::io::ErrorKind::StorageFull =>
+        {
+            ENOSPC
+        }
         _ => EIO,
     };
     AdapterError::new(errno, e.to_string())
