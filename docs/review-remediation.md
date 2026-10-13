@@ -1376,3 +1376,30 @@ using a bounded 4 KiB page buffer. This cost is documented in
 The remote restore path still copies a selected generation into a new
 namespace. No hardware power-loss, kernel NBD or real mount campaign was
 performed for these regressions.
+
+## Additional functional corrections — 2026-10-13
+
+The six findings were reproduced against the product implementation in
+`0a9199a`. These fixes preserve the on-disk formats and wire messages.
+
+| Finding | Correction | Permanent regression |
+|---|---|---|
+| BUG-060, failed journal creation cleanup | Retain the failed inactive segment index until unlink and journal directory sync both succeed. FLUSH/FUA, index reuse and covered-segment reclamation first complete this obligation. Preserve the original creation error and reject genuinely corrupt headers. | maki-core `review_journal_creation_cleanup.rs`: first/successor header partial writes, remove/directory failures, retry and sequence bounds, v2/v3, checkpoint, restart and torn power loss |
+| BUG-061, configured outer capacity mismatch | Compare configuration to the authenticated COW manifest capacity before provider initialization and READY, for both local and remote protected backing. Refuse mismatch without resizing; direct low-level open still uses stored geometry. | maki-nbdkit `review_rollback_capacity.rs`: actual local AES and remote mTLS, smaller/larger/matching capacity, reserve policy, credential-loading order, session release and data preservation |
+| BUG-062, inaccurate gRPC request estimate | Check the completed protobuf request's exact encoded length before readiness or transmission. A local size violation remains a request error and does not charge endpoint breakers. Preserve genuine remote status semantics. | maki-crypto-grpc `review_request_size.rs`: fitting and oversized requests, context/varint boundaries, two-peer breaker neutrality and remote Internal failover |
+| BUG-063, unknown WebSocket error class | Treat missing, malformed or unsupported remote error classifications as endpoint contract violations. Preserve recognized error classes and refuse unsafe retransmission. | maki-crypto-websocket `review_error_class.rs`: conformance followed by peer failure, healthy failover, malformed classes, all-peer terminal failure and unsafe controls |
+| BUG-064, lost WebSocket receive verdict | Carry receive size/encoding/framing violations through generation cleanup as Contract. Publish death and sweep the same generation under one pending lock, so retirement cannot replace the verdict. Ordinary abrupt transport loss still reconnects when safe. | maki-crypto-websocket `review_receive_contract.rs`: single/fragmented size limits, invalid UTF-8, multiple pending callers, healthy successor, breaker failover, terminal stall and unsafe controls; existing connection-lifetime suites |
+| BUG-065, omitted split-retry totals | Increment provider call and item totals when each ordinary or split call actually starts. Exclude unstarted cancelled groups and preserve coalesced, pending and inflight semantics. | maki-crypto `review_retry_metrics.rs`: encrypt/decrypt retries, cancellation before/after dispatch, mixed group sizes, coalescing and inflight counts |
+
+There are 50 new permanent regression functions. The original implementations
+failed the corresponding test-first checks. Focused verification includes the
+complete crypto/gRPC, backing and WebSocket package suites, daemon capacity
+tests and related journal durability regressions. The final workspace, complete
+ignored release gates and exact-revision Linux/Windows CI are recorded
+separately; focused checks do not establish those outcomes or physical
+power-loss qualification.
+
+The preceding Linux CI was blocked by the RustSec audit of `quinn-proto`
+0.11.17. The lockfile now selects its fixed 0.11.18 patch while retaining other
+dependency choices. The local dependency audit and pinned erasure contract pass;
+the audit remains enabled in CI.

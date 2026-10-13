@@ -202,6 +202,10 @@ shard, request and volume sizes that leave room for their actual metadata and
 checkpoint workload. The normal multi-GiB default reserves are inappropriate
 for this bounded mode and are rejected.
 
+On attach, the configured capacity must equal the authenticated manifest's
+stored capacity, in both local and remote modes. Changing the configuration
+does not resize an existing backing; a different capacity requires migration.
+
 Creation physically allocates a `2 * capacity` arena and two manifest slots,
 each `8 MiB + (capacity / 4096) * 256` bytes. Thus the example reserves 288 MiB
 on the backing filesystem, plus small files/filesystem metadata and witness
