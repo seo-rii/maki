@@ -988,6 +988,9 @@ fn verify_live_attachment(
             "attachment is not fully live (mount or VG mapping missing); refusing to grow",
         ));
     }
+    if let Some(proof) = &record.recovery {
+        proof.verify_growth_topology(record)?;
+    }
     Ok(())
 }
 
@@ -1448,6 +1451,10 @@ fn execute_with_options(
 #[cfg(test)]
 #[path = "exec_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_growth_topology.rs"]
+mod review_growth_topology;
 
 #[cfg(test)]
 #[path = "command_tests.rs"]

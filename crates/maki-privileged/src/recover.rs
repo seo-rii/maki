@@ -23,6 +23,30 @@ pub(crate) struct RecoveryProof {
     mount_permitted: bool,
 }
 
+impl RecoveryProof {
+    /// In-place growth currently preserves the attach proof verbatim. With
+    /// one whole-device PV, extending an LV changes its length but cannot
+    /// introduce a different slave. Partition PVs can add another partition
+    /// during lvextend, which would invalidate cleanup and retry authority.
+    /// Refuse that unqualified transition before any external command until
+    /// there is a durable protocol for publishing a changed mapping proof.
+    pub(super) fn verify_growth_topology(&self, record: &BoundDeviceRecord) -> io::Result<()> {
+        let nbd = record
+            .device
+            .strip_prefix("/dev/")
+            .ok_or_else(|| invalid("invalid NBD path"))?;
+        if self.nodes.iter().any(|node| {
+            node.name != nbd
+                && (node.dm_name.is_none() || node.slaves.len() != 1 || node.slaves[0] != nbd)
+        }) {
+            return Err(invalid(
+                "grow requires whole-device NBD PV mappings; partition PVs and layered mappings are unsupported",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryIntent {
