@@ -131,8 +131,12 @@ impl<T> BoundedQueue<T> {
     /// Enqueue, waiting for capacity (count and bytes).
     pub async fn push(&self, item: T, bytes: u64) -> Result<(), CryptoError> {
         let permit = self.capacity.acquire(bytes).await?;
-        self.inner.lock().push_back((item, permit));
+        let mut inner = self.inner.lock();
+        inner.push_back((item, permit));
+        // Publish the count before a consumer can remove this item and
+        // decrement it. Insertion and removal use the same critical section.
         self.len.fetch_add(1, Ordering::SeqCst);
+        drop(inner);
         self.notify.notify_one();
         Ok(())
     }
