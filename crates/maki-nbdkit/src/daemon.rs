@@ -155,6 +155,36 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
+/// Open and validate an existing volume before a tool chooses creation or
+/// explicitly authorized reuse. Protected backing must be opened through its
+/// witness; trying enrollment first cannot classify its AlreadyExists error.
+/// A present format marker with incomplete contents is an error, never a reset.
+pub fn existing_volume_from_config(
+    config: &VolumeConfig,
+) -> Result<Option<Superblock>, DaemonError> {
+    config.validate()?;
+    let root = Path::new(&config.backing.root);
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(DaemonError::Unsupported(
+                "backing root is not a directory".into(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    if !root.join("rollback.format").try_exists()?
+        && !root.join(maki_format::layout::SUPERBLOCK_A).try_exists()?
+        && !root.join(maki_format::layout::SUPERBLOCK_B).try_exists()?
+    {
+        return Ok(None);
+    }
+    let backing = build_backing(config)?;
+    let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())?;
+    Ok(Some(envelope.superblock))
+}
+
 fn resolve_key_source(cred: &CredentialRef) -> Result<(Box<dyn KeySource>, String), DaemonError> {
     match cred.source.as_str() {
         "env" => Ok((Box::new(EnvKeySource), cred.name.clone())),

@@ -242,21 +242,32 @@ fn main() -> ExitCode {
         eprintln!("working-set must be a positive multiple of io-size no larger than the volume");
         return ExitCode::from(2);
     }
-    match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
-        Ok(_) => {}
-        Err(DaemonError::Format(FormatError::AlreadyExists(_))) if options.destroy_data => {}
-        Err(DaemonError::Format(FormatError::AlreadyExists(_))) => {
-            eprintln!(
-                "error: {} names an existing volume; the benchmark overwrites its \
-                 data. Pass --destroy-data to run it anyway.",
-                options.config_path
-            );
-            return ExitCode::from(2);
-        }
+    // Protected backings must be opened through their existing witness. A
+    // create attempt would start enrollment again and refuse the stored root
+    // before the benchmark can honor its destruction authorization.
+    let existing = match maki_nbdkit::daemon::existing_volume_from_config(&config) {
+        Ok(Some(_)) => true,
+        Ok(None) => match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
+            Ok(_) => false,
+            // A plain volume may have appeared after the existing-volume probe.
+            Err(DaemonError::Format(FormatError::AlreadyExists(_))) => true,
+            Err(error) => {
+                eprintln!("error: cannot create the volume: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
         Err(error) => {
-            eprintln!("error: cannot create the volume: {error}");
+            eprintln!("error: cannot open the existing volume: {error}");
             return ExitCode::FAILURE;
         }
+    };
+    if existing && !options.destroy_data {
+        eprintln!(
+            "error: {} names an existing volume; the benchmark overwrites its \
+             data. Pass --destroy-data to run it anyway.",
+            options.config_path
+        );
+        return ExitCode::from(2);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

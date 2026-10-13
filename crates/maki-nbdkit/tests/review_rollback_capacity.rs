@@ -5,8 +5,8 @@ use maki_backing::remote_witness::{Phase, StateStore};
 use maki_backing::{Backing, RollbackBacking};
 use maki_format::config::VolumeConfig;
 use maki_nbdkit::daemon::{
-    attach_from_config, build_backing, create_volume_from_config_str, parse_and_validate,
-    DaemonError,
+    attach_from_config, build_backing, create_volume_from_config_str, existing_volume_from_config,
+    parse_and_validate, DaemonError,
 };
 use maki_witness::{certificate_fingerprint, Principal, Role, Server, ServerOptions, TlsFiles};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -349,5 +349,38 @@ async fn remote_larger_and_smaller_capacity_refuse_attach_release_and_preserve_d
     engine.write(4096, &[0xaf; 4096], true).await.unwrap();
     engine.stop_checkpoint_worker().await;
     drop(engine);
+    assert_eq!(fixture.phase(), Phase::Released);
+}
+
+#[tokio::test]
+async fn existing_remote_volume_probe_preserves_identity_data_and_releases_session() {
+    let fixture = Remote::new();
+    persist(&fixture.config, 0x70).await;
+    let engine = attach_from_config(&fixture.config).await.unwrap();
+    let before = engine.geometry().clone();
+    engine.stop_checkpoint_worker().await;
+    drop(engine);
+    let first = existing_volume_from_config(&fixture.config)
+        .unwrap()
+        .unwrap();
+    let second = existing_volume_from_config(&fixture.config)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.volume_uuid, second.volume_uuid);
+    assert_eq!(first.geometry, before);
+    assert_eq!(fixture.phase(), Phase::Released);
+    let engine = attach_from_config(&fixture.config).await.unwrap();
+    assert_eq!(engine.read(0, 4096).await.unwrap(), [0x70; 4096]);
+    engine.stop_checkpoint_worker().await;
+}
+
+#[test]
+fn existing_remote_volume_probe_rejects_capacity_mismatch_and_releases_session() {
+    let fixture = Remote::new();
+    let changed = changed_capacity(&fixture.config, CAPACITY * 2);
+    assert_capacity_error(
+        existing_volume_from_config(&changed).unwrap_err(),
+        CAPACITY * 2,
+    );
     assert_eq!(fixture.phase(), Phase::Released);
 }
