@@ -219,9 +219,36 @@ struct ValidationProvider {
     endpoint: Arc<Endpoint>,
     global: Arc<DualSemaphore>,
     changed: Arc<Notify>,
+    reference: bool,
 }
 
 impl ValidationProvider {
+    fn failure(&self, operation: &str, error: CryptoError) -> CryptoError {
+        // Each Endpoint already wraps its peer in CheckedProvider. That
+        // check attributes malformed successful replies to the peer before
+        // cross-endpoint validation can turn a decrypt failure into a generic
+        // incompatibility verdict. A broken reference is inconclusive for
+        // the candidate; it must not permanently reject that candidate.
+        if self.reference
+            && matches!(
+                error,
+                CryptoError::Contract(_)
+                    | CryptoError::ProviderFatal(_)
+                    | CryptoError::UnsupportedContext(_)
+            )
+        {
+            CryptoError::Retryable(format!(
+                "validation reference {:?} {operation} failed: {error}",
+                self.endpoint.name
+            ))
+        } else {
+            // In particular, retain Integrity / NonRetryableRequest while
+            // the reference decrypts candidate ciphertext: this is evidence
+            // of incompatibility, rather than a malformed reference reply.
+            error
+        }
+    }
+
     async fn admit(&self, bytes: u64) -> Result<EndpointAdmission, CryptoError> {
         if self.global.max_items() == 0
             || self.endpoint.semaphore.max_items() == 0
@@ -263,7 +290,12 @@ impl CryptoProvider for ValidationProvider {
         let _admission = self.admit(0).await?;
         self.endpoint.inflight.fetch_add(1, Ordering::SeqCst);
         let _inflight = InflightGuard(&self.endpoint.inflight);
-        let mut caps = self.endpoint.provider.capabilities().await?;
+        let mut caps = self
+            .endpoint
+            .provider
+            .capabilities()
+            .await
+            .map_err(|error| self.failure("capabilities", error))?;
         // Split self-test probes to fit both logical batch limits and the
         // worst-case resident ciphertext budget. Serving capabilities stay
         // unchanged; only these background probes use the smaller batches.
@@ -295,7 +327,11 @@ impl CryptoProvider for ValidationProvider {
         let _admission = self.admit(bytes).await?;
         self.endpoint.inflight.fetch_add(1, Ordering::SeqCst);
         let _inflight = InflightGuard(&self.endpoint.inflight);
-        self.endpoint.provider.encrypt_batch(context, items).await
+        self.endpoint
+            .provider
+            .encrypt_batch(context, items)
+            .await
+            .map_err(|error| self.failure("encrypt", error))
     }
 
     async fn decrypt_batch(
@@ -307,7 +343,11 @@ impl CryptoProvider for ValidationProvider {
         let _admission = self.admit(bytes).await?;
         self.endpoint.inflight.fetch_add(1, Ordering::SeqCst);
         let _inflight = InflightGuard(&self.endpoint.inflight);
-        self.endpoint.provider.decrypt_batch(context, items).await
+        self.endpoint
+            .provider
+            .decrypt_batch(context, items)
+            .await
+            .map_err(|error| self.failure("decrypt", error))
     }
 }
 
@@ -628,16 +668,17 @@ impl EndpointSet {
             // The validator is *invoked* here (its attempt is accounted
             // synchronously); only the resulting future runs in the
             // background.
-            let bounded = |endpoint| -> Arc<dyn CryptoProvider> {
+            let bounded = |endpoint, reference| -> Arc<dyn CryptoProvider> {
                 Arc::new(ValidationProvider {
                     endpoint,
                     global: self.global.clone(),
                     changed: self.capacity_changed.clone(),
+                    reference,
                 })
             };
             let attempt = validator(
-                bounded(reference.clone()),
-                bounded(endpoint.clone()),
+                bounded(reference.clone(), true),
+                bounded(endpoint.clone(), false),
                 context.clone(),
             );
             let changed = self.capacity_changed.clone();

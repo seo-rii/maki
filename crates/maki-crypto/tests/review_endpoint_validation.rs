@@ -275,6 +275,41 @@ async fn validators_stop_after_owner_and_last_caller_are_dropped() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_bad_reference_does_not_permanently_reject_a_healthy_candidate() {
+    use maki_test_support::fake_provider::Misbehavior;
+    let a = Gated::new();
+    let b = Gated::new();
+    for p in [&a, &b] {
+        provider_self_test(p.as_ref(), &ctx(), U, "test-profile-v1")
+            .await
+            .unwrap();
+    }
+    a.inner.set_misbehavior(Some(Misbehavior::DropLastItem));
+    let set = EndpointSet::with_quarantine(
+        vec![
+            ("reference".into(), a.clone(), true),
+            ("healthy_candidate".into(), b.clone(), false),
+        ],
+        Some(validator()),
+        cfg(),
+        Arc::new(ManualClock::new()),
+    );
+    assert!(matches!(
+        set.encrypt_batch(&ctx(), &input()).await,
+        Err(CryptoError::Contract(_))
+    ));
+    settle().await;
+    let status = set.endpoint_status();
+    println!(
+        "reference-only bad reply: candidate validated={} rejected={}",
+        status[1].validated, status[1].rejected
+    );
+    provider_self_test(b.as_ref(), &ctx(), U, "test-profile-v1")
+        .await
+        .unwrap();
+    assert!(!status[1].rejected,"healthy candidate permanently excluded because reference violated its own response contract");
+}
+#[tokio::test(flavor = "current_thread")]
 async fn healthy_reference_promotes_a_healthy_candidate() {
     let a = Gated::new();
     let b = Gated::new();
@@ -292,6 +327,82 @@ async fn healthy_reference_promotes_a_healthy_candidate() {
     let status = set.endpoint_status();
     assert!(status[1].validated);
     assert!(!status[1].rejected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_reference_decrypt_defers_candidate_then_recovers() {
+    let clock = Arc::new(ManualClock::new());
+    let reference = Gated::new();
+    let candidate = Gated::new();
+    reference.malformed_decrypt.store(true, Ordering::SeqCst);
+    let set = EndpointSet::with_quarantine(
+        vec![
+            ("reference".into(), reference.clone(), true),
+            ("candidate".into(), candidate.clone(), false),
+        ],
+        Some(validator()),
+        cfg(),
+        clock.clone(),
+    );
+    set.encrypt_batch(&ctx(), &input()).await.unwrap();
+    settle().await;
+    assert!(
+        !set.endpoint_status()[1].rejected,
+        "reference malformed decrypt is not candidate incompatibility"
+    );
+    assert!(!set.endpoint_status()[1].validated);
+    reference.malformed_decrypt.store(false, Ordering::SeqCst);
+    clock.advance(Duration::from_secs(2));
+    set.encrypt_batch(&ctx(), &input()).await.unwrap();
+    settle().await;
+    assert!(set.endpoint_status()[1].validated);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_candidate_contract_is_still_rejected() {
+    use maki_test_support::fake_provider::Misbehavior;
+    let reference = Gated::new();
+    let candidate = Gated::new();
+    candidate
+        .inner
+        .set_misbehavior(Some(Misbehavior::DropLastItem));
+    let set = EndpointSet::with_quarantine(
+        vec![
+            ("reference".into(), reference, true),
+            ("candidate".into(), candidate, false),
+        ],
+        Some(validator()),
+        cfg(),
+        Arc::new(ManualClock::new()),
+    );
+    set.encrypt_batch(&ctx(), &input()).await.unwrap();
+    settle().await;
+    assert!(set.endpoint_status()[1].rejected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn different_key_candidate_is_still_rejected() {
+    let reference = Gated::new();
+    let candidate = Gated::from_inner(
+        FakeCryptoProvider::new(U as u32)
+            .with_key(99)
+            .with_max_batch(1, U as u64),
+    );
+    provider_self_test(candidate.as_ref(), &ctx(), U, "test-profile-v1")
+        .await
+        .unwrap();
+    let set = EndpointSet::with_quarantine(
+        vec![
+            ("reference".into(), reference, true),
+            ("candidate".into(), candidate, false),
+        ],
+        Some(validator()),
+        cfg(),
+        Arc::new(ManualClock::new()),
+    );
+    set.encrypt_batch(&ctx(), &input()).await.unwrap();
+    settle().await;
+    assert!(set.endpoint_status()[1].rejected);
 }
 
 #[tokio::test(flavor = "current_thread")]
