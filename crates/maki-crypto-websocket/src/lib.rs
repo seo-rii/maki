@@ -566,7 +566,7 @@ impl WsCryptoProvider {
                         "remote crypto provider returned an unrecognized context refusal".into(),
                     ),
                 },
-                _ => CryptoError::ProviderFatal(
+                _ => CryptoError::Contract(
                     "remote crypto provider returned an unrecognized error class".into(),
                 ),
             });
