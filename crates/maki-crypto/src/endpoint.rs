@@ -730,6 +730,7 @@ impl EndpointSet {
         excluded: &[Arc<Endpoint>],
         bytes: u64,
         deadline: Option<Duration>,
+        first_rpc: bool,
     ) -> Result<Option<EndpointAdmission>, CryptoError> {
         let admit = async {
             let _turn = self.admission_gate.lock().await;
@@ -741,6 +742,7 @@ impl EndpointSet {
                 changed.as_mut().enable();
                 let now = self.clock.now();
                 let mut next_ready: Option<Duration> = None;
+                let mut has_eligible_endpoint = false;
                 let mut candidates: Vec<_> = self
                     .endpoints
                     .iter()
@@ -750,6 +752,7 @@ impl EndpointSet {
                         {
                             return None;
                         }
+                        has_eligible_endpoint = true;
                         match endpoint.breaker.next_admission_time() {
                             Some(ready) if ready <= now => Some(endpoint.clone()),
                             Some(ready) => {
@@ -761,7 +764,7 @@ impl EndpointSet {
                     })
                     .collect();
                 candidates.sort_by_key(|e| e.inflight.load(Ordering::SeqCst));
-                if candidates.is_empty() {
+                if candidates.is_empty() && (!first_rpc || !has_eligible_endpoint) {
                     return None;
                 }
                 for endpoint in candidates {
@@ -783,6 +786,11 @@ impl EndpointSet {
                         changed: self.capacity_changed.clone(),
                     });
                 }
+                // Before the first RPC, a cooling circuit or an occupied
+                // probe window is admission wait, not a failed retry pass.
+                // Stay in the FIFO and wake at readiness or capacity return.
+                // After an actual failed RPC, an exhausted pass still returns
+                // above and follows the configured retry backoff.
                 match next_ready {
                     Some(ready) => {
                         tokio::select! {
@@ -965,12 +973,17 @@ impl EndpointSet {
                 }));
             }
             let mut excluded = contract_failed.clone();
-            while let Some(admission) = self.admit_endpoint(&excluded, bytes, deadline).await? {
+            while let Some(admission) = self
+                .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
+                .await?
+            {
                 let endpoint = admission.endpoint.clone();
-                excluded.push(endpoint.clone());
                 let Some(probe) = endpoint.breaker.acquire() else {
+                    // Readiness can change on another worker after admission.
+                    // No RPC was attempted, so keep this peer eligible.
                     continue;
                 };
+                excluded.push(endpoint.clone());
                 if calls_made > 0 {
                     // A re-send of a request that already reached a provider.
                     if !retry_safe {
