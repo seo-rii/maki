@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
-use crate::protocol::{read_line, ProtocolError, Request};
+use crate::protocol::{read_line, ProtocolError, Request, MAX_LINE};
 
 /// Bounds on control sessions. Fixed values: the control plane is local
 /// and single-purpose, so there is nothing to tune per deployment.
@@ -161,6 +161,37 @@ async fn handle(backend: &Arc<dyn ControlBackend>, request: Request) -> Value {
     }
 }
 
+/// Cap serialization as well as the bytes on the wire. In particular, an
+/// unusually long degradation/mutation error from any backend must return
+/// an explicit readable error, rather than breaking official client framing.
+struct ResponseBuffer(Vec<u8>);
+
+impl std::io::Write for ResponseBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_LINE - self.0.len() {
+            return Err(std::io::Error::other("control response exceeds line limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_response(response: &Value) -> Result<Vec<u8>, ProtocolError> {
+    let mut buffer = ResponseBuffer(Vec::with_capacity(256));
+    match serde_json::to_writer(&mut buffer, response) {
+        Ok(()) => Ok(buffer.0),
+        Err(error) if error.is_io() => Ok(serde_json::to_vec(&json!({
+            "ok": false,
+            "error": "control response exceeds the 65536-byte line limit; response was not truncated",
+        }))?),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Serve one connection until EOF, the idle timeout, or a write timeout.
 /// Errors terminate the session (bounded input; a protocol violation never
 /// grows memory unboundedly).
@@ -184,7 +215,7 @@ where
             Ok(request) => handle(&backend, request).await,
             Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
         };
-        let mut bytes = serde_json::to_vec(&response)?;
+        let mut bytes = serialize_response(&response)?;
         bytes.push(b'\n');
         let write = async {
             wr.write_all(&bytes).await?;

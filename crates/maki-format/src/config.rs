@@ -1351,6 +1351,13 @@ fn validate_endpoints(
             "[crypto.{transport}] needs at least one [[crypto.{transport}.endpoint]]"
         )));
     }
+    if !crate::endpoint_limits::fits_control_response(
+        endpoints.iter().map(|endpoint| endpoint.name.as_str()),
+    ) {
+        return Err(invalid(format!(
+            "[crypto.{transport}] endpoint names/count exceed the control response budget"
+        )));
+    }
     let mut names = std::collections::BTreeSet::new();
     for endpoint in endpoints {
         if endpoint.name.is_empty() {

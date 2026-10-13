@@ -13,6 +13,7 @@ pub mod checkpoint;
 pub mod codec;
 pub mod config;
 pub mod durable_proof;
+pub mod endpoint_limits;
 pub mod error;
 pub mod geometry;
 pub mod init;
