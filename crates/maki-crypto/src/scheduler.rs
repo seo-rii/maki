@@ -152,7 +152,14 @@ impl Drop for PendingCharge {
 struct InflightCall(Arc<SchedulerStats>);
 
 impl InflightCall {
-    fn enter(stats: Arc<SchedulerStats>) -> Self {
+    fn enter(stats: Arc<SchedulerStats>, items: usize, coalesced: bool) -> Self {
+        stats.batches.fetch_add(1, Ordering::SeqCst);
+        stats
+            .batched_items
+            .fetch_add(items as u64, Ordering::SeqCst);
+        if coalesced {
+            stats.coalesced_batches.fetch_add(1, Ordering::SeqCst);
+        }
         stats.inflight_batches.fetch_add(1, Ordering::SeqCst);
         Self(stats)
     }
@@ -241,13 +248,13 @@ async fn run_retries<I: Send + 'static, O: Send + 'static>(
             if reply.is_closed() {
                 return original;
             }
-            let result = {
-                let _call = InflightCall::enter(stats);
-                tokio::select! {
-                    biased;
-                    _ = reply.closed() => None,
-                    result = call(context, group.items) => Some(result),
-                }
+            let result = tokio::select! {
+                biased;
+                _ = reply.closed() => None,
+                result = async {
+                    let _call = InflightCall::enter(stats, len, false);
+                    call(context, group.items).await
+                } => Some(result),
             };
             if let Some((_, result)) = result {
                 deliver(result, len, vec![len], vec![reply]);
@@ -516,14 +523,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             continue;
         }
         let items = batch.iter().map(|g| g.items.len()).sum::<usize>();
-        stats.batches.fetch_add(1, Ordering::SeqCst);
-        stats
-            .batched_items
-            .fetch_add(items as u64, Ordering::SeqCst);
-        if batch.len() > 1 {
-            stats.coalesced_batches.fetch_add(1, Ordering::SeqCst);
-        }
-
+        let coalesced = batch.len() > 1;
         let context = batch[0].context.clone();
         let mut lengths = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
@@ -544,13 +544,13 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             // `inflight_batches` counts provider calls dispatched and not
             // yet answered (SPEC 40), abandoned ones included until they
             // are dropped.
-            let result = {
-                let _call = InflightCall::enter(stats.clone());
-                tokio::select! {
-                    biased;
-                    _ = all_replies_closed(replies.iter_mut()) => None,
-                    result = call(context.clone(), all_items) => Some(result),
-                }
+            let result = tokio::select! {
+                biased;
+                _ = all_replies_closed(replies.iter_mut()) => None,
+                result = async {
+                    let _call = InflightCall::enter(stats.clone(), items, coalesced);
+                    call(context.clone(), all_items).await
+                } => Some(result),
             };
             let Some((all_items, result)) = result else {
                 return;
