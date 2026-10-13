@@ -224,8 +224,8 @@ async fn oversized_incoming_frame_is_an_error() {
     let p = provider(&url); // max_frame_bytes = 512 KiB < huge response
     let err = p.encrypt_batch(&ctx(), &[pt(1, 0x01)]).await.unwrap_err();
     assert!(
-        err.is_retryable(),
-        "oversized frame kills the connection: {err:?}"
+        matches!(err, maki_crypto::CryptoError::Contract(_)),
+        "oversized frame violates the endpoint contract: {err:?}"
     );
 }
 

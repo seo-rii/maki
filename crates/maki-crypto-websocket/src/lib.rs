@@ -16,7 +16,8 @@
 //! arrive out of order; responses with unknown ids (stale, from an earlier
 //! connection generation) are dropped. On connection failure, pending
 //! requests fail `Retryable` and the next call reconnects transparently.
-//! Frame sizes are bounded in both directions.
+//! Frame sizes are bounded in both directions. Invalid receive framing is
+//! an endpoint contract failure, so that operation is never resent to it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,12 +145,13 @@ struct ConnectionCancellation {
 
 impl ConnectionCancellation {
     fn retire(&self) {
-        // Mark before sweeping, so a racing request never registers on a
-        // generation whose response reader can no longer deliver it.
-        self.dead_generation
-            .fetch_max(self.generation, Ordering::SeqCst);
+        WsCryptoProvider::fail_pending_generation(
+            &self.pending,
+            &self.dead_generation,
+            self.generation,
+            &retryable("connection lost: retired"),
+        );
         self.task.abort();
-        WsCryptoProvider::fail_pending_generation(&self.pending, self.generation, "retired");
     }
 }
 
@@ -172,13 +174,17 @@ struct MarkDeadOnDrop {
     pending: Pending,
     dead_generation: Arc<AtomicU64>,
     generation: u64,
+    failure: CryptoError,
 }
 
 impl Drop for MarkDeadOnDrop {
     fn drop(&mut self) {
-        self.dead_generation
-            .fetch_max(self.generation, Ordering::SeqCst);
-        WsCryptoProvider::fail_pending_generation(&self.pending, self.generation, "closed");
+        WsCryptoProvider::fail_pending_generation(
+            &self.pending,
+            &self.dead_generation,
+            self.generation,
+            &self.failure,
+        );
     }
 }
 
@@ -291,8 +297,17 @@ impl WsCryptoProvider {
     }
 
     /// Fail only the requests owned by the retiring connection generation.
-    fn fail_pending_generation(pending: &Pending, generation: u64, why: &str) {
+    fn fail_pending_generation(
+        pending: &Pending,
+        dead_generation: &AtomicU64,
+        generation: u64,
+        failure: &CryptoError,
+    ) {
         let mut map = pending.lock();
+        // Publish death and its verdict under the same lock. Otherwise a
+        // reconnect could see the dead flag and retire this connection with
+        // a generic Retryable sweep before its Contract reaches the callers.
+        dead_generation.fetch_max(generation, Ordering::SeqCst);
         let ids: Vec<u64> = map
             .iter()
             .filter(|(_, (g, _))| *g == generation)
@@ -300,7 +315,7 @@ impl WsCryptoProvider {
             .collect();
         for id in ids {
             if let Some((_, tx)) = map.remove(&id) {
-                let _ = tx.send(Err(retryable(format!("connection lost: {why}"))));
+                let _ = tx.send(Err(failure.duplicate()));
             }
         }
     }
@@ -398,10 +413,25 @@ impl WsCryptoProvider {
                     }
                     Some(Err(e)) => {
                         tracing::debug!("websocket: reader exited: {e}");
-                        return;
+                        use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
+                        return match e {
+                            Error::Capacity(_) | Error::Utf8 => CryptoError::Contract(
+                                "websocket peer violated the receive size or encoding contract"
+                                    .into(),
+                            ),
+                            // EOF without a closing handshake is an ordinary
+                            // lost transport, including during peer failover.
+                            Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+                                retryable("connection lost: closed")
+                            }
+                            Error::Protocol(_) => CryptoError::Contract(
+                                "websocket peer violated the receive framing contract".into(),
+                            ),
+                            _ => retryable("connection lost: closed"),
+                        };
                     }
                     None => {
-                        return;
+                        return retryable("connection lost: closed");
                     }
                 }
             }
@@ -409,14 +439,19 @@ impl WsCryptoProvider {
         let task = tokio::spawn(async move {
             // Natural exit and abort share the same generation-scoped
             // cleanup, including failure of the writer before a response.
-            let _mark_dead = MarkDeadOnDrop {
+            let mut mark_dead = MarkDeadOnDrop {
                 pending,
                 dead_generation,
                 generation,
+                failure: retryable("connection lost: closed"),
             };
             tokio::select! {
+                // Preserve a receive verdict when the writer has also
+                // stopped. Mark/sweep atomically for this generation on drop,
+                // before callers can reconnect or retire its pending peers.
+                biased;
+                failure = reader => { mark_dead.failure = failure; },
                 _ = writer => {},
-                _ = reader => {},
             }
         });
 
