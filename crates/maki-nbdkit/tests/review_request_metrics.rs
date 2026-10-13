@@ -361,7 +361,21 @@ async fn cancelled_storage_caller_has_zero_requests_and_one_retained_slot() {
     *backing.gate.released.lock().unwrap() = true;
     backing.gate.wake.notify_all();
     engine.flush().await.unwrap();
-    let metrics = control.metrics().await;
+    // FLUSH waits for the storage lock, while the cancelled write's owned
+    // orchestration drops its admission guard after that lock is released.
+    // Observe that separate completion instead of assuming both have the
+    // same scheduler wakeup order. The timeout only catches leaked permits.
+    let metrics = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let metrics = control.metrics().await;
+            if metrics["maki_admission_slots"] == json!(0) {
+                break metrics;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled storage orchestration did not release its admission guard");
     assert_eq!(cancelled["maki_active_requests"], json!(0));
     assert_eq!(cancelled["maki_admission_slots"], json!(1));
     assert_eq!(cancelled["maki_active_callbacks"], json!(1));
