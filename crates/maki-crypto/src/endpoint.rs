@@ -157,7 +157,7 @@ pub struct EndpointStatus {
 
 pub struct EndpointSet {
     endpoints: Vec<Arc<Endpoint>>,
-    global: DualSemaphore,
+    global: Arc<DualSemaphore>,
     admission_gate: AsyncMutex<()>,
     capacity_changed: Arc<Notify>,
     policy: RetryPolicy,
@@ -165,6 +165,9 @@ pub struct EndpointSet {
     config: DispatchConfig,
     metrics: DispatchMetrics,
     validator: Option<EndpointValidator>,
+    /// Validation belongs to the serving set, rather than to the caller
+    /// that happened to discover a quarantined peer.
+    validation_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     caps: OnceCell<CryptoCapabilities>,
     /// The provider plaintext unit selected by this volume, including any
     /// prefix added before dispatch. Unbound sets conservatively use the
@@ -174,18 +177,137 @@ pub struct EndpointSet {
 
 /// Both budgets are acquired without waiting, then retained only for the RPC.
 /// Release capacity before notifying the FIFO admission waiter.
-struct EndpointAdmission<'a> {
+struct EndpointAdmission {
     endpoint: Arc<Endpoint>,
     global: Option<DualPermit>,
     local: Option<DualPermit>,
-    changed: &'a Notify,
+    changed: Arc<Notify>,
 }
 
-impl Drop for EndpointAdmission<'_> {
+impl Drop for EndpointAdmission {
     fn drop(&mut self) {
         drop(self.global.take());
         drop(self.local.take());
         self.changed.notify_waiters();
+    }
+}
+
+impl Drop for EndpointSet {
+    fn drop(&mut self) {
+        for task in self.validation_tasks.get_mut().drain(..) {
+            task.abort();
+        }
+    }
+}
+
+struct ValidationGuard {
+    endpoint: Arc<Endpoint>,
+    changed: Arc<Notify>,
+}
+
+impl Drop for ValidationGuard {
+    fn drop(&mut self) {
+        self.endpoint.validating.store(false, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+}
+
+/// One validation RPC owns exactly the same count and resident-byte permits
+/// as a serving RPC. A self-test never retains one peer's permit while it
+/// calls the other peer, including when global capacity is just one RPC.
+struct ValidationProvider {
+    endpoint: Arc<Endpoint>,
+    global: Arc<DualSemaphore>,
+    changed: Arc<Notify>,
+}
+
+impl ValidationProvider {
+    async fn admit(&self, bytes: u64) -> Result<EndpointAdmission, CryptoError> {
+        if self.global.max_items() == 0
+            || self.endpoint.semaphore.max_items() == 0
+            || bytes > self.global.max_bytes()
+            || bytes > self.endpoint.semaphore.max_bytes()
+        {
+            return Err(CryptoError::NonRetryableRequest(
+                "validation RPC exceeds global or endpoint admission capacity".into(),
+            ));
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // Never wait with either permit retained. A fixed validation
+            // target cannot block serving admission's FIFO candidate search.
+            if let Some(local) = self.endpoint.semaphore.try_acquire(bytes) {
+                if let Some(global) = self.global.try_acquire(bytes) {
+                    return Ok(EndpointAdmission {
+                        endpoint: self.endpoint.clone(),
+                        global: Some(global),
+                        local: Some(local),
+                        changed: self.changed.clone(),
+                    });
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
+#[async_trait]
+impl CryptoProvider for ValidationProvider {
+    fn max_operation_time(&self) -> Option<Duration> {
+        self.endpoint.provider.max_operation_time()
+    }
+
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        let _admission = self.admit(0).await?;
+        self.endpoint.inflight.fetch_add(1, Ordering::SeqCst);
+        let _inflight = InflightGuard(&self.endpoint.inflight);
+        let mut caps = self.endpoint.provider.capabilities().await?;
+        // Split self-test probes to fit both logical batch limits and the
+        // worst-case resident ciphertext budget. Serving capabilities stay
+        // unchanged; only these background probes use the smaller batches.
+        let byte_budget = self
+            .global
+            .max_bytes()
+            .min(self.endpoint.semaphore.max_bytes());
+        let largest_plaintext = caps
+            .supported_plaintext_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1);
+        let unit_budget = u64::from(largest_plaintext.max(caps.max_ciphertext_size).max(1));
+        caps.batch.max_items = caps
+            .batch
+            .max_items
+            .min((byte_budget / unit_budget).max(1).min(u64::from(u32::MAX)) as u32);
+        caps.batch.max_bytes = caps.batch.max_bytes.min(byte_budget);
+        Ok(caps)
+    }
+
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        let bytes = items.iter().map(|item| item.data.len() as u64).sum();
+        let _admission = self.admit(bytes).await?;
+        self.endpoint.inflight.fetch_add(1, Ordering::SeqCst);
+        let _inflight = InflightGuard(&self.endpoint.inflight);
+        self.endpoint.provider.encrypt_batch(context, items).await
+    }
+
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        let bytes = items.iter().map(|item| item.data.len() as u64).sum();
+        let _admission = self.admit(bytes).await?;
+        self.endpoint.inflight.fetch_add(1, Ordering::SeqCst);
+        let _inflight = InflightGuard(&self.endpoint.inflight);
+        self.endpoint.provider.decrypt_batch(context, items).await
     }
 }
 
@@ -277,10 +399,10 @@ impl EndpointSet {
             .collect();
         Self {
             endpoints,
-            global: DualSemaphore::new(
+            global: Arc::new(DualSemaphore::new(
                 config.global_max_inflight_batches,
                 config.global_max_inflight_bytes,
-            ),
+            )),
             admission_gate: AsyncMutex::new(()),
             capacity_changed: Arc::new(Notify::new()),
             policy: config.retry.clone(),
@@ -288,6 +410,7 @@ impl EndpointSet {
             config,
             metrics: DispatchMetrics::default(),
             validator,
+            validation_tasks: parking_lot::Mutex::new(Vec::new()),
             caps: OnceCell::new(),
             plaintext_size: None,
         }
@@ -505,13 +628,27 @@ impl EndpointSet {
             // The validator is *invoked* here (its attempt is accounted
             // synchronously); only the resulting future runs in the
             // background.
+            let bounded = |endpoint| -> Arc<dyn CryptoProvider> {
+                Arc::new(ValidationProvider {
+                    endpoint,
+                    global: self.global.clone(),
+                    changed: self.capacity_changed.clone(),
+                })
+            };
             let attempt = validator(
-                reference.provider.clone(),
-                endpoint.provider.clone(),
+                bounded(reference.clone()),
+                bounded(endpoint.clone()),
                 context.clone(),
             );
             let changed = self.capacity_changed.clone();
-            tokio::spawn(async move {
+            // Retaining the handle bounds task ownership to this set. The
+            // guard also restores the endpoint's state on task cancellation.
+            let guard = ValidationGuard {
+                endpoint: endpoint.clone(),
+                changed: changed.clone(),
+            };
+            let task = tokio::spawn(async move {
+                let _guard = guard;
                 let result = attempt.await;
                 match result {
                     Ok(()) => {
@@ -535,8 +672,10 @@ impl EndpointSet {
                         );
                     }
                 }
-                endpoint.validating.store(false, Ordering::SeqCst);
             });
+            let mut tasks = self.validation_tasks.lock();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
         }
     }
 
@@ -550,7 +689,7 @@ impl EndpointSet {
         excluded: &[Arc<Endpoint>],
         bytes: u64,
         deadline: Option<Duration>,
-    ) -> Result<Option<EndpointAdmission<'_>>, CryptoError> {
+    ) -> Result<Option<EndpointAdmission>, CryptoError> {
         let admit = async {
             let _turn = self.admission_gate.lock().await;
             loop {
@@ -600,7 +739,7 @@ impl EndpointSet {
                         endpoint,
                         global: Some(global),
                         local: Some(local),
-                        changed: &self.capacity_changed,
+                        changed: self.capacity_changed.clone(),
                     });
                 }
                 match next_ready {
