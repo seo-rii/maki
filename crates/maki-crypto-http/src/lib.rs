@@ -791,7 +791,14 @@ impl HttpCryptoProvider {
         for (name, value) in &op.headers {
             request = request.header(name, value);
         }
-        if json {
+        // An explicit media type also applies to JSON, including vendor
+        // types. Appending the default would send two Content-Type fields.
+        if json
+            && !op
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
             request = request.header("content-type", "application/json");
         }
         let response = request
