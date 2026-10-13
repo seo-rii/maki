@@ -1057,6 +1057,9 @@ impl EndpointSet {
                                 // at once, never retried into (R5-005).
                                 probe.on_failure();
                                 if !retry_safe {
+                                    self.metrics
+                                        .retries_refused_unsafe
+                                        .fetch_add(1, Ordering::SeqCst);
                                     return Err(err);
                                 }
                                 contract_failed.push(endpoint.clone());
