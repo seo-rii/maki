@@ -48,6 +48,87 @@ pub const DURABLE_MARK_SIZE: usize = 32;
 /// Largest `backing.journal_segment_size` a configuration may use.
 pub const MAX_JOURNAL_SEGMENT_SIZE: u64 = 1 << 30;
 
+/// Checked additional bytes for appending groups of equally sized records.
+/// Each group is `(framed_record_length, record_count)`. Grouping lets
+/// configuration validation project even a very large request in constant
+/// time; the runtime writer supplies one-record groups of actual lengths.
+/// `active` is the current `(write_offset, record_count)`, or `None` before
+/// the first segment. An empty segment accepts one oversized record, exactly
+/// as the writer does. Every new segment contributes its header.
+pub fn checked_append_footprint(
+    segment_size: u64,
+    active: Option<(u64, u64)>,
+    record_groups: impl IntoIterator<Item = (u64, u64)>,
+) -> Option<u64> {
+    let header = SEGMENT_HEADER_SIZE as u64;
+    let mut projected = active;
+    let mut added = 0u64;
+    for (record_len, count) in record_groups {
+        if count == 0 {
+            continue;
+        }
+        if record_len == 0 {
+            return None;
+        }
+        // Fill the existing segment first. Its first record may exceed the
+        // segment size; subsequent records require a roll at that boundary.
+        let fitting = match projected {
+            None => 0,
+            Some((offset, records)) => {
+                let fit = segment_size.saturating_sub(offset) / record_len;
+                if records == 0 {
+                    fit.max(1)
+                } else {
+                    fit
+                }
+            }
+        }
+        .min(count);
+        if fitting > 0 {
+            let (offset, records) = projected?;
+            let bytes = record_len.checked_mul(fitting)?;
+            added = added.checked_add(bytes)?;
+            projected = Some((offset.checked_add(bytes)?, records.checked_add(fitting)?));
+        }
+        let remaining = count - fitting;
+        if remaining > 0 {
+            let per_segment = (segment_size.saturating_sub(header) / record_len).max(1);
+            let segments = remaining.div_ceil(per_segment);
+            added = added
+                .checked_add(record_len.checked_mul(remaining)?)?
+                .checked_add(header.checked_mul(segments)?)?;
+            let last_count = (remaining - 1) % per_segment + 1;
+            projected = Some((
+                header.checked_add(record_len.checked_mul(last_count)?)?,
+                last_count,
+            ));
+        }
+    }
+    Some(added)
+}
+
+/// Hard limit that lets a largest request make progress after reclaim.
+/// Reclaim keeps the active segment, which may hold one oversized record.
+/// Start its append projection at the largest retained length so the first
+/// record rolls; all subsequent roll headers are included too. Preserve the
+/// existing conservative two-segments-plus-records configuration floor.
+pub fn minimum_journal_limit(
+    segment_size: u64,
+    max_record_len: u64,
+    records_per_request: u64,
+) -> Option<u64> {
+    let retained = segment_size.max((SEGMENT_HEADER_SIZE as u64).checked_add(max_record_len)?);
+    let append = checked_append_footprint(
+        segment_size,
+        Some((retained, 1)),
+        [(max_record_len, records_per_request)],
+    )?;
+    let legacy_floor = segment_size
+        .checked_mul(2)?
+        .checked_add(max_record_len.checked_mul(records_per_request)?)?;
+    Some(legacy_floor.max(retained.checked_add(append)?))
+}
+
 /// Largest segment file any configuration's writer can produce. Recovery
 /// bounds segment files by this, not by the currently configured size: a
 /// checkpoint never deletes the active segment, so after a clean stop a

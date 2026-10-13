@@ -49,7 +49,8 @@ use uuid::Uuid;
 use maki_backing::{Backing, BackingFile};
 use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
-    encode_record, DurableMark, JournalRecord, SegmentHeader, SEGMENT_HEADER_SIZE,
+    checked_append_footprint, encode_record, DurableMark, JournalRecord, SegmentHeader,
+    SEGMENT_HEADER_SIZE,
 };
 use maki_format::layout;
 
@@ -249,30 +250,16 @@ impl JournalWriter {
     /// the encoded record size (`RECORD_HEADER_SIZE + payload`), the same
     /// quantity those methods advance `write_offset` by.
     pub fn append_footprint(&self, record_lens: impl IntoIterator<Item = u64>) -> u64 {
-        let header = SEGMENT_HEADER_SIZE as u64;
-        let mut added = 0u64;
-        // Projected active-segment state as records are appended:
-        // (write_offset, record_count). `None` = no active segment, which
-        // forces a roll on the first record exactly as `append` does.
-        let mut projected = self
+        let active = self
             .active
             .as_ref()
             .map(|a| (a.write_offset, a.info.record_count));
-        for record_len in record_lens {
-            let needs_roll = match projected {
-                None => true,
-                Some((offset, count)) => count > 0 && offset + record_len > self.segment_size,
-            };
-            if needs_roll {
-                added += header + record_len;
-                projected = Some((header + record_len, 1));
-            } else {
-                let (offset, count) = projected.expect("no roll implies an active projection");
-                added += record_len;
-                projected = Some((offset + record_len, count + 1));
-            }
-        }
-        added
+        checked_append_footprint(
+            self.segment_size,
+            active,
+            record_lens.into_iter().map(|len| (len, 1)),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     /// fdatasync the active segment's pending records and publish the

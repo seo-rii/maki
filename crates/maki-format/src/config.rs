@@ -1260,19 +1260,23 @@ impl VolumeConfig {
         // remains, and the largest single request must still fit under the
         // hard limit, or the journal could refuse writes forever.
         let record = crate::journal::max_record_len(self.crypto.capabilities.max_ciphertext_size);
+        let progress_overflow = || {
+            ConfigError::Invalid("journal progress bound exceeds u64 byte accounting range".into())
+        };
         let units_per_request = self
             .nbd
             .maximum_io
             .0
             .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
-            + 1;
-        let largest_request = units_per_request.saturating_mul(record);
-        let needed = seg.saturating_mul(2).saturating_add(largest_request);
+            .checked_add(1)
+            .ok_or_else(progress_overflow)?;
+        let needed = crate::journal::minimum_journal_limit(seg, record, units_per_request)
+            .ok_or_else(progress_overflow)?;
         if max < needed {
             return Err(ConfigError::Invalid(format!(
-                "backing.journal_max_bytes {max} must be at least {needed}: two segments plus \
-                 the largest request ({units_per_request} records of {record} bytes) so a \
-                 reclaim can always make room"
+                "backing.journal_max_bytes {max} must be at least {needed}: the largest \
+                 request ({units_per_request} records of {record} bytes), all segment headers \
+                 and a retained active segment must fit after reclaim"
             )));
         }
         if self.limits.max_journal_pending_bytes.0 < record {
