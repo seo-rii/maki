@@ -23,11 +23,12 @@ mod workload_verify;
 #[path = "lvm_preflight.rs"]
 mod lvm_preflight;
 
+#[path = "allocation.rs"]
+mod allocation;
+
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
-use crate::probe::{
-    choose_free_nbd, nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices,
-};
+use crate::probe::{nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices};
 use crate::state::{BoundDeviceRecord, TrustedState};
 use crate::verify::{
     verify_filesystem_identity, verify_mount_device, verify_mount_identity, MountExpectation,
@@ -50,7 +51,7 @@ pub enum ExecError {
     Step { step: String, message: String },
     #[error("{0}")]
     Verify(#[from] crate::verify::MountVerifyError),
-    #[error("no free /dev/nbdN device (all connected or module not loaded)")]
+    #[error("no free /dev/nbdN device (all connected/in use or module not loaded)")]
     NoFreeDevice,
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -198,19 +199,14 @@ fn nbd_backend_at(sysfs: &Path, device: &str) -> io::Result<Option<String>> {
     }
 }
 
-/// Lowest free `/dev/nbdN` according to sysfs (a connected device has a
-/// `pid` attribute). Call with the attach lock held.
+/// Lowest unused `/dev/nbdN` in sysfs and the current mount namespace.
+/// Connections, root/partition holders and direct mounts occupy a device.
+/// Call with the attach lock held; observation failures refuse allocation.
 pub fn allocate_nbd_device() -> Result<String, ExecError> {
-    let mut devices = Vec::new();
-    for entry in std::fs::read_dir("/sys/class/block")? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("nbd") && name[3..].chars().all(|c| c.is_ascii_digit()) {
-            let connected = entry.path().join("pid").exists();
-            devices.push((name, connected));
-        }
-    }
-    choose_free_nbd(&devices).ok_or(ExecError::NoFreeDevice)
+    allocation::allocate(
+        Path::new("/sys/class/block"),
+        Path::new("/proc/self/mountinfo"),
+    )
 }
 
 fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
