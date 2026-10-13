@@ -1286,9 +1286,12 @@ impl Engine {
     /// after reclaim because reclaim can change the active segment (R08).
     ///
     /// A request that still does not fit after a reclaim is refused only
-    /// when nothing more can be reclaimed: a checkpoint retires records up
-    /// to the durable mark, so volatile records another writer appended
-    /// while the reclaim ran are synced and a further round is taken, up to
+    /// when nothing more can be reclaimed, i.e. a checkpoint already covers
+    /// every appended record. A checkpoint retires records up to the horizon
+    /// it captured, so records another writer appended while the reclaim ran
+    /// are still held, whether they are volatile (they are synced first) or
+    /// already durable through FUA/FLUSH (`durable == appended` proves
+    /// nothing, BUG-089); a further round is taken, up to
     /// [`MAX_RECLAIM_ROUNDS`] (`last_round`).
     fn admit_journal(
         &self,
@@ -1300,7 +1303,7 @@ impl Engine {
         let exhausted = |volume: &Volume| {
             reclaimed
                 && (last_round
-                    || volume.journal_durable_sequence() >= volume.journal_appended_sequence())
+                    || volume.checkpoint_sequence() >= volume.journal_appended_sequence())
         };
         let policy = &self.inner.policy;
         let footprint =

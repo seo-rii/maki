@@ -286,6 +286,20 @@ async fn a_zero_limit_keeps_the_overlay_unbounded_for_library_callers() {
 /// after a reclaim; it held only when no other writer ran concurrently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_volatile_write_during_inline_reclaim_does_not_cause_enospc() {
+    concurrent_write_during_inline_reclaim(false).await;
+}
+
+/// BUG-089: the same with a FUA (or flushed) concurrent write. Its records
+/// are durable but newer than the horizon the running checkpoint captured,
+/// so after the reclaim `durable == appended` and the overlay still holds
+/// them. That does not prove nothing more can be reclaimed: one more round
+/// retires them. Only a checkpoint covering every appended record does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_fua_write_during_inline_reclaim_does_not_cause_enospc() {
+    concurrent_write_during_inline_reclaim(true).await;
+}
+
+async fn concurrent_write_during_inline_reclaim(fua: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let _guard = failpoints::test_lock();
@@ -319,7 +333,7 @@ async fn a_concurrent_volatile_write_during_inline_reclaim_does_not_cause_enospc
             if !once.swap(true, Ordering::SeqCst) {
                 let payload = vec![0xA5; 2 * UNIT as usize];
                 runtime
-                    .block_on(other.write(off(40), &payload, false))
+                    .block_on(other.write(off(40), &payload, fua))
                     .expect("the concurrent small write is admitted");
             }
             None
