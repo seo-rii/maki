@@ -302,7 +302,10 @@ when available, and establish throughput and tail latency with the
 ## WebSocket and gRPC contracts
 
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
-stale response IDs are discarded, pending requests are scoped to a connection
+stale response IDs are discarded; a binary frame, a text frame that is not JSON,
+or a response without a numeric ID breaks the contract and fails every request
+on that connection at once as a contract error. Ping and pong frames are
+ignored, and a close frame ends the connection. Pending requests are scoped to a connection
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
