@@ -82,6 +82,18 @@ pub fn validate_encrypt_result(
                 caps.max_ciphertext_size
             )));
         }
+        // A pass-through answer would be persisted as "ciphertext". Checked on
+        // every call, not only by the attach self-test: an endpoint can start
+        // echoing later (a stub backend behind a load balancer), and a tag
+        // appended or a nonce prepended must not hide the echo (BUG-105). A
+        // real cipher reproduces a whole unit of plaintext with negligible
+        // probability. The error charges the endpoint that answered.
+        let plain = item.data.expose();
+        if !plain.is_empty() && (ct.data.starts_with(plain) || ct.data.ends_with(plain)) {
+            return Err(CryptoError::Contract(format!(
+                "encrypt result {i} carries its plaintext: the provider is not encrypting"
+            )));
+        }
     }
     Ok(())
 }

@@ -404,7 +404,10 @@ async fn self_test_rejects_a_pass_through_provider() {
     let err = provider_self_test(&echo, &ctx(), UNIT, "test-profile-v1")
         .await
         .expect_err("echo provider passed the self-test");
-    assert!(matches!(err, CryptoError::ProviderFatal(_)), "{err}");
+    // Since BUG-105 the per-call contract check refuses the echo first; it
+    // is in the provider-fatal class, which refuses attach.
+    assert_eq!(err.class(), maki_crypto::ErrorClass::ProviderFatal, "{err}");
+    assert!(err.to_string().contains("not encrypting"), "{err}");
 }
 
 /// Claims context binding but ignores the context.
