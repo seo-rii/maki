@@ -92,3 +92,23 @@ fn check_of_a_missing_root_creates_nothing() {
         );
     }
 }
+
+/// BUG-112: help and version for the root-only checker too.
+#[test]
+fn maki_check_help_and_version_succeed() {
+    let run = |flag: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_maki-check"))
+            .arg(flag)
+            .output()
+            .unwrap()
+    };
+    let help = run("--help");
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("usage:"));
+    let version = run("--version");
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("maki-check {}", env!("CARGO_PKG_VERSION"))
+    );
+}

@@ -10,8 +10,11 @@ use std::sync::Arc;
 
 use maki_backing::Backing;
 
+const USAGE: &str =
+    "usage: maki-check <volume-backing-root> [--deep] [--journal-segment-size <bytes>]";
+
 fn usage() -> ExitCode {
-    eprintln!("usage: maki-check <volume-backing-root> [--deep] [--journal-segment-size <bytes>]");
+    eprintln!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -26,6 +29,14 @@ fn main() -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--version" | "-V" => {
+                println!("maki-check {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
             "--deep" => deep = true,
             "--journal-segment-size" => {
                 i += 1;

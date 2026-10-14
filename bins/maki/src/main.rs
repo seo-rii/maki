@@ -8,9 +8,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-fn usage() -> ExitCode {
-    eprintln!(
-        "usage:
+const USAGE: &str = "usage:
   maki volume create <config.toml> [--discard]  initialize a volume (opt-in v3 discard)
   maki volume inspect <config.toml>    print volume metadata
   maki volume witness <config.toml>    inspect remote authority without claiming a writer
@@ -28,8 +26,12 @@ fn usage() -> ExitCode {
   maki reload <config.toml> <section>  hot config reload (control socket)
     control commands take --socket <path> in place of <config.toml>, e.g.
     --socket /run/maki-control/<volume>/control.sock for maki-admin members
-  maki attach|detach|grow ...          delegated to maki-attach (privileged)"
-    );
+  maki attach|detach|grow ...          delegated to maki-attach (privileged)
+  maki --help | --version";
+
+/// Misuse: the usage on stderr, status 2.
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -133,6 +135,15 @@ fn main() -> ExitCode {
         return control_by_socket(&argv, socket, timeout);
     }
     match argv.as_slice() {
+        // BUG-112: asking for help is not misuse.
+        ["--help" | "-h" | "help"] => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        ["--version" | "-V"] => {
+            println!("maki {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         ["volume", "create", config] | ["volume", "create", config, "--discard"] => {
             let raw = match std::fs::read_to_string(config) {
                 Ok(raw) => raw,
