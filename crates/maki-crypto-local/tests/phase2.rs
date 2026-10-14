@@ -28,7 +28,8 @@ fn keys() -> MapKeySource {
     let mut m = MapKeySource::new();
     m.insert("vol-key", vec![0x11; 32]);
     m.insert("vol-key-2", vec![0x22; 32]);
-    m.insert("xts-key", vec![0x33; 64]);
+    // Distinct data and tweak halves: XTS refuses identical ones.
+    m.insert("xts-key", [vec![0x33; 32], vec![0x34; 32]].concat());
     m.insert("short-key", vec![0x44; 16]);
     m
 }
@@ -264,4 +265,22 @@ async fn local_providers_pass_conformance() {
     provider_conformance(&xts, &xts_ctx(), UNIT, "local-xts-v1")
         .await
         .unwrap();
+}
+
+/// BUG-095: IEEE 1619 / NIST SP 800-38E require the two XTS key halves to
+/// differ (FIPS 140-3 IG C.I). A 64-byte key made by repeating one 32-byte
+/// key loaded silently; it is refused like a wrong-length key.
+#[test]
+fn xts_refuses_identical_key_halves() {
+    let mut keys = MapKeySource::new();
+    let half: Vec<u8> = (100..132u8).collect();
+    keys.insert("doubled", [half.clone(), half].concat());
+    let err = AesXtsProvider::new(&keys, "doubled", 4096, "xts-v1").unwrap_err();
+    assert!(
+        matches!(&err, CryptoError::ProviderFatal(m) if m.contains("halves")),
+        "{err:?}"
+    );
+    // Control: distinct halves load.
+    keys.insert("distinct", (0..64u8).collect());
+    AesXtsProvider::new(&keys, "distinct", 4096, "xts-v1").unwrap();
 }

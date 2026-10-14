@@ -56,6 +56,14 @@ impl AesXtsProvider {
             )));
         }
         let (k1, k2) = key.expose().split_at(32);
+        // IEEE 1619 / SP 800-38E: the data and tweak keys must differ
+        // (BUG-095). Compare without an early exit.
+        if k1.iter().zip(k2).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0 {
+            return Err(CryptoError::ProviderFatal(format!(
+                "AES-256-XTS key {key_name:?} has identical halves; the data and tweak \
+                 keys must differ"
+            )));
+        }
         let c1 = Aes256::new_from_slice(k1)
             .map_err(|_| CryptoError::ProviderFatal("cipher init failed".to_string()))?;
         let c2 = Aes256::new_from_slice(k2)
