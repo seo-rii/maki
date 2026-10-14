@@ -1037,10 +1037,16 @@ impl EndpointSet {
                             return Err(err);
                         }
                         match err.class() {
-                            ErrorClass::Retryable
+                            class @ (ErrorClass::Retryable
                             | ErrorClass::Throttled
-                            | ErrorClass::EndpointFatal => {
-                                probe.on_failure();
+                            | ErrorClass::EndpointFatal) => {
+                                if class == ErrorClass::EndpointFatal {
+                                    // Unusable, not unlucky: open now so
+                                    // later requests go to a peer (BUG-094).
+                                    probe.on_endpoint_fatal();
+                                } else {
+                                    probe.on_failure();
+                                }
                                 last_error = Some(err);
                                 if let Some(dl) = deadline {
                                     if self.clock.now() >= dl {

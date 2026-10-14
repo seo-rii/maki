@@ -160,3 +160,63 @@ async fn a_contract_violating_endpoint_is_not_retried_on_a_later_pass() {
         "the request was sent again to the endpoint that violated the contract"
     );
 }
+
+fn endpoint_fatal() -> CryptoError {
+    CryptoError::EndpointFatal("HTTP 401 Unauthorized".into())
+}
+
+/// BUG-094: an `EndpointFatal` answer (revoked credential, missing route,
+/// refused TLS identity) says the endpoint is unusable, not that one attempt
+/// was unlucky. It opens that endpoint's circuit at once, so later requests
+/// go to a healthy peer instead of failing `failure_threshold` times first.
+/// A non-retry-safe request that already reached it is still never re-sent.
+#[tokio::test]
+async fn an_endpoint_fatal_answer_opens_the_circuit_at_once() {
+    let revoked = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let healthy = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    revoked.fail_next((0..100).map(|_| endpoint_fatal()));
+    let set = EndpointSet::new(
+        vec![
+            ("revoked".into(), revoked.clone()),
+            ("healthy".into(), healthy.clone()),
+        ],
+        cfg(false),
+        Arc::new(ManualClock::new()),
+    );
+    let err = set.encrypt_batch(&ctx(), &[pt(1)]).await.unwrap_err();
+    assert!(matches!(err, CryptoError::EndpointFatal(_)), "{err:?}");
+    assert_eq!(
+        healthy.encrypt_calls(),
+        0,
+        "never re-sent when not retry-safe"
+    );
+    assert_eq!(set.endpoint_status()[0].circuit, CircuitState::Open);
+
+    for i in 2..10 {
+        let out = set
+            .encrypt_batch(&ctx(), &[pt(i)])
+            .await
+            .expect("later requests route to the healthy peer");
+        assert_eq!(out[0].unit_index, i);
+    }
+    assert_eq!(revoked.encrypt_calls(), 1);
+}
+
+/// Control: ordinary transient failures still need `failure_threshold`
+/// consecutive failures before the circuit opens.
+#[tokio::test]
+async fn a_retryable_failure_alone_does_not_open_the_circuit() {
+    let flaky = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let healthy = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    flaky.fail_next([CryptoError::Retryable("blip".into())]);
+    let set = EndpointSet::new(
+        vec![
+            ("flaky".into(), flaky.clone()),
+            ("healthy".into(), healthy.clone()),
+        ],
+        cfg(false),
+        Arc::new(ManualClock::new()),
+    );
+    set.encrypt_batch(&ctx(), &[pt(1)]).await.unwrap_err();
+    assert_eq!(set.endpoint_status()[0].circuit, CircuitState::Closed);
+}
