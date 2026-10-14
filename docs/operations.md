@@ -107,6 +107,21 @@ install -d -o maki -g maki -m 0700 /var/lib/maki/example
 sudo -u maki maki volume create /etc/maki/volumes/example.toml
 ```
 
+The packaged units derive every path from the systemd instance name, so with
+them the instance, the file names and two configuration values must agree. For
+instance `example`:
+
+| Item | Required value |
+|---|---|
+| Volume configuration | `/etc/maki/volumes/example.toml` (`maki@example` reads it) |
+| `volume.name` | `example`: the default control socket is `/run/maki-control/<volume.name>/control.sock`, and the unit only creates and permits `/run/maki-control/example` and `/run/maki/example` |
+| `backing.root` | `/var/lib/maki/example`: `ProtectSystem=strict` leaves only that tree writable |
+| Attach configuration | `/etc/maki/attach/example.toml` (`maki-attach@example` reads it and connects to `/run/maki/example/nbd.sock`) |
+| Credential | `/etc/maki/secrets/example.token`, loaded as `crypto-token` |
+
+A mismatch shows up as a daemon that cannot bind its control socket or open
+its backing. Override paths only together with a matching service drop-in.
+
 `maki-check` can also inspect a backing root directly:
 
 ```bash

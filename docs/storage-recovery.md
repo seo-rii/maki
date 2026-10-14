@@ -238,6 +238,23 @@ cleanup succeeds; a cleanup failure leaves the workload stopped. Retry loops
 are bounded by the daemon start limit and the recovery job timeout. The target
 stop path runs attach cleanup before the daemon stops.
 
+The daemon unit allows three starts in five minutes (`StartLimitBurst=3`,
+`StartLimitIntervalSec=300`). Once a crash loop reaches that limit, systemd
+refuses every further start of `maki@<volume>.service`, including the one the
+recovery unit's `OnSuccess=` requests and a manual `systemctl start`, until the
+interval has passed or the failed state is cleared. After fixing the cause,
+clear it for the whole lifecycle and start the target again:
+
+```sh
+systemctl reset-failed 'maki*@<volume>.*'
+systemctl start maki-workload@<volume>.target
+```
+
+Keep the glob quoted. `systemctl` matches a glob only against loaded units, so
+the command covers the daemon, attach, recovery and target units of that one
+volume and skips any that are not loaded. A literal name of a unit that is not
+loaded fails the command instead.
+
 The graph controls only workloads registered in the target. Disable other
 supervisors and Docker restart policies that could start the application
 outside it. A host remount is not assumed to update an existing Docker bind

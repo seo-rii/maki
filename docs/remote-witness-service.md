@@ -319,6 +319,32 @@ to lower-case hexadecimal for the commands below. In Python a reviewed current
 root is `bytes(record["current"]["anchor"]["root"]).hex()`; a snapshot root is
 `bytes(descriptor["anchor"]["root"]).hex()`.
 
+Takeover and restore fence whichever writer currently holds the authority,
+a healthy one included: its next commit is refused and its mounted filesystem
+sees I/O errors. The packaged recovery unit may then start a new daemon that
+claims the new state before you have inspected it, and after a restore that
+state is the older snapshot. Quiesce first:
+
+1. Stop the workload lifecycle with `systemctl stop maki-workload@<volume>.target`
+   and wait until the workloads, `maki-attach@<volume>.service` and
+   `maki@<volume>.service` all report `inactive`
+   ([planned shutdown](deployment/postgres.md#6-planned-stop-and-start)).
+2. Run takeover or restore below, then inspect the result with
+   `maki volume witness`.
+3. Return the backing to the daemon user (next paragraph) and only then start
+   the target again.
+
+These commands, and `resume-enrollment`, create the new writer namespace
+owner-only (`0700` directories, `0600` files) as the user that runs them. Run
+as root, which an administrator key readable only by root requires, they leave
+a `remote-*` tree the `maki` daemon cannot open, and the next attach fails. Keep
+the administrator key unreadable to the daemon user and hand the tree back after
+the command instead:
+
+```sh
+chown -R maki:maki /var/lib/maki/<volume>
+```
+
 For a stale or failed writer, review the current fence/root and replace the
 placeholders:
 

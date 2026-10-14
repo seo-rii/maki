@@ -159,8 +159,20 @@ production.
 - Cleanup blocked by an open file on the LV: the lifecycle stays down and
   reports the failure; close the descriptor and retry
   ([storage recovery](../storage-recovery.md)).
-- Backing filesystem full: writes fail with ENOSPC before acknowledgement;
-  PostgreSQL sees write errors and stops. Existing data stays readable.
+- Repeated daemon failures: after three starts in five minutes systemd refuses
+  to start `maki@postgres.service` again. Fix the cause, then run
+  `systemctl reset-failed 'maki*@postgres.*'` before
+  `systemctl start maki-workload@postgres.target`
+  ([packaged lifecycle](../storage-recovery.md#packaged-workload-lifecycle)).
+- Backing filesystem full (free space below the emergency reserve plus the
+  checkpoint headroom): Maki refuses writes before acknowledgement, and the
+  kernel NBD client reports them to the filesystem as I/O errors (EIO), not
+  ENOSPC. PostgreSQL stops on the write error. Do not count on reading data
+  through the mount meanwhile: XFS shuts itself down when a log write fails,
+  and deleting files inside the volume does not help, because a delete is a
+  write too. Free space on the backing filesystem, then restart the lifecycle.
+  No database run under space pressure has been qualified yet
+  ([pressure run](../qualification/database-discard-pressure-validation-2026-10-03.md)).
 - Provider unavailable (remote provider): with `availability_policy = "stall"`
   I/O stalls until an endpoint returns; nothing is acknowledged meanwhile.
 

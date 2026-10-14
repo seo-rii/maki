@@ -473,9 +473,10 @@ does not postpone the worker's periodic sync of pending writes.
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
 journal, and `limits.max_ciphertext_bytes` only governs the remote scheduler's
-queue, not this structure. `maki status` reports `overlay_bytes` and
-`overlay_units`; the byte figure is the logical charge (a shared version is
-counted twice), not process RSS, and the bound applies to that projection.
+queue, not this structure. `maki metrics` reports `maki_overlay_bytes` and
+`maki_overlay_units` (`maki status` does not); the byte figure is the logical
+charge (a shared version is counted twice), not process RSS, and the bound
+applies to that projection.
 
 Free space is read with `statvfs` on Unix hosts. When the emergency reserve is
 enabled, an unavailable or failed query fails write admission with ENOSPC;
