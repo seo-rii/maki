@@ -16,11 +16,18 @@
 //! survive while an earlier one is lost), so damage there is a torn tail
 //! and everything from the damage on is dropped — those records were never
 //! acknowledged durable. The writer records the fdatasync'd prefix in the
-//! [`DurableMark`] (`journal/durable-mark`) after every sync; recovery
-//! passes it to [`scan_segment_bounded`]. Without a mark (older volumes,
-//! or the mark's own write lost) the scanner falls back to the heuristic in
-//! [`scan_segment`]: a failed payload CRC immediately followed by a valid
-//! successor record is treated as corruption.
+//! [`DurableMark`] (`journal/durable-mark`) after every sync.
+//!
+//! This module provides the record and segment codecs, the durable mark and
+//! two in-memory scanners used by tests, fuzzing and differential checks:
+//! [`scan_segment_bounded`] classifies against a known durable prefix, and
+//! [`scan_segment`] (no prefix) uses a heuristic: a failed payload CRC
+//! immediately followed by a valid successor record is treated as
+//! corruption. Recovery uses neither. It streams segments through its own
+//! scanner (`maki-core`'s `recovery_scan`), takes the durable prefix from the
+//! durable proof and mark, and never falls back to the heuristic: without
+//! either for the final segment only its header is proven, so damage after
+//! it is a torn tail (M-007, S-04).
 
 use uuid::Uuid;
 

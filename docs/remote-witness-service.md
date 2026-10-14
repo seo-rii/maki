@@ -94,6 +94,12 @@ and allow-lists govern the public witness protocol; they do not restrict a
 client that has direct backend access. This feature does not configure etcd
 membership, storage, network policy or authentication infrastructure.
 
+Every FLUSH or FUA, like every other backing sync such as a checkpoint,
+advances the authority record with an etcd transaction, so etcd's revision
+history grows with the volume's write rate. Enable etcd auto-compaction and
+monitor the backend quota: at the quota, etcd raises a `NOSPACE` alarm and
+refuses writes, and the volume stops.
+
 Record the actual cluster ID from trusted operator inspection. Configure it as
 a quoted canonical decimal string so the full unsigned 64-bit range fits TOML.
 Replace the example cluster ID and addresses below. The storage identity must be a fresh,
@@ -176,7 +182,12 @@ pin is checked by a read before mutation on that endpoint.
 Etcd leader failover and frontend failover retain the same history. Etcd
 snapshot rollback, cluster recreation and changing the cluster pin require a
 separate explicit authority migration; never reset a pin to accept an older
-snapshot. Never restore the quorum with a volume backup. To move an existing file-backed authority volume to quorum mode, create a
+snapshot. The pin detects a different cluster, not a restore of the same one:
+restoring an etcd snapshot with the original `--initial-cluster-token` and peer
+URLs reproduces the same cluster ID, so frontends accept the older authority
+state it holds. Such a restore is an administrator action outside the freshness
+guarantee and belongs only in that explicit migration, never in routine etcd
+recovery. Never restore the quorum with a volume backup. To move an existing file-backed authority volume to quorum mode, create a
 separate destination with a fresh storage identity and perform a verified
 logical data migration. Copying an existing local authority value into etcd
 while its old service can still run would fork trusted history and is refused

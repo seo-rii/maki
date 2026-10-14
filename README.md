@@ -115,8 +115,8 @@ Format and behaviour changes: [CHANGELOG.md](CHANGELOG.md).
 
 | Path | Purpose |
 |---|---|
-| `crates/` | Storage engine, format, crypto providers, control plane, test support |
-| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark` |
+| `crates/` | Storage engine, format, crypto providers, control plane, remote witness, test support |
+| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark`, `maki-witness` |
 | `packaging/` | Debian package builder, systemd, sysusers, tmpfiles, provider examples |
 | `examples/` | Complete deployment bundles |
 | `docs/` | User, operator, reference and qualification documentation |

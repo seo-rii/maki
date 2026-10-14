@@ -26,7 +26,8 @@ HTTP example is available at
 | `security` | Core-dump, memory-lock, and secure-swap policy |
 
 Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
-Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
+Durations use values such as `150us`, `50ms`, `5s`, or `2m` (minutes), always
+as a quoted string with a unit. Unlike byte sizes, a bare integer is rejected.
 
 `volume.name` is an operational identifier of 1–64 ASCII bytes, using only
 letters, digits, `_` and `-`. Validation rejects longer names before creating
@@ -147,7 +148,9 @@ Changing a mode cannot bypass the mandatory integrity/context tests.
 schema, geometry, and secret-literal checks it rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
-  `[crypto.circuit_breaker]`, and `[crypto.retry_budget]`, a non-finite or
+  `[crypto.circuit_breaker]`, and `[crypto.retry_budget]` (except
+  `limits.max_overlay_bytes` and `limits.max_overlay_entries`, where `0`
+  disables the bound), a non-finite or
   negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s` or whose reciprocal cannot
   be represented by `Duration`, an
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch

@@ -3,7 +3,9 @@
 //! Maki never trusts a provider's batch result shape. `CheckedProvider`
 //! wraps any provider and verifies count, order, unit indices, and size
 //! limits on every call; a violation is `CryptoError::Contract`
-//! (ProviderFatal — a misbehaving provider is never retried into).
+//! (ProviderFatal). It is never retried against the endpoint that sent it; in
+//! an `EndpointSet` it charges that endpoint's breaker, and a retry-safe
+//! request fails over to an endpoint it has not tried yet (R5-005).
 
 use std::sync::Arc;
 

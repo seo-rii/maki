@@ -2033,8 +2033,8 @@ valid power-loss evidence.
 # 55. CI Strategy
 
 The checked-in workflow runs the pull-request suite on Linux and Windows.
-Scheduled nightly jobs run the seven named release phase gates, the plugin
-build/ABI check, and fake-provider refusal. The DB gate is a simulated commit
+Scheduled nightly jobs run every ignored release gate (no name filter), the
+plugin build/ABI check, and fake-provider refusal. The DB gate is a simulated commit
 ledger; it does not run SQLite, PostgreSQL or a kernel XFS stack. The broader
 tiers below are qualification targets. Continued fuzzing, systemd sandbox,
 real DB/XFS, weekly and release qualification require separate runners and

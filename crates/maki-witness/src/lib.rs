@@ -1,7 +1,7 @@
 //! Authenticated, bounded remote freshness authority transport.
 //!
-//! Each TLS 1.3 connection carries one versioned, request-id-bound RPC. The
-//! A single client call never retries. Identity-pinned endpoint sets retry the
+//! Each TLS 1.3 connection carries one versioned, request-id-bound RPC. A
+//! single client call never retries. Identity-pinned endpoint sets retry the
 //! same operation after transport failures, resolving possible durable commits.
 
 pub mod failover;

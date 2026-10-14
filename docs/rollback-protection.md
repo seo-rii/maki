@@ -27,8 +27,13 @@ Tests use a RAM filesystem solely to exercise the separate-device boundary.
 
 Replacing an old valid ciphertext page fails authentication against the current
 manifest. Restoring an older complete backing fails comparison with the current
-witness. Missing or corrupt committed evidence refuses attachment; an observed
-witness mismatch or uncertain storage commit stops every handle in that session.
+witness. Missing or corrupt committed evidence refuses attachment. In a running
+session, any failed freshness check or uncertain storage commit stops every
+handle in that session: a witness mismatch, and equally a witness that is only
+temporarily unavailable. The session stays stopped after the witness returns
+and never falls back. Recover by detaching and reattaching the volume; a remote
+session that could not be released needs the
+[takeover procedure](remote-witness-service.md#snapshot-takeover-and-restore).
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.

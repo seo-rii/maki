@@ -503,8 +503,9 @@ WRITE A with FUA succeeds; crash
 => A is new
 ```
 
-`CrashableBacking` models independent survival of pending operations. Tearing is
-available but is not enabled in the main power-loss gate. Simulation is useful
+`CrashableBacking` models independent survival of pending operations. The main
+power-loss gate (`phase12_powerloss.rs`) also enables tearing at 512-byte
+granularity, so an unsynced write can survive in part. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 

@@ -184,11 +184,14 @@ impl FileKeySource {
             )));
         }
         let path = self.dir.join(name);
-        // SPEC §9: a file credential is a *root-only secret file*. A key
-        // readable by the group or by others, or anything but a regular
-        // file (a symlink to somewhere else, a FIFO), is refused rather
-        // than loaded. systemd's LoadCredential files are 0400. The checks
-        // run on the opened descriptor (see `open_credential`).
+        // SPEC §9: a file credential is a *root-only secret file*. Any group
+        // or other access, or anything but a regular file (a symlink to
+        // somewhere else, a FIFO), is refused rather than loaded. The one
+        // exception is systemd's credentials directory: from systemd 257,
+        // LoadCredential files are 0440 for the service's group, so group
+        // read (never write) is accepted there when the file's group is the
+        // process's effective group or root (R5-037). The checks run on the
+        // opened descriptor (see `open_credential`).
         let (file, meta) = match open_credential(&path) {
             Ok(opened) => opened,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
