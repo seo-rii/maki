@@ -184,6 +184,9 @@ fn assert_storage_full(result: Result<(), CoreError>) {
 #[tokio::test]
 async fn consecutive_write_observes_external_space_drop_without_clock_advance() {
     let (backing, clock, engine) = fixture(RESERVE).await;
+    // A refusal wakes the worker to reclaim space (BUG-106); with a durable
+    // record to apply it would checkpoint. Admission alone is under test.
+    engine.stop_checkpoint_worker().await;
     backing.storage.set_free_bytes(Some(2 * RESERVE));
     engine.write(0, &[0xA5; UNIT as usize], true).await.unwrap();
     let before = engine.monitoring_snapshot().stats;
