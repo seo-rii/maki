@@ -246,6 +246,26 @@ pub(super) fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Ba
     }))
 }
 
+/// Authenticate the authority's current generation in this root *before* a
+/// claim or takeover changes the authority. A configuration that names
+/// another volume's witness would otherwise raise that volume's fence (or
+/// revoke its live writer) and only then fail to find the data (BUG-107).
+/// GC applies the same check before trusting an authority.
+fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<()> {
+    let current = record
+        .current
+        .as_ref()
+        .ok_or_else(|| invalid("uninitialized remote backing"))?;
+    let source = scope(disk.clone(), &current.namespace)
+        .map_err(|_| invalid("remote authority's current namespace is not valid in this root"))?;
+    load_generation(source.as_ref(), current).map_err(|error| {
+        invalid(format!(
+            "this backing root does not hold the remote authority's current generation              ({error}); check the witness address and backing root before retrying"
+        ))
+    })?;
+    Ok(())
+}
+
 pub(super) fn load_generation(
     disk: &dyn Backing,
     descriptor: &Descriptor,
@@ -405,6 +425,7 @@ impl RollbackBacking {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let expected = inspect(rpc.as_ref())?;
+        holds_current(&disk, &expected)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
@@ -415,6 +436,7 @@ impl RollbackBacking {
     pub fn takeover_remote(root: &Path, rpc: Arc<dyn Rpc>, expected: &Record) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
+        holds_current(&disk, expected)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), expected, &authorization, Action::Takeover)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
