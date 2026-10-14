@@ -930,3 +930,35 @@ fn same_writer_certificate_cannot_reuse_its_old_key_after_admin_enrollment_recov
     let mut reopened = StateStore::open(&directory).unwrap();
     assert_eq!(reopened.handle(Role::Writer, &public).unwrap(), released);
 }
+
+/// BUG-104: `serve` reserved one of `max_connections` worker slots for every
+/// accepted TCP socket before TLS, and closed any socket that arrived while
+/// they were all taken. A peer without a certificate held every slot with
+/// idle sockets, renewed once per timeout, and every writer's freshness
+/// check then failed. Workers are taken only after authentication; pending
+/// handshakes are bounded separately and the oldest is evicted first.
+#[test]
+fn idle_unauthenticated_sockets_cannot_lock_out_an_authenticated_client() {
+    let fixture = Fixture::new();
+    let server = Arc::new(fixture.server());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handler: Arc<maki_witness::Handler> =
+        Arc::new(|_, request: &[u8]| serde_json::from_slice(request).map_err(io::Error::other));
+    std::thread::spawn(move || server.serve(listener, handler));
+
+    // Twice as many idle sockets as worker slots, all accepted by the
+    // server before the real client arrives.
+    let idle: Vec<_> = (0..4)
+        .map(|_| std::net::TcpStream::connect(address).unwrap())
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let client = Client::new(fixture.client(address)).unwrap();
+    let answer = client.call::<_, Value>(&json!({"inspect": true}));
+    drop(idle);
+    assert_eq!(
+        answer.expect("an authenticated client was refused behind idle sockets"),
+        json!({"inspect": true})
+    );
+}

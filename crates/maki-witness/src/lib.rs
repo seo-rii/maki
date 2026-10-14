@@ -8,9 +8,9 @@ pub mod failover;
 
 pub mod etcd;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -389,6 +389,8 @@ struct DeadlineIo {
     socket: TcpStream,
     deadline: Instant,
 }
+
+type ServerStream = rustls::StreamOwned<rustls::ServerConnection, DeadlineIo>;
 impl Read for DeadlineIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.socket
@@ -424,6 +426,61 @@ pub struct Server {
     timeout: Duration,
     max_connections: usize,
     active: Arc<AtomicUsize>,
+}
+
+/// Connections that have not yet been given a worker slot, oldest first.
+/// Each entry holds a duplicate of the socket so it can be cut off.
+struct Handshakes {
+    capacity: usize,
+    pending: Mutex<(u64, VecDeque<(u64, TcpStream)>)>,
+}
+
+/// Leaves the handshake table on drop: authenticated, failed, or unwound.
+struct HandshakeTicket {
+    table: Arc<Handshakes>,
+    id: u64,
+}
+
+impl Handshakes {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            pending: Mutex::new((0, VecDeque::new())),
+        }
+    }
+
+    fn admit(self: &Arc<Self>, socket: &TcpStream) -> io::Result<HandshakeTicket> {
+        let duplicate = socket.try_clone()?;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while pending.1.len() >= self.capacity {
+            if let Some((_, oldest)) = pending.1.pop_front() {
+                // Its thread sees EOF and leaves; it holds no worker slot,
+                // since the ticket is dropped only once one is reserved.
+                let _ = oldest.shutdown(Shutdown::Both);
+            }
+        }
+        let id = pending.0;
+        pending.0 = pending.0.wrapping_add(1);
+        pending.1.push_back((id, duplicate));
+        Ok(HandshakeTicket {
+            table: self.clone(),
+            id,
+        })
+    }
+}
+
+impl Drop for HandshakeTicket {
+    fn drop(&mut self) {
+        let mut pending = self
+            .table
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.1.retain(|(id, _)| *id != self.id);
+    }
 }
 
 /// Its drop releases capacity on success, authentication failure, and unwind.
@@ -508,7 +565,8 @@ impl Server {
     }
 
     /// Handle exactly one connection, sharing one absolute network deadline.
-    /// The production accept loop reserves a permit before creating a thread.
+    /// The production accept loop bounds pending handshakes and takes a
+    /// worker permit only after authentication (see [`Server::serve`]).
     pub fn handle_connection(&self, socket: TcpStream, handler: &Handler) -> io::Result<()> {
         self.handle_until(socket, Instant::now() + self.timeout, handler)
     }
@@ -519,6 +577,16 @@ impl Server {
         deadline: Instant,
         handler: &Handler,
     ) -> io::Result<()> {
+        let (tls, role) = self.authenticate(socket, deadline)?;
+        self.respond(tls, role, deadline, handler)
+    }
+
+    /// TLS 1.3 with a listed client certificate, mapped to its role.
+    fn authenticate(
+        &self,
+        socket: TcpStream,
+        deadline: Instant,
+    ) -> io::Result<(ServerStream, Role)> {
         socket.set_nodelay(true)?;
         let mut io = DeadlineIo { socket, deadline };
         let mut connection =
@@ -545,7 +613,16 @@ impl Server {
                     "unlisted client certificate",
                 )
             })?;
-        let mut tls = rustls::StreamOwned::new(connection, io);
+        Ok((rustls::StreamOwned::new(connection, io), role))
+    }
+
+    fn respond(
+        &self,
+        mut tls: ServerStream,
+        role: Role,
+        deadline: Instant,
+        handler: &Handler,
+    ) -> io::Result<()> {
         let frame = read_frame(&mut tls)?;
         let request: IncomingRequest<'_> = serde_json::from_slice(frame.expose())
             .map_err(|_| corrupt("invalid witness request"))?;
@@ -578,7 +655,17 @@ impl Server {
         write_frame(&mut tls, bytes.expose())
     }
 
+    /// Serve connections until the listener fails.
+    ///
+    /// A worker slot (`max_connections`) is taken only after TLS has
+    /// authenticated a listed certificate, and an authenticated connection
+    /// waits for one until its deadline instead of being closed. Before
+    /// that, a connection only holds a handshake slot: those are bounded at
+    /// four per worker, and when they are all taken the oldest pending
+    /// handshake is cut off. Idle unauthenticated sockets therefore cannot
+    /// starve a client that completes TLS promptly (BUG-104).
     pub fn serve(self: Arc<Self>, listener: TcpListener, handler: Arc<Handler>) -> io::Result<()> {
+        let handshakes = Arc::new(Handshakes::new(self.max_connections * 4));
         for accepted in listener.incoming() {
             let socket = match accepted {
                 Ok(socket) => socket,
@@ -586,7 +673,7 @@ impl Server {
                 Err(e) => return Err(e),
             };
             let deadline = Instant::now() + self.timeout;
-            let Ok(permit) = self.try_reserve_connection() else {
+            let Ok(ticket) = handshakes.admit(&socket) else {
                 continue;
             };
             let server = self.clone();
@@ -594,12 +681,26 @@ impl Server {
             std::thread::Builder::new()
                 .name("maki-witness-rpc".into())
                 .spawn(move || {
-                    let _permit = permit;
                     // No application payloads or remote error text are logged.
-                    let _ = server.handle_until(socket, deadline, handler.as_ref());
+                    let _ = (|| {
+                        let (tls, role) = server.authenticate(socket, deadline)?;
+                        let _permit = server.reserve_until(deadline)?;
+                        drop(ticket);
+                        server.respond(tls, role, deadline, handler.as_ref())
+                    })();
                 })?;
         }
         Ok(())
+    }
+
+    /// Wait for a worker slot until `deadline`.
+    fn reserve_until(&self, deadline: Instant) -> io::Result<ConnectionPermit> {
+        loop {
+            if let Ok(permit) = self.try_reserve_connection() {
+                return Ok(permit);
+            }
+            std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(2)));
+        }
     }
 }
 

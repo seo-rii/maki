@@ -426,8 +426,13 @@ connection rolled a transaction back. Quorum unavailability stops service;
 there is no stale replica or offline fallback.
 
 The server admits 1–256 connection workers and requires 1–256 distinct
-allow-listed certificate identities. Admission precedes worker creation, and
-capacity is released on success, error or Rust unwinding. A connection's
+allow-listed certificate identities. A connection takes a worker only after
+TLS has authenticated an allow-listed certificate, and waits for one until its
+deadline instead of being closed. Before that it holds one of four handshake
+slots per worker; when they are all taken, the oldest pending handshake is cut
+off, so idle unauthenticated sockets cannot lock out writers. Admission
+precedes thread creation, and capacity is released on success, error or Rust
+unwinding. A connection's
 absolute deadline covers handshake, framing and replies; slow fragments cannot
 extend it. A blocked local filesystem operation cannot be forcibly cancelled
 by the socket deadline, but workers remain bounded and clients time out.
