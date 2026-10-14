@@ -1194,7 +1194,7 @@ fn initialize_volume(
             .map(|k| k.name.clone())
             .unwrap_or_default(),
         geometry,
-        format_version: 1,
+        format_version: maki_format::superblock::CRYPTO_FORMAT_VERSION,
         created_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
