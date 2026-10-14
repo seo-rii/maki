@@ -996,6 +996,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "thiserror",
  "tokio",
  "tonic",

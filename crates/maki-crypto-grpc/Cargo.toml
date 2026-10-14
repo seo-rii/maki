@@ -13,6 +13,9 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 tonic = { version = "0.13", features = ["tls-native-roots"] }
+# Probes whether the host trust store has any roots before asking tonic for
+# them (tonic refuses an empty store even when a CA is configured).
+rustls-native-certs = "0.8"
 prost = "0.13"
 http-body = "1"
 zeroize.workspace = true

@@ -585,7 +585,19 @@ impl GrpcCryptoProvider {
                 return Err(fatal("https endpoint requires explicit TLS configuration"));
             }
             (Some("https"), Some(tls)) => {
-                let mut config = ClientTlsConfig::new().with_native_roots();
+                // A configured CA adds trust to the host's roots, as for the
+                // HTTP and WebSocket transports. tonic refuses to build the
+                // connector when native roots are requested and none load, so
+                // on a host with an empty OS store the CA in hand was useless
+                // (BUG-097): request native roots only if there are any, or if
+                // no CA is configured (then nothing is trusted and attach
+                // fails closed, as before).
+                let native_roots = tls.ca_certificate_pem.is_none()
+                    || !rustls_native_certs::load_native_certs().certs.is_empty();
+                let mut config = ClientTlsConfig::new();
+                if native_roots {
+                    config = config.with_native_roots();
+                }
                 if let Some(ca) = tls.ca_certificate_pem {
                     if ca.is_empty() {
                         return Err(fatal("custom TLS CA certificate is empty"));
