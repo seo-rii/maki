@@ -167,7 +167,11 @@ systemd-analyze verify maki@demo.service maki-attach@demo.service \
 assertion until a volume exists; that is expected.)
 
 Grant an administrator account access to control sockets by adding it to the
-`maki-admin` group. Root does not need it.
+`maki-admin` group. Root does not need it. The volume configuration is
+readable only by root and group `maki`, so a `maki-admin` member names the
+socket directly: `maki status --socket /run/maki-control/<volume>/control.sock`.
+Do not add administrators to group `maki` instead: it also opens the NBD
+sockets under `/run/maki`.
 
 ## Next steps
 

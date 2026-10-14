@@ -313,6 +313,18 @@ maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456 --ttl 1s
 ```
 
+The control commands use the configuration only to find the socket: they
+parse it but do not validate it, so a configuration edited for the next start
+cannot block `maki drain` on the running daemon. The packaged configuration is
+readable only by root and group `maki`; a `maki-admin` member names the socket
+instead, with `--socket` in place of the configuration:
+
+```bash
+maki status --socket /run/maki-control/example/control.sock
+maki drain --socket /run/maki-control/example/control.sock
+maki reload --socket /run/maki-control/example/control.sock cache --max-bytes 268435456
+```
+
 `drain` permanently closes admission to reads, writes, flushes, checkpoints,
 and reloads for that attachment. It waits for already admitted callbacks,
 including writes still waiting for encryption, then flushes and checkpoints.
