@@ -146,9 +146,14 @@ unsafe extern "C" fn after_fork() -> c_int {
 unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
     guarded("config", -1, || {
         let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
-        let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+        let value = unsafe { CStr::from_ptr(value) };
         if key == "config" {
-            *CONFIG_PATH.lock() = Some(value.into_owned());
+            // A lossy conversion would store a different path (BUG-120).
+            let Ok(path) = value.to_str() else {
+                eprintln!("maki-nbdkit: config=<path> must be valid UTF-8");
+                return -1;
+            };
+            *CONFIG_PATH.lock() = Some(path.to_owned());
             0
         } else {
             eprintln!("maki-nbdkit: unknown parameter {key}");
@@ -611,6 +616,18 @@ mod tests {
         assert_eq!(log.admit(start + Duration::from_millis(900)), None);
         assert_eq!(log.admit(start + Duration::from_secs(1)), Some(2));
         assert_eq!(log.admit(start + Duration::from_secs(1)), None);
+    }
+
+    /// BUG-120: the `config` value went through `to_string_lossy`, so a path
+    /// with a non-UTF-8 byte was stored with U+FFFD in its place and attach
+    /// then failed with a misleading "not found", or opened a file whose
+    /// name literally contains U+FFFD. Such a value is refused instead.
+    #[test]
+    fn a_non_utf8_config_path_is_refused_not_rewritten() {
+        let before = CONFIG_PATH.lock().clone();
+        let status = unsafe { config(c"config".as_ptr(), c"/tmp/\xff.toml".as_ptr()) };
+        assert_eq!(status, -1);
+        assert_eq!(*CONFIG_PATH.lock(), before, "a rewritten path was stored");
     }
 
     #[test]
