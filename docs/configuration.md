@@ -531,7 +531,8 @@ requests are coalesced into one provider call when their items fit
 `crypto.batch.max_items` / `max_bytes`; a batch is dispatched as soon as
 `target_items` or `target_bytes` is reached, and at the latest `max_wait`
 after its first item arrived. A request's items are never split and keep
-their order. Each lane keeps up to `limits.max_crypto_inflight_batches`
+their order. Requests that touch the same unit are never coalesced: one
+provider call never carries a unit twice. Each lane keeps up to `limits.max_crypto_inflight_batches`
 batches in flight at once (the dispatcher's own limits bound what reaches the
 endpoints), so one slow batch does not serialize the requests behind it.
 `limits.max_pending_crypto_items` bounds queued items per lane (one permit per
