@@ -287,8 +287,10 @@ example configuration; `sysusers.d` makes `maki` a member so the unprivileged da
 it). A socket that cannot be bound fails attach: a daemon without its control
 socket is not operable. Rootless runs must therefore set `control.socket` to a
 writable path. An address with a live listener, including a full connection
-backlog, is refused instead of replaced. Stale sockets can be reclaimed;
-concurrent publishers serialize the address check and publication. Clean
+backlog, is refused instead of replaced. Stale sockets can be reclaimed; any
+other file at the address (a regular file, a symlink, a directory) is refused
+and left untouched, so a mistyped `control.socket` cannot overwrite volume
+data. Concurrent publishers serialize the address check and publication. Clean
 detach removes only the socket inode owned by that listener, so an older
 daemon cannot remove a successor that reused its pathname.
 
