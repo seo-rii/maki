@@ -199,7 +199,7 @@ Use a dedicated socket and one daemon per volume:
 ```bash
 nbdkit --foreground \
   -U /run/maki/example/nbd.sock \
-  /usr/lib/maki/libmaki_nbdkit.so \
+  /usr/lib/maki/maki-nbdkit.so \
   config=/etc/maki/volumes/example.toml
 ```
 

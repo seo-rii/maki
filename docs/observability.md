@@ -96,5 +96,8 @@ subscriber at startup (default threshold `info`, `MAKI_LOG` overrides), so
 checkpoint and journal-sync failures, provider quarantine, store repairs and
 control-server errors appear in `journalctl -u maki@<volume>.service` with
 their level and target. A `state: degraded` in `maki status` therefore has a
-matching `WARN` line with the underlying error class. See
-[operations: logging](operations.md#logging).
+matching `WARN` line with the underlying error class. A failed NBD request
+(read, write, flush, trim or zero) is logged as a `WARN` `request failed` line
+with the operation, offset, length, errno and error, at most once per second;
+the next line counts the ones suppressed in between. Payload bytes are never
+logged. See [operations: logging](operations.md#logging).
