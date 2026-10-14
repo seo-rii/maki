@@ -176,6 +176,10 @@ pub struct SlotStore {
     /// A bounded post-recovery scan retries physical release of persisted
     /// tombstones. No extra per-unit bitmap or payload history is retained.
     reclaim_cursor: Option<(u64, u64)>,
+    /// The last reclamation window failed to punch (BUG-123): the scan keeps
+    /// its cursor, but is not pending work until a later checkpoint, run
+    /// for its own reasons, retries it.
+    reclaim_stalled: bool,
 }
 
 /// Shard index of a `shard-XXXXXXXX.dat` file name, verified by
@@ -528,6 +532,7 @@ impl SlotStore {
             damaged_units,
             discard_enabled,
             reclaim_cursor: None,
+            reclaim_stalled: false,
         })
     }
 
@@ -562,7 +567,7 @@ impl SlotStore {
     }
 
     pub(crate) fn has_pending_reclamation(&self) -> bool {
-        self.reclaim_cursor.is_some()
+        self.reclaim_cursor.is_some() && !self.reclaim_stalled
     }
 
     /// Call only after bounded replay has applied every surviving record.
@@ -1024,6 +1029,7 @@ impl SlotStore {
         };
         let shard = &self.shards[&idx];
         if shard.dirty_discard {
+            self.reclaim_stalled = true;
             return Err(CoreError::Durability(
                 "reclamation requires durable discard metadata".into(),
             ));
@@ -1038,7 +1044,11 @@ impl SlotStore {
             .filter(|in_shard| map.get(*in_shard))
             .map(|in_shard| base + in_shard)
             .filter(|unit| can_punch(*unit));
-        self.punch_slots(units)?;
+        if let Err(error) = self.punch_slots(units) {
+            self.reclaim_stalled = true;
+            return Err(error);
+        }
+        self.reclaim_stalled = false;
         self.reclaim_cursor = if end < map.units() {
             Some((idx, end))
         } else {
