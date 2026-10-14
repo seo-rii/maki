@@ -20,6 +20,7 @@ use maki_format::canary::KeyCanary;
 use maki_format::checker::CheckReport;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use maki_format::layout;
+use maki_format::FormatError;
 
 use crate::error::CoreError;
 use crate::journal::effective_segment_size;
@@ -55,9 +56,19 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         }
     };
 
+    // The fast check loaded the superblock a moment ago. A failure now
+    // means the check cannot run (I/O) or the copy changed since; neither
+    // may end in a report without errors, which would claim a pass for a
+    // journal and slots nobody examined (BUG-090).
     let superblock = match load_superblock(&backing) {
         Ok(sb) => sb,
-        Err(_) => return Ok(report), // already reported by the fast check
+        Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
+            return Err(CoreError::Io(e))
+        }
+        Err(e) => {
+            report.errors.push(format!("superblock: {e}"));
+            return Ok(report);
+        }
     };
 
     // Checkpoint state: both copies inspected, at least one required.
