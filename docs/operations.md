@@ -161,6 +161,11 @@ at independent physical devices. The same check applies to zram writeback.
 Encrypted swap above NBD, including through partitions, LVM, or MD, is refused:
 paging out Maki must not require Maki to serve that paging I/O. Missing or
 inconsistent sysfs metadata, cycles, and unproven virtual backing are refused.
+"dm-crypt" means a cryptsetup mapping of an encrypting type (LUKS1, LUKS2,
+plain, loop-AES, TrueCrypt/VeraCrypt, BitLocker, FileVault2): cryptsetup also
+names integrity-only (`integritysetup`), dm-verity and helper devices
+`CRYPT-…`, and those are refused. A mapping set up with `cipher_null` cannot
+be distinguished in sysfs; do not use one for swap.
 Keep swap and its dependency topology fixed while the attachment is running;
 this is an attach-time check, not a watcher of privileged device changes.
 
