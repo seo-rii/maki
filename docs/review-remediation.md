@@ -1488,3 +1488,68 @@ ignored release gates and exact-revision Linux/Windows CI are recorded
 separately. The canary tests use the executable crash model, and NBD allocation
 tests use observation fixtures; neither constitutes physical power-loss or
 kernel NBD/LVM campaign qualification.
+
+## Project review (2026-10-14)
+
+A static review of the whole tree at `b268798` covered the engine, journal and
+recovery, formats and backing, rollback protection, the crypto layer and
+remote transports, nbdkit and control, the privileged helper and packaging,
+and the documentation and CI. Each correction below landed test-first in its
+own pull request; the RED evidence is in each commit message. No on-disk
+format changed. The findings that need a design decision, or were not yet
+taken on, are listed after the table.
+
+| Finding | Correction | Permanent regression | PR |
+|---|---|---|---|
+| TEST-003, nightly gates stopped at the first failing binary | The unfiltered `-- --ignored` run compiled the etcd quorum gate, which refuses to skip without `MAKI_ETCD_BIN`; without `--no-fail-fast` every gate after it silently did not run. The gate is behind the opt-in `etcd-qualification` feature and the nightly run uses `--no-fail-fast` | `scripts/test_ci_gate_validation.py` | #1 |
+| BUG-089, spurious ENOSPC after an inline reclaim | `durable >= appended` did not prove nothing more could be reclaimed: a concurrent FUA is durable but newer than the checkpoint horizon. Refuse only when the checkpoint covers every appended record, or on the last round | maki-core `review_r4_overlay_bound.rs`: concurrent FUA during inline reclaim, volatile control | #2 |
+| BUG-090, deep check passed without checking | A failed second superblock read returned an error-free report. I/O now fails the check; any other failure is reported | maki-core `review_check.rs`: the fast phase's reads succeed and the deep check's own read fails | #5 |
+| BUG-091, non-canonical segment and shard names | `seg-000000000000000A` parsed as segment 10 and was scanned under one name but replayed and reclaimed under another. Names must round-trip through `layout`; the fast checker uses recovery's shard parser and reports adoption accurately | maki-format `review_format.rs`; maki-core `review_check.rs` | #5 |
+| BUG-092, transport limits sized for plaintext | gRPC messages, WebSocket frames and batched HTTP responses carry ciphertext. Each limit must hold the larger of the plaintext and the ciphertext batch (base64 where encoded); zero WebSocket and gRPC timeouts are refused | maki-format `review_config.rs`: gRPC, WebSocket, batched HTTP and timeouts | #4 |
+| BUG-093, HTTP mappings counted fields never sent | Context binding counted `fields` of a raw body and `item_fields` of a per-item body, and a raw body with `items_path` counted as a batch. Both use `BodyConfig::is_batch` | maki-format `review_r3b_config.rs` | #4 |
+| BUG-094, endpoint-fatal answers charged like transient ones | A revoked credential or missing route kept its circuit closed for `failure_threshold` answers. `EndpointFatal` opens it at once; no-resend for non-retry-safe requests is unchanged | maki-crypto `review_r5_endpoint_attribution.rs`, with a retryable control | #3 |
+| BUG-095, XTS key with identical halves | IEEE 1619 requires distinct data and tweak keys; a doubled 32-byte key loaded silently. It is refused like a wrong-length key | maki-crypto-local `phase2.rs` | #3 |
+| BUG-096, root `blkid` read a mount source as an option | A stacked FUSE mount chooses the mountinfo source (`fsname=-c/etc/shadow`). Only absolute paths are probed, after `--` | maki-privileged `exec_tests.rs` | #6 |
+| BUG-097, gRPC CA unusable with an empty host store | tonic refuses an empty native store even with a CA. Native roots are requested only when present or when no CA is configured; a CA still adds to the host roots | maki-crypto-grpc `review_custom_ca_trust.rs` (own binary: it empties the store through `SSL_CERT_FILE`/`SSL_CERT_DIR`) | #8 |
+| BUG-098, panics across nbdkit callbacks; failed requests unlogged | Every working callback runs behind a panic boundary that fails it with EIO; failed requests are logged as rate-limited `WARN` lines without payload | maki-nbdkit `plugin.rs` unit tests | #9 |
+| Build: tokio `test-util` in production builds | The pausable clock is requested only as a dev-dependency | `scripts/test_dependency_features_validation.py` | #7 |
+
+### Open after this pass
+
+These findings were confirmed by reading the code but are not corrected yet.
+The first group needs a design decision.
+
+- **Volume isolation on a shared host.** Every `maki@` instance runs as the
+  same `maki` user, and the plugin accepts any client on its NBD socket, so a
+  compromised daemon for one volume can open another volume's socket
+  (SPEC §5). Options: a user per volume or `DynamicUser=`, a peer-credential
+  check, and `InaccessiblePaths=` for other volumes.
+- **Remote witness availability.** The witness reserves a connection slot
+  before TLS authentication, and a rollback session stops permanently on any
+  `verify_current` error, including a transient outage. Unauthenticated idle
+  sockets can therefore stop every protected volume until it is reattached.
+- **Root helper `PATH`.** Child commands search `/usr/local/sbin` and
+  `/usr/local/bin` first, which the documented source-built `nbd-client`
+  relies on; absolute tool paths would remove the shadowing risk.
+- **Privileged lifecycle.** One global attach lock is held across fsyncs that
+  cannot be interrupted, and `nbd-client` has no `-timeout`; a failed or
+  timed-out `maki-attach@` start runs no cleanup (no `ExecStopPost=` or
+  `OnFailure=`); the stop path refuses when the configuration was edited while
+  attached; detach, recovery and grow address LVM by VG name without
+  `--devices`/`--select` scoping.
+- **Control CLI access.** Control commands read the root-owned volume
+  configuration, so a non-root `maki-admin` member cannot use them.
+- **Remote transports.** A gRPC channel keeps reusing a dead HTTP/2 connection
+  after an RPC deadline (retire it as the WebSocket provider does); WebSocket
+  connects are serialized behind one lock with an unbounded wait; mTLS private
+  key PEM copies are not wiped; HTTP formats credential templates with
+  `str::replace`; the guarded response JSON tree has no node budget.
+- **Provider self-test.** Pass-through detection catches only an exact echo
+  (`plaintext‖MAC` passes), and there is no nonce or keystream reuse probe.
+- **Engine and recovery robustness.** The checkpoint worker retries a failing
+  checkpoint without backoff; a failed journal directory sync can leave an idle
+  volume degraded; bounded replay stores the allocation maps after every
+  1 MiB batch; volume creation publishes the superblock before the catalog.
+- **Witness service.** A restored authority is not detected although the
+  backing holds newer fences; online `maki volume gc` aborts while the writer
+  advances; one bad endpoint certificate defeats etcd and frontend failover.
