@@ -147,10 +147,15 @@ fn guard(address: *const u8, length: usize) -> Option<PageLock> {
         return None;
     }
     let lock = lock_pages(address, length);
-    if lock.is_none() && length != 0 {
+    if is_lock_failure(&lock, length) {
         LOCK_FAILURES.fetch_add(1, Ordering::SeqCst);
     }
     lock
+}
+
+/// An empty range has nothing to protect: not locking it is no failure.
+fn is_lock_failure(lock: &Option<PageLock>, length: usize) -> bool {
+    lock.is_none() && length != 0
 }
 
 impl SecretBuffer {
@@ -486,10 +491,14 @@ mod tests {
         let boxed = SecretBox::new([0x5au8; 512]);
         assert!(boxed.is_page_locked() || page_lock_failures() > before);
         // A zero-sized value has no bytes to protect: neither locked nor
-        // counted as a failure.
-        let failures = page_lock_failures();
+        // counted as a failure. The rule is checked directly: the failure
+        // counter is process-global, and other tests allocate buffers
+        // concurrently while this one has locking enabled. Where locking is
+        // unavailable (Windows) each of those counts, which made a
+        // before/after comparison of the counter flaky (TEST-007).
         assert!(!SecretBox::new(()).is_page_locked());
-        assert_eq!(page_lock_failures(), failures);
+        assert!(!is_lock_failure(&None, 0));
+        assert!(is_lock_failure(&None, 1));
         set_page_locking(false);
         assert_eq!(boxed[511], 0x5a);
         let rendered = format!("{boxed:?}");
