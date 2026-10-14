@@ -1514,6 +1514,27 @@ taken on, are listed after the table.
 | BUG-098, panics across nbdkit callbacks; failed requests unlogged | Every working callback runs behind a panic boundary that fails it with EIO; failed requests are logged as rate-limited `WARN` lines without payload | maki-nbdkit `plugin.rs` unit tests | #9 |
 | Build: tokio `test-util` in production builds | The pausable clock is requested only as a dev-dependency | `scripts/test_dependency_features_validation.py` | #7 |
 
+### Second pass (same day)
+
+Six further reviewers covered the engine write paths, nbdkit and control,
+the crypto scheduler, the witness and rollback client, the test tooling and
+the packaging. Each correction below is test-first in its own pull request.
+
+| Finding | Correction | Permanent regression | PR |
+|---|---|---|---|
+| BUG-099, control bind replaced any file | `control.socket` is configurable and the daemon owns the backing root; binding renamed the socket over whatever was there (`superblock.a`). Only a dead socket is reclaimed | maki-control `review_socket_ownership.rs`: regular file and symlink at the address | #11 |
+| BUG-100, superblock published before the catalog | A crash between them left a root that looked initialized but could not attach. The superblock is written last, after every other file and dirent is durable | maki-format `review_init_crash.rs`: every cut point, then power loss | #12 |
+| BUG-101, failing checkpoint retried on every write | Each write above the watermark woke the worker, which reran the failing checkpoint under the exclusive lock. A failure waits one interval | maki-core `review_checkpoint_backoff.rs` (ManualClock, counting failpoint) | #13 |
+| BUG-102, one unit twice in a coalesced call | Two versions of a unit are interchangeable to every per-position check; a provider answering by unit index gave both callers one plaintext. A batch never carries a unit twice | maki-crypto `review_scheduler_duplicate_units.rs` | #14 |
+| BUG-103, a transient witness outage stopped the session | A read-only Inspect that could not reach the witness stopped the session for good; only a final answer does now, and an outage refuses each operation without fallback | maki-backing `remote_rollback.rs`: outage then recovery, takeover during an outage | #15 |
+| BUG-104, witness slots taken before TLS | Idle unauthenticated sockets held every worker. Workers are taken after authentication; pending handshakes are bounded and the oldest is cut off | maki-witness `transport.rs`: idle sockets, then a real client | #16 |
+| BUG-105, plaintext echo accepted per call | Only the self-test looked, and only for an exact echo. Every encrypt result that carries its plaintext at either end is a contract violation of that call | maki-crypto `review_plaintext_echo.rs`: exact, tag and nonce framing; late echo; self-test | #17 |
+| BUG-106, reserve refusal woke no checkpoint | Between the worker's low-space trigger and the admission requirement every write was ENOSPC until the interval. A refusal wakes the worker | maki-core `review_reserve_refusal_reclaims.rs` | #18 |
+| BUG-107, remote claim before checking the root | A witness address naming another volume's authority raised its fence or revoked its writer before failing. The current manifest is authenticated in this root first | maki-backing `remote_rollback.rs`: two independent fixtures | #20 |
+| TEST-004, crash model mixed names and inodes | A durable entry without synced data vanished; a re-created name showed the unlinked inode's bytes; rename over a file restored the old target or lost it. Inodes and names are separate and a rename is atomic | maki-test-support `review_crash_posix.rs` | #21 |
+| TEST-005, sweeps accepted superseded failed writes | A failed write's data stayed acceptable after a newer write was acknowledged or durable. Live and post-crash views retire it separately | maki-core `review_r3b_durability.rs` oracle self-test | #21 |
+| Docs: stop waits ended early | `systemctl is-active` fails for `deactivating` and `failed`; the guides poll `ActiveState` and stop on failure | `scripts/test_docs_lifecycle_validation.py` | #19 |
+
 ### Open after this pass
 
 These findings were confirmed by reading the code but are not corrected yet.
@@ -1524,10 +1545,11 @@ The first group needs a design decision.
   compromised daemon for one volume can open another volume's socket
   (SPEC §5). Options: a user per volume or `DynamicUser=`, a peer-credential
   check, and `InaccessiblePaths=` for other volumes.
-- **Remote witness availability.** The witness reserves a connection slot
-  before TLS authentication, and a rollback session stops permanently on any
-  `verify_current` error, including a transient outage. Unauthenticated idle
-  sockets can therefore stop every protected volume until it is reattached.
+- **Read-only commands claim a remote writer.** `maki volume inspect`, `maki
+  check` and the benchmark's existence probe open a remote-witness root
+  through `open_remote`: they claim a fence, copy the namespace and release
+  it in `Drop`, which an interrupted command skips. A tested design choice
+  (`review_rollback_capacity.rs`); a read-only open would avoid both.
 - **Root helper `PATH`.** Child commands search `/usr/local/sbin` and
   `/usr/local/bin` first, which the documented source-built `nbd-client`
   relies on; absolute tool paths would remove the shadowing risk.
@@ -1536,20 +1558,41 @@ The first group needs a design decision.
   timed-out `maki-attach@` start runs no cleanup (no `ExecStopPost=` or
   `OnFailure=`); the stop path refuses when the configuration was edited while
   attached; detach, recovery and grow address LVM by VG name without
-  `--devices`/`--select` scoping.
-- **Control CLI access.** Control commands read the root-owned volume
-  configuration, so a non-root `maki-admin` member cannot use them.
+  `--devices`/`--select` scoping. `maki@` has no `TimeoutStopSec`: a final
+  checkpoint longer than 90 s is killed, and `OnFailure` recovery then
+  restarts the lifecycle the operator stopped. The guides drain before the
+  unmount, which XFS then performs against a closed device, and key rotation
+  stops the attach unit, which takes the daemon with it before the drain.
+- **Control CLI access.** Control commands read and fully validate the
+  root-owned volume configuration, so a non-root `maki-admin` member cannot
+  use them, and an edited configuration with an error blocks `maki drain` on
+  the running daemon.
+- **Settings validated but not applied.** `cache.lock_memory = false` does
+  not stop cache entries from being page-locked under `secure-buffers`, and
+  `memory_lock_mode = "off"` requires it even with the cache off;
+  `crypto.max_operation_time` is ignored under the `stall` policy;
+  `nbd.socket` and `nbd.connections` are not read at runtime; the attach
+  `device_block_size` is never compared with `nbd.minimum_io`. Refusing them
+  would reject configurations that attach today.
 - **Remote transports.** A gRPC channel keeps reusing a dead HTTP/2 connection
   after an RPC deadline (retire it as the WebSocket provider does); WebSocket
   connects are serialized behind one lock with an unbounded wait; mTLS private
   key PEM copies are not wiped; HTTP formats credential templates with
-  `str::replace`; the guarded response JSON tree has no node budget.
-- **Provider self-test.** Pass-through detection catches only an exact echo
-  (`plaintext‖MAC` passes), and there is no nonce or keystream reuse probe.
-- **Engine and recovery robustness.** The checkpoint worker retries a failing
-  checkpoint without backoff; a failed journal directory sync can leave an idle
-  volume degraded; bounded replay stores the allocation maps after every
-  1 MiB batch; volume creation publishes the superblock before the catalog.
+  `str::replace`; the guarded response JSON tree has no node budget; HTTP and
+  gRPC accept a CA file that holds no certificate. A frontend's own etcd
+  401/403 reaches clients as a final denial, so they do not fail over.
+- **Provider self-test.** There is no nonce or keystream reuse probe.
+- **Engine and recovery robustness.** A failed journal directory sync can
+  leave an idle volume degraded; bounded replay stores the allocation maps
+  after every 1 MiB batch; the first write after attach re-stores both map
+  copies of every shard under the exclusive lock. On a filesystem without
+  native `fallocate`, glibc's `posix_fallocate` emulation writes zero bytes
+  into a slot a running checkpoint may be writing.
 - **Witness service.** A restored authority is not detected although the
   backing holds newer fences; online `maki volume gc` aborts while the writer
   advances; one bad endpoint certificate defeats etcd and frontend failover.
+- **Test tooling.** No power-loss sweep issues TRIM; torn writes split at
+  offsets relative to each write, not at absolute sectors; a directory sync
+  also makes the directory's own entry durable; the HTTP chaos server merges
+  repeated headers; the fuzz targets omit `DurableProof`, the witness decoders
+  and the privileged mountinfo parsers.

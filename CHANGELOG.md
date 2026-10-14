@@ -217,6 +217,20 @@ documents.
   gate behind `etcd-qualification` (TEST-003), and tokio's `test-util` is no
   longer part of production builds. See the
   [remediation log](docs/review-remediation.md#project-review-2026-10-14).
+- **2026-10-14 second review pass**: binding the control socket refuses any
+  file at the address other than a dead socket (BUG-099). Volume creation
+  writes the superblock last, so an interrupted creation is not a volume
+  (BUG-100). The checkpoint worker waits one interval after a failed pass
+  (BUG-101), and a write refused for free space wakes it (BUG-106). A
+  coalesced provider call never carries one unit twice (BUG-102). A remote
+  witness that cannot be reached refuses each operation without stopping the
+  session; a mismatch still stops it (BUG-103). Witness workers are given only
+  to authenticated connections (BUG-104). An encrypt result that carries its
+  own plaintext is refused on every call (BUG-105). Remote attach and takeover
+  authenticate the current generation in the local root before changing the
+  authority, so a damaged or foreign root leaves it unchanged rather than
+  Claimed (BUG-107). The crash simulator models inodes and atomic rename, and
+  the durability sweeps retire superseded failed writes (TEST-004, TEST-005).
 
 - **2026-10-12 correctness and recovery review**: journal sync/recovery retries
   reassert accepted file lengths and verified bytes; volume creation holds its
@@ -425,8 +439,9 @@ observable behaviour:
 - **2026-10-14 project review**: docs that contradicted `status.md` or the code
   were corrected (remote witness status, power-loss tearing, nightly gate
   scope, deep-check report order, `drain` timeout, duration syntax, overlay
-  zero limits, rollback-session stop on witness unavailability, control
-  command access for `maki-admin`, etcd restore and compaction). The crate
+  zero limits, control command access for `maki-admin`, etcd restore and
+  compaction). The operator guides wait for stopped units through
+  `ActiveState` instead of `systemctl is-active`. The crate
   maps list `maki-witness`, and stale crate and module comments were fixed.
 
 - [Remote transports under the syscall filter](docs/qualification/remote-transport-syscall-filter-validation-2026-10-04.md):
