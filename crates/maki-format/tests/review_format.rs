@@ -572,3 +572,54 @@ fn followup_superblock_store_raw_generation_probe_is_also_bounded() {
         "RawGeneration must not reintroduce an oversized whole-file read before typed parsing"
     );
 }
+
+/// BUG-091: a journal segment name must spell its index exactly as
+/// `layout::journal_segment` does. `from_str_radix` alone also accepted
+/// upper-case hex and a leading `+`, so a foreign file such as
+/// `seg-000000000000000A` was scanned under one name while replay and
+/// reclaim used the canonical path, failing attach or every checkpoint.
+#[test]
+fn journal_segment_names_parse_only_in_canonical_form() {
+    use maki_format::layout::{journal_segment, parse_journal_segment, JOURNAL_DIR};
+
+    for index in [0u64, 10, 0xdead_beef, u64::MAX] {
+        let path = journal_segment(index);
+        let name = path.strip_prefix(&format!("{JOURNAL_DIR}/")).unwrap();
+        assert_eq!(parse_journal_segment(name), Some(index), "{name}");
+    }
+    for name in [
+        "seg-000000000000000A",
+        "seg-+00000000000000a",
+        "seg-00000000000000a",
+        "seg-0000000000000000a",
+        "seg-000000000000000g",
+        "seg-",
+        "seg-000000000000000a.tmp",
+    ] {
+        assert_eq!(parse_journal_segment(name), None, "{name}");
+    }
+}
+
+/// BUG-091: shard data file names likewise parse only in the form
+/// `layout::shard_data` produces, so the fast checker and recovery agree on
+/// which files are shards.
+#[test]
+fn shard_data_names_parse_only_in_canonical_form() {
+    use maki_format::layout::{parse_shard_data, shard_data, DATA_DIR};
+
+    for index in [0u64, 0x2a, 0xffff_ffff, 0x1_0000_0000, u64::MAX] {
+        let path = shard_data(index);
+        let name = path.strip_prefix(&format!("{DATA_DIR}/")).unwrap();
+        assert_eq!(parse_shard_data(name), Some(index), "{name}");
+    }
+    for name in [
+        "shard-0000002A.dat",
+        "shard-+000002a.dat",
+        "shard-2a.dat",
+        "shard-00000000002a.dat",
+        "shard-0000002a.alloc.a",
+        "shard-0000002a.dat.tmp",
+    ] {
+        assert_eq!(parse_shard_data(name), None, "{name}");
+    }
+}

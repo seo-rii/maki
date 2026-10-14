@@ -333,3 +333,43 @@ fn deep_check_never_passes_when_its_own_superblock_read_fails() {
     }
     assert!(deep(&backing).ok(), "the volume itself is healthy");
 }
+
+/// BUG-091: the fast checker names exactly the shard data files recovery
+/// adopts. A canonical file missing from the catalog is adopted at attach
+/// (S-01), not "ignored by reads"; a non-canonical spelling is not a shard
+/// for recovery, so the checker must not report it as one either.
+#[test]
+fn fast_check_reports_the_shard_files_recovery_adopts() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    drop(new_volume(&backing));
+    assert!(geometry().num_shards() > 0xb && geometry().num_shards() <= 0x20);
+    for name in [
+        "shard-0000000b.dat",
+        "shard-0000000A.dat",
+        "shard-00000020.dat",
+    ] {
+        backing
+            .open(&format!("{}/{name}", layout::DATA_DIR), true)
+            .unwrap();
+    }
+
+    let report = fast(&backing);
+    assert!(report.ok(), "{}", errors(&report));
+    let warnings = report.warnings.join("\n");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("shard-0000000b.dat") && w.contains("adopts")),
+        "{warnings}"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("shard-00000020.dat") && w.contains("beyond")),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("shard-0000000A.dat"), "{warnings}");
+}
