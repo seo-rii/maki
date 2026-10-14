@@ -23,6 +23,11 @@ documents.
   [validation rules](docs/configuration.md#validation-rules).
 - **An AES-XTS key with identical halves is refused** (BUG-095, 2026-10-14):
   IEEE 1619 requires distinct data and tweak keys.
+- **File credentials and TLS files need absolute paths** (BUG-122,
+  2026-10-15). A relative `file` credential name or TLS `ca_file` /
+  `client_cert_file` resolved against each process's working directory and
+  now fails validation; write the absolute path. See
+  [configuration](docs/configuration.md).
 
 - **Remote witness authority and wire v2 require private session ownership**
   (2026-10-12). `MAKIRW02` authority state stores a digest of a random 256-bit
@@ -248,6 +253,18 @@ documents.
   (BUG-120). A power-loss sweep with TRIM joins the release gates (TEST-006),
   a page-lock unit test no longer races on Windows (TEST-007), and witness
   transport tests no longer time out on loaded runners (TEST-008).
+- **2026-10-15 fourth review pass**: a gRPC response cut inside a message, or
+  OK without one, is a contract error (BUG-121). File credentials and TLS
+  files must be absolute paths (BUG-122). A failed hole punch no longer fails
+  an idle checkpoint, so drain and shutdown work while punching fails
+  (BUG-123). The daemon and CLIs raise the soft descriptor limit for shard
+  files, and a failed shard open other than a missing file is reported as
+  I/O, not corruption (BUG-124). A panic while the volume write lock is held
+  stops the engine until the volume is attached again (BUG-125). An encrypt
+  result carrying its plaintext anywhere is refused, and `grow --size-bytes`
+  must be a multiple of 512 (BUG-105, BUG-116 follow-ups). The operator guides
+  correct the overlay metrics, full-backing behaviour, start-limit reset,
+  instance naming and witness takeover procedures.
 
 - **2026-10-12 correctness and recovery review**: journal sync/recovery retries
   reassert accepted file lengths and verified bytes; volume creation holds its
