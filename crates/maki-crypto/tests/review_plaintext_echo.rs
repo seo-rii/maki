@@ -51,6 +51,8 @@ enum Echo {
     Exact,
     WithTag,
     WithNonce,
+    /// nonce ‖ plaintext ‖ tag: an integrity-only (null cipher) profile.
+    Framed,
 }
 
 fn echo(item: &PlaintextUnit, shape: Echo) -> CiphertextUnit {
@@ -59,6 +61,7 @@ fn echo(item: &PlaintextUnit, shape: Echo) -> CiphertextUnit {
         Echo::Exact => plain.to_vec(),
         Echo::WithTag => [plain, &[0xA5; 16]].concat(),
         Echo::WithNonce => [&[0x5A; 12][..], plain].concat(),
+        Echo::Framed => [&[0x5A; 12][..], plain, &[0xA5; 16]].concat(),
     };
     CiphertextUnit {
         unit_index: item.unit_index,
@@ -74,7 +77,7 @@ async fn caps() -> CryptoCapabilities {
 async fn an_encrypt_result_carrying_its_plaintext_is_a_contract_violation() {
     let caps = caps().await;
     let items = [pt(1), pt(2)];
-    for shape in [Echo::Exact, Echo::WithTag, Echo::WithNonce] {
+    for shape in [Echo::Exact, Echo::WithTag, Echo::WithNonce, Echo::Framed] {
         let mut out: Vec<_> = items
             .iter()
             .map(|item| CiphertextUnit {
@@ -137,6 +140,7 @@ impl CryptoProvider for Switching {
                     Echo::Exact => &data[..],
                     Echo::WithTag => &data[..data.len() - 16],
                     Echo::WithNonce => &data[12..],
+                    Echo::Framed => &data[12..data.len() - 16],
                 };
                 PlaintextUnit {
                     unit_index: item.unit_index,
@@ -149,7 +153,7 @@ impl CryptoProvider for Switching {
 
 #[tokio::test]
 async fn a_provider_that_starts_echoing_after_attach_is_refused_per_call() {
-    for shape in [Echo::Exact, Echo::WithTag, Echo::WithNonce] {
+    for shape in [Echo::Exact, Echo::WithTag, Echo::WithNonce, Echo::Framed] {
         let provider = Arc::new(Switching {
             inner: fake(),
             echo: AtomicBool::new(false),
@@ -167,7 +171,7 @@ async fn a_provider_that_starts_echoing_after_attach_is_refused_per_call() {
 
 #[tokio::test]
 async fn the_self_test_refuses_an_echo_with_a_tag_or_nonce() {
-    for shape in [Echo::WithTag, Echo::WithNonce] {
+    for shape in [Echo::WithTag, Echo::WithNonce, Echo::Framed] {
         let provider = Switching {
             inner: fake(),
             echo: AtomicBool::new(true),
