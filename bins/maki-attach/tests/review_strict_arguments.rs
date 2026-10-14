@@ -100,3 +100,24 @@ fn grow_size_must_be_plain_decimal_digits() {
         assert!(output.stdout.is_empty(), "{size:?} printed a plan");
     }
 }
+
+/// BUG-116 (follow-up): LVM refuses a byte size that is not a multiple of
+/// 512 ("Size is not a multiple of 512"), so a plan with such a target
+/// printed and then failed on every attempt, including the documented retry
+/// with the same target. Such a size is refused before any plan is printed.
+#[test]
+fn grow_size_must_be_a_multiple_of_512() {
+    for size in ["1000", "1048577", "513"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+            .args(["grow", "--volume", "strict-audit-missing-config", "--plan"])
+            .args(["--size-bytes", size])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{size} was accepted");
+        assert!(output.stdout.is_empty(), "{size} printed a plan");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("512"),
+            "{size}: the refusal names the rule"
+        );
+    }
+}

@@ -196,6 +196,15 @@ fn main() -> ExitCode {
             else {
                 return usage();
             };
+            // LVM refuses a byte size that is not sector aligned, so such a
+            // target would fail on every attempt, retries included.
+            if target % 512 != 0 {
+                eprintln!(
+                    "error: --size-bytes {target} is not a multiple of 512; LVM refuses unaligned \
+                     byte sizes"
+                );
+                return ExitCode::from(2);
+            }
             plan_grow(&GrowRequest {
                 volume,
                 volume_uuid: request.volume_uuid.clone(),

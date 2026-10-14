@@ -413,7 +413,8 @@ maki-attach detach --volume example --plan
 maki-attach grow --volume example --size-bytes 2147483648 --plan
 ```
 
-`grow --size-bytes` is an absolute minimum LV size in bytes. LVM may round
+`grow --size-bytes` is an absolute minimum LV size in bytes, given as plain
+decimal digits and a multiple of 512. LVM may round
 up to its extent size; an LV already at or above the target is left unchanged,
 and XFS growth is retried. Reuse the same target after a timeout or failure,
 including a failure after `lvextend` already changed the LV. The former
