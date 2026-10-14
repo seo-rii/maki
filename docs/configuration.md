@@ -182,7 +182,23 @@ schema, geometry, and secret-literal checks it rejects:
   loopback, so TLS options cannot be silently ignored;
 - HTTP batch layouts (`body.items_path`) whose response mapping lacks
   `items_path` or `item_index_path`: every batch element must echo its unit
-  index so reordered, dropped, or duplicated results are detected;
+  index so reordered, dropped, or duplicated results are detected. Only a
+  `type = "json"` body with `items_path` is a batch; a raw body is sent one
+  item per request;
+- a declared `capabilities.context_binding` whose context fields do not reach
+  the provider: each of `volume_id`, `compatibility_id` and `format_version`
+  must be a source in the JSON `fields`, or in `item_fields` of a batch
+  layout (a raw body sends no fields, and a per-item body never sends
+  `item_fields`);
+- a transport limit that cannot carry one full crypto batch. A batch puts
+  `crypto.batch.max_bytes` of plaintext on the wire, or
+  `min(max_items, max_bytes / unit) × capabilities.max_ciphertext_size` of
+  ciphertext, whichever is larger: gRPC `max_message_bytes` (default 4 MiB)
+  must hold it as raw bytes, and WebSocket `max_frame_bytes` (default 8 MiB)
+  and, for a batched HTTP mapping, `max_response_bytes` (default 8 MiB) must
+  hold it base64-encoded. These are necessary bounds; leave headroom for the
+  surrounding JSON or protobuf framing. A zero limit is rejected;
+- a zero `timeout` for any remote transport;
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
