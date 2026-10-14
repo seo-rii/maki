@@ -1558,6 +1558,7 @@ handling; the earlier lists' remaining concrete items were taken on too.
 | BUG-119, key open errors all "not a regular file" | Permission and symlink errors say so | maki-crypto-local `review_keysource.rs` | #34 |
 | BUG-120, lossy nbdkit config path | A non-UTF-8 `config=` value is refused instead of rewritten | maki-nbdkit `plugin.rs` unit test | #35 |
 | TEST-007, racy page-lock test | A unit test compared the process-global lock-failure counter while other tests allocated buffers; on Windows each counts. The rule is checked directly | maki-crypto `secret.rs` unit test | #36 |
+| TEST-008, flaky witness transport tests | Fixture clients had 500 ms (and 2 s) deadlines for calls expected to succeed; loaded runners timed out loopback connects. Fixture clients allow 5 s (10 s); expiry tests keep their own short deadlines | maki-witness `transport.rs`, `session_erasure.rs` | #37 |
 
 ### Open after this pass
 

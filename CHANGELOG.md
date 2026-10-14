@@ -246,7 +246,8 @@ documents.
   `maki` and `maki-check` gain `--help` and `--version` (BUG-112); key-file
   open errors say why (BUG-119); a non-UTF-8 nbdkit `config=` path is refused
   (BUG-120). A power-loss sweep with TRIM joins the release gates (TEST-006),
-  and a page-lock unit test no longer races on Windows (TEST-007).
+  a page-lock unit test no longer races on Windows (TEST-007), and witness
+  transport tests no longer time out on loaded runners (TEST-008).
 
 - **2026-10-12 correctness and recovery review**: journal sync/recovery retries
   reassert accepted file lengths and verified bytes; volume creation holds its
