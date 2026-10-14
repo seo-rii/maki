@@ -155,3 +155,39 @@ fn an_unsynced_replace_is_atomic_and_never_leaves_the_target_absent() {
     assert_eq!(read(&backing, "f"), b"OLD");
     assert_eq!(read(&backing, "f.tmp"), b"NEW");
 }
+
+/// Sectors are aligned to the device, not to each write: a write that
+/// starts inside a sector can persist that sector's part without the next
+/// one. Tearing at offsets relative to each write made the first `gran`
+/// bytes of every write atomic, so a journal record header straddling a
+/// sector boundary was never torn.
+#[test]
+fn a_torn_write_splits_at_absolute_sector_boundaries() {
+    const GRAN: usize = 512;
+    let mut split_at_the_boundary = false;
+    for seed in 0..400 {
+        let backing = CrashableBacking::new().with_tearing(GRAN);
+        write_synced(&backing, "f", &[0u8; 2048]);
+        backing.sync_dir("").unwrap();
+        let file = backing.open("f", true).unwrap();
+        file.write_at(500, &[0xAB; 1024]).unwrap();
+        drop(file);
+        backing.crash(&mut StdRng::seed_from_u64(seed));
+        let bytes = read(&backing, "f");
+        assert_eq!(bytes.len(), 2048);
+        // Every surviving piece is whole between absolute boundaries.
+        for range in [500..512, 512..1024, 1024..1524] {
+            let piece = &bytes[range.clone()];
+            assert!(
+                piece.iter().all(|b| *b == 0) || piece.iter().all(|b| *b == 0xAB),
+                "seed {seed}: sector {range:?} was split"
+            );
+        }
+        split_at_the_boundary |=
+            bytes[500..512].iter().all(|b| *b == 0xAB) && bytes[512..1024].iter().all(|b| *b == 0);
+    }
+    assert!(
+        split_at_the_boundary,
+        "the head of the first sector never persisted without the next sector"
+    );
+}

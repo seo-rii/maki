@@ -3,10 +3,13 @@
 //!
 //! Durability rules simulated:
 //! - `write_at`/`set_len` are volatile until `sync_data` on the file,
-//! - file creation/removal is volatile until `sync_dir` on the parent,
+//! - file creation/removal/rename is volatile until `sync_dir` on the parent;
+//!   names and inodes are separate, so a durable name can survive with its
+//!   unsynced data lost and a rename is kept or undone as a whole,
 //! - on crash, each volatile operation is independently kept or lost,
-//! - optionally, the last surviving write of a file may be *torn* (prefix
-//!   kept at a configurable granularity),
+//! - optionally, any surviving write may be *torn* at sector boundaries of
+//!   a configurable granularity, aligned to the file (a prefix of sectors
+//!   kept, or one sector missing),
 //! - a removal that was never dir-synced may resurrect the file,
 //! - a creation that was never dir-synced may vanish even if its data was
 //!   fdatasync'd (orphan inode).
@@ -239,14 +242,24 @@ fn apply(data: &mut Vec<u8>, p: &Pend) {
 /// Persist a write partially at sector granularity `gran`: either only a
 /// prefix of its sectors reached the disk (the file did not grow past it),
 /// or every sector but one random one did (a hole of stale bytes inside an
-/// otherwise complete write).
+/// otherwise complete write). Sectors are aligned to the file, not to the
+/// write: a write starting inside a sector can persist that sector's part
+/// without the next one (TEST-004).
 fn apply_torn(data: &mut Vec<u8>, offset: u64, src: &[u8], gran: usize, rng: &mut impl Rng) {
-    let sectors = src.len().div_ceil(gran);
-    if sectors == 0 {
+    if src.is_empty() {
         return;
     }
+    // Cut points inside `src` at absolute multiples of `gran`, plus both ends.
+    let mut cuts = vec![0];
+    let mut next = gran - (offset % gran as u64) as usize;
+    while next < src.len() {
+        cuts.push(next);
+        next += gran;
+    }
+    cuts.push(src.len());
+    let sectors = cuts.len() - 1;
     if rng.random_bool(0.5) {
-        let keep = (rng.random_range(0..sectors) * gran).min(src.len());
+        let keep = cuts[rng.random_range(0..sectors)];
         apply(
             data,
             &Pend::Write {
@@ -256,8 +269,7 @@ fn apply_torn(data: &mut Vec<u8>, offset: u64, src: &[u8], gran: usize, rng: &mu
         );
     } else {
         let hole = rng.random_range(0..sectors);
-        let hole_start = hole * gran;
-        let hole_end = (hole_start + gran).min(src.len());
+        let (hole_start, hole_end) = (cuts[hole], cuts[hole + 1]);
         apply(
             data,
             &Pend::Write {
