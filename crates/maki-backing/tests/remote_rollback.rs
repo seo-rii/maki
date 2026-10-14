@@ -188,16 +188,49 @@ fn lost_commit_reply_retries_the_identical_operation_without_losing_data() {
     assert_eq!(read(&b), b"after!");
 }
 
+/// BUG-103: an unreachable witness refuses every operation, with no
+/// fallback, but it contradicts nothing: Inspect changes no state. A
+/// transient outage (an etcd leader election, a frontend restart) used to
+/// stop the session for good, so every protected volume returned EIO until
+/// an administrator took over, and shutdown could not release it.
 #[test]
-fn unavailable_witness_stops_existing_handles_and_never_falls_back() {
+fn unavailable_witness_refuses_io_without_fallback_until_it_answers_again() {
     let f = Fixture::new();
     let b = f.create();
     write(&b, b"confirmed");
     let file = b.open("payload", false).unwrap();
     f.writer.unavailable.store(true, Ordering::SeqCst);
     assert!(file.read_at(0, &mut [0; 9]).is_err());
-    f.writer.unavailable.store(false, Ordering::SeqCst);
     assert!(b.check_freshness().is_err());
+    f.writer.unavailable.store(false, Ordering::SeqCst);
+    b.check_freshness()
+        .expect("an unchanged authority is fresh again once it answers");
+    let mut bytes = [0; 9];
+    file.read_at(0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"confirmed");
+    write(&b, b"advanced!");
+    assert_eq!(read(&b), b"advanced!");
+}
+
+#[test]
+fn a_takeover_during_an_outage_still_stops_the_session_for_good() {
+    let f = Fixture::new();
+    let b = f.create();
+    write(&b, b"confirmed");
+    let file = b.open("payload", false).unwrap();
+    f.writer.unavailable.store(true, Ordering::SeqCst);
+    assert!(file.read_at(0, &mut [0; 9]).is_err());
+    let expected = inspect(f.admin.as_ref());
+    let successor =
+        RollbackBacking::takeover_remote(f.root.path(), f.admin.clone(), &expected).unwrap();
+    f.writer.unavailable.store(false, Ordering::SeqCst);
+    assert!(b.check_freshness().is_err(), "a revoked session resumed");
+    assert!(file.read_at(0, &mut [0; 9]).is_err());
+    assert!(
+        b.check_freshness().is_err(),
+        "an observed revocation stops the session permanently"
+    );
+    assert_eq!(read(&successor), b"confirmed");
 }
 
 #[test]
