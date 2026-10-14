@@ -166,13 +166,8 @@ systemd-analyze verify maki@demo.service maki-attach@demo.service \
 (`maki-attach@demo.service` reports a missing `/etc/maki/attach/demo.toml`
 assertion until a volume exists; that is expected.)
 
-The `maki-admin` group grants access to the control sockets, but the control
-commands (`maki status`, `metrics`, `checkpoint`, `drain`, `reload`) first read
-and validate `/etc/maki/volumes/<volume>.toml`, which only root and group
-`maki` can read. For now, run them as root or as an account that can read the
-volume configuration and any TLS `ca_file` or `client_cert_file` it names. Do
-not add administrators to group `maki` for this: it also opens the NBD sockets
-under `/run/maki`.
+Grant an administrator account access to control sockets by adding it to the
+`maki-admin` group. Root does not need it.
 
 ## Next steps
 

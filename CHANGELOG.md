@@ -231,6 +231,9 @@ documents.
   authority, so a damaged or foreign root leaves it unchanged rather than
   Claimed (BUG-107). The crash simulator models inodes and atomic rename, and
   the durability sweeps retire superseded failed writes (TEST-004, TEST-005).
+  Control commands take `--socket <path>` in place of the volume
+  configuration, so `maki-admin` members can use them, and only parse a
+  configuration they are given (BUG-108).
 
 - **2026-10-12 correctness and recovery review**: journal sync/recovery retries
   reassert accepted file lengths and verified bytes; volume creation holds its
@@ -439,8 +442,7 @@ observable behaviour:
 - **2026-10-14 project review**: docs that contradicted `status.md` or the code
   were corrected (remote witness status, power-loss tearing, nightly gate
   scope, deep-check report order, `drain` timeout, duration syntax, overlay
-  zero limits, control command access for `maki-admin`, etcd restore and
-  compaction). The operator guides wait for stopped units through
+  zero limits, etcd restore and compaction). The operator guides wait for stopped units through
   `ActiveState` instead of `systemctl is-active`. The crate
   maps list `maki-witness`, and stale crate and module comments were fixed.
 

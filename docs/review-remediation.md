@@ -1533,6 +1533,7 @@ the packaging. Each correction below is test-first in its own pull request.
 | BUG-107, remote claim before checking the root | A witness address naming another volume's authority raised its fence or revoked its writer before failing. The current manifest is authenticated in this root first | maki-backing `remote_rollback.rs`: two independent fixtures | #20 |
 | TEST-004, crash model mixed names and inodes | A durable entry without synced data vanished; a re-created name showed the unlinked inode's bytes; rename over a file restored the old target or lost it. Inodes and names are separate and a rename is atomic | maki-test-support `review_crash_posix.rs` | #21 |
 | TEST-005, sweeps accepted superseded failed writes | A failed write's data stayed acceptable after a newer write was acknowledged or durable. Live and post-crash views retire it separately | maki-core `review_r3b_durability.rs` oracle self-test | #21 |
+| BUG-108, control commands needed the root-owned configuration | They read and fully validated it, so a `maki-admin` member could not reach the socket and an edited configuration blocked `drain`. `--socket` names the socket; a configuration is only parsed | `bins/maki` `review_control_cli_access.rs` against a fake daemon | #22 |
 | Docs: stop waits ended early | `systemctl is-active` fails for `deactivating` and `failed`; the guides poll `ActiveState` and stop on failure | `scripts/test_docs_lifecycle_validation.py` | #19 |
 
 ### Open after this pass
@@ -1563,10 +1564,6 @@ The first group needs a design decision.
   restarts the lifecycle the operator stopped. The guides drain before the
   unmount, which XFS then performs against a closed device, and key rotation
   stops the attach unit, which takes the daemon with it before the drain.
-- **Control CLI access.** Control commands read and fully validate the
-  root-owned volume configuration, so a non-root `maki-admin` member cannot
-  use them, and an edited configuration with an error blocks `maki drain` on
-  the running daemon.
 - **Settings validated but not applied.** `cache.lock_memory = false` does
   not stop cache entries from being page-locked under `secure-buffers`, and
   `memory_lock_mode = "off"` requires it even with the cache off;
