@@ -39,6 +39,13 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     let mut report = maki_format::checker::check_volume(backing.as_ref())?;
     report.info.push("deep check: enabled".to_string());
 
+    // Not a volume (the fast check reported it): taking the lock would
+    // create `volume.lock` in whatever directory was named (BUG-110). A
+    // root with superblock files, however damaged, is still checked.
+    if !backing.exists(layout::SUPERBLOCK_A)? && !backing.exists(layout::SUPERBLOCK_B)? {
+        return Ok(report);
+    }
+
     let _lock = match acquire_lock(&backing) {
         Ok(lock) => lock,
         Err(RecoveryError::AlreadyAttached) => {

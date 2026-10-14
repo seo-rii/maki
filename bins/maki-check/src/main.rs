@@ -57,6 +57,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // A rollback-protected root keeps the volume inside an outer format that
+    // only the configured daemon path can open (BUG-110).
+    if std::path::Path::new(&root).join("rollback.format").exists() {
+        eprintln!(
+            "error: {root} is a rollback-protected backing; maki-check cannot open its \
+             outer format. Run `maki check <config.toml> [--deep]` with the volume configuration"
+        );
+        return ExitCode::FAILURE;
+    }
     let backing = match maki_backing::FileBacking::new(root.as_str()) {
         Ok(b) => b,
         Err(e) => {
