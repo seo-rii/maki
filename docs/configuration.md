@@ -143,7 +143,11 @@ Changing a mode cannot bypass the mandatory integrity/context tests.
 
 ## Validation rules
 
-`validate()` runs before a volume is created and before every attach. Beyond
+`validate()` runs before a volume is created and before every attach. Errors
+name the line, column, field or endpoint but never print a value: a TOML or
+schema error replaces every quoted value with `…`, and an endpoint URL is shown
+as `scheme://host` without userinfo, path or query, so a secret pasted by
+mistake does not reach the journal through the error that refuses it. Beyond
 schema, geometry, and secret-literal checks it rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
