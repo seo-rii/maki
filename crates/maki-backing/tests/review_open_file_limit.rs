@@ -15,7 +15,10 @@ fn limits() -> (libc::rlim_t, libc::rlim_t) {
         rlim_max: 0,
     };
     // SAFETY: getrlimit writes into a valid, owned struct.
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
     (limit.rlim_cur, limit.rlim_max)
 }
 
@@ -42,7 +45,10 @@ fn the_soft_descriptor_limit_is_raised_toward_the_hard_limit() {
     let raised = raise_open_file_limit().expect("raising within the hard limit is permitted");
     let (soft, after_hard) = limits();
     assert_eq!(after_hard, hard, "the hard limit is never changed");
-    assert_eq!(soft as u64, raised, "the reported limit is the one in effect");
+    assert_eq!(
+        soft as u64, raised,
+        "the reported limit is the one in effect"
+    );
     assert!(
         soft > 64,
         "the soft limit stayed at 64 below a hard limit of {hard}"
