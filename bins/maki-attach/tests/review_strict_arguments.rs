@@ -75,3 +75,28 @@ fn valid_plans_keep_defaults_and_growth_arguments() {
         );
     }
 }
+
+/// BUG-116: `--size-bytes` was parsed with `u64::from_str`, which accepts a
+/// leading `+`. An operator typing `+10737418240` to mean "add 10 GiB" got
+/// an absolute 10 GiB target, which an existing larger LV already exceeds,
+/// so grow did nothing and reported success. Only plain decimal digits are
+/// a size; relative growth stays refused as it is for `--add-bytes`.
+#[test]
+fn grow_size_must_be_plain_decimal_digits() {
+    for size in [
+        "+1048576",
+        " 1048576",
+        "1048576 ",
+        "0x100000",
+        "1_048_576",
+        "1e6",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+            .args(["grow", "--volume", "strict-audit-missing-config", "--plan"])
+            .args(["--size-bytes", size])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{size:?} was accepted");
+        assert!(output.stdout.is_empty(), "{size:?} printed a plan");
+    }
+}
