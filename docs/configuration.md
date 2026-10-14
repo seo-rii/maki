@@ -468,7 +468,10 @@ An intermediate sync failure stops further appends and is returned to the caller
 
 The default checkpoint worker interval is 30 seconds. An administrative
 checkpoint applies durable records; a successful call that advances no sequence
-does not postpone the worker's periodic sync of pending writes.
+does not postpone the worker's periodic sync of pending writes. After a failed
+pass the worker waits one interval before it tries again, however many writes
+cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
+checkpoints inline, and a success clears the wait.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole

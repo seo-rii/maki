@@ -318,6 +318,9 @@ struct EngineInner {
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
     last_checkpoint_at: parking_lot::Mutex<Duration>,
+    /// Clock time before which the worker does not retry after a failed
+    /// pass (BUG-101); `None` after a success.
+    checkpoint_retry_at: parking_lot::Mutex<Option<Duration>>,
     free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
     /// Published samples have their own memory-only locks: `free_space`
     /// may be held across a stalled statvfs, and `volume` across storage I/O.
@@ -613,6 +616,7 @@ impl Engine {
             }),
             policy: options.checkpoint,
             last_checkpoint_at: parking_lot::Mutex::new(clock.now()),
+            checkpoint_retry_at: parking_lot::Mutex::new(None),
             clock,
             checkpoint_notify: notify.clone(),
             checkpoint_stop: AtomicBool::new(false),
@@ -1709,6 +1713,18 @@ impl EngineInner {
         if appended <= checkpointed && covered == 0 && !reclaim {
             return; // nothing to apply and nothing to reclaim
         }
+        // After a failed pass, wait out the regular interval. Every write
+        // above the watermark wakes the worker, and rerunning a failing
+        // checkpoint under the exclusive lock on each wake-up hammered a
+        // degraded device and stalled foreground I/O (BUG-101). Writes that
+        // reach the hard bound still checkpoint inline.
+        if self
+            .checkpoint_retry_at
+            .lock()
+            .is_some_and(|retry_at| self.clock.now() < retry_at)
+        {
+            return;
+        }
         let by_size = total >= self.policy.journal_high_watermark_bytes;
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
             let backing = self.backing.clone();
@@ -1745,19 +1761,33 @@ impl EngineInner {
             let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
             if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
+                self.defer_checkpoint_retry();
                 return;
             }
         }
         if !self.checkpoint_stop.load(Ordering::SeqCst) {
-            if let Err(e) = self.checkpoint().await {
-                tracing::warn!("checkpoint worker: checkpoint failed: {e}");
-            } else if self.volume.read().await.has_pending_reclamation() {
-                // Drain another bounded batch without sleeping an entire
-                // checkpoint interval. Each pass releases the volume lock;
-                // failures wait for the regular interval before retrying.
-                self.checkpoint_notify.notify_one();
+            match self.checkpoint().await {
+                Err(e) => {
+                    tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+                    self.defer_checkpoint_retry();
+                }
+                Ok(_) => {
+                    *self.checkpoint_retry_at.lock() = None;
+                    if self.volume.read().await.has_pending_reclamation() {
+                        // Drain another bounded batch without sleeping an
+                        // entire checkpoint interval. Each pass releases the
+                        // volume lock; failures wait for the regular
+                        // interval before retrying.
+                        self.checkpoint_notify.notify_one();
+                    }
+                }
             }
         }
+    }
+
+    /// Postpone the worker's next attempt by the regular interval.
+    fn defer_checkpoint_retry(&self) {
+        *self.checkpoint_retry_at.lock() = Some(self.clock.now() + self.policy.interval);
     }
 }
 
