@@ -1536,6 +1536,28 @@ the packaging. Each correction below is test-first in its own pull request.
 | BUG-108, control commands needed the root-owned configuration | They read and fully validated it, so a `maki-admin` member could not reach the socket and an edited configuration blocked `drain`. `--socket` names the socket; a configuration is only parsed | `bins/maki` `review_control_cli_access.rs` against a fake daemon | #22 |
 | Docs: stop waits ended early | `systemctl is-active` fails for `deactivating` and `failed`; the guides poll `ActiveState` and stop on failure | `scripts/test_docs_lifecycle_validation.py` | #19 |
 
+### Third pass (same day)
+
+Five reviewers covered the privileged helper, journal and recovery, the
+remote transports, every unsafe block, and configuration, key and credential
+handling; the earlier lists' remaining concrete items were taken on too.
+
+| Finding | Correction | Permanent regression | PR |
+|---|---|---|---|
+| BUG-109, superblock flags and crypto format version ignored | Unknown flags or a format version other than 1 are refused, so a later incompatible format is never read with these rules | maki-format `review_superblock_fields.rs` | #23 |
+| BUG-110, `maki-check --deep` wrote into a non-volume | The deep phase took the volume lock (creating `volume.lock`) after the fast check found no superblock; a rollback-protected root was reported as corrupt | `bins/maki-check` `review_deep.rs` | #24 |
+| TEST-006, no power-loss sweep issued TRIM | Writes and unit-aligned trims, flushes, checkpoints, power loss or restart, against the reference model, with a 400-seed release gate | maki-core `review_trim_power_loss.rs` | #25 |
+| BUG-111, witness `serve` exited on EMFILE | Accept errors are transient: pause and keep accepting, as the control socket does | maki-witness `accept_exhaustion.rs` (own binary) | #26 |
+| BUG-112, no `--help`/`--version` | Help exits 0 on stdout; `--version` prints the package version | `bins/maki` `review_cli_help.rs`, maki-check e2e | #27 |
+| BUG-113, configuration errors echoed secrets | TOML errors rendered the source line and their Debug the whole document; URL errors printed userinfo and query. Errors now give line, column and field, never a value | maki-format `review_config_secret_echo.rs` | #28 |
+| BUG-114, any `CRYPT-` device counted as encrypted swap | Integrity-only, verity and helper devices carry the prefix too; only encrypting cryptsetup types count | maki-nbdkit `security_swap_tests.rs` | #29 |
+| BUG-115, gRPC TLS handshake without a deadline | `connect_lazy` bounds only the TCP connect; a silent TLS peer pinned the channel. The connect timeout now covers TLS | maki-crypto-grpc `review_tls_handshake_deadline.rs` | #30 |
+| BUG-116, `grow --size-bytes +N` | A leading `+` parsed as an absolute size; plain digits only | `bins/maki-attach` `review_strict_arguments.rs` | #31 |
+| BUG-117, WebSocket frames outside the contract dropped | Non-JSON, id-less and binary frames now fail the generation as a contract error instead of timing out | maki-crypto-websocket `review_unmatched_frames.rs` | #32 |
+| BUG-118, attach over existing submounts | A mount below the mountpoint is refused before connecting, as the verify gate does | maki-privileged `exec_tests.rs`, `detach_tests.rs` | #33 |
+| BUG-119, key open errors all "not a regular file" | Permission and symlink errors say so | maki-crypto-local `review_keysource.rs` | #34 |
+| BUG-120, lossy nbdkit config path | A non-UTF-8 `config=` value is refused instead of rewritten | maki-nbdkit `plugin.rs` unit test | #35 |
+
 ### Open after this pass
 
 These findings were confirmed by reading the code but are not corrected yet.
@@ -1559,7 +1581,12 @@ The first group needs a design decision.
   timed-out `maki-attach@` start runs no cleanup (no `ExecStopPost=` or
   `OnFailure=`); the stop path refuses when the configuration was edited while
   attached; detach, recovery and grow address LVM by VG name without
-  `--devices`/`--select` scoping. `maki@` has no `TimeoutStopSec`: a final
+  `--devices`/`--select` scoping; they also match device-mapper mappings by
+  VG name only, so another daemon's metadata naming this volume's VG can be
+  autoactivated on its NBD device and block this volume. A workload-owned
+  FUSE mount at or below the mountpoint blocks detach, cleanup and recovery,
+  and detach resolves the mountpoint path again for `umount`/`xfs_growfs`.
+  `maki@` has no `TimeoutStopSec`: a final
   checkpoint longer than 90 s is killed, and `OnFailure` recovery then
   restarts the lifecycle the operator stopped. The guides drain before the
   unmount, which XFS then performs against a closed device, and key rotation
@@ -1578,18 +1605,27 @@ The first group needs a design decision.
   `str::replace`; the guarded response JSON tree has no node budget; HTTP and
   gRPC accept a CA file that holds no certificate. A frontend's own etcd
   401/403 reaches clients as a final denial, so they do not fail over.
+  WebSocket has no TCP keepalive and no idle check before reusing a
+  connection; gRPC framing errors tonic detects itself (no message, EOF inside
+  a message) are classified Retryable instead of Contract. Query-string
+  literals (R5-007) and relative file-credential or TLS paths, which resolve
+  against the process working directory, pass validation.
 - **Provider self-test.** There is no nonce or keystream reuse probe.
 - **Engine and recovery robustness.** A failed journal directory sync can
   leave an idle volume degraded; bounded replay stores the allocation maps
   after every 1 MiB batch; the first write after attach re-stores both map
   copies of every shard under the exclusive lock. On a filesystem without
   native `fallocate`, glibc's `posix_fallocate` emulation writes zero bytes
-  into a slot a running checkpoint may be writing.
+  into a slot a running checkpoint may be writing. Bounded replay saves no
+  progress, so a recovery longer than `TimeoutStartSec` restarts from the old
+  checkpoint every time; every attach rewrites and syncs the whole accepted
+  journal, not only the final segment's unproven tail; recovery fails on I/O
+  to the advisory durable mark. Per-buffer `mlock` fragments the address
+  space and a failed `munlock` is ignored.
 - **Witness service.** A restored authority is not detected although the
   backing holds newer fences; online `maki volume gc` aborts while the writer
   advances; one bad endpoint certificate defeats etcd and frontend failover.
-- **Test tooling.** No power-loss sweep issues TRIM; torn writes split at
-  offsets relative to each write, not at absolute sectors; a directory sync
-  also makes the directory's own entry durable; the HTTP chaos server merges
+- **Test tooling.** A directory sync also makes the directory's own entry
+  durable; the HTTP chaos server merges
   repeated headers; the fuzz targets omit `DurableProof`, the witness decoders
   and the privileged mountinfo parsers.

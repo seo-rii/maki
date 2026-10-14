@@ -234,6 +234,18 @@ documents.
   Control commands take `--socket <path>` in place of the volume
   configuration, so `maki-admin` members can use them, and only parse a
   configuration they are given (BUG-108).
+- **2026-10-14 third review pass**: configuration errors never print a value
+  (BUG-113). Only encrypting cryptsetup mappings count as encrypted swap
+  (BUG-114). A gRPC TLS handshake is bounded by the connect timeout
+  (BUG-115), and WebSocket frames outside the response contract fail the
+  connection as a contract error (BUG-117). Attach refuses a mountpoint with
+  mounts below it (BUG-118) and `grow --size-bytes` takes plain digits only
+  (BUG-116). Superblocks with unknown flags or format version are refused
+  (BUG-109); `maki-check --deep` no longer writes into a directory that is not
+  a volume (BUG-110); the witness keeps accepting after EMFILE (BUG-111);
+  `maki` and `maki-check` gain `--help` and `--version` (BUG-112); key-file
+  open errors say why (BUG-119); a non-UTF-8 nbdkit `config=` path is refused
+  (BUG-120). A power-loss sweep with TRIM joins the release gates (TEST-006).
 
 - **2026-10-12 correctness and recovery review**: journal sync/recovery retries
   reassert accepted file lengths and verified bytes; volume creation holds its
