@@ -136,14 +136,30 @@ Keep the durability settings the campaign used: `fsync = on`,
 ## 6. Planned stop and start
 
 ```bash
+# Succeeds once every named unit is inactive; fails at once if one failed
+# (inspect it before continuing) or after WAIT_SECONDS (default 600).
+wait_stopped() {
+    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    for unit in "$@"; do
+        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
+            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit is $state: preserve the host state and inspect it" >&2
+                return 1
+            fi
+            sleep 1
+        done
+    done
+}
 systemctl stop postgresql@15-main.service        # or pg_ctlcluster 15 main stop
 maki drain /etc/maki/volumes/postgres.toml       # returns the durable checkpoint sequence
 systemctl stop maki-workload@postgres.target
-while systemctl is-active --quiet postgresql@15-main.service || \
-      systemctl is-active --quiet maki-attach@postgres.service || \
-      systemctl is-active --quiet maki@postgres.service; do sleep 1; done
-maki check /etc/maki/volumes/postgres.toml --deep
+wait_stopped postgresql@15-main.service maki-attach@postgres.service maki@postgres.service &&
+    maki check /etc/maki/volumes/postgres.toml --deep
 ```
+
+`wait_stopped` polls `ActiveState` because `systemctl is-active` also fails
+while a unit is still `deactivating` or has `failed`
+([why](../operations.md#privileged-helper)).
 
 Start with `systemctl start maki-workload@postgres.target`; the target starts
 the daemon, waits for its readiness notification, attaches, runs the gate,
