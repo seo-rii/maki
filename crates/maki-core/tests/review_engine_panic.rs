@@ -69,7 +69,10 @@ async fn a_panic_while_holding_the_volume_lock_stops_the_engine() {
         None
     })));
     assert!(engine.write(512, &[2; 512], true).await.is_err());
-    assert!(!armed.load(Ordering::SeqCst), "the injected panic never fired");
+    assert!(
+        !armed.load(Ordering::SeqCst),
+        "the injected panic never fired"
+    );
     backing.set_fault_hook(None);
 
     // Nothing may be acknowledged or served from that state any more.
@@ -77,9 +80,18 @@ async fn a_panic_while_holding_the_volume_lock_stops_the_engine() {
         engine.write(1024, &[3; 512], true).await.is_err(),
         "a write was acknowledged after a storage task panicked mid-mutation"
     );
-    assert!(engine.flush().await.is_err(), "FLUSH succeeded after the panic");
-    assert!(engine.read(0, 512).await.is_err(), "a read was served after the panic");
-    assert!(engine.checkpoint().await.is_err(), "a checkpoint ran after the panic");
+    assert!(
+        engine.flush().await.is_err(),
+        "FLUSH succeeded after the panic"
+    );
+    assert!(
+        engine.read(0, 512).await.is_err(),
+        "a read was served after the panic"
+    );
+    assert!(
+        engine.checkpoint().await.is_err(),
+        "a checkpoint ran after the panic"
+    );
     match engine.state() {
         EngineState::Degraded { reason } => {
             assert!(reason.contains("panic"), "unexpected reason: {reason}")
@@ -89,9 +101,7 @@ async fn a_panic_while_holding_the_volume_lock_stops_the_engine() {
     drop(engine);
 
     // Recovery from disk is the way back: the acknowledged write survives.
-    let engine = Engine::attach(backing, provider, options())
-        .await
-        .unwrap();
+    let engine = Engine::attach(backing, provider, options()).await.unwrap();
     engine.stop_checkpoint_worker().await;
     assert_eq!(engine.read(0, 512).await.unwrap(), vec![1; 512]);
 }
