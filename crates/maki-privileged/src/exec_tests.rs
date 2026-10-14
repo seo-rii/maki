@@ -1655,3 +1655,28 @@ fn step_commands_do_not_inherit_the_callers_environment() {
     )
     .expect("the step saw the caller's environment");
 }
+
+/// BUG-096: the mount source comes from mountinfo, and whoever mounts on
+/// top of the mountpoint chooses it: a FUSE `fsname=-c/etc/shadow` stacked
+/// between `mount` and verification. Root's blkid must never read it as an
+/// option (`-c` rewrites that file as a blkid cache), and a source that is
+/// not an absolute device path cannot be the volume's filesystem at all.
+#[test]
+fn filesystem_uuid_probe_never_reads_a_mount_source_as_an_option() {
+    for source in ["-c/etc/shadow", "--garbage-collect", "fuse-source", ""] {
+        assert!(
+            blkid_uuid_command(source).is_none(),
+            "{source:?} must not be probed"
+        );
+    }
+    let probe = blkid_uuid_command("/dev/mapper/vg-data").expect("a device path is probed");
+    let args: Vec<String> = probe
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args[args.len() - 2..],
+        ["--".to_string(), "/dev/mapper/vg-data".to_string()],
+        "{args:?}"
+    );
+}

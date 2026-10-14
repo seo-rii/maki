@@ -236,12 +236,22 @@ fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
     }
 }
 
+/// The filesystem UUID probe for a mount source. The source comes from
+/// mountinfo and is chosen by whoever mounted there (a FUSE `fsname` can be
+/// anything), so only an absolute path is probed, and `--` ends blkid's
+/// options before it (BUG-096). The topology check still decides whether
+/// the device is the volume's.
+fn blkid_uuid_command(device: &str) -> Option<std::process::Command> {
+    if !device.starts_with('/') {
+        return None;
+    }
+    let mut command = command::controlled("blkid");
+    command.args(["-o", "value", "-s", "UUID", "--", device]);
+    Some(command)
+}
+
 fn blkid_uuid(device: &str) -> Option<String> {
-    let out = command::capture(
-        command::controlled("blkid").args(["-o", "value", "-s", "UUID", device]),
-        command::Policy::PROBE,
-    )
-    .ok()?;
+    let out = command::capture(&mut blkid_uuid_command(device)?, command::Policy::PROBE).ok()?;
     if !out.status.success() {
         return None;
     }
