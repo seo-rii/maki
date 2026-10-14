@@ -80,21 +80,14 @@ fn create_volume_with_metadata_version(
     let lock_file = backing.open(layout::VOLUME_LOCK, true)?;
     lock_file.sync_data()?;
 
-    // Required evidence is initialized before publishing a v2 superblock.
-    // An interrupted initialization must never resemble a legacy volume or
-    // an empty history whose proof files were simply lost.
+    // The superblock is the commit point and is published last: until a
+    // copy of it is durable the root is not a volume, so an interrupted
+    // creation never resembles an initialized volume missing its catalog,
+    // checkpoint state or durable proof (BUG-100). Required evidence is
+    // initialized first, too: an interrupted initialization must never
+    // resemble a legacy volume or an empty history whose proof files were
+    // simply lost.
     DurableProofStore::initialize(backing, superblock.volume_uuid)?;
-
-    // Both superblock copies, so a single later torn write can never leave
-    // the volume unreadable.
-    superblock.generation = 0;
-    let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
-    let mut envelope = VolumeSuperblock {
-        superblock,
-        metadata_version,
-    };
-    sb_ab.store(backing, &mut envelope)?; // side A, gen 1
-    sb_ab.store(backing, &mut envelope)?; // side B, gen 2
 
     // Empty shard catalog (single copy now; second side written on first
     // update).
@@ -117,10 +110,22 @@ fn create_volume_with_metadata_version(
     mark.set_len(0)?;
     mark.sync_data()?;
 
-    // Make all dirents durable.
+    // Make every dirent above durable before the superblock can be.
     backing.sync_dir(layout::DATA_DIR)?;
     backing.sync_dir(layout::JOURNAL_DIR)?;
     backing.sync_dir(layout::CHECKPOINT_DIR)?;
+    backing.sync_dir("")?;
+
+    // Both superblock copies, so a single later torn write can never leave
+    // the volume unreadable.
+    superblock.generation = 0;
+    let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
+    let mut envelope = VolumeSuperblock {
+        superblock,
+        metadata_version,
+    };
+    sb_ab.store(backing, &mut envelope)?; // side A, gen 1
+    sb_ab.store(backing, &mut envelope)?; // side B, gen 2
     backing.sync_dir("")?;
 
     Ok(envelope.superblock)
