@@ -483,6 +483,9 @@ impl Drop for HandshakeTicket {
     }
 }
 
+/// Pause after a failed `accept` before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Its drop releases capacity on success, authentication failure, and unwind.
 pub struct ConnectionPermit(Arc<AtomicUsize>);
 impl Drop for ConnectionPermit {
@@ -670,7 +673,16 @@ impl Server {
             let socket = match accepted {
                 Ok(socket) => socket,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                // BUG-111: running out of descriptors or buffers (EMFILE,
+                // ENFILE, ENOBUFS), or a connection aborted before accept,
+                // is transient. Returning ended the service and with it the
+                // freshness authority of every volume using it. Pause so a
+                // persistent failure does not spin, and keep accepting, as
+                // the control socket does (O-04).
+                Err(_) => {
+                    std::thread::sleep(ACCEPT_BACKOFF);
+                    continue;
+                }
             };
             let deadline = Instant::now() + self.timeout;
             let Ok(ticket) = handshakes.admit(&socket) else {
