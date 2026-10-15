@@ -262,10 +262,14 @@ impl Volume {
         if let Some(unit) = overlay_unit {
             return Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)));
         }
-        let Some(unit) = self.store.first_allocated_unit() else {
-            return Ok(None);
-        };
-        Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)))
+        // A live overlay tombstone can hide the first stored allocation.
+        // Keep searching without checkpointing or changing the volume.
+        for unit in self.store.allocated_units() {
+            if let Some((_, data)) = self.read_ct(unit)? {
+                return Ok(Some((unit, data)));
+            }
+        }
+        Ok(None)
     }
 
     /// Journal a ciphertext write; publish to the overlay on success.
