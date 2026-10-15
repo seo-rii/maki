@@ -339,6 +339,11 @@ For a provider with `retry_safe = false`, those peers return EIO instead of
 being resent. Include that shared-connection failure scope in the application's
 availability contract; a per-request timeout does not isolate its peers.
 
+A gRPC request gives up after `timeout`, but the connection attempt behind it
+(TCP connect and TLS handshake together) may continue for up to four times
+`timeout`, so a slow handshake still serves the next request; a peer that never
+completes the handshake is abandoned then and the next request reconnects.
+
 Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request has been
 sent, and the WebSocket transport does not resend over a fresh connection. With

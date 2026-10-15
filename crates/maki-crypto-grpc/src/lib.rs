@@ -429,6 +429,10 @@ mod receive_contract_tests {
 
 // ---------------------------------------------------------------- provider
 
+/// A connection attempt, TLS handshake included, is abandoned after this
+/// many RPC timeouts (BUG-115).
+const CONNECT_BOUND_RPC_TIMEOUTS: u32 = 4;
+
 pub struct GrpcProviderSpec {
     /// e.g. `http://crypto.internal:7000` (or https with TLS config).
     pub url: String,
@@ -626,10 +630,24 @@ impl GrpcCryptoProvider {
             }
             (None, _) => return Err(fatal("gRPC endpoint URL has no scheme")),
         }
+        // `connect_lazy` applies the connect timeout to the TCP connect only;
+        // a peer that accepts TCP and never answers the ClientHello then
+        // pins the channel's connection worker, and every later RPC queues
+        // behind that handshake (BUG-115). With an explicit connector, tonic
+        // bounds the whole connect, TLS included, and reconnects afterwards.
+        // The bound is several RPC timeouts: a slow but working handshake
+        // still completes in the background for the next RPC, as before.
+        // The TCP connector is configured like tonic's own: its timeout is
+        // divided across the resolved addresses, so an unreachable first
+        // address (`localhost` as `::1` on Windows) leaves time for the next.
+        let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
+        tcp.enforce_http(false);
+        tcp.set_nodelay(true);
+        tcp.set_connect_timeout(Some(spec.timeout));
         let channel = endpoint
             .timeout(spec.timeout)
-            .connect_timeout(spec.timeout)
-            .connect_lazy();
+            .connect_timeout(spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS))
+            .connect_with_connector_lazy(tcp);
         let encrypt_path = PathAndQuery::try_from(spec.encrypt_path.clone())
             .map_err(|e| fatal(format!("bad encrypt path: {e}")))?;
         let decrypt_path = PathAndQuery::try_from(spec.decrypt_path.clone())
