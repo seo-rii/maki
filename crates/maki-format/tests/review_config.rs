@@ -687,8 +687,8 @@ root = "/x"
 
 #[test]
 fn remote_transport_limits_carry_a_full_ciphertext_batch() {
-    // gRPC sends raw bytes: 520 KiB holds the plaintext batch, not the
-    // 561,152-byte ciphertext batch (exactly 548 KiB).
+    // 520 KiB holds the plaintext batch, not the ciphertext. Even exactly
+    // 548 KiB only holds ciphertext and leaves no room for protobuf fields.
     let grpc = |limit: &str| {
         remote_batch(
             "remote-grpc",
@@ -696,10 +696,11 @@ fn remote_transport_limits_carry_a_full_ciphertext_batch() {
         )
     };
     assert!(err(&grpc("520KiB")).contains("max_message_bytes"));
-    ok(&grpc("548KiB"));
+    assert!(err(&grpc("548KiB")).contains("max_message_bytes"));
+    ok(&grpc("552KiB"));
 
-    // WebSocket sends base64: 700 KiB holds the encoded plaintext batch
-    // (699,052 bytes) but not the encoded ciphertext batch (748,204 bytes).
+    // 731 KiB only holds the separately padded base64 ciphertext items;
+    // the JSON fields and envelope need additional frame capacity.
     let ws = |limit: &str| {
         remote_batch(
             "remote-websocket",
@@ -707,12 +708,12 @@ fn remote_transport_limits_carry_a_full_ciphertext_batch() {
         )
     };
     assert!(err(&ws("700KiB")).contains("max_frame_bytes"));
-    ok(&ws("731KiB"));
+    assert!(err(&ws("731KiB")).contains("max_frame_bytes"));
+    ok(&ws("740KiB"));
 }
 
-/// A batched HTTP mapping receives the whole batch in one response body,
-/// base64 or hex encoded: `max_response_bytes` must at least hold the
-/// base64 form of a full ciphertext batch.
+/// A batched HTTP mapping receives the whole batch in one response body:
+/// the limit must hold both encoded ciphertext and the declared JSON shape.
 #[test]
 fn batched_http_response_limit_carries_a_full_ciphertext_batch() {
     let http = |limit: &str| {
@@ -759,7 +760,11 @@ root = "/x"
         )
     };
     assert!(err(&http("700KiB")).contains("max_response_bytes"));
-    ok(&http("731KiB"));
+    assert!(err(&http("731KiB")).contains("max_response_bytes"));
+    ok(&http("740KiB"));
+    // The reviewed 800 KiB cap fits base64, but not hex ciphertext alone.
+    let hex = http("800KiB").replace("encoding = \"base64\"", "encoding = \"hex\"");
+    assert!(err(&hex).contains("max_response_bytes"));
 }
 
 /// HTTP refuses a zero timeout; WebSocket and gRPC accepted `"0s"`, which

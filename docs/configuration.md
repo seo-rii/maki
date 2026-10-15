@@ -190,14 +190,18 @@ schema, geometry, and secret-literal checks it rejects:
   must be a source in the JSON `fields`, or in `item_fields` of a batch
   layout (a raw body sends no fields, and a per-item body never sends
   `item_fields`);
-- a transport limit that cannot carry one full crypto batch. A batch puts
-  `crypto.batch.max_bytes` of plaintext on the wire, or
-  `min(max_items, max_bytes / unit) × capabilities.max_ciphertext_size` of
-  ciphertext, whichever is larger: gRPC `max_message_bytes` (default 4 MiB)
-  must hold it as raw bytes, and WebSocket `max_frame_bytes` (default 8 MiB)
-  and, for a batched HTTP mapping, `max_response_bytes` (default 8 MiB) must
-  hold it base64-encoded. These are necessary bounds; leave headroom for the
-  surrounding JSON or protobuf framing. A zero limit is rejected;
+- a transport limit that cannot carry one full crypto batch, including the
+  declared maximum ciphertext size. gRPC `max_message_bytes` (default 4 MiB)
+  includes protobuf field tags, lengths, indices and context. WebSocket
+  `max_frame_bytes` (default 8 MiB) includes each item's base64 padding, JSON
+  structure, escaped profile, and maximum-width numeric fields. HTTP
+  `max_response_bytes` (default 8 MiB) covers each operation's response mapping,
+  base64/base64url/hex encoding, JSON pointer wrappers and echoed indices; raw
+  and single-item responses are checked too. JSON bounds cover compact object
+  mappings containing the declared fields. Optional provider metadata, array
+  siblings selected by numeric pointers, whitespace and redundant escaping
+  need additional response capacity. Remote responses still obey the hard
+  runtime cap. A zero limit is rejected;
 - a zero `timeout` for any remote transport;
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name

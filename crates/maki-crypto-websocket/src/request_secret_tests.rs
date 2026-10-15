@@ -211,3 +211,33 @@ fn length_counting_refuses_unaddressable_vec_capacity() {
     );
     assert_eq!(counter.bytes, isize::MAX as usize);
 }
+
+#[test]
+fn full_ciphertext_request_uses_the_exact_serialized_frame_boundary() {
+    let mut context = context();
+    context.format_version = u32::MAX;
+    context.crypto_compatibility_id = "profile-\"\\\n\u{1}-한글".into();
+    for size in [4383, 4384, 4385] {
+        let payload = vec![0xAB; size];
+        let items: Vec<_> = (0..128)
+            .map(|i| (u64::MAX - i, payload.as_slice()))
+            .collect();
+        let expected = json!({
+            "format": context.format_version,
+            "id": u64::MAX,
+            "items": items.iter().map(|(unit,data)|json!({"unit":unit,"data":b64(data)})).collect::<Vec<_>>(),
+            "op": "decrypt",
+            "profile": context.crypto_compatibility_id,
+            "volume": context.volume_uuid,
+        }).to_string();
+        assert!(
+            request::encode_request(u64::MAX, "decrypt", &context, &items, expected.len() - 1)
+                .is_err()
+        );
+        for limit in [expected.len(), expected.len() + 1] {
+            let actual =
+                request::encode_request(u64::MAX, "decrypt", &context, &items, limit).unwrap();
+            assert_eq!(actual.expose(), expected.as_bytes());
+        }
+    }
+}
