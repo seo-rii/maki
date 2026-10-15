@@ -242,6 +242,10 @@ fn main() -> ExitCode {
         eprintln!("working-set must be a positive multiple of io-size no larger than the volume");
         return ExitCode::from(2);
     }
+    if let Err(error) = workload::validate_oracle_capacity(working_set_bytes / io_size as u64) {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
     // Protected backings must be opened through their existing witness. A
     // create attempt would start enrollment again and refuse the stored root
     // before the benchmark can honor its destruction authorization.
