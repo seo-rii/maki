@@ -21,7 +21,7 @@ configuration paths. Do not run storage commands against an unreviewed target.
 
 | Change | Required procedure |
 | --- | --- |
-| Bearer token, client authentication credential, or credential source reference that retains access to exactly the same key/profile | Stop and detach the workload, acknowledge drain, stop the daemon, update credentials, and reattach with verification. |
+| Bearer token, client authentication credential, or credential source reference that retains access to exactly the same key/profile | Quiesce the application, unmount while I/O admission is open, acknowledge drain, stop the lifecycle target, update credentials, and reattach with verification. |
 | Server certificate or private server CA with the same key/profile | Use separate stopped stages for overlapping trust, server-chain replacement, and old-root removal; verify fresh handshakes and every configured peer at each stage. |
 | Endpoint address that serves the same key/profile | The same stopped procedure, with verification of every configured peer against the existing volume. Preserve the required transport security and capability contract. |
 | Actual key bytes or provider-side key version, algorithm, incompatible ciphertext encoding/context binding, or provider identity | Create a separate volume and restore a database-native backup into it. |
@@ -58,20 +58,27 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    the separate sequence below. Record non-secret certificate
    subjects, issuers, serials, and fingerprints for both sides of the change.
 
-2. Stop database writers and their supervisors, and prevent automatic restarts.
-   Stop containers and release their bind mounts in each relevant mount
-   namespace. For an attachment managed by the packaged active attach unit,
-   stopping that unit performs unmount, VG deactivation, and NBD disconnect
-   while the crypto daemon is still available:
+2. Quiesce database writers through the application's own shutdown interface,
+   close their files, and prevent automatic restarts. Release container bind
+   mounts in every relevant mount namespace. Do not issue systemd stop jobs for
+   the workload, attach or daemon units before the acknowledgement: those jobs
+   can propagate through the target's dependencies and stop the daemon before
+   `drain` can reach its control socket. The daemon must remain running through
+   unmount and the acknowledgement.
+
+   Verify the intended attachment:
 
    ```sh
-   sudo systemctl stop maki-attach@example.service
+   sudo maki-attach verify --volume example
    ```
 
-   Verify that the intended storage attachment is gone before continuing.
-   An inactive unit does not prove that a manually created attachment was
-   removed. For manually managed attachments, use the established helper
-   detach procedure instead. If cleanup fails, resolve it before rotating;
+   Unmount the verified filesystem at the mountpoint from the trusted attach
+   configuration, using the deployment's reviewed unmount procedure while the
+   daemon and I/O admission remain available. Confirm unmount succeeded before
+   continuing; a prior `sync` does not remove unmount's need for writeback.
+   Do not stop the attach unit yet: the later target stop will deactivate the
+   VG and disconnect NBD after the acknowledgement. If unmount fails, keep
+   admission open and resolve it before rotating;
    [disconnected storage recovery](storage-recovery.md) has additional limits.
 
 3. With the filesystem unmounted and the daemon still running, request and
@@ -89,11 +96,20 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    drain. Successful drain closes I/O admission for that attachment; only a
    new attachment can resume I/O.
 
-4. After the acknowledgement, stop the daemon and confirm it has exited and
-   released the volume lock:
+4. After the acknowledgement, stop the lifecycle target:
 
    ```sh
-   sudo systemctl stop maki@example.service
+   sudo systemctl stop maki-workload@example.target
+   ```
+
+   Wait for every registered workload, `maki-attach@example.service` and
+   `maki@example.service` to report `ActiveState=inactive`, using the bounded
+   [stop wait](operations.md#privileged-helper). A failed unit or timeout stops
+   the procedure. The target's own stop job can finish before those units do;
+   confirm the daemon has exited and released the volume lock before inspecting
+   the offline volume:
+
+   ```sh
    maki volume inspect /etc/maki/volumes/example.toml
    ```
 
@@ -160,9 +176,10 @@ containing the old and new private roots for the configured `ca_file`.
 If providers are shared, distribute overlapping trust to every affected client
 before replacing a server certificate and coordinate their maintenance windows.
 
-Use the stopped sequence above for each stage: stop writers, detach, acknowledge
-drain, stop the daemon, change inputs, and restart with full peer, mount, and
-database verification. This implementation reads the CA file at construction;
+Use the stopped sequence above for each stage: quiesce writers, unmount,
+acknowledge drain, stop the target and wait for every unit, change inputs, and
+restart with full peer, mount, and database verification. This implementation
+reads the CA file at construction;
 changing it does not reload a running connection pool.
 
 1. Install the overlapping old/new trust bundle while the client is stopped.
@@ -206,7 +223,7 @@ stopped; test independent failover and full-provider loss separately.
 ## Roll back a credential change
 
 Keep writers stopped if the new credential or any peer fails validation. If a
-new daemon attached, repeat the unmount/detach, acknowledged drain, and stop
+new daemon attached, repeat the unmount, acknowledged drain, and target-stop
 sequence before changing its inputs again. If attach itself failed, confirm
 that the process exited and the volume lock is released; no successful drain
 can be inferred from that failure.
@@ -236,9 +253,9 @@ initialize that backing path, erase recovery evidence, or rebind its canary.
    encrypted shards or rewrite the old volume's identity: those ciphertexts
    remain bound to the old UUID/key/profile.
 4. At cutover, stop old-volume writers and complete the database-specific
-   final backup/log synchronization. Detach, acknowledge drain, and stop the
-   old daemon as above. Validate database recovery and application data on
-   the new volume before redirecting the workload and permitting writes.
+   final backup/log synchronization. Unmount, acknowledge drain, and stop the
+   old lifecycle target as above. Validate database recovery and application
+   data on the new volume before redirecting the workload and permitting writes.
 5. Retain the old volume, configuration, and key through the agreed retention
    window. Once the new database accepts writes, switching back to the old
    volume can lose those writes; rollback then needs a database-level data

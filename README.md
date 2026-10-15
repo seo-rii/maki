@@ -73,7 +73,8 @@ sudo -u maki maki volume create /etc/maki/volumes/demo.toml
 # then pin the UUIDs in /etc/maki/attach/demo.toml  (docs/getting-started/first-volume.md)
 systemctl start maki-workload@demo.target
 maki-attach verify --volume demo && echo hello > /srv/demo/hello.txt
-maki drain /etc/maki/volumes/demo.toml && systemctl stop maki-workload@demo.target
+# Keep I/O admission open for filesystem unmount; daemon unload drains afterward.
+systemctl stop maki-workload@demo.target
 ```
 
 ## Production deployment
