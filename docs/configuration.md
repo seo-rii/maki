@@ -262,8 +262,10 @@ privileged attach helper has no crypto dependency and no credential directive.
 
 Every credential reference is loaded from exactly the `source` it declares:
 `credential` reads `$CREDENTIALS_DIRECTORY/<name>` and fails closed when the
-directory is unset, `file` reads the named file, `env` reads
-`MAKI_CREDENTIAL_<NAME>`. There is no fallback between sources, so a production
+directory is unset, `file` reads the named file (an absolute path: a relative
+one would resolve against whichever process's working directory reads it), `env`
+reads `MAKI_CREDENTIAL_<NAME>`. TLS `ca_file` and `client_cert_file` paths must
+be absolute for the same reason. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is

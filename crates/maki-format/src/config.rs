@@ -1213,8 +1213,10 @@ impl VolumeConfig {
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         self.validate_journal_bounds()?;
         self.validate_settings()?;
-        self.validate_provider_sections()?;
+        // Name conflicts first: they say more than a per-credential error
+        // about the same name.
         self.validate_credential_sources()?;
+        self.validate_provider_sections()?;
         if !self
             .crypto
             .capabilities
@@ -1323,7 +1325,22 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     if c.name.is_empty() {
         return Err(ConfigError::Invalid("credential name is empty".to_string()));
     }
+    // A `file` credential names a path. A relative one resolves against the
+    // working directory of whichever process reads it, which is not the one
+    // that validated it (BUG-122).
+    if c.source == "file" && !is_absolute_path(&c.name) {
+        return Err(ConfigError::Invalid(format!(
+            "file credential {:?} must be an absolute path",
+            c.name
+        )));
+    }
     Ok(())
+}
+
+/// Absolute on this platform, or rooted at `/` (the form the shipped
+/// configurations use, also accepted on Windows test hosts).
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with('/') || std::path::Path::new(path).is_absolute()
 }
 
 impl VolumeConfig {
@@ -1524,6 +1541,13 @@ fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
         ("client_cert_file", &tls.client_cert_file),
     ] {
         if let Some(path) = path {
+            // Relative paths resolve against the reading process's working
+            // directory, not the validating one (BUG-122).
+            if !is_absolute_path(path) {
+                return Err(invalid(format!(
+                    "[crypto.{section}.tls] {field} {path:?} must be an absolute path"
+                )));
+            }
             // Check the type before opening: opening a FIFO would block.
             if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
                 return Err(invalid(format!(
