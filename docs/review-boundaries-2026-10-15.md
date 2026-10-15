@@ -220,8 +220,35 @@ and output logic are unchanged.
 WebSocket connection deadline before TLS/root preparation. An exhausted budget
 does not open a socket; otherwise network setup uses the remaining time.
 Both deadline regressions failed before the fix; all 80 WebSocket tests,
-dependency-feature checks and strict Clippy passed. Native-root discovery
-remains synchronous and cannot be preempted by this deadline.
+dependency-feature checks and strict Clippy passed. Final review then found
+that direct deadline addition panicked for a timeout such as `Duration::MAX`,
+which Tokio's prior relative timeout accepted. [#74](https://github.com/seo-rii/maki/pull/74),
+commit `cdef14f`, uses checked addition and preserves that behavior. The real
+local handshake reproduced the panic before the fix; all three deadline tests
+and strict Clippy passed afterward. Native-root discovery remains synchronous
+and cannot be preempted by this deadline.
+
+The intermediate candidate `6b7d0cb` started run
+[38733755607](https://github.com/seo-rii/maki/actions/runs/38733755607).
+That run was cancelled when the final review required further fixes; its
+completed etcd job is not a complete qualification result.
+
+The final integration review also found that global control-socket option
+parsing intercepted the privileged helper's NBD `--socket` argument.
+[#75](https://github.com/seo-rii/maki/pull/75), commit `85c72cf`, preserves raw
+attach/detach/grow arguments before control parsing, as well as the existing
+leading-timeout fallback. The actual CLI regression failed before the fix;
+seven CLI tests and strict Clippy passed afterward.
+
+[#76](https://github.com/seo-rii/maki/pull/76), commit `d1c9554`, preserves the
+space-refusal trigger when a failed physical reclamation hint has retained a
+cursor but all journal records are already gone. The regression failed before
+the fix; it now verifies exactly one attempt per refusal without autonomous
+retry, then actual slot reclamation and a successful write after fault repair.
+All 31 related tests and strict Clippy passed. Existing checkpoint backoff and
+immediate-retry suppression are unchanged; stalled physical release still
+requires another checkpoint reason, such as space refusal, rather than the
+interval alone.
 
 [#68](https://github.com/seo-rii/maki/pull/68) combines the reviewed PR heads
 while preserving each change's commits. Its description records the final
