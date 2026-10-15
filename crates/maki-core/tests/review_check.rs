@@ -14,6 +14,7 @@ use maki_format::checker::{check_volume, CheckReport};
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
+use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::failpoints;
 use maki_test_support::CrashableBacking;
 
@@ -278,4 +279,97 @@ fn deep_check_refuses_to_race_an_attached_volume() {
     );
     drop(vol);
     assert!(deep(&backing).ok());
+}
+
+/// BUG-090: the deep check reads the superblock a second time after the fast
+/// check. When only that read fails (a transient I/O error, or a copy that
+/// changed in between), the check must not end with an error-free report:
+/// "check passed" would then cover a journal and slots nobody examined.
+#[test]
+fn deep_check_never_passes_when_its_own_superblock_read_fails() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    vol.write_ct(5, &ct(7), true).unwrap();
+    vol.checkpoint().unwrap();
+    drop(vol);
+
+    let superblock_open = |op: &FaultOp<'_>| matches!(op, FaultOp::Open { path, .. } if path.starts_with("superblock."));
+    // How many superblock opens the fast check makes on its own.
+    let opens = Arc::new(AtomicUsize::new(0));
+    let counted = opens.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op: &FaultOp<'_>| {
+        if superblock_open(op) {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+        None
+    })));
+    assert!(fast(&backing).ok());
+    let fast_opens = opens.load(Ordering::SeqCst);
+    assert!(fast_opens > 0, "the fast check reads the superblock");
+
+    // Let the deep check's fast phase succeed, then fail every later read.
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = seen.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op: &FaultOp<'_>| {
+        (superblock_open(op) && counter.fetch_add(1, Ordering::SeqCst) >= fast_opens)
+            .then(|| std::io::Error::other("injected superblock read failure"))
+    })));
+    let result = deep_check(backing.clone() as Arc<dyn Backing>, SEGMENT);
+    backing.set_fault_hook(None);
+    assert!(
+        seen.load(Ordering::SeqCst) > fast_opens,
+        "the deep check read the superblock again"
+    );
+    match result {
+        Err(maki_core::CoreError::Io(_)) => {}
+        Err(other) => panic!("an I/O failure must surface as I/O: {other}"),
+        Ok(report) => panic!(
+            "deep check passed without examining the volume: errors {:?}, info {:?}",
+            report.errors, report.info
+        ),
+    }
+    assert!(deep(&backing).ok(), "the volume itself is healthy");
+}
+
+/// BUG-091: the fast checker names exactly the shard data files recovery
+/// adopts. A canonical file missing from the catalog is adopted at attach
+/// (S-01), not "ignored by reads"; a non-canonical spelling is not a shard
+/// for recovery, so the checker must not report it as one either.
+#[test]
+fn fast_check_reports_the_shard_files_recovery_adopts() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    drop(new_volume(&backing));
+    assert!(geometry().num_shards() > 0xb && geometry().num_shards() <= 0x20);
+    for name in [
+        "shard-0000000b.dat",
+        "shard-0000000A.dat",
+        "shard-00000020.dat",
+    ] {
+        backing
+            .open(&format!("{}/{name}", layout::DATA_DIR), true)
+            .unwrap();
+    }
+
+    let report = fast(&backing);
+    assert!(report.ok(), "{}", errors(&report));
+    let warnings = report.warnings.join("\n");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("shard-0000000b.dat") && w.contains("adopts")),
+        "{warnings}"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("shard-00000020.dat") && w.contains("beyond")),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("shard-0000000A.dat"), "{warnings}");
 }

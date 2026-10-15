@@ -43,6 +43,14 @@ pub mod layout {
         format!("{DATA_DIR}/shard-{shard:08x}.dat")
     }
 
+    /// Parse a shard data file name (an entry of [`DATA_DIR`]) back to its
+    /// index. Only the exact spelling [`shard_data`] produces is a shard.
+    pub fn parse_shard_data(name: &str) -> Option<u64> {
+        let hex = name.strip_prefix("shard-")?.strip_suffix(".dat")?;
+        let index = u64::from_str_radix(hex, 16).ok()?;
+        (shard_data(index) == format!("{DATA_DIR}/{name}")).then_some(index)
+    }
+
     pub fn shard_alloc_a(shard: u64) -> String {
         format!("{DATA_DIR}/shard-{shard:08x}.alloc.a")
     }
@@ -63,12 +71,13 @@ pub mod layout {
         format!("{JOURNAL_DIR}/seg-{index:016x}")
     }
 
-    /// Parse a journal segment file name back to its index.
+    /// Parse a journal segment file name back to its index. Only the exact
+    /// spelling [`journal_segment`] produces is a segment: recovery scans a
+    /// listed name but replays and reclaims through the canonical path, so a
+    /// second spelling (upper-case hex, a sign) must never be accepted.
     pub fn parse_journal_segment(name: &str) -> Option<u64> {
         let hex = name.strip_prefix("seg-")?;
-        if hex.len() != 16 {
-            return None;
-        }
-        u64::from_str_radix(hex, 16).ok()
+        let index = u64::from_str_radix(hex, 16).ok()?;
+        (journal_segment(index) == format!("{JOURNAL_DIR}/{name}")).then_some(index)
     }
 }

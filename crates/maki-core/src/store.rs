@@ -193,12 +193,6 @@ fn catalog_store(geometry: &Geometry) -> AbStore {
         .with_max_len(ShardCatalog::max_encoded_len(geometry.num_shards()))
 }
 
-fn parse_shard_data_name(name: &str) -> Option<u64> {
-    let hex = name.strip_prefix("shard-")?.strip_suffix(".dat")?;
-    let idx = u64::from_str_radix(hex, 16).ok()?;
-    (layout::shard_data(idx) == format!("{}/{name}", layout::DATA_DIR)).then_some(idx)
-}
-
 /// What the slot of a unit whose allocation bit is clear holds.
 enum Probe {
     /// An all-zero header (or, in a shard never checkpointed into, a slot
@@ -335,7 +329,7 @@ impl SlotStore {
         let mut catalog_dirty = false;
         let mut orphans: Vec<u64> = Vec::new();
         for name in backing.list(layout::DATA_DIR)? {
-            if let Some(idx) = parse_shard_data_name(&name) {
+            if let Some(idx) = layout::parse_shard_data(&name) {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {
                     orphans.push(idx);
                 }
