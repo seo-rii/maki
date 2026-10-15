@@ -1826,8 +1826,8 @@ impl VolumeConfig {
                 }
             }
         }
-        // Binding the control socket replaces whatever file is at its path,
-        // so it must never share one with the NBD export socket. Compare the
+        // Binding the control socket reclaims a dead socket at its path, so
+        // it must never share one with the NBD export socket. Compare the
         // effective paths (defaults included) component-wise, so `a//b` and
         // `a/./b` name the same file.
         let control_socket = self

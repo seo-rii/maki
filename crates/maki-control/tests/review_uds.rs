@@ -1,6 +1,7 @@
 //! Review M-017: control socket binding applies mode 0660 before any client
-//! can connect, replaces a stale socket file, resolves the configured group,
-//! and removes the path when the listener is dropped. Unix only.
+//! can connect, replaces a stale socket (never another kind of file, BUG-099),
+//! resolves the configured group, and removes the path when the listener is
+//! dropped. Unix only.
 
 #![cfg(unix)]
 
@@ -35,7 +36,7 @@ impl ControlBackend for Fake {
 async fn bind_sets_mode_replaces_stale_socket_and_cleans_up() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control.sock");
-    std::fs::write(&path, b"stale").unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
 
     let listener = bind_control_socket(&path, None).unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

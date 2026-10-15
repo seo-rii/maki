@@ -158,3 +158,39 @@ async fn a_full_listener_backlog_is_still_a_live_address() {
     drop(bind_control_socket(&socket, None).unwrap());
     assert!(!socket.exists());
 }
+
+/// BUG-099: the address is configurable, and binding renamed the socket over
+/// whatever file was there. A mistyped `control.socket` naming a volume file
+/// (`superblock.a`, a shard) destroyed it. Only a dead socket is reclaimed.
+#[tokio::test]
+async fn a_regular_file_at_the_address_is_not_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("superblock.a");
+    std::fs::write(&path, b"volume metadata").unwrap();
+
+    let error = bind_control_socket(&path, None).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"volume metadata");
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        1,
+        "a refused bind leaves no staging directory behind"
+    );
+}
+
+#[tokio::test]
+async fn a_symlink_at_the_address_is_not_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    std::fs::write(&target, b"kept").unwrap();
+    let path = directory.path().join("control.sock");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    let error = bind_control_socket(&path, None).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&target).unwrap(), b"kept");
+}
