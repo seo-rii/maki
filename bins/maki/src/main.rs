@@ -519,6 +519,17 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
 fn existing_backing(
     cfg: &maki_format::config::VolumeConfig,
 ) -> Result<std::sync::Arc<dyn maki_backing::Backing>, String> {
+    // Opening a remote RollbackBacking claims a writer and forks a namespace.
+    // Diagnostic commands must not mutate the authority, even if they fail or
+    // are killed before Drop can release that session.
+    if cfg
+        .backing
+        .rollback_protection
+        .as_ref()
+        .is_some_and(|r| r.remote.is_some())
+    {
+        return Err("read-only remote backing inspection is not supported; use `maki volume witness` to inspect the authority without claiming a writer".into());
+    }
     let root = std::path::Path::new(&cfg.backing.root);
     match std::fs::metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
