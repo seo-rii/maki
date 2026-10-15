@@ -215,7 +215,11 @@ fn truncated_or_extended_arena_rejects_exact_witness_root_without_rewinding_it()
         assert!(RollbackBacking::open_remote(f.root.path(), f.writer.clone()).is_err());
         let after = f.current();
         assert_eq!(after.current, before.current);
-        assert_eq!(after.phase, Phase::Claimed);
+        // The damage is found before any claim (BUG-107): the authority is
+        // left exactly as it was, and every later attach refuses again.
+        assert_eq!(after.phase, Phase::Released);
+        assert_eq!(after.fence, before.fence);
+        assert!(RollbackBacking::open_remote(f.root.path(), f.writer.clone()).is_err());
     }
 }
 

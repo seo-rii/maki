@@ -441,3 +441,40 @@ fn unresolved_commit_reply_poison_preserves_remote_committed_generation() {
     assert_eq!(read(&new), b"committed");
     new.check_freshness().unwrap();
 }
+
+/// BUG-107: attach claimed the authority (raising its fence) and takeover
+/// revoked the live writer *before* checking that this backing root holds
+/// the authority's current data. A configuration whose address names
+/// another volume's witness stranded that volume (Claimed, needing an
+/// administrator) or revoked its live writer, and then failed anyway.
+#[test]
+fn attach_refuses_another_roots_authority_without_claiming_it() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    drop(a.create());
+    drop(b.create());
+    let before = inspect(b.writer.as_ref());
+    assert!(RollbackBacking::open_remote(a.root.path(), b.writer.clone()).is_err());
+    assert_eq!(
+        inspect(b.writer.as_ref()),
+        before,
+        "a misrouted attach changed another volume's authority"
+    );
+    let b_again = RollbackBacking::open_remote(b.root.path(), b.writer.clone()).unwrap();
+    b_again.check_freshness().unwrap();
+}
+
+#[test]
+fn takeover_refuses_another_roots_authority_without_revoking_its_writer() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    drop(a.create());
+    let live = b.create();
+    write(&live, b"live");
+    let expected = inspect(b.admin.as_ref());
+    assert!(RollbackBacking::takeover_remote(a.root.path(), b.admin.clone(), &expected).is_err());
+    assert_eq!(inspect(b.admin.as_ref()), expected);
+    live.check_freshness()
+        .expect("a misrouted takeover revoked another volume's live writer");
+    assert_eq!(read(&live), b"live");
+}

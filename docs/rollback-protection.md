@@ -64,10 +64,13 @@ sets provide frontend failover; independent copied local directories cannot.
 Its storage and restore authority must remain independent of the backing's
 administration.
 
-Every attach claims a higher fence, authenticates the current manifest and
-copies its committed pages into a fresh, fully reserved namespace before
-activation. The old session cannot publish, and any in-flight physical write
-stays within its old namespace. Normal attach requires a released session;
+Every attach first authenticates the authority's current manifest in its own
+backing root, so a configuration that names another volume's witness fails
+without changing that authority; it then claims a higher fence and copies the
+committed pages into a fresh, fully reserved namespace before activation.
+Takeover applies the same check before it revokes the current writer. The old
+session cannot publish, and any in-flight physical write stays within its old
+namespace. Normal attach requires a released session;
 crashes, ambiguous responses and failed copies require explicit administrator
 intervention. Cached and overlay reads also consult the remote authority.
 
