@@ -8,8 +8,11 @@
 //! `max_wait` after its first item arrived; it never exceeds `max_items` /
 //! `max_bytes`. Requests are whole groups: a request's items are never
 //! split across batches and their order is preserved, so per-position
-//! validation in `CheckedProvider` keeps working. A request larger than a
-//! lane can admit as one group — more than `max_items`/`max_bytes`, or more
+//! validation in `CheckedProvider` keeps working. Requests that share a unit
+//! are never coalesced: two versions of one unit are interchangeable to
+//! every per-position check, so a provider that answers a batch by unit
+//! index could hand both callers the same result (BUG-102). A request larger
+//! than a lane can admit as one group — more than `max_items`/`max_bytes`, or more
 //! than the lane's pending capacity — is *rejected*, never split or silently
 //! clamped, so its pending charge can never exceed the budget (R04). Encrypt
 //! and decrypt run on separate lanes, each bounded (count + bytes) so pending
@@ -26,7 +29,7 @@
 //! takes slices). Local providers gain nothing from coalescing, so the
 //! daemon only wraps remote ones.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,6 +118,30 @@ impl SchedulerStats {
     pub fn coalesced_batches_total(&self) -> u64 {
         self.coalesced_batches.load(Ordering::SeqCst)
     }
+}
+
+/// A batch item addressed by its crypto unit.
+trait UnitIndexed {
+    fn unit_index(&self) -> u64;
+}
+
+impl UnitIndexed for PlaintextUnit {
+    fn unit_index(&self) -> u64 {
+        self.unit_index
+    }
+}
+
+impl UnitIndexed for CiphertextUnit {
+    fn unit_index(&self) -> u64 {
+        self.unit_index
+    }
+}
+
+fn units_of<I: UnitIndexed, O>(groups: &[Group<I, O>]) -> HashSet<u64> {
+    groups
+        .iter()
+        .flat_map(|g| g.items.iter().map(UnitIndexed::unit_index))
+        .collect()
 }
 
 struct Group<I, O> {
@@ -326,7 +353,7 @@ struct Lane<I, O> {
     max_admit_logical_bytes: u64,
 }
 
-impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
+impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
     fn spawn(
         config: SchedulerConfig,
         max_pending_bytes: u64,
@@ -429,7 +456,7 @@ impl<I: Send + 'static, O: Send + 'static> Lane<I, O> {
 
 /// One lane's aggregation loop: form batches of whole groups, dispatch,
 /// route results back. Exits when every sender is gone.
-async fn run_lane<I: Send + 'static, O: Send + 'static>(
+async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
     mut rx: mpsc::Receiver<Group<I, O>>,
     config: SchedulerConfig,
     clock: Arc<dyn Clock>,
@@ -458,6 +485,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
         let mut batch: Vec<Group<I, O>> = vec![first];
         let mut items: usize = batch[0].items.len();
         let mut bytes: u64 = batch[0].logical_bytes;
+        let mut units = units_of(&batch);
 
         while items < config.target_items && bytes < config.target_bytes {
             let remaining = deadline.saturating_sub(clock.now());
@@ -473,6 +501,7 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
                         if batch.is_empty() { continue 'lane; }
                         items = batch.iter().map(|g| g.items.len()).sum();
                         bytes = batch.iter().map(|g| g.logical_bytes).sum();
+                        units = units_of(&batch);
                         continue;
                     },
                     g = rx.recv() => g,
@@ -485,15 +514,23 @@ async fn run_lane<I: Send + 'static, O: Send + 'static>(
             if group.reply.is_closed() {
                 continue;
             }
+            // A unit already in this batch closes it (BUG-102): results are
+            // matched by position and unit index only, which cannot tell
+            // two versions of one unit apart.
             let fits = items + group.items.len() <= config.max_items
                 && bytes + group.logical_bytes <= config.max_bytes
-                && group.context == batch[0].context;
+                && group.context == batch[0].context
+                && group
+                    .items
+                    .iter()
+                    .all(|item| !units.contains(&item.unit_index()));
             if !fits {
                 queued.push_front(group);
                 break;
             }
             items += group.items.len();
             bytes += group.logical_bytes;
+            units.extend(group.items.iter().map(UnitIndexed::unit_index));
             batch.push(group);
         }
 

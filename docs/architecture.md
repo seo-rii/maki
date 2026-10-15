@@ -244,7 +244,9 @@ configuration validation otherwise.
 
 Remote providers sit behind a batch scheduler: concurrent requests are
 coalesced into bounded provider calls (targets, maxima, and a maximum wait from
-configuration), whole requests are never split, and each lane's pending work is
+configuration), whole requests are never split, requests that share a unit go
+in separate calls (results are matched by position and unit index, which
+cannot tell two versions of one unit apart), and each lane's pending work is
 bounded by count and bytes so a slow provider applies backpressure instead of
 growing memory. Each lane keeps several batches in flight (bounded by
 `limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
