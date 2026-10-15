@@ -613,7 +613,17 @@ impl Engine {
 
         let provider =
             CheckedProvider::pinned(provider, volume.superblock().geometry.crypto_unit_size);
-        verify_key_canary(&volume, &provider, &context, caps.integrity.present()).await?;
+        let volume = Arc::new(volume);
+        verify_key_canary(
+            volume.clone(),
+            &provider,
+            &context,
+            caps.integrity.present(),
+        )
+        .await?;
+        let volume = Arc::try_unwrap(volume).map_err(|_| {
+            AttachError::Config("canary verification retained the recovered volume".into())
+        })?;
 
         let (batch_max_items, batch_max_bytes) = if caps.batch.supported {
             (
@@ -1940,6 +1950,10 @@ fn spawn_checkpoint_worker(
 
 /// Key-canary check (SPEC §12, review M-001).
 ///
+/// All backing access runs on blocking workers, including legacy ciphertext
+/// probing and both metadata copies. The owned volume keeps its exclusive
+/// lock alive until any in-flight storage operation finishes on cancellation.
+///
 /// - Canary present: decrypt it and compare with the known plaintext; any
 ///   mismatch or integrity failure refuses attach. Transport-class errors
 ///   are surfaced as such rather than as a key mismatch.
@@ -1950,18 +1964,22 @@ fn spawn_checkpoint_worker(
 ///   proof instead, then establish the canary; without integrity there is
 ///   no proof, so attach is refused.
 pub async fn verify_key_canary(
-    volume: &Volume,
+    volume: Arc<Volume>,
     provider: &CheckedProvider,
     context: &CryptoContext,
     provider_has_integrity: bool,
 ) -> Result<(), AttachError> {
-    let backing = volume.backing().clone();
-    let superblock = volume.superblock();
+    let superblock = volume.superblock().clone();
     let unit_size = superblock.geometry.crypto_unit_size as usize;
     let expected = canary_plaintext(&superblock.volume_uuid, unit_size);
-    let ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let loading = volume.clone();
+    let existing = storage_task(move || {
+        AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B)
+            .load::<KeyCanary>(loading.backing().as_ref())
+    })
+    .await??;
 
-    if let Some(mut canary) = ab.load::<KeyCanary>(backing.as_ref())? {
+    if let Some(canary) = existing {
         if canary.volume_uuid != superblock.volume_uuid {
             return Err(AttachError::KeyMismatch(
                 "canary belongs to a different volume".to_string(),
@@ -1986,9 +2004,7 @@ pub async fn verify_key_canary(
         // both copies and their dirents before accepting data that needs
         // this canary to reopen after a power loss (BUG-085). Keep this
         // after the identity/plaintext checks so a wrong key cannot publish.
-        ab.store(backing.as_ref(), &mut canary)?;
-        ab.store(backing.as_ref(), &mut canary)?;
-        backing.sync_dir("")?;
+        persist_key_canary(volume, canary).await?;
         return Ok(());
     }
 
@@ -2000,7 +2016,9 @@ pub async fn verify_key_canary(
                     .to_string(),
             ));
         }
-        let Some((unit, data)) = volume.first_ciphertext_unit()? else {
+        let probing = volume.clone();
+        let Some((unit, data)) = storage_task(move || probing.first_ciphertext_unit()).await??
+        else {
             return Err(AttachError::MissingCanary(
                 "volume has history but no readable ciphertext to probe".to_string(),
             ));
@@ -2057,16 +2075,27 @@ pub async fn verify_key_canary(
                 .to_string(),
         ));
     }
-    let mut record = KeyCanary {
+    let record = KeyCanary {
         generation: 0,
         volume_uuid: superblock.volume_uuid,
         unit_index: CANARY_UNIT_INDEX,
         ciphertext: ct.data,
     };
-    ab.store(backing.as_ref(), &mut record)?;
-    ab.store(backing.as_ref(), &mut record)?;
-    backing.sync_dir("")?;
-    Ok(())
+    persist_key_canary(volume, record).await
+}
+
+/// Retain the volume lock with the blocking operation even if its async
+/// caller is cancelled during metadata publication.
+async fn persist_key_canary(volume: Arc<Volume>, mut record: KeyCanary) -> Result<(), AttachError> {
+    storage_task(move || {
+        let backing = volume.backing();
+        let ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+        ab.store(backing.as_ref(), &mut record)?;
+        ab.store(backing.as_ref(), &mut record)?;
+        backing.sync_dir("")?;
+        Ok::<_, AttachError>(())
+    })
+    .await?
 }
 
 /// Decrypt one unit for verification, classifying failures: integrity,
