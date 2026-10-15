@@ -464,15 +464,24 @@ there is no stale replica or offline fallback.
 
 The server admits 1–256 connection workers and requires 1–256 distinct
 allow-listed certificate identities. A connection takes a worker only after
-TLS has authenticated an allow-listed certificate, and waits for one until its
-deadline instead of being closed. Before that it holds one of four handshake
-slots per worker; when they are all taken, the oldest pending handshake is cut
-off, so idle unauthenticated sockets cannot lock out writers. Admission
-precedes thread creation, and capacity is released on success, error or Rust
-unwinding. A connection's
-absolute deadline covers handshake, framing and replies; slow fragments cannot
-extend it. A blocked local filesystem operation cannot be forcibly cancelled
-by the socket deadline, but workers remain bounded and clients time out.
+TLS has authenticated an allow-listed certificate. Until it acquires a worker,
+it occupies one of four pending slots per worker, including while waiting after
+authentication. If these slots fill, a new arrival evicts the oldest pending
+connection and closes its socket. An authenticated waiter can therefore be
+disconnected before its deadline; it observes eviction as `ConnectionAborted`
+on the server, not as a guaranteed protocol error response to the client.
+
+A separate lifetime limit allows at most five connection tasks per worker,
+including active requests, pending connections, and evicted tasks that have not
+yet exited. Eviction does not release this capacity: the task retains its charge
+until its TLS state and request processing end, including error and unwinding
+paths. The accept loop waits for capacity before creating another thread, within
+the accepted connection's deadline. Accept and thread-creation failures are
+retried with backoff; a failed thread creation releases that connection's socket
+and capacity. One absolute deadline covers admission, authentication, worker
+waiting, framing and replies; slow fragments cannot extend it. A blocked local
+filesystem operation cannot be forcibly cancelled by the socket deadline, but
+workers remain bounded and clients time out.
 
 TLS/protocol failures do not log request payloads or peer-provided error text.
 Missing or untrusted certificates, unknown identities, wrong server names,
