@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use maki_core::engine::Engine;
 use maki_core::CoreError;
-use maki_crypto::SecretBuffer;
 
 use crate::daemon;
 
@@ -201,7 +200,10 @@ impl NbdAdapter {
     }
 
     /// Run a blocking engine operation with a panic boundary.
-    fn run<T>(&self, op: impl FnOnce(Engine) -> BoxCoreFuture<T>) -> Result<T, AdapterError> {
+    fn run<'a, T>(
+        &self,
+        op: impl FnOnce(Engine) -> BoxCoreFuture<'a, T>,
+    ) -> Result<T, AdapterError> {
         let state = self.state()?;
         let engine = state.engine.clone();
         let outcome =
@@ -271,8 +273,8 @@ impl NbdAdapter {
     /// Alignment and bounds. Negotiation is advisory and the Linux NBD
     /// client ignores the maximum block size (6.12 sends up to
     /// `max_sectors_kb`), so a longer request is not refused: reads and
-    /// writes are split into chunks of at most `maximum_io`, each copied and
-    /// admitted on its own, which keeps the engine's per-request bound
+    /// writes are split into chunks of at most `maximum_io`, each admitted
+    /// before plaintext is copied, which keeps the engine's per-request bound
     /// (R5-038). A trim carries no payload at all (R5-010).
     fn validate_extent(&self, offset: u64, length: usize) -> Result<(), AdapterError> {
         let state = self.state()?;
@@ -323,10 +325,9 @@ impl NbdAdapter {
             let at = offset + (index * maximum) as u64;
             // FUA on the last chunk: its journal sync covers the earlier ones.
             let last = fua && index + 1 == chunks;
-            let owned = SecretBuffer::from_slice(chunk);
-            self.run(move |engine| {
-                Box::pin(async move { engine.write(at, owned.expose(), last).await })
-            })?;
+            // block_on completes before nbdkit reclaims its borrowed buffer.
+            // The engine performs its first plaintext copy only after admission.
+            self.run(move |engine| Box::pin(async move { engine.write(at, chunk, last).await }))?;
         }
         Ok(())
     }
@@ -402,7 +403,7 @@ impl NbdAdapter {
             let count = (end - at).min(maximum) as usize;
             let last = at + count as u64 == end;
             self.run(move |engine| {
-                Box::pin(async move { engine.write(at, &vec![0u8; count], fua && last).await })
+                Box::pin(async move { engine.write_zeroes(at, count, fua && last).await })
             })?;
             at += count as u64;
         }
@@ -464,5 +465,5 @@ impl NbdAdapter {
     }
 }
 
-type BoxCoreFuture<T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, CoreError>> + Send>>;
+type BoxCoreFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, CoreError>> + Send + 'a>>;

@@ -16,6 +16,7 @@ const SYNC: usize = 3;
 const SPACE: usize = 4;
 const OPEN: usize = 5;
 const DIRSYNC: usize = 6;
+const FRESHNESS: usize = 7;
 
 #[derive(Default)]
 struct Gate {
@@ -54,6 +55,7 @@ impl Gate {
 struct SlowBacking {
     inner: MemBacking,
     gate: Arc<Gate>,
+    freshness_calls: AtomicUsize,
 }
 
 struct SlowFile {
@@ -83,6 +85,12 @@ impl BackingFile for SlowFile {
 }
 
 impl Backing for SlowBacking {
+    fn check_freshness(&self) -> io::Result<()> {
+        self.freshness_calls.fetch_add(1, Ordering::SeqCst);
+        self.gate.block(FRESHNESS);
+        Ok(())
+    }
+
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         self.gate.block(OPEN);
         Ok(Arc::new(SlowFile {
@@ -436,4 +444,61 @@ async fn cancelled_canary_publication_retains_volume_lock_until_storage_finishes
     .await
     .expect("cancelled canary storage retained the lock after completion");
     assert!(!backing.gate.stalled.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_freshness_work_retains_admission_before_other_callbacks() {
+    let backing = backing();
+    let mut options = options();
+    options.limits.max_active_callbacks = 1;
+    options.limits.max_plaintext_bytes = 1024;
+    let engine = Engine::attach(
+        backing.clone(),
+        Arc::new(FakeCryptoProvider::new(1024)),
+        options,
+    )
+    .await
+    .unwrap();
+    engine.stop_checkpoint_worker().await;
+    backing.freshness_calls.store(0, Ordering::SeqCst);
+    backing.gate.operation.store(FRESHNESS, Ordering::SeqCst);
+    let first_engine = engine.clone();
+    let first = tokio::spawn(async move { first_engine.read(0, 1024).await });
+    backing.gate.entered.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let stats = engine.stats().await;
+    let occupied = (stats.admission_slots, stats.plaintext_bytes_in_flight);
+
+    for _ in 0..128 {
+        let read = engine.read(0, 1024);
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        let write = engine.write(0, &[0x55; 1024], false);
+        tokio::pin!(write);
+        assert!(futures_util::poll!(&mut write).is_pending());
+        let zero = engine.write_zeroes(0, 1024, false);
+        tokio::pin!(zero);
+        assert!(futures_util::poll!(&mut zero).is_pending());
+        let flush = engine.flush();
+        tokio::pin!(flush);
+        assert!(futures_util::poll!(&mut flush).is_pending());
+    }
+    let freshness_calls = backing.freshness_calls.load(Ordering::SeqCst);
+    backing.gate.release();
+    assert_eq!(
+        occupied,
+        (1, 1024),
+        "cancelled blocking freshness lost its admission permit"
+    );
+    assert_eq!(
+        freshness_calls, 1,
+        "queued callbacks dispatched freshness before admission"
+    );
+    tokio::time::timeout(Duration::from_secs(2), engine.write_zeroes(512, 512, true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(engine.read(0, 1024).await.unwrap(), vec![0; 1024]);
+    assert_eq!(engine.stats().await.admission_slots, 0);
 }
