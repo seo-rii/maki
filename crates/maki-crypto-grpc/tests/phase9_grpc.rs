@@ -436,3 +436,178 @@ async fn unimplemented_only_poisoned_endpoint_and_respects_retry_safety() {
         }
     }
 }
+
+/// Keep the first established TCP connection open but stop forwarding every
+/// byte. Later connections use the same healthy backend, so success requires
+/// retiring the unresponsive channel rather than retrying its dead socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unresponsive_established_channel_is_replaced_after_timeout_or_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::{TcpListener, TcpStream};
+
+    for cancel in [false, true] {
+        let backend = grpc_server(Arc::new(ServerState::default())).await;
+        let backend = backend.strip_prefix("http://").unwrap().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop_forwarding = Arc::new(tokio::sync::Notify::new());
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let proxy = tokio::spawn({
+            let accepted = accepted.clone();
+            let stop_forwarding = stop_forwarding.clone();
+            let parked = parked.clone();
+            async move {
+                loop {
+                    let (mut client, _) = listener.accept().await.unwrap();
+                    let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                    let mut upstream = TcpStream::connect(&backend).await.unwrap();
+                    let stop_forwarding = stop_forwarding.clone();
+                    let parked = parked.clone();
+                    tokio::spawn(async move {
+                        if first {
+                            tokio::select! {
+                                _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
+                                _ = stop_forwarding.notified() => {
+                                    parked.notify_one();
+                                    let held_open = (client, upstream);
+                                    std::future::pending::<()>().await;
+                                    drop(held_open);
+                                }
+                            }
+                        } else {
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                        }
+                    });
+                }
+            }
+        });
+        let p = GrpcCryptoProvider::new(GrpcProviderSpec {
+            url: format!("http://{address}"),
+            encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+            decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+            metadata: vec![],
+            capabilities: caps(),
+            timeout: Duration::from_secs(1),
+            max_message_bytes: 1 << 20,
+        })
+        .unwrap();
+        let context = ctx();
+        let plaintext = [pt(1, 0xAB)];
+        p.encrypt_batch(&context, &plaintext).await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        stop_forwarding.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+
+        if cancel {
+            assert!(tokio::time::timeout(
+                Duration::from_millis(50),
+                p.encrypt_batch(&context, &plaintext)
+            )
+            .await
+            .is_err());
+        } else {
+            let failure = p.encrypt_batch(&context, &plaintext).await.unwrap_err();
+            assert_eq!(failure.class(), ErrorClass::Retryable);
+        }
+        let encrypted = p.encrypt_batch(&context, &plaintext).await.expect(
+            "next RPC must use a fresh connection after an established channel stops responding",
+        );
+        let decrypted = p.decrypt_batch(&context, &encrypted).await.unwrap();
+        assert_eq!(decrypted[0].data.expose(), plaintext[0].data.expose());
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "reuse the healthy replacement"
+        );
+        proxy.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unfinished_tls_handshake_survives_an_rpc_timeout_and_later_succeeds() {
+    use maki_crypto_grpc::GrpcTlsConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend.local_addr().unwrap();
+    let tls =
+        tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(
+            certificate.cert.pem(),
+            certificate.key_pair.serialize_pem(),
+        ));
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(CryptoServer {
+                state: Arc::new(ServerState::default()),
+            })
+            .serve_with_incoming(tokio_stream_wrapper::listener_stream(backend))
+            .await
+            .unwrap();
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let forwarding = Arc::new(tokio::sync::Notify::new());
+    let proxy = tokio::spawn({
+        let accepted = accepted.clone();
+        let forwarding = forwarding.clone();
+        async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let mut upstream = TcpStream::connect(backend_address).await.unwrap();
+                let forwarding = forwarding.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    forwarding.notify_one();
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        }
+    });
+    let p = GrpcCryptoProvider::new_with_tls(
+        GrpcProviderSpec {
+            url: format!("https://{address}"),
+            encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+            decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+            metadata: vec![],
+            capabilities: caps(),
+            timeout: Duration::from_millis(500),
+            max_message_bytes: 1 << 20,
+        },
+        GrpcTlsConfig {
+            ca_certificate_pem: Some(certificate.cert.pem().into_bytes()),
+            client_identity: None,
+        },
+    )
+    .unwrap();
+    let context = ctx();
+    let plaintext = [pt(7, 0xAB)];
+    assert_eq!(
+        p.encrypt_batch(&context, &plaintext)
+            .await
+            .unwrap_err()
+            .class(),
+        ErrorClass::Retryable
+    );
+    tokio::time::timeout(Duration::from_secs(5), forwarding.notified())
+        .await
+        .unwrap();
+    let encrypted = p.encrypt_batch(&context, &plaintext).await.unwrap();
+    assert_eq!(encrypted[0].data, vec![0xAB ^ XOR; UNIT]);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "finish the original bounded TLS attempt"
+    );
+    proxy.abort();
+    server.abort();
+}
