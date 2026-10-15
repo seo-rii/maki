@@ -168,10 +168,59 @@ fn image(unit: u64, stamp: u32) -> Vec<u8> {
     v
 }
 
+/// Values a failed (unacknowledged) write may have left in a unit. Such a
+/// write is journaled and published, so it may surface, but only until a
+/// later write to the unit supersedes it (TEST-005): a live read must show
+/// the newer acknowledged write, and after a crash the older value is
+/// acceptable only while that newer write is not yet durable.
 #[derive(Default)]
 struct Maybe {
-    /// Values a failed (unacknowledged) write may have landed in a unit.
-    by_unit: BTreeMap<u64, BTreeSet<Vec<u8>>>,
+    /// What a live read may show instead of the model's value.
+    live: BTreeMap<u64, BTreeSet<Vec<u8>>>,
+    /// What recovery may show instead of the model's value.
+    crash: BTreeMap<u64, BTreeSet<Vec<u8>>>,
+    /// Units acknowledged after their last failed write, not yet durable:
+    /// the next successful barrier retires their `crash` values.
+    superseded: BTreeSet<u64>,
+}
+
+impl Maybe {
+    fn failed(&mut self, unit: u64, value: Vec<u8>) {
+        self.live.entry(unit).or_default().insert(value.clone());
+        self.crash.entry(unit).or_default().insert(value);
+        self.superseded.remove(&unit);
+    }
+
+    fn acknowledged(&mut self, unit: u64, fua: bool) {
+        self.live.remove(&unit);
+        if fua {
+            self.crash.remove(&unit);
+            self.superseded.remove(&unit);
+        } else if self.crash.contains_key(&unit) {
+            self.superseded.insert(unit);
+        }
+    }
+
+    fn flushed(&mut self) {
+        for unit in std::mem::take(&mut self.superseded) {
+            self.crash.remove(&unit);
+        }
+    }
+
+    fn live_may_show(&self, unit: u64, value: &[u8]) -> bool {
+        self.live.get(&unit).is_some_and(|set| set.contains(value))
+    }
+
+    fn crash_may_show(&self, unit: u64, value: &[u8]) -> bool {
+        self.crash.get(&unit).is_some_and(|set| set.contains(value))
+    }
+
+    /// Recovery read the unit: what it showed is the new durable state.
+    fn settled(&mut self, unit: u64) {
+        self.live.remove(&unit);
+        self.crash.remove(&unit);
+        self.superseded.remove(&unit);
+    }
 }
 
 /// Compare every unit after a recovery against the oracle and adopt what
@@ -199,15 +248,55 @@ async fn check_all(
         if let Err(violation) = model.crash_adopt(unit, &actual) {
             // An unacknowledged write may or may not have landed; anything
             // else is a durability violation.
-            let landed = maybe
-                .by_unit
-                .get(&unit)
-                .is_some_and(|set| set.contains(&actual));
+            let landed = maybe.crash_may_show(unit, &actual);
             assert!(landed, "{what}: {violation}\n{history}");
             model.write_fua(unit, &actual);
         }
-        maybe.by_unit.remove(&unit);
+        maybe.settled(unit);
     }
+}
+
+/// The sweeps' own oracle (TEST-005): a failed write stops being an
+/// acceptable outcome once a newer write to the unit is acknowledged (live)
+/// or durable (after a crash), and stays one while no newer write is.
+#[test]
+fn a_superseded_failed_write_is_no_longer_an_acceptable_outcome() {
+    let (failed, newer) = (vec![1u8], vec![2u8]);
+    let mut maybe = Maybe::default();
+    maybe.failed(7, failed.clone());
+    assert!(maybe.live_may_show(7, &failed) && maybe.crash_may_show(7, &failed));
+    maybe.acknowledged(7, false);
+    assert!(
+        !maybe.live_may_show(7, &failed),
+        "live view showed a stale write"
+    );
+    assert!(
+        maybe.crash_may_show(7, &failed),
+        "the newer write is not durable yet"
+    );
+    maybe.flushed();
+    assert!(
+        !maybe.crash_may_show(7, &failed),
+        "a FLUSH made the newer write durable"
+    );
+
+    let mut maybe = Maybe::default();
+    maybe.failed(7, failed.clone());
+    maybe.acknowledged(7, true);
+    assert!(
+        !maybe.crash_may_show(7, &failed),
+        "a FUA write is durable at once"
+    );
+
+    let mut maybe = Maybe::default();
+    maybe.failed(7, failed.clone());
+    maybe.acknowledged(7, false);
+    maybe.failed(7, newer.clone());
+    maybe.flushed();
+    assert!(
+        maybe.crash_may_show(7, &failed) && maybe.crash_may_show(7, &newer),
+        "a failed write after the acknowledged one keeps both possible"
+    );
 }
 
 struct Cycle {
@@ -280,6 +369,7 @@ async fn sweep_verbose(
                                 } else {
                                     model.write(u, &image(u, stamp));
                                 }
+                                maybe.acknowledged(u, fua);
                             }
                         }
                         Err(e) => {
@@ -292,7 +382,7 @@ async fn sweep_verbose(
                                 "seed {seed}: unexpected error class {e}"
                             );
                             for u in first..first + count {
-                                maybe.by_unit.entry(u).or_default().insert(image(u, stamp));
+                                maybe.failed(u, image(u, stamp));
                             }
                         }
                     }
@@ -304,7 +394,10 @@ async fn sweep_verbose(
                         result.as_ref().map(|_| ()).map_err(|e| e.to_string())
                     ));
                     match result {
-                        Ok(()) => model.flush(),
+                        Ok(()) => {
+                            model.flush();
+                            maybe.flushed();
+                        }
                         Err(e) => assert!(
                             sync_fault_permille > 0 && matches!(e, CoreError::Io(_)),
                             "seed {seed}: flush error {e}"
@@ -333,17 +426,14 @@ async fn sweep_verbose(
                         // view may show it; from here on it behaves like an
                         // acknowledged write that the next barrier makes
                         // durable. Anything else is foreign data.
-                        let landed = maybe
-                            .by_unit
-                            .get(&unit)
-                            .is_some_and(|set| set.contains(&actual));
                         assert!(
-                            landed,
+                            maybe.live_may_show(unit, &actual),
                             "seed {seed} cycle {cycle_index}: live read of unit {unit} is neither \
-                             the acknowledged value nor a failed write's data"
+                             the acknowledged value nor a failed write newer than it"
                         );
                         trace.op(format!("live read of unit {unit} shows a failed write"));
                         model.write(unit, &actual);
+                        maybe.acknowledged(unit, false);
                     }
                 }
             }
@@ -766,7 +856,6 @@ async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
     let mut rng = StdRng::seed_from_u64(seed ^ 0xC0DE);
     let backing = Arc::new(CrashableBacking::new().with_tearing(256));
     let mut model = ReferenceBlockModel::new(BIG_UNIT as usize, DEVICE_UNITS);
-    let mut maybe = Maybe::default();
     let mut engine = attach_big(&backing, cache).await;
 
     for cycle in 0..cycles {
@@ -837,7 +926,6 @@ async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
                 panic!("{what}: {violation}");
             }
         }
-        maybe.by_unit.clear();
     }
 }
 
@@ -1051,6 +1139,7 @@ async fn damage_sweep(seed: u64, cycles: usize) -> bool {
                                 } else {
                                     model.write(u, &image(u, stamp));
                                 }
+                                maybe.acknowledged(u, fua);
                             }
                         }
                         // A damaged volume may refuse writes (EIO); the data
@@ -1058,7 +1147,7 @@ async fn damage_sweep(seed: u64, cycles: usize) -> bool {
                         Err(e) => {
                             log.push(format!("{tag} refused: {e}"));
                             for u in first..first + count {
-                                maybe.by_unit.entry(u).or_default().insert(image(u, stamp));
+                                maybe.failed(u, image(u, stamp));
                             }
                         }
                     }
@@ -1067,6 +1156,7 @@ async fn damage_sweep(seed: u64, cycles: usize) -> bool {
                     Ok(()) => {
                         log.push("flush".to_string());
                         model.flush();
+                        maybe.flushed();
                     }
                     Err(e) => log.push(format!("flush refused: {e}")),
                 },
@@ -1105,10 +1195,7 @@ async fn damage_sweep(seed: u64, cycles: usize) -> bool {
             match engine.read(off(unit), UNIT as usize).await {
                 Ok(actual) => {
                     if let Err(violation) = model.crash_adopt(unit, &actual) {
-                        let landed = maybe
-                            .by_unit
-                            .get(&unit)
-                            .is_some_and(|set| set.contains(&actual));
+                        let landed = maybe.crash_may_show(unit, &actual);
                         // Documented limitation (S-04): the durable mark is
                         // a plain write and is usually lost in the crash, so
                         // damage inside the final segment's synced records
@@ -1123,7 +1210,7 @@ async fn damage_sweep(seed: u64, cycles: usize) -> bool {
                         );
                         model.write_fua(unit, &actual);
                     }
-                    maybe.by_unit.remove(&unit);
+                    maybe.settled(unit);
                 }
                 Err(CoreError::Corrupt(_)) | Err(CoreError::Io(_)) => {
                     // EIO: the unit keeps its allowed set for later cycles.
