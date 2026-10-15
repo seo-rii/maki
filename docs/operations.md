@@ -623,17 +623,31 @@ become inactive before running an offline check, taking a snapshot, or removing
 backing storage:
 
 ```bash
+# Succeeds once every named unit is inactive; fails at once if one failed
+# (inspect it before continuing) or after WAIT_SECONDS (default 600).
+wait_stopped() {
+    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    for unit in "$@"; do
+        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
+            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit is $state: preserve the host state and inspect it" >&2
+                return 1
+            fi
+            sleep 1
+        done
+    done
+}
 systemctl stop maki-workload@pg.target
-while systemctl is-active --quiet your-workload.service || \
-      systemctl is-active --quiet maki-attach@pg.service || \
-      systemctl is-active --quiet maki@pg.service; do
-    sleep 1
-done
-maki check /etc/maki/volumes/pg.toml
+wait_stopped your-workload.service maki-attach@pg.service maki@pg.service &&
+    maki check /etc/maki/volumes/pg.toml
 ```
 
-Use a bounded operator timeout around that loop. If it expires, preserve the
-host state for diagnosis rather than forcing NBD, LVM, or device-mapper cleanup.
+Do not wait with `systemctl is-active`: it fails, and so ends a wait loop, as
+soon as a unit is `deactivating` (the daemon is still flushing, checkpointing
+and holding the volume lock) or `failed` (attach cleanup left a mount or
+mapping behind). Wait for `ActiveState` to read `inactive`. If a unit fails or
+the bounded wait expires, preserve the host state for diagnosis rather than
+forcing NBD, LVM, or device-mapper cleanup.
 The 2026-09-17 combined qualification observed this asynchronous tail directly;
 after all named units became inactive, no mount, mapping, NBD connection,
 trusted volume record, or workload container remained.

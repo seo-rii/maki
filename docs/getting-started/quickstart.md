@@ -175,13 +175,29 @@ then stop the target and wait for every unit to become inactive before an
 offline check:
 
 ```bash
+# Succeeds once every named unit is inactive; fails at once if one failed
+# (inspect it before continuing) or after WAIT_SECONDS (default 600).
+wait_stopped() {
+    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    for unit in "$@"; do
+        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
+            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit is $state: preserve the host state and inspect it" >&2
+                return 1
+            fi
+            sleep 1
+        done
+    done
+}
 maki drain /etc/maki/volumes/demo.toml
 systemctl stop maki-workload@demo.target
-while systemctl is-active --quiet maki-attach@demo.service || \
-      systemctl is-active --quiet maki@demo.service; do sleep 1; done
-findmnt /srv/demo || echo "unmounted"
-maki check /etc/maki/volumes/demo.toml --deep
+wait_stopped maki-attach@demo.service maki@demo.service &&
+    { findmnt /srv/demo || echo "unmounted"; } &&
+    maki check /etc/maki/volumes/demo.toml --deep
 ```
+
+`systemctl is-active` is not a stop test: it also fails while a unit is still
+`deactivating` or has `failed`, so `wait_stopped` polls for `inactive`.
 
 ## 8. Start again and read the data back
 
@@ -206,9 +222,9 @@ the target owns their ordering and the recovery unit
 ```bash
 maki drain /etc/maki/volumes/demo.toml
 systemctl disable --now maki-workload@demo.target
-while systemctl is-active --quiet maki@demo.service; do sleep 1; done
-rm -rf /var/lib/maki/demo /etc/maki/attach/demo.toml /etc/maki/volumes/demo.toml
-shred -u /etc/maki/secrets/demo.token
+wait_stopped maki-attach@demo.service maki@demo.service &&
+    rm -rf /var/lib/maki/demo /etc/maki/attach/demo.toml /etc/maki/volumes/demo.toml &&
+    shred -u /etc/maki/secrets/demo.token
 ```
 
 ## What you have and have not seen
