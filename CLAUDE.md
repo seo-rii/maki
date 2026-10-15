@@ -44,7 +44,8 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 | `maki-cache` | versioned plaintext LRU, key `(unit, write_sequence)` |
 | `maki-nbdkit` | blocking `NbdAdapter` (panic boundary), daemon assembly from config, Linux `plugin.rs` C shim |
 | `maki-control` / `maki-privileged` | control socket (bound by the daemon, chgrp'd, no privileged verbs); attach/detach/grow plans with rollback, root-owned attach config + argument hygiene, pure mount/sysfs probes, Linux executor (no crypto deps) |
-| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark` |
+| `maki-witness` | remote freshness authority: TLS 1.3 mutual-auth client/server (one request-id-bound RPC per connection), etcd v3 quorum store, identity-pinned frontend failover; the local state-directory store is `maki_backing::remote_witness` |
+| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark`, `maki-witness` (package `maki-witness-cli`) |
 
 ## Traps that already bit us (don't re-learn)
 

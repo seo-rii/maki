@@ -43,6 +43,7 @@ crypto credentials.
 | `maki-nbdkit` | Blocking adapter, daemon assembly, and Linux C ABI shim |
 | `maki-control` | Unprivileged control socket protocol |
 | `maki-privileged` | Auditable attach, detach, mount, and growth plans |
+| `maki-witness` | Remote witness client and server, etcd quorum store, and frontend failover |
 | `maki-test-support` | Durability oracle, crash backing, fake provider, manual clock, and failpoints |
 
 ## Read and write semantics
@@ -338,10 +339,11 @@ separate privileged `lvextend` and `xfs_growfs` operation.
   ciphertext for the same unit is not detected. An experimental
   [rollback-protected backing](rollback-protection.md) is available for new
   Linux volumes; it anchors an authenticated copy-on-write store in an
-  independently managed local witness filesystem and is bounded to
-  experimental workloads without production qualification. Remote witnesses,
-  distributed fencing and controlled restore epochs from the
-  [design proposal](rollback-protection-design.md) remain unimplemented.
+  independently managed local witness filesystem or a remote witness service
+  (TLS 1.3 mutual authentication, monotonic fencing, administrator restore
+  epochs, optional etcd quorum). Both modes are experimental and not
+  campaign-qualified; the Merkle-tree manifest from the
+  [design proposal](rollback-protection-design.md) remains unimplemented.
   [Status](status.md) records the current state of both.
 
 See [Configuration](configuration.md), [Operations](operations.md), and the

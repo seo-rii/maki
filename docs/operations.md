@@ -133,7 +133,9 @@ when checking a backing
 root directly, pass `--journal-segment-size` if the volume uses a non-default
 size.
 
-The deep report ends with one of three verdicts:
+The deep report states one of three verdicts as an `info: deep check verdict:`
+line, printed before any `warning:` and `ERROR:` lines; the report ends with
+`check passed` or `check FAILED`:
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
@@ -858,8 +860,8 @@ metric labels.
 - `maki reload` returns an error naming the section for any change the running
   daemon cannot apply; only `cache` is applied at runtime today. An error means
   the change was not applied: restart the daemon.
-- `maki status`, `metrics`, `checkpoint` and `reload` give up when the daemon
-  does not answer within 60 s (600 s for `checkpoint`); pass
+- `maki status`, `metrics`, `checkpoint`, `drain` and `reload` give up when the
+  daemon does not answer within 60 s (600 s for `checkpoint` and `drain`); pass
   `--timeout <seconds>` to wait longer. A timeout means the daemon is stalled
   or busy, not that the command was rejected.
 - While the journal cannot be synced (see the writeback item above) `maki
