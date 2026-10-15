@@ -194,3 +194,25 @@ fn eviction_order_survives_many_entries_and_touches() {
     assert!(cache.get(41, 1).is_none(), "untouched sibling was evicted");
     assert_eq!(cache.stats().bytes, 64 * 100);
 }
+
+#[test]
+fn empty_entries_cannot_grow_metadata_without_payload() {
+    let (cache, _) = cache(1, Duration::from_secs(1));
+    for unit in 0..10_000 {
+        cache.put(unit, 1, buf(0, 0));
+    }
+    assert_eq!(cache.stats().entries, 0);
+    assert_eq!(cache.stats().bytes, 0);
+    cache.put(7, 3, buf(7, 1));
+    cache.put(7, 2, buf(0, 0));
+    assert!(
+        cache.get(7, 3).is_some(),
+        "older empty insert preserves current version"
+    );
+    cache.put(7, 4, buf(0, 0));
+    assert_eq!(
+        cache.stats().entries,
+        0,
+        "new empty version invalidates old plaintext"
+    );
+}

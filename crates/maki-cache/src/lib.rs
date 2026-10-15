@@ -140,7 +140,7 @@ impl VersionedLruCache {
             return; // dropped => zeroized
         }
         inner.remove(unit);
-        if len > inner.max_bytes || inner.max_bytes == 0 {
+        if len == 0 || len > inner.max_bytes || inner.max_bytes == 0 {
             return; // dropped => zeroized
         }
         inner.make_room(len);

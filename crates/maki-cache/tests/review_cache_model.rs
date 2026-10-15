@@ -53,7 +53,7 @@ impl Model {
             return;
         }
         self.entries.remove(&unit);
-        if len > self.max_bytes || self.max_bytes == 0 {
+        if len == 0 || len > self.max_bytes || self.max_bytes == 0 {
             return;
         }
         while self.bytes() + len > self.max_bytes {
