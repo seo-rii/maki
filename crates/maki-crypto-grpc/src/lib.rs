@@ -27,7 +27,9 @@ use maki_crypto::{
     PlaintextUnit, SecretBuffer,
 };
 
+mod connection;
 mod protected;
+use connection::ConnectionCache;
 use protected::{WireItem, WireRequest, WireResponse};
 
 #[cfg(test)]
@@ -570,7 +572,7 @@ impl std::fmt::Debug for GrpcProviderSpec {
 
 pub struct GrpcCryptoProvider {
     spec: GrpcProviderSpec,
-    channel: Channel,
+    connections: ConnectionCache,
     encrypt_path: PathAndQuery,
     decrypt_path: PathAndQuery,
 }
@@ -678,10 +680,14 @@ impl GrpcCryptoProvider {
         tcp.enforce_http(false);
         tcp.set_nodelay(true);
         tcp.set_connect_timeout(Some(spec.timeout));
-        let channel = endpoint
+        let endpoint = endpoint
             .timeout(spec.timeout)
-            .connect_timeout(spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS))
-            .connect_with_connector_lazy(tcp);
+            .connect_timeout(spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS));
+        let connections = ConnectionCache::new(
+            endpoint,
+            tcp,
+            spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS),
+        );
         let encrypt_path = PathAndQuery::try_from(spec.encrypt_path.clone())
             .map_err(|e| fatal(format!("bad encrypt path: {e}")))?;
         let decrypt_path = PathAndQuery::try_from(spec.decrypt_path.clone())
@@ -695,7 +701,7 @@ impl GrpcCryptoProvider {
                 .map_err(|e| fatal(format!("bad metadata value for {key:?}: {e}")))?;
         }
         Ok(Self {
-            channel,
+            connections,
             encrypt_path,
             decrypt_path,
             spec,
@@ -725,8 +731,9 @@ impl GrpcCryptoProvider {
             )));
         }
 
+        let mut connection = self.connections.exchange();
         let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
-            inner: self.channel.clone(),
+            inner: connection.channel(),
             limit: self.spec.max_message_bytes,
         })
         .max_decoding_message_size(self.spec.max_message_bytes)
@@ -759,15 +766,24 @@ impl GrpcCryptoProvider {
                 .await
                 .map_err(|status| map_status(&status))
         };
-        let response = tokio::time::timeout(self.spec.timeout, exchange)
-            .await
-            .map_err(|_| {
-                CryptoError::Retryable(format!(
+        let response = match tokio::time::timeout(self.spec.timeout, exchange).await {
+            Ok(Ok(response)) => {
+                connection.succeeded();
+                response.into_inner()
+            }
+            Ok(Err(error)) => {
+                if error.class() != ErrorClass::Retryable {
+                    connection.preserve();
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(CryptoError::Retryable(format!(
                     "grpc operation exceeded the {:?} transport timeout",
                     self.spec.timeout
-                ))
-            })??
-            .into_inner();
+                )));
+            }
+        };
 
         if response.items.len() != expected.len() {
             return Err(CryptoError::Contract(format!(
