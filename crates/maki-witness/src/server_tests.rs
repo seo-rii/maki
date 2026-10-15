@@ -227,3 +227,63 @@ fn eviction_does_not_reuse_capacity_before_tls_teardown() {
     assert_eq!(counts.tls.load(Ordering::Acquire), 0);
     assert_eq!(table.state.lock().unwrap().live, 0);
 }
+
+#[test]
+fn failed_thread_spawn_releases_connection_and_serves_next_client() {
+    let fixture = Fixture::new();
+    let table = Arc::new(Handshakes::new(1));
+    let server = fixture.server.clone();
+    let listener = fixture.listener;
+    let handshakes = table.clone();
+    let handled = Arc::new(AtomicUsize::new(0));
+    let calls = handled.clone();
+    let handler: Arc<Handler> = Arc::new(move |_, request| {
+        calls.fetch_add(1, Ordering::AcqRel);
+        serde_json::from_slice(request).map_err(io::Error::other)
+    });
+    let (failed_tx, failed_rx) = mpsc::channel();
+    let acceptor = std::thread::spawn(move || {
+        let mut attempts = 0;
+        let mut workers = Vec::new();
+        let result =
+            server.serve_incoming(listener.incoming().take(2), handler, handshakes, |task| {
+                attempts += 1;
+                if attempts == 1 {
+                    // Builder::spawn drops the closure when OS thread
+                    // creation fails. Inject that failure deterministically.
+                    drop(task);
+                    failed_tx.send(()).unwrap();
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "spawn failure"));
+                }
+                workers.push(std::thread::spawn(task));
+                Ok(())
+            });
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        result.unwrap();
+        assert_eq!(attempts, 2);
+    });
+    assert!(fixture
+        .client
+        .call::<_, serde_json::Value>(&serde_json::json!({"first": true}))
+        .is_err());
+    failed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    {
+        let state = table.state.lock().unwrap();
+        assert_eq!(state.live, 0);
+        assert!(state.pending.is_empty());
+    }
+    let request = serde_json::json!({"after": "spawn failure"});
+    assert_eq!(
+        fixture
+            .client
+            .call::<_, serde_json::Value>(&request)
+            .unwrap(),
+        request
+    );
+    acceptor.join().unwrap();
+    assert_eq!(handled.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.server.active.load(Ordering::Acquire), 0);
+    assert_eq!(table.state.lock().unwrap().live, 0);
+}

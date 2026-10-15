@@ -726,7 +726,7 @@ impl Server {
         write_frame(&mut tls, bytes.expose())
     }
 
-    /// Serve connections until the listener fails.
+    /// Serve connections, retrying accept and thread-creation failures.
     ///
     /// A worker slot (`max_connections`) is taken only after TLS has
     /// authenticated a listed certificate, and an authenticated connection
@@ -740,7 +740,22 @@ impl Server {
     /// client that completes TLS promptly (BUG-104).
     pub fn serve(self: Arc<Self>, listener: TcpListener, handler: Arc<Handler>) -> io::Result<()> {
         let handshakes = Arc::new(Handshakes::new(self.max_connections));
-        for accepted in listener.incoming() {
+        self.serve_incoming(listener.incoming(), handler, handshakes, |task| {
+            std::thread::Builder::new()
+                .name("maki-witness-rpc".into())
+                .spawn(task)
+                .map(|_| ())
+        })
+    }
+
+    fn serve_incoming(
+        self: Arc<Self>,
+        incoming: impl IntoIterator<Item = io::Result<TcpStream>>,
+        handler: Arc<Handler>,
+        handshakes: Arc<Handshakes>,
+        mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for accepted in incoming {
             let socket = match accepted {
                 Ok(socket) => socket,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -761,20 +776,24 @@ impl Server {
             };
             let server = self.clone();
             let handler = handler.clone();
-            std::thread::Builder::new()
-                .name("maki-witness-rpc".into())
-                .spawn(move || {
-                    // Keep this outside the inner closure so TLS state is
-                    // destroyed before the task's lifetime charge releases.
-                    let ticket = ticket;
-                    // No application payloads or remote error text are logged.
-                    let _ = (|| {
-                        let (tls, role) = server.authenticate(socket, deadline)?;
-                        let _permit = server.reserve_until(deadline, &ticket)?;
-                        ticket.worker_acquired()?;
-                        server.respond(tls, role, deadline, handler.as_ref())
-                    })();
-                })?;
+            let spawned = spawn(Box::new(move || {
+                // Keep this outside the inner closure so TLS state is
+                // destroyed before the task's lifetime charge releases.
+                let ticket = ticket;
+                // No application payloads or remote error text are logged.
+                let _ = (|| {
+                    let (tls, role) = server.authenticate(socket, deadline)?;
+                    let _permit = server.reserve_until(deadline, &ticket)?;
+                    ticket.worker_acquired()?;
+                    server.respond(tls, role, deadline, handler.as_ref())
+                })();
+            }));
+            if spawned.is_err() {
+                // Thread creation can hit the same transient resource
+                // pressure as accept. Dropping the failed task closes its
+                // socket and releases its ticket; keep the listener alive.
+                std::thread::sleep(ACCEPT_BACKOFF);
+            }
         }
         Ok(())
     }
