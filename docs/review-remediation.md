@@ -10,7 +10,9 @@ These dated sections preserve the findings and evidence from each review
 pass. For current support and limits, use [Status](status.md). The
 [R3 readiness record](qualification/historical-reviews/production-readiness-review-2026-09-08.md)
 is the historical record of that review.
-Later fixes can supersede an older section's remaining-work list.
+Later fixes can supersede an older section's remaining-work list. The
+[2026-10-15 boundary follow-up](review-boundaries-2026-10-15.md) distinguishes
+proposed PR fixes from remote-main changes and combined qualification.
 
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
@@ -1669,3 +1671,8 @@ The first group needs a design decision.
   durable; the HTTP chaos server merges
   repeated headers; the fuzz targets omit `DurableProof`, the witness decoders
   and the privileged mountinfo parsers.
+
+## Boundary review follow-up (2026-10-15)
+
+See the [PR, regression, commit and remaining-boundary map](review-boundaries-2026-10-15.md).
+Open-PR evidence is separate from remote-main integration and release qualification.
