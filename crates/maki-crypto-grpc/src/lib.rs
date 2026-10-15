@@ -159,6 +159,8 @@ struct ResponseFraming {
     header_bytes: usize,
     remaining: usize,
     limit: usize,
+    /// Messages received completely.
+    messages: usize,
 }
 
 impl ResponseFraming {
@@ -168,7 +170,13 @@ impl ResponseFraming {
             header_bytes: 0,
             remaining: 0,
             limit,
+            messages: 0,
         }
+    }
+
+    /// A length prefix or message body is still incomplete.
+    fn inside_message(&self) -> bool {
+        self.header_bytes > 0 || self.remaining > 0
     }
 
     fn observe(&mut self, mut bytes: &[u8]) -> Result<(), &'static str> {
@@ -177,6 +185,9 @@ impl ResponseFraming {
                 let consumed = self.remaining.min(bytes.len());
                 self.remaining -= consumed;
                 bytes = &bytes[consumed..];
+                if self.remaining == 0 {
+                    self.messages += 1;
+                }
                 continue;
             }
             let consumed = (self.header.len() - self.header_bytes).min(bytes.len());
@@ -195,6 +206,9 @@ impl ResponseFraming {
                 }
                 self.remaining = length;
                 self.header_bytes = 0;
+                if length == 0 {
+                    self.messages += 1;
+                }
             }
         }
         Ok(())
@@ -215,12 +229,32 @@ impl http_body::Body for BoundedResponseBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
-        if let Some(Ok(frame)) = &frame {
-            if let Some(bytes) = frame.data_ref() {
-                if let Err(message) = self.framing.observe(bytes) {
-                    return Poll::Ready(Some(Err(receive_contract_status(message))));
+        // A response that ends inside a message, or reports success without
+        // one, broke the receive contract; tonic would surface either as a
+        // local `Internal` status, which maps to Retryable (BUG-121).
+        let violation = match &frame {
+            Some(Ok(frame)) => {
+                if let Some(bytes) = frame.data_ref() {
+                    self.framing.observe(bytes).err()
+                } else if let Some(trailers) = frame.trailers_ref() {
+                    if self.framing.inside_message() {
+                        Some("grpc response ended inside a message")
+                    } else if self.framing.messages == 0
+                        && trailers.get("grpc-status").map(|v| v.as_bytes()) == Some(b"0")
+                    {
+                        Some("grpc response reported success without a message")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
             }
+            None if self.framing.inside_message() => Some("grpc response ended inside a message"),
+            _ => None,
+        };
+        if let Some(message) = violation {
+            return Poll::Ready(Some(Err(receive_contract_status(message))));
         }
         Poll::Ready(frame)
     }
