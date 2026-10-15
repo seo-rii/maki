@@ -53,6 +53,7 @@ fn caps() -> maki_crypto::CryptoCapabilities {
 #[derive(Default)]
 struct ServerState {
     require_token: Option<String>,
+    padded_lengths: Option<(usize, usize)>,
     fail_with: parking_lot_lite::Mutex<Option<Code>>,
     reorder: std::sync::atomic::AtomicBool,
     calls: std::sync::atomic::AtomicUsize,
@@ -105,9 +106,20 @@ impl CryptoServer {
         let mut items: Vec<CryptoItem> = message
             .items
             .into_iter()
-            .map(|item| CryptoItem {
-                unit_index: item.unit_index,
-                data: item.data.iter().map(|b| b ^ XOR).collect(),
+            .map(|item| {
+                let mut data: Vec<_> = item.data.iter().map(|b| b ^ XOR).collect();
+                if let Some((plain, cipher)) = self.state.padded_lengths {
+                    if data.len() == plain {
+                        data.resize(cipher, 0);
+                    } else {
+                        assert_eq!(data.len(), cipher);
+                        data.truncate(plain);
+                    }
+                }
+                CryptoItem {
+                    unit_index: item.unit_index,
+                    data,
+                }
             })
             .collect();
         if self.state.reorder.load(std::sync::atomic::Ordering::SeqCst) && items.len() >= 2 {
@@ -433,6 +445,97 @@ async fn unimplemented_only_poisoned_endpoint_and_respects_retry_safety() {
         assert_eq!(set.global_inflight(), (0, 0));
         if all_failed {
             assert_eq!(set.endpoint_states()[1].1, CircuitState::Open);
+        }
+    }
+}
+
+// The limit is measured by the real protobuf serializer, then used by both
+// configuration validation and tonic's live request/response codecs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validated_full_batches_roundtrip_at_serialized_grpc_boundary() {
+    use maki_format::config::{parse_config, ByteSize};
+    use prost::Message;
+    for cipher_len in [4383, 4384, 4385] {
+        let state = Arc::new(ServerState {
+            padded_lengths: Some((4096, cipher_len)),
+            ..Default::default()
+        });
+        let url = grpc_server(state).await;
+        let mut cfg = parse_config(&format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "transport-boundary"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "grpc-profile-v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = {cipher_len}
+[crypto.batch]
+max_items = 128
+max_bytes = "512KiB"
+[crypto.grpc]
+[[crypto.grpc.endpoint]]
+name = "test"
+url = "{url}"
+[backing]
+root = "/unused"
+"#
+        ))
+        .unwrap();
+        let mut context = ctx();
+        context.format_version = u32::MAX;
+        let message = CryptoBatchRequest {
+            volume_id: context.volume_uuid.to_string(),
+            compatibility_id: context.crypto_compatibility_id.clone(),
+            format_version: context.format_version,
+            items: (0..128)
+                .map(|i| CryptoItem {
+                    unit_index: u64::MAX - i,
+                    data: vec![0xAB; cipher_len],
+                })
+                .collect(),
+        };
+        let serialized = message.encode_to_vec();
+        let boundary = serialized.len();
+        assert_eq!(boundary, message.encoded_len());
+        cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(boundary as u64 - 1));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_message_bytes"));
+        for limit in [boundary, boundary + 1] {
+            cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(limit as u64));
+            cfg.validate().unwrap();
+            let mut capabilities = caps();
+            capabilities.supported_plaintext_sizes = vec![4096];
+            capabilities.max_ciphertext_size = cipher_len as u32;
+            capabilities.batch.max_items = 128;
+            let p = GrpcCryptoProvider::new(GrpcProviderSpec {
+                url: url.clone(),
+                encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+                decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+                metadata: vec![],
+                capabilities,
+                timeout: Duration::from_secs(5),
+                max_message_bytes: limit,
+            })
+            .unwrap();
+            let plaintext: Vec<_> = (0..128)
+                .map(|i| PlaintextUnit {
+                    unit_index: u64::MAX - i,
+                    data: SecretBuffer::from_slice(&vec![i as u8; 4096]),
+                })
+                .collect();
+            let encrypted = p.encrypt_batch(&context, &plaintext).await.unwrap();
+            assert!(encrypted.iter().all(|item| item.data.len() == cipher_len));
+            let decrypted = p.decrypt_batch(&context, &encrypted).await.unwrap();
+            for (expected, actual) in plaintext.iter().zip(&decrypted) {
+                assert_eq!(expected.data.expose(), actual.data.expose());
+            }
         }
     }
 }

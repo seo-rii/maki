@@ -64,6 +64,7 @@ fn pt(i: u64, fill: u8) -> PlaintextUnit {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Normal,
+    Padded(usize),
     /// Buffer two requests, answer them in reverse order.
     OutOfOrderPairs,
     /// Send a bogus-id response before each real one.
@@ -115,6 +116,27 @@ async fn ws_server(mode: Mode) -> (String, Arc<AtomicU32>) {
                     match mode {
                         Mode::Normal => {
                             let r = xor_response(&request);
+                            let _ = sink.send(r.to_string().into()).await;
+                        }
+                        Mode::Padded(cipher_len) => {
+                            let items: Vec<_> = request["items"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|item| {
+                                    let mut data = b64d(item["data"].as_str().unwrap());
+                                    data.iter_mut().for_each(|byte| *byte ^= XOR);
+                                    if request["op"] == "encrypt" {
+                                        assert_eq!(data.len(), 4096);
+                                        data.resize(cipher_len, 0);
+                                    } else {
+                                        assert_eq!(data.len(), cipher_len);
+                                        data.truncate(4096);
+                                    }
+                                    json!({"unit": item["unit"], "data": b64(&data)})
+                                })
+                                .collect();
+                            let r = json!({"id":request["id"],"items":items});
                             let _ = sink.send(r.to_string().into()).await;
                         }
                         Mode::OutOfOrderPairs => {
@@ -251,4 +273,88 @@ async fn websocket_passes_provider_conformance() {
     provider_conformance(&p, &ctx(), UNIT, "ws-profile-v1")
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validated_full_batches_roundtrip_at_serialized_websocket_boundary() {
+    use maki_format::config::{parse_config, ByteSize};
+    for cipher_len in [4383, 4384, 4385] {
+        let (url, _) = ws_server(Mode::Padded(cipher_len)).await;
+        let mut cfg = parse_config(&format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "transport-boundary"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-websocket"
+crypto_compatibility_id = "ws-profile-v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = {cipher_len}
+[crypto.batch]
+max_items = 128
+max_bytes = "512KiB"
+[crypto.websocket]
+[[crypto.websocket.endpoint]]
+name = "test"
+url = "{url}"
+[backing]
+root = "/unused"
+"#
+        ))
+        .unwrap();
+        // Include both two-byte JSON escapes and the six-byte control escape.
+        cfg.crypto.crypto_compatibility_id = "profile-\"\\\n\u{1}-한글".into();
+        let mut context = ctx();
+        context.crypto_compatibility_id = cfg.crypto.crypto_compatibility_id.clone();
+        context.format_version = u32::MAX;
+        let request = json!({
+            "format": context.format_version,
+            "id": u64::MAX,
+            "items": (0..128).map(|i| json!({
+                "unit": u64::MAX-i,
+                "data": b64(&vec![0xAB; cipher_len]),
+            })).collect::<Vec<_>>(),
+            "op": "decrypt",
+            "profile": context.crypto_compatibility_id,
+            "volume": context.volume_uuid,
+        });
+        let boundary = serde_json::to_vec(&request).unwrap().len();
+        cfg.crypto.websocket.as_mut().unwrap().max_frame_bytes =
+            Some(ByteSize(boundary as u64 - 1));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_frame_bytes"));
+        for limit in [boundary, boundary + 1] {
+            cfg.crypto.websocket.as_mut().unwrap().max_frame_bytes = Some(ByteSize(limit as u64));
+            cfg.validate().unwrap();
+            let mut capabilities = caps();
+            capabilities.crypto_compatibility_id = context.crypto_compatibility_id.clone();
+            capabilities.supported_plaintext_sizes = vec![4096];
+            capabilities.max_ciphertext_size = cipher_len as u32;
+            capabilities.batch.max_items = 128;
+            let p = WsCryptoProvider::new(WsProviderSpec {
+                url: url.clone(),
+                capabilities,
+                timeout: Duration::from_secs(5),
+                max_frame_bytes: limit,
+                tls: None,
+            });
+            let plaintext: Vec<_> = (0..128)
+                .map(|i| PlaintextUnit {
+                    unit_index: u64::MAX - i,
+                    data: SecretBuffer::from_slice(&vec![i as u8; 4096]),
+                })
+                .collect();
+            let encrypted = p.encrypt_batch(&context, &plaintext).await.unwrap();
+            assert!(encrypted.iter().all(|item| item.data.len() == cipher_len));
+            let decrypted = p.decrypt_batch(&context, &encrypted).await.unwrap();
+            for (expected, actual) in plaintext.iter().zip(&decrypted) {
+                assert_eq!(expected.data.expose(), actual.data.expose());
+            }
+        }
+    }
 }
