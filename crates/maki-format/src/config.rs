@@ -33,57 +33,22 @@ pub enum ConfigError {
 
 /// Parse a volume configuration.
 ///
-/// A TOML or schema error is reported by line, column and message with every
-/// quoted value replaced. `toml::de::Error` renders the offending source line,
-/// serde quotes the rejected value, and its `Debug` holds the whole document;
-/// these errors reach stderr and the journal, so a literal secret pasted
-/// against SPEC §9 would leak through the error that refuses it (BUG-113).
+/// TOML and schema failures expose only a fixed classification and location.
+/// Both values and unknown field names are untrusted input. Neither Display
+/// nor Debug retains the TOML error, its free-form message, or source text.
 pub fn parse_config(input: &str) -> Result<VolumeConfig, ConfigError> {
-    toml::from_str(input).map_err(|error| ConfigError::Parse(redacted_parse_error(&error, input)))
-}
-
-fn redacted_parse_error(error: &toml::de::Error, input: &str) -> String {
-    let location = error
-        .span()
-        .map(|span| {
-            let before = input.get(..span.start).unwrap_or(input);
-            let line = before.matches('\n').count() + 1;
-            let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-            format!("line {line}, column {column}: ")
-        })
-        .unwrap_or_default();
-    format!("{location}{}", redact_values(error.message()))
-}
-
-/// Replace every double-quoted literal (as serde and toml quote values) and
-/// the value of an unknown enum variant with `…`. Field and key names, which
-/// serde quotes with backticks, stay: they say what to fix.
-fn redact_values(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut chars = message.chars().peekable();
-    while let Some(c) = chars.next() {
-        out.push(c);
-        let quote = match c {
-            '"' => Some('"'),
-            '`' if out.ends_with("variant `") => Some('`'),
-            _ => None,
-        };
-        if let Some(quote) = quote {
-            let mut escaped = false;
-            for c in chars.by_ref() {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == quote {
-                    break;
-                }
-            }
-            out.push('…');
-            out.push(quote);
-        }
-    }
-    out
+    toml::from_str(input).map_err(|error| {
+        let location = error
+            .span()
+            .and_then(|span| input.get(..span.start))
+            .map(|before| {
+                let line = before.matches('\n').count() + 1;
+                let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                format!(" at line {line}, column {column}")
+            })
+            .unwrap_or_default();
+        ConfigError::Parse(format!("invalid TOML or configuration schema{location}"))
+    })
 }
 
 /// `scheme://host[:port]` of an endpoint URL, for messages: userinfo, path
