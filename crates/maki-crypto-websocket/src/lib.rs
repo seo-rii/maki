@@ -367,15 +367,39 @@ impl WsCryptoProvider {
             loop {
                 match source.next().await {
                     Some(Ok(msg)) => {
-                        let Some(frame) = response::own_message(msg) else {
+                        use tokio_tungstenite::tungstenite::Message;
+                        // Responses are JSON text frames with a numeric
+                        // correlation id; only an unknown or stale id is
+                        // discarded. Anything else breaks the receive
+                        // contract and fails this generation at once, instead
+                        // of leaving every request to time out and be resent
+                        // or retried under `stall` (BUG-117). Payloads are
+                        // still taken into guarded buffers before they drop.
+                        let text = matches!(msg, Message::Text(_));
+                        let control = matches!(msg, Message::Ping(_) | Message::Pong(_));
+                        let closing = matches!(msg, Message::Close(_));
+                        let frame = response::own_message(msg);
+                        if control {
+                            // tungstenite answers pings itself.
                             continue;
+                        }
+                        if closing {
+                            return retryable("connection lost: closed");
+                        }
+                        let violation = |what: &str| {
+                            CryptoError::Contract(format!(
+                                "websocket peer sent {what}; responses are JSON text frames \
+                                 with a numeric id"
+                            ))
+                        };
+                        let Some(frame) = frame.filter(|_| text) else {
+                            return violation("a non-text frame");
                         };
                         let Ok(value) = frame.parse() else {
-                            tracing::warn!("websocket: unparseable frame dropped");
-                            continue;
+                            return violation("a text frame that is not a JSON response");
                         };
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
-                            continue;
+                            return violation("a response without a numeric id");
                         };
                         let frame = if matches!(
                             value
