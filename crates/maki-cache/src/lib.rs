@@ -6,8 +6,9 @@
 //! caching exists — no write-back, no dirty entries, no persistence.
 //!
 //! Bounded by bytes with LRU eviction, TTL expiry, runtime resize, and
-//! zeroize-on-evict (plaintext lives in `SecretBuffer`, which zeroizes on
-//! drop; eviction drops the buffer immediately).
+//! lazy TTL checks. Eviction releases the cache's `Arc`; plaintext is
+//! zeroized when the last `Arc<SecretBuffer>` is dropped. Callers may retain
+//! a buffer beyond its TTL or eviction, so neither is a deletion deadline.
 //!
 //! Recency is tracked in an ordered index keyed by a monotonic tick, so an
 //! eviction is O(log n) rather than a scan of every entry: a full cache of
@@ -29,7 +30,8 @@ pub struct CacheConfig {
     pub max_bytes: u64,
     pub ttl: Duration,
     /// Kept for config parity; buffers always zeroize on drop via
-    /// `SecretBuffer`, so eviction is zeroizing regardless.
+    /// `SecretBuffer` after the final owner releases them. Eviction alone
+    /// does not zeroize buffers still held by callers.
     pub zeroize_on_evict: bool,
 }
 
@@ -126,8 +128,8 @@ impl VersionedLruCache {
     /// Cache the plaintext of `(unit, write_sequence)`. Replaces any older
     /// version of the unit; a newer cached version is kept, since a slow
     /// reader may finish decrypting an older version after a faster one
-    /// cached the current one (R5-020). Oversized entries are silently not
-    /// cached.
+    /// cached the current one (R5-020). Empty and oversized entries are not
+    /// cached; a rejected current/newer version invalidates the old entry.
     pub fn put(&self, unit: u64, write_sequence: u64, data: SecretBuffer) {
         let len = data.len() as u64;
         let now = self.clock.now();
@@ -160,7 +162,8 @@ impl VersionedLruCache {
 
     /// Plaintext for `(unit, current_write_sequence)`, or None. A version
     /// mismatch (stale entry) evicts and misses; TTL expiry evicts and
-    /// misses.
+    /// misses. TTL is evaluated on lookup, not by a background timer. The
+    /// returned owner remains valid until dropped, including after eviction.
     pub fn get(&self, unit: u64, write_sequence: u64) -> Option<Arc<SecretBuffer>> {
         let now = self.clock.now();
         let ttl = self.ttl.lock();
