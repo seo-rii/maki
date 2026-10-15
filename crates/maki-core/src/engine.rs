@@ -77,6 +77,13 @@ pub enum AttachError {
     MissingCanary(String),
 }
 
+/// A caller-owned write buffer or allocation-free zero request. Both are
+/// materialized into unit buffers only while holding engine admission.
+enum WriteInput<'a> {
+    Borrowed(&'a [u8]),
+    Zeroes(usize),
+}
+
 /// Admission limits at the block-core entry (SPEC §30): both request count
 /// and byte count are bounded.
 #[derive(Debug, Clone)]
@@ -831,9 +838,18 @@ impl Engine {
         Ok(())
     }
 
-    async fn check_freshness(&self) -> Result<(), CoreError> {
+    async fn check_freshness(
+        &self,
+        admission: Arc<maki_crypto::flow::DualPermit>,
+    ) -> Result<(), CoreError> {
         let backing = self.inner.backing.clone();
-        storage_task(move || backing.check_freshness()).await??;
+        storage_task(move || {
+            // Cancellation cannot release capacity while the blocking
+            // freshness RPC still owns its worker and backing resources.
+            let _admission = admission;
+            backing.check_freshness()
+        })
+        .await??;
         Ok(())
     }
 
@@ -915,13 +931,13 @@ impl Engine {
 
     async fn read_secret_inner(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
-        self.check_freshness().await?;
         let admission = Arc::new(
             self.inner
                 .admission
                 .acquire(self.admission_cost(offset, len))
                 .await?,
         );
+        self.check_freshness(admission.clone()).await?;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
@@ -1027,16 +1043,47 @@ impl Engine {
 
     async fn write_inner(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
-        self.check_freshness().await?;
         let admission = Arc::new(
             self.inner
                 .admission
                 .acquire(self.admission_cost(offset, data.len()))
                 .await?,
         );
+        self.write_admitted(offset, WriteInput::Borrowed(data), fua, admission)
+            .await
+    }
+
+    /// Write zeroes without allocating a request-sized buffer before admission.
+    pub async fn write_zeroes(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
+        self.observe_request(RequestKind::Write, fua, async {
+            self.check_range(offset, len)?;
+            let admission = Arc::new(
+                self.inner
+                    .admission
+                    .acquire(self.admission_cost(offset, len))
+                    .await?,
+            );
+            self.write_admitted(offset, WriteInput::Zeroes(len), fua, admission)
+                .await
+        })
+        .await
+    }
+
+    async fn write_admitted(
+        &self,
+        offset: u64,
+        data: WriteInput<'_>,
+        fua: bool,
+        admission: Arc<maki_crypto::flow::DualPermit>,
+    ) -> Result<(), CoreError> {
+        self.check_freshness(admission.clone()).await?;
+        let data_len = match data {
+            WriteInput::Borrowed(bytes) => bytes.len(),
+            WriteInput::Zeroes(len) => len,
+        };
         let unit_size = self.unit_size();
         let first = offset / unit_size;
-        let last = (offset + data.len() as u64 - 1) / unit_size;
+        let last = (offset + data_len as u64 - 1) / unit_size;
 
         // Serialize against other writers/RMW of the same units (SPEC §28).
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
@@ -1050,7 +1097,6 @@ impl Engine {
         let inner = self.inner.clone();
         let io_admission = admission.clone();
         let io_guards = guards.clone();
-        let data_len = data.len();
         let (rmw_cts, need_rmw, cached) = storage_task(move || {
             let (_admission, _guards) = (io_admission, io_guards);
             let mut rmw_cts = Vec::new();
@@ -1114,11 +1160,15 @@ impl Engine {
                 SecretBuffer::zeroed(unit_size as usize)
             };
             let dst_from = offset.max(unit_start) - unit_start;
-            let dst_to = (offset + data.len() as u64).min(unit_start + unit_size) - unit_start;
-            let src_from = offset.max(unit_start) - offset;
-            buf.expose_mut()[dst_from as usize..dst_to as usize].copy_from_slice(
-                &data[src_from as usize..src_from as usize + (dst_to - dst_from) as usize],
-            );
+            let dst_to = (offset + data_len as u64).min(unit_start + unit_size) - unit_start;
+            let destination = &mut buf.expose_mut()[dst_from as usize..dst_to as usize];
+            match data {
+                WriteInput::Borrowed(bytes) => {
+                    let src_from = (offset.max(unit_start) - offset) as usize;
+                    destination.copy_from_slice(&bytes[src_from..src_from + destination.len()]);
+                }
+                WriteInput::Zeroes(_) => destination.fill(0),
+            }
             items.push(PlaintextUnit {
                 unit_index: unit,
                 data: buf,
@@ -1172,7 +1222,6 @@ impl Engine {
 
     async fn trim_inner(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
         self.check_extent(offset, len)?;
-        self.check_freshness().await?;
         if !self.can_trim() {
             return Err(CoreError::Invalid(
                 "discard requires a volume created with --discard".into(),
@@ -1185,7 +1234,8 @@ impl Engine {
             return if fua {
                 self.flush_inner().await
             } else {
-                Ok(())
+                let admission = Arc::new(self.inner.admission.acquire(0).await?);
+                self.check_freshness(admission).await
             };
         }
         let per_chunk = (self.inner.max_request_bytes / unit_size).max(1);
@@ -1209,6 +1259,7 @@ impl Engine {
                 .acquire(self.admission_cost(first * unit_size, bytes))
                 .await?,
         );
+        self.check_freshness(admission.clone()).await?;
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, end - 1).await);
         let cts = (first..end)
             .map(|unit_index| CiphertextUnit {
@@ -1510,10 +1561,12 @@ impl Engine {
     }
 
     async fn flush_inner(&self) -> Result<(), CoreError> {
-        self.check_freshness().await?;
+        let admission = Arc::new(self.inner.admission.acquire(0).await?);
+        self.check_freshness(admission.clone()).await?;
         let mut volume = self.inner.write_volume().await?;
         let inner = self.inner.clone();
         storage_task(move || {
+            let _admission = admission;
             let started = inner.clock.now();
             let outcome = inner.sync_journal(&mut volume);
             outcome?;
