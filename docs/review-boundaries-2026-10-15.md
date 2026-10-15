@@ -238,7 +238,12 @@ parsing intercepted the privileged helper's NBD `--socket` argument.
 [#75](https://github.com/seo-rii/maki/pull/75), commit `85c72cf`, preserves raw
 attach/detach/grow arguments before control parsing, as well as the existing
 leading-timeout fallback. The actual CLI regression failed before the fix;
-seven CLI tests and strict Clippy passed afterward.
+seven CLI tests and strict Clippy passed afterward. Follow-up review combined
+the leading timeout with the helper socket override and found that socket
+parsing still intercepted that form. [#77](https://github.com/seo-rii/maki/pull/77),
+commit `50530a7`, routes helper commands immediately after prefix-timeout removal
+as well. The composed attach/detach/grow regressions failed before the fix and
+all seven CLI tests plus strict Clippy passed afterward.
 
 [#76](https://github.com/seo-rii/maki/pull/76), commit `d1c9554`, preserves the
 space-refusal trigger when a failed physical reclamation hint has retained a
