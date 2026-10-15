@@ -22,7 +22,7 @@ the qualified *shape*, not as an approval.
 | Attach pins `fs_uuid` **and** the complete `[lvm_identity]` | [configuration](../configuration.md#privileged-attachment-identity) |
 | The qualified topology: whole NBD device → one PV → one VG → one linear XFS data LV | [support matrix](support-matrix.md#exported-stack-above-maki) |
 | The workload is registered against `maki-workload@<volume>.target` and gated by `maki-attach verify` on every start | [operations](../operations.md#privileged-helper) |
-| Planned stops go through `maki drain` before `systemctl stop` of the target | [operations](../operations.md#privileged-helper) |
+| Planned stops stop the lifecycle target with I/O admission open, allowing unmount before daemon drain | [operations](../operations.md#privileged-helper) |
 | Backups capture the backing, both configurations and the credential separately, or use a database-native dump | [operations](../operations.md#fresh-host-restore-of-an-unchanged-v2-backing) |
 
 ## 1. Choose the provider
@@ -135,6 +135,12 @@ Keep the durability settings the campaign used: `fsync = on`,
 
 ## 6. Planned stop and start
 
+Stop the target with engine I/O admission open. Its ordered stop shuts down
+PostgreSQL, unmounts the filesystem through attach cleanup, then drains and
+stops the daemon. Do not drain before unmount or stop only the PostgreSQL or
+attach unit. For a separate durability acknowledgement, use the
+[explicit unmount-then-drain procedure](../operations.md#privileged-helper).
+
 ```bash
 # Succeeds once every named unit is inactive; fails at once if one failed
 # (inspect it before continuing) or after WAIT_SECONDS (default 600).
@@ -150,9 +156,7 @@ wait_stopped() {
         done
     done
 }
-systemctl stop postgresql@15-main.service        # or pg_ctlcluster 15 main stop
-maki drain /etc/maki/volumes/postgres.toml       # returns the durable checkpoint sequence
-systemctl stop maki-workload@postgres.target
+systemctl stop maki-workload@postgres.target &&
 wait_stopped postgresql@15-main.service maki-attach@postgres.service maki@postgres.service &&
     maki check /etc/maki/volumes/postgres.toml --deep
 ```
@@ -196,7 +200,8 @@ production.
 
 Two supported shapes, both qualified once on Debian 12:
 
-1. **Unchanged backing restore**: drain, stop, capture `/var/lib/maki/postgres`,
+1. **Unchanged backing restore**: quiesce, unmount, acknowledge drain, stop the
+   target and wait for every unit to be inactive, then capture `/var/lib/maki/postgres`,
    both configuration files and the credential (separately), restore on a
    host with the same package, and verify against an independent ledger
    ([procedure](../operations.md#fresh-host-restore-of-an-unchanged-v2-backing)).
