@@ -53,7 +53,7 @@ server_name = "witness.example.test"
 timeout_ms = 5000
 ca_file = "/etc/maki/witness-ca.pem"
 client_cert_file = "/etc/maki/writer.cert.pem"
-client_key_file = "/run/credentials/maki/writer.key.pem"
+client_key_file = "/etc/maki/witness/writer.key.pem"
 ```
 
 Select exactly one of `address` or `addresses`; an endpoint set contains 1–8
