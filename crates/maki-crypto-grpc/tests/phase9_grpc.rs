@@ -548,8 +548,19 @@ async fn unresponsive_established_channel_is_replaced_after_timeout_or_cancellat
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::{TcpListener, TcpStream};
 
-    for cancel in [false, true] {
-        let backend = grpc_server(Arc::new(ServerState::default())).await;
+    for (initial_status, cancel) in [
+        None,
+        Some(Code::InvalidArgument),
+        Some(Code::ResourceExhausted),
+    ]
+    .into_iter()
+    .flat_map(|status| [false, true].map(|cancel| (status, cancel)))
+    {
+        let backend = grpc_server(Arc::new(ServerState {
+            fail_with: parking_lot_lite::Mutex::new(initial_status),
+            ..Default::default()
+        }))
+        .await;
         let backend = backend.strip_prefix("http://").unwrap().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -597,7 +608,19 @@ async fn unresponsive_established_channel_is_replaced_after_timeout_or_cancellat
         .unwrap();
         let context = ctx();
         let plaintext = [pt(1, 0xAB)];
-        p.encrypt_batch(&context, &plaintext).await.unwrap();
+        let first = p.encrypt_batch(&context, &plaintext).await;
+        match initial_status {
+            Some(Code::InvalidArgument) => {
+                assert_eq!(first.unwrap_err().class(), ErrorClass::NonRetryableRequest);
+            }
+            Some(Code::ResourceExhausted) => {
+                assert_eq!(first.unwrap_err().class(), ErrorClass::Throttled);
+            }
+            None => {
+                first.unwrap();
+            }
+            _ => unreachable!(),
+        }
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
         stop_forwarding.notify_one();
         tokio::time::timeout(Duration::from_secs(5), parked.notified())
