@@ -88,9 +88,24 @@ impl VolumeConfig {
                 self.crypto.effective_compatibility_id().len() as u64,
             ))
             .saturating_add(6);
-        Ok(context
+        let normal = context
             .saturating_add(count.saturating_mul(delimited_len(item)))
-            .max(self.crypto.batch.max_bytes.0))
+            .max(self.crypto.batch.max_bytes.0);
+        // Attach's context-binding probe appends this suffix to the profile
+        // and decrypts one ciphertext at unit zero. The longer string can
+        // cross a protobuf varint boundary even when a normal singleton fits.
+        let probe = if self.crypto.capabilities.context_binding != "none" {
+            delimited_len(36)
+                .saturating_add(delimited_len(
+                    (self.crypto.effective_compatibility_id().len() as u64)
+                        .saturating_add(".selftest-probe".len() as u64),
+                ))
+                .saturating_add(6)
+                .saturating_add(delimited_len(delimited_len(payload)))
+        } else {
+            0
+        };
+        Ok(normal.max(probe))
     }
 
     pub(super) fn websocket_frame_bound(&self) -> Result<u64, ConfigError> {

@@ -192,7 +192,8 @@ schema, geometry, and secret-literal checks it rejects:
   `item_fields`);
 - a transport limit that cannot carry one full crypto batch, including the
   declared maximum ciphertext size. gRPC `max_message_bytes` (default 4 MiB)
-  includes protobuf field tags, lengths, indices and context. WebSocket
+  includes protobuf field tags, lengths, indices, context and the singleton
+  negative profile probe used by attach self-tests. WebSocket
   `max_frame_bytes` (default 8 MiB) includes each item's base64 padding, JSON
   structure, escaped profile, and maximum-width numeric fields. HTTP
   `max_response_bytes` (default 8 MiB) covers each operation's response mapping,
