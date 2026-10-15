@@ -390,10 +390,16 @@ impl SlotStore {
                     "shard {shard_idx}: allocation map size mismatch"
                 )));
             }
+            // Only an absent file is damage. Every cataloged shard stays
+            // open, so a large volume can meet the descriptor limit here:
+            // EMFILE and other open failures keep their errno (BUG-124).
             let data = backing
                 .open(&layout::shard_data(shard_idx), false)
-                .map_err(|e| {
-                    CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                    }
+                    _ => CoreError::Io(e),
                 })?;
             // A data file shorter than its physical size (see `ShortFile`).
             let mut alloc = alloc;

@@ -693,6 +693,14 @@ slots and 64 GiB shards, the full slot span is 18 TiB. Its allocation maps use
 copies use 4,152 bytes. The last partial logical shard still contributes a full
 shard file because shard files are created at their complete fixed length.
 
+Every shard in the catalog keeps one open file descriptor while the volume is
+attached. The daemon, `maki` and `maki-check` raise their soft
+`RLIMIT_NOFILE` to the hard limit (at most 2^20) before opening a volume;
+systemd's default hard limit of 524288 is far above any practical shard count.
+A lower hard limit (`LimitNOFILE=`) must leave room for the shards plus the
+journal and connections, or attach fails with `Too many open files`. That error
+names no damage: raise the limit and attach again.
+
 These values describe format files at maximum allocation. Add journal and
 checkpoint headroom, filesystem allocation and metadata overhead,
 copy-on-write behavior, and database temporary space when sizing the backing

@@ -1036,6 +1036,11 @@ pub async fn attach_from_config_with_stats(
 > {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
+    // Every cataloged shard keeps a descriptor (BUG-124). A refusal leaves
+    // the inherited limit; an open that then fails reports EMFILE.
+    if let Err(e) = maki_backing::raise_open_file_limit() {
+        tracing::warn!("cannot raise the open-file soft limit: {e}");
+    }
     let backing = build_backing(config)?;
     let options = engine_options(config);
     let volume = Volume::recover(backing, options.volume.clone()).map_err(AttachError::from)?;

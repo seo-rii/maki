@@ -121,6 +121,10 @@ fn main() -> ExitCode {
     // Store repairs and recovery decisions are reported through `tracing`;
     // an offline check or volume creation must show them too (R4-001).
     maki_core::logging::install_default_logging();
+    // Opening a volume keeps every shard data file open (BUG-124).
+    if let Err(e) = maki_backing::raise_open_file_limit() {
+        eprintln!("warning: cannot raise the open-file soft limit: {e}");
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,
