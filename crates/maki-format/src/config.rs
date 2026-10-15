@@ -24,15 +24,85 @@ pub const MAX_VOLUME_NAME_BYTES: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Where and what, never the document: see [`parse_config`].
     #[error("config parse error: {0}")]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("config invalid: {0}")]
     Invalid(String),
 }
 
+/// Parse a volume configuration.
+///
+/// A TOML or schema error is reported by line, column and message with every
+/// quoted value replaced. `toml::de::Error` renders the offending source line,
+/// serde quotes the rejected value, and its `Debug` holds the whole document;
+/// these errors reach stderr and the journal, so a literal secret pasted
+/// against SPEC §9 would leak through the error that refuses it (BUG-113).
 pub fn parse_config(input: &str) -> Result<VolumeConfig, ConfigError> {
-    let cfg: VolumeConfig = toml::from_str(input)?;
-    Ok(cfg)
+    toml::from_str(input).map_err(|error| ConfigError::Parse(redacted_parse_error(&error, input)))
+}
+
+fn redacted_parse_error(error: &toml::de::Error, input: &str) -> String {
+    let location = error
+        .span()
+        .map(|span| {
+            let before = input.get(..span.start).unwrap_or(input);
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("line {line}, column {column}: ")
+        })
+        .unwrap_or_default();
+    format!("{location}{}", redact_values(error.message()))
+}
+
+/// Replace every double-quoted literal (as serde and toml quote values) and
+/// the value of an unknown enum variant with `…`. Field and key names, which
+/// serde quotes with backticks, stay: they say what to fix.
+fn redact_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        let quote = match c {
+            '"' => Some('"'),
+            '`' if out.ends_with("variant `") => Some('`'),
+            _ => None,
+        };
+        if let Some(quote) = quote {
+            let mut escaped = false;
+            for c in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == quote {
+                    break;
+                }
+            }
+            out.push('…');
+            out.push(quote);
+        }
+    }
+    out
+}
+
+/// `scheme://host[:port]` of an endpoint URL, for messages: userinfo, path
+/// and query may carry credentials (BUG-113).
+fn redacted_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let scheme: String = scheme
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '+')
+                .collect();
+            format!("{scheme}://{host}")
+        }
+        None => "(no scheme)".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------- ByteSize
@@ -1332,20 +1402,22 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
     let (scheme, rest) = url
         .split_once("://")
-        .ok_or_else(|| invalid(format!("endpoint url {url:?} has no scheme")))?;
+        .ok_or_else(|| invalid("endpoint url has no scheme; expected scheme://host[:port]"))?;
     if scheme.is_empty()
         || !scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '+')
     {
         return Err(invalid(format!(
-            "endpoint url {url:?} has an invalid scheme"
+            "endpoint url {} has an invalid scheme",
+            redacted_url(url)
         )));
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.contains('@') {
         return Err(invalid(format!(
-            "endpoint url {url:?} carries userinfo; credentials belong in credential references"
+            "endpoint url {} carries userinfo; credentials belong in credential references",
+            redacted_url(url)
         )));
     }
     let host = if let Some(stripped) = authority.strip_prefix('[') {
@@ -1358,7 +1430,10 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             .to_string()
     };
     if host.is_empty() {
-        return Err(invalid(format!("endpoint url {url:?} has no host")));
+        return Err(invalid(format!(
+            "endpoint url {} has no host",
+            redacted_url(url)
+        )));
     }
     Ok((scheme.to_ascii_lowercase(), host))
 }
@@ -1404,7 +1479,13 @@ fn validate_endpoints(
                 endpoint.name
             )));
         }
-        let (scheme, host) = parse_endpoint_url(&endpoint.url)?;
+        let (scheme, host) = parse_endpoint_url(&endpoint.url).map_err(|error| match error {
+            ConfigError::Invalid(message) => invalid(format!(
+                "[crypto.{transport}] endpoint {:?}: {message}",
+                endpoint.name
+            )),
+            other => other,
+        })?;
         if scheme == plaintext_scheme {
             if has_tls_options {
                 return Err(invalid(format!(
@@ -1413,16 +1494,18 @@ fn validate_endpoints(
             }
             if !is_loopback_host(&host) {
                 return Err(invalid(format!(
-                    "endpoint {:?}: plaintext {plaintext_scheme}:// is only allowed to loopback \
-                     hosts; block data would cross the network unencrypted (use {tls_scheme}:// \
-                     or a local tunnel)",
-                    endpoint.url
+                    "endpoint {:?} ({}): plaintext {plaintext_scheme}:// is only allowed to \
+                     loopback hosts; block data would cross the network unencrypted (use \
+                     {tls_scheme}:// or a local tunnel)",
+                    endpoint.name,
+                    redacted_url(&endpoint.url)
                 )));
             }
         } else if scheme != tls_scheme {
             return Err(invalid(format!(
-                "endpoint {:?}: scheme must be {plaintext_scheme} or {tls_scheme}",
-                endpoint.url
+                "endpoint {:?} ({}): scheme must be {plaintext_scheme} or {tls_scheme}",
+                endpoint.name,
+                redacted_url(&endpoint.url)
             )));
         }
     }
