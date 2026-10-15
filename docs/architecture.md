@@ -230,8 +230,11 @@ failed reclaim marks the engine degraded until a later checkpoint succeeds; the
 
 Every provider declares plaintext sizes, maximum ciphertext size, batching,
 retry safety, integrity, context binding, and a compatibility identity. Maki
-validates response count, order, unit index, and size on every call. A provider
-self-test runs before attach, and multi-endpoint configurations verify
+validates response count, order, unit index, and size on every call, and
+refuses an encrypt result that carries its own plaintext at either end (an
+echo, or an echo with a tag appended or a nonce prepended): an endpoint that
+starts passing data through after attach is charged and failed over instead of
+having plaintext persisted. A provider self-test runs before attach, and multi-endpoint configurations verify
 cross-endpoint ciphertext compatibility.
 
 The self-test proves only that the provider is coherent with itself. The key
