@@ -3,7 +3,7 @@
 //! itself), and endpoint URL errors printed the whole URL, userinfo and
 //! query included. These errors reach stderr and the systemd journal, so the
 //! literal secrets SPEC §9 forbids leaked through the very error that
-//! refused them. Errors still say where and what, never the value.
+//! refused them. Errors expose only the parse classification and location.
 
 use maki_format::config::parse_config;
 
@@ -45,9 +45,9 @@ fn a_literal_key_where_a_reference_belongs_is_not_echoed() {
 }
 
 #[test]
-fn an_unknown_field_holding_a_token_is_named_but_not_echoed() {
+fn an_unknown_field_holding_a_token_is_not_echoed() {
     let document = format!("{BASE}token = \"{SECRET}\"\n");
-    assert_redacted(&document, "token");
+    assert_redacted(&document, "line ");
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn a_pasted_private_key_is_not_echoed() {
         "{BASE}[crypto]\nprovider = \"remote-http\"\ncrypto_compatibility_id = \"x\"\n\
          client_key = \"\"\"-----BEGIN PRIVATE KEY-----\n{SECRET}\n-----END PRIVATE KEY-----\"\"\"\n"
     );
-    assert_redacted(&document, "client_key");
+    assert_redacted(&document, "line ");
 }
 
 #[test]
@@ -85,5 +85,26 @@ fn endpoint_url_errors_never_print_userinfo_or_query() {
         assert!(!debug.contains(SECRET), "{url}: {debug}");
         assert!(display.contains(still_says), "{url}: {display}");
         assert!(display.contains("primary"), "names the endpoint: {display}");
+    }
+}
+
+#[test]
+fn untrusted_error_fragments_never_reach_display_or_debug() {
+    for field in [
+        format!("availability_policy = \"bad`{SECRET}\""),
+        "key = 1234567890123456".to_string(),
+        format!("\"{SECRET}\" = true"),
+        format!(r#"key = "bad\\\"{SECRET}""#),
+    ] {
+        let document = format!("{BASE}[crypto]\nprovider = \"local-aes-gcm-siv\"\ncrypto_compatibility_id = \"x\"\n{field}\n");
+        let (display, debug) = parse_error(&document);
+        for output in [display, debug] {
+            assert!(!output.contains(SECRET), "{output}");
+            assert!(!output.contains("1234567890123456"), "{output}");
+            assert!(
+                output.contains("invalid TOML or configuration schema at line "),
+                "{output}"
+            );
+        }
     }
 }
