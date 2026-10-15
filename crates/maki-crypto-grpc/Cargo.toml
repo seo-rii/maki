@@ -31,7 +31,7 @@ maki-backing.workspace = true
 maki-core.workspace = true
 maki-format.workspace = true
 maki-crypto-local.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rcgen.workspace = true
 rustls.workspace = true
 # Raw HTTP/2 responses tonic's server would never produce (truncated
