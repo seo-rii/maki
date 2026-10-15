@@ -339,24 +339,43 @@ impl WsCryptoProvider {
     }
 
     async fn connect(&self) -> Result<Connection, CryptoError> {
-        let connector = match self
-            .tls_connector
-            .as_ref()
-            .map_err(|message| CryptoError::ProviderFatal(message.clone()))?
-        {
-            Some(connector) => Some(connector.clone()),
-            // Build an explicit WSS connector for every default-root connect,
-            // retaining native-root reloads without the implicit TLS provider.
-            None => Self::build_tls_connector(&self.spec).map_err(CryptoError::ProviderFatal)?,
-        };
+        self.connect_with_tls(|| {
+            match self
+                .tls_connector
+                .as_ref()
+                .map_err(|message| CryptoError::ProviderFatal(message.clone()))?
+            {
+                Some(connector) => Ok(Some(connector.clone())),
+                // Build an explicit WSS connector for every default-root connect,
+                // retaining native-root reloads without the implicit TLS provider.
+                None => Self::build_tls_connector(&self.spec).map_err(CryptoError::ProviderFatal),
+            }
+        })
+        .await
+    }
+
+    // Keep TLS preparation inside the connection budget. The injectable loader
+    // also lets the deadline tests model a slow synchronous native-root scan.
+    async fn connect_with_tls(
+        &self,
+        prepare_tls: impl FnOnce() -> Result<Option<Connector>, CryptoError>,
+    ) -> Result<Connection, CryptoError> {
+        let deadline = tokio::time::Instant::now() + self.spec.timeout;
+        let connector = prepare_tls()?;
+        // Native-root discovery is synchronous and cannot be preempted here.
+        // Once it returns, an exhausted budget must not open a socket, and
+        // network setup receives only the time left from this same deadline.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(retryable("websocket connect timeout"));
+        }
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
         // TCP connect and the HTTP upgrade have no timeout of their own: a
         // peer that accepts and never answers would hold the connection
         // mutex forever, and with it every request on this provider (C-05).
-        let (ws, _response) = tokio::time::timeout(
-            self.spec.timeout,
+        let (ws, _response) = tokio::time::timeout_at(
+            deadline,
             tokio_tungstenite::connect_async_tls_with_config(
                 &self.spec.url,
                 Some(config),
@@ -767,3 +786,7 @@ mod request_secret_tests;
 #[cfg(test)]
 #[path = "response_secret_tests.rs"]
 mod response_secret_tests;
+
+#[cfg(test)]
+#[path = "connect_deadline_tests.rs"]
+mod connect_deadline_tests;

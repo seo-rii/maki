@@ -27,6 +27,6 @@ maki-backing.workspace = true
 maki-core.workspace = true
 maki-format.workspace = true
 maki-crypto-local.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rcgen.workspace = true
 tokio-rustls.workspace = true
