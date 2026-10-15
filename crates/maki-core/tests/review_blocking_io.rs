@@ -15,6 +15,7 @@ const WRITE: usize = 2;
 const SYNC: usize = 3;
 const SPACE: usize = 4;
 const OPEN: usize = 5;
+const DIRSYNC: usize = 6;
 
 #[derive(Default)]
 struct Gate {
@@ -105,6 +106,7 @@ impl Backing for SlowBacking {
         self.inner.list(path)
     }
     fn sync_dir(&self, path: &str) -> io::Result<()> {
+        self.gate.block(DIRSYNC);
         self.inner.sync_dir(path)
     }
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
@@ -353,5 +355,85 @@ async fn cancelled_worker_stop_does_not_detach_the_worker() {
 
     backing.gate.release();
     second.await.unwrap();
+    assert!(!backing.gate.stalled.load(Ordering::SeqCst));
+}
+
+async fn canary_fixture(
+    existing: bool,
+    legacy: bool,
+) -> (Arc<SlowBacking>, Arc<maki_core::volume::Volume>) {
+    let backing = if existing || legacy {
+        let (backing, engine) = fixture().await;
+        engine.stop_checkpoint_worker().await;
+        drop(engine);
+        if legacy {
+            backing.remove(maki_format::layout::KEY_CANARY_A).unwrap();
+            backing.remove(maki_format::layout::KEY_CANARY_B).unwrap();
+        }
+        backing
+    } else {
+        backing()
+    };
+    let volume = maki_core::volume::Volume::recover(backing.clone(), Default::default()).unwrap();
+    (backing, Arc::new(volume))
+}
+
+async fn verify(volume: Arc<maki_core::volume::Volume>) {
+    let superblock = volume.superblock();
+    let context = maki_crypto::CryptoContext {
+        volume_uuid: superblock.volume_uuid,
+        format_version: superblock.format_version,
+        crypto_compatibility_id: superblock.crypto_compatibility_id.clone(),
+    };
+    let provider = maki_crypto::checked::CheckedProvider::pinned(
+        Arc::new(FakeCryptoProvider::new(1024)),
+        1024,
+    );
+    maki_core::engine::verify_key_canary(volume, &provider, &context, true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canary_storage_keeps_current_thread_runtime_responsive() {
+    // Existing canary load/repair, first publication, and legacy ciphertext
+    // probing all execute the real public verification API.
+    for (existing, legacy, operation) in [
+        (true, false, READ),
+        (true, false, WRITE),
+        (true, false, SYNC),
+        (true, false, DIRSYNC),
+        (false, false, OPEN),
+        (false, false, WRITE),
+        (false, false, SYNC),
+        (false, false, DIRSYNC),
+        (false, true, READ),
+    ] {
+        let (backing, volume) = canary_fixture(existing, legacy).await;
+        responsive(&backing.gate, operation, verify(volume)).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_canary_publication_retains_volume_lock_until_storage_finishes() {
+    let (backing, volume) = canary_fixture(false, false).await;
+    backing.gate.operation.store(WRITE, Ordering::SeqCst);
+    let verification = tokio::spawn(verify(volume));
+    backing.gate.entered.notified().await;
+    verification.abort();
+    assert!(verification.await.unwrap_err().is_cancelled());
+    assert!(backing.try_lock(maki_format::layout::VOLUME_LOCK).is_err());
+    backing.gate.release();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(lock) = backing.try_lock(maki_format::layout::VOLUME_LOCK) {
+                drop(lock);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled canary storage retained the lock after completion");
     assert!(!backing.gate.stalled.load(Ordering::SeqCst));
 }
