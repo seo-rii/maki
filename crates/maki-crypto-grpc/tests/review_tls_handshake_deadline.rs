@@ -42,6 +42,11 @@ fn caps() -> CryptoCapabilities {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_that_never_answers_tls_does_not_pin_the_channel() {
+    // This integration-test binary deliberately installs no global provider.
+    // It must also run with both rustls backends enabled by feature unification
+    // (for example, `--features rustls/aws-lc-rs`), where automatic selection
+    // would panic before the first connection attempt.
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
     // Accept every TCP connection and hold it open without a byte of TLS.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -68,6 +73,10 @@ async fn a_peer_that_never_answers_tls_does_not_pin_the_channel() {
         GrpcTlsConfig::default(),
     )
     .unwrap();
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_none(),
+        "gRPC must select its TLS provider without changing process-global state"
+    );
     let context = CryptoContext {
         volume_uuid: uuid::Uuid::from_u128(0x115),
         format_version: 1,

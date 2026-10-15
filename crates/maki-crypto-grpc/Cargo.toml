@@ -12,7 +12,10 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-tonic = { version = "0.13", features = ["tls-native-roots"] }
+# Select tonic's explicit ring fallback when no process-global provider exists.
+# Roots alone leave rustls to infer one, which panics if another dependency
+# enables aws-lc alongside our ring backend.
+tonic = { version = "0.13", features = ["tls-native-roots", "tls-ring"] }
 prost = "0.13"
 http-body = "1"
 zeroize.workspace = true
