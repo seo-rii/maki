@@ -126,6 +126,14 @@ fn main() -> ExitCode {
         eprintln!("warning: cannot raise the open-file soft limit: {e}");
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Helper options belong to the helper, including its NBD --socket
+    // override. Preserve them before interpreting any control options.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("attach" | "detach" | "grow")
+    ) {
+        return privileged_helper(&args);
+    }
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,
         Err(e) => return fail(e),
@@ -254,16 +262,19 @@ fn main() -> ExitCode {
             serde_json::Value::Null,
             timeout.unwrap_or(CONTROL_TIMEOUT),
         ),
-        ["attach", ..] | ["detach", ..] | ["grow", ..] => {
-            eprintln!(
-                "this operation requires the privileged helper: run `maki-attach {}` \
-                 (or systemctl start maki-attach@<volume>)",
-                argv.join(" ")
-            );
-            ExitCode::from(3)
-        }
+        // Retain the existing route when a leading --timeout was removed.
+        ["attach", ..] | ["detach", ..] | ["grow", ..] => privileged_helper(&args),
         _ => usage(),
     }
+}
+
+fn privileged_helper(args: &[String]) -> ExitCode {
+    eprintln!(
+        "this operation requires the privileged helper: run `maki-attach {}` \
+         (or systemctl start maki-attach@<volume>)",
+        args.join(" ")
+    );
+    ExitCode::from(3)
 }
 
 /// The control commands with `--socket <path>` in place of the volume
