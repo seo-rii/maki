@@ -817,11 +817,18 @@ async fn dispatch_endpoint_set(
         flagged.push((name, provider, false));
     }
 
-    let canary = maki_format::ab::AbStore::new(
-        maki_format::layout::KEY_CANARY_A,
-        maki_format::layout::KEY_CANARY_B,
-    )
-    .load::<maki_format::canary::KeyCanary>(volume.backing().as_ref())?;
+    // Snapshot the canary for later endpoint revalidation without blocking
+    // the async dispatcher; cancellation retains the recovered volume lock.
+    let reading = volume.clone();
+    let canary = tokio::task::spawn_blocking(move || {
+        maki_format::ab::AbStore::new(
+            maki_format::layout::KEY_CANARY_A,
+            maki_format::layout::KEY_CANARY_B,
+        )
+        .load::<maki_format::canary::KeyCanary>(reading.backing().as_ref())
+    })
+    .await
+    .map_err(|e| DaemonError::Unsupported(format!("canary storage worker failed: {e}")))??;
     let validation_context = context.clone();
     let validator: EndpointValidator = Arc::new(move |reference, candidate, _request_context| {
         let context = validation_context.clone();
