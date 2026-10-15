@@ -243,7 +243,7 @@ fn real_nbdkit_serves_requests_above_the_advertised_maximum() {
         .join("libmaki_nbdkit.so");
     assert!(plugin.is_file(), "missing cargo-built plugin: {plugin:?}");
     let script = r#"
-import ctypes as c, sys
+import ctypes as c, sys, time
 lib = c.CDLL('libnbd.so.0')
 def api(name, args, result=c.c_int):
     fn = getattr(lib, name); fn.argtypes = args; fn.restype = result; return fn
@@ -263,12 +263,38 @@ h = create()
 try:
     check(set_strict(h, 0))
     check(connect_uri(h, sys.argv[1].encode()))
+    # Negotiating a second client must not create another live plugin
+    # handle, even though the multi-conn capability is merely advisory.
+    for _ in range(16):
+        rejected = create()
+        try:
+            if connect_uri(rejected, sys.argv[1].encode()) >= 0:
+                raise RuntimeError('second NBD connection was admitted')
+        finally:
+            close(rejected)
     payload = bytes((i * 7) % 251 for i in range(20 * 1024))
     check(pwrite(h, c.create_string_buffer(payload, len(payload)), len(payload), 4096, 1))
     readback = c.create_string_buffer(len(payload))
     check(pread(h, readback, len(payload), 4096, 0))
     if readback.raw != payload: raise RuntimeError('oversized readback differs')
     check(shutdown(h, 0))
+    # The server close callback may run just after the client observes EOF.
+    # A fresh connection must eventually recover the slot and read the data.
+    for _ in range(100):
+        successor = create()
+        if connect_uri(successor, sys.argv[1].encode()) >= 0:
+            break
+        close(successor)
+        time.sleep(0.01)
+    else:
+        raise RuntimeError('closed NBD handle did not release connection slot')
+    try:
+        readback = c.create_string_buffer(8192)
+        check(pread(successor, readback, 8192, 4096, 0))
+        if readback.raw != payload[:8192]: raise RuntimeError('successor readback differs')
+        check(shutdown(successor, 0))
+    finally:
+        close(successor)
     print('native oversized requests served')
 finally:
     close(h)

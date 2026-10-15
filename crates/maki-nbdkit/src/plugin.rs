@@ -17,6 +17,7 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,10 @@ const API_VERSION: c_int = NBDKIT_API_VERSION;
 
 static CONFIG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static ADAPTER: OnceLock<NbdAdapter> = OnceLock::new();
+// nbd.connections is validated as exactly one. A successful open owns this
+// slot until nbdkit closes its handle; failed negotiations release it via
+// that same close callback. Rejected opens create no plugin-owned work.
+static ACTIVE_CONNECTION: AtomicBool = AtomicBool::new(false);
 static STARTUP: startup::Startup = startup::Startup::new();
 
 fn adapter() -> Option<&'static NbdAdapter> {
@@ -178,12 +183,24 @@ unsafe extern "C" fn config_complete() -> c_int {
 
 unsafe extern "C" fn open(_readonly: c_int) -> *mut c_void {
     guarded("open", std::ptr::null_mut(), || match adapter() {
-        Some(a) => a as *const NbdAdapter as *mut c_void,
+        Some(a) => {
+            if ACTIVE_CONNECTION
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                a as *const NbdAdapter as *mut c_void
+            } else {
+                set_errno(libc::EBUSY);
+                std::ptr::null_mut()
+            }
+        }
         None => std::ptr::null_mut(),
     })
 }
 
-unsafe extern "C" fn close(_handle: *mut c_void) {}
+unsafe extern "C" fn close(_handle: *mut c_void) {
+    ACTIVE_CONNECTION.store(false, Ordering::Release);
+}
 
 unsafe extern "C" fn get_size(handle: *mut c_void) -> i64 {
     guarded("get_size", -1, || {
