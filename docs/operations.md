@@ -924,6 +924,14 @@ metric labels.
   status` reports `state: degraded` with the reason, and `maki_volume_state`
   is 2, until a barrier succeeds; a successful checkpoint alone does not clear
   it.
+- If a storage task panics while it holds the volume write lock (a bug, not
+  an I/O error), the engine stops: the in-memory volume may be half updated,
+  so every later read, write, trim, FLUSH and checkpoint fails with EIO,
+  `maki status` reports `state: degraded` with a reason starting `engine
+  stopped:`, and the log has an `ERROR` line. Nothing clears it. Restart the
+  daemon; recovery rebuilds the state from disk and keeps every write a FLUSH
+  or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
+  cannot prove durability through that state.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with mode `0600` or `0400`, or attach is
   refused. A `credential` (systemd `LoadCredential=`) may also be `0440` when

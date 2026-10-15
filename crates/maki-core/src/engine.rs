@@ -25,10 +25,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock};
+use tokio::sync::{
+    Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock,
+};
 
 use maki_backing::Backing;
 use maki_crypto::checked::CheckedProvider;
@@ -333,6 +336,11 @@ struct EngineInner {
     /// operation, so [`Engine::state`] can report it without the volume
     /// lock: a journal that cannot be synced is a degraded volume.
     journal_uncertain: AtomicBool,
+    /// Set when a task panicked while it held the volume write lock
+    /// ([`VolumeWriteGuard`]). The async lock does not poison, and the panic
+    /// may have left the in-memory volume half updated: every later request
+    /// fails until the volume is attached again (BUG-125).
+    failure: OnceLock<String>,
     /// FLUSH and FUA latency (SPEC §40 `maki_flush_seconds`,
     /// `maki_fua_seconds`), measured on the engine clock.
     flush_latency: LatencyStats,
@@ -470,6 +478,40 @@ fn enospc(msg: impl Into<String>) -> CoreError {
 /// its append-footprint accounting must agree on this, so both go through here.
 fn record_len(ct: &CiphertextUnit) -> u64 {
     maki_format::journal::RECORD_HEADER_SIZE as u64 + ct.data.len() as u64
+}
+
+/// The volume write lock, held by a request, the checkpoint or the worker.
+/// The async lock does not poison, so a panic that unwinds through the guard's
+/// owner latches the engine failed before the lock is released: no later
+/// request may trust a volume the panic may have left half updated (BUG-125).
+/// Every mutation runs in a storage task that owns the guard, which is what
+/// makes `thread::panicking` observe it; keep it that way.
+struct VolumeWriteGuard {
+    volume: OwnedRwLockWriteGuard<Volume>,
+    inner: Arc<EngineInner>,
+}
+
+impl std::ops::Deref for VolumeWriteGuard {
+    type Target = Volume;
+
+    fn deref(&self) -> &Volume {
+        &self.volume
+    }
+}
+
+impl std::ops::DerefMut for VolumeWriteGuard {
+    fn deref_mut(&mut self) -> &mut Volume {
+        &mut self.volume
+    }
+}
+
+impl Drop for VolumeWriteGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.inner
+                .fail("a task panicked while it held the volume write lock");
+        }
+    }
 }
 
 /// Acquire storage/admission guards before dispatch, and move them into this
@@ -633,6 +675,7 @@ impl Engine {
             observed_free_space: parking_lot::Mutex::new(None),
             observed_volume: parking_lot::Mutex::new(observed_volume),
             journal_uncertain: AtomicBool::new(false),
+            failure: OnceLock::new(),
             flush_latency: LatencyStats::default(),
             fua_latency: LatencyStats::default(),
             active_requests: AtomicU64::new(0),
@@ -887,7 +930,7 @@ impl Engine {
         // entry is evicted — unless `verify_on_hit` is set, which reads and
         // CRC-checks the payload first and uses the cache only to skip the
         // provider call.
-        let volume = self.inner.volume.clone().read_owned().await;
+        let volume = self.inner.read_volume().await?;
         let inner = self.inner.clone();
         let io_admission = admission.clone();
         let (mut cached, cts, seqs) = storage_task(move || {
@@ -997,7 +1040,7 @@ impl Engine {
         // when it holds `(unit, sequence)`, exactly as on the read path
         // (R4-006, including `verify_on_hit`); the unit locks keep the
         // sequence stable meanwhile (R5-032).
-        let volume = self.inner.volume.clone().read_owned().await;
+        let volume = self.inner.read_volume().await?;
         let inner = self.inner.clone();
         let io_admission = admission.clone();
         let io_guards = guards.clone();
@@ -1187,7 +1230,7 @@ impl Engine {
             for round in 0..=MAX_RECLAIM_ROUNDS {
                 let reclaimed = round > 0;
                 let last_round = round == MAX_RECLAIM_ROUNDS;
-                let mut volume = engine.inner.volume.clone().write_owned().await;
+                let mut volume = engine.inner.write_volume().await?;
                 let io_engine = engine.clone();
                 let io_cts = cts.clone();
                 let io_admission = _admission.clone();
@@ -1465,7 +1508,7 @@ impl Engine {
 
     async fn flush_inner(&self) -> Result<(), CoreError> {
         self.check_freshness().await?;
-        let mut volume = self.inner.volume.clone().write_owned().await;
+        let mut volume = self.inner.write_volume().await?;
         let inner = self.inner.clone();
         storage_task(move || {
             let started = inner.clock.now();
@@ -1496,7 +1539,10 @@ impl Engine {
             started: self.inner.clock.now(),
             outcome: RequestOutcome::Cancelled,
         };
-        let result = operation.await;
+        let result = match self.inner.check_running() {
+            Ok(()) => operation.await,
+            Err(stopped) => Err(stopped),
+        };
         request.outcome = if result.is_ok() {
             RequestOutcome::Success
         } else {
@@ -1630,9 +1676,54 @@ impl EngineInner {
         *self.observed_volume.lock() = snapshot;
     }
 
-    /// The reported state: a checkpoint-degraded volume stays degraded; a
-    /// ready one is degraded while its journal cannot be synced.
+    /// Latch the engine failed (first reason wins); see [`Self::failure`].
+    fn fail(&self, reason: &str) {
+        if self.failure.set(reason.to_string()).is_ok() {
+            tracing::error!(
+                "engine stopped: {reason}; every request fails until the volume is attached \
+                 again and recovered from disk"
+            );
+        }
+    }
+
+    /// Refuse work once the engine has latched a failure.
+    fn check_running(&self) -> Result<(), CoreError> {
+        match self.failure.get() {
+            Some(reason) => Err(CoreError::Durability(format!(
+                "engine stopped: {reason}; attach the volume again to recover it from disk"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Take the volume write lock. The latch is checked after the lock is
+    /// held: a panicking holder latches before it releases the lock, so a
+    /// waiter queued behind it never sees the state it left.
+    async fn write_volume(self: &Arc<Self>) -> Result<VolumeWriteGuard, CoreError> {
+        let volume = self.volume.clone().write_owned().await;
+        self.check_running()?;
+        Ok(VolumeWriteGuard {
+            volume,
+            inner: self.clone(),
+        })
+    }
+
+    /// Take the volume read lock for a request (see [`Self::write_volume`]).
+    async fn read_volume(&self) -> Result<OwnedRwLockReadGuard<Volume>, CoreError> {
+        let volume = self.volume.clone().read_owned().await;
+        self.check_running()?;
+        Ok(volume)
+    }
+
+    /// The reported state: a stopped engine reports why; a checkpoint-degraded
+    /// volume stays degraded; a ready one is degraded while its journal cannot
+    /// be synced.
     fn effective_state(&self, state: EngineState) -> EngineState {
+        if let Some(reason) = self.failure.get() {
+            return EngineState::Degraded {
+                reason: format!("engine stopped: {reason}; attach the volume again"),
+            };
+        }
         match state {
             EngineState::Ready if self.journal_uncertain.load(Ordering::SeqCst) => {
                 EngineState::Degraded {
@@ -1653,12 +1744,12 @@ impl EngineInner {
         tokio::spawn(async move {
             let _checkpoint = inner.checkpoint_gate.lock().await;
             let completed = async {
-                let mut volume = inner.volume.clone().write_owned().await;
+                let mut volume = inner.write_volume().await?;
                 let prepared = storage_task(move || volume.prepare_checkpoint()).await??;
                 storage_task(move || prepared.execute()).await?
             }
             .await;
-            let mut volume = inner.volume.clone().write_owned().await;
+            let mut volume = inner.write_volume().await?;
             let publishing = inner.clone();
             storage_task(move || {
                 let checkpoint_before = volume.checkpoint_sequence();
@@ -1767,7 +1858,9 @@ impl EngineInner {
         // the elapsed interval, the overlay bound or a refused write, sync
         // first so the pass actually shrinks what it was woken for.
         if (by_time || by_overlay || by_refusal) && durable < appended {
-            let mut volume = self.volume.clone().write_owned().await;
+            let Ok(mut volume) = self.write_volume().await else {
+                return;
+            };
             if self.checkpoint_stop.load(Ordering::SeqCst) {
                 return;
             }
@@ -1832,7 +1925,8 @@ fn spawn_checkpoint_worker(
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if inner.checkpoint_stop.load(Ordering::SeqCst) {
+            // A stopped engine has nothing safe to checkpoint (BUG-125).
+            if inner.checkpoint_stop.load(Ordering::SeqCst) || inner.failure.get().is_some() {
                 return;
             }
             inner.worker_pass().await;
