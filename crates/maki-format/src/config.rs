@@ -313,6 +313,10 @@ pub struct HttpSection {
     pub max_response_bytes: Option<ByteSize>,
 }
 
+/// Default HTTP response-body cap when `[crypto.http].max_response_bytes`
+/// is unset. Validation and the HTTP provider use the same value.
+pub const DEFAULT_HTTP_MAX_RESPONSE_BYTES: u64 = 8 << 20;
+
 /// Default WebSocket frame-size cap when `[crypto.websocket].max_frame_bytes`
 /// is unset. Must match the daemon's transport wiring; validation and the
 /// runtime use the same value so a config that validates also runs.
@@ -433,6 +437,20 @@ pub struct BodyConfig {
     /// Per-item fields within `items_path` elements.
     #[serde(default)]
     pub item_fields: BTreeMap<String, FieldMapping>,
+}
+
+impl BodyConfig {
+    /// One request carries several items: a JSON body with `items_path`.
+    /// A raw body, or a JSON body without `items_path`, sends one request
+    /// per item (and never sends `item_fields`).
+    pub fn is_batch(&self) -> bool {
+        self.body_type == "json" && self.items_path.is_some()
+    }
+}
+
+/// Length of `n` bytes once base64-encoded with padding.
+fn base64_len(n: u64) -> u64 {
+    n.div_ceil(3).saturating_mul(4)
 }
 
 fn d_json() -> String {
@@ -825,9 +843,9 @@ impl VolumeConfig {
     /// Otherwise `[crypto.batch] max_items`.
     pub fn effective_batch_max_items(&self) -> u32 {
         let per_item = |op: &Option<HttpOpConfig>| {
-            op.as_ref()
+            !op.as_ref()
                 .and_then(|op| op.body.as_ref())
-                .is_none_or(|body| body.items_path.is_none())
+                .is_some_and(BodyConfig::is_batch)
         };
         match &self.crypto.http {
             Some(http)
@@ -930,6 +948,21 @@ impl VolumeConfig {
                     self.volume.crypto_unit_size, self.crypto.random_prefix_bytes
                 ))
             })
+    }
+
+    /// The largest crypto payload one batch puts on the wire: plaintext on
+    /// encrypt requests and decrypt responses, ciphertext (with the
+    /// provider's declared maximum overhead) on encrypt responses and
+    /// decrypt requests. `crypto.batch.max_bytes` counts plaintext and is
+    /// kept as the plaintext bound even when `max_items` is smaller.
+    fn max_batch_wire_bytes(&self) -> Result<u64, ConfigError> {
+        let batch = &self.crypto.batch;
+        let unit = u64::from(self.provider_plaintext_size()?).max(1);
+        let units = u64::from(batch.max_items).min(batch.max_bytes.0 / unit);
+        let ciphertext = units
+            .checked_mul(u64::from(self.crypto.capabilities.max_ciphertext_size))
+            .ok_or_else(|| invalid("maximum ciphertext batch size overflows u64"))?;
+        Ok(batch.max_bytes.0.max(ciphertext))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1460,11 +1493,7 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
             validate_credential(c)?;
         }
     }
-    let body_is_batch = op
-        .body
-        .as_ref()
-        .map(|b| b.body_type == "json" && b.items_path.is_some())
-        .unwrap_or(false);
+    let body_is_batch = op.body.as_ref().is_some_and(BodyConfig::is_batch);
     if let Some(body) = &op.body {
         if !["json", "raw"].contains(&body.body_type.as_str()) {
             return Err(invalid(format!(
@@ -1918,10 +1947,19 @@ impl VolumeConfig {
                 // (R3-006). WebSocket and gRPC always send all three.
                 if crypto.capabilities.context_binding != "none" {
                     for (name, op) in [("encrypt", encrypt), ("decrypt", decrypt)] {
+                        // Only mappings that reach the wire count: a raw body
+                        // sends the payload alone, and item_fields are sent
+                        // only inside a batch (BUG-093).
                         let sources: Vec<&str> = op
                             .body
                             .iter()
-                            .flat_map(|b| b.fields.values().chain(b.item_fields.values()))
+                            .filter(|b| b.body_type == "json")
+                            .flat_map(|b| {
+                                let items = b.is_batch().then_some(&b.item_fields);
+                                b.fields
+                                    .values()
+                                    .chain(items.into_iter().flatten().map(|(_, m)| m))
+                            })
                             .map(|m| m.source.as_str())
                             .collect();
                         for required in ["volume_id", "compatibility_id", "format_version"] {
@@ -1949,6 +1987,26 @@ impl VolumeConfig {
                         return Err(invalid("[crypto.http] max_response_bytes must be positive"));
                     }
                 }
+                // A batched mapping receives the whole batch in one response
+                // body, at least base64-encoded (BUG-092).
+                if [encrypt, decrypt]
+                    .iter()
+                    .any(|op| op.body.as_ref().is_some_and(BodyConfig::is_batch))
+                {
+                    let limit = http
+                        .max_response_bytes
+                        .map(|b| b.0)
+                        .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES);
+                    let encoded = base64_len(self.max_batch_wire_bytes()?);
+                    if encoded > limit {
+                        return Err(invalid(format!(
+                            "[crypto.http] max_response_bytes {limit} cannot carry a full crypto \
+                             batch (~{encoded} bytes once base64-encoded); lower \
+                             crypto.batch.max_items or crypto.batch.max_bytes, or raise \
+                             max_response_bytes"
+                        )));
+                    }
+                }
             }
             "remote-websocket" => {
                 if crypto.key.is_some() {
@@ -1963,6 +2021,9 @@ impl VolumeConfig {
                     validate_tls("websocket", tls)?;
                 }
                 validate_endpoints("websocket", &ws.endpoint, "ws", "wss", ws.tls.is_some())?;
+                if ws.timeout.is_some_and(|t| t.0.is_zero()) {
+                    return Err(invalid("[crypto.websocket] timeout must be positive"));
+                }
                 let frame = ws
                     .max_frame_bytes
                     .map(|b| b.0)
@@ -1976,15 +2037,17 @@ impl VolumeConfig {
                 // (~4/3 the raw bytes). If a maximal batch's base64 payload
                 // alone cannot fit the frame, every large batch fails at
                 // runtime with a non-retryable frame-limit error on a volume
-                // that validated cleanly. This is a necessary bound; leave
-                // headroom above it for the surrounding JSON structure.
-                let encoded = self.crypto.batch.max_bytes.0.div_ceil(3).saturating_mul(4);
+                // that validated cleanly. Encrypt responses and decrypt
+                // requests carry ciphertext, larger than the plaintext batch
+                // (BUG-092). This is a necessary bound; leave headroom above
+                // it for the surrounding JSON structure.
+                let encoded = base64_len(self.max_batch_wire_bytes()?);
                 if encoded > frame {
                     return Err(invalid(format!(
-                        "[crypto.websocket] max_frame_bytes {frame} cannot carry a \
-                         crypto.batch.max_bytes {} batch (~{encoded} bytes once base64-encoded); \
-                         lower crypto.batch.max_bytes or raise max_frame_bytes",
-                        self.crypto.batch.max_bytes.0
+                        "[crypto.websocket] max_frame_bytes {frame} cannot carry a full \
+                         crypto batch (~{encoded} bytes once base64-encoded); lower \
+                         crypto.batch.max_items or crypto.batch.max_bytes, or raise \
+                         max_frame_bytes"
                     )));
                 }
             }
@@ -2002,6 +2065,9 @@ impl VolumeConfig {
                     validate_tls("grpc", tls)?;
                 }
                 validate_endpoints("grpc", &grpc.endpoint, "http", "https", grpc.tls.is_some())?;
+                if grpc.timeout.is_some_and(|t| t.0.is_zero()) {
+                    return Err(invalid("[crypto.grpc] timeout must be positive"));
+                }
                 for (name, value) in &grpc.metadata {
                     if name.trim().is_empty() {
                         return Err(invalid("[crypto.grpc.metadata] empty key"));
@@ -2017,17 +2083,18 @@ impl VolumeConfig {
                 if message == 0 {
                     return Err(invalid("[crypto.grpc] max_message_bytes must be positive"));
                 }
-                // A whole batch is one gRPC message. If crypto.batch.max_bytes
-                // exceeds the message limit, every large batch is rejected at
-                // the transport (non-retryable) on a volume that validated
-                // cleanly. Necessary bound; leave headroom for protobuf
-                // framing (~16 bytes per item plus a fixed prefix).
-                if self.crypto.batch.max_bytes.0 > message {
+                // A whole batch is one gRPC message. If a full batch exceeds
+                // the message limit, every large batch is rejected at the
+                // transport (non-retryable) on a volume that validated
+                // cleanly. Encrypt responses and decrypt requests carry
+                // ciphertext (BUG-092). Necessary bound; leave headroom for
+                // protobuf framing (~16 bytes per item plus a fixed prefix).
+                let wire = self.max_batch_wire_bytes()?;
+                if wire > message {
                     return Err(invalid(format!(
-                        "[crypto.grpc] max_message_bytes {message} cannot carry a \
-                         crypto.batch.max_bytes {} batch; lower crypto.batch.max_bytes or raise \
-                         max_message_bytes",
-                        self.crypto.batch.max_bytes.0
+                        "[crypto.grpc] max_message_bytes {message} cannot carry a full \
+                         crypto batch ({wire} bytes); lower crypto.batch.max_items or \
+                         crypto.batch.max_bytes, or raise max_message_bytes"
                     )));
                 }
             }

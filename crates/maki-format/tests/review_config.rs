@@ -650,3 +650,136 @@ fn control_and_nbd_sockets_must_differ() {
     .unwrap();
     parse(&local()).validate().unwrap();
 }
+
+// ---------- transport limits carry ciphertext (BUG-092) ----------
+
+/// The default 128-item batch of 4096-byte units is 512 KiB of plaintext but
+/// 128 x 4384 = 561,152 bytes of ciphertext, and the ciphertext is what an
+/// encrypt response and a decrypt request carry. A limit sized for the
+/// plaintext validated cleanly and then refused every full batch at runtime.
+fn remote_batch(provider: &str, section: &str) -> String {
+    let endpoint = if provider == "remote-websocket" {
+        "[[crypto.websocket.endpoint]]\nname = \"a\"\nurl = \"ws://127.0.0.1:7000\""
+    } else {
+        "[[crypto.grpc.endpoint]]\nname = \"a\"\nurl = \"http://localhost:7000\""
+    };
+    format!(
+        r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "{provider}"
+crypto_compatibility_id = "v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[crypto.batch]
+max_bytes = "512KiB"
+{section}
+{endpoint}
+[backing]
+root = "/x"
+"#
+    )
+}
+
+#[test]
+fn remote_transport_limits_carry_a_full_ciphertext_batch() {
+    // gRPC sends raw bytes: 520 KiB holds the plaintext batch, not the
+    // 561,152-byte ciphertext batch (exactly 548 KiB).
+    let grpc = |limit: &str| {
+        remote_batch(
+            "remote-grpc",
+            &format!("[crypto.grpc]\nmax_message_bytes = \"{limit}\""),
+        )
+    };
+    assert!(err(&grpc("520KiB")).contains("max_message_bytes"));
+    ok(&grpc("548KiB"));
+
+    // WebSocket sends base64: 700 KiB holds the encoded plaintext batch
+    // (699,052 bytes) but not the encoded ciphertext batch (748,204 bytes).
+    let ws = |limit: &str| {
+        remote_batch(
+            "remote-websocket",
+            &format!("[crypto.websocket]\nmax_frame_bytes = \"{limit}\""),
+        )
+    };
+    assert!(err(&ws("700KiB")).contains("max_frame_bytes"));
+    ok(&ws("731KiB"));
+}
+
+/// A batched HTTP mapping receives the whole batch in one response body,
+/// base64 or hex encoded: `max_response_bytes` must at least hold the
+/// base64 form of a full ciphertext batch.
+#[test]
+fn batched_http_response_limit_carries_a_full_ciphertext_batch() {
+    let http = |limit: &str| {
+        let mut ops = String::new();
+        for op in ["encrypt", "decrypt"] {
+            ops += &format!(
+                r#"[crypto.http.{op}]
+path = "/{op}"
+[crypto.http.{op}.body]
+items_path = "/items"
+[crypto.http.{op}.body.item_fields]
+"/data" = {{ source = "payload", encoding = "base64" }}
+"/unit" = {{ source = "unit_index" }}
+[crypto.http.{op}.response]
+items_path = "/items"
+item_index_path = "/unit"
+data_path = "/data"
+encoding = "base64"
+"#
+            );
+        }
+        format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "t"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-http"
+crypto_compatibility_id = "v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[crypto.batch]
+max_bytes = "512KiB"
+[crypto.http]
+max_response_bytes = "{limit}"
+[[crypto.http.endpoint]]
+name = "a"
+url = "https://crypto.internal"
+{ops}[backing]
+root = "/x"
+"#
+        )
+    };
+    assert!(err(&http("700KiB")).contains("max_response_bytes"));
+    ok(&http("731KiB"));
+}
+
+/// HTTP refuses a zero timeout; WebSocket and gRPC accepted `"0s"`, which
+/// makes every connect or RPC expire at once and reports each endpoint as
+/// unreachable at attach.
+#[test]
+fn websocket_and_grpc_timeouts_must_be_positive() {
+    for (provider, section) in [
+        ("remote-websocket", "[crypto.websocket]"),
+        ("remote-grpc", "[crypto.grpc]"),
+    ] {
+        let zero = remote_batch(provider, &format!("{section}\ntimeout = \"0s\""));
+        let e = err(&zero);
+        assert!(
+            e.contains("timeout") && e.contains(section),
+            "{provider}: {e}"
+        );
+        ok(&remote_batch(
+            provider,
+            &format!("{section}\ntimeout = \"1s\""),
+        ));
+    }
+}
