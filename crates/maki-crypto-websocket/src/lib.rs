@@ -212,7 +212,13 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
 
 impl WsCryptoProvider {
     pub fn new(spec: WsProviderSpec) -> Self {
-        let tls_connector = Self::build_tls_connector(&spec);
+        // Preserve deferred default-root loading: a WSS connection without
+        // explicit TLS options reloads native roots on every new connection.
+        let tls_connector = if spec.tls.is_some() {
+            Self::build_tls_connector(&spec)
+        } else {
+            Ok(None)
+        };
         Self {
             spec,
             tls_connector,
@@ -226,7 +232,11 @@ impl WsCryptoProvider {
 
     /// Construct a provider after validating its TLS configuration.
     pub fn new_checked(spec: WsProviderSpec) -> Result<Self, CryptoError> {
-        let tls_connector = Self::build_tls_connector(&spec).map_err(CryptoError::ProviderFatal)?;
+        let tls_connector = if spec.tls.is_some() {
+            Self::build_tls_connector(&spec).map_err(CryptoError::ProviderFatal)?
+        } else {
+            None
+        };
         Ok(Self {
             spec,
             tls_connector: Ok(tls_connector),
@@ -249,11 +259,11 @@ impl WsCryptoProvider {
         if !is_wss {
             return Ok(None);
         }
-        let Some(tls) = &spec.tls else {
-            // tokio-tungstenite builds its verified rustls connector from the
-            // enabled system and public root sets.
-            return Ok(None);
-        };
+        // Always supply our own WSS connector, including the default-root
+        // case. Without a process default, the dependency's fallback infers
+        // a provider from crate features and panics if both backends exist.
+        let default_tls = WsTlsOptions::default();
+        let tls = spec.tls.as_ref().unwrap_or(&default_tls);
         if tls.client_cert_pem.is_some() != tls.client_key_pem.is_some() {
             return Err("client certificate and private key must be configured together".into());
         }
@@ -275,7 +285,15 @@ impl WsCryptoProvider {
             }
         }
 
-        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        // Preserve an embedder's explicit choice; otherwise use the same ring
+        // backend selected by this crate without installing process state.
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|error| format!("bad TLS protocol configuration: {error}"))?
+            .with_root_certificates(roots);
         let config = match (&tls.client_cert_pem, &tls.client_key_pem) {
             (Some(cert_pem), Some(key_pem)) => {
                 let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
@@ -321,11 +339,16 @@ impl WsCryptoProvider {
     }
 
     async fn connect(&self) -> Result<Connection, CryptoError> {
-        let connector = self
+        let connector = match self
             .tls_connector
             .as_ref()
             .map_err(|message| CryptoError::ProviderFatal(message.clone()))?
-            .clone();
+        {
+            Some(connector) => Some(connector.clone()),
+            // Build an explicit WSS connector for every default-root connect,
+            // retaining native-root reloads without the implicit TLS provider.
+            None => Self::build_tls_connector(&self.spec).map_err(CryptoError::ProviderFatal)?,
+        };
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
