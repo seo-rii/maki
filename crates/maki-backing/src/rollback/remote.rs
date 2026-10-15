@@ -35,6 +35,26 @@ impl Witness {
             }
         }
     }
+    /// Whether a failed freshness check stops the session. A local witness
+    /// stops on any failure. A remote Inspect changes nothing, so a witness
+    /// that could not be asked (timeout, refused or reset connection, an
+    /// unavailable quorum) only refuses this operation; the next check
+    /// either matches again or observes the change (BUG-103). A mismatch,
+    /// an invalid or denied answer stops the session for good. The kinds
+    /// match the ones the failover client treats as final.
+    pub(super) fn stops_session(&self, error: &io::Error) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(_) => matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::NotFound
+            ),
+        }
+    }
     pub(super) fn advance(&mut self, root: [u8; 32]) -> io::Result<()> {
         match self {
             Self::Local(witness) => witness.advance(root),

@@ -29,6 +29,10 @@ Replacing an old valid ciphertext page fails authentication against the current
 manifest. Restoring an older complete backing fails comparison with the current
 witness. Missing or corrupt committed evidence refuses attachment; an observed
 witness mismatch or uncertain storage commit stops every handle in that session.
+A remote witness that cannot be reached (a timeout, a refused or reset
+connection, an unavailable quorum) refuses each operation with no fallback, but
+does not stop the session: the next check either matches the claimed record
+again or observes the change and stops it.
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.

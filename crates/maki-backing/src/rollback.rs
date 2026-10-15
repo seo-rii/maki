@@ -491,7 +491,9 @@ impl State {
             ));
         }
         if let Err(error) = self.witness.verify_current() {
-            self.poisoned = true;
+            if self.witness.stops_session(&error) {
+                self.poisoned = true;
+            }
             return Err(error);
         }
         Ok(())
