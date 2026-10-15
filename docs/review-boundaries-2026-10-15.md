@@ -1,7 +1,8 @@
 # Boundary review follow-up — 2026-10-15
 
-This is a map of proposed changes and evidence, not a release approval.
-The observed remote `main` is `0cc3539c9af9671099e5c7d2cdf19cbc99977d58`.
+This is a map of reviewed changes and evidence, not a release approval.
+At the start of this review, remote `main` was
+`0cc3539c9af9671099e5c7d2cdf19cbc99977d58`.
 Local `main` at `b268798` contains five additional commits; neither the local
 branch nor an open PR establishes that the changes are merged remotely.
 
@@ -19,7 +20,7 @@ combination passes qualification. Keep those states separate below.
 | R-04 | [#44](https://github.com/seo-rii/maki/pull/44), after #43 | `review_checkpoint_concurrency`: 128 cancelled gate waiters, active publication survives cancellation; 7 passed | `55a62b9` | Direct Engine API scope, separate from control-socket serialization |
 | R-05 | [#45](https://github.com/seo-rii/maki/pull/45) | `maki-cache` suite: 10,000 empty keys, version ordering, randomized model | `d70f8e8` | Payload budget bounds positive-size entry count, not total allocator overhead |
 | R-06 | [#58](https://github.com/seo-rii/maki/pull/58) | Benchmark oracle rejects the previous plaintext generation returned through a real Engine; hot-address ordering, failed writes, bounded oracle preflight; 17 tests and strict Clippy passed | `21a86c4` | Benchmark oracle is not storage durability qualification |
-| R-07 | [#54](https://github.com/seo-rii/maki/pull/54) | `remote::load_tests`: open/read/length failures, missing/corrupt peer, valid fallback, arena I/O; 4 passed | `564c702` | Independent of transient witness freshness handling in #15 |
+| R-07 | [#54](https://github.com/seo-rii/maki/pull/54), completed at the public pre-claim boundary by [#69](https://github.com/seo-rii/maki/pull/69) | Loader faults (4) and public remote rollback suite (17) passed; attach/takeover retain I/O kind and errno, preserve authority and allow retry after storage repair | `564c702`, `f75ec5e` | Independent of transient witness freshness handling in #15 |
 | R-08 | [#60](https://github.com/seo-rii/maki/pull/60), after #59 | Docs matched to native chunked writes/zeroes and rejection rules; #59 native/limit 7 tests plus ABI and strict Clippy passed | `51c9fe4` | Advisory NBD maximum and per-engine-call maximum are different |
 | R-09 | [#46](https://github.com/seo-rii/maki/pull/46), after #45 | Returned Arc survives lazy TTL eviction; final owner releases buffer | `bf2d72a` | TTL/eviction is not an immediate plaintext-erasure deadline |
 
@@ -98,7 +99,7 @@ log shows timeouts in
 `same_writer_certificate_cannot_reuse_its_old_key_after_admin_enrollment_recovery`
 and `state_rpc_enforces_authenticated_roles_and_preserves_cas_conflicts`.
 [#37](https://github.com/seo-rii/maki/pull/37) adjusts witness fixture deadlines;
-only a new Windows run can establish the current result.
+both Windows jobs passed in the integration run described below.
 
 The first local combination (`9899175`, PRs #1–#55) ran
 `cargo test --workspace --locked --no-fail-fast` and exited 101. Two remote
@@ -166,10 +167,67 @@ the later code changes concern TLS backend selection, dependency updates and
 test fixtures. This local evidence does not substitute for a fresh full
 workspace/release/native/etcd run on the final integration revision.
 
-The integration branch combines existing and follow-up PR heads for validation
-without changing remote main. Full combined CI results are pending. The
-integration PR will link the exact revision and run; do not replace this with
-an aggregate count of tests from different branches.
+The first remote integration run [38718662162](https://github.com/seo-rii/maki/actions/runs/38718662162)
+tested candidate `d24960e187822087bc067ef6e78e4736c3a60135` at GitHub merge
+checkout `c5b3b680acc4abb3337f212e107c6047c6e18a9f`. Both Windows jobs,
+latest-stable Ubuntu, release/native gates and real etcd qualification passed.
+Baseline Ubuntu also passed audit, Clippy and workspace tests, then failed the
+Python dependency-feature contract: gRPC's paused-clock tests lacked a direct
+dev-only Tokio `test-util` declaration. Commit `ebda86e` supplies that feature;
+all three connection tests, the complete 74-test validation-script discovery,
+36 package/release/documentation tests, fmt and diff checks passed locally.
+The original integration run remains a failed run.
+
+Merge review found that the public attach/takeover wrapper still converted
+loader I/O errors to `InvalidData`. [#69](https://github.com/seo-rii/maki/pull/69)
+keeps the root/witness mismatch context only for corruption. Both new public
+regressions failed before the fix and passed afterward; authority and a live
+writer remain unchanged on an actual storage error, and retry succeeds after
+repair. All 17 remote rollback tests, four loader fault tests and strict
+Clippy passed.
+
+The workflow follow-up `00558d6` restricts branch-name opt-in to PRs from this
+repository. A fork named `review/integration-*` cannot opt into release/etcd
+jobs through that condition. Scheduled and manually dispatched qualification
+remain enabled; event/repository/branch cases cover both jobs.
+
+[#70](https://github.com/seo-rii/maki/pull/70), commit `d67152f`, treats a
+completed nonretryable or throttled gRPC response as an established connection.
+Otherwise the first error response left the initial handshake grace period in
+force and delayed retirement after a subsequent blackhole. The live regression
+covers success, InvalidArgument and ResourceExhausted followed by timeout or
+cancellation; it failed before the fix. Twelve integration tests, three
+connection tests and strict Clippy passed.
+
+[#71](https://github.com/seo-rii/maki/pull/71) aligns configuration diagnostics,
+all published shutdown recipes and the witness eviction/lifetime contract with
+the integrated behavior. Routine target stop keeps admission open for unmount;
+explicit drain acknowledgement follows unmount while the daemon remains alive.
+The key-rotation procedure also accounts for systemd stop propagation. Sixteen
+documentation contract/link tests and the complete link check passed. This is
+procedure consistency, not new dirty-XFS qualification evidence.
+
+The automatic review's suspected unbuffered TLS KeyUpdate ordering failure on
+#63 was not reproduced. Existing `check_required_size` includes queued TLS
+records and `write_fragments` copies them before encrypting application data.
+[#72](https://github.com/seo-rii/maki/pull/72), commit `4a3712d`, adds real-peer
+low-record-limit regressions for direct output and exact-size retry after an
+insufficient buffer. Both ring and AWS-LC library suites passed (265 and 266
+tests); vendor provenance and contract checks passed. Production encryption
+and output logic are unchanged.
+
+[#73](https://github.com/seo-rii/maki/pull/73), commit `e242d85`, starts the
+WebSocket connection deadline before TLS/root preparation. An exhausted budget
+does not open a socket; otherwise network setup uses the remaining time.
+Both deadline regressions failed before the fix; all 80 WebSocket tests,
+dependency-feature checks and strict Clippy passed. Native-root discovery
+remains synchronous and cannot be preempted by this deadline.
+
+[#68](https://github.com/seo-rii/maki/pull/68) combines the reviewed PR heads
+while preserving each change's commits. Its description records the final
+candidate, complete CI run and eventual merge revision. Use that exact result
+instead of adding test counts from different branches. The integration run
+above predates the final review follow-ups and does not qualify them.
 
 Dependency examples retained: #26 → #16; #27 → #22; #35 → #9; #43 → #18;
 #44 → #43; #49 → #44; #52 → #26; #53 → #52; #50 → #28; #46 → #45;
