@@ -1998,7 +1998,10 @@ TLS configurations MUST fail closed.
 # 52. Cache and Operational Verification
 
 The read cache MUST be tested for write-sequence matching, stale-read prevention,
-TTL, LRU and byte bounds, runtime resizing, metrics, and zeroization on eviction.
+TTL, LRU and byte bounds, runtime resizing, metrics, and zeroization on final
+buffer-owner drop. TTL is checked lazily on lookup. Eviction releases the
+cache owner; an outstanding `Arc<SecretBuffer>` may outlive TTL and eviction.
+Empty payloads are not cached, so payload accounting also bounds entry count.
 Growth tests cover lazy shard creation during workload and crash recovery at
 catalog boundaries. Mount validation rejects every identity or readiness
 mismatch independently.

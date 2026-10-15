@@ -155,7 +155,8 @@ fn hit_and_miss_counters() {
 // ---------- zeroization ----------
 
 /// Evicted plaintext is dropped through SecretBuffer (zeroize-on-drop);
-/// the cache never hands back or retains a buffer after eviction.
+/// the cache no longer returns or retains that entry after eviction.
+/// Previously returned Arc owners may retain it until their own drop.
 #[test]
 fn eviction_drops_buffers() {
     let (cache, clock) = cache(1024, Duration::from_secs(5));
@@ -214,5 +215,28 @@ fn empty_entries_cannot_grow_metadata_without_payload() {
         cache.stats().entries,
         0,
         "new empty version invalidates old plaintext"
+    );
+}
+
+#[test]
+fn ttl_and_eviction_release_only_the_cache_owner() {
+    let (cache, clock) = cache(16, Duration::from_secs(1));
+    cache.put(1, 1, buf(0x42, 16));
+    let retained = cache.get(1, 1).unwrap();
+    let weak = Arc::downgrade(&retained);
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(
+        cache.stats().entries,
+        1,
+        "TTL does not run an eager deletion timer"
+    );
+    assert!(cache.get(1, 1).is_none());
+    assert_eq!(cache.stats().entries, 0);
+    assert_eq!(retained.expose(), &[0x42; 16]);
+    assert!(weak.upgrade().is_some(), "caller still owns the buffer");
+    drop(retained);
+    assert!(
+        weak.upgrade().is_none(),
+        "final owner drop releases SecretBuffer"
     );
 }
