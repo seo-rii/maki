@@ -78,14 +78,14 @@ nbdkit `VmHWM` was 11,415,552 bytes. Both 48 MiB cgroups touched their cap; both
 64 MiB runs stayed below it without max events. This qualifies that fixed
 profile and does not define a universal deployment minimum.
 
-The scheduled job runs:
-
 Linux PR, push, and scheduled CI installs the pinned `cargo-audit 0.22.1` and
 runs `cargo audit --deny warnings`. A known vulnerability, unmaintained or
 unsound advisory, or yanked crate therefore fails the job against the fetched
 RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
 from affected 0.23.43 to 0.23.45 after `RUSTSEC-2026-0285`; the focused HTTP/TLS
 package suite and a fresh warning-denying audit passed locally.
+
+The scheduled job runs:
 
 | Test identifier | Workload |
 |---|---|
@@ -101,9 +101,25 @@ package suite and a fresh warning-denying audit passed locally.
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
 | `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on `/dev/shm`) |
 
-The job runs `cargo test --workspace --release --locked -- --ignored` without
-a name filter, so every ignored test runs, including any new gate; the
-`maki-privileged` subprocess fixture is a no-op there.
+The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
+without a name filter, so every ignored test runs, including any new gate; the
+`maki-privileged` subprocess fixture is a no-op there. `--no-fail-fast` keeps
+one failing gate binary from hiding the result of every binary after it.
+
+Gates that need operator-provided infrastructure refuse to skip, so they are
+compiled only with an opt-in feature and are not part of the scheduled run:
+
+| Feature | Gate | Requires |
+|---|---|---|
+| `maki-nbdkit/cgroup-qualification` | `memory_budget.rs` `delegated_cgroup_oom_enforces_memory_max` | `MAKI_MEMORY_TEST_CGROUP`, a disposable delegated cgroup v2 ([performance](performance.md)) |
+| `maki-witness/etcd-qualification` | `etcd_ha.rs` `real_three_member_quorum_cas_leader_failover_and_majority_loss` | `MAKI_ETCD_BIN` (verified etcd v3.6 with `etcdctl` beside it) and `MAKI_WITNESS_BIN` (built `maki-witness`) |
+
+```bash
+cargo build --release --locked -p maki-witness-cli
+MAKI_ETCD_BIN=/opt/etcd-v3.6/etcd MAKI_WITNESS_BIN=$PWD/target/release/maki-witness \
+  cargo test --release --locked -p maki-witness --features etcd-qualification \
+  --test etcd_ha -- --ignored --nocapture
+```
 
 It also builds the Linux cdylib, verifies the global `plugin_init` symbol,
 installs `nbdkit-plugin-dev` and runs `review_abi.rs`, which compiles a C probe

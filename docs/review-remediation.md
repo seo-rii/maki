@@ -1465,3 +1465,24 @@ controls. Strict Clippy passes for the affected packages on Rust 1.94.0.
 
 Repeated witness observations remain a measured optimization candidate
 (PERF-003). These fixes preserve the existing authority freshness checks.
+
+## Functional follow-up: attach retries and ready endpoint admission
+
+The four findings below were reproduced against `0cc3539`. Each correction has
+permanent test-first regressions and preserves the on-disk formats.
+
+| Finding | Correction | Permanent regression |
+|---|---|---|
+| BUG-085, readable but unsynced key canary | Verify the existing key binding, then restore both canary copies and their directory entries before attach succeeds. Reject a wrong key before publication. | maki-core `review_canary_retry.rs`: first publication and retry sync failures, process restart followed by power loss, FUA readback, wrong-key refusal and authenticated fallback |
+| BUG-086, unsent request waiting for endpoint readiness | Keep the caller's admission position while eligible peers are OPEN or probe-saturated. Wake on cooldown or capacity return without consuming a retry pass before the first RPC. Keep a peer eligible if a concurrent caller takes its probe slot before dispatch. | maki-crypto `review_endpoint_readiness.rs`: OPEN cooldown, successful/cancelled probe, waiting caller cancellation, deadline and actual failed-RPC retry control |
+| BUG-087, duplicate HTTP media type | Add the JSON default only when no explicit Content-Type header is configured, ignoring header-name case. | maki-crypto-http `review_content_type.rs`: actual loopback HTTP, standard/vendor media types, single/batch encrypt/decrypt and raw/default controls |
+| BUG-088, occupied automatic NBD choice | Choose the lowest unused device after checking connection state, root/partition holders and direct mounts. Keep the final executor recheck and refuse incomplete observations. | maki-privileged `allocation_tests.rs`: synthetic sysfs/mountinfo, occupied lower devices, numeric order, missing/malformed/bounded observations and existing explicit-device refusal controls |
+
+There are 32 new permanent regression functions. Test-first runs produced 19
+expected-behavior failures and 10 passing controls before implementation.
+Focused suites pass for canary attach, crypto, HTTP and privileged operations,
+including strict Clippy for the changed packages. Complete workspace checks,
+ignored release gates and exact-revision Linux/Windows CI are recorded
+separately. The canary tests use the executable crash model, and NBD allocation
+tests use observation fixtures; neither constitutes physical power-loss or
+kernel NBD/LVM campaign qualification.

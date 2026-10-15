@@ -175,6 +175,12 @@ provider type under the same compatibility identity refuses attach with
 only wrong-key detection for `local-aes-xts`, which otherwise decrypts to
 garbage without an error.
 
+After verifying an existing canary, attach rewrites and syncs both copies and
+the backing directory before accepting I/O. A readable copy may have survived
+only in the page cache after an earlier sync failure. This adds metadata I/O
+on attach; a failed sync refuses attach and can be retried after correcting
+the backing error. A wrong key is rejected before either copy is rewritten.
+
 Consequences for operations:
 
 - Attach a new volume once with the intended production key before handing it
@@ -428,7 +434,11 @@ Execution (Linux, root) then:
 
 1. opens `/run/maki-attach` through verified root-owned directory descriptors,
    takes its private `attach.lock`, and, unless a device is pinned, allocates
-   the lowest free `/dev/nbdN` from sysfs;
+   the lowest unused `/dev/nbdN` from sysfs. Automatic selection skips connected
+   devices and devices whose root or partitions have holders or direct mounts
+   in the helper's mount namespace. Unreadable or inconsistent observations
+   refuse allocation; the helper checks the selected device again before
+   connecting it;
 2. records the requested attachment and a random connection identifier before
    connecting NBD, then connects with the configured block size, waits until
    the device reports a size, and verifies its kernel backend identifier;

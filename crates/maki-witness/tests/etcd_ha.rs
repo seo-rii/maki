@@ -19,7 +19,7 @@ fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "etcd-qualification"))]
 fn inspect() -> Request {
     Request {
         authorization: None,
@@ -32,7 +32,7 @@ fn inspect() -> Request {
 struct Credentials {
     _dir: tempfile::TempDir,
     client: TlsFiles,
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "etcd-qualification"))]
     server_files: TlsFiles,
     server: Arc<rustls::ServerConfig>,
 }
@@ -60,7 +60,7 @@ impl Credentials {
         let server = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let client = rcgen::generate_simple_self_signed(vec!["witness-backend".into()]).unwrap();
         let client_files = write_identity(dir.path(), "client", &client, &server.cert.pem());
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "etcd-qualification"))]
         let server_files = write_identity(dir.path(), "server", &server, &client.cert.pem());
         let mut roots = rustls::RootCertStore::empty();
         roots.add(client.cert.der().clone()).unwrap();
@@ -85,7 +85,7 @@ impl Credentials {
         Self {
             _dir: dir,
             client: client_files,
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "etcd-qualification"))]
             server_files,
             server: Arc::new(config),
         }
@@ -485,7 +485,7 @@ fn json_response_body_limit_is_enforced_before_large_body_allocation() {
     assert_eq!(requests.into_iter().count(), 1);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "etcd-qualification"))]
 mod quorum {
     use super::*;
     use maki_backing::remote_witness::{namespace, Descriptor, Phase};
