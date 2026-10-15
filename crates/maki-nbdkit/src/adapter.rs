@@ -1,10 +1,11 @@
 //! Blocking NBD adapter over the async engine (SPEC §48).
 //!
-//! - Every entry point catches panics: nothing ever unwinds across the FFI
-//!   boundary; a panic maps to EIO and the adapter stays usable.
+//! - Engine calls run behind a panic boundary that maps a panic to EIO; the
+//!   plugin's callbacks add one around everything else, so nothing ever
+//!   unwinds across the FFI boundary.
 //! - Capability surface per SPEC §48: FLUSH + FUA supported; TRIM enabled
-//!   only for opt-in v3 volumes; native write-zeroes and multi-connection
-//!   disabled (nbdkit emulates zeroes via pwrite).
+//!   only for opt-in v3 volumes; native, chunked write-zeroes (R5-036) without
+//!   fast zero; multi-connection disabled.
 //! - The NBD I/O limits are advertised through the plugin's `block_size`
 //!   callback *and* enforced here: negotiation is advisory, so a request
 //!   outside the configured minimum/maximum, misaligned, or past the end of
