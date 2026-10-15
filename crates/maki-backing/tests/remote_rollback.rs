@@ -454,7 +454,11 @@ fn attach_refuses_another_roots_authority_without_claiming_it() {
     drop(a.create());
     drop(b.create());
     let before = inspect(b.writer.as_ref());
-    assert!(RollbackBacking::open_remote(a.root.path(), b.writer.clone()).is_err());
+    let error = RollbackBacking::open_remote(a.root.path(), b.writer.clone())
+        .err()
+        .expect("another root must be refused");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("check the witness address"));
     assert_eq!(
         inspect(b.writer.as_ref()),
         before,
@@ -472,9 +476,82 @@ fn takeover_refuses_another_roots_authority_without_revoking_its_writer() {
     let live = b.create();
     write(&live, b"live");
     let expected = inspect(b.admin.as_ref());
-    assert!(RollbackBacking::takeover_remote(a.root.path(), b.admin.clone(), &expected).is_err());
+    let error = RollbackBacking::takeover_remote(a.root.path(), b.admin.clone(), &expected)
+        .err()
+        .expect("another root must be refused");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("check the witness address"));
     assert_eq!(inspect(b.admin.as_ref()), expected);
     live.check_freshness()
         .expect("a misrouted takeover revoked another volume's live writer");
     assert_eq!(read(&live), b"live");
+}
+
+fn check_preclaim_manifest_io_error(takeover: bool) {
+    let f = Fixture::new();
+    let backing = f.create();
+    write(&backing, b"confirmed");
+    let live = if takeover {
+        Some(backing)
+    } else {
+        drop(backing);
+        None
+    };
+    let expected = inspect(f.admin.as_ref());
+    let namespace = f
+        .root
+        .path()
+        .join(&expected.current.as_ref().unwrap().namespace);
+    let manifests = ["rollback.manifest.0", "rollback.manifest.1"];
+    // A directory at a manifest path makes Linux openat(O_RDWR) return
+    // EISDIR regardless of the test user's privileges. Keep the actual
+    // manifests so a successful retry can prove the generation is intact.
+    for name in manifests {
+        std::fs::rename(
+            namespace.join(name),
+            namespace.join(format!("{name}.saved")),
+        )
+        .unwrap();
+        std::fs::create_dir(namespace.join(name)).unwrap();
+    }
+    let result = if takeover {
+        RollbackBacking::takeover_remote(f.root.path(), f.admin.clone(), &expected)
+    } else {
+        RollbackBacking::open_remote(f.root.path(), f.writer.clone())
+    };
+    let error = result
+        .err()
+        .expect("unreadable manifests must refuse attach");
+    assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+    assert_eq!(error.raw_os_error(), Some(libc::EISDIR));
+    assert_eq!(inspect(f.admin.as_ref()), expected);
+    if let Some(live) = &live {
+        live.check_freshness().unwrap();
+        assert_eq!(read(live), b"confirmed");
+    }
+    for name in manifests {
+        std::fs::remove_dir(namespace.join(name)).unwrap();
+        std::fs::rename(
+            namespace.join(format!("{name}.saved")),
+            namespace.join(name),
+        )
+        .unwrap();
+    }
+    let reopened = if takeover {
+        RollbackBacking::takeover_remote(f.root.path(), f.admin.clone(), &expected)
+    } else {
+        RollbackBacking::open_remote(f.root.path(), f.writer.clone())
+    }
+    .unwrap();
+    assert_eq!(read(&reopened), b"confirmed");
+}
+
+#[test]
+fn attach_preserves_manifest_io_errors_before_claim() {
+    check_preclaim_manifest_io_error(false);
+}
+
+#[test]
+fn takeover_preserves_manifest_io_errors_before_revoking_writer() {
+    check_preclaim_manifest_io_error(true);
 }
