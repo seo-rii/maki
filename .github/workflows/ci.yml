@@ -7,6 +7,7 @@ name: ci
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main, master]
   schedule:
@@ -128,7 +129,7 @@ jobs:
         run: cargo test --workspace --locked
 
   nightly-gates:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'review/integration-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +144,7 @@ jobs:
       - name: phase gates (release)
         run: cargo test --workspace --release --locked --no-fail-fast -- --ignored
       - name: nbdkit plugin build (cdylib + plugin_init symbol)
+        if: ${{ !cancelled() }}
         run: |
           cargo build --release --locked -p maki-nbdkit
           nm -D target/release/libmaki_nbdkit.so | grep -q plugin_init
@@ -150,6 +152,7 @@ jobs:
       # NBDKIT_* constants are checked against the distribution's header by
       # a C probe (tests/review_abi.rs), not by comments.
       - name: nbdkit ABI check against the installed header
+        if: ${{ !cancelled() }}
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nbdkit-plugin-dev
@@ -159,6 +162,7 @@ jobs:
       # fake provider. (In `cargo test --workspace` feature unification turns
       # it on for the nbdkit crate's own tests, so this is checked here.)
       - name: release build refuses provider = "fake"
+        if: ${{ !cancelled() }}
         run: |
           cargo build --release --locked -p maki
           cat > /tmp/fake.toml <<'EOF'
@@ -179,3 +183,34 @@ jobs:
             echo "release build accepted provider = fake" >&2; exit 1
           fi
           test ! -e /tmp/fakevol/superblock.a
+
+  etcd-qualification:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'review/integration-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: etcd-qualification
+      - name: install verified etcd and matching etcdctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/etcd-v3.6.5-linux-amd64.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/etcd-io/etcd/releases/download/v3.6.5/etcd-v3.6.5-linux-amd64.tar.gz
+          # Digest published by the upstream GitHub release asset API.
+          echo "66bad39ed920f6fc15fd74adcb8bfd38ba9a6412f8c7852d09eb11670e88cac3  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "MAKI_ETCD_BIN=$RUNNER_TEMP/etcd-v3.6.5-linux-amd64/etcd" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/etcd-v3.6.5-linux-amd64/etcd" --version
+          "$RUNNER_TEMP/etcd-v3.6.5-linux-amd64/etcdctl" version
+      - name: build witness frontend from the checked out revision
+        run: cargo build --release --locked -p maki-witness-cli
+      - name: real three-member quorum and frontend qualification
+        shell: bash
+        run: |
+          export MAKI_WITNESS_BIN="$GITHUB_WORKSPACE/target/release/maki-witness"
+          cargo test --release --locked -p maki-witness --features etcd-qualification --test etcd_ha -- --ignored
