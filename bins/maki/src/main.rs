@@ -138,6 +138,14 @@ fn main() -> ExitCode {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
+    // A leading --timeout can expose a helper verb. Route it before
+    // interpreting the helper's NBD socket as a control socket.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("attach" | "detach" | "grow")
+    ) {
+        return privileged_helper(&args);
+    }
     let socket = match take_socket(&mut args) {
         Ok(socket) => socket,
         Err(e) => return fail(e),
@@ -262,8 +270,6 @@ fn main() -> ExitCode {
             serde_json::Value::Null,
             timeout.unwrap_or(CONTROL_TIMEOUT),
         ),
-        // Retain the existing route when a leading --timeout was removed.
-        ["attach", ..] | ["detach", ..] | ["grow", ..] => privileged_helper(&args),
         _ => usage(),
     }
 }
