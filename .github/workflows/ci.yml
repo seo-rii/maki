@@ -51,6 +51,11 @@ jobs:
       # the build reproducible against Cargo.lock (third review).
       - name: workspace tests
         run: cargo test --workspace --locked
+      # A separate package invocation avoids workspace dev dependencies
+      # supplying tonic's TLS backend and hiding missing production features.
+      - name: standalone gRPC TLS provider selection (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p maki-crypto-grpc --features rustls/aws-lc-rs --test review_tls_handshake_deadline
       - name: pinned plaintext-erasure dependency contract (Linux)
         if: runner.os == 'Linux'
         run: |
