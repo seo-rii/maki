@@ -859,7 +859,10 @@ metric labels.
   [physical reservation report](qualification/physical-reservation-validation-2026-09-18.md).
   This does not preallocate untouched slots or cover non-Linux backing behavior.
   A reserve-only refusal leaves existing data readable and does not
-  by itself set a checkpoint error or change the engine state. A failed
+  by itself set a checkpoint error or change the engine state. It wakes the
+  checkpoint worker for an immediate pass, which deletes covered journal
+  segments and punches pending trims, so space a checkpoint can give back
+  returns without waiting for the worker's interval. A failed
   checkpoint reports `state: degraded` with its error, cleared by a successful
   checkpoint; the worker retries on its interval and writes retry necessary
   reclaim. Other outstanding failure states can still prevent `ready`.

@@ -317,6 +317,9 @@ struct EngineInner {
     state: parking_lot::Mutex<EngineState>,
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
+    /// Write admission refused a write for free space since the worker's
+    /// last pass (BUG-106): the next pass checkpoints to give space back.
+    space_refused: AtomicBool,
     last_checkpoint_at: parking_lot::Mutex<Duration>,
     /// Clock time before which the worker does not retry after a failed
     /// pass (BUG-101); `None` after a success.
@@ -625,6 +628,7 @@ impl Engine {
             state: parking_lot::Mutex::new(EngineState::Ready),
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
+            space_refused: AtomicBool::new(false),
             free_space: parking_lot::Mutex::new(None),
             observed_free_space: parking_lot::Mutex::new(None),
             observed_volume: parking_lot::Mutex::new(observed_volume),
@@ -1346,6 +1350,12 @@ impl Engine {
                 ));
             };
             if free < required {
+                // The refusal stays side-effect free, but a checkpoint may
+                // delete covered segments and punch pending trims: wake the
+                // worker instead of waiting for its interval, since its own
+                // low-space trigger sits below this requirement (BUG-106).
+                self.inner.space_refused.store(true, Ordering::SeqCst);
+                self.inner.checkpoint_notify.notify_one();
                 return Err(enospc(format!(
                     "backing free space {free} below required {required} bytes (emergency reserve {} + checkpoint headroom {headroom} + journal append footprint {append_footprint})",
                     policy.emergency_reserve_bytes
@@ -1749,13 +1759,14 @@ impl EngineInner {
             .now()
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
-        if !(by_size || by_space || by_time || by_overlay || reclaim) {
+        let by_refusal = self.space_refused.swap(false, Ordering::SeqCst);
+        if !(by_size || by_space || by_time || by_overlay || reclaim || by_refusal) {
             return;
         }
         // A checkpoint applies only durable records: when the trigger is
-        // the elapsed interval or the overlay bound, sync first so the pass
-        // actually shrinks what it was woken for.
-        if (by_time || by_overlay) && durable < appended {
+        // the elapsed interval, the overlay bound or a refused write, sync
+        // first so the pass actually shrinks what it was woken for.
+        if (by_time || by_overlay || by_refusal) && durable < appended {
             let mut volume = self.volume.clone().write_owned().await;
             if self.checkpoint_stop.load(Ordering::SeqCst) {
                 return;
