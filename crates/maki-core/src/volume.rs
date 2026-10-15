@@ -491,8 +491,17 @@ impl Volume {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
             }
-            self.store
-                .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
+            // Physical reclamation is a space hint (R5-008): a window that
+            // cannot be punched (ENOSPC splitting an extent, EIO) is logged
+            // and retried by a later checkpoint, never failed here, or
+            // `maki drain` and a clean shutdown could never succeed while it
+            // keeps failing (BUG-123).
+            if let Err(error) = self
+                .store
+                .retry_reclamation(|unit| self.overlay.get(unit).is_none())
+            {
+                tracing::warn!("checkpoint: slot reclamation deferred: {error}");
+            }
             self.sanitize();
             return Ok(base_checkpoint);
         }
