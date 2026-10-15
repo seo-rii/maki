@@ -279,9 +279,16 @@ fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<()> {
     let source = scope(disk.clone(), &current.namespace)
         .map_err(|_| invalid("remote authority's current namespace is not valid in this root"))?;
     load_generation(source.as_ref(), current).map_err(|error| {
-        invalid(format!(
-            "this backing root does not hold the remote authority's current generation              ({error}); check the witness address and backing root before retrying"
-        ))
+        if error.kind() == io::ErrorKind::InvalidData {
+            invalid(format!(
+                "this backing root does not hold the remote authority's current generation \
+                 ({error}); check the witness address and backing root before retrying"
+            ))
+        } else {
+            // Unreadable storage does not establish a root/authority mismatch.
+            // Preserve both its classification and the underlying OS error.
+            error
+        }
     })?;
     Ok(())
 }
