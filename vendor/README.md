@@ -1,6 +1,6 @@
 # Pinned plaintext-erasure patches
 
-Maki uses local patches of `serde_json` 1.0.151, `rustls` 0.23.45, `bytes`
+Maki uses local patches of `serde_json` 1.0.151, `rustls` 0.23.46, `bytes`
 1.12.1, `hyper` 1.11.1 and `tungstenite` 0.26.2. Their
 published sources and licenses are retained here. `upstream.json` records the
 published crate archive SHA-256 and every original file hash; the archive hashes
@@ -35,6 +35,14 @@ obsolete compaction tails. Replacing or releasing these buffers erases their
 full capacity. Inbound payload guards erase data on errors and erase excluded
 ranges on truncation; encryption staging is guarded through errors and growth.
 Successful API transfers retain the receiving caller's ownership.
+
+The 0.23.46 update imports the published upstream fixes for
+[RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346.html),
+[RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347.html),
+[RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348.html), and
+[RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349.html).
+All seven source files with local plaintext-erasure edits retain those edits;
+upstream handshake, record-limit, and decompression changes remain intact.
 
 `bytes` erases discarded exclusive `BytesMut` regions and retired backing
 allocations, including growth and compaction. Shared backing storage is erased
