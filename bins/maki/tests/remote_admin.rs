@@ -586,13 +586,24 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
         assert_eq!(after.fence, before.fence + 1);
         assert_eq!(after.phase, Phase::Released);
         assert!(after.current.is_some());
-        success(&["volume", "inspect", f.path(false)]);
+        failure(
+            &["volume", "inspect", f.path(false)],
+            "read-only remote backing inspection is not supported",
+        );
+        assert_eq!(inspect(f.writer.as_ref()), after);
+        // This fixture explicitly acquires a writer to verify initialization.
+        // The diagnostic CLI must never acquire that writer implicitly.
+        let backing = RollbackBacking::open_remote(&f.root, f.writer.clone()).unwrap();
+        let envelope = maki_format::superblock::load_volume_superblock(&backing).unwrap();
+        assert_eq!(envelope.superblock.geometry.max_virtual_size, 1 << 20);
+        assert_eq!(envelope.superblock.provider_type, "local-aes-gcm-siv");
+        drop(backing);
         assert!(!run(&args).status.success());
     }
 }
 
 #[test]
-fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_inspect() {
+fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness() {
     let f = Fixture::new();
     let closed = TcpListener::bind("127.0.0.1:0").unwrap();
     let unavailable = closed.local_addr().unwrap();
@@ -609,12 +620,16 @@ fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_inspect() {
     std::fs::write(&config, &raw).unwrap();
     let path = config.to_str().unwrap();
     success(&["volume", "create", path]);
-    success(&["volume", "inspect", path]);
     let output = success(&["volume", "witness", path]);
     let before: Record = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(before.identity, [1; 16]);
     assert_eq!(before.phase, Phase::Released);
     assert!(before.current.is_some());
+    failure(
+        &["volume", "inspect", path],
+        "read-only remote backing inspection is not supported",
+    );
+    assert_eq!(inspect(f.writer.as_ref()), before);
     std::fs::write(
         &config,
         raw.replace(&identity, &uuid::Uuid::from_bytes([2; 16]).to_string()),
