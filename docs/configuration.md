@@ -197,10 +197,12 @@ schema, geometry, and secret-literal checks it rejects:
   structure, escaped profile, and maximum-width numeric fields. HTTP
   `max_response_bytes` (default 8 MiB) covers each operation's response mapping,
   base64/base64url/hex encoding, JSON pointer wrappers and echoed indices; raw
-  and single-item responses are checked too. JSON bounds cover compact object
-  mappings containing the declared fields. Optional provider metadata, array
-  siblings selected by numeric pointers, whitespace and redundant escaping
-  need additional response capacity. Remote responses still obey the hard
+  and single-item responses are checked too. JSON bounds cover compact documents
+  containing the declared fields, including the required null-filled
+  array prefixes selected by numeric JSON-pointer tokens. Only RFC 6901 `~0`
+  and `~1` pointer escapes are accepted. Optional provider metadata, non-null
+  data in unmapped array siblings, whitespace and redundant escaping need
+  additional response capacity. Remote responses still obey the hard
   runtime cap. A zero limit is rejected;
 - a zero `timeout` for any remote transport;
 - TLS material that does not exist or cannot be read, `client_key` without

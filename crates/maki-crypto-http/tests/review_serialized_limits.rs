@@ -191,3 +191,117 @@ async fn single_json_and_raw_responses_are_also_bounded() {
         assert_eq!(decrypted[0].data.expose(), plaintext[0].data.expose());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn numeric_response_pointer_includes_required_array_prefix_at_exact_boundary() {
+    for batch in [false, true] {
+        let server = TestServer::start(Arc::new(move |request| {
+            let size = if request.path == "/encrypt" {
+                4384
+            } else {
+                4096
+            };
+            let encoded = PayloadEncoding::HexUpper.encode(&vec![0xAB; size]);
+            let payload = if batch {
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                json!(request["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| json!({
+                        "u/nit":item["unit"], "d~ata\"":encoded,
+                    }))
+                    .collect::<Vec<_>>())
+            } else {
+                json!(encoded)
+            };
+            let mut array = vec![serde_json::Value::Null; 128];
+            array.push(payload);
+            ResponseSpec::json(&json!(array))
+        }))
+        .await;
+        let mut cfg = config(&server.url(), "hex-upper", 4384, batch);
+        let http = cfg.crypto.http.as_mut().unwrap();
+        for op in [&mut http.encrypt, &mut http.decrypt] {
+            let response = op.as_mut().unwrap().response.as_mut().unwrap();
+            if batch {
+                response.items_path = Some("/128".into());
+            } else {
+                response.data_path = Some("/128".into());
+            }
+        }
+        let count = if batch { 128 } else { 1 };
+        let payload = PayloadEncoding::HexUpper.encode(&vec![0xAB; 4384]);
+        let expected = if batch {
+            json!((0..count)
+                .map(|i| json!({"u/nit":u64::MAX-i,"d~ata\"":payload}))
+                .collect::<Vec<_>>())
+        } else {
+            json!(payload)
+        };
+        let mut array = vec![serde_json::Value::Null; 128];
+        array.push(expected);
+        let boundary = serde_json::to_vec(&array).unwrap().len();
+        cfg.crypto.http.as_mut().unwrap().max_response_bytes = Some(ByteSize(boundary as u64 - 1));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_response_bytes"));
+        for limit in [boundary, boundary + 1] {
+            cfg.crypto.http.as_mut().unwrap().max_response_bytes = Some(ByteSize(limit as u64));
+            cfg.validate().unwrap();
+            let p =
+                HttpCryptoProvider::from_config(&cfg, &server.url(), &MapKeySource::new()).unwrap();
+            let plaintext: Vec<_> = (0..count)
+                .map(|i| PlaintextUnit {
+                    unit_index: u64::MAX - i,
+                    data: SecretBuffer::from_slice(&vec![0xAB; 4096]),
+                })
+                .collect();
+            let encrypted = p.encrypt_batch(&context(), &plaintext).await.unwrap();
+            let decrypted = p.decrypt_batch(&context(), &encrypted).await.unwrap();
+            for (actual, expected) in decrypted.iter().zip(&plaintext) {
+                assert_eq!(actual.data.expose(), expected.data.expose());
+            }
+        }
+    }
+}
+
+#[test]
+fn response_pointer_escapes_are_unambiguous_and_numeric_object_keys_still_work() {
+    let mut cfg = config("http://127.0.0.1:1", "hex", 4384, true);
+    let response = cfg
+        .crypto
+        .http
+        .as_mut()
+        .unwrap()
+        .encrypt
+        .as_mut()
+        .unwrap()
+        .response
+        .as_mut()
+        .unwrap();
+    response.data_path = Some("/~3".into());
+    response.item_index_path = Some("/~03".into());
+    assert!(cfg
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("JSON pointer escape"));
+    for token in ["01", "+1", "184467440737095516160", "a~0b", "a~1b"] {
+        let mut cfg = config("http://127.0.0.1:1", "hex", 4384, false);
+        cfg.crypto
+            .http
+            .as_mut()
+            .unwrap()
+            .encrypt
+            .as_mut()
+            .unwrap()
+            .response
+            .as_mut()
+            .unwrap()
+            .data_path = Some(format!("/{token}"));
+        cfg.validate().unwrap();
+    }
+}

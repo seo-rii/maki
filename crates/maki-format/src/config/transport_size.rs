@@ -30,9 +30,10 @@ fn json_string_len(value: &str) -> u64 {
     })
 }
 
-/// Object wrappers needed to reach a value through an RFC 6901 pointer.
-/// Shared ancestors are counted twice when combining paths: conservative,
-/// without constructing a potentially deeply nested JSON tree at validation.
+/// Wrappers needed to reach a value through an RFC 6901 pointer. Numeric
+/// tokens can address objects or arrays: budget the larger object wrapper or
+/// array wrapper with the mandatory preceding null elements. Shared ancestors
+/// are counted twice when combining paths, without constructing a JSON tree.
 fn pointer_overhead(pointer: &str) -> Result<u64, ConfigError> {
     if pointer.is_empty() {
         return Ok(0);
@@ -40,11 +41,33 @@ fn pointer_overhead(pointer: &str) -> Result<u64, ConfigError> {
     let tokens = pointer
         .strip_prefix('/')
         .ok_or_else(|| invalid("HTTP response JSON pointers must be empty or begin with '/'"))?;
-    Ok(tokens.split('/').fold(0u64, |length, token| {
+    tokens.split('/').try_fold(0u64, |length, token| {
+        // Runtime pointer lookup is permissive about malformed escapes. Only
+        // RFC 6901 escapes are accepted here, making token spelling unique so
+        // the separate-leaf check cannot miss aliases such as ~3 and ~03.
+        let mut chars = token.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                return Err(invalid("invalid HTTP response JSON pointer escape"));
+            }
+        }
         let key = token.replace("~1", "/").replace("~0", "~");
         // {"key":VALUE}: braces and colon plus the serialized key.
-        length.saturating_add(json_string_len(&key).saturating_add(3))
-    }))
+        let object = json_string_len(&key).saturating_add(3);
+        // Match the runtime's canonical array-index spelling and usize bound.
+        // An overflowing numeric token can still name an object field.
+        let array = if !(key.starts_with('+') || key.starts_with('0') && key.len() != 1) {
+            key.parse::<usize>()
+                .ok()
+                .map(|index| {
+                    2u64.saturating_add((index as u64).saturating_mul(5)) // [null,...,VALUE]
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(length.saturating_add(object.max(array)))
+    })
 }
 
 impl VolumeConfig {
