@@ -1286,6 +1286,14 @@ fn execute_with_options(
                 "new attachment has pre-existing mounts, mappings, or holders; refusing to adopt them",
             ));
         }
+        // Mounting over a filesystem already mounted below the mountpoint
+        // hides it, and its owner's detach would then resolve the same path
+        // inside this volume (BUG-118). The verify gate refuses the same.
+        if before.nested {
+            return Err(identity_error(
+                "a filesystem is already mounted below the mountpoint; refusing to mount over it",
+            ));
+        }
         // Persist the unique identity before connecting: process death
         // cannot leave an unrecorded connection or authorize a later reuse
         // of the same /dev/nbdN by a different attachment.

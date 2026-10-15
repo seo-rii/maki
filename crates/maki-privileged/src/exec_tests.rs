@@ -386,6 +386,7 @@ impl System for FakeSystem {
             mounted: self.mounted,
             vg_active: self.vg_active,
             nbd_in_use: self.vg_active || self.extra_holders,
+            nested: false,
         })
     }
 }
@@ -1577,6 +1578,45 @@ fn a_new_attach_does_not_adopt_unrecorded_live_resources() {
         );
         assert!(state.read("pg").unwrap().is_none());
     }
+}
+
+/// BUG-118: the pre-attach check looked only at mounts exactly at the
+/// mountpoint. Attaching over a directory that already had a filesystem
+/// mounted below it (another volume at `/srv/pg/wal`, attached first at
+/// boot) hid that mount: its owner's later detach then resolved the same
+/// path inside this volume, whose contents another daemon and workload
+/// control. The verify gate already refuses nested mounts; attach does too.
+#[test]
+fn a_new_attach_refuses_a_mountpoint_with_mounts_below_it() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mountpoint = fixture.0.join("filesystem");
+    std::fs::create_dir(&mountpoint).unwrap();
+    let sysfs = fixture.0.join("sysfs");
+    std::fs::create_dir_all(sysfs.join("nbd3/holders")).unwrap();
+    std::fs::write(sysfs.join("nbd3/dev"), "43:96\n").unwrap();
+    let mut request = request();
+    request.mountpoint = mountpoint.to_str().unwrap().into();
+    request.nbd_device = "/dev/nbd3".into();
+    request.init_sentinel = true;
+    let mut system = ReviewForeignMountSystem {
+        inner: FakeSystem::default(),
+        mountinfo: format!(
+            "50 1 253:7 / {}/wal rw,nosuid,nodev - xfs /dev/mapper/vg_other-wal rw\n",
+            request.mountpoint
+        ),
+        sysfs,
+    };
+    let result = execute_with(&plan_attach(&request), Some(&state), &mut system);
+    let error = result.expect_err("attached over an existing nested mount");
+    assert!(error.to_string().contains("below"), "{error}");
+    assert!(
+        system.inner.steps.is_empty(),
+        "acted before refusing: {:?}",
+        system.inner.steps
+    );
+    assert!(state.read("pg").unwrap().is_none());
 }
 
 #[test]
