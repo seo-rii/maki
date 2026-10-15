@@ -485,3 +485,13 @@ CAS, real TLS authentication and role enforcement, uncertain replies, writer
 fencing, snapshots and enrollment recovery. Quorum tests additionally exercise
 leader/front-end loss and loss of majority. These results do not replace
 independent-host, persistent-disk or disruptive campaign qualification.
+
+## Diagnostic commands and writer ownership
+
+`maki volume witness <config.toml>` inspects the authority without claiming a
+writer. `maki volume inspect`, `maki check`, and `maki check --deep` refuse remote
+rollback backing until a read-only backing view is implemented. Opening the
+normal remote backing claims a writer and creates a new namespace; diagnostic
+commands must not do that implicitly, including when they fail or are killed.
+This refusal applies to both active and released authority states. It does not
+validate the stored ciphertext or replace an offline data-integrity check.

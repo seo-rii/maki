@@ -624,3 +624,48 @@ fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_inspect() {
     assert!(!run(&["volume", "create", path]).status.success());
     assert_eq!(inspect(f.writer.as_ref()), before);
 }
+
+#[test]
+fn diagnostic_commands_never_claim_or_fork_a_remote_writer() {
+    let fixture = Fixture::new();
+    let mut backing = Some(fixture.create());
+    write(
+        backing.as_ref().unwrap(),
+        b"diagnostic-must-not-change-authority",
+    );
+    for active in [true, false] {
+        let before = inspect(fixture.writer.as_ref());
+        assert_eq!(
+            before.phase,
+            if active {
+                Phase::Active
+            } else {
+                Phase::Released
+            }
+        );
+        let names = || {
+            let mut paths = std::fs::read_dir(&fixture.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let namespaces = names();
+        for args in [
+            vec!["volume", "inspect", fixture.path(false)],
+            vec!["check", fixture.path(false)],
+            vec!["check", fixture.path(false), "--deep"],
+        ] {
+            failure(
+                &args,
+                "read-only remote backing inspection is not supported",
+            );
+            assert_eq!(inspect(fixture.writer.as_ref()), before);
+            assert_eq!(names(), namespaces, "diagnostic created a writer namespace");
+        }
+        if active {
+            drop(backing.take());
+        }
+    }
+}
