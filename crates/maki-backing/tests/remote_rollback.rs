@@ -188,16 +188,49 @@ fn lost_commit_reply_retries_the_identical_operation_without_losing_data() {
     assert_eq!(read(&b), b"after!");
 }
 
+/// BUG-103: an unreachable witness refuses every operation, with no
+/// fallback, but it contradicts nothing: Inspect changes no state. A
+/// transient outage (an etcd leader election, a frontend restart) used to
+/// stop the session for good, so every protected volume returned EIO until
+/// an administrator took over, and shutdown could not release it.
 #[test]
-fn unavailable_witness_stops_existing_handles_and_never_falls_back() {
+fn unavailable_witness_refuses_io_without_fallback_until_it_answers_again() {
     let f = Fixture::new();
     let b = f.create();
     write(&b, b"confirmed");
     let file = b.open("payload", false).unwrap();
     f.writer.unavailable.store(true, Ordering::SeqCst);
     assert!(file.read_at(0, &mut [0; 9]).is_err());
-    f.writer.unavailable.store(false, Ordering::SeqCst);
     assert!(b.check_freshness().is_err());
+    f.writer.unavailable.store(false, Ordering::SeqCst);
+    b.check_freshness()
+        .expect("an unchanged authority is fresh again once it answers");
+    let mut bytes = [0; 9];
+    file.read_at(0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"confirmed");
+    write(&b, b"advanced!");
+    assert_eq!(read(&b), b"advanced!");
+}
+
+#[test]
+fn a_takeover_during_an_outage_still_stops_the_session_for_good() {
+    let f = Fixture::new();
+    let b = f.create();
+    write(&b, b"confirmed");
+    let file = b.open("payload", false).unwrap();
+    f.writer.unavailable.store(true, Ordering::SeqCst);
+    assert!(file.read_at(0, &mut [0; 9]).is_err());
+    let expected = inspect(f.admin.as_ref());
+    let successor =
+        RollbackBacking::takeover_remote(f.root.path(), f.admin.clone(), &expected).unwrap();
+    f.writer.unavailable.store(false, Ordering::SeqCst);
+    assert!(b.check_freshness().is_err(), "a revoked session resumed");
+    assert!(file.read_at(0, &mut [0; 9]).is_err());
+    assert!(
+        b.check_freshness().is_err(),
+        "an observed revocation stops the session permanently"
+    );
+    assert_eq!(read(&successor), b"confirmed");
 }
 
 #[test]
@@ -407,4 +440,118 @@ fn unresolved_commit_reply_poison_preserves_remote_committed_generation() {
     drop(old);
     assert_eq!(read(&new), b"committed");
     new.check_freshness().unwrap();
+}
+
+/// BUG-107: attach claimed the authority (raising its fence) and takeover
+/// revoked the live writer *before* checking that this backing root holds
+/// the authority's current data. A configuration whose address names
+/// another volume's witness stranded that volume (Claimed, needing an
+/// administrator) or revoked its live writer, and then failed anyway.
+#[test]
+fn attach_refuses_another_roots_authority_without_claiming_it() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    drop(a.create());
+    drop(b.create());
+    let before = inspect(b.writer.as_ref());
+    let error = RollbackBacking::open_remote(a.root.path(), b.writer.clone())
+        .err()
+        .expect("another root must be refused");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("check the witness address"));
+    assert_eq!(
+        inspect(b.writer.as_ref()),
+        before,
+        "a misrouted attach changed another volume's authority"
+    );
+    let b_again = RollbackBacking::open_remote(b.root.path(), b.writer.clone()).unwrap();
+    b_again.check_freshness().unwrap();
+}
+
+#[test]
+fn takeover_refuses_another_roots_authority_without_revoking_its_writer() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    drop(a.create());
+    let live = b.create();
+    write(&live, b"live");
+    let expected = inspect(b.admin.as_ref());
+    let error = RollbackBacking::takeover_remote(a.root.path(), b.admin.clone(), &expected)
+        .err()
+        .expect("another root must be refused");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("check the witness address"));
+    assert_eq!(inspect(b.admin.as_ref()), expected);
+    live.check_freshness()
+        .expect("a misrouted takeover revoked another volume's live writer");
+    assert_eq!(read(&live), b"live");
+}
+
+fn check_preclaim_manifest_io_error(takeover: bool) {
+    let f = Fixture::new();
+    let backing = f.create();
+    write(&backing, b"confirmed");
+    let live = if takeover {
+        Some(backing)
+    } else {
+        drop(backing);
+        None
+    };
+    let expected = inspect(f.admin.as_ref());
+    let namespace = f
+        .root
+        .path()
+        .join(&expected.current.as_ref().unwrap().namespace);
+    let manifests = ["rollback.manifest.0", "rollback.manifest.1"];
+    // A directory at a manifest path makes Linux openat(O_RDWR) return
+    // EISDIR regardless of the test user's privileges. Keep the actual
+    // manifests so a successful retry can prove the generation is intact.
+    for name in manifests {
+        std::fs::rename(
+            namespace.join(name),
+            namespace.join(format!("{name}.saved")),
+        )
+        .unwrap();
+        std::fs::create_dir(namespace.join(name)).unwrap();
+    }
+    let result = if takeover {
+        RollbackBacking::takeover_remote(f.root.path(), f.admin.clone(), &expected)
+    } else {
+        RollbackBacking::open_remote(f.root.path(), f.writer.clone())
+    };
+    let error = result
+        .err()
+        .expect("unreadable manifests must refuse attach");
+    assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+    assert_eq!(error.raw_os_error(), Some(libc::EISDIR));
+    assert_eq!(inspect(f.admin.as_ref()), expected);
+    if let Some(live) = &live {
+        live.check_freshness().unwrap();
+        assert_eq!(read(live), b"confirmed");
+    }
+    for name in manifests {
+        std::fs::remove_dir(namespace.join(name)).unwrap();
+        std::fs::rename(
+            namespace.join(format!("{name}.saved")),
+            namespace.join(name),
+        )
+        .unwrap();
+    }
+    let reopened = if takeover {
+        RollbackBacking::takeover_remote(f.root.path(), f.admin.clone(), &expected)
+    } else {
+        RollbackBacking::open_remote(f.root.path(), f.writer.clone())
+    }
+    .unwrap();
+    assert_eq!(read(&reopened), b"confirmed");
+}
+
+#[test]
+fn attach_preserves_manifest_io_errors_before_claim() {
+    check_preclaim_manifest_io_error(false);
+}
+
+#[test]
+fn takeover_preserves_manifest_io_errors_before_revoking_writer() {
+    check_preclaim_manifest_io_error(true);
 }

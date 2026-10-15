@@ -13,6 +13,8 @@ pub(crate) struct DetachObservation {
     pub mounted: bool,
     pub vg_active: bool,
     pub nbd_in_use: bool,
+    /// Something is mounted strictly below the mountpoint (by path component).
+    pub nested: bool,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -173,6 +175,7 @@ pub(crate) fn observe_kernel(
     }
 
     let mut mounted_device = None;
+    let mut nested = false;
     for line in mountinfo.lines().filter(|line| !line.trim().is_empty()) {
         let (left, right) = line
             .split_once(" - ")
@@ -187,7 +190,10 @@ pub(crate) fn observe_kernel(
         // filesystem mounts are represented in mountinfo rather than in
         // holders. Neither may be mistaken for an entirely unused NBD.
         nbd_in_use |= nbd_devices.contains(&device);
-        if crate::probe::unescape(fields[4]) == record.attachment.mountpoint {
+        let mounted_path = crate::probe::unescape(fields[4]);
+        nested |= mounted_path != record.attachment.mountpoint
+            && Path::new(&mounted_path).starts_with(&record.attachment.mountpoint);
+        if mounted_path == record.attachment.mountpoint {
             // Every entry at the target must belong to the same complete
             // filesystem. A stacked or bind-subtree mount is not safe to
             // unmount as part of this recorded attachment.
@@ -208,6 +214,7 @@ pub(crate) fn observe_kernel(
         mounted,
         vg_active,
         nbd_in_use,
+        nested,
     })
 }
 

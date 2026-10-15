@@ -447,6 +447,7 @@ async fn no_op_inner_provider_cannot_hide_behind_random_prefix() {
             "outer-v1"
         )
         .await,
-        Err(CryptoError::ProviderFatal(message)) if message.contains("not encrypting")
+        Err(error) if error.class() == maki_crypto::ErrorClass::ProviderFatal
+            && error.to_string().contains("not encrypting")
     ));
 }

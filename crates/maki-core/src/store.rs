@@ -176,6 +176,10 @@ pub struct SlotStore {
     /// A bounded post-recovery scan retries physical release of persisted
     /// tombstones. No extra per-unit bitmap or payload history is retained.
     reclaim_cursor: Option<(u64, u64)>,
+    /// The last reclamation window failed to punch (BUG-123): the scan keeps
+    /// its cursor, but is not pending work until a later checkpoint, run
+    /// for its own reasons, retries it.
+    reclaim_stalled: bool,
 }
 
 /// Shard index of a `shard-XXXXXXXX.dat` file name, verified by
@@ -191,12 +195,6 @@ fn map_store(a: String, b: String, geometry: &Geometry) -> AbStore {
 fn catalog_store(geometry: &Geometry) -> AbStore {
     AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B)
         .with_max_len(ShardCatalog::max_encoded_len(geometry.num_shards()))
-}
-
-fn parse_shard_data_name(name: &str) -> Option<u64> {
-    let hex = name.strip_prefix("shard-")?.strip_suffix(".dat")?;
-    let idx = u64::from_str_radix(hex, 16).ok()?;
-    (layout::shard_data(idx) == format!("{}/{name}", layout::DATA_DIR)).then_some(idx)
 }
 
 /// What the slot of a unit whose allocation bit is clear holds.
@@ -335,7 +333,7 @@ impl SlotStore {
         let mut catalog_dirty = false;
         let mut orphans: Vec<u64> = Vec::new();
         for name in backing.list(layout::DATA_DIR)? {
-            if let Some(idx) = parse_shard_data_name(&name) {
+            if let Some(idx) = layout::parse_shard_data(&name) {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {
                     orphans.push(idx);
                 }
@@ -392,10 +390,16 @@ impl SlotStore {
                     "shard {shard_idx}: allocation map size mismatch"
                 )));
             }
+            // Only an absent file is damage. Every cataloged shard stays
+            // open, so a large volume can meet the descriptor limit here:
+            // EMFILE and other open failures keep their errno (BUG-124).
             let data = backing
                 .open(&layout::shard_data(shard_idx), false)
-                .map_err(|e| {
-                    CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                    }
+                    _ => CoreError::Io(e),
                 })?;
             // A data file shorter than its physical size (see `ShortFile`).
             let mut alloc = alloc;
@@ -528,6 +532,7 @@ impl SlotStore {
             damaged_units,
             discard_enabled,
             reclaim_cursor: None,
+            reclaim_stalled: false,
         })
     }
 
@@ -562,7 +567,7 @@ impl SlotStore {
     }
 
     pub(crate) fn has_pending_reclamation(&self) -> bool {
-        self.reclaim_cursor.is_some()
+        self.reclaim_cursor.is_some() && !self.reclaim_stalled
     }
 
     /// Call only after bounded replay has applied every surviving record.
@@ -1024,6 +1029,7 @@ impl SlotStore {
         };
         let shard = &self.shards[&idx];
         if shard.dirty_discard {
+            self.reclaim_stalled = true;
             return Err(CoreError::Durability(
                 "reclamation requires durable discard metadata".into(),
             ));
@@ -1038,7 +1044,11 @@ impl SlotStore {
             .filter(|in_shard| map.get(*in_shard))
             .map(|in_shard| base + in_shard)
             .filter(|unit| can_punch(*unit));
-        self.punch_slots(units)?;
+        if let Err(error) = self.punch_slots(units) {
+            self.reclaim_stalled = true;
+            return Err(error);
+        }
+        self.reclaim_stalled = false;
         self.reclaim_cursor = if end < map.units() {
             Some((idx, end))
         } else {

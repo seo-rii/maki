@@ -197,3 +197,46 @@ fn cataloged_v3_shard_without_either_discard_copy_refuses_attach() {
     }
     assert!(Volume::recover(backing, VolumeOptions::default()).is_err());
 }
+
+#[test]
+fn ciphertext_probe_skips_live_overlay_tombstones_across_shards() {
+    let backing = Arc::new(MemBacking::new());
+    create_volume_with_discard(backing.as_ref(), superblock(0xc1f3)).unwrap();
+    let mut volume = Volume::recover(backing, VolumeOptions::default()).unwrap();
+    for unit in [0, 1, 8] {
+        volume
+            .write_ct(unit, &[unit as u8 + 1; 1032], true)
+            .unwrap();
+    }
+    volume.checkpoint().unwrap();
+    for unit in [0, 1] {
+        volume.discard_ct(unit, false).unwrap();
+    }
+    let before = volume.checkpoint_sequence();
+    assert_eq!(
+        volume.first_ciphertext_unit().unwrap(),
+        Some((8, vec![9; 1032]))
+    );
+    assert_eq!(
+        volume.checkpoint_sequence(),
+        before,
+        "probe must not mutate storage"
+    );
+    volume.discard_ct(8, false).unwrap();
+    assert_eq!(volume.first_ciphertext_unit().unwrap(), None);
+    volume.write_ct(4, &[0x44; 1032], false).unwrap();
+    assert_eq!(
+        volume.first_ciphertext_unit().unwrap(),
+        Some((4, vec![0x44; 1032]))
+    );
+}
+
+#[test]
+fn ciphertext_probe_keeps_v2_empty_ciphertext_semantics() {
+    let backing = Arc::new(MemBacking::new());
+    create_volume(backing.as_ref(), superblock(0xc1f2)).unwrap();
+    let mut volume = Volume::recover(backing, VolumeOptions::default()).unwrap();
+    volume.write_ct(0, &[], true).unwrap();
+    volume.checkpoint().unwrap();
+    assert_eq!(volume.first_ciphertext_unit().unwrap(), Some((0, vec![])));
+}

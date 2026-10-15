@@ -170,18 +170,39 @@ before every start. `status` should report `state: ready`.
 
 `maki drain` closes I/O admission, flushes and checkpoints, and returns the
 checkpoint sequence as an explicit acknowledgement that everything written so
-far is durable. Run it after the workload has quiesced (here: after `sync`),
-then stop the target and wait for every unit to become inactive before an
-offline check:
+far is durable. First close every file on the demo mount, verify its identity,
+and unmount while admission is still open: unmount may write filesystem data
+or metadata even after `sync`. Only after unmount succeeds, drain, stop the
+target, and wait for every unit to become inactive before an offline check.
+For a normal stop without a separate acknowledgement, stop the target directly;
+its ordered cleanup unmounts before daemon unload drains the engine.
 
 ```bash
-maki drain /etc/maki/volumes/demo.toml
-systemctl stop maki-workload@demo.target
-while systemctl is-active --quiet maki-attach@demo.service || \
-      systemctl is-active --quiet maki@demo.service; do sleep 1; done
-findmnt /srv/demo || echo "unmounted"
-maki check /etc/maki/volumes/demo.toml --deep
+# Succeeds once every named unit is inactive; fails at once if one failed
+# (inspect it before continuing) or after WAIT_SECONDS (default 600).
+wait_stopped() {
+    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    for unit in "$@"; do
+        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
+            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit is $state: preserve the host state and inspect it" >&2
+                return 1
+            fi
+            sleep 1
+        done
+    done
+}
+maki-attach verify --volume demo &&
+    umount -- /srv/demo &&
+    maki drain /etc/maki/volumes/demo.toml &&
+    systemctl stop maki-workload@demo.target &&
+wait_stopped maki-attach@demo.service maki@demo.service &&
+    { findmnt /srv/demo || echo "unmounted"; } &&
+    maki check /etc/maki/volumes/demo.toml --deep
 ```
+
+`systemctl is-active` is not a stop test: it also fails while a unit is still
+`deactivating` or has `failed`, so `wait_stopped` polls for `inactive`.
 
 ## 8. Start again and read the data back
 
@@ -204,11 +225,10 @@ the target owns their ordering and the recovery unit
 ## 9. Clean up
 
 ```bash
-maki drain /etc/maki/volumes/demo.toml
-systemctl disable --now maki-workload@demo.target
-while systemctl is-active --quiet maki@demo.service; do sleep 1; done
-rm -rf /var/lib/maki/demo /etc/maki/attach/demo.toml /etc/maki/volumes/demo.toml
-shred -u /etc/maki/secrets/demo.token
+systemctl disable --now maki-workload@demo.target &&
+wait_stopped maki-attach@demo.service maki@demo.service &&
+    rm -rf /var/lib/maki/demo /etc/maki/attach/demo.toml /etc/maki/volumes/demo.toml &&
+    shred -u /etc/maki/secrets/demo.token
 ```
 
 ## What you have and have not seen

@@ -94,6 +94,12 @@ and allow-lists govern the public witness protocol; they do not restrict a
 client that has direct backend access. This feature does not configure etcd
 membership, storage, network policy or authentication infrastructure.
 
+Every FLUSH or FUA, like every other backing sync such as a checkpoint,
+advances the authority record with an etcd transaction, so etcd's revision
+history grows with the volume's write rate. Enable etcd auto-compaction and
+monitor the backend quota: at the quota, etcd raises a `NOSPACE` alarm and
+refuses writes, and the volume stops.
+
 Record the actual cluster ID from trusted operator inspection. Configure it as
 a quoted canonical decimal string so the full unsigned 64-bit range fits TOML.
 Replace the example cluster ID and addresses below. The storage identity must be a fresh,
@@ -176,7 +182,12 @@ pin is checked by a read before mutation on that endpoint.
 Etcd leader failover and frontend failover retain the same history. Etcd
 snapshot rollback, cluster recreation and changing the cluster pin require a
 separate explicit authority migration; never reset a pin to accept an older
-snapshot. Never restore the quorum with a volume backup. To move an existing file-backed authority volume to quorum mode, create a
+snapshot. The pin detects a different cluster, not a restore of the same one:
+restoring an etcd snapshot with the original `--initial-cluster-token` and peer
+URLs reproduces the same cluster ID, so frontends accept the older authority
+state it holds. Such a restore is an administrator action outside the freshness
+guarantee and belongs only in that explicit migration, never in routine etcd
+recovery. Never restore the quorum with a volume backup. To move an existing file-backed authority volume to quorum mode, create a
 separate destination with a fresh storage identity and perform a verified
 logical data migration. Copying an existing local authority value into etcd
 while its old service can still run would fork trusted history and is refused
@@ -319,6 +330,32 @@ to lower-case hexadecimal for the commands below. In Python a reviewed current
 root is `bytes(record["current"]["anchor"]["root"]).hex()`; a snapshot root is
 `bytes(descriptor["anchor"]["root"]).hex()`.
 
+Takeover and restore fence whichever writer currently holds the authority,
+a healthy one included: its next commit is refused and its mounted filesystem
+sees I/O errors. The packaged recovery unit may then start a new daemon that
+claims the new state before you have inspected it, and after a restore that
+state is the older snapshot. Quiesce first:
+
+1. Stop the workload lifecycle with `systemctl stop maki-workload@<volume>.target`
+   and wait until the workloads, `maki-attach@<volume>.service` and
+   `maki@<volume>.service` all report `inactive`
+   ([planned shutdown](deployment/postgres.md#6-planned-stop-and-start)).
+2. Run takeover or restore below, then inspect the result with
+   `maki volume witness`.
+3. Return the backing to the daemon user (next paragraph) and only then start
+   the target again.
+
+These commands, and `resume-enrollment`, create the new writer namespace
+owner-only (`0700` directories, `0600` files) as the user that runs them. Run
+as root, which an administrator key readable only by root requires, they leave
+a `remote-*` tree the `maki` daemon cannot open, and the next attach fails. Keep
+the administrator key unreadable to the daemon user and hand the tree back after
+the command instead:
+
+```sh
+chown -R maki:maki /var/lib/maki/<volume>
+```
+
 For a stale or failed writer, review the current fence/root and replace the
 placeholders:
 
@@ -426,11 +463,25 @@ connection rolled a transaction back. Quorum unavailability stops service;
 there is no stale replica or offline fallback.
 
 The server admits 1–256 connection workers and requires 1–256 distinct
-allow-listed certificate identities. Admission precedes worker creation, and
-capacity is released on success, error or Rust unwinding. A connection's
-absolute deadline covers handshake, framing and replies; slow fragments cannot
-extend it. A blocked local filesystem operation cannot be forcibly cancelled
-by the socket deadline, but workers remain bounded and clients time out.
+allow-listed certificate identities. A connection takes a worker only after
+TLS has authenticated an allow-listed certificate. Until it acquires a worker,
+it occupies one of four pending slots per worker, including while waiting after
+authentication. If these slots fill, a new arrival evicts the oldest pending
+connection and closes its socket. An authenticated waiter can therefore be
+disconnected before its deadline; it observes eviction as `ConnectionAborted`
+on the server, not as a guaranteed protocol error response to the client.
+
+A separate lifetime limit allows at most five connection tasks per worker,
+including active requests, pending connections, and evicted tasks that have not
+yet exited. Eviction does not release this capacity: the task retains its charge
+until its TLS state and request processing end, including error and unwinding
+paths. The accept loop waits for capacity before creating another thread, within
+the accepted connection's deadline. Accept and thread-creation failures are
+retried with backoff; a failed thread creation releases that connection's socket
+and capacity. One absolute deadline covers admission, authentication, worker
+waiting, framing and replies; slow fragments cannot extend it. A blocked local
+filesystem operation cannot be forcibly cancelled by the socket deadline, but
+workers remain bounded and clients time out.
 
 TLS/protocol failures do not log request payloads or peer-provided error text.
 Missing or untrusted certificates, unknown identities, wrong server names,
@@ -443,3 +494,13 @@ CAS, real TLS authentication and role enforcement, uncertain replies, writer
 fencing, snapshots and enrollment recovery. Quorum tests additionally exercise
 leader/front-end loss and loss of majority. These results do not replace
 independent-host, persistent-disk or disruptive campaign qualification.
+
+## Diagnostic commands and writer ownership
+
+`maki volume witness <config.toml>` inspects the authority without claiming a
+writer. `maki volume inspect`, `maki check`, and `maki check --deep` refuse remote
+rollback backing until a read-only backing view is implemented. Opening the
+normal remote backing claims a writer and creates a new namespace; diagnostic
+commands must not do that implicitly, including when they fail or are killed.
+This refusal applies to both active and released authority states. It does not
+validate the stored ciphertext or replace an offline data-integrity check.

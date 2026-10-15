@@ -73,7 +73,8 @@ sudo -u maki maki volume create /etc/maki/volumes/demo.toml
 # then pin the UUIDs in /etc/maki/attach/demo.toml  (docs/getting-started/first-volume.md)
 systemctl start maki-workload@demo.target
 maki-attach verify --volume demo && echo hello > /srv/demo/hello.txt
-maki drain /etc/maki/volumes/demo.toml && systemctl stop maki-workload@demo.target
+# Keep I/O admission open for filesystem unmount; daemon unload drains afterward.
+systemctl stop maki-workload@demo.target
 ```
 
 ## Production deployment
@@ -115,8 +116,8 @@ Format and behaviour changes: [CHANGELOG.md](CHANGELOG.md).
 
 | Path | Purpose |
 |---|---|
-| `crates/` | Storage engine, format, crypto providers, control plane, test support |
-| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark` |
+| `crates/` | Storage engine, format, crypto providers, control plane, remote witness, test support |
+| `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark`, `maki-witness` |
 | `packaging/` | Debian package builder, systemd, sysusers, tmpfiles, provider examples |
 | `examples/` | Complete deployment bundles |
 | `docs/` | User, operator, reference and qualification documentation |

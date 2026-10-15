@@ -1,19 +1,19 @@
 //! Authenticated, bounded remote freshness authority transport.
 //!
-//! Each TLS 1.3 connection carries one versioned, request-id-bound RPC. The
-//! A single client call never retries. Identity-pinned endpoint sets retry the
+//! Each TLS 1.3 connection carries one versioned, request-id-bound RPC. A
+//! single client call never retries. Identity-pinned endpoint sets retry the
 //! same operation after transport failures, resolving possible durable commits.
 
 pub mod failover;
 
 pub mod etcd;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub use maki_backing::remote_witness::Role;
 use maki_backing::remote_witness::{Record, Request, Rpc, StateStore};
@@ -389,6 +389,8 @@ struct DeadlineIo {
     socket: TcpStream,
     deadline: Instant,
 }
+
+type ServerStream = rustls::StreamOwned<rustls::ServerConnection, DeadlineIo>;
 impl Read for DeadlineIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.socket
@@ -425,6 +427,132 @@ pub struct Server {
     max_connections: usize,
     active: Arc<AtomicUsize>,
 }
+
+/// Connections that have not yet been given a worker slot, oldest first.
+/// Each entry holds a duplicate of the socket so it can be cut off.
+struct Handshakes {
+    capacity: usize,
+    task_capacity: usize,
+    state: Mutex<HandshakeState>,
+    released: Condvar,
+}
+
+struct HandshakeState {
+    next_id: u64,
+    live: usize,
+    pending: VecDeque<PendingHandshake>,
+}
+
+struct PendingHandshake {
+    id: u64,
+    socket: TcpStream,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Charges a connection task until its TLS state and request processing end,
+/// including after its pending handshake is evicted.
+struct HandshakeTicket {
+    table: Arc<Handshakes>,
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Handshakes {
+    fn new(workers: usize) -> Self {
+        Self {
+            capacity: workers * 4,
+            task_capacity: workers * 5,
+            state: Mutex::new(HandshakeState {
+                next_id: 0,
+                live: 0,
+                pending: VecDeque::new(),
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    fn admit(
+        self: &Arc<Self>,
+        socket: &TcpStream,
+        deadline: Instant,
+    ) -> io::Result<HandshakeTicket> {
+        let duplicate = socket.try_clone()?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.pending.len() >= self.capacity {
+            if let Some(oldest) = state.pending.pop_front() {
+                // A TLS read observes shutdown; an authenticated permit
+                // waiter observes cancellation. Neither releases task
+                // capacity until its connection task actually exits.
+                oldest.cancelled.store(true, Ordering::Release);
+                let _ = oldest.socket.shutdown(Shutdown::Both);
+            }
+        }
+        while state.live >= self.task_capacity {
+            state = self
+                .released
+                .wait_timeout(state, remaining(deadline)?)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        remaining(deadline)?;
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.pending.push_back(PendingHandshake {
+            id,
+            socket: duplicate,
+            cancelled: cancelled.clone(),
+        });
+        state.live += 1;
+        Ok(HandshakeTicket {
+            table: self.clone(),
+            id,
+            cancelled,
+        })
+    }
+}
+
+impl HandshakeTicket {
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "witness pending connection evicted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn worker_acquired(&self) -> io::Result<()> {
+        let mut state = self
+            .table
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_cancelled()?;
+        state.pending.retain(|pending| pending.id != self.id);
+        Ok(())
+    }
+}
+
+impl Drop for HandshakeTicket {
+    fn drop(&mut self) {
+        let mut state = self
+            .table
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending.retain(|pending| pending.id != self.id);
+        state.live -= 1;
+        self.table.released.notify_one();
+    }
+}
+
+/// Pause after a failed `accept` before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Its drop releases capacity on success, authentication failure, and unwind.
 pub struct ConnectionPermit(Arc<AtomicUsize>);
@@ -508,7 +636,8 @@ impl Server {
     }
 
     /// Handle exactly one connection, sharing one absolute network deadline.
-    /// The production accept loop reserves a permit before creating a thread.
+    /// The production accept loop bounds pending handshakes and takes a
+    /// worker permit only after authentication (see [`Server::serve`]).
     pub fn handle_connection(&self, socket: TcpStream, handler: &Handler) -> io::Result<()> {
         self.handle_until(socket, Instant::now() + self.timeout, handler)
     }
@@ -519,6 +648,16 @@ impl Server {
         deadline: Instant,
         handler: &Handler,
     ) -> io::Result<()> {
+        let (tls, role) = self.authenticate(socket, deadline)?;
+        self.respond(tls, role, deadline, handler)
+    }
+
+    /// TLS 1.3 with a listed client certificate, mapped to its role.
+    fn authenticate(
+        &self,
+        socket: TcpStream,
+        deadline: Instant,
+    ) -> io::Result<(ServerStream, Role)> {
         socket.set_nodelay(true)?;
         let mut io = DeadlineIo { socket, deadline };
         let mut connection =
@@ -545,7 +684,16 @@ impl Server {
                     "unlisted client certificate",
                 )
             })?;
-        let mut tls = rustls::StreamOwned::new(connection, io);
+        Ok((rustls::StreamOwned::new(connection, io), role))
+    }
+
+    fn respond(
+        &self,
+        mut tls: ServerStream,
+        role: Role,
+        deadline: Instant,
+        handler: &Handler,
+    ) -> io::Result<()> {
         let frame = read_frame(&mut tls)?;
         let request: IncomingRequest<'_> = serde_json::from_slice(frame.expose())
             .map_err(|_| corrupt("invalid witness request"))?;
@@ -578,28 +726,92 @@ impl Server {
         write_frame(&mut tls, bytes.expose())
     }
 
+    /// Serve connections, retrying accept and thread-creation failures.
+    ///
+    /// A worker slot (`max_connections`) is taken only after TLS has
+    /// authenticated a listed certificate, and an authenticated connection
+    /// waits for one until its deadline or eviction. Before
+    /// that, a connection only holds a handshake slot: those are bounded at
+    /// four per worker, and when they are all taken the oldest pending
+    /// handshake is cancelled and cut off. A separate lifetime charge bounds
+    /// all connection tasks (including evicted tasks and their TLS objects)
+    /// to five per worker. Admission waits for reclamation before spawning
+    /// another task. Idle unauthenticated sockets therefore cannot starve a
+    /// client that completes TLS promptly (BUG-104).
     pub fn serve(self: Arc<Self>, listener: TcpListener, handler: Arc<Handler>) -> io::Result<()> {
-        for accepted in listener.incoming() {
+        let handshakes = Arc::new(Handshakes::new(self.max_connections));
+        self.serve_incoming(listener.incoming(), handler, handshakes, |task| {
+            std::thread::Builder::new()
+                .name("maki-witness-rpc".into())
+                .spawn(task)
+                .map(|_| ())
+        })
+    }
+
+    fn serve_incoming(
+        self: Arc<Self>,
+        incoming: impl IntoIterator<Item = io::Result<TcpStream>>,
+        handler: Arc<Handler>,
+        handshakes: Arc<Handshakes>,
+        mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for accepted in incoming {
             let socket = match accepted {
                 Ok(socket) => socket,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                // BUG-111: running out of descriptors or buffers (EMFILE,
+                // ENFILE, ENOBUFS), or a connection aborted before accept,
+                // is transient. Returning ended the service and with it the
+                // freshness authority of every volume using it. Pause so a
+                // persistent failure does not spin, and keep accepting, as
+                // the control socket does (O-04).
+                Err(_) => {
+                    std::thread::sleep(ACCEPT_BACKOFF);
+                    continue;
+                }
             };
             let deadline = Instant::now() + self.timeout;
-            let Ok(permit) = self.try_reserve_connection() else {
+            let Ok(ticket) = handshakes.admit(&socket, deadline) else {
                 continue;
             };
             let server = self.clone();
             let handler = handler.clone();
-            std::thread::Builder::new()
-                .name("maki-witness-rpc".into())
-                .spawn(move || {
-                    let _permit = permit;
-                    // No application payloads or remote error text are logged.
-                    let _ = server.handle_until(socket, deadline, handler.as_ref());
-                })?;
+            let spawned = spawn(Box::new(move || {
+                // Keep this outside the inner closure so TLS state is
+                // destroyed before the task's lifetime charge releases.
+                let ticket = ticket;
+                // No application payloads or remote error text are logged.
+                let _ = (|| {
+                    let (tls, role) = server.authenticate(socket, deadline)?;
+                    let _permit = server.reserve_until(deadline, &ticket)?;
+                    ticket.worker_acquired()?;
+                    server.respond(tls, role, deadline, handler.as_ref())
+                })();
+            }));
+            if spawned.is_err() {
+                // Thread creation can hit the same transient resource
+                // pressure as accept. Dropping the failed task closes its
+                // socket and releases its ticket; keep the listener alive.
+                std::thread::sleep(ACCEPT_BACKOFF);
+            }
         }
         Ok(())
+    }
+
+    /// Wait for a worker slot until `deadline`, observing handshake eviction.
+    fn reserve_until(
+        &self,
+        deadline: Instant,
+        ticket: &HandshakeTicket,
+    ) -> io::Result<ConnectionPermit> {
+        loop {
+            ticket.check_cancelled()?;
+            let remaining = remaining(deadline)?;
+            if let Ok(permit) = self.try_reserve_connection() {
+                return Ok(permit);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
     }
 }
 
@@ -650,6 +862,9 @@ fn write_frame(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     output.write_all(bytes)?;
     output.flush()
 }
+
+#[cfg(test)]
+mod server_tests;
 
 #[cfg(test)]
 mod tests {

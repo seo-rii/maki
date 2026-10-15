@@ -27,6 +27,7 @@ hold everywhere:
 | Use a remote HTTP/WSS/gRPC crypto provider | [Configuration: providers](configuration.md#providers), [`postgres-prod.toml`](../packaging/examples/postgres-prod.toml) |
 | Define acceptance criteria for the actual host, provider and workload | [Deployment qualification profile](deployment/qualification-profile.md) |
 | Measure throughput, tail latency, memory and capacity | [Performance profiles](performance.md) |
+| Run `maki-benchmark` and read its verified report | [Concurrent engine benchmarks](benchmark.md) |
 
 ## Operations
 
@@ -39,6 +40,7 @@ hold everywhere:
 | Interpret status and metrics during a stall | [Observability](observability.md) |
 | Enable TRIM and space reclamation (v3) | [Discard and space reclamation](space-reclamation.md) |
 | Restore or migrate a volume, legacy v1 handling | [Durable recovery and compatibility](durable-recovery.md) |
+| Set up, fail over and restore a remote witness authority (experimental) | [Remote witness service](remote-witness-service.md) |
 
 ## Reference
 

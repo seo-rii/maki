@@ -210,3 +210,18 @@ fn the_workload_cannot_block_detach_through_its_sentinel() {
         .observe(&fixture.mountinfo("253:1", "/", "xfs"))
         .is_err());
 }
+
+#[test]
+fn mounts_below_the_mountpoint_are_observed_by_path_component() {
+    let fixture = Fixture::new();
+    let mountpoint = &fixture.record.attachment.mountpoint;
+    let below = format!("41 25 253:9 / {mountpoint}/wal rw - xfs /dev/x rw\n");
+    let sibling = format!("41 25 253:9 / {mountpoint}2 rw - xfs /dev/x rw\n");
+    let observed = fixture.observe(&below).unwrap();
+    assert!(observed.nested && !observed.mounted);
+    assert!(!fixture.observe(&sibling).unwrap().nested);
+    fixture.mapping("vg--maki-data--lv", "nbd3");
+    let own = fixture.mountinfo("253:0", "/", "xfs");
+    let observed = fixture.observe(&own).unwrap();
+    assert!(observed.mounted && !observed.nested);
+}

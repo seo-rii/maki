@@ -29,6 +29,10 @@ Replacing an old valid ciphertext page fails authentication against the current
 manifest. Restoring an older complete backing fails comparison with the current
 witness. Missing or corrupt committed evidence refuses attachment; an observed
 witness mismatch or uncertain storage commit stops every handle in that session.
+A remote witness that cannot be reached (a timeout, a refused or reset
+connection, an unavailable quorum) refuses each operation with no fallback, but
+does not stop the session: the next check either matches the claimed record
+again or observes the change and stops it.
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.
@@ -60,10 +64,13 @@ sets provide frontend failover; independent copied local directories cannot.
 Its storage and restore authority must remain independent of the backing's
 administration.
 
-Every attach claims a higher fence, authenticates the current manifest and
-copies its committed pages into a fresh, fully reserved namespace before
-activation. The old session cannot publish, and any in-flight physical write
-stays within its old namespace. Normal attach requires a released session;
+Every attach first authenticates the authority's current manifest in its own
+backing root, so a configuration that names another volume's witness fails
+without changing that authority; it then claims a higher fence and copies the
+committed pages into a fresh, fully reserved namespace before activation.
+Takeover applies the same check before it revokes the current writer. The old
+session cannot publish, and any in-flight physical write stays within its old
+namespace. Normal attach requires a released session;
 crashes, ambiguous responses and failed copies require explicit administrator
 intervention. Cached and overlay reads also consult the remote authority.
 

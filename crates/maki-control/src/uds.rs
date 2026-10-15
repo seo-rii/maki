@@ -148,9 +148,9 @@ pub fn resolve_gid_with_capacity(name: &str, initial: usize) -> io::Result<u32> 
     Ok(grp.gr_gid)
 }
 
-/// Bind the control socket (replacing a stale file, refusing live sockets), apply `group` if
-/// given, and restrict the mode to 0660 before publishing its path. Must
-/// be called inside a tokio runtime.
+/// Bind the control socket (replacing a dead socket, refusing a live socket
+/// and any other kind of file), apply `group` if given, and restrict the mode
+/// to 0660 before publishing its path. Must be called inside a tokio runtime.
 pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<ControlListener> {
     let parent = path
         .parent()
@@ -221,6 +221,18 @@ pub fn bind_control_socket(path: &Path, group: Option<&str>) -> io::Result<Contr
                 io::ErrorKind::AddrInUse,
                 format!(
                     "control socket {} already has a live listener",
+                    path.display()
+                ),
+            ));
+        }
+        // BUG-099: only a dead socket is ours to reclaim. The address is
+        // configurable, and renaming over a regular file, a symlink or a
+        // device destroyed whatever a mistyped path named (`superblock.a`).
+        Ok(metadata) if !metadata.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "control socket path {} exists and is not a socket; refusing to replace it",
                     path.display()
                 ),
             ));

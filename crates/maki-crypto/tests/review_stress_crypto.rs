@@ -9,6 +9,7 @@
 //! * counters return to zero: no leaked pending items, bytes, or permits;
 //! * once faults stop, the set recovers and serves again.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,13 +17,14 @@ use std::time::Duration;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use maki_crypto::breaker::BreakerConfig;
+use maki_crypto::breaker::{BreakerConfig, CircuitState};
 use maki_crypto::clock::SystemClock;
 use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
 use maki_crypto::scheduler::{BatchScheduler, SchedulerConfig};
 use maki_crypto::{Clock, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer};
 use maki_test_support::fake_provider::FakeCryptoProvider;
+use maki_test_support::ManualClock;
 
 const UNIT: usize = 256;
 const TASKS: u64 = 48;
@@ -227,6 +229,11 @@ async fn dispatcher_survives_random_endpoint_faults_and_leaks_nothing() {
     let endpoints: Vec<Arc<FakeCryptoProvider>> = (0..3)
         .map(|_| Arc::new(FakeCryptoProvider::new(UNIT as u32)))
         .collect();
+    for endpoint in &endpoints {
+        // Exercise immediate circuit opening before startup scheduling can
+        // let an unaffected request make the success assertion pass.
+        endpoint.fail_next((0..3).map(|_| CryptoError::EndpointFatal("chaos".into())));
+    }
     let set = Arc::new(EndpointSet::new(
         endpoints
             .iter()
@@ -237,13 +244,15 @@ async fn dispatcher_survives_random_endpoint_faults_and_leaks_nothing() {
         Arc::new(SystemClock::new()),
     ));
 
-    let stop = Arc::new(AtomicBool::new(false));
     let chaos = {
         let endpoints = endpoints.clone();
-        let stop = stop.clone();
         tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(0xD15);
-            while !stop.load(Ordering::SeqCst) {
+            // With EndpointFatal opening immediately, replenishing all peers
+            // indefinitely outpaces half-open probes: this is a continuous
+            // outage, which cannot promise any successful request. Bound the
+            // injection burst so the same workload includes a healthy window.
+            for _ in 0..128 {
                 let ep = &endpoints[rng.random_range(0..endpoints.len())];
                 if ep.queued_failures() < 3 {
                     ep.fail_next([random_error(&mut rng)]);
@@ -297,11 +306,17 @@ async fn dispatcher_survives_random_endpoint_faults_and_leaks_nothing() {
         total_ok += ok;
         total_failed += failed;
     }
-    stop.store(true, Ordering::SeqCst);
     chaos.await.unwrap();
 
-    assert!(total_ok > 0, "nothing ever succeeded");
-    let _ = total_failed;
+    assert!(
+        total_ok > 0,
+        "nothing ever succeeded ({total_failed} failures)"
+    );
+    assert!(
+        set.metrics().failovers_total() > 0,
+        "fault injection never triggered failover"
+    );
+    assert_eq!(set.global_inflight(), (0, 0), "global permits leaked");
     for status in set.endpoint_status() {
         assert_eq!(status.inflight, 0, "permit leaked on {}", status.name);
     }
@@ -330,4 +345,77 @@ async fn dispatcher_survives_random_endpoint_faults_and_leaks_nothing() {
     for status in set.endpoint_status() {
         assert_eq!(status.inflight, 0, "permit leaked on {}", status.name);
     }
+    assert_eq!(
+        set.global_inflight(),
+        (0, 0),
+        "global permits leaked after recovery"
+    );
+}
+
+#[tokio::test]
+async fn all_endpoint_fatal_outage_fails_then_recovers_after_the_probe_deadline() {
+    let clock = Arc::new(ManualClock::new());
+    let endpoints: Vec<_> = (0..3)
+        .map(|_| Arc::new(FakeCryptoProvider::new(UNIT as u32)))
+        .collect();
+    for endpoint in &endpoints {
+        endpoint.fail_next([CryptoError::EndpointFatal("unavailable".into())]);
+    }
+    let mut config = dispatch_cfg();
+    config.max_attempts = Some(1);
+    config.retry.initial_delay = Duration::ZERO;
+    config.retry.max_delay = Duration::ZERO;
+    let reopen = config.breaker.open_initial;
+    let set = EndpointSet::new(
+        endpoints
+            .iter()
+            .enumerate()
+            .map(|(i, endpoint)| {
+                (
+                    format!("ep{i}"),
+                    endpoint.clone() as Arc<dyn CryptoProvider>,
+                )
+            })
+            .collect(),
+        config,
+        clock.clone(),
+    );
+    let context = ctx();
+    let units = [pt(7), pt(8)];
+    let error = set.encrypt_batch(&context, &units).await.unwrap_err();
+    assert!(matches!(error, CryptoError::EndpointFatal(_)), "{error:?}");
+    for (endpoint, status) in endpoints.iter().zip(set.endpoint_status()) {
+        assert_eq!(
+            endpoint.encrypt_calls(),
+            1,
+            "first fatal answer must open immediately"
+        );
+        assert_eq!(status.circuit, CircuitState::Open);
+        assert_eq!(status.inflight, 0);
+    }
+    assert_eq!(set.global_inflight(), (0, 0));
+
+    // The injected failure was consumed, but recovery must wait until a
+    // half-open probe is admissible. Poll directly without advancing time.
+    let recovery = set.encrypt_batch(&context, &units);
+    tokio::pin!(recovery);
+    let state = std::future::poll_fn(|cx| std::task::Poll::Ready(recovery.as_mut().poll(cx))).await;
+    assert!(state.is_pending(), "open circuits were bypassed");
+    clock.advance(reopen);
+    let ciphertext = recovery.await.unwrap();
+    let back = endpoints[0]
+        .decrypt_batch(&context, &ciphertext)
+        .await
+        .unwrap();
+    for (actual, expected) in back.iter().zip(&units) {
+        assert_eq!(actual.unit_index, expected.unit_index);
+        assert_eq!(actual.data.expose(), expected.data.expose());
+    }
+    assert_eq!(set.endpoint_status()[0].circuit, CircuitState::Closed);
+    assert_eq!(set.global_inflight(), (0, 0));
+    assert!(set
+        .endpoint_status()
+        .iter()
+        .all(|status| status.inflight == 0));
+    assert_eq!(clock.sleeper_count(), 0);
 }

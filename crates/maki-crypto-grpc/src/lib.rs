@@ -27,7 +27,9 @@ use maki_crypto::{
     PlaintextUnit, SecretBuffer,
 };
 
+mod connection;
 mod protected;
+use connection::ConnectionCache;
 use protected::{WireItem, WireRequest, WireResponse};
 
 #[cfg(test)]
@@ -159,6 +161,8 @@ struct ResponseFraming {
     header_bytes: usize,
     remaining: usize,
     limit: usize,
+    /// Messages received completely.
+    messages: usize,
 }
 
 impl ResponseFraming {
@@ -168,7 +172,13 @@ impl ResponseFraming {
             header_bytes: 0,
             remaining: 0,
             limit,
+            messages: 0,
         }
+    }
+
+    /// A length prefix or message body is still incomplete.
+    fn inside_message(&self) -> bool {
+        self.header_bytes > 0 || self.remaining > 0
     }
 
     fn observe(&mut self, mut bytes: &[u8]) -> Result<(), &'static str> {
@@ -177,6 +187,9 @@ impl ResponseFraming {
                 let consumed = self.remaining.min(bytes.len());
                 self.remaining -= consumed;
                 bytes = &bytes[consumed..];
+                if self.remaining == 0 {
+                    self.messages += 1;
+                }
                 continue;
             }
             let consumed = (self.header.len() - self.header_bytes).min(bytes.len());
@@ -195,6 +208,9 @@ impl ResponseFraming {
                 }
                 self.remaining = length;
                 self.header_bytes = 0;
+                if length == 0 {
+                    self.messages += 1;
+                }
             }
         }
         Ok(())
@@ -215,12 +231,32 @@ impl http_body::Body for BoundedResponseBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
-        if let Some(Ok(frame)) = &frame {
-            if let Some(bytes) = frame.data_ref() {
-                if let Err(message) = self.framing.observe(bytes) {
-                    return Poll::Ready(Some(Err(receive_contract_status(message))));
+        // A response that ends inside a message, or reports success without
+        // one, broke the receive contract; tonic would surface either as a
+        // local `Internal` status, which maps to Retryable (BUG-121).
+        let violation = match &frame {
+            Some(Ok(frame)) => {
+                if let Some(bytes) = frame.data_ref() {
+                    self.framing.observe(bytes).err()
+                } else if let Some(trailers) = frame.trailers_ref() {
+                    if self.framing.inside_message() {
+                        Some("grpc response ended inside a message")
+                    } else if self.framing.messages == 0
+                        && trailers.get("grpc-status").map(|v| v.as_bytes()) == Some(b"0")
+                    {
+                        Some("grpc response reported success without a message")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
             }
+            None if self.framing.inside_message() => Some("grpc response ended inside a message"),
+            _ => None,
+        };
+        if let Some(message) = violation {
+            return Poll::Ready(Some(Err(receive_contract_status(message))));
         }
         Poll::Ready(frame)
     }
@@ -429,6 +465,10 @@ mod receive_contract_tests {
 
 // ---------------------------------------------------------------- provider
 
+/// A connection attempt, TLS handshake included, is abandoned after this
+/// many RPC timeouts (BUG-115).
+const CONNECT_BOUND_RPC_TIMEOUTS: u32 = 4;
+
 pub struct GrpcProviderSpec {
     /// e.g. `http://crypto.internal:7000` (or https with TLS config).
     pub url: String,
@@ -532,7 +572,7 @@ impl std::fmt::Debug for GrpcProviderSpec {
 
 pub struct GrpcCryptoProvider {
     spec: GrpcProviderSpec,
-    channel: Channel,
+    connections: ConnectionCache,
     encrypt_path: PathAndQuery,
     decrypt_path: PathAndQuery,
 }
@@ -585,7 +625,19 @@ impl GrpcCryptoProvider {
                 return Err(fatal("https endpoint requires explicit TLS configuration"));
             }
             (Some("https"), Some(tls)) => {
-                let mut config = ClientTlsConfig::new().with_native_roots();
+                // A configured CA adds trust to the host's roots, as for the
+                // HTTP and WebSocket transports. tonic refuses to build the
+                // connector when native roots are requested and none load, so
+                // on a host with an empty OS store the CA in hand was useless
+                // (BUG-097): request native roots only if there are any, or if
+                // no CA is configured (then nothing is trusted and attach
+                // fails closed, as before).
+                let native_roots = tls.ca_certificate_pem.is_none()
+                    || !rustls_native_certs::load_native_certs().certs.is_empty();
+                let mut config = ClientTlsConfig::new();
+                if native_roots {
+                    config = config.with_native_roots();
+                }
                 if let Some(ca) = tls.ca_certificate_pem {
                     if ca.is_empty() {
                         return Err(fatal("custom TLS CA certificate is empty"));
@@ -614,10 +666,28 @@ impl GrpcCryptoProvider {
             }
             (None, _) => return Err(fatal("gRPC endpoint URL has no scheme")),
         }
-        let channel = endpoint
+        // `connect_lazy` applies the connect timeout to the TCP connect only;
+        // a peer that accepts TCP and never answers the ClientHello then
+        // pins the channel's connection worker, and every later RPC queues
+        // behind that handshake (BUG-115). With an explicit connector, tonic
+        // bounds the whole connect, TLS included, and reconnects afterwards.
+        // The bound is several RPC timeouts: a slow but working handshake
+        // still completes in the background for the next RPC, as before.
+        // The TCP connector is configured like tonic's own: its timeout is
+        // divided across the resolved addresses, so an unreachable first
+        // address (`localhost` as `::1` on Windows) leaves time for the next.
+        let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
+        tcp.enforce_http(false);
+        tcp.set_nodelay(true);
+        tcp.set_connect_timeout(Some(spec.timeout));
+        let endpoint = endpoint
             .timeout(spec.timeout)
-            .connect_timeout(spec.timeout)
-            .connect_lazy();
+            .connect_timeout(spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS));
+        let connections = ConnectionCache::new(
+            endpoint,
+            tcp,
+            spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS),
+        );
         let encrypt_path = PathAndQuery::try_from(spec.encrypt_path.clone())
             .map_err(|e| fatal(format!("bad encrypt path: {e}")))?;
         let decrypt_path = PathAndQuery::try_from(spec.decrypt_path.clone())
@@ -631,7 +701,7 @@ impl GrpcCryptoProvider {
                 .map_err(|e| fatal(format!("bad metadata value for {key:?}: {e}")))?;
         }
         Ok(Self {
-            channel,
+            connections,
             encrypt_path,
             decrypt_path,
             spec,
@@ -661,8 +731,9 @@ impl GrpcCryptoProvider {
             )));
         }
 
+        let mut connection = self.connections.exchange();
         let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
-            inner: self.channel.clone(),
+            inner: connection.channel(),
             limit: self.spec.max_message_bytes,
         })
         .max_decoding_message_size(self.spec.max_message_bytes)
@@ -695,15 +766,24 @@ impl GrpcCryptoProvider {
                 .await
                 .map_err(|status| map_status(&status))
         };
-        let response = tokio::time::timeout(self.spec.timeout, exchange)
-            .await
-            .map_err(|_| {
-                CryptoError::Retryable(format!(
+        let response = match tokio::time::timeout(self.spec.timeout, exchange).await {
+            Ok(Ok(response)) => {
+                connection.succeeded();
+                response.into_inner()
+            }
+            Ok(Err(error)) => {
+                if error.class() != ErrorClass::Retryable {
+                    connection.preserve();
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(CryptoError::Retryable(format!(
                     "grpc operation exceeded the {:?} transport timeout",
                     self.spec.timeout
-                ))
-            })??
-            .into_inner();
+                )));
+            }
+        };
 
         if response.items.len() != expected.len() {
             return Err(CryptoError::Contract(format!(

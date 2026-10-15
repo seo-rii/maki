@@ -8,7 +8,8 @@ use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextU
 
 /// A local or remote cryptographic provider.
 ///
-/// Contract (validated by the caller — see `batch_check` in Phase 2):
+/// Contract (validated by the caller — see `validate_encrypt_result` and
+/// `validate_decrypt_result` in `checked.rs`, applied by `CheckedProvider`):
 /// - the result vector has exactly one entry per input item,
 /// - in the same order, with matching `unit_index`,
 /// - ciphertext never exceeds `capabilities().max_ciphertext_size`,

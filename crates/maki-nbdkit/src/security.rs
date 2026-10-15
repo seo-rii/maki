@@ -298,12 +298,27 @@ mod linux {
         }
     }
 
+    /// cryptsetup names every device it activates `CRYPT-<TYPE>-…`, including
+    /// ones that do not encrypt: standalone dm-integrity (`INTEGRITY`), the
+    /// integrity layer under LUKS2 authenticated encryption (`SUBDEV`),
+    /// dm-verity and temporary helpers (`TEMP`). Only encrypting types make
+    /// encrypted swap (BUG-114); an unknown type fails closed. A mapping
+    /// configured with `cipher_null` cannot be told apart in sysfs.
+    fn is_encrypting_crypt_uuid(uuid: &str) -> bool {
+        const ENCRYPTING: [&str; 7] = [
+            "LUKS1", "LUKS2", "PLAIN", "LOOPAES", "TCRYPT", "BITLK", "FVAULT2",
+        ];
+        uuid.strip_prefix("CRYPT-")
+            .and_then(|rest| rest.split('-').next())
+            .is_some_and(|kind| ENCRYPTING.contains(&kind))
+    }
+
     fn is_encrypted_swap(device: Device, sysfs: &Path) -> bool {
         let Some(path) = block_node(sysfs, device) else {
             return false;
         };
         if !std::fs::read_to_string(path.join("dm/uuid"))
-            .is_ok_and(|uuid| uuid.trim().starts_with("CRYPT-"))
+            .is_ok_and(|uuid| is_encrypting_crypt_uuid(uuid.trim()))
         {
             return false;
         }

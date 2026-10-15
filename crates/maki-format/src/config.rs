@@ -7,6 +7,8 @@
 //!   be `{ source = "credential", name = "…" }` references (SPEC §9),
 //! - human-friendly sizes ("128MiB"), durations ("150us"), rates ("1/s").
 
+mod transport_size;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -24,15 +26,50 @@ pub const MAX_VOLUME_NAME_BYTES: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Where and what, never the document: see [`parse_config`].
     #[error("config parse error: {0}")]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("config invalid: {0}")]
     Invalid(String),
 }
 
+/// Parse a volume configuration.
+///
+/// TOML and schema failures expose only a fixed classification and location.
+/// Both values and unknown field names are untrusted input. Neither Display
+/// nor Debug retains the TOML error, its free-form message, or source text.
 pub fn parse_config(input: &str) -> Result<VolumeConfig, ConfigError> {
-    let cfg: VolumeConfig = toml::from_str(input)?;
-    Ok(cfg)
+    toml::from_str(input).map_err(|error| {
+        let location = error
+            .span()
+            .and_then(|span| input.get(..span.start))
+            .map(|before| {
+                let line = before.matches('\n').count() + 1;
+                let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                format!(" at line {line}, column {column}")
+            })
+            .unwrap_or_default();
+        ConfigError::Parse(format!("invalid TOML or configuration schema{location}"))
+    })
+}
+
+/// `scheme://host[:port]` of an endpoint URL, for messages: userinfo, path
+/// and query may carry credentials (BUG-113).
+fn redacted_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let scheme: String = scheme
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '+')
+                .collect();
+            format!("{scheme}://{host}")
+        }
+        None => "(no scheme)".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------- ByteSize
@@ -313,6 +350,10 @@ pub struct HttpSection {
     pub max_response_bytes: Option<ByteSize>,
 }
 
+/// Default HTTP response-body cap when `[crypto.http].max_response_bytes`
+/// is unset. Validation and the HTTP provider use the same value.
+pub const DEFAULT_HTTP_MAX_RESPONSE_BYTES: u64 = 8 << 20;
+
 /// Default WebSocket frame-size cap when `[crypto.websocket].max_frame_bytes`
 /// is unset. Must match the daemon's transport wiring; validation and the
 /// runtime use the same value so a config that validates also runs.
@@ -433,6 +474,15 @@ pub struct BodyConfig {
     /// Per-item fields within `items_path` elements.
     #[serde(default)]
     pub item_fields: BTreeMap<String, FieldMapping>,
+}
+
+impl BodyConfig {
+    /// One request carries several items: a JSON body with `items_path`.
+    /// A raw body, or a JSON body without `items_path`, sends one request
+    /// per item (and never sends `item_fields`).
+    pub fn is_batch(&self) -> bool {
+        self.body_type == "json" && self.items_path.is_some()
+    }
 }
 
 fn d_json() -> String {
@@ -825,9 +875,9 @@ impl VolumeConfig {
     /// Otherwise `[crypto.batch] max_items`.
     pub fn effective_batch_max_items(&self) -> u32 {
         let per_item = |op: &Option<HttpOpConfig>| {
-            op.as_ref()
+            !op.as_ref()
                 .and_then(|op| op.body.as_ref())
-                .is_none_or(|body| body.items_path.is_none())
+                .is_some_and(BodyConfig::is_batch)
         };
         match &self.crypto.http {
             Some(http)
@@ -1110,8 +1160,10 @@ impl VolumeConfig {
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         self.validate_journal_bounds()?;
         self.validate_settings()?;
-        self.validate_provider_sections()?;
+        // Name conflicts first: they say more than a per-credential error
+        // about the same name.
         self.validate_credential_sources()?;
+        self.validate_provider_sections()?;
         if !self
             .crypto
             .capabilities
@@ -1220,7 +1272,22 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     if c.name.is_empty() {
         return Err(ConfigError::Invalid("credential name is empty".to_string()));
     }
+    // A `file` credential names a path. A relative one resolves against the
+    // working directory of whichever process reads it, which is not the one
+    // that validated it (BUG-122).
+    if c.source == "file" && !is_absolute_path(&c.name) {
+        return Err(ConfigError::Invalid(format!(
+            "file credential {:?} must be an absolute path",
+            c.name
+        )));
+    }
     Ok(())
+}
+
+/// Absolute on this platform, or rooted at `/` (the form the shipped
+/// configurations use, also accepted on Windows test hosts).
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with('/') || std::path::Path::new(path).is_absolute()
 }
 
 impl VolumeConfig {
@@ -1299,20 +1366,22 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
     let (scheme, rest) = url
         .split_once("://")
-        .ok_or_else(|| invalid(format!("endpoint url {url:?} has no scheme")))?;
+        .ok_or_else(|| invalid("endpoint url has no scheme; expected scheme://host[:port]"))?;
     if scheme.is_empty()
         || !scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '+')
     {
         return Err(invalid(format!(
-            "endpoint url {url:?} has an invalid scheme"
+            "endpoint url {} has an invalid scheme",
+            redacted_url(url)
         )));
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.contains('@') {
         return Err(invalid(format!(
-            "endpoint url {url:?} carries userinfo; credentials belong in credential references"
+            "endpoint url {} carries userinfo; credentials belong in credential references",
+            redacted_url(url)
         )));
     }
     let host = if let Some(stripped) = authority.strip_prefix('[') {
@@ -1325,7 +1394,10 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             .to_string()
     };
     if host.is_empty() {
-        return Err(invalid(format!("endpoint url {url:?} has no host")));
+        return Err(invalid(format!(
+            "endpoint url {} has no host",
+            redacted_url(url)
+        )));
     }
     Ok((scheme.to_ascii_lowercase(), host))
 }
@@ -1371,7 +1443,13 @@ fn validate_endpoints(
                 endpoint.name
             )));
         }
-        let (scheme, host) = parse_endpoint_url(&endpoint.url)?;
+        let (scheme, host) = parse_endpoint_url(&endpoint.url).map_err(|error| match error {
+            ConfigError::Invalid(message) => invalid(format!(
+                "[crypto.{transport}] endpoint {:?}: {message}",
+                endpoint.name
+            )),
+            other => other,
+        })?;
         if scheme == plaintext_scheme {
             if has_tls_options {
                 return Err(invalid(format!(
@@ -1380,16 +1458,18 @@ fn validate_endpoints(
             }
             if !is_loopback_host(&host) {
                 return Err(invalid(format!(
-                    "endpoint {:?}: plaintext {plaintext_scheme}:// is only allowed to loopback \
-                     hosts; block data would cross the network unencrypted (use {tls_scheme}:// \
-                     or a local tunnel)",
-                    endpoint.url
+                    "endpoint {:?} ({}): plaintext {plaintext_scheme}:// is only allowed to \
+                     loopback hosts; block data would cross the network unencrypted (use \
+                     {tls_scheme}:// or a local tunnel)",
+                    endpoint.name,
+                    redacted_url(&endpoint.url)
                 )));
             }
         } else if scheme != tls_scheme {
             return Err(invalid(format!(
-                "endpoint {:?}: scheme must be {plaintext_scheme} or {tls_scheme}",
-                endpoint.url
+                "endpoint {:?} ({}): scheme must be {plaintext_scheme} or {tls_scheme}",
+                endpoint.name,
+                redacted_url(&endpoint.url)
             )));
         }
     }
@@ -1408,6 +1488,13 @@ fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
         ("client_cert_file", &tls.client_cert_file),
     ] {
         if let Some(path) = path {
+            // Relative paths resolve against the reading process's working
+            // directory, not the validating one (BUG-122).
+            if !is_absolute_path(path) {
+                return Err(invalid(format!(
+                    "[crypto.{section}.tls] {field} {path:?} must be an absolute path"
+                )));
+            }
             // Check the type before opening: opening a FIFO would block.
             if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
                 return Err(invalid(format!(
@@ -1460,11 +1547,7 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
             validate_credential(c)?;
         }
     }
-    let body_is_batch = op
-        .body
-        .as_ref()
-        .map(|b| b.body_type == "json" && b.items_path.is_some())
-        .unwrap_or(false);
+    let body_is_batch = op.body.as_ref().is_some_and(BodyConfig::is_batch);
     if let Some(body) = &op.body {
         if !["json", "raw"].contains(&body.body_type.as_str()) {
             return Err(invalid(format!(
@@ -1797,8 +1880,8 @@ impl VolumeConfig {
                 }
             }
         }
-        // Binding the control socket replaces whatever file is at its path,
-        // so it must never share one with the NBD export socket. Compare the
+        // Binding the control socket reclaims a dead socket at its path, so
+        // it must never share one with the NBD export socket. Compare the
         // effective paths (defaults included) component-wise, so `a//b` and
         // `a/./b` name the same file.
         let control_socket = self
@@ -1918,10 +2001,19 @@ impl VolumeConfig {
                 // (R3-006). WebSocket and gRPC always send all three.
                 if crypto.capabilities.context_binding != "none" {
                     for (name, op) in [("encrypt", encrypt), ("decrypt", decrypt)] {
+                        // Only mappings that reach the wire count: a raw body
+                        // sends the payload alone, and item_fields are sent
+                        // only inside a batch (BUG-093).
                         let sources: Vec<&str> = op
                             .body
                             .iter()
-                            .flat_map(|b| b.fields.values().chain(b.item_fields.values()))
+                            .filter(|b| b.body_type == "json")
+                            .flat_map(|b| {
+                                let items = b.is_batch().then_some(&b.item_fields);
+                                b.fields
+                                    .values()
+                                    .chain(items.into_iter().flatten().map(|(_, m)| m))
+                            })
                             .map(|m| m.source.as_str())
                             .collect();
                         for required in ["volume_id", "compatibility_id", "format_version"] {
@@ -1949,6 +2041,22 @@ impl VolumeConfig {
                         return Err(invalid("[crypto.http] max_response_bytes must be positive"));
                     }
                 }
+                let limit = http
+                    .max_response_bytes
+                    .map(|b| b.0)
+                    .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES);
+                for (name, op, is_encrypt) in
+                    [("encrypt", encrypt, true), ("decrypt", decrypt, false)]
+                {
+                    let encoded = self.http_response_bound(op, is_encrypt)?;
+                    if encoded > limit {
+                        return Err(invalid(format!(
+                            "[crypto.http] max_response_bytes {limit} cannot carry a full {name} \
+                             response ({encoded} serialized bytes); lower crypto.batch.max_items \
+                             or crypto.batch.max_bytes, or raise max_response_bytes"
+                        )));
+                    }
+                }
             }
             "remote-websocket" => {
                 if crypto.key.is_some() {
@@ -1963,6 +2071,9 @@ impl VolumeConfig {
                     validate_tls("websocket", tls)?;
                 }
                 validate_endpoints("websocket", &ws.endpoint, "ws", "wss", ws.tls.is_some())?;
+                if ws.timeout.is_some_and(|t| t.0.is_zero()) {
+                    return Err(invalid("[crypto.websocket] timeout must be positive"));
+                }
                 let frame = ws
                     .max_frame_bytes
                     .map(|b| b.0)
@@ -1972,19 +2083,13 @@ impl VolumeConfig {
                         "[crypto.websocket] max_frame_bytes must be positive",
                     ));
                 }
-                // A batch is sent as one JSON frame with base64 payloads
-                // (~4/3 the raw bytes). If a maximal batch's base64 payload
-                // alone cannot fit the frame, every large batch fails at
-                // runtime with a non-retryable frame-limit error on a volume
-                // that validated cleanly. This is a necessary bound; leave
-                // headroom above it for the surrounding JSON structure.
-                let encoded = self.crypto.batch.max_bytes.0.div_ceil(3).saturating_mul(4);
+                let encoded = self.websocket_frame_bound()?;
                 if encoded > frame {
                     return Err(invalid(format!(
-                        "[crypto.websocket] max_frame_bytes {frame} cannot carry a \
-                         crypto.batch.max_bytes {} batch (~{encoded} bytes once base64-encoded); \
-                         lower crypto.batch.max_bytes or raise max_frame_bytes",
-                        self.crypto.batch.max_bytes.0
+                        "[crypto.websocket] max_frame_bytes {frame} cannot carry a full \
+                         crypto batch ({encoded} serialized bytes); lower \
+                         crypto.batch.max_items or crypto.batch.max_bytes, or raise \
+                         max_frame_bytes"
                     )));
                 }
             }
@@ -2002,6 +2107,9 @@ impl VolumeConfig {
                     validate_tls("grpc", tls)?;
                 }
                 validate_endpoints("grpc", &grpc.endpoint, "http", "https", grpc.tls.is_some())?;
+                if grpc.timeout.is_some_and(|t| t.0.is_zero()) {
+                    return Err(invalid("[crypto.grpc] timeout must be positive"));
+                }
                 for (name, value) in &grpc.metadata {
                     if name.trim().is_empty() {
                         return Err(invalid("[crypto.grpc.metadata] empty key"));
@@ -2017,17 +2125,12 @@ impl VolumeConfig {
                 if message == 0 {
                     return Err(invalid("[crypto.grpc] max_message_bytes must be positive"));
                 }
-                // A whole batch is one gRPC message. If crypto.batch.max_bytes
-                // exceeds the message limit, every large batch is rejected at
-                // the transport (non-retryable) on a volume that validated
-                // cleanly. Necessary bound; leave headroom for protobuf
-                // framing (~16 bytes per item plus a fixed prefix).
-                if self.crypto.batch.max_bytes.0 > message {
+                let wire = self.grpc_message_bound()?;
+                if wire > message {
                     return Err(invalid(format!(
-                        "[crypto.grpc] max_message_bytes {message} cannot carry a \
-                         crypto.batch.max_bytes {} batch; lower crypto.batch.max_bytes or raise \
-                         max_message_bytes",
-                        self.crypto.batch.max_bytes.0
+                        "[crypto.grpc] max_message_bytes {message} cannot carry a full \
+                         crypto batch ({wire} serialized bytes); lower crypto.batch.max_items or \
+                         crypto.batch.max_bytes, or raise max_message_bytes"
                     )));
                 }
             }

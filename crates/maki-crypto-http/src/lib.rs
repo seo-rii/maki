@@ -791,7 +791,14 @@ impl HttpCryptoProvider {
         for (name, value) in &op.headers {
             request = request.header(name, value);
         }
-        if json {
+        // An explicit media type also applies to JSON, including vendor
+        // types. Appending the default would send two Content-Type fields.
+        if json
+            && !op
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
             request = request.header("content-type", "application/json");
         }
         let response = request
@@ -1207,7 +1214,7 @@ impl HttpCryptoProvider {
             max_response_bytes: http
                 .max_response_bytes
                 .map(|b| b.0 as usize)
-                .unwrap_or(8 << 20),
+                .unwrap_or(maki_format::config::DEFAULT_HTTP_MAX_RESPONSE_BYTES as usize),
             tls,
         })
     }

@@ -144,23 +144,30 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         }
     }
 
-    // Orphaned shard files (exist but not in catalog) are a warning: they can
-    // result from a crash between file creation and catalog update, and are
-    // ignored by reads.
+    // A shard data file the loaded catalog copy does not list results from a
+    // crash between file creation and the catalog update, or from a fallback
+    // to an older catalog copy. Recovery adopts it and serves its slots
+    // (S-01); one beyond the geometry is never read. Only the canonical
+    // spelling is a shard file, exactly as recovery parses it.
     if backing.exists(layout::DATA_DIR)? {
         for name in backing.list(layout::DATA_DIR)? {
-            if let Some(hex) = name
-                .strip_prefix("shard-")
-                .and_then(|n| n.strip_suffix(".dat"))
-            {
-                if let Ok(idx) = u64::from_str_radix(hex, 16) {
-                    if !catalog.contains(idx) {
-                        report
-                            .warnings
-                            .push(format!("orphaned shard data file {name} (index {idx})"));
-                    }
-                }
+            let Some(idx) = layout::parse_shard_data(&name) else {
+                continue;
+            };
+            if catalog.contains(idx) {
+                continue;
             }
+            report.warnings.push(if idx < geometry.num_shards() {
+                format!(
+                    "shard data file {name} (index {idx}) is not in the catalog; \
+                     recovery adopts it"
+                )
+            } else {
+                format!(
+                    "shard data file {name} (index {idx}) lies beyond the volume \
+                     geometry and is ignored"
+                )
+            });
         }
     }
 

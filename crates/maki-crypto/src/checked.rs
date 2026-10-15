@@ -3,7 +3,9 @@
 //! Maki never trusts a provider's batch result shape. `CheckedProvider`
 //! wraps any provider and verifies count, order, unit indices, and size
 //! limits on every call; a violation is `CryptoError::Contract`
-//! (ProviderFatal — a misbehaving provider is never retried into).
+//! (ProviderFatal). It is never retried against the endpoint that sent it; in
+//! an `EndpointSet` it charges that endpoint's breaker, and a retry-safe
+//! request fails over to an endpoint it has not tried yet (R5-005).
 
 use std::sync::Arc;
 
@@ -80,6 +82,19 @@ pub fn validate_encrypt_result(
                 "encrypt result {i} is {} bytes, exceeding max_ciphertext_size {}",
                 ct.data.len(),
                 caps.max_ciphertext_size
+            )));
+        }
+        // A pass-through answer would be persisted as "ciphertext". Checked on
+        // every call, not only by the attach self-test: an endpoint can start
+        // echoing later (a stub backend behind a load balancer), and framing
+        // (a nonce before it, a tag after it, or both, as an integrity-only
+        // profile produces) must not hide the echo (BUG-105). A real cipher
+        // reproduces a whole unit of plaintext with negligible probability.
+        // The error charges the endpoint that answered.
+        let plain = item.data.expose();
+        if !plain.is_empty() && ct.data.windows(plain.len()).any(|window| window == plain) {
+            return Err(CryptoError::Contract(format!(
+                "encrypt result {i} carries its plaintext: the provider is not encrypting"
             )));
         }
     }

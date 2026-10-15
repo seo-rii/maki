@@ -8,9 +8,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-fn usage() -> ExitCode {
-    eprintln!(
-        "usage:
+const USAGE: &str = "usage:
   maki volume create <config.toml> [--discard]  initialize a volume (opt-in v3 discard)
   maki volume inspect <config.toml>    print volume metadata
   maki volume witness <config.toml>    inspect remote authority without claiming a writer
@@ -26,8 +24,14 @@ fn usage() -> ExitCode {
   maki drain <config.toml>             close I/O admission, flush and checkpoint
   maki reload <config.toml> cache --max-bytes <bytes> [--ttl <duration>]
   maki reload <config.toml> <section>  hot config reload (control socket)
-  maki attach|detach|grow ...          delegated to maki-attach (privileged)"
-    );
+    control commands take --socket <path> in place of <config.toml>, e.g.
+    --socket /run/maki-control/<volume>/control.sock for maki-admin members
+  maki attach|detach|grow ...          delegated to maki-attach (privileged)
+  maki --help | --version";
+
+/// Misuse: the usage on stderr, status 2.
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -63,17 +67,103 @@ fn take_timeout(args: &mut Vec<String>) -> Result<Option<Duration>, String> {
     Ok(Some(Duration::from_secs(secs)))
 }
 
+/// Remove `--socket <path>` from the arguments, if present.
+fn take_socket(args: &mut Vec<String>) -> Result<Option<String>, String> {
+    let Some(i) = args.iter().position(|a| a == "--socket") else {
+        return Ok(None);
+    };
+    let value = args
+        .get(i + 1)
+        .cloned()
+        .filter(|path| !path.is_empty() && !path.starts_with("--"))
+        .ok_or_else(|| "--socket needs the control socket path".to_string())?;
+    args.drain(i..i + 2);
+    Ok(Some(value))
+}
+
+/// Where a control command connects (BUG-108). The volume configuration
+/// names the socket; `--socket` gives it directly, for a `maki-admin` member
+/// who cannot read the root-owned configuration. Non-Unix builds refuse
+/// every control command before connecting.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum ControlTarget<'a> {
+    Config(&'a str),
+    Socket(String),
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl ControlTarget<'_> {
+    /// Only the socket address is needed: the configuration is parsed, not
+    /// validated, so one edited for the next start cannot block `drain` on
+    /// the running daemon.
+    fn socket(&self) -> Result<String, String> {
+        match self {
+            Self::Socket(path) => Ok(path.clone()),
+            Self::Config(config) => {
+                let raw = std::fs::read_to_string(config).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!(
+                            "{config}: {e}; without access to the volume configuration pass \
+                             --socket /run/maki-control/<volume>/control.sock"
+                        )
+                    } else {
+                        format!("{config}: {e}")
+                    }
+                })?;
+                let cfg = maki_format::config::parse_config(&raw).map_err(|e| e.to_string())?;
+                Ok(maki_nbdkit::daemon::control_socket_path(&cfg))
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // Store repairs and recovery decisions are reported through `tracing`;
     // an offline check or volume creation must show them too (R4-001).
     maki_core::logging::install_default_logging();
+    // Opening a volume keeps every shard data file open (BUG-124).
+    if let Err(e) = maki_backing::raise_open_file_limit() {
+        eprintln!("warning: cannot raise the open-file soft limit: {e}");
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Helper options belong to the helper, including its NBD --socket
+    // override. Preserve them before interpreting any control options.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("attach" | "detach" | "grow")
+    ) {
+        return privileged_helper(&args);
+    }
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
+    // A leading --timeout can expose a helper verb. Route it before
+    // interpreting the helper's NBD socket as a control socket.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("attach" | "detach" | "grow")
+    ) {
+        return privileged_helper(&args);
+    }
+    let socket = match take_socket(&mut args) {
+        Ok(socket) => socket,
+        Err(e) => return fail(e),
+    };
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    if let Some(socket) = socket {
+        return control_by_socket(&argv, socket, timeout);
+    }
     match argv.as_slice() {
+        // BUG-112: asking for help is not misuse.
+        ["--help" | "-h" | "help"] => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        ["--version" | "-V"] => {
+            println!("maki {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         ["volume", "create", config] | ["volume", "create", config, "--discard"] => {
             let raw = match std::fs::read_to_string(config) {
                 Ok(raw) => raw,
@@ -141,56 +231,98 @@ fn main() -> ExitCode {
             Err(e) => fail(e),
         },
         ["status", config] => control(
-            config,
+            &ControlTarget::Config(config),
             "status",
             None,
             serde_json::Value::Null,
             timeout.unwrap_or(CONTROL_TIMEOUT),
         ),
         ["metrics", config] => control(
-            config,
+            &ControlTarget::Config(config),
             "metrics",
             None,
             serde_json::Value::Null,
             timeout.unwrap_or(CONTROL_TIMEOUT),
         ),
         ["checkpoint", config] => control(
-            config,
+            &ControlTarget::Config(config),
             "checkpoint",
             None,
             serde_json::Value::Null,
             timeout.unwrap_or(CHECKPOINT_TIMEOUT),
         ),
         ["drain", config] => control(
-            config,
+            &ControlTarget::Config(config),
             "drain",
             None,
             serde_json::Value::Null,
             timeout.unwrap_or(CHECKPOINT_TIMEOUT),
         ),
-        ["reload", config, "cache", flags @ ..] => {
-            reload_cache(config, flags, timeout.unwrap_or(CONTROL_TIMEOUT))
-        }
+        ["reload", config, "cache", flags @ ..] => reload_cache(
+            &ControlTarget::Config(config),
+            flags,
+            timeout.unwrap_or(CONTROL_TIMEOUT),
+        ),
         ["reload", config, section] => control(
-            config,
+            &ControlTarget::Config(config),
             "reload",
             Some(section),
             serde_json::Value::Null,
             timeout.unwrap_or(CONTROL_TIMEOUT),
         ),
-        ["attach", ..] | ["detach", ..] | ["grow", ..] => {
-            eprintln!(
-                "this operation requires the privileged helper: run `maki-attach {}` \
-                 (or systemctl start maki-attach@<volume>)",
-                argv.join(" ")
-            );
-            ExitCode::from(3)
-        }
         _ => usage(),
     }
 }
 
-fn reload_cache(config: &str, flags: &[&str], timeout: Duration) -> ExitCode {
+fn privileged_helper(args: &[String]) -> ExitCode {
+    eprintln!(
+        "this operation requires the privileged helper: run `maki-attach {}` \
+         (or systemctl start maki-attach@<volume>)",
+        args.join(" ")
+    );
+    ExitCode::from(3)
+}
+
+/// The control commands with `--socket <path>` in place of the volume
+/// configuration; any other command refuses the option.
+fn control_by_socket(argv: &[&str], socket: String, timeout: Option<Duration>) -> ExitCode {
+    let target = ControlTarget::Socket(socket);
+    let simple = |command: &str, default: Duration| {
+        control(
+            &target,
+            command,
+            None,
+            serde_json::Value::Null,
+            timeout.unwrap_or(default),
+        )
+    };
+    match argv {
+        ["status"] => simple("status", CONTROL_TIMEOUT),
+        ["metrics"] => simple("metrics", CONTROL_TIMEOUT),
+        ["checkpoint"] => simple("checkpoint", CHECKPOINT_TIMEOUT),
+        ["drain"] => simple("drain", CHECKPOINT_TIMEOUT),
+        ["reload", "cache", flags @ ..] => {
+            reload_cache(&target, flags, timeout.unwrap_or(CONTROL_TIMEOUT))
+        }
+        ["reload", section] => control(
+            &target,
+            "reload",
+            Some(section),
+            serde_json::Value::Null,
+            timeout.unwrap_or(CONTROL_TIMEOUT),
+        ),
+        ["status" | "metrics" | "checkpoint" | "drain" | "reload", ..] => {
+            fail("pass either a volume configuration or --socket <path>, not both".to_string())
+        }
+        _ => fail(
+            "--socket applies only to the control commands (status, metrics, \
+                   checkpoint, drain, reload)"
+                .to_string(),
+        ),
+    }
+}
+
+fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -> ExitCode {
     let mut max_bytes = None;
     let mut ttl = None;
     let mut args = flags.iter();
@@ -230,7 +362,7 @@ fn reload_cache(config: &str, flags: &[&str], timeout: Duration) -> ExitCode {
     if let Some(ttl) = ttl {
         payload["ttl"] = serde_json::json!(ttl);
     }
-    control(config, "reload", Some("cache"), payload, timeout)
+    control(target, "reload", Some("cache"), payload, timeout)
 }
 
 /// The backing tree is created owner-only; a root-created volume is
@@ -519,6 +651,17 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
 fn existing_backing(
     cfg: &maki_format::config::VolumeConfig,
 ) -> Result<std::sync::Arc<dyn maki_backing::Backing>, String> {
+    // Opening a remote RollbackBacking claims a writer and forks a namespace.
+    // Diagnostic commands must not mutate the authority, even if they fail or
+    // are killed before Drop can release that session.
+    if cfg
+        .backing
+        .rollback_protection
+        .as_ref()
+        .is_some_and(|r| r.remote.is_some())
+    {
+        return Err("read-only remote backing inspection is not supported; use `maki volume witness` to inspect the authority without claiming a writer".into());
+    }
     let root = std::path::Path::new(&cfg.backing.root);
     match std::fs::metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -584,17 +727,16 @@ fn check(config: &str, deep: bool) -> Result<bool, String> {
 
 #[cfg(unix)]
 fn control(
-    config: &str,
+    target: &ControlTarget<'_>,
     command: &str,
     section: Option<&str>,
     payload: serde_json::Value,
     timeout: Duration,
 ) -> ExitCode {
-    let cfg = match read_config(config) {
-        Ok(c) => c,
+    let socket = match target.socket() {
+        Ok(socket) => socket,
         Err(e) => return fail(e),
     };
-    let socket = maki_nbdkit::daemon::control_socket_path(&cfg);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -639,7 +781,7 @@ fn control(
 
 #[cfg(not(unix))]
 fn control(
-    _config: &str,
+    _target: &ControlTarget<'_>,
     _command: &str,
     _section: Option<&str>,
     _payload: serde_json::Value,

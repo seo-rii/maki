@@ -1998,7 +1998,10 @@ TLS configurations MUST fail closed.
 # 52. Cache and Operational Verification
 
 The read cache MUST be tested for write-sequence matching, stale-read prevention,
-TTL, LRU and byte bounds, runtime resizing, metrics, and zeroization on eviction.
+TTL, LRU and byte bounds, runtime resizing, metrics, and zeroization on final
+buffer-owner drop. TTL is checked lazily on lookup. Eviction releases the
+cache owner; an outstanding `Arc<SecretBuffer>` may outlive TTL and eviction.
+Empty payloads are not cached, so payload accounting also bounds entry count.
 Growth tests cover lazy shard creation during workload and crash recovery at
 catalog boundaries. Mount validation rejects every identity or readiness
 mismatch independently.
@@ -2033,8 +2036,8 @@ valid power-loss evidence.
 # 55. CI Strategy
 
 The checked-in workflow runs the pull-request suite on Linux and Windows.
-Scheduled nightly jobs run the seven named release phase gates, the plugin
-build/ABI check, and fake-provider refusal. The DB gate is a simulated commit
+Scheduled nightly jobs run every ignored release gate (no name filter), the
+plugin build/ABI check, and fake-provider refusal. The DB gate is a simulated commit
 ledger; it does not run SQLite, PostgreSQL or a kernel XFS stack. The broader
 tiers below are qualification targets. Continued fuzzing, systemd sandbox,
 real DB/XFS, weekly and release qualification require separate runners and

@@ -3,10 +3,13 @@
 //!
 //! Durability rules simulated:
 //! - `write_at`/`set_len` are volatile until `sync_data` on the file,
-//! - file creation/removal is volatile until `sync_dir` on the parent,
+//! - file creation/removal/rename is volatile until `sync_dir` on the parent;
+//!   names and inodes are separate, so a durable name can survive with its
+//!   unsynced data lost and a rename is kept or undone as a whole,
 //! - on crash, each volatile operation is independently kept or lost,
-//! - optionally, the last surviving write of a file may be *torn* (prefix
-//!   kept at a configurable granularity),
+//! - optionally, any surviving write may be *torn* at sector boundaries of
+//!   a configurable granularity, aligned to the file (a prefix of sectors
+//!   kept, or one sector missing),
 //! - a removal that was never dir-synced may resurrect the file,
 //! - a creation that was never dir-synced may vanish even if its data was
 //!   fdatasync'd (orphan inode).
@@ -77,22 +80,15 @@ enum Pend {
     SetLen(u64),
 }
 
-#[derive(Clone, Debug, Default)]
-struct FileState {
-    /// Content known durable (data-synced). `None` = no durable content.
-    durable: Option<Vec<u8>>,
-    /// Whether the directory entry is durable.
-    dirent_durable: bool,
-    /// Volatile existence + pending ops. `None` = removed in volatile view.
-    volatile: Option<Volatile>,
-}
+type InodeId = u64;
 
+/// File content, independent of any name (TEST-004): an open handle keeps
+/// its inode across `remove` and `rename`, a re-created name is a new inode,
+/// and a name can survive a crash while its inode's data does not.
 #[derive(Clone, Debug, Default)]
-struct Volatile {
-    /// If false, the durable image of the next successful sync starts from
-    /// an empty file (fresh inode after re-create), not from the durable
-    /// content.
-    base_durable: bool,
+struct Inode {
+    /// Content known durable (data-synced). A new inode is empty on disk.
+    durable: Vec<u8>,
     /// Dirty operations: what the next successful `sync_data` persists.
     pending: Vec<Pend>,
     /// The page-cache view: every operation ever applied, including writes
@@ -100,23 +96,43 @@ struct Volatile {
     image: Vec<u8>,
 }
 
-impl Volatile {
-    fn fresh() -> Self {
-        Self::default()
-    }
-
-    fn from_durable(durable: &[u8]) -> Self {
+impl Inode {
+    fn from_content(content: Vec<u8>) -> Self {
         Self {
-            base_durable: true,
+            image: content.clone(),
+            durable: content,
             pending: Vec::new(),
-            image: durable.to_vec(),
         }
+    }
+}
+
+/// A directory entry. Namespace changes are volatile until the parent
+/// directory is synced: a crash keeps each pending change or loses it, and
+/// the names one operation changed (both names of a rename) go together.
+#[derive(Clone, Debug, Default)]
+struct Name {
+    /// The inode the on-disk directory names.
+    durable: Option<InodeId>,
+    /// The inode the in-memory directory names (`None` = removed/absent).
+    volatile: Option<InodeId>,
+    /// The operation that last changed this name.
+    change: u64,
+}
+
+impl Name {
+    fn pending(&self) -> bool {
+        self.durable != self.volatile
     }
 }
 
 #[derive(Default)]
 struct Inner {
-    files: BTreeMap<String, FileState>,
+    inodes: BTreeMap<InodeId, Inode>,
+    names: BTreeMap<String, Name>,
+    /// Open handles per inode: an unlinked inode stays usable while open.
+    handles: BTreeMap<InodeId, usize>,
+    next_inode: InodeId,
+    next_change: u64,
     /// dir path -> dirent durable?
     dirs: BTreeMap<String, bool>,
     locks: std::collections::HashSet<String>,
@@ -143,21 +159,67 @@ impl Inner {
         Ok(())
     }
 
-    fn compose(&self, state: &FileState) -> Option<Vec<u8>> {
-        state.volatile.as_ref().map(|vol| vol.image.clone())
+    fn volatile(&self, path: &str) -> Option<InodeId> {
+        self.names.get(path).and_then(|name| name.volatile)
+    }
+
+    /// Point `path` at `inode` in the volatile namespace as part of `change`.
+    fn relink(&mut self, path: &str, inode: Option<InodeId>, change: u64) {
+        let name = self.names.entry(path.to_string()).or_default();
+        name.volatile = inode;
+        name.change = change;
+    }
+
+    /// Drop inodes that no name (durable or volatile) and no handle reaches.
+    fn collect_garbage(&mut self) {
+        let mut reached: std::collections::BTreeSet<InodeId> =
+            self.handles.keys().copied().collect();
+        for name in self.names.values() {
+            reached.extend(name.durable);
+            reached.extend(name.volatile);
+        }
+        self.inodes.retain(|id, _| reached.contains(id));
+    }
+
+    fn new_change(&mut self) -> u64 {
+        self.next_change += 1;
+        self.next_change
+    }
+
+    /// Settle the namespace after a crash: each pending change (`keep`
+    /// decides per change, so both names of a rename agree) either reached
+    /// the disk or did not. Returns the inodes still named afterwards.
+    fn settle_names(&mut self, mut keep: impl FnMut(&str, u64) -> bool) -> Vec<InodeId> {
+        let mut decided: BTreeMap<u64, bool> = BTreeMap::new();
+        let paths: Vec<String> = self.names.keys().cloned().collect();
+        for path in paths {
+            let name = self.names.get_mut(&path).unwrap();
+            if name.pending() {
+                let kept = *decided
+                    .entry(name.change)
+                    .or_insert_with(|| keep(&path, name.change));
+                let target = if kept { name.volatile } else { name.durable };
+                name.durable = target;
+                name.volatile = target;
+            }
+            if name.durable.is_none() {
+                self.names.remove(&path);
+            }
+        }
+        let mut live: Vec<InodeId> = self.names.values().filter_map(|n| n.durable).collect();
+        live.sort_unstable();
+        live.dedup();
+        self.inodes.retain(|id, _| live.binary_search(id).is_ok());
+        live
     }
 }
 
-/// The content a successful `sync_data` makes durable: the durable base
-/// (or an empty fresh inode) plus every *dirty* operation, in order. Writes
-/// an earlier failed sync marked clean are not part of it.
-fn durable_after_sync(state: &FileState, vol: &Volatile) -> Vec<u8> {
-    let mut data = if vol.base_durable {
-        state.durable.clone().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    for p in &vol.pending {
+/// The content a successful `sync_data` makes durable: the durable content
+/// plus every *dirty* operation, in order. Writes an earlier failed sync
+/// marked clean are not part of it.
+fn durable_after_sync(inode: &Inode) -> Vec<u8> {
+    let mut data = inode.durable.clone();
+    for p in &inode.pending {
         apply(&mut data, p);
     }
     data
@@ -180,14 +242,24 @@ fn apply(data: &mut Vec<u8>, p: &Pend) {
 /// Persist a write partially at sector granularity `gran`: either only a
 /// prefix of its sectors reached the disk (the file did not grow past it),
 /// or every sector but one random one did (a hole of stale bytes inside an
-/// otherwise complete write).
+/// otherwise complete write). Sectors are aligned to the file, not to the
+/// write: a write starting inside a sector can persist that sector's part
+/// without the next one (TEST-004).
 fn apply_torn(data: &mut Vec<u8>, offset: u64, src: &[u8], gran: usize, rng: &mut impl Rng) {
-    let sectors = src.len().div_ceil(gran);
-    if sectors == 0 {
+    if src.is_empty() {
         return;
     }
+    // Cut points inside `src` at absolute multiples of `gran`, plus both ends.
+    let mut cuts = vec![0];
+    let mut next = gran - (offset % gran as u64) as usize;
+    while next < src.len() {
+        cuts.push(next);
+        next += gran;
+    }
+    cuts.push(src.len());
+    let sectors = cuts.len() - 1;
     if rng.random_bool(0.5) {
-        let keep = (rng.random_range(0..sectors) * gran).min(src.len());
+        let keep = cuts[rng.random_range(0..sectors)];
         apply(
             data,
             &Pend::Write {
@@ -197,8 +269,7 @@ fn apply_torn(data: &mut Vec<u8>, offset: u64, src: &[u8], gran: usize, rng: &mu
         );
     } else {
         let hole = rng.random_range(0..sectors);
-        let hole_start = hole * gran;
-        let hole_end = (hole_start + gran).min(src.len());
+        let (hole_start, hole_end) = (cuts[hole], cuts[hole + 1]);
         apply(
             data,
             &Pend::Write {
@@ -274,9 +345,10 @@ impl CrashableBacking {
         self.inner.lock().stats_read_bytes
     }
 
-    /// Simulate a crash: every volatile operation is independently kept or
-    /// lost; the last surviving write of each file may be torn if tearing is
-    /// enabled. Afterwards, everything that survived is durable.
+    /// Simulate a crash: every pending namespace change and every dirty
+    /// write is independently kept or lost (a rename as one change); with
+    /// tearing enabled any kept write may persist partially. Afterwards,
+    /// everything that survived is durable.
     pub fn crash(&self, rng: &mut impl Rng) {
         let tearing = self.tearing;
         let mut inner = self.inner.lock();
@@ -296,219 +368,137 @@ impl CrashableBacking {
             }
         }
 
-        let names: Vec<String> = inner.files.keys().cloned().collect();
-        for name in names {
-            let state = inner.files.get(&name).unwrap().clone();
-            let new_state = match &state.volatile {
-                None => {
-                    // Removed in volatile view.
-                    let deletion_durable = !state.dirent_durable;
-                    if deletion_durable || rng.random_bool(0.5) {
-                        None // deletion persisted
-                    } else {
-                        // deletion lost: file resurrects with durable content
-                        state.durable.as_ref().map(|d| FileState {
-                            durable: Some(d.clone()),
-                            dirent_durable: true,
-                            volatile: Some(Volatile::from_durable(d)),
-                        })
-                    }
+        let live = inner.settle_names(|_, _| rng.random_bool(0.5));
+        for id in live {
+            let inode = inner.inodes.get_mut(&id).unwrap();
+            let mut data = inode.durable.clone();
+            // Keep each pending op independently. With tearing enabled *any*
+            // kept write may persist partially at sector granularity — not
+            // only the last one: sectors of unsynced writes reach the platter
+            // in any order, so an earlier record can be torn while a later
+            // one is intact (SPEC §27 torn-tail classification).
+            for p in &inode.pending {
+                if !rng.random_bool(0.5) {
+                    continue;
                 }
-                Some(vol) => {
-                    let dirent_survives = state.dirent_durable || rng.random_bool(0.5);
-                    if !dirent_survives {
-                        None
-                    } else {
-                        let mut data = if vol.base_durable {
-                            state.durable.clone().unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        // Keep each pending op independently. With tearing
-                        // enabled *any* kept write may persist partially at
-                        // sector granularity — not only the last one: sectors
-                        // of unsynced writes reach the platter in any order,
-                        // so an earlier record can be torn while a later one
-                        // is intact (SPEC §27 torn-tail classification).
-                        let kept: Vec<&Pend> = vol
-                            .pending
-                            .iter()
-                            .filter(|_| rng.random_bool(0.5))
-                            .collect();
-                        for p in kept {
-                            if let (Some(gran), Pend::Write { offset, data: src }) = (tearing, p) {
-                                if rng.random_bool(0.3) {
-                                    apply_torn(&mut data, *offset, src, gran, rng);
-                                    continue;
-                                }
-                            }
-                            apply(&mut data, p);
-                        }
-                        Some(FileState {
-                            volatile: Some(Volatile::from_durable(&data)),
-                            durable: Some(data),
-                            dirent_durable: true,
-                        })
-                    }
-                }
-            };
-            match new_state {
-                Some(s) => {
-                    inner.files.insert(name, s);
-                }
-                None => {
-                    inner.files.remove(&name);
-                }
-            }
-        }
-    }
-
-    /// Crash losing *every* volatile operation (worst case): unsynced writes
-    /// dropped, unsynced creations vanish, unsynced deletions resurrect.
-    pub fn crash_all_lost(&self) {
-        let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
-        let names: Vec<String> = inner.files.keys().cloned().collect();
-        for name in names {
-            let state = inner.files.get(&name).unwrap().clone();
-            let survives = state.dirent_durable && state.durable.is_some();
-            if survives {
-                let durable = state.durable.clone().unwrap_or_default();
-                inner.files.insert(
-                    name,
-                    FileState {
-                        volatile: Some(Volatile::from_durable(&durable)),
-                        durable: Some(durable),
-                        dirent_durable: true,
-                    },
-                );
-            } else {
-                inner.files.remove(&name);
-            }
-        }
-        let dirs: Vec<String> = inner.dirs.keys().cloned().collect();
-        for d in dirs {
-            if !inner.dirs[&d] {
-                inner.dirs.remove(&d);
-            }
-        }
-    }
-
-    /// Deterministic torn-tail crash for journal tests: all pending ops of
-    /// `path` are applied except the final write, which keeps only its first
-    /// `keep_bytes` bytes. Other files crash losing all volatile state.
-    pub fn crash_keep_torn_prefix(&self, path: &str, keep_bytes: usize) {
-        {
-            let mut inner = self.inner.lock();
-            let state = inner.files.get(path).expect("file must exist").clone();
-            let vol = state.volatile.as_ref().expect("file removed");
-            let mut data = if vol.base_durable {
-                state.durable.clone().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let last_write_idx = vol
-                .pending
-                .iter()
-                .rposition(|p| matches!(p, Pend::Write { .. }));
-            for (i, p) in vol.pending.iter().enumerate() {
-                if Some(i) == last_write_idx {
-                    if let Pend::Write { offset, data: src } = p {
-                        let keep = keep_bytes.min(src.len());
-                        // Torn tail: the file only grew as far as the kept
-                        // prefix reaches.
-                        let end = *offset as usize + keep;
-                        apply(
-                            &mut data,
-                            &Pend::Write {
-                                offset: *offset,
-                                data: src[..keep].to_vec(),
-                            },
-                        );
-                        data.truncate(end.max(if vol.base_durable {
-                            state.durable.as_ref().map_or(0, |d| d.len())
-                        } else {
-                            0
-                        }));
+                if let (Some(gran), Pend::Write { offset, data: src }) = (tearing, p) {
+                    if rng.random_bool(0.3) {
+                        apply_torn(&mut data, *offset, src, gran, rng);
                         continue;
                     }
                 }
                 apply(&mut data, p);
             }
-            inner.files.insert(
-                path.to_string(),
-                FileState {
-                    volatile: Some(Volatile::from_durable(&data)),
-                    durable: Some(data),
-                    dirent_durable: true,
-                },
-            );
+            *inode = Inode::from_content(data);
         }
-        // Everything else: worst case.
-        let inner = self.inner.lock();
-        let names: Vec<String> = inner
-            .files
-            .keys()
-            .filter(|n| n.as_str() != path)
-            .cloned()
-            .collect();
-        drop(inner);
-        for name in names {
-            let mut inner = self.inner.lock();
-            let state = inner.files.get(&name).unwrap().clone();
-            let survives = state.dirent_durable && state.durable.is_some();
-            if survives {
-                let durable = state.durable.clone().unwrap_or_default();
-                inner.files.insert(
-                    name,
-                    FileState {
-                        volatile: Some(Volatile::from_durable(&durable)),
-                        durable: Some(durable),
-                        dirent_durable: true,
-                    },
-                );
-            } else {
-                inner.files.remove(&name);
+    }
+
+    /// Crash losing *every* volatile operation (worst case): unsynced writes
+    /// dropped, unsynced creations vanish, unsynced deletions and renames
+    /// are undone.
+    pub fn crash_all_lost(&self) {
+        let mut inner = self.inner.lock();
+        inner.stats_pending_writes = 0;
+        for id in inner.settle_names(|_, _| false) {
+            let inode = inner.inodes.get_mut(&id).unwrap();
+            *inode = Inode::from_content(std::mem::take(&mut inode.durable));
+        }
+        inner.dirs.retain(|_, durable| *durable);
+    }
+
+    /// Deterministic torn-tail crash for journal tests: all pending ops of
+    /// `path` are applied except the final write, which keeps only its first
+    /// `keep_bytes` bytes, and its directory entry survives. Everything else
+    /// crashes losing all volatile state.
+    pub fn crash_keep_torn_prefix(&self, path: &str, keep_bytes: usize) {
+        let mut inner = self.inner.lock();
+        inner.stats_pending_writes = 0;
+        let torn = inner.volatile(path).expect("file must exist");
+        let inode = inner.inodes[&torn].clone();
+        let mut data = inode.durable.clone();
+        let last_write_idx = inode
+            .pending
+            .iter()
+            .rposition(|p| matches!(p, Pend::Write { .. }));
+        for (i, p) in inode.pending.iter().enumerate() {
+            if Some(i) == last_write_idx {
+                if let Pend::Write { offset, data: src } = p {
+                    let keep = keep_bytes.min(src.len());
+                    // Torn tail: the file only grew as far as the kept
+                    // prefix reaches.
+                    let end = *offset as usize + keep;
+                    apply(
+                        &mut data,
+                        &Pend::Write {
+                            offset: *offset,
+                            data: src[..keep].to_vec(),
+                        },
+                    );
+                    data.truncate(end.max(inode.durable.len()));
+                    continue;
+                }
             }
+            apply(&mut data, p);
         }
+        let torn_change = inner.names[path].change;
+        for id in inner.settle_names(|name, change| name == path || change == torn_change) {
+            let inode = inner.inodes.get_mut(&id).unwrap();
+            let content = if id == torn {
+                data.clone()
+            } else {
+                std::mem::take(&mut inode.durable)
+            };
+            *inode = Inode::from_content(content);
+        }
+        inner.dirs.retain(|_, durable| *durable);
     }
 }
 
 pub struct CrashFile {
     inner: Arc<Mutex<Inner>>,
+    /// The name the file was opened by (fault hooks and messages).
     path: String,
+    inode: InodeId,
+}
+
+impl Drop for CrashFile {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        if let Some(count) = inner.handles.get_mut(&self.inode) {
+            *count -= 1;
+            if *count == 0 {
+                inner.handles.remove(&self.inode);
+                inner.collect_garbage();
+            }
+        }
+    }
 }
 
 impl CrashFile {
-    fn with_state<R>(
+    fn with_inode<R>(
         &self,
-        f: impl FnOnce(&mut Inner, &mut FileState) -> io::Result<R>,
+        f: impl FnOnce(&mut Inner, &mut Inode) -> io::Result<R>,
     ) -> io::Result<R> {
         let mut inner = self.inner.lock();
-        let mut state = inner
-            .files
-            .get(&self.path)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, self.path.clone()))?;
-        if state.volatile.is_none() {
-            return Err(io::Error::new(
+        let mut inode = inner.inodes.get(&self.inode).cloned().ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{} (removed)", self.path),
-            ));
-        }
+                format!("{} (lost in a crash)", self.path),
+            )
+        })?;
         // A failing operation can still have changed the file (a partial
         // write persisted its prefix, a failed sync marked pages clean):
         // keep the state whatever the outcome.
-        let r = f(&mut inner, &mut state);
-        inner.files.insert(self.path.clone(), state);
+        let r = f(&mut inner, &mut inode);
+        inner.inodes.insert(self.inode, inode);
         r
     }
 }
 
 impl BackingFile for CrashFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.with_state(|inner, state| {
-            let data = inner.compose(state).unwrap();
+        self.with_inode(|inner, inode| {
+            let data = &inode.image;
             let start = offset as usize;
             let end = start + buf.len();
             if end > data.len() {
@@ -524,7 +514,7 @@ impl BackingFile for CrashFile {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.with_state(|inner, state| {
+        self.with_inode(|inner, inode| {
             let op = FaultOp::WriteAt {
                 path: &self.path,
                 offset,
@@ -541,9 +531,8 @@ impl BackingFile for CrashFile {
                     offset,
                     data: written.to_vec(),
                 };
-                let vol = state.volatile.as_mut().unwrap();
-                apply(&mut vol.image, &pend);
-                vol.pending.push(pend);
+                apply(&mut inode.image, &pend);
+                inode.pending.push(pend);
                 inner.stats_pending_writes += 1;
             }
             outcome
@@ -551,11 +540,11 @@ impl BackingFile for CrashFile {
     }
 
     fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.with_state(|inner, state| {
+        self.with_inode(|inner, inode| {
             let end = offset
                 .checked_add(len)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "punch overflow"))?;
-            let file_len = state.volatile.as_ref().unwrap().image.len() as u64;
+            let file_len = inode.image.len() as u64;
             let end = end.min(file_len);
             if offset >= end {
                 return Ok(());
@@ -574,49 +563,42 @@ impl BackingFile for CrashFile {
                 offset,
                 data: zeros,
             };
-            let vol = state.volatile.as_mut().unwrap();
-            apply(&mut vol.image, &pend);
-            vol.pending.push(pend);
+            apply(&mut inode.image, &pend);
+            inode.pending.push(pend);
             inner.stats_pending_writes += 1;
             Ok(())
         })
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        self.with_state(|inner, state| {
+        self.with_inode(|inner, inode| {
             inner.check(&FaultOp::SetLen {
                 path: &self.path,
                 len,
             })?;
-            let vol = state.volatile.as_mut().unwrap();
-            apply(&mut vol.image, &Pend::SetLen(len));
-            vol.pending.push(Pend::SetLen(len));
+            apply(&mut inode.image, &Pend::SetLen(len));
+            inode.pending.push(Pend::SetLen(len));
             Ok(())
         })
     }
 
     fn len(&self) -> io::Result<u64> {
-        self.with_state(|inner, state| Ok(inner.compose(state).unwrap().len() as u64))
+        self.with_inode(|_, inode| Ok(inode.image.len() as u64))
     }
-
     fn sync_data(&self) -> io::Result<()> {
-        self.with_state(|inner, state| {
+        self.with_inode(|inner, inode| {
             if let Err(e) = inner.check(&FaultOp::SyncData { path: &self.path }) {
                 if !inner.lenient_sync_failures {
                     // Writeback failed: the kernel marks the pages clean and
                     // keeps their (unpersisted) content in the page cache. A
                     // retry of fsync has nothing dirty to write and succeeds
                     // without touching the disk.
-                    state.volatile.as_mut().unwrap().pending.clear();
+                    inode.pending.clear();
                 }
                 return Err(e);
             }
-            let vol = state.volatile.as_ref().unwrap();
-            let data = durable_after_sync(state, vol);
-            state.durable = Some(data);
-            let vol = state.volatile.as_mut().unwrap();
-            vol.base_durable = true;
-            vol.pending.clear();
+            inode.durable = durable_after_sync(inode);
+            inode.pending.clear();
             Ok(())
         })
     }
@@ -640,85 +622,63 @@ impl Backing for CrashableBacking {
         validate(path, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Open { path, create })?;
-        let exists = inner
-            .files
-            .get(path)
-            .map(|s| s.volatile.is_some())
-            .unwrap_or(false);
-        if !exists {
-            if !create {
-                return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string()));
+        let inode = match inner.volatile(path) {
+            Some(inode) => inode,
+            None if create => {
+                // A new, empty inode: nothing of an unlinked predecessor at
+                // this name is visible through it, before or after a crash.
+                inner.next_inode += 1;
+                let inode = inner.next_inode;
+                inner.inodes.insert(inode, Inode::default());
+                let change = inner.new_change();
+                inner.relink(path, Some(inode), change);
+                inode
             }
-            let prev = inner.files.get(path).cloned().unwrap_or_default();
-            inner.files.insert(
-                path.to_string(),
-                FileState {
-                    durable: prev.durable,
-                    dirent_durable: false,
-                    volatile: Some(Volatile::fresh()),
-                },
-            );
-        }
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string())),
+        };
+        *inner.handles.entry(inode).or_default() += 1;
         Ok(Arc::new(CrashFile {
             inner: self.inner.clone(),
             path: path.to_string(),
+            inode,
         }))
     }
 
     fn exists(&self, path: &str) -> io::Result<bool> {
         validate(path, false)?;
         let inner = self.inner.lock();
-        Ok(inner
-            .files
-            .get(path)
-            .map(|s| s.volatile.is_some())
-            .unwrap_or(false)
-            || inner.dirs.contains_key(path))
+        Ok(inner.volatile(path).is_some() || inner.dirs.contains_key(path))
     }
 
     fn remove(&self, path: &str) -> io::Result<()> {
         validate(path, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Remove { path })?;
-        match inner.files.get_mut(path) {
-            Some(state) if state.volatile.is_some() => {
-                state.volatile = None;
-                Ok(())
-            }
-            _ => Err(io::Error::new(io::ErrorKind::NotFound, path.to_string())),
+        if inner.volatile(path).is_none() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string()));
         }
+        let change = inner.new_change();
+        inner.relink(path, None, change);
+        Ok(())
     }
 
+    /// Atomic replace: `to` names `from`'s inode (with the data already
+    /// synced in it) and `from` disappears, as one namespace change that a
+    /// crash before the directory sync keeps or undoes as a whole.
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         validate(from, false)?;
         validate(to, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Rename { from, to })?;
-        let src = inner
-            .files
-            .get(from)
-            .cloned()
-            .filter(|s| s.volatile.is_some())
+        let inode = inner
+            .volatile(from)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, from.to_string()))?;
-        let content = inner.compose(&src).unwrap();
-        // Fresh volatile file at `to` with the moved content.
-        let prev_to = inner.files.get(to).cloned().unwrap_or_default();
-        inner.files.insert(
-            to.to_string(),
-            FileState {
-                durable: prev_to.durable,
-                dirent_durable: false,
-                volatile: Some(Volatile {
-                    base_durable: false,
-                    pending: vec![Pend::Write {
-                        offset: 0,
-                        data: content.clone(),
-                    }],
-                    image: content,
-                }),
-            },
-        );
-        inner.files.get_mut(from).unwrap().volatile = None;
+        if from == to {
+            return Ok(());
+        }
+        let change = inner.new_change();
+        inner.relink(to, Some(inode), change);
+        inner.relink(from, None, change);
         Ok(())
     }
 
@@ -745,8 +705,8 @@ impl Backing for CrashableBacking {
             format!("{dir}/")
         };
         let mut out: Vec<String> = Vec::new();
-        for (name, st) in &inner.files {
-            if st.volatile.is_none() {
+        for (name, entry) in &inner.names {
+            if entry.volatile.is_none() {
                 continue;
             }
             if let Some(rest) = name.strip_prefix(&prefix) {
@@ -777,26 +737,16 @@ impl Backing for CrashableBacking {
         } else {
             format!("{dir}/")
         };
-        let names: Vec<String> = inner.files.keys().cloned().collect();
-        for name in names {
+        inner.names.retain(|name, entry| {
             let direct = name
                 .strip_prefix(&prefix)
-                .map(|r| !r.is_empty() && !r.contains('/'))
-                .unwrap_or(false);
-            if !direct {
-                continue;
+                .is_some_and(|r| !r.is_empty() && !r.contains('/'));
+            if direct {
+                entry.durable = entry.volatile;
             }
-            let state = inner.files.get_mut(&name).unwrap();
-            match &state.volatile {
-                Some(_) => state.dirent_durable = true,
-                None => {
-                    // deletion becomes durable
-                    if state.durable.is_some() || state.dirent_durable {
-                        inner.files.remove(&name);
-                    }
-                }
-            }
-        }
+            entry.durable.is_some() || entry.volatile.is_some()
+        });
+        inner.collect_garbage();
         if !dir.is_empty() {
             inner.dirs.insert(dir.to_string(), true);
         }

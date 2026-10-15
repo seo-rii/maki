@@ -186,12 +186,25 @@ fn main() -> ExitCode {
                 eprintln!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
                 return ExitCode::from(2);
             }
+            // Plain decimal digits only: `u64::from_str` accepts a leading
+            // `+`, which turned an intended relative "+N" into an absolute
+            // target that an existing larger LV already met (BUG-116).
             let Some(target) = flag(&args, "--size-bytes")
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|size| *size > 0)
             else {
                 return usage();
             };
+            // LVM refuses a byte size that is not sector aligned, so such a
+            // target would fail on every attempt, retries included.
+            if target % 512 != 0 {
+                eprintln!(
+                    "error: --size-bytes {target} is not a multiple of 512; LVM refuses unaligned \
+                     byte sizes"
+                );
+                return ExitCode::from(2);
+            }
             plan_grow(&GrowRequest {
                 volume,
                 volume_uuid: request.volume_uuid.clone(),

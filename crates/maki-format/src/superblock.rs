@@ -23,6 +23,11 @@ pub const SUPERBLOCK_VERSION: u32 = 1;
 pub const SUPERBLOCK_VERSION_V2: u32 = 2;
 /// Envelope selecting durable proof plus per-shard discard metadata semantics.
 pub const SUPERBLOCK_VERSION_V3: u32 = 3;
+/// The only crypto context format version this binary writes and reads.
+pub const CRYPTO_FORMAT_VERSION: u32 = 1;
+/// Superblock flags this binary understands: none. A later format sets a
+/// flag to mark itself incompatible with readers that do not know it.
+pub const SUPPORTED_FLAGS: u64 = 0;
 /// On-disk length cap for the superblock's string fields; config validation
 /// enforces it so `encode` can never be handed an over-long value.
 pub const MAX_STR: usize = 128;
@@ -109,7 +114,19 @@ impl Superblock {
         let shard_logical_size = r.u64()?;
         let format_version = r.u32()?;
         let created_unix = r.u64()?;
-        let _flags = r.u64()?;
+        let flags = r.u64()?;
+        // BUG-109: both fields exist so a later format can mark a volume
+        // incompatible; ignoring them would open it with this version's rules.
+        if format_version != CRYPTO_FORMAT_VERSION {
+            return Err(FormatError::Unsupported(format!(
+                "crypto format version {format_version} (this binary supports {CRYPTO_FORMAT_VERSION})"
+            )));
+        }
+        if flags & !SUPPORTED_FLAGS != 0 {
+            return Err(FormatError::Unsupported(format!(
+                "superblock flags {flags:#x}"
+            )));
+        }
         let provider_type = r.string(MAX_STR)?;
         let crypto_compatibility_id = r.string(MAX_STR)?;
         let key_identity = r.string(MAX_STR)?;

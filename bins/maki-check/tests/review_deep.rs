@@ -84,3 +84,50 @@ fn deep_check_rejects_unknown_flags() {
     let out = run(&["/tmp/whatever", "--bogus"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// BUG-110: the deep check took the volume lock, creating `volume.lock`,
+/// even when the fast check had just found no superblock: a mistyped path
+/// (the parent `/var/lib/maki`, another directory) was written into by a
+/// checker that must never mutate.
+#[test]
+fn deep_check_of_a_directory_that_is_not_a_volume_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("unrelated"), b"keep").unwrap();
+    let out = run(&[dir.path().to_str().unwrap(), "--deep"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("no valid superblock"),
+        "{}",
+        stdout(&out)
+    );
+    let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["unrelated"], "the checker created files");
+}
+
+/// A rollback-protected root holds the volume inside an outer format that
+/// this root-only tool cannot open; it reported such a root as a volume with
+/// no valid superblock instead of naming the tool that can check it.
+#[test]
+fn a_rollback_protected_root_names_the_command_that_can_check_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rollback.format"), b"marker").unwrap();
+    for deep in [false, true] {
+        let mut args = vec![dir.path().to_str().unwrap()];
+        if deep {
+            args.push("--deep");
+        }
+        let out = run(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains("rollback-protected") && stderr.contains("maki check"),
+            "deep={deep}: {stderr}{}",
+            stdout(&out)
+        );
+        assert!(!dir.path().join("volume.lock").exists());
+    }
+}

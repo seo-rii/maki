@@ -10,8 +10,11 @@ use std::sync::Arc;
 
 use maki_backing::Backing;
 
+const USAGE: &str =
+    "usage: maki-check <volume-backing-root> [--deep] [--journal-segment-size <bytes>]";
+
 fn usage() -> ExitCode {
-    eprintln!("usage: maki-check <volume-backing-root> [--deep] [--journal-segment-size <bytes>]");
+    eprintln!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -19,6 +22,10 @@ fn main() -> ExitCode {
     // The store reports adopted shards and repaired allocation maps through
     // `tracing`; the checker must not drop them (R4-001).
     maki_core::logging::install_default_logging();
+    // Opening a volume keeps every shard data file open (BUG-124).
+    if let Err(e) = maki_backing::raise_open_file_limit() {
+        eprintln!("warning: cannot raise the open-file soft limit: {e}");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut root: Option<String> = None;
     let mut deep = false;
@@ -26,6 +33,14 @@ fn main() -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--version" | "-V" => {
+                println!("maki-check {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
             "--deep" => deep = true,
             "--journal-segment-size" => {
                 i += 1;
@@ -56,6 +71,15 @@ fn main() -> ExitCode {
             eprintln!("error: {root}: {e}");
             return ExitCode::FAILURE;
         }
+    }
+    // A rollback-protected root keeps the volume inside an outer format that
+    // only the configured daemon path can open (BUG-110).
+    if std::path::Path::new(&root).join("rollback.format").exists() {
+        eprintln!(
+            "error: {root} is a rollback-protected backing; maki-check cannot open its \
+             outer format. Run `maki check <config.toml> [--deep]` with the volume configuration"
+        );
+        return ExitCode::FAILURE;
     }
     let backing = match maki_backing::FileBacking::new(root.as_str()) {
         Ok(b) => b,

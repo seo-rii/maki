@@ -102,7 +102,11 @@ post-recovery reclamation.
 The scan skips every unit with a remaining overlay version, including a newer
 tombstone hiding an intermediate write reservation. Normal checkpointing handles
 that newer version later. A failed punch or data sync leaves the cursor unchanged
-for retry; the worker waits until its next wakeup after a failure. Unsupported
+for retry and is logged; it never fails the checkpoint, so `maki drain` and a
+clean shutdown still succeed while punching keeps failing (for example ENOSPC
+splitting an extent on a full filesystem). The stalled scan is then no longer
+pending work: the worker does not rerun it on its own, and the next checkpoint
+that runs for other reasons, or the next attach, retries it. Unsupported
 punching completes the hint without releasing physical blocks. Each attach starts
 a new scan, so previously punched holes can be visited again. Recovery itself
 still performs no physical release while replaying journal records.
@@ -130,7 +134,7 @@ across four shards. The ext4 physical test discards 126 of 128 adjacent slots,
 requires over 75% allocated-block reduction, and verifies retained neighbors,
 reopening, and rewriting.
 `review_discard_reclaim_retry.rs` covers idle checkpoint and worker progress after
-replay, failed-release retry, preservation of newer write reservations, and the
+replay, failed-release retry without failing the checkpoint or spinning the worker, preservation of newer write reservations, and the
 per-checkpoint scan bound. The real-file suite also checks that an idle checkpoint
 after recovery releases over 75% of blocks for the 126-of-128-slot discard case.
 

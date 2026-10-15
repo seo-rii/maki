@@ -20,6 +20,11 @@ use tonic::{Code, Request, Response, Status};
 #[derive(Clone)]
 enum Mode {
     Authenticated(u8),
+    SizedAuthenticated {
+        seed: u8,
+        unit: u32,
+        profile: String,
+    },
     Error(Code, Vec<String>),
     Stall,
 }
@@ -46,14 +51,27 @@ impl Server {
                 Err(status)
             }
             Mode::Stall => std::future::pending().await,
-            Mode::Authenticated(seed) => {
+            Mode::Authenticated(_) | Mode::SizedAuthenticated { .. } => {
                 let message = request.into_inner();
                 let context = maki_crypto::CryptoContext {
                     volume_uuid: message.volume_id.parse().unwrap(),
                     format_version: message.format_version,
                     crypto_compatibility_id: message.compatibility_id,
                 };
-                let provider = local(seed);
+                let provider = match mode {
+                    Mode::Authenticated(seed) => local(seed),
+                    Mode::SizedAuthenticated {
+                        seed,
+                        unit,
+                        profile,
+                    } => {
+                        let mut keys = maki_crypto_local::keysource::MapKeySource::new();
+                        keys.insert("fixture", vec![seed; 32]);
+                        maki_crypto_local::AesGcmSivProvider::new(&keys, "fixture", unit, &profile)
+                            .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
                 let result = if decrypt {
                     let items: Vec<_> = message
                         .items
@@ -337,5 +355,115 @@ async fn grpc_context_refusals_require_exact_status_and_one_field() {
             ),
             "{error}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn singleton_config_limit_covers_mandatory_long_profile_selftest() {
+    use maki_crypto::selftest::provider_self_test;
+    use maki_format::config::{parse_config, ByteSize};
+    use prost::Message;
+    let profile = "p".repeat(113);
+    let (url, _) = server(Mode::SizedAuthenticated {
+        seed: 1,
+        unit: 4096,
+        profile: profile.clone(),
+    })
+    .await;
+    let mut keys = maki_crypto_local::keysource::MapKeySource::new();
+    keys.insert("fixture", vec![1; 32]);
+    let local =
+        maki_crypto_local::AesGcmSivProvider::new(&keys, "fixture", 4096, &profile).unwrap();
+    let mut caps = local.capabilities().await.unwrap();
+    caps.batch.max_items = 1;
+    caps.batch.max_bytes = 4096;
+    let cipher_len = caps.max_ciphertext_size as usize;
+    let mut cfg = parse_config(&format!(
+        r#"
+config_schema_version = 1
+[volume]
+name = "singleton-profile-probe"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "{profile}"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = {cipher_len}
+context_binding = "verified"
+[crypto.batch]
+max_items = 1
+target_items = 1
+max_bytes = "4096"
+target_bytes = "4096"
+[crypto.grpc]
+[[crypto.grpc.endpoint]]
+name = "test"
+url = "{url}"
+[backing]
+root = "/unused"
+"#
+    ))
+    .unwrap();
+    let context = maki_crypto::CryptoContext {
+        volume_uuid: uuid::Uuid::from_u128(7),
+        format_version: 1,
+        crypto_compatibility_id: profile.clone(),
+    };
+    let normal = CryptoBatchRequest {
+        volume_id: context.volume_uuid.to_string(),
+        compatibility_id: profile.clone(),
+        format_version: u32::MAX,
+        items: vec![CryptoItem {
+            unit_index: u64::MAX,
+            data: vec![0; cipher_len],
+        }],
+    };
+    let probe = CryptoBatchRequest {
+        volume_id: context.volume_uuid.to_string(),
+        compatibility_id: format!("{profile}.selftest-probe"),
+        format_version: u32::MAX,
+        items: vec![CryptoItem {
+            unit_index: 0,
+            data: vec![0; cipher_len],
+        }],
+    };
+    let normal_limit = normal.encode_to_vec().len();
+    let boundary = probe.encode_to_vec().len().max(normal_limit);
+    assert!(boundary > normal_limit);
+    cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(normal_limit as u64));
+    assert!(cfg
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("max_message_bytes"));
+    cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(boundary as u64 - 1));
+    assert!(cfg
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("max_message_bytes"));
+    for limit in [normal_limit, boundary, boundary + 1] {
+        let provider = GrpcCryptoProvider::new(GrpcProviderSpec {
+            url: url.clone(),
+            encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+            decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+            metadata: vec![],
+            capabilities: caps.clone(),
+            timeout: Duration::from_secs(5),
+            max_message_bytes: limit,
+        })
+        .unwrap();
+        let result = provider_self_test(&provider, &context, 4096, &profile).await;
+        if limit == normal_limit {
+            assert!(
+                result.is_err(),
+                "old normal-only bound must fail the mandatory probe"
+            );
+        } else {
+            cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(limit as u64));
+            cfg.validate().unwrap();
+            result.unwrap();
+        }
     }
 }

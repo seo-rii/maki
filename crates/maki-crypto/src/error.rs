@@ -5,7 +5,8 @@
 pub enum ErrorClass {
     /// Transient; retry with backoff against the same endpoint.
     Retryable,
-    /// Explicit throttle signal (e.g. HTTP 429); retry with stronger backoff.
+    /// Explicit throttle signal (e.g. HTTP 429); currently retried exactly like
+    /// `Retryable`, with no extra backoff.
     Throttled,
     /// The request itself is invalid or the data is bad; retrying is useless.
     NonRetryableRequest,

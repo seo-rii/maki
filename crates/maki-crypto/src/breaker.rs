@@ -53,21 +53,37 @@ pub struct CircuitBreaker {
     inner: Mutex<Inner>,
 }
 
+/// The verdict an admission reports when its operation completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Success,
+    /// One failure towards `failure_threshold`.
+    Failure,
+    /// The endpoint itself is unusable (`ErrorClass::EndpointFatal`): open
+    /// the circuit now rather than after `failure_threshold` attempts.
+    EndpointFatal,
+}
+
 /// Owns an admission until its outcome is known or its operation is dropped.
 /// A stale admission must never release a newer half-open window's slot.
 pub(crate) struct BreakerPermit<'a> {
     breaker: &'a CircuitBreaker,
     generation: u64,
-    outcome: Option<bool>,
+    outcome: Option<Verdict>,
 }
 
 impl BreakerPermit<'_> {
     pub(crate) fn on_success(mut self) {
-        self.outcome = Some(true);
+        self.outcome = Some(Verdict::Success);
     }
 
     pub(crate) fn on_failure(mut self) {
-        self.outcome = Some(false);
+        self.outcome = Some(Verdict::Failure);
+    }
+
+    /// The endpoint answered that it cannot serve at all (BUG-094).
+    pub(crate) fn on_endpoint_fatal(mut self) {
+        self.outcome = Some(Verdict::EndpointFatal);
     }
 }
 
@@ -169,14 +185,14 @@ impl CircuitBreaker {
     }
 
     pub fn on_success(&self) {
-        self.finish(None, Some(true));
+        self.finish(None, Some(Verdict::Success));
     }
 
     pub fn on_failure(&self) {
-        self.finish(None, Some(false));
+        self.finish(None, Some(Verdict::Failure));
     }
 
-    fn finish(&self, generation: Option<u64>, outcome: Option<bool>) {
+    fn finish(&self, generation: Option<u64>, outcome: Option<Verdict>) {
         let mut inner = self.inner.lock();
         if generation.is_some_and(|generation| generation != inner.generation) {
             return;
@@ -186,8 +202,8 @@ impl CircuitBreaker {
         }
         let now = self.clock.now();
         match (inner.state, outcome) {
-            (CircuitState::Closed, Some(true)) => inner.consecutive_failures = 0,
-            (CircuitState::HalfOpen, Some(true)) => {
+            (CircuitState::Closed, Some(Verdict::Success)) => inner.consecutive_failures = 0,
+            (CircuitState::HalfOpen, Some(Verdict::Success)) => {
                 inner.half_open_successes += 1;
                 if inner.half_open_successes >= self.config.success_threshold {
                     inner.state = CircuitState::Closed;
@@ -196,9 +212,11 @@ impl CircuitBreaker {
                     inner.open_duration = self.config.open_initial;
                 }
             }
-            (CircuitState::Closed, Some(false)) => {
+            (CircuitState::Closed, Some(failure)) => {
                 inner.consecutive_failures += 1;
-                if inner.consecutive_failures >= self.config.failure_threshold {
+                if failure == Verdict::EndpointFatal
+                    || inner.consecutive_failures >= self.config.failure_threshold
+                {
                     inner.state = CircuitState::Open;
                     inner.generation += 1;
                     // Configured durations have no upper bound: saturate
@@ -206,7 +224,7 @@ impl CircuitBreaker {
                     inner.open_until = now.saturating_add(inner.open_duration);
                 }
             }
-            (CircuitState::HalfOpen, Some(false)) => {
+            (CircuitState::HalfOpen, Some(Verdict::Failure | Verdict::EndpointFatal)) => {
                 inner.open_duration = inner
                     .open_duration
                     .saturating_mul(2)

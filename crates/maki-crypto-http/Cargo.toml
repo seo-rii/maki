@@ -22,6 +22,7 @@ zeroize.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 maki-backing.workspace = true
 maki-core.workspace = true
 maki-format.workspace = true

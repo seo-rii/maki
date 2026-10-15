@@ -11,6 +11,24 @@ documents.
 
 ### Breaking changes
 
+- **Remote transport limits must hold a full ciphertext batch** (BUG-092,
+  2026-10-14). gRPC `max_message_bytes`, WebSocket `max_frame_bytes` and, for
+  a batched HTTP mapping, `max_response_bytes` are checked against the larger
+  of the plaintext and the ciphertext batch (base64 where encoded), and a zero
+  WebSocket or gRPC `timeout` is refused. A configuration that validated
+  before but could not carry a full batch now fails validation instead of
+  failing every full batch at runtime; raise the limit or lower
+  `crypto.batch.max_items`/`max_bytes`. HTTP context binding now counts only
+  mappings the provider sends (BUG-093). See
+  [validation rules](docs/configuration.md#validation-rules).
+- **An AES-XTS key with identical halves is refused** (BUG-095, 2026-10-14):
+  IEEE 1619 requires distinct data and tweak keys.
+- **File credentials and TLS files need absolute paths** (BUG-122,
+  2026-10-15). A relative `file` credential name or TLS `ca_file` /
+  `client_cert_file` resolved against each process's working directory and
+  now fails validation; write the absolute path. See
+  [configuration](docs/configuration.md).
+
 - **Remote witness authority and wire v2 require private session ownership**
   (2026-10-12). `MAKIRW02` authority state stores a digest of a random 256-bit
   session capability. Writers must prove the current capability for activation,
@@ -189,6 +207,64 @@ documents.
   checker in CI (2026-09-23).
 
 ### Fixed
+
+- **2026-10-14 project review**: inline reclaim keeps reclaiming while a
+  checkpoint has not covered every append, so a concurrent FUA no longer turns
+  a write into ENOSPC (BUG-089). `maki-check --deep` fails instead of passing
+  when its own superblock read fails (BUG-090). Journal segment and shard file
+  names parse only in canonical form, and the fast checker reports the orphan
+  shards recovery adopts (BUG-091). An endpoint-fatal answer opens that
+  endpoint's circuit at once (BUG-094). The root helper never passes a mount
+  source to `blkid` as an option (BUG-096). A configured gRPC CA works on hosts
+  with an empty trust store (BUG-097). nbdkit callbacks fail with EIO instead
+  of aborting on a panic, and failed requests are logged, rate-limited
+  (BUG-098). The nightly release gates run to completion, with the etcd quorum
+  gate behind `etcd-qualification` (TEST-003), and tokio's `test-util` is no
+  longer part of production builds. See the
+  [remediation log](docs/review-remediation.md#project-review-2026-10-14).
+- **2026-10-14 second review pass**: binding the control socket refuses any
+  file at the address other than a dead socket (BUG-099). Volume creation
+  writes the superblock last, so an interrupted creation is not a volume
+  (BUG-100). The checkpoint worker waits one interval after a failed pass
+  (BUG-101), and a write refused for free space wakes it (BUG-106). A
+  coalesced provider call never carries one unit twice (BUG-102). A remote
+  witness that cannot be reached refuses each operation without stopping the
+  session; a mismatch still stops it (BUG-103). Witness workers are given only
+  to authenticated connections (BUG-104). An encrypt result that carries its
+  own plaintext is refused on every call (BUG-105). Remote attach and takeover
+  authenticate the current generation in the local root before changing the
+  authority, so a damaged or foreign root leaves it unchanged rather than
+  Claimed (BUG-107). The crash simulator models inodes and atomic rename, and
+  the durability sweeps retire superseded failed writes (TEST-004, TEST-005).
+  Control commands take `--socket <path>` in place of the volume
+  configuration, so `maki-admin` members can use them, and only parse a
+  configuration they are given (BUG-108).
+- **2026-10-14 third review pass**: configuration errors never print a value
+  (BUG-113). Only encrypting cryptsetup mappings count as encrypted swap
+  (BUG-114). A gRPC TLS handshake is bounded by the connect timeout
+  (BUG-115), and WebSocket frames outside the response contract fail the
+  connection as a contract error (BUG-117). Attach refuses a mountpoint with
+  mounts below it (BUG-118) and `grow --size-bytes` takes plain digits only
+  (BUG-116). Superblocks with unknown flags or format version are refused
+  (BUG-109); `maki-check --deep` no longer writes into a directory that is not
+  a volume (BUG-110); the witness keeps accepting after EMFILE (BUG-111);
+  `maki` and `maki-check` gain `--help` and `--version` (BUG-112); key-file
+  open errors say why (BUG-119); a non-UTF-8 nbdkit `config=` path is refused
+  (BUG-120). A power-loss sweep with TRIM joins the release gates (TEST-006),
+  a page-lock unit test no longer races on Windows (TEST-007), and witness
+  transport tests no longer time out on loaded runners (TEST-008).
+- **2026-10-15 fourth review pass**: a gRPC response cut inside a message, or
+  OK without one, is a contract error (BUG-121). File credentials and TLS
+  files must be absolute paths (BUG-122). A failed hole punch no longer fails
+  an idle checkpoint, so drain and shutdown work while punching fails
+  (BUG-123). The daemon and CLIs raise the soft descriptor limit for shard
+  files, and a failed shard open other than a missing file is reported as
+  I/O, not corruption (BUG-124). A panic while the volume write lock is held
+  stops the engine until the volume is attached again (BUG-125). An encrypt
+  result carrying its plaintext anywhere is refused, and `grow --size-bytes`
+  must be a multiple of 512 (BUG-105, BUG-116 follow-ups). The operator guides
+  correct the overlay metrics, full-backing behaviour, start-limit reset,
+  instance naming and witness takeover procedures.
 
 - **2026-10-12 correctness and recovery review**: journal sync/recovery retries
   reassert accepted file lengths and verified bytes; volume creation holds its
@@ -393,6 +469,13 @@ observable behaviour:
   per-RPC deadlines cover gRPC readiness plus the call (BUG-017).
 
 ### Documentation
+
+- **2026-10-14 project review**: docs that contradicted `status.md` or the code
+  were corrected (remote witness status, power-loss tearing, nightly gate
+  scope, deep-check report order, `drain` timeout, duration syntax, overlay
+  zero limits, etcd restore and compaction). The operator guides wait for stopped units through
+  `ActiveState` instead of `systemctl is-active`. The crate
+  maps list `maki-witness`, and stale crate and module comments were fixed.
 
 - [Remote transports under the syscall filter](docs/qualification/remote-transport-syscall-filter-validation-2026-10-04.md):
   the first external campaign for WebSocket and gRPC.

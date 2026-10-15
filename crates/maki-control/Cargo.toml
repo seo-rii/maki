@@ -16,7 +16,7 @@ tracing.workspace = true
 [dev-dependencies]
 parking_lot.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

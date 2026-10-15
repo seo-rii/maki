@@ -67,18 +67,79 @@ fn idle_checkpoint_reclaims_a_discard_consumed_by_recovery() {
     assert!(volume.read_ct(1).unwrap().is_none());
 }
 
+/// BUG-123: physical reclamation is a space hint (R5-008), but a failed
+/// punch failed every *idle* checkpoint, and so `maki drain`, `maki
+/// checkpoint` and a clean shutdown, for as long as punching kept failing
+/// (ENOSPC splitting an extent on a full filesystem, EIO), although every
+/// acknowledged write was durable. It is logged and retried instead.
 #[test]
-fn failed_reclamation_retains_its_cursor_for_retry() {
+fn a_failed_reclamation_does_not_fail_the_checkpoint_and_is_retried() {
     let (backing, mut volume, geometry) = recovered_discard();
+    let sequence = volume.checkpoint_sequence();
     backing.set_fault_hook(Some(Arc::new(move |op| {
         matches!(op, FaultOp::WriteAt { path, .. } if path.ends_with(".dat"))
             .then(|| io::Error::other("physical release temporarily failed"))
     })));
-    assert!(volume.checkpoint().is_err());
+    assert_eq!(volume.checkpoint().unwrap(), sequence);
+    assert_eq!(volume.checkpoint().unwrap(), sequence);
     assert!(volume.read_ct(1).unwrap().is_none());
+    assert!(raw_slot(&backing, &geometry, 1).iter().any(|b| *b != 0));
     backing.set_fault_hook(None);
     volume.checkpoint().unwrap();
     assert!(raw_slot(&backing, &geometry, 1).iter().all(|b| *b == 0));
+}
+
+#[tokio::test]
+async fn an_engine_checkpoint_succeeds_while_punching_fails_and_the_worker_does_not_spin() {
+    let (backing, volume, geometry) = fixture(false);
+    drop(volume);
+    let options = || EngineOptions {
+        checkpoint: CheckpointPolicy {
+            interval: Duration::from_secs(3600),
+            journal_high_watermark_bytes: u64::MAX,
+            emergency_reserve_bytes: 0,
+            low_space_checkpoint_bytes: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let provider = Arc::new(FakeCryptoProvider::new(1024));
+    let engine = Engine::attach(backing.clone(), provider.clone(), options())
+        .await
+        .unwrap();
+    engine.stop_checkpoint_worker().await;
+    engine.write(1024, &[0x61; 1024], true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+    engine.trim(1024, 1024, true).await.unwrap();
+    drop(engine);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counted = attempts.clone();
+    let slot_size = geometry.slot_size as usize;
+    backing.set_fault_hook(Some(Arc::new(move |op| {
+        matches!(op, FaultOp::WriteAt { path, len, .. }
+            if path.ends_with(".dat") && *len == slot_size)
+        .then(|| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            io::Error::from_raw_os_error(28) // ENOSPC splitting an extent
+        })
+    })));
+    let engine = Engine::attach(backing.clone(), provider, options())
+        .await
+        .unwrap();
+    // What `maki drain` runs: a flush, then an idle checkpoint.
+    engine.flush().await.unwrap();
+    engine.checkpoint().await.unwrap();
+    // A stalled reclamation is not pending work: the worker must not rerun
+    // it back to back.
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seen = attempts.load(Ordering::SeqCst);
+    assert!(seen <= 2, "the worker retried a failing punch {seen} times");
+    assert_eq!(engine.read(1024, 1024).await.unwrap(), vec![0; 1024]);
+    engine.stop_checkpoint_worker().await;
 }
 
 #[test]

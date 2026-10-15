@@ -13,6 +13,9 @@ use crate::client::ClientConnectionData;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
 use crate::server::ServerConnectionData;
 
+#[cfg(all(test, feature = "std"))]
+mod maki_key_update_tests;
+
 #[cfg(all(test, feature = "std", feature = "ring"))]
 mod maki_erasure_tests {
     use super::ReadTraffic;
@@ -508,6 +511,10 @@ impl<Data> WriteTraffic<'_, Data> {
         application_data: &[u8],
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EncryptError> {
+        self.conn
+            .core
+            .common_state
+            .request_key_update_for(application_data.into());
         self.conn
             .core
             .maybe_refresh_traffic_keys();

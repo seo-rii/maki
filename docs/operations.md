@@ -79,6 +79,10 @@ maki check /etc/maki/volumes/example.toml
 `volume create` needs an empty backing root: it refuses a root whose `data/`,
 `journal/` or `checkpoint/` directory still holds a file, because an earlier
 volume's shards would otherwise be adopted and served by the new one.
+The superblock copies are written last, once everything else is durable, so a
+creation interrupted by a crash leaves no superblock: the root is not a volume.
+`volume create` refuses any files the interrupted run left in the layout
+directories until the root is emptied.
 
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing
@@ -107,6 +111,21 @@ install -d -o maki -g maki -m 0700 /var/lib/maki/example
 sudo -u maki maki volume create /etc/maki/volumes/example.toml
 ```
 
+The packaged units derive every path from the systemd instance name, so with
+them the instance, the file names and two configuration values must agree. For
+instance `example`:
+
+| Item | Required value |
+|---|---|
+| Volume configuration | `/etc/maki/volumes/example.toml` (`maki@example` reads it) |
+| `volume.name` | `example`: the default control socket is `/run/maki-control/<volume.name>/control.sock`, and the unit only creates and permits `/run/maki-control/example` and `/run/maki/example` |
+| `backing.root` | `/var/lib/maki/example`: `ProtectSystem=strict` leaves only that tree writable |
+| Attach configuration | `/etc/maki/attach/example.toml` (`maki-attach@example` reads it and connects to `/run/maki/example/nbd.sock`) |
+| Credential | `/etc/maki/secrets/example.token`, loaded as `crypto-token` |
+
+A mismatch shows up as a daemon that cannot bind its control socket or open
+its backing. Override paths only together with a matching service drop-in.
+
 `maki-check` can also inspect a backing root directly:
 
 ```bash
@@ -133,7 +152,9 @@ when checking a backing
 root directly, pass `--journal-segment-size` if the volume uses a non-default
 size.
 
-The deep report ends with one of three verdicts:
+The deep report states one of three verdicts as an `info: deep check verdict:`
+line, printed before any `warning:` and `ERROR:` lines; the report ends with
+`check passed` or `check FAILED`:
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
@@ -161,6 +182,11 @@ at independent physical devices. The same check applies to zram writeback.
 Encrypted swap above NBD, including through partitions, LVM, or MD, is refused:
 paging out Maki must not require Maki to serve that paging I/O. Missing or
 inconsistent sysfs metadata, cycles, and unproven virtual backing are refused.
+"dm-crypt" means a cryptsetup mapping of an encrypting type (LUKS1, LUKS2,
+plain, loop-AES, TrueCrypt/VeraCrypt, BitLocker, FileVault2): cryptsetup also
+names integrity-only (`integritysetup`), dm-verity and helper devices
+`CRYPT-…`, and those are refused. A mapping set up with `cipher_null` cannot
+be distinguished in sysfs; do not use one for swap.
 Keep swap and its dependency topology fixed while the attachment is running;
 this is an attach-time check, not a watcher of privileged device changes.
 
@@ -174,6 +200,12 @@ provider type under the same compatibility identity refuses attach with
 `key canary verification failed` or `crypto identity mismatch`. This is the
 only wrong-key detection for `local-aes-xts`, which otherwise decrypts to
 garbage without an error.
+
+After verifying an existing canary, attach rewrites and syncs both copies and
+the backing directory before accepting I/O. A readable copy may have survived
+only in the page cache after an earlier sync failure. This adds metadata I/O
+on attach; a failed sync refuses attach and can be retried after correcting
+the backing error. A wrong key is rejected before either copy is rewritten.
 
 Consequences for operations:
 
@@ -193,7 +225,7 @@ Use a dedicated socket and one daemon per volume:
 ```bash
 nbdkit --foreground \
   -U /run/maki/example/nbd.sock \
-  /usr/lib/maki/libmaki_nbdkit.so \
+  /usr/lib/maki/maki-nbdkit.so \
   config=/etc/maki/volumes/example.toml
 ```
 
@@ -281,8 +313,10 @@ example configuration; `sysusers.d` makes `maki` a member so the unprivileged da
 it). A socket that cannot be bound fails attach: a daemon without its control
 socket is not operable. Rootless runs must therefore set `control.socket` to a
 writable path. An address with a live listener, including a full connection
-backlog, is refused instead of replaced. Stale sockets can be reclaimed;
-concurrent publishers serialize the address check and publication. Clean
+backlog, is refused instead of replaced. Stale sockets can be reclaimed; any
+other file at the address (a regular file, a symlink, a directory) is refused
+and left untouched, so a mistyped `control.socket` cannot overwrite volume
+data. Concurrent publishers serialize the address check and publication. Clean
 detach removes only the socket inode owned by that listener, so an older
 daemon cannot remove a successor that reused its pathname.
 
@@ -305,6 +339,18 @@ maki checkpoint /etc/maki/volumes/example.toml
 maki drain /etc/maki/volumes/example.toml
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456 --ttl 1s
+```
+
+The control commands use the configuration only to find the socket: they
+parse it but do not validate it, so a configuration edited for the next start
+cannot block `maki drain` on the running daemon. The packaged configuration is
+readable only by root and group `maki`; a `maki-admin` member names the socket
+instead, with `--socket` in place of the configuration:
+
+```bash
+maki status --socket /run/maki-control/example/control.sock
+maki drain --socket /run/maki-control/example/control.sock
+maki reload --socket /run/maki-control/example/control.sock cache --max-bytes 268435456
 ```
 
 `drain` permanently closes admission to reads, writes, flushes, checkpoints,
@@ -407,7 +453,8 @@ maki-attach detach --volume example --plan
 maki-attach grow --volume example --size-bytes 2147483648 --plan
 ```
 
-`grow --size-bytes` is an absolute minimum LV size in bytes. LVM may round
+`grow --size-bytes` is an absolute minimum LV size in bytes, given as plain
+decimal digits and a multiple of 512. LVM may round
 up to its extent size; an LV already at or above the target is left unchanged,
 and XFS growth is retried. Reuse the same target after a timeout or failure,
 including a failure after `lvextend` already changed the LV. The former
@@ -428,7 +475,11 @@ Execution (Linux, root) then:
 
 1. opens `/run/maki-attach` through verified root-owned directory descriptors,
    takes its private `attach.lock`, and, unless a device is pinned, allocates
-   the lowest free `/dev/nbdN` from sysfs;
+   the lowest unused `/dev/nbdN` from sysfs. Automatic selection skips connected
+   devices and devices whose root or partitions have holders or direct mounts
+   in the helper's mount namespace. Unreadable or inconsistent observations
+   refuse allocation; the helper checks the selected device again before
+   connecting it;
 2. records the requested attachment and a random connection identifier before
    connecting NBD, then connects with the configured block size, waits until
    the device reports a size, and verifies its kernel backend identifier;
@@ -594,10 +645,18 @@ For Docker, put container creation and removal in the registered workload unit
 and disable an independent `restart: always` path that could bypass the target.
 Docker bind mounts are `rprivate` by default, so a host remount does not make an
 old container safe; the lifecycle must stop and create the container again.
-For planned shutdown, obtain a successful `maki drain` acknowledgement first,
-after the application has quiesced and closed its database, then stop
-`maki-workload@pg.target`. Do not stop only the workload or attach unit: the
+For a normal packaged shutdown, stop `maki-workload@pg.target` while engine
+admission is still open. Filesystem unmount may need to write dirty data or
+metadata; running `maki drain` before unmount prevents those writes. The
+ordered target stop unmounts through attach cleanup before daemon unload drains
+the engine. Do not stop only the workload or attach unit: the
 `Requires=` and `PartOf=` relationships can deactivate the rest of the graph.
+For an explicit durability acknowledgement, first quiesce and close the
+application through its own shutdown interface, unmount its verified filesystem
+while the daemon is running, then run `maki drain` and require success before
+stopping the target. If unmount fails, keep admission open and resolve that
+failure; a successful drain cannot substitute for a successful unmount.
+
 The target stop orders the workload before attach cleanup and attach cleanup
 before daemon shutdown. The target's own stop job may finish while those
 dependent stop jobs are still deactivating. Wait for every lifecycle unit to
@@ -605,17 +664,31 @@ become inactive before running an offline check, taking a snapshot, or removing
 backing storage:
 
 ```bash
+# Succeeds once every named unit is inactive; fails at once if one failed
+# (inspect it before continuing) or after WAIT_SECONDS (default 600).
+wait_stopped() {
+    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    for unit in "$@"; do
+        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
+            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit is $state: preserve the host state and inspect it" >&2
+                return 1
+            fi
+            sleep 1
+        done
+    done
+}
 systemctl stop maki-workload@pg.target
-while systemctl is-active --quiet your-workload.service || \
-      systemctl is-active --quiet maki-attach@pg.service || \
-      systemctl is-active --quiet maki@pg.service; do
-    sleep 1
-done
-maki check /etc/maki/volumes/pg.toml
+wait_stopped your-workload.service maki-attach@pg.service maki@pg.service &&
+    maki check /etc/maki/volumes/pg.toml
 ```
 
-Use a bounded operator timeout around that loop. If it expires, preserve the
-host state for diagnosis rather than forcing NBD, LVM, or device-mapper cleanup.
+Do not wait with `systemctl is-active`: it fails, and so ends a wait loop, as
+soon as a unit is `deactivating` (the daemon is still flushing, checkpointing
+and holding the volume lock) or `failed` (attach cleanup left a mount or
+mapping behind). Wait for `ActiveState` to read `inactive`. If a unit fails or
+the bounded wait expires, preserve the host state for diagnosis rather than
+forcing NBD, LVM, or device-mapper cleanup.
 The 2026-09-17 combined qualification observed this asynchronous tail directly;
 after all named units became inactive, no mount, mapping, NBD connection,
 trusted volume record, or workload container remained.
@@ -701,9 +774,11 @@ Use this procedure only when restoring the same v2 volume UUID, backing data,
 crypto compatibility identity and key. A DB-native or legacy-v1 migration uses
 the separate process in [durable recovery](durable-recovery.md).
 
-1. Stop database writers, close database connections, run `maki drain`, and
-   stop `maki-workload@<volume>.target`. Wait until the workload, attach and
-   daemon units are inactive. Run `maki check` before capture.
+1. Stop database writers and close database connections through the application
+   shutdown interface. Unmount the verified filesystem while engine admission
+   is open, then require a successful `maki drain` acknowledgement. Stop
+   `maki-workload@<volume>.target` and wait until the workload, attach and daemon
+   units are inactive. Run `maki check` before capture.
 2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
    Capture the credential through the deployment's secret-backup mechanism,
    separately from ordinary logs and backups. Record hashes, Maki revision,
@@ -841,21 +916,32 @@ metric labels.
   [physical reservation report](qualification/physical-reservation-validation-2026-09-18.md).
   This does not preallocate untouched slots or cover non-Linux backing behavior.
   A reserve-only refusal leaves existing data readable and does not
-  by itself set a checkpoint error or change the engine state. A failed
+  by itself set a checkpoint error or change the engine state. It wakes the
+  checkpoint worker for an immediate pass, which deletes covered journal
+  segments and punches pending trims, so space a checkpoint can give back
+  returns without waiting for the worker's interval. A failed
   checkpoint reports `state: degraded` with its error, cleared by a successful
   checkpoint; the worker retries on its interval and writes retry necessary
   reclaim. Other outstanding failure states can still prevent `ready`.
 - `maki reload` returns an error naming the section for any change the running
   daemon cannot apply; only `cache` is applied at runtime today. An error means
   the change was not applied: restart the daemon.
-- `maki status`, `metrics`, `checkpoint` and `reload` give up when the daemon
-  does not answer within 60 s (600 s for `checkpoint`); pass
+- `maki status`, `metrics`, `checkpoint`, `drain` and `reload` give up when the
+  daemon does not answer within 60 s (600 s for `checkpoint` and `drain`); pass
   `--timeout <seconds>` to wait longer. A timeout means the daemon is stalled
   or busy, not that the command was rejected.
 - While the journal cannot be synced (see the writeback item above) `maki
   status` reports `state: degraded` with the reason, and `maki_volume_state`
   is 2, until a barrier succeeds; a successful checkpoint alone does not clear
   it.
+- If a storage task panics while it holds the volume write lock (a bug, not
+  an I/O error), the engine stops: the in-memory volume may be half updated,
+  so every later read, write, trim, FLUSH and checkpoint fails with EIO,
+  `maki status` reports `state: degraded` with a reason starting `engine
+  stopped:`, and the log has an `ERROR` line. Nothing clears it. Restart the
+  daemon; recovery rebuilds the state from disk and keeps every write a FLUSH
+  or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
+  cannot prove durability through that state.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with mode `0600` or `0400`, or attach is
   refused. A `credential` (systemd `LoadCredential=`) may also be `0440` when

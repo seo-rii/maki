@@ -46,14 +46,24 @@ backing creation.
 
 Mixed workloads initialize the complete working set and FLUSH it before
 measurement; `setup.writes`, `setup.flushes` and `setup.elapsed_seconds` report
-that cost separately. Every write uses an address-dependent fixed payload, so
-concurrent writes of the same address agree and reads can always be checked.
+that cost separately. Each address starts at generation zero; every successful
+measured write advances its generation and repeats the address and generation
+throughout the payload. Reads compare against the latest successful write, so
+returning an earlier value at the correct address fails verification.
+Reads and writes sharing an address execute in submission order. A busy address
+delays submission until its preceding operation finishes, so hot addresses can
+reduce effective concurrency. Unrelated addresses use independent locks.
 Phased random reads repeat the written address sequence, including wraps and
 repeated draws. Choose a working set larger than the configured cache to measure
 storage/provider behavior beyond cache capacity.
 
-Jobs finish and refill in completion order while memory remains bounded by
-concurrency and I/O size. Periodic FLUSH drains a cohort before its barrier; if
+The oracle stores eight bytes per I/O slot, capped at 64 MiB (8,388,608 slots,
+or a 32 GiB working set for 4 KiB I/O). Larger working sets are rejected before
+backing creation. Only addresses with an outstanding job/result retain a lock,
+so lock metadata is bounded by concurrency (at most 256 entries).
+
+Jobs finish and refill in completion order while request memory remains bounded
+by concurrency and I/O size. Periodic FLUSH drains a cohort before its barrier; if
 the cohort is smaller than concurrency it also limits effective parallelism.
 
 ## Reading the report
@@ -73,6 +83,8 @@ barrier spacing and seed. `resources` distinguishes exact and sampled values:
 
 - `peak_pending_operations` counts submitted, unfinished engine calls and
   returns to `pending_operations_at_exit = 0` on success.
+- `oracle_generation_bytes` reports eight bytes per tracked slot, excluding
+  allocator overhead and the at-most-256 sequencing locks.
 - `observed_peak_active_callbacks`, `observed_peak_plaintext_bytes`,
   `observed_peak_overlay_bytes` and `observed_peak_journal_pending_bytes` come
   from nonblocking engine snapshots sampled every 1ms. Short peaks can fall

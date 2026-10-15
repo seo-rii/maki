@@ -987,7 +987,11 @@ name = "maki-crypto-grpc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "h2",
+ "http",
  "http-body",
+ "hyper-util",
  "maki-backing",
  "maki-core",
  "maki-crypto",
@@ -996,6 +1000,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "thiserror",
  "tokio",
  "tonic",
@@ -1660,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 dependencies = [
  "aws-lc-rs",
  "log",

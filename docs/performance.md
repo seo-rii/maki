@@ -29,8 +29,10 @@ be positive; I/O size must be block-aligned and fit both the volume and
 `nbd.maximum_io`. Invalid arguments are rejected before volume creation.
 The default working set covers the smaller of the operation count and the
 whole I/O slots in the device; `--working-set` selects an explicit span. Reads check
-the benchmark pattern and its offset; a failed operation or mismatch exits
-unsuccessfully without a success report.
+the benchmark pattern, offset and latest successful write generation; a failed
+operation or mismatch exits unsuccessfully without a success report. Generation
+tracking uses eight bytes per I/O slot with a 64 MiB budget; workloads above
+that bound are rejected before backing creation (see [the benchmark guide](benchmark.md)).
 
 Both text and JSON report throughput, IOPS and request latency. JSON schema
 version 1 records provider type, operation count, I/O size, selected concurrency,

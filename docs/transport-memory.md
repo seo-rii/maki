@@ -256,7 +256,7 @@ secure-swap policy covers them.
 
 ## Parser and TLS library-owned copies
 
-Maki pins local patches of `serde_json` 1.0.151 and `rustls` 0.23.45 through
+Maki pins local patches of `serde_json` 1.0.151 and `rustls` 0.23.46 through
 workspace dependency overrides. All HTTP and WebSocket JSON parsing, and all
 rustls-based HTTP, WebSocket and gRPC TLS connections resolve to these patched
 sources. The [vendor guide](../vendor/README.md) records the covered owners and

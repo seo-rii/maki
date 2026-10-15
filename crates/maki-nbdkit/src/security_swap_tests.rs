@@ -73,13 +73,13 @@ impl Topology {
     }
 
     fn crypt(&mut self, id: Device, name: &str) {
+        self.crypt_with_uuid(id, name, "CRYPT-LUKS2-fixture-swap");
+    }
+
+    fn crypt_with_uuid(&mut self, id: Device, name: &str, uuid: &str) {
         self.add(id, name, false);
         fs::create_dir(self.devices[&id].join("dm")).unwrap();
-        fs::write(
-            self.devices[&id].join("dm/uuid"),
-            "CRYPT-LUKS2-fixture-swap\n",
-        )
-        .unwrap();
+        fs::write(self.devices[&id].join("dm/uuid"), format!("{uuid}\n")).unwrap();
         fs::write(self.devices[&id].join("dm/name"), "cryptswap\n").unwrap();
         self.aliases.insert("/dev/mapper/cryptswap".into(), id);
     }
@@ -308,5 +308,31 @@ fn empty_zram_writeback_attribute_is_ambiguous() {
     for value in ["", " \n\t"] {
         fs::write(t.path((252, 0)).join("backing_dev"), value).unwrap();
         assert_eq!(t.classify("/dev/zram0"), SwapSafety::Unsafe);
+    }
+}
+
+/// BUG-114: cryptsetup names every device it activates `CRYPT-<TYPE>-…`,
+/// including ones that do not encrypt: standalone dm-integrity, the
+/// integrity layer under LUKS2 authenticated encryption, dm-verity and
+/// temporary helper devices. Only encrypting types count as encrypted swap.
+#[test]
+fn only_encrypting_cryptsetup_types_count_as_encrypted_swap() {
+    for (uuid, expected) in [
+        ("CRYPT-LUKS1-0123-swap", SwapSafety::Encrypted),
+        ("CRYPT-LUKS2-0123-swap", SwapSafety::Encrypted),
+        ("CRYPT-PLAIN-swap", SwapSafety::Encrypted),
+        ("CRYPT-BITLK-0123-swap", SwapSafety::Encrypted),
+        ("CRYPT-INTEGRITY-swapint", SwapSafety::Unsafe),
+        ("CRYPT-SUBDEV-0123-swap_dif", SwapSafety::Unsafe),
+        ("CRYPT-VERITY-0123-swap", SwapSafety::Unsafe),
+        ("CRYPT-TEMP-0123-swap", SwapSafety::Unsafe),
+        ("CRYPT-", SwapSafety::Unsafe),
+        ("CRYPT-UNKNOWNTYPE-0123-swap", SwapSafety::Unsafe),
+    ] {
+        let mut t = Topology::new();
+        t.crypt_with_uuid((253, 0), "dm-0", uuid);
+        t.add((8, 0), "sda", true);
+        t.edge((253, 0), (8, 0));
+        assert_eq!(t.classify("/dev/dm-0"), expected, "{uuid}");
     }
 }

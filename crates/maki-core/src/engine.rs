@@ -25,10 +25,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock};
+use tokio::sync::{
+    Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock,
+};
 
 use maki_backing::Backing;
 use maki_crypto::checked::CheckedProvider;
@@ -72,6 +75,13 @@ pub enum AttachError {
     /// integrity with which to probe existing ciphertext instead.
     #[error("volume has data but no key canary: {0}")]
     MissingCanary(String),
+}
+
+/// A caller-owned write buffer or allocation-free zero request. Both are
+/// materialized into unit buffers only while holding engine admission.
+enum WriteInput<'a> {
+    Borrowed(&'a [u8]),
+    Zeroes(usize),
 }
 
 /// Admission limits at the block-core entry (SPEC §30): both request count
@@ -313,11 +323,17 @@ struct EngineInner {
     checkpoint_stop: AtomicBool,
     checkpoint_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Serializes snapshots through publication, including inline reclaim.
-    checkpoint_gate: AsyncMutex<()>,
+    checkpoint_gate: Arc<AsyncMutex<()>>,
     state: parking_lot::Mutex<EngineState>,
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
+    /// Write admission refused a write for free space since the worker's
+    /// last pass (BUG-106): the next pass checkpoints to give space back.
+    space_refused: AtomicBool,
     last_checkpoint_at: parking_lot::Mutex<Duration>,
+    /// Clock time before which the worker does not retry after a failed
+    /// pass (BUG-101); `None` after a success.
+    checkpoint_retry_at: parking_lot::Mutex<Option<Duration>>,
     free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
     /// Published samples have their own memory-only locks: `free_space`
     /// may be held across a stalled statvfs, and `volume` across storage I/O.
@@ -327,6 +343,11 @@ struct EngineInner {
     /// operation, so [`Engine::state`] can report it without the volume
     /// lock: a journal that cannot be synced is a degraded volume.
     journal_uncertain: AtomicBool,
+    /// Set when a task panicked while it held the volume write lock
+    /// ([`VolumeWriteGuard`]). The async lock does not poison, and the panic
+    /// may have left the in-memory volume half updated: every later request
+    /// fails until the volume is attached again (BUG-125).
+    failure: OnceLock<String>,
     /// FLUSH and FUA latency (SPEC §40 `maki_flush_seconds`,
     /// `maki_fua_seconds`), measured on the engine clock.
     flush_latency: LatencyStats,
@@ -466,6 +487,40 @@ fn record_len(ct: &CiphertextUnit) -> u64 {
     maki_format::journal::RECORD_HEADER_SIZE as u64 + ct.data.len() as u64
 }
 
+/// The volume write lock, held by a request, the checkpoint or the worker.
+/// The async lock does not poison, so a panic that unwinds through the guard's
+/// owner latches the engine failed before the lock is released: no later
+/// request may trust a volume the panic may have left half updated (BUG-125).
+/// Every mutation runs in a storage task that owns the guard, which is what
+/// makes `thread::panicking` observe it; keep it that way.
+struct VolumeWriteGuard {
+    volume: OwnedRwLockWriteGuard<Volume>,
+    inner: Arc<EngineInner>,
+}
+
+impl std::ops::Deref for VolumeWriteGuard {
+    type Target = Volume;
+
+    fn deref(&self) -> &Volume {
+        &self.volume
+    }
+}
+
+impl std::ops::DerefMut for VolumeWriteGuard {
+    fn deref_mut(&mut self) -> &mut Volume {
+        &mut self.volume
+    }
+}
+
+impl Drop for VolumeWriteGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.inner
+                .fail("a task panicked while it held the volume write lock");
+        }
+    }
+}
+
 /// Acquire storage/admission guards before dispatch, and move them into this
 /// closure: dropping an async caller cannot cancel a running disk operation.
 async fn storage_task<T: Send + 'static>(
@@ -565,7 +620,17 @@ impl Engine {
 
         let provider =
             CheckedProvider::pinned(provider, volume.superblock().geometry.crypto_unit_size);
-        verify_key_canary(&volume, &provider, &context, caps.integrity.present()).await?;
+        let volume = Arc::new(volume);
+        verify_key_canary(
+            volume.clone(),
+            &provider,
+            &context,
+            caps.integrity.present(),
+        )
+        .await?;
+        let volume = Arc::try_unwrap(volume).map_err(|_| {
+            AttachError::Config("canary verification retained the recovered volume".into())
+        })?;
 
         let (batch_max_items, batch_max_bytes) = if caps.batch.supported {
             (
@@ -613,18 +678,21 @@ impl Engine {
             }),
             policy: options.checkpoint,
             last_checkpoint_at: parking_lot::Mutex::new(clock.now()),
+            checkpoint_retry_at: parking_lot::Mutex::new(None),
             clock,
             checkpoint_notify: notify.clone(),
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_worker: AsyncMutex::new(None),
-            checkpoint_gate: AsyncMutex::new(()),
+            checkpoint_gate: Arc::new(AsyncMutex::new(())),
             state: parking_lot::Mutex::new(EngineState::Ready),
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
+            space_refused: AtomicBool::new(false),
             free_space: parking_lot::Mutex::new(None),
             observed_free_space: parking_lot::Mutex::new(None),
             observed_volume: parking_lot::Mutex::new(observed_volume),
             journal_uncertain: AtomicBool::new(false),
+            failure: OnceLock::new(),
             flush_latency: LatencyStats::default(),
             fua_latency: LatencyStats::default(),
             active_requests: AtomicU64::new(0),
@@ -774,9 +842,18 @@ impl Engine {
         Ok(())
     }
 
-    async fn check_freshness(&self) -> Result<(), CoreError> {
+    async fn check_freshness(
+        &self,
+        admission: Arc<maki_crypto::flow::DualPermit>,
+    ) -> Result<(), CoreError> {
         let backing = self.inner.backing.clone();
-        storage_task(move || backing.check_freshness()).await??;
+        storage_task(move || {
+            // Cancellation cannot release capacity while the blocking
+            // freshness RPC still owns its worker and backing resources.
+            let _admission = admission;
+            backing.check_freshness()
+        })
+        .await??;
         Ok(())
     }
 
@@ -858,13 +935,13 @@ impl Engine {
 
     async fn read_secret_inner(&self, offset: u64, len: usize) -> Result<SecretBuffer, CoreError> {
         self.check_range(offset, len)?;
-        self.check_freshness().await?;
         let admission = Arc::new(
             self.inner
                 .admission
                 .acquire(self.admission_cost(offset, len))
                 .await?,
         );
+        self.check_freshness(admission.clone()).await?;
         let unit_size = self.unit_size();
         let first = offset / unit_size;
         let last = (offset + len as u64 - 1) / unit_size;
@@ -879,7 +956,7 @@ impl Engine {
         // entry is evicted — unless `verify_on_hit` is set, which reads and
         // CRC-checks the payload first and uses the cache only to skip the
         // provider call.
-        let volume = self.inner.volume.clone().read_owned().await;
+        let volume = self.inner.read_volume().await?;
         let inner = self.inner.clone();
         let io_admission = admission.clone();
         let (mut cached, cts, seqs) = storage_task(move || {
@@ -970,16 +1047,47 @@ impl Engine {
 
     async fn write_inner(&self, offset: u64, data: &[u8], fua: bool) -> Result<(), CoreError> {
         self.check_range(offset, data.len())?;
-        self.check_freshness().await?;
         let admission = Arc::new(
             self.inner
                 .admission
                 .acquire(self.admission_cost(offset, data.len()))
                 .await?,
         );
+        self.write_admitted(offset, WriteInput::Borrowed(data), fua, admission)
+            .await
+    }
+
+    /// Write zeroes without allocating a request-sized buffer before admission.
+    pub async fn write_zeroes(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
+        self.observe_request(RequestKind::Write, fua, async {
+            self.check_range(offset, len)?;
+            let admission = Arc::new(
+                self.inner
+                    .admission
+                    .acquire(self.admission_cost(offset, len))
+                    .await?,
+            );
+            self.write_admitted(offset, WriteInput::Zeroes(len), fua, admission)
+                .await
+        })
+        .await
+    }
+
+    async fn write_admitted(
+        &self,
+        offset: u64,
+        data: WriteInput<'_>,
+        fua: bool,
+        admission: Arc<maki_crypto::flow::DualPermit>,
+    ) -> Result<(), CoreError> {
+        self.check_freshness(admission.clone()).await?;
+        let data_len = match data {
+            WriteInput::Borrowed(bytes) => bytes.len(),
+            WriteInput::Zeroes(len) => len,
+        };
         let unit_size = self.unit_size();
         let first = offset / unit_size;
-        let last = (offset + data.len() as u64 - 1) / unit_size;
+        let last = (offset + data_len as u64 - 1) / unit_size;
 
         // Serialize against other writers/RMW of the same units (SPEC §28).
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
@@ -989,11 +1097,10 @@ impl Engine {
         // when it holds `(unit, sequence)`, exactly as on the read path
         // (R4-006, including `verify_on_hit`); the unit locks keep the
         // sequence stable meanwhile (R5-032).
-        let volume = self.inner.volume.clone().read_owned().await;
+        let volume = self.inner.read_volume().await?;
         let inner = self.inner.clone();
         let io_admission = admission.clone();
         let io_guards = guards.clone();
-        let data_len = data.len();
         let (rmw_cts, need_rmw, cached) = storage_task(move || {
             let (_admission, _guards) = (io_admission, io_guards);
             let mut rmw_cts = Vec::new();
@@ -1057,11 +1164,15 @@ impl Engine {
                 SecretBuffer::zeroed(unit_size as usize)
             };
             let dst_from = offset.max(unit_start) - unit_start;
-            let dst_to = (offset + data.len() as u64).min(unit_start + unit_size) - unit_start;
-            let src_from = offset.max(unit_start) - offset;
-            buf.expose_mut()[dst_from as usize..dst_to as usize].copy_from_slice(
-                &data[src_from as usize..src_from as usize + (dst_to - dst_from) as usize],
-            );
+            let dst_to = (offset + data_len as u64).min(unit_start + unit_size) - unit_start;
+            let destination = &mut buf.expose_mut()[dst_from as usize..dst_to as usize];
+            match data {
+                WriteInput::Borrowed(bytes) => {
+                    let src_from = (offset.max(unit_start) - offset) as usize;
+                    destination.copy_from_slice(&bytes[src_from..src_from + destination.len()]);
+                }
+                WriteInput::Zeroes(_) => destination.fill(0),
+            }
             items.push(PlaintextUnit {
                 unit_index: unit,
                 data: buf,
@@ -1115,7 +1226,6 @@ impl Engine {
 
     async fn trim_inner(&self, offset: u64, len: usize, fua: bool) -> Result<(), CoreError> {
         self.check_extent(offset, len)?;
-        self.check_freshness().await?;
         if !self.can_trim() {
             return Err(CoreError::Invalid(
                 "discard requires a volume created with --discard".into(),
@@ -1128,7 +1238,8 @@ impl Engine {
             return if fua {
                 self.flush_inner().await
             } else {
-                Ok(())
+                let admission = Arc::new(self.inner.admission.acquire(0).await?);
+                self.check_freshness(admission).await
             };
         }
         let per_chunk = (self.inner.max_request_bytes / unit_size).max(1);
@@ -1152,6 +1263,7 @@ impl Engine {
                 .acquire(self.admission_cost(first * unit_size, bytes))
                 .await?,
         );
+        self.check_freshness(admission.clone()).await?;
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, end - 1).await);
         let cts = (first..end)
             .map(|unit_index| CiphertextUnit {
@@ -1179,7 +1291,7 @@ impl Engine {
             for round in 0..=MAX_RECLAIM_ROUNDS {
                 let reclaimed = round > 0;
                 let last_round = round == MAX_RECLAIM_ROUNDS;
-                let mut volume = engine.inner.volume.clone().write_owned().await;
+                let mut volume = engine.inner.write_volume().await?;
                 let io_engine = engine.clone();
                 let io_cts = cts.clone();
                 let io_admission = _admission.clone();
@@ -1286,9 +1398,12 @@ impl Engine {
     /// after reclaim because reclaim can change the active segment (R08).
     ///
     /// A request that still does not fit after a reclaim is refused only
-    /// when nothing more can be reclaimed: a checkpoint retires records up
-    /// to the durable mark, so volatile records another writer appended
-    /// while the reclaim ran are synced and a further round is taken, up to
+    /// when nothing more can be reclaimed, i.e. a checkpoint already covers
+    /// every appended record. A checkpoint retires records up to the horizon
+    /// it captured, so records another writer appended while the reclaim ran
+    /// are still held, whether they are volatile (they are synced first) or
+    /// already durable through FUA/FLUSH (`durable == appended` proves
+    /// nothing, BUG-089); a further round is taken, up to
     /// [`MAX_RECLAIM_ROUNDS`] (`last_round`).
     fn admit_journal(
         &self,
@@ -1300,7 +1415,7 @@ impl Engine {
         let exhausted = |volume: &Volume| {
             reclaimed
                 && (last_round
-                    || volume.journal_durable_sequence() >= volume.journal_appended_sequence())
+                    || volume.checkpoint_sequence() >= volume.journal_appended_sequence())
         };
         let policy = &self.inner.policy;
         let footprint =
@@ -1339,6 +1454,12 @@ impl Engine {
                 ));
             };
             if free < required {
+                // The refusal stays side-effect free, but a checkpoint may
+                // delete covered segments and punch pending trims: wake the
+                // worker instead of waiting for its interval, since its own
+                // low-space trigger sits below this requirement (BUG-106).
+                self.inner.space_refused.store(true, Ordering::SeqCst);
+                self.inner.checkpoint_notify.notify_one();
                 return Err(enospc(format!(
                     "backing free space {free} below required {required} bytes (emergency reserve {} + checkpoint headroom {headroom} + journal append footprint {append_footprint})",
                     policy.emergency_reserve_bytes
@@ -1447,10 +1568,12 @@ impl Engine {
     }
 
     async fn flush_inner(&self) -> Result<(), CoreError> {
-        self.check_freshness().await?;
-        let mut volume = self.inner.volume.clone().write_owned().await;
+        let admission = Arc::new(self.inner.admission.acquire(0).await?);
+        self.check_freshness(admission.clone()).await?;
+        let mut volume = self.inner.write_volume().await?;
         let inner = self.inner.clone();
         storage_task(move || {
+            let _admission = admission;
             let started = inner.clock.now();
             let outcome = inner.sync_journal(&mut volume);
             outcome?;
@@ -1479,7 +1602,10 @@ impl Engine {
             started: self.inner.clock.now(),
             outcome: RequestOutcome::Cancelled,
         };
-        let result = operation.await;
+        let result = match self.inner.check_running() {
+            Ok(()) => operation.await,
+            Err(stopped) => Err(stopped),
+        };
         request.outcome = if result.is_ok() {
             RequestOutcome::Success
         } else {
@@ -1613,9 +1739,54 @@ impl EngineInner {
         *self.observed_volume.lock() = snapshot;
     }
 
-    /// The reported state: a checkpoint-degraded volume stays degraded; a
-    /// ready one is degraded while its journal cannot be synced.
+    /// Latch the engine failed (first reason wins); see [`Self::failure`].
+    fn fail(&self, reason: &str) {
+        if self.failure.set(reason.to_string()).is_ok() {
+            tracing::error!(
+                "engine stopped: {reason}; every request fails until the volume is attached \
+                 again and recovered from disk"
+            );
+        }
+    }
+
+    /// Refuse work once the engine has latched a failure.
+    fn check_running(&self) -> Result<(), CoreError> {
+        match self.failure.get() {
+            Some(reason) => Err(CoreError::Durability(format!(
+                "engine stopped: {reason}; attach the volume again to recover it from disk"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Take the volume write lock. The latch is checked after the lock is
+    /// held: a panicking holder latches before it releases the lock, so a
+    /// waiter queued behind it never sees the state it left.
+    async fn write_volume(self: &Arc<Self>) -> Result<VolumeWriteGuard, CoreError> {
+        let volume = self.volume.clone().write_owned().await;
+        self.check_running()?;
+        Ok(VolumeWriteGuard {
+            volume,
+            inner: self.clone(),
+        })
+    }
+
+    /// Take the volume read lock for a request (see [`Self::write_volume`]).
+    async fn read_volume(&self) -> Result<OwnedRwLockReadGuard<Volume>, CoreError> {
+        let volume = self.volume.clone().read_owned().await;
+        self.check_running()?;
+        Ok(volume)
+    }
+
+    /// The reported state: a stopped engine reports why; a checkpoint-degraded
+    /// volume stays degraded; a ready one is degraded while its journal cannot
+    /// be synced.
     fn effective_state(&self, state: EngineState) -> EngineState {
+        if let Some(reason) = self.failure.get() {
+            return EngineState::Degraded {
+                reason: format!("engine stopped: {reason}; attach the volume again"),
+            };
+        }
         match state {
             EngineState::Ready if self.journal_uncertain.load(Ordering::SeqCst) => {
                 EngineState::Degraded {
@@ -1632,16 +1803,20 @@ impl EngineInner {
     /// and metadata publication finish. New writes keep their live overlay
     /// versions while the immutable checkpoint snapshot is applied.
     async fn checkpoint(self: &Arc<Self>) -> Result<u64, CoreError> {
+        // Waiting callers own only their cancellable future. Create a durable
+        // owner only after admission, so aborting queued calls cannot leave
+        // an unbounded set of detached checkpoint owners behind the gate.
+        let checkpoint = self.checkpoint_gate.clone().lock_owned().await;
         let inner = self.clone();
         tokio::spawn(async move {
-            let _checkpoint = inner.checkpoint_gate.lock().await;
+            let _checkpoint = checkpoint;
             let completed = async {
-                let mut volume = inner.volume.clone().write_owned().await;
+                let mut volume = inner.write_volume().await?;
                 let prepared = storage_task(move || volume.prepare_checkpoint()).await??;
                 storage_task(move || prepared.execute()).await?
             }
             .await;
-            let mut volume = inner.volume.clone().write_owned().await;
+            let mut volume = inner.write_volume().await?;
             let publishing = inner.clone();
             storage_task(move || {
                 let checkpoint_before = volume.checkpoint_sequence();
@@ -1706,8 +1881,29 @@ impl EngineInner {
                 self.overlay_above_watermark(&v),
             )
         };
-        if appended <= checkpointed && covered == 0 && !reclaim {
-            return; // nothing to apply and nothing to reclaim
+        // A failed physical-release hint keeps its cursor but is excluded
+        // from immediate reclamation work to avoid a retry loop. A space
+        // refusal must still run an idle checkpoint after every journal
+        // record is gone. Keep the signal pending through retry backoff;
+        // it is consumed below only when a pass can actually run.
+        if appended <= checkpointed
+            && covered == 0
+            && !reclaim
+            && !self.space_refused.load(Ordering::SeqCst)
+        {
+            return; // nothing to apply and no independent reclamation trigger
+        }
+        // After a failed pass, wait out the regular interval. Every write
+        // above the watermark wakes the worker, and rerunning a failing
+        // checkpoint under the exclusive lock on each wake-up hammered a
+        // degraded device and stalled foreground I/O (BUG-101). Writes that
+        // reach the hard bound still checkpoint inline.
+        if self
+            .checkpoint_retry_at
+            .lock()
+            .is_some_and(|retry_at| self.clock.now() < retry_at)
+        {
+            return;
         }
         let by_size = total >= self.policy.journal_high_watermark_bytes;
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
@@ -1730,14 +1926,17 @@ impl EngineInner {
             .now()
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
-        if !(by_size || by_space || by_time || by_overlay || reclaim) {
+        let by_refusal = self.space_refused.swap(false, Ordering::SeqCst);
+        if !(by_size || by_space || by_time || by_overlay || reclaim || by_refusal) {
             return;
         }
         // A checkpoint applies only durable records: when the trigger is
-        // the elapsed interval or the overlay bound, sync first so the pass
-        // actually shrinks what it was woken for.
-        if (by_time || by_overlay) && durable < appended {
-            let mut volume = self.volume.clone().write_owned().await;
+        // the elapsed interval, the overlay bound or a refused write, sync
+        // first so the pass actually shrinks what it was woken for.
+        if (by_time || by_overlay || by_refusal) && durable < appended {
+            let Ok(mut volume) = self.write_volume().await else {
+                return;
+            };
             if self.checkpoint_stop.load(Ordering::SeqCst) {
                 return;
             }
@@ -1745,19 +1944,33 @@ impl EngineInner {
             let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
             if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
+                self.defer_checkpoint_retry();
                 return;
             }
         }
         if !self.checkpoint_stop.load(Ordering::SeqCst) {
-            if let Err(e) = self.checkpoint().await {
-                tracing::warn!("checkpoint worker: checkpoint failed: {e}");
-            } else if self.volume.read().await.has_pending_reclamation() {
-                // Drain another bounded batch without sleeping an entire
-                // checkpoint interval. Each pass releases the volume lock;
-                // failures wait for the regular interval before retrying.
-                self.checkpoint_notify.notify_one();
+            match self.checkpoint().await {
+                Err(e) => {
+                    tracing::warn!("checkpoint worker: checkpoint failed: {e}");
+                    self.defer_checkpoint_retry();
+                }
+                Ok(_) => {
+                    *self.checkpoint_retry_at.lock() = None;
+                    if self.volume.read().await.has_pending_reclamation() {
+                        // Drain another bounded batch without sleeping an
+                        // entire checkpoint interval. Each pass releases the
+                        // volume lock; failures wait for the regular
+                        // interval before retrying.
+                        self.checkpoint_notify.notify_one();
+                    }
+                }
             }
         }
+    }
+
+    /// Postpone the worker's next attempt by the regular interval.
+    fn defer_checkpoint_retry(&self) {
+        *self.checkpoint_retry_at.lock() = Some(self.clock.now() + self.policy.interval);
     }
 }
 
@@ -1788,7 +2001,8 @@ fn spawn_checkpoint_worker(
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if inner.checkpoint_stop.load(Ordering::SeqCst) {
+            // A stopped engine has nothing safe to checkpoint (BUG-125).
+            if inner.checkpoint_stop.load(Ordering::SeqCst) || inner.failure.get().is_some() {
                 return;
             }
             inner.worker_pass().await;
@@ -1797,6 +2011,10 @@ fn spawn_checkpoint_worker(
 }
 
 /// Key-canary check (SPEC §12, review M-001).
+///
+/// All backing access runs on blocking workers, including legacy ciphertext
+/// probing and both metadata copies. The owned volume keeps its exclusive
+/// lock alive until any in-flight storage operation finishes on cancellation.
 ///
 /// - Canary present: decrypt it and compare with the known plaintext; any
 ///   mismatch or integrity failure refuses attach. Transport-class errors
@@ -1808,18 +2026,22 @@ fn spawn_checkpoint_worker(
 ///   proof instead, then establish the canary; without integrity there is
 ///   no proof, so attach is refused.
 pub async fn verify_key_canary(
-    volume: &Volume,
+    volume: Arc<Volume>,
     provider: &CheckedProvider,
     context: &CryptoContext,
     provider_has_integrity: bool,
 ) -> Result<(), AttachError> {
-    let backing = volume.backing().clone();
-    let superblock = volume.superblock();
+    let superblock = volume.superblock().clone();
     let unit_size = superblock.geometry.crypto_unit_size as usize;
     let expected = canary_plaintext(&superblock.volume_uuid, unit_size);
-    let ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let loading = volume.clone();
+    let existing = storage_task(move || {
+        AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B)
+            .load::<KeyCanary>(loading.backing().as_ref())
+    })
+    .await??;
 
-    if let Some(canary) = ab.load::<KeyCanary>(backing.as_ref())? {
+    if let Some(canary) = existing {
         if canary.volume_uuid != superblock.volume_uuid {
             return Err(AttachError::KeyMismatch(
                 "canary belongs to a different volume".to_string(),
@@ -1830,7 +2052,7 @@ pub async fn verify_key_canary(
             context,
             CiphertextUnit {
                 unit_index: canary.unit_index,
-                data: canary.ciphertext,
+                data: canary.ciphertext.clone(),
             },
         )
         .await?;
@@ -1839,6 +2061,12 @@ pub async fn verify_key_canary(
                 "canary decrypted to unexpected plaintext (wrong key or provider)".to_string(),
             ));
         }
+        // A failed first publication can leave a valid canary only in the
+        // page cache. Verification proves the key, not durability: restore
+        // both copies and their dirents before accepting data that needs
+        // this canary to reopen after a power loss (BUG-085). Keep this
+        // after the identity/plaintext checks so a wrong key cannot publish.
+        persist_key_canary(volume, canary).await?;
         return Ok(());
     }
 
@@ -1850,7 +2078,9 @@ pub async fn verify_key_canary(
                     .to_string(),
             ));
         }
-        let Some((unit, data)) = volume.first_ciphertext_unit()? else {
+        let probing = volume.clone();
+        let Some((unit, data)) = storage_task(move || probing.first_ciphertext_unit()).await??
+        else {
             return Err(AttachError::MissingCanary(
                 "volume has history but no readable ciphertext to probe".to_string(),
             ));
@@ -1907,16 +2137,27 @@ pub async fn verify_key_canary(
                 .to_string(),
         ));
     }
-    let mut record = KeyCanary {
+    let record = KeyCanary {
         generation: 0,
         volume_uuid: superblock.volume_uuid,
         unit_index: CANARY_UNIT_INDEX,
         ciphertext: ct.data,
     };
-    ab.store(backing.as_ref(), &mut record)?;
-    ab.store(backing.as_ref(), &mut record)?;
-    backing.sync_dir("")?;
-    Ok(())
+    persist_key_canary(volume, record).await
+}
+
+/// Retain the volume lock with the blocking operation even if its async
+/// caller is cancelled during metadata publication.
+async fn persist_key_canary(volume: Arc<Volume>, mut record: KeyCanary) -> Result<(), AttachError> {
+    storage_task(move || {
+        let backing = volume.backing();
+        let ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+        ab.store(backing.as_ref(), &mut record)?;
+        ab.store(backing.as_ref(), &mut record)?;
+        backing.sync_dir("")?;
+        Ok::<_, AttachError>(())
+    })
+    .await?
 }
 
 /// Decrypt one unit for verification, classifying failures: integrity,

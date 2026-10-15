@@ -262,10 +262,14 @@ impl Volume {
         if let Some(unit) = overlay_unit {
             return Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)));
         }
-        let Some(unit) = self.store.first_allocated_unit() else {
-            return Ok(None);
-        };
-        Ok(self.read_ct(unit)?.map(|(_, data)| (unit, data)))
+        // A live overlay tombstone can hide the first stored allocation.
+        // Keep searching without checkpointing or changing the volume.
+        for unit in self.store.allocated_units() {
+            if let Some((_, data)) = self.read_ct(unit)? {
+                return Ok(Some((unit, data)));
+            }
+        }
+        Ok(None)
     }
 
     /// Journal a ciphertext write; publish to the overlay on success.
@@ -491,8 +495,17 @@ impl Volume {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
             }
-            self.store
-                .retry_reclamation(|unit| self.overlay.get(unit).is_none())?;
+            // Physical reclamation is a space hint (R5-008): a window that
+            // cannot be punched (ENOSPC splitting an extent, EIO) is logged
+            // and retried by a later checkpoint, never failed here, or
+            // `maki drain` and a clean shutdown could never succeed while it
+            // keeps failing (BUG-123).
+            if let Err(error) = self
+                .store
+                .retry_reclamation(|unit| self.overlay.get(unit).is_none())
+            {
+                tracing::warn!("checkpoint: slot reclamation deferred: {error}");
+            }
             self.sanitize();
             return Ok(base_checkpoint);
         }

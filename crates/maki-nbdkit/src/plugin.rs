@@ -17,11 +17,13 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::adapter::NbdAdapter;
+use crate::adapter::{AdapterError, NbdAdapter};
 
 #[path = "startup.rs"]
 mod startup;
@@ -48,10 +50,80 @@ const API_VERSION: c_int = NBDKIT_API_VERSION;
 
 static CONFIG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static ADAPTER: OnceLock<NbdAdapter> = OnceLock::new();
+// nbd.connections is validated as exactly one. A successful open owns this
+// slot until nbdkit closes its handle; failed negotiations release it via
+// that same close callback. Rejected opens create no plugin-owned work.
+static ACTIVE_CONNECTION: AtomicBool = AtomicBool::new(false);
 static STARTUP: startup::Startup = startup::Startup::new();
 
 fn adapter() -> Option<&'static NbdAdapter> {
     STARTUP.ready().then(|| ADAPTER.get()).flatten()
+}
+
+/// Run one callback body. A panic must never unwind into nbdkit's C frames
+/// (that aborts the whole server): it is logged and the callback fails with
+/// EIO instead (BUG-098). The adapter's engine calls have their own boundary;
+/// this one also covers allocation, copying and the configuration callbacks.
+fn guarded<T>(callback: &'static str, failure: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::error!(callback, "panic caught at the nbdkit callback boundary");
+            set_errno(libc::EIO);
+            failure
+        }
+    }
+}
+
+/// Rate limit for per-request failure lines: at most one per second, each
+/// reporting how many were suppressed since the previous one.
+struct FailureLog {
+    state: Mutex<(Option<Instant>, u64)>,
+}
+
+impl FailureLog {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new((None, 0)),
+        }
+    }
+
+    /// `Some(suppressed)` when a line may be written at `now`.
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock();
+        match state.0 {
+            Some(last) if now.saturating_duration_since(last) < Duration::from_secs(1) => {
+                state.1 += 1;
+                None
+            }
+            _ => {
+                state.0 = Some(now);
+                Some(std::mem::take(&mut state.1))
+            }
+        }
+    }
+}
+
+static FAILURES: FailureLog = FailureLog::new();
+
+/// Fail a request: nbdkit reads errno, and the log says why. The client
+/// only ever sees an I/O error, so without this line a slot CRC failure, a
+/// provider deadline or a refused admission left no trace (BUG-098). The
+/// message never carries payload bytes.
+fn fail(op: &'static str, offset: u64, count: u32, error: &AdapterError) -> c_int {
+    if let Some(suppressed) = FAILURES.admit(Instant::now()) {
+        tracing::warn!(
+            op,
+            offset,
+            count,
+            errno = error.errno,
+            suppressed,
+            "request failed: {}",
+            error.message
+        );
+    }
+    set_errno(error.errno);
+    -1
 }
 
 unsafe extern "C" fn after_fork() -> c_int {
@@ -77,40 +149,64 @@ unsafe extern "C" fn after_fork() -> c_int {
 }
 
 unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
-    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
-    let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
-    if key == "config" {
-        *CONFIG_PATH.lock() = Some(value.into_owned());
-        0
-    } else {
-        eprintln!("maki-nbdkit: unknown parameter {key}");
-        -1
-    }
+    guarded("config", -1, || {
+        let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+        let value = unsafe { CStr::from_ptr(value) };
+        if key == "config" {
+            // A lossy conversion would store a different path (BUG-120).
+            let Ok(path) = value.to_str() else {
+                eprintln!("maki-nbdkit: config=<path> must be valid UTF-8");
+                return -1;
+            };
+            *CONFIG_PATH.lock() = Some(path.to_owned());
+            0
+        } else {
+            eprintln!("maki-nbdkit: unknown parameter {key}");
+            -1
+        }
+    })
 }
 
 unsafe extern "C" fn config_complete() -> c_int {
-    // Install the tracing sink before anything that can warn runs, so even
-    // pre-fork validation failures are logged with their level (R4-001).
-    maki_core::logging::install_default_logging();
-    if CONFIG_PATH.lock().is_none() {
-        eprintln!("maki-nbdkit: missing config=<path> parameter");
-        return -1;
-    }
-    0
+    guarded("config_complete", -1, || {
+        // Install the tracing sink before anything that can warn runs, so
+        // even pre-fork validation failures are logged with their level
+        // (R4-001).
+        maki_core::logging::install_default_logging();
+        if CONFIG_PATH.lock().is_none() {
+            eprintln!("maki-nbdkit: missing config=<path> parameter");
+            return -1;
+        }
+        0
+    })
 }
 
 unsafe extern "C" fn open(_readonly: c_int) -> *mut c_void {
-    match adapter() {
-        Some(a) => a as *const NbdAdapter as *mut c_void,
+    guarded("open", std::ptr::null_mut(), || match adapter() {
+        Some(a) => {
+            if ACTIVE_CONNECTION
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                a as *const NbdAdapter as *mut c_void
+            } else {
+                set_errno(libc::EBUSY);
+                std::ptr::null_mut()
+            }
+        }
         None => std::ptr::null_mut(),
-    }
+    })
 }
 
-unsafe extern "C" fn close(_handle: *mut c_void) {}
+unsafe extern "C" fn close(_handle: *mut c_void) {
+    ACTIVE_CONNECTION.store(false, Ordering::Release);
+}
 
 unsafe extern "C" fn get_size(handle: *mut c_void) -> i64 {
-    let a = unsafe { &*(handle as *const NbdAdapter) };
-    a.get_size() as i64
+    guarded("get_size", -1, || {
+        let a = unsafe { &*(handle as *const NbdAdapter) };
+        a.get_size() as i64
+    })
 }
 
 unsafe extern "C" fn block_size(
@@ -119,15 +215,17 @@ unsafe extern "C" fn block_size(
     preferred: *mut u32,
     maximum: *mut u32,
 ) -> c_int {
-    let a = unsafe { &*(handle as *const NbdAdapter) };
-    let sizes = a.block_sizes();
-    // nbdkit supplies valid output pointers for the negotiation callback.
-    unsafe {
-        *minimum = sizes.0;
-        *preferred = sizes.1;
-        *maximum = sizes.2;
-    }
-    0
+    guarded("block_size", -1, || {
+        let a = unsafe { &*(handle as *const NbdAdapter) };
+        let sizes = a.block_sizes();
+        // nbdkit supplies valid output pointers for the negotiation callback.
+        unsafe {
+            *minimum = sizes.0;
+            *preferred = sizes.1;
+            *maximum = sizes.2;
+        }
+        0
+    })
 }
 
 unsafe extern "C" fn can_write(_h: *mut c_void) -> c_int {
@@ -143,8 +241,10 @@ unsafe extern "C" fn is_rotational(_h: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn can_trim(handle: *mut c_void) -> c_int {
-    let adapter = unsafe { &*(handle as *const NbdAdapter) };
-    c_int::from(adapter.can_trim())
+    guarded("can_trim", -1, || {
+        let adapter = unsafe { &*(handle as *const NbdAdapter) };
+        c_int::from(adapter.can_trim())
+    })
 }
 
 unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
@@ -191,15 +291,14 @@ unsafe extern "C" fn pread_v2(
     offset: u64,
     _flags: u32,
 ) -> c_int {
-    let a = unsafe { &*(handle as *const NbdAdapter) };
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
-    match a.pread(slice, offset) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_errno(e.errno);
-            -1
+    guarded("pread", -1, || {
+        let a = unsafe { &*(handle as *const NbdAdapter) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
+        match a.pread(slice, offset) {
+            Ok(()) => 0,
+            Err(e) => fail("pread", offset, count, &e),
         }
-    }
+    })
 }
 
 unsafe extern "C" fn pwrite_v2(
@@ -209,38 +308,35 @@ unsafe extern "C" fn pwrite_v2(
     offset: u64,
     flags: u32,
 ) -> c_int {
-    let a = unsafe { &*(handle as *const NbdAdapter) };
-    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, count as usize) };
-    let fua = flags & NBDKIT_FLAG_FUA != 0;
-    match a.pwrite(slice, offset, fua) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_errno(e.errno);
-            -1
+    guarded("pwrite", -1, || {
+        let a = unsafe { &*(handle as *const NbdAdapter) };
+        let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, count as usize) };
+        let fua = flags & NBDKIT_FLAG_FUA != 0;
+        match a.pwrite(slice, offset, fua) {
+            Ok(()) => 0,
+            Err(e) => fail("pwrite", offset, count, &e),
         }
-    }
+    })
 }
 
 unsafe extern "C" fn flush_v2(handle: *mut c_void, _flags: u32) -> c_int {
-    let a = unsafe { &*(handle as *const NbdAdapter) };
-    match a.flush() {
-        Ok(()) => 0,
-        Err(e) => {
-            set_errno(e.errno);
-            -1
+    guarded("flush", -1, || {
+        let a = unsafe { &*(handle as *const NbdAdapter) };
+        match a.flush() {
+            Ok(()) => 0,
+            Err(e) => fail("flush", 0, 0, &e),
         }
-    }
+    })
 }
 
 unsafe extern "C" fn trim_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
-    let adapter = unsafe { &*(handle as *const NbdAdapter) };
-    match adapter.trim(offset, count as usize, flags & NBDKIT_FLAG_FUA != 0) {
-        Ok(()) => 0,
-        Err(error) => {
-            set_errno(error.errno);
-            -1
+    guarded("trim", -1, || {
+        let adapter = unsafe { &*(handle as *const NbdAdapter) };
+        match adapter.trim(offset, count as usize, flags & NBDKIT_FLAG_FUA != 0) {
+            Ok(()) => 0,
+            Err(error) => fail("trim", offset, count, &error),
         }
-    }
+    })
 }
 
 unsafe extern "C" fn zero_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
@@ -250,22 +346,25 @@ unsafe extern "C" fn zero_v2(handle: *mut c_void, count: u32, offset: u64, flags
         set_errno(libc::ENOTSUP);
         return -1;
     }
-    let adapter = unsafe { &*(handle as *const NbdAdapter) };
-    match adapter.zero(
-        offset,
-        count as usize,
-        flags & NBDKIT_FLAG_MAY_TRIM != 0,
-        flags & NBDKIT_FLAG_FUA != 0,
-    ) {
-        Ok(()) => 0,
-        Err(error) => {
-            set_errno(error.errno);
-            -1
+    guarded("zero", -1, || {
+        let adapter = unsafe { &*(handle as *const NbdAdapter) };
+        match adapter.zero(
+            offset,
+            count as usize,
+            flags & NBDKIT_FLAG_MAY_TRIM != 0,
+            flags & NBDKIT_FLAG_FUA != 0,
+        ) {
+            Ok(()) => 0,
+            Err(error) => fail("zero", offset, count, &error),
         }
-    }
+    })
 }
 
 unsafe extern "C" fn unload() {
+    guarded("unload", (), unload_adapter)
+}
+
+fn unload_adapter() {
     if let Some(a) = ADAPTER.get() {
         // `unload` is a void C callback, so a shutdown error cannot propagate
         // to the caller — but it must not be swallowed: a failed final
@@ -344,7 +443,9 @@ static PLUGIN: nbdkit_plugin = nbdkit_plugin {
     _thread_model: THREAD_MODEL_PARALLEL,
     name: c"maki".as_ptr(),
     longname: c"Maki encrypted volume".as_ptr(),
-    version: c"0.1.0".as_ptr(),
+    version: concat!(env!("CARGO_PKG_VERSION"), "\0")
+        .as_ptr()
+        .cast::<c_char>(),
     description: c"Crash-consistent encrypted block device (see SPEC.md)".as_ptr(),
     load: None,
     unload: Some(unload),
@@ -504,5 +605,51 @@ mod tests {
         assert!(of("block_size") > of("zero"));
         assert_eq!(of("_struct_size"), 0);
         assert_eq!(PLUGIN._struct_size as usize, of("sizeof_prefix"));
+    }
+
+    /// BUG-098: a panic inside a callback must reach nbdkit as a failed
+    /// request, never unwind into C, which aborts the whole server. Only
+    /// the adapter's engine call had a boundary; buffer allocation and
+    /// copying, and the configuration callbacks, ran outside it.
+    #[test]
+    fn a_panicking_callback_fails_the_request_with_eio() {
+        set_errno(0);
+        let status = guarded("pwrite", -1, || -> c_int { panic!("simulated") });
+        assert_eq!(status, -1);
+        assert_eq!(unsafe { *libc_errno_location() }, libc::EIO);
+        assert!(guarded("open", std::ptr::null_mut::<c_void>(), || panic!()).is_null());
+        assert_eq!(guarded("get_size", -1i64, || 7), 7);
+    }
+
+    /// BUG-098: per-request failures reach the log, at most one line per
+    /// second, with the number of lines suppressed in between.
+    #[test]
+    fn request_failures_are_logged_at_most_once_per_second() {
+        use std::time::{Duration, Instant};
+        let log = FailureLog::new();
+        let start = Instant::now();
+        assert_eq!(log.admit(start), Some(0));
+        assert_eq!(log.admit(start + Duration::from_millis(100)), None);
+        assert_eq!(log.admit(start + Duration::from_millis(900)), None);
+        assert_eq!(log.admit(start + Duration::from_secs(1)), Some(2));
+        assert_eq!(log.admit(start + Duration::from_secs(1)), None);
+    }
+
+    /// BUG-120: the `config` value went through `to_string_lossy`, so a path
+    /// with a non-UTF-8 byte was stored with U+FFFD in its place and attach
+    /// then failed with a misleading "not found", or opened a file whose
+    /// name literally contains U+FFFD. Such a value is refused instead.
+    #[test]
+    fn a_non_utf8_config_path_is_refused_not_rewritten() {
+        let before = CONFIG_PATH.lock().clone();
+        let status = unsafe { config(c"config".as_ptr(), c"/tmp/\xff.toml".as_ptr()) };
+        assert_eq!(status, -1);
+        assert_eq!(*CONFIG_PATH.lock(), before, "a rewritten path was stored");
+    }
+
+    #[test]
+    fn plugin_version_is_the_crate_version() {
+        let version = unsafe { CStr::from_ptr(PLUGIN.version) };
+        assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
     }
 }

@@ -53,6 +53,7 @@ fn caps() -> maki_crypto::CryptoCapabilities {
 #[derive(Default)]
 struct ServerState {
     require_token: Option<String>,
+    padded_lengths: Option<(usize, usize)>,
     fail_with: parking_lot_lite::Mutex<Option<Code>>,
     reorder: std::sync::atomic::AtomicBool,
     calls: std::sync::atomic::AtomicUsize,
@@ -105,9 +106,20 @@ impl CryptoServer {
         let mut items: Vec<CryptoItem> = message
             .items
             .into_iter()
-            .map(|item| CryptoItem {
-                unit_index: item.unit_index,
-                data: item.data.iter().map(|b| b ^ XOR).collect(),
+            .map(|item| {
+                let mut data: Vec<_> = item.data.iter().map(|b| b ^ XOR).collect();
+                if let Some((plain, cipher)) = self.state.padded_lengths {
+                    if data.len() == plain {
+                        data.resize(cipher, 0);
+                    } else {
+                        assert_eq!(data.len(), cipher);
+                        data.truncate(plain);
+                    }
+                }
+                CryptoItem {
+                    unit_index: item.unit_index,
+                    data,
+                }
             })
             .collect();
         if self.state.reorder.load(std::sync::atomic::Ordering::SeqCst) && items.len() >= 2 {
@@ -435,4 +447,293 @@ async fn unimplemented_only_poisoned_endpoint_and_respects_retry_safety() {
             assert_eq!(set.endpoint_states()[1].1, CircuitState::Open);
         }
     }
+}
+
+// The limit is measured by the real protobuf serializer, then used by both
+// configuration validation and tonic's live request/response codecs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validated_full_batches_roundtrip_at_serialized_grpc_boundary() {
+    use maki_format::config::{parse_config, ByteSize};
+    use prost::Message;
+    for cipher_len in [4383, 4384, 4385] {
+        let state = Arc::new(ServerState {
+            padded_lengths: Some((4096, cipher_len)),
+            ..Default::default()
+        });
+        let url = grpc_server(state).await;
+        let mut cfg = parse_config(&format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "transport-boundary"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "grpc-profile-v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = {cipher_len}
+[crypto.batch]
+max_items = 128
+max_bytes = "512KiB"
+[crypto.grpc]
+[[crypto.grpc.endpoint]]
+name = "test"
+url = "{url}"
+[backing]
+root = "/unused"
+"#
+        ))
+        .unwrap();
+        let mut context = ctx();
+        context.format_version = u32::MAX;
+        let message = CryptoBatchRequest {
+            volume_id: context.volume_uuid.to_string(),
+            compatibility_id: context.crypto_compatibility_id.clone(),
+            format_version: context.format_version,
+            items: (0..128)
+                .map(|i| CryptoItem {
+                    unit_index: u64::MAX - i,
+                    data: vec![0xAB; cipher_len],
+                })
+                .collect(),
+        };
+        let serialized = message.encode_to_vec();
+        let boundary = serialized.len();
+        assert_eq!(boundary, message.encoded_len());
+        cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(boundary as u64 - 1));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_message_bytes"));
+        for limit in [boundary, boundary + 1] {
+            cfg.crypto.grpc.as_mut().unwrap().max_message_bytes = Some(ByteSize(limit as u64));
+            cfg.validate().unwrap();
+            let mut capabilities = caps();
+            capabilities.supported_plaintext_sizes = vec![4096];
+            capabilities.max_ciphertext_size = cipher_len as u32;
+            capabilities.batch.max_items = 128;
+            let p = GrpcCryptoProvider::new(GrpcProviderSpec {
+                url: url.clone(),
+                encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+                decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+                metadata: vec![],
+                capabilities,
+                timeout: Duration::from_secs(5),
+                max_message_bytes: limit,
+            })
+            .unwrap();
+            let plaintext: Vec<_> = (0..128)
+                .map(|i| PlaintextUnit {
+                    unit_index: u64::MAX - i,
+                    data: SecretBuffer::from_slice(&vec![i as u8; 4096]),
+                })
+                .collect();
+            let encrypted = p.encrypt_batch(&context, &plaintext).await.unwrap();
+            assert!(encrypted.iter().all(|item| item.data.len() == cipher_len));
+            let decrypted = p.decrypt_batch(&context, &encrypted).await.unwrap();
+            for (expected, actual) in plaintext.iter().zip(&decrypted) {
+                assert_eq!(expected.data.expose(), actual.data.expose());
+            }
+        }
+    }
+}
+
+/// Keep the first established TCP connection open but stop forwarding every
+/// byte. Later connections use the same healthy backend, so success requires
+/// retiring the unresponsive channel rather than retrying its dead socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unresponsive_established_channel_is_replaced_after_timeout_or_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::{TcpListener, TcpStream};
+
+    for (initial_status, cancel) in [
+        None,
+        Some(Code::InvalidArgument),
+        Some(Code::ResourceExhausted),
+    ]
+    .into_iter()
+    .flat_map(|status| [false, true].map(|cancel| (status, cancel)))
+    {
+        let backend = grpc_server(Arc::new(ServerState {
+            fail_with: parking_lot_lite::Mutex::new(initial_status),
+            ..Default::default()
+        }))
+        .await;
+        let backend = backend.strip_prefix("http://").unwrap().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop_forwarding = Arc::new(tokio::sync::Notify::new());
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let proxy = tokio::spawn({
+            let accepted = accepted.clone();
+            let stop_forwarding = stop_forwarding.clone();
+            let parked = parked.clone();
+            async move {
+                loop {
+                    let (mut client, _) = listener.accept().await.unwrap();
+                    let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                    let mut upstream = TcpStream::connect(&backend).await.unwrap();
+                    let stop_forwarding = stop_forwarding.clone();
+                    let parked = parked.clone();
+                    tokio::spawn(async move {
+                        if first {
+                            tokio::select! {
+                                _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
+                                _ = stop_forwarding.notified() => {
+                                    parked.notify_one();
+                                    let held_open = (client, upstream);
+                                    std::future::pending::<()>().await;
+                                    drop(held_open);
+                                }
+                            }
+                        } else {
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                        }
+                    });
+                }
+            }
+        });
+        let p = GrpcCryptoProvider::new(GrpcProviderSpec {
+            url: format!("http://{address}"),
+            encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+            decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+            metadata: vec![],
+            capabilities: caps(),
+            timeout: Duration::from_secs(1),
+            max_message_bytes: 1 << 20,
+        })
+        .unwrap();
+        let context = ctx();
+        let plaintext = [pt(1, 0xAB)];
+        let first = p.encrypt_batch(&context, &plaintext).await;
+        match initial_status {
+            Some(Code::InvalidArgument) => {
+                assert_eq!(first.unwrap_err().class(), ErrorClass::NonRetryableRequest);
+            }
+            Some(Code::ResourceExhausted) => {
+                assert_eq!(first.unwrap_err().class(), ErrorClass::Throttled);
+            }
+            None => {
+                first.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        stop_forwarding.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+
+        if cancel {
+            assert!(tokio::time::timeout(
+                Duration::from_millis(50),
+                p.encrypt_batch(&context, &plaintext)
+            )
+            .await
+            .is_err());
+        } else {
+            let failure = p.encrypt_batch(&context, &plaintext).await.unwrap_err();
+            assert_eq!(failure.class(), ErrorClass::Retryable);
+        }
+        let encrypted = p.encrypt_batch(&context, &plaintext).await.expect(
+            "next RPC must use a fresh connection after an established channel stops responding",
+        );
+        let decrypted = p.decrypt_batch(&context, &encrypted).await.unwrap();
+        assert_eq!(decrypted[0].data.expose(), plaintext[0].data.expose());
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "reuse the healthy replacement"
+        );
+        proxy.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unfinished_tls_handshake_survives_an_rpc_timeout_and_later_succeeds() {
+    use maki_crypto_grpc::GrpcTlsConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend.local_addr().unwrap();
+    let tls =
+        tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(
+            certificate.cert.pem(),
+            certificate.key_pair.serialize_pem(),
+        ));
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(CryptoServer {
+                state: Arc::new(ServerState::default()),
+            })
+            .serve_with_incoming(tokio_stream_wrapper::listener_stream(backend))
+            .await
+            .unwrap();
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let forwarding = Arc::new(tokio::sync::Notify::new());
+    let proxy = tokio::spawn({
+        let accepted = accepted.clone();
+        let forwarding = forwarding.clone();
+        async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let mut upstream = TcpStream::connect(backend_address).await.unwrap();
+                let forwarding = forwarding.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    forwarding.notify_one();
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        }
+    });
+    let p = GrpcCryptoProvider::new_with_tls(
+        GrpcProviderSpec {
+            url: format!("https://{address}"),
+            encrypt_path: "/maki.CryptoService/EncryptBatch".into(),
+            decrypt_path: "/maki.CryptoService/DecryptBatch".into(),
+            metadata: vec![],
+            capabilities: caps(),
+            timeout: Duration::from_millis(500),
+            max_message_bytes: 1 << 20,
+        },
+        GrpcTlsConfig {
+            ca_certificate_pem: Some(certificate.cert.pem().into_bytes()),
+            client_identity: None,
+        },
+    )
+    .unwrap();
+    let context = ctx();
+    let plaintext = [pt(7, 0xAB)];
+    assert_eq!(
+        p.encrypt_batch(&context, &plaintext)
+            .await
+            .unwrap_err()
+            .class(),
+        ErrorClass::Retryable
+    );
+    tokio::time::timeout(Duration::from_secs(5), forwarding.notified())
+        .await
+        .unwrap();
+    let encrypted = p.encrypt_batch(&context, &plaintext).await.unwrap();
+    assert_eq!(encrypted[0].data, vec![0xAB ^ XOR; UNIT]);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "finish the original bounded TLS attempt"
+    );
+    proxy.abort();
+    server.abort();
 }

@@ -26,7 +26,8 @@ HTTP example is available at
 | `security` | Core-dump, memory-lock, and secure-swap policy |
 
 Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
-Durations use values such as `150us`, `50ms`, `5s`, or `30s`.
+Durations use values such as `150us`, `50ms`, `5s`, or `2m` (minutes), always
+as a quoted string with a unit. Unlike byte sizes, a bare integer is rejected.
 
 `volume.name` is an operational identifier of 1–64 ASCII bytes, using only
 letters, digits, `_` and `-`. Validation rejects longer names before creating
@@ -52,7 +53,7 @@ server_name = "witness.example.test"
 timeout_ms = 5000
 ca_file = "/etc/maki/witness-ca.pem"
 client_cert_file = "/etc/maki/writer.cert.pem"
-client_key_file = "/run/credentials/maki/writer.key.pem"
+client_key_file = "/etc/maki/witness/writer.key.pem"
 ```
 
 Select exactly one of `address` or `addresses`; an endpoint set contains 1–8
@@ -143,11 +144,19 @@ Changing a mode cannot bypass the mandatory integrity/context tests.
 
 ## Validation rules
 
-`validate()` runs before a volume is created and before every attach. Beyond
-schema, geometry, and secret-literal checks it rejects:
+`validate()` runs before a volume is created and before every attach. TOML and
+schema parse errors report only `invalid TOML or configuration schema`, with
+line and column when available. Their Display and Debug output omit the source
+text, values, unknown field names and the parser's free-form message; inspect
+the configuration locally at the reported location to diagnose the problem.
+Semantic validation errors can name a known field or endpoint. Endpoint URLs
+are shown as `scheme://host[:port]` without userinfo, path or query. Beyond
+schema, geometry, and secret-literal checks validation rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
-  `[crypto.circuit_breaker]`, and `[crypto.retry_budget]`, a non-finite or
+  `[crypto.circuit_breaker]`, and `[crypto.retry_budget]` (except
+  `limits.max_overlay_bytes` and `limits.max_overlay_entries`, where `0`
+  disables the bound), a non-finite or
   negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s` or whose reciprocal cannot
   be represented by `Duration`, an
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
@@ -182,7 +191,30 @@ schema, geometry, and secret-literal checks it rejects:
   loopback, so TLS options cannot be silently ignored;
 - HTTP batch layouts (`body.items_path`) whose response mapping lacks
   `items_path` or `item_index_path`: every batch element must echo its unit
-  index so reordered, dropped, or duplicated results are detected;
+  index so reordered, dropped, or duplicated results are detected. Only a
+  `type = "json"` body with `items_path` is a batch; a raw body is sent one
+  item per request;
+- a declared `capabilities.context_binding` whose context fields do not reach
+  the provider: each of `volume_id`, `compatibility_id` and `format_version`
+  must be a source in the JSON `fields`, or in `item_fields` of a batch
+  layout (a raw body sends no fields, and a per-item body never sends
+  `item_fields`);
+- a transport limit that cannot carry one full crypto batch, including the
+  declared maximum ciphertext size. gRPC `max_message_bytes` (default 4 MiB)
+  includes protobuf field tags, lengths, indices, context and the singleton
+  negative profile probe used by attach self-tests. WebSocket
+  `max_frame_bytes` (default 8 MiB) includes each item's base64 padding, JSON
+  structure, escaped profile, and maximum-width numeric fields. HTTP
+  `max_response_bytes` (default 8 MiB) covers each operation's response mapping,
+  base64/base64url/hex encoding, JSON pointer wrappers and echoed indices; raw
+  and single-item responses are checked too. JSON bounds cover compact documents
+  containing the declared fields, including the required null-filled
+  array prefixes selected by numeric JSON-pointer tokens. Only RFC 6901 `~0`
+  and `~1` pointer escapes are accepted. Optional provider metadata, non-null
+  data in unmapped array siblings, whitespace and redundant escaping need
+  additional response capacity. Remote responses still obey the hard
+  runtime cap. A zero limit is rejected;
+- a zero `timeout` for any remote transport;
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
@@ -239,8 +271,10 @@ privileged attach helper has no crypto dependency and no credential directive.
 
 Every credential reference is loaded from exactly the `source` it declares:
 `credential` reads `$CREDENTIALS_DIRECTORY/<name>` and fails closed when the
-directory is unset, `file` reads the named file, `env` reads
-`MAKI_CREDENTIAL_<NAME>`. There is no fallback between sources, so a production
+directory is unset, `file` reads the named file (an absolute path: a relative
+one would resolve against whichever process's working directory reads it), `env`
+reads `MAKI_CREDENTIAL_<NAME>`. TLS `ca_file` and `client_cert_file` paths must
+be absolute for the same reason. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
@@ -273,6 +307,11 @@ the vendor cipher. Supported mappings include raw single-item payloads and JSON
 objects containing payload, unit index, volume ID, compatibility ID, or batch
 index. Binary data may use base64, base64url, or hexadecimal encoding.
 
+JSON requests default to `Content-Type: application/json`. An explicitly
+configured `Content-Type` overrides that default, including vendor media types;
+header-name matching is case-insensitive. This applies to single-item and batch
+operations. Raw requests retain their configured headers without a JSON default.
+
 The endpoint URL's path is a prefix for each operation path. For example,
 `https://crypto.example/gateway?tenant=demo` with `/encrypt` requests
 `/gateway/encrypt?tenant=demo`. Endpoint and operation-path queries are preserved,
@@ -297,7 +336,10 @@ when available, and establish throughput and tail latency with the
 ## WebSocket and gRPC contracts
 
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
-stale response IDs are discarded, pending requests are scoped to a connection
+stale response IDs are discarded; a binary frame, a text frame that is not JSON,
+or a response without a numeric ID breaks the contract and fails every request
+on that connection at once as a contract error. Ping and pong frames are
+ignored, and a close frame ends the connection. Pending requests are scoped to a connection
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
@@ -310,6 +352,11 @@ Retiring a generation also fails its other in-flight requests as retryable.
 For a provider with `retry_safe = false`, those peers return EIO instead of
 being resent. Include that shared-connection failure scope in the application's
 availability contract; a per-request timeout does not isolate its peers.
+
+A gRPC request gives up after `timeout`, but the connection attempt behind it
+(TCP connect and TLS handshake together) may continue for up to four times
+`timeout`, so a slow handshake still serves the next request; a peer that never
+completes the handshake is abandoned then and the next request reconnects.
 
 Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request has been
@@ -463,14 +510,18 @@ An intermediate sync failure stops further appends and is returned to the caller
 
 The default checkpoint worker interval is 30 seconds. An administrative
 checkpoint applies durable records; a successful call that advances no sequence
-does not postpone the worker's periodic sync of pending writes.
+does not postpone the worker's periodic sync of pending writes. After a failed
+pass the worker waits one interval before it tries again, however many writes
+cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
+checkpoints inline, and a success clears the wait.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
 journal, and `limits.max_ciphertext_bytes` only governs the remote scheduler's
-queue, not this structure. `maki status` reports `overlay_bytes` and
-`overlay_units`; the byte figure is the logical charge (a shared version is
-counted twice), not process RSS, and the bound applies to that projection.
+queue, not this structure. `maki metrics` reports `maki_overlay_bytes` and
+`maki_overlay_units` (`maki status` does not); the byte figure is the logical
+charge (a shared version is counted twice), not process RSS, and the bound
+applies to that projection.
 
 Free space is read with `statvfs` on Unix hosts. When the emergency reserve is
 enabled, an unavailable or failed query fails write admission with ENOSPC;
@@ -526,7 +577,8 @@ requests are coalesced into one provider call when their items fit
 `crypto.batch.max_items` / `max_bytes`; a batch is dispatched as soon as
 `target_items` or `target_bytes` is reached, and at the latest `max_wait`
 after its first item arrived. A request's items are never split and keep
-their order. Each lane keeps up to `limits.max_crypto_inflight_batches`
+their order. Requests that touch the same unit are never coalesced: one
+provider call never carries a unit twice. Each lane keeps up to `limits.max_crypto_inflight_batches`
 batches in flight at once (the dispatcher's own limits bound what reaches the
 endpoints), so one slow batch does not serialize the requests behind it.
 `limits.max_pending_crypto_items` bounds queued items per lane (one permit per
@@ -649,6 +701,14 @@ slots and 64 GiB shards, the full slot span is 18 TiB. Its allocation maps use
 1,073,758,208 bytes across both copies at full allocation; the two full catalog
 copies use 4,152 bytes. The last partial logical shard still contributes a full
 shard file because shard files are created at their complete fixed length.
+
+Every shard in the catalog keeps one open file descriptor while the volume is
+attached. The daemon, `maki` and `maki-check` raise their soft
+`RLIMIT_NOFILE` to the hard limit (at most 2^20) before opening a volume;
+systemd's default hard limit of 524288 is far above any practical shard count.
+A lower hard limit (`LimitNOFILE=`) must leave room for the shards plus the
+journal and connections, or attach fails with `Too many open files`. That error
+names no damage: raise the limit and attach again.
 
 These values describe format files at maximum allocation. Add journal and
 checkpoint headroom, filesystem allocation and metadata overhead,

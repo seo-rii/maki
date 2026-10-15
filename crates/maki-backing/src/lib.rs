@@ -24,6 +24,47 @@ pub use rollback::RollbackBacking;
 pub use file::FileBacking;
 pub use mem::MemBacking;
 
+/// Ceiling for [`raise_open_file_limit`]: Linux's default `fs.nr_open`.
+#[cfg(unix)]
+const OPEN_FILE_LIMIT_CAP: u64 = 1 << 20;
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit (at most 2^20) and return
+/// the soft limit now in effect; never lowers it.
+///
+/// Every cataloged shard keeps its data file open, and systemd starts
+/// services with a soft limit of 1024 under a much higher hard limit, so a
+/// volume with about a thousand shards would fail with EMFILE (BUG-124).
+/// Nothing here uses `select(2)`, the reason that soft limit stays low.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is `u64` on Linux, not on every Unix
+pub fn raise_open_file_limit() -> io::Result<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into a valid, owned struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let target = (limit.rlim_max as u64).min(OPEN_FILE_LIMIT_CAP) as libc::rlim_t;
+    if limit.rlim_cur >= target {
+        return Ok(limit.rlim_cur as u64);
+    }
+    limit.rlim_cur = target;
+    // SAFETY: setrlimit reads a valid struct; the soft limit stays within
+    // the unchanged hard limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(target as u64)
+}
+
+/// No descriptor limit to raise on this platform.
+#[cfg(not(unix))]
+pub fn raise_open_file_limit() -> io::Result<u64> {
+    Ok(u64::MAX)
+}
+
 // Share the executable crash model with this crate's unit tests without a
 // dependency cycle through maki-test-support.
 #[cfg(test)]

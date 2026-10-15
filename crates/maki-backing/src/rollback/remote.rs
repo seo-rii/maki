@@ -35,6 +35,26 @@ impl Witness {
             }
         }
     }
+    /// Whether a failed freshness check stops the session. A local witness
+    /// stops on any failure. A remote Inspect changes nothing, so a witness
+    /// that could not be asked (timeout, refused or reset connection, an
+    /// unavailable quorum) only refuses this operation; the next check
+    /// either matches again or observes the change (BUG-103). A mismatch,
+    /// an invalid or denied answer stops the session for good. The kinds
+    /// match the ones the failover client treats as final.
+    pub(super) fn stops_session(&self, error: &io::Error) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(_) => matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::NotFound
+            ),
+        }
+    }
     pub(super) fn advance(&mut self, root: [u8; 32]) -> io::Result<()> {
         match self {
             Self::Local(witness) => witness.advance(root),
@@ -246,10 +266,38 @@ pub(super) fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Ba
     }))
 }
 
+/// Authenticate the authority's current generation in this root *before* a
+/// claim or takeover changes the authority. A configuration that names
+/// another volume's witness would otherwise raise that volume's fence (or
+/// revoke its live writer) and only then fail to find the data (BUG-107).
+/// GC applies the same check before trusting an authority.
+fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<()> {
+    let current = record
+        .current
+        .as_ref()
+        .ok_or_else(|| invalid("uninitialized remote backing"))?;
+    let source = scope(disk.clone(), &current.namespace)
+        .map_err(|_| invalid("remote authority's current namespace is not valid in this root"))?;
+    load_generation(source.as_ref(), current).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            invalid(format!(
+                "this backing root does not hold the remote authority's current generation \
+                 ({error}); check the witness address and backing root before retrying"
+            ))
+        } else {
+            // Unreadable storage does not establish a root/authority mismatch.
+            // Preserve both its classification and the underlying OS error.
+            error
+        }
+    })?;
+    Ok(())
+}
+
 pub(super) fn load_generation(
     disk: &dyn Backing,
     descriptor: &Descriptor,
 ) -> io::Result<(Manifest, Vec<u8>)> {
+    let mut storage_error = None;
     for name in MANIFESTS {
         let candidate = (|| {
             let file = disk.open(name, false)?;
@@ -264,9 +312,15 @@ pub(super) fn load_generation(
             if digest(b"maki.rollback.manifest.v1\0", &bytes) != descriptor.anchor.root {
                 return Err(invalid("remote root mismatch"));
             }
-            let manifest: Manifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            manifest.validate()?;
-            if manifest.encode()? != bytes
+            let manifest: Manifest = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("invalid remote manifest encoding"))?;
+            manifest
+                .validate()
+                .map_err(|_| invalid("invalid remote manifest content"))?;
+            if manifest
+                .encode()
+                .map_err(|_| invalid("invalid remote manifest size"))?
+                != bytes
                 || manifest.identity != descriptor.anchor.identity
                 || manifest.generation != descriptor.anchor.generation
                 || file.len()? != manifest_bound(manifest.capacity)
@@ -281,11 +335,25 @@ pub(super) fn load_generation(
             }
             Ok((manifest, bytes))
         })();
-        if let Ok(value) = candidate {
-            return Ok(value);
+        match candidate {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::InvalidData
+                ) => {}
+            Err(error) => {
+                // Try the redundant copy, but do not report unreadable storage
+                // as proven corruption when no exact candidate can be read.
+                if storage_error.is_none() {
+                    storage_error = Some(error);
+                }
+            }
         }
     }
-    Err(invalid("no exact remote witnessed manifest"))
+    Err(storage_error.unwrap_or_else(|| invalid("no exact remote witnessed manifest")))
 }
 
 fn copy_generation(
@@ -405,6 +473,7 @@ impl RollbackBacking {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let expected = inspect(rpc.as_ref())?;
+        holds_current(&disk, &expected)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
@@ -415,6 +484,7 @@ impl RollbackBacking {
     pub fn takeover_remote(root: &Path, rpc: Arc<dyn Rpc>, expected: &Record) -> io::Result<Self> {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
+        holds_current(&disk, expected)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), expected, &authorization, Action::Takeover)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
@@ -591,3 +661,7 @@ impl RollbackBacking {
         Ok(descriptor)
     }
 }
+
+#[cfg(test)]
+#[path = "remote_load_tests.rs"]
+mod load_tests;

@@ -56,8 +56,11 @@ rule it enforces. Guide: [PostgreSQL deployment](../../docs/deployment/postgres.
 
 ## Operations
 
-- [ ] Planned-stop runbook: stop PostgreSQL → `maki drain` → stop target →
-      wait for all units → offline check
+- [ ] Planned-stop runbook: stop the lifecycle target with I/O admission open →
+      ordered PostgreSQL stop, unmount and daemon drain → wait for all units
+      to be inactive → offline check. A separate drain acknowledgement requires
+      application quiescence and successful unmount first
+      ([procedure](../../docs/deployment/postgres.md#6-planned-stop-and-start)).
 - [ ] Recovery runbook read: [storage recovery](../../docs/storage-recovery.md)
 - [ ] Backup shape chosen and rehearsed (unchanged-backing restore or
       database-native), including the credential path

@@ -230,7 +230,7 @@ pub async fn build_provider_with_endpoints(
 
 async fn build_provider_for_volume(
     config: &VolumeConfig,
-    volume: Option<&Volume>,
+    volume: Option<&Arc<Volume>>,
 ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
     // Public callers can supply an unvalidated configuration. Refuse name
     // collisions before the name-only credential router loads any secret.
@@ -394,7 +394,7 @@ impl RoutedKeySource {
 /// (retry/budget/breaker/failover) from configuration.
 async fn remote_http_provider(
     config: &VolumeConfig,
-    volume: Option<&Volume>,
+    volume: Option<&Arc<Volume>>,
 ) -> Result<Arc<EndpointSet>, DaemonError> {
     let http = config
         .crypto
@@ -436,7 +436,7 @@ fn read_tls_file(
 /// Per-endpoint verified WS/WSS transports through the shared dispatcher.
 async fn remote_websocket_provider(
     config: &VolumeConfig,
-    volume: Option<&Volume>,
+    volume: Option<&Arc<Volume>>,
 ) -> Result<Arc<EndpointSet>, DaemonError> {
     let ws = config
         .crypto
@@ -495,7 +495,7 @@ async fn remote_websocket_provider(
 /// with credential-resolved ASCII metadata and verified HTTPS/mTLS support.
 async fn remote_grpc_provider(
     config: &VolumeConfig,
-    volume: Option<&Volume>,
+    volume: Option<&Arc<Volume>>,
 ) -> Result<Arc<EndpointSet>, DaemonError> {
     let grpc = config
         .crypto
@@ -662,7 +662,7 @@ fn resolve_metadata_value(
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
-    volume: Option<&Volume>,
+    volume: Option<&Arc<Volume>>,
 ) -> Result<Arc<EndpointSet>, DaemonError> {
     // Provider-only construction still needs a real, exclusively held volume;
     // constructing transports first retains early credential/config errors.
@@ -670,8 +670,14 @@ async fn dispatch_endpoint_set(
     let volume = match volume {
         Some(volume) => volume,
         None => {
-            recovered = Volume::recover(build_backing(config)?, engine_options(config).volume)
-                .map_err(AttachError::from)?;
+            let backing = build_backing(config)?;
+            let options = engine_options(config).volume;
+            recovered = Arc::new(
+                tokio::task::spawn_blocking(move || Volume::recover(backing, options))
+                    .await
+                    .map_err(|e| DaemonError::Unsupported(format!("recovery worker failed: {e}")))?
+                    .map_err(AttachError::from)?,
+            );
             &recovered
         }
     };
@@ -729,7 +735,7 @@ async fn dispatch_endpoint_set(
                     let caps = validation_provider.capabilities().await?;
                     let checked = CheckedProvider::pinned(validation_provider.clone(), unit as u32);
                     match maki_core::engine::verify_key_canary(
-                        volume,
+                        volume.clone(),
                         &checked,
                         &context,
                         caps.integrity.present(),
@@ -811,11 +817,18 @@ async fn dispatch_endpoint_set(
         flagged.push((name, provider, false));
     }
 
-    let canary = maki_format::ab::AbStore::new(
-        maki_format::layout::KEY_CANARY_A,
-        maki_format::layout::KEY_CANARY_B,
-    )
-    .load::<maki_format::canary::KeyCanary>(volume.backing().as_ref())?;
+    // Snapshot the canary for later endpoint revalidation without blocking
+    // the async dispatcher; cancellation retains the recovered volume lock.
+    let reading = volume.clone();
+    let canary = tokio::task::spawn_blocking(move || {
+        maki_format::ab::AbStore::new(
+            maki_format::layout::KEY_CANARY_A,
+            maki_format::layout::KEY_CANARY_B,
+        )
+        .load::<maki_format::canary::KeyCanary>(reading.backing().as_ref())
+    })
+    .await
+    .map_err(|e| DaemonError::Unsupported(format!("canary storage worker failed: {e}")))??;
     let validation_context = context.clone();
     let validator: EndpointValidator = Arc::new(move |reference, candidate, _request_context| {
         let context = validation_context.clone();
@@ -1036,9 +1049,20 @@ pub async fn attach_from_config_with_stats(
 > {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
+    // Every cataloged shard keeps a descriptor (BUG-124). A refusal leaves
+    // the inherited limit; an open that then fails reports EMFILE.
+    if let Err(e) = maki_backing::raise_open_file_limit() {
+        tracing::warn!("cannot raise the open-file soft limit: {e}");
+    }
     let backing = build_backing(config)?;
     let options = engine_options(config);
-    let volume = Volume::recover(backing, options.volume.clone()).map_err(AttachError::from)?;
+    let recovery_options = options.volume.clone();
+    let volume = Arc::new(
+        tokio::task::spawn_blocking(move || Volume::recover(backing, recovery_options))
+            .await
+            .map_err(|e| DaemonError::Unsupported(format!("recovery worker failed: {e}")))?
+            .map_err(AttachError::from)?,
+    );
     validate_recovered_geometry(config, &volume)?;
     let (provider, endpoints) = build_provider_for_volume(config, Some(&volume)).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
@@ -1053,6 +1077,9 @@ pub async fn attach_from_config_with_stats(
     } else {
         (provider, None)
     };
+    let volume = Arc::try_unwrap(volume).map_err(|_| {
+        DaemonError::Unsupported("endpoint verification retained the recovered volume".into())
+    })?;
     let engine = Engine::attach_recovered(volume, provider, options).await?;
     crate::security::recheck_memory_budget(config)?;
     Ok((engine, stats, endpoints))
@@ -1194,7 +1221,7 @@ fn initialize_volume(
             .map(|k| k.name.clone())
             .unwrap_or_default(),
         geometry,
-        format_version: 1,
+        format_version: maki_format::superblock::CRYPTO_FORMAT_VERSION,
         created_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

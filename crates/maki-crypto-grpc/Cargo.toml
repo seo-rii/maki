@@ -12,16 +12,30 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-tonic = { version = "0.13", features = ["tls-native-roots"] }
+# Select tonic's explicit ring fallback when no process-global provider exists.
+# Roots alone leave rustls to infer one, which panics if another dependency
+# enables aws-lc alongside our ring backend.
+tonic = { version = "0.13", features = ["tls-native-roots", "tls-ring"] }
+# Probes whether the host trust store has any roots before asking tonic for
+# them (tonic refuses an empty store even when a CA is configured).
+rustls-native-certs = "0.8"
 prost = "0.13"
 http-body = "1"
 zeroize.workspace = true
+# The TCP connector handed to tonic, so its connect timeout also covers the
+# TLS handshake (`connect_with_connector_lazy`); the same version tonic uses.
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 
 [dev-dependencies]
 maki-backing.workspace = true
 maki-core.workspace = true
 maki-format.workspace = true
 maki-crypto-local.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rcgen.workspace = true
 rustls.workspace = true
+# Raw HTTP/2 responses tonic's server would never produce (truncated
+# messages); the version tonic already uses.
+h2 = "0.4"
+http = "1"
+bytes = "1"
