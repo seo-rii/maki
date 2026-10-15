@@ -84,6 +84,9 @@ unsound advisory, or yanked crate therefore fails the job against the fetched
 RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
 from affected 0.23.43 to 0.23.45 after `RUSTSEC-2026-0285`; the focused HTTP/TLS
 package suite and a fresh warning-denying audit passed locally.
+The current vendored pin is 0.23.46, which includes the subsequent
+`RUSTSEC-2026-0346` through `RUSTSEC-2026-0349` fixes while retaining the local
+plaintext-erasure patch and its allocator-observed regressions.
 
 The scheduled job runs:
 
