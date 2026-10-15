@@ -619,10 +619,18 @@ For Docker, put container creation and removal in the registered workload unit
 and disable an independent `restart: always` path that could bypass the target.
 Docker bind mounts are `rprivate` by default, so a host remount does not make an
 old container safe; the lifecycle must stop and create the container again.
-For planned shutdown, obtain a successful `maki drain` acknowledgement first,
-after the application has quiesced and closed its database, then stop
-`maki-workload@pg.target`. Do not stop only the workload or attach unit: the
+For a normal packaged shutdown, stop `maki-workload@pg.target` while engine
+admission is still open. Filesystem unmount may need to write dirty data or
+metadata; running `maki drain` before unmount prevents those writes. The
+ordered target stop unmounts through attach cleanup before daemon unload drains
+the engine. Do not stop only the workload or attach unit: the
 `Requires=` and `PartOf=` relationships can deactivate the rest of the graph.
+For an explicit durability acknowledgement, first quiesce and close the
+application through its own shutdown interface, unmount its verified filesystem
+while the daemon is running, then run `maki drain` and require success before
+stopping the target. If unmount fails, keep admission open and resolve that
+failure; a successful drain cannot substitute for a successful unmount.
+
 The target stop orders the workload before attach cleanup and attach cleanup
 before daemon shutdown. The target's own stop job may finish while those
 dependent stop jobs are still deactivating. Wait for every lifecycle unit to
@@ -726,9 +734,11 @@ Use this procedure only when restoring the same v2 volume UUID, backing data,
 crypto compatibility identity and key. A DB-native or legacy-v1 migration uses
 the separate process in [durable recovery](durable-recovery.md).
 
-1. Stop database writers, close database connections, run `maki drain`, and
-   stop `maki-workload@<volume>.target`. Wait until the workload, attach and
-   daemon units are inactive. Run `maki check` before capture.
+1. Stop database writers and close database connections through the application
+   shutdown interface. Unmount the verified filesystem while engine admission
+   is open, then require a successful `maki drain` acknowledgement. Stop
+   `maki-workload@<volume>.target` and wait until the workload, attach and daemon
+   units are inactive. Run `maki check` before capture.
 2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
    Capture the credential through the deployment's secret-backup mechanism,
    separately from ordinary logs and backups. Record hashes, Maki revision,
