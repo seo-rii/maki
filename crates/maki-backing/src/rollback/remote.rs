@@ -290,6 +290,7 @@ pub(super) fn load_generation(
     disk: &dyn Backing,
     descriptor: &Descriptor,
 ) -> io::Result<(Manifest, Vec<u8>)> {
+    let mut storage_error = None;
     for name in MANIFESTS {
         let candidate = (|| {
             let file = disk.open(name, false)?;
@@ -304,9 +305,15 @@ pub(super) fn load_generation(
             if digest(b"maki.rollback.manifest.v1\0", &bytes) != descriptor.anchor.root {
                 return Err(invalid("remote root mismatch"));
             }
-            let manifest: Manifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            manifest.validate()?;
-            if manifest.encode()? != bytes
+            let manifest: Manifest = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("invalid remote manifest encoding"))?;
+            manifest
+                .validate()
+                .map_err(|_| invalid("invalid remote manifest content"))?;
+            if manifest
+                .encode()
+                .map_err(|_| invalid("invalid remote manifest size"))?
+                != bytes
                 || manifest.identity != descriptor.anchor.identity
                 || manifest.generation != descriptor.anchor.generation
                 || file.len()? != manifest_bound(manifest.capacity)
@@ -321,11 +328,25 @@ pub(super) fn load_generation(
             }
             Ok((manifest, bytes))
         })();
-        if let Ok(value) = candidate {
-            return Ok(value);
+        match candidate {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::InvalidData
+                ) => {}
+            Err(error) => {
+                // Try the redundant copy, but do not report unreadable storage
+                // as proven corruption when no exact candidate can be read.
+                if storage_error.is_none() {
+                    storage_error = Some(error);
+                }
+            }
         }
     }
-    Err(invalid("no exact remote witnessed manifest"))
+    Err(storage_error.unwrap_or_else(|| invalid("no exact remote witnessed manifest")))
 }
 
 fn copy_generation(
@@ -633,3 +654,7 @@ impl RollbackBacking {
         Ok(descriptor)
     }
 }
+
+#[cfg(test)]
+#[path = "remote_load_tests.rs"]
+mod load_tests;
