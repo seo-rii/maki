@@ -404,13 +404,25 @@ async fn real_remote_internal_still_charges_the_failed_peer_and_fails_over() {
 }
 
 #[test]
-fn both_reported_message_size_configurations_validate() {
+fn message_size_configurations_allow_full_context_and_selftest_headroom() {
     let backing_root = if cfg!(windows) {
         r"C:\maki-grpc-size-unused"
     } else {
         "/unused/grpc-size"
     };
-    for (compatibility_id, limit) in [("a".to_string(), 580), ("x".repeat(128), 600)] {
+    for compatibility_id in ["a".to_string(), "x".repeat(128)] {
+        // A valid configuration must fit every declared request, including the
+        // widest unit index and format version. Also leave room for attach's
+        // singleton context-binding probe, which extends the profile at unit 0.
+        let normal = request_len(&context(&compatibility_id, u32::MAX), &[u64::MAX]);
+        let probe = request_len(
+            &context(&format!("{compatibility_id}.selftest-probe"), u32::MAX),
+            &[0],
+        );
+        let limit = normal.max(probe);
+        // The long-profile 600-byte case above intentionally exercises a direct
+        // provider's local error. Serialized config validation (#57) rejects
+        // that undersized configuration; it is not a valid config example.
         let raw = format!(
             r#"
 config_schema_version = 1
