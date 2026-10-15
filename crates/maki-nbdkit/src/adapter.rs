@@ -7,11 +7,12 @@
 //!   only for opt-in v3 volumes; native, chunked write-zeroes (R5-036) without
 //!   fast zero; multi-connection disabled.
 //! - The NBD I/O limits are advertised through the plugin's `block_size`
-//!   callback *and* enforced here: negotiation is advisory, so a request
-//!   outside the configured minimum/maximum, misaligned, or past the end of
-//!   the device is refused with EINVAL before any plaintext is copied or
-//!   the engine entered (BUG-011). The engine refuses anything above
-//!   `nbd.maximum_io` on its own as well (third review, F07).
+//!   callback. Zero-length, misaligned, and out-of-range requests are
+//!   refused with EINVAL before plaintext is copied or the engine entered
+//!   (BUG-011). Negotiation is advisory: larger aligned reads, writes, and
+//!   native write-zeroes are split into chunks of at most `nbd.maximum_io`
+//!   (R5-038). The engine's individual read/write calls still refuse requests
+//!   above that maximum (third review, F07); trims also use bounded chunks.
 //! - `open_config` also binds and serves the per-volume control socket
 //!   (SPEC §7, review M-005) on the adapter's runtime; a socket that cannot
 //!   be bound fails attach. `shutdown` is the clean-detach path: FLUSH
