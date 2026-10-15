@@ -70,7 +70,7 @@ fn session_capability_and_tls_frames_are_erased_on_success_and_rejected_requests
             certificate_sha256: maki_witness::certificate_fingerprint(writer_identity.cert.der()),
             role: Role::Writer,
         }],
-        timeout_ms: 2000,
+        timeout_ms: 10_000,
         max_connections: 2,
     })
     .unwrap();
@@ -78,7 +78,7 @@ fn session_capability_and_tls_frames_are_erased_on_success_and_rejected_requests
     let client = Client::new(ClientOptions {
         address: listener.local_addr().unwrap(),
         server_name: "localhost".into(),
-        timeout_ms: 2000,
+        timeout_ms: 10_000,
         tls: writer_files,
     })
     .unwrap();

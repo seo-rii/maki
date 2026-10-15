@@ -66,11 +66,15 @@ impl Fixture {
         .unwrap()
     }
 
+    /// A generous deadline: these calls are expected to succeed or to fail
+    /// fast (TLS refusal, EOF), and loaded CI runners, Windows ones in
+    /// particular, timed out 500 ms loopback connects (TEST-008). Tests
+    /// that exercise expiry set their own short deadline.
     fn client(&self, address: SocketAddr) -> ClientOptions {
         ClientOptions {
             address,
             server_name: "localhost".into(),
-            timeout_ms: 500,
+            timeout_ms: 5000,
             tls: self.alice.clone(),
         }
     }
