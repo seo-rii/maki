@@ -1,6 +1,7 @@
 use crate::{latency::Latencies, Options};
 use maki_core::engine::Engine;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ pub struct SetupReport {
 }
 #[derive(Default, Serialize)]
 pub struct ResourceReport {
+    pub oracle_generation_bytes: u64,
     pub peak_pending_operations: u64,
     pub pending_operations_at_exit: u64,
     pub observed_peak_active_callbacks: u64,
@@ -75,6 +77,32 @@ enum Kind {
     Read,
     Mixed,
 }
+
+const MAX_ORACLE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub fn validate_oracle_capacity(slots: u64) -> Result<(), String> {
+    if slots == 0 || slots > MAX_ORACLE_BYTES / std::mem::size_of::<AtomicU64>() as u64 {
+        return Err("working-set needs more than the 64 MiB generation-oracle budget".into());
+    }
+    Ok(())
+}
+
+struct Oracle {
+    generations: Vec<AtomicU64>,
+}
+
+impl Oracle {
+    fn new(slots: u64) -> Result<Self, String> {
+        validate_oracle_capacity(slots)?;
+        let slots = slots as usize;
+        let mut generations = Vec::new();
+        generations
+            .try_reserve_exact(slots)
+            .map_err(|_| "cannot allocate the bounded generation oracle")?;
+        generations.resize_with(slots, || AtomicU64::new(0));
+        Ok(Self { generations })
+    }
+}
 fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
     // SplitMix64: reproducible independent address draws, without an address
     // vector proportional to the operation count or working-set size.
@@ -83,19 +111,27 @@ fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
     (value ^ (value >> 31)) % slots
 }
-fn data_for(offset: u64, size: usize) -> Vec<u8> {
-    let mut bytes = vec![0xa5; size];
-    bytes[..8].copy_from_slice(&offset.to_le_bytes());
+fn data_for(offset: u64, generation: u64, size: usize) -> Vec<u8> {
+    let mut bytes = vec![0; size];
+    // Keep a nonzero marker even for address zero at setup generation zero,
+    // so the benchmark does not accidentally measure zero/hole shortcuts.
+    let mut pattern = [0xa5; 24];
+    pattern[..8].copy_from_slice(&offset.to_le_bytes());
+    pattern[8..16].copy_from_slice(&generation.to_le_bytes());
+    for chunk in bytes.chunks_mut(pattern.len()) {
+        chunk.copy_from_slice(&pattern[..chunk.len()]);
+    }
     bytes
 }
 
-/// At most `concurrency` jobs/results exist. Completion order drives refill,
-/// so a slow request does not retain later results or block new submissions.
+/// At most `concurrency` jobs/results exist. Completion order drives refill;
+/// an occupied address delays submission until its preceding I/O ends.
 async fn phase(
     engine: &Engine,
     options: &Options,
     slots: u64,
     kind: Kind,
+    oracle: &Arc<Oracle>,
     pending: &Arc<Pending>,
     samples: &mut Samples,
 ) -> Result<f64, String> {
@@ -110,6 +146,9 @@ async fn phase(
     while first < options.ops {
         let end = first.saturating_add(group).min(options.ops);
         let mut jobs = JoinSet::new();
+        // Only addresses with an outstanding job/result need a sequencer.
+        // The map therefore contains at most `concurrency` entries.
+        let mut sequencers: HashMap<u64, (Arc<tokio::sync::Mutex<()>>, usize)> = HashMap::new();
         let mut next = first;
         while next < end || !jobs.is_empty() {
             while next < end && jobs.len() < options.concurrency {
@@ -132,10 +171,22 @@ async fn phase(
                 let size = options.io_size;
                 let fua = options.fua;
                 let engine = engine.clone();
+                // Acquire in submission order, before spawning. Keeping the
+                // guard through I/O and the oracle update serializes an
+                // address's reads/writes even if task scheduling reorders.
+                let (lock, outstanding) = sequencers
+                    .entry(slot)
+                    .or_insert_with(|| (Arc::new(tokio::sync::Mutex::new(())), 0));
+                *outstanding += 1;
+                let sequence = lock.clone().lock_owned().await;
+                let oracle = oracle.clone();
                 let guard = PendingGuard::new(pending.clone());
                 jobs.spawn(async move {
                     let _guard = guard;
-                    let expected = data_for(offset, size);
+                    let _sequence = sequence;
+                    let previous = oracle.generations[slot as usize].load(Ordering::Acquire);
+                    let generation = if read { previous } else { previous + 1 };
+                    let expected = data_for(offset, generation, size);
                     let began = Instant::now();
                     let elapsed;
                     if read {
@@ -145,7 +196,7 @@ async fn phase(
                             .map_err(|error| format!("read at offset {offset} failed: {error}"))?;
                         elapsed = began.elapsed();
                         if actual != expected {
-                            return Err(format!("read verification failed at offset {offset}"));
+                            return Err(format!("read verification failed at offset {offset} (expected generation {generation})"));
                         }
                     } else {
                         engine
@@ -153,15 +204,25 @@ async fn phase(
                             .await
                             .map_err(|error| format!("write at offset {offset} failed: {error}"))?;
                         elapsed = began.elapsed();
+                        // A rejected/cancelled write must not advance the
+                        // expected value used by a later read.
+                        oracle.generations[slot as usize].store(generation, Ordering::Release);
                     }
-                    Ok::<_, String>((read, elapsed))
+                    Ok::<_, String>((slot, read, elapsed))
                 });
             }
-            let (read, elapsed) = jobs
+            let (slot, read, elapsed) = jobs
                 .join_next()
                 .await
                 .expect("one pending job")
                 .map_err(|error| format!("I/O worker failed: {error}"))??;
+            // Earlier completed results can share their address with newer
+            // tasks or results; retain their common lock until all are joined.
+            let outstanding = &mut sequencers.get_mut(&slot).expect("submitted address").1;
+            *outstanding -= 1;
+            if *outstanding == 0 {
+                sequencers.remove(&slot);
+            }
             if read {
                 samples.reads.record(elapsed);
             } else {
@@ -226,6 +287,7 @@ pub async fn run(
     working_set_bytes: u64,
 ) -> Result<Measurements, String> {
     let slots = working_set_bytes / options.io_size as u64;
+    let oracle = Arc::new(Oracle::new(slots)?);
     let began = Instant::now();
     let mut setup = SetupReport {
         writes: 0,
@@ -234,11 +296,12 @@ pub async fn run(
     };
     if options.read_percent.is_some() {
         // Reads may be scheduled before any measured write. Initialize the
-        // complete working set with the same address-dependent payload.
+        // complete working set at generation zero before measured writes
+        // start advancing each address independently.
         for slot in 0..slots {
             let offset = slot * options.io_size as u64;
             engine
-                .write(offset, &data_for(offset, options.io_size), false)
+                .write(offset, &data_for(offset, 0, options.io_size), false)
                 .await
                 .map_err(|error| format!("setup write at offset {offset} failed: {error}"))?;
             setup.writes += 1;
@@ -274,16 +337,41 @@ pub async fn run(
     let began = Instant::now();
     let result = async {
         if options.read_percent.is_some() {
-            let final_flush_us =
-                phase(&engine, options, slots, Kind::Mixed, &pending, &mut samples).await?;
+            let final_flush_us = phase(
+                &engine,
+                options,
+                slots,
+                Kind::Mixed,
+                &oracle,
+                &pending,
+                &mut samples,
+            )
+            .await?;
             let elapsed = began.elapsed();
             Ok::<_, String>((elapsed, elapsed, final_flush_us))
         } else {
-            let final_flush_us =
-                phase(&engine, options, slots, Kind::Write, &pending, &mut samples).await?;
+            let final_flush_us = phase(
+                &engine,
+                options,
+                slots,
+                Kind::Write,
+                &oracle,
+                &pending,
+                &mut samples,
+            )
+            .await?;
             let write_elapsed = began.elapsed();
             let reading = Instant::now();
-            phase(&engine, options, slots, Kind::Read, &pending, &mut samples).await?;
+            phase(
+                &engine,
+                options,
+                slots,
+                Kind::Read,
+                &oracle,
+                &pending,
+                &mut samples,
+            )
+            .await?;
             Ok((write_elapsed, reading.elapsed(), final_flush_us))
         }
     }
@@ -299,6 +387,8 @@ pub async fn run(
         .into_inner()
         .map_err(|_| "resource monitor state poisoned")?;
     resources.peak_pending_operations = pending.peak.load(Ordering::SeqCst);
+    resources.oracle_generation_bytes =
+        (oracle.generations.len() * std::mem::size_of::<AtomicU64>()) as u64;
     resources.pending_operations_at_exit = pending.current.load(Ordering::SeqCst);
     resources.monitor_interval_ms = 1;
     resources.process_peak_rss_bytes = peak_rss();
@@ -325,3 +415,7 @@ pub async fn run(
         resources,
     })
 }
+
+#[cfg(test)]
+#[path = "workload_tests.rs"]
+mod tests;

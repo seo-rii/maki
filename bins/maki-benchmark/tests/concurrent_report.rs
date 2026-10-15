@@ -93,6 +93,7 @@ fn real_concurrency_random_mixed_fua_and_periodic_flush_are_verified_and_reporte
             .unwrap();
         assert!(pending > 0 && pending <= concurrency);
         assert_eq!(report["resources"]["pending_operations_at_exit"], 0);
+        assert_eq!(report["resources"]["oracle_generation_bytes"], 16 * 8);
         #[cfg(target_os = "linux")]
         assert!(
             report["resources"]["process_peak_rss_bytes"]
@@ -110,6 +111,29 @@ fn real_concurrency_random_mixed_fua_and_periodic_flush_are_verified_and_reporte
             );
         }
     }
+}
+
+#[test]
+fn oracle_budget_is_rejected_before_backing_creation() {
+    let (directory, config) = fixture();
+    let raw = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        raw.replace(
+            "max_virtual_size = \"1MiB\"",
+            "max_virtual_size = \"64GiB\"",
+        ),
+    )
+    .unwrap();
+    let output = run(&config, &["--working-set", "34359742464"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("generation-oracle budget"));
+    assert!(!directory.path().join("volume").exists());
 }
 
 #[test]
