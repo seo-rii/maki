@@ -85,7 +85,9 @@ impl Exchange<'_> {
 
     /// A completed nonretryable/throttled response needs no reconnect.
     pub(super) fn preserve(&mut self) {
-        self.finished = true;
+        // An application error still proves the transport connected. Future
+        // failures must not receive the unfinished-handshake grace period.
+        self.succeeded();
     }
 }
 
