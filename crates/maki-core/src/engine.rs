@@ -1881,8 +1881,17 @@ impl EngineInner {
                 self.overlay_above_watermark(&v),
             )
         };
-        if appended <= checkpointed && covered == 0 && !reclaim {
-            return; // nothing to apply and nothing to reclaim
+        // A failed physical-release hint keeps its cursor but is excluded
+        // from immediate reclamation work to avoid a retry loop. A space
+        // refusal must still run an idle checkpoint after every journal
+        // record is gone. Keep the signal pending through retry backoff;
+        // it is consumed below only when a pass can actually run.
+        if appended <= checkpointed
+            && covered == 0
+            && !reclaim
+            && !self.space_refused.load(Ordering::SeqCst)
+        {
+            return; // nothing to apply and no independent reclamation trigger
         }
         // After a failed pass, wait out the regular interval. Every write
         // above the watermark wakes the worker, and rerunning a failing
