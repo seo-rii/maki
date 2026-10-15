@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub use maki_backing::remote_witness::Role;
 use maki_backing::remote_witness::{Record, Request, Rpc, StateStore};
@@ -432,54 +432,122 @@ pub struct Server {
 /// Each entry holds a duplicate of the socket so it can be cut off.
 struct Handshakes {
     capacity: usize,
-    pending: Mutex<(u64, VecDeque<(u64, TcpStream)>)>,
+    task_capacity: usize,
+    state: Mutex<HandshakeState>,
+    released: Condvar,
 }
 
-/// Leaves the handshake table on drop: authenticated, failed, or unwound.
+struct HandshakeState {
+    next_id: u64,
+    live: usize,
+    pending: VecDeque<PendingHandshake>,
+}
+
+struct PendingHandshake {
+    id: u64,
+    socket: TcpStream,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Charges a connection task until its TLS state and request processing end,
+/// including after its pending handshake is evicted.
 struct HandshakeTicket {
     table: Arc<Handshakes>,
     id: u64,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Handshakes {
-    fn new(capacity: usize) -> Self {
+    fn new(workers: usize) -> Self {
         Self {
-            capacity: capacity.max(1),
-            pending: Mutex::new((0, VecDeque::new())),
+            capacity: workers * 4,
+            task_capacity: workers * 5,
+            state: Mutex::new(HandshakeState {
+                next_id: 0,
+                live: 0,
+                pending: VecDeque::new(),
+            }),
+            released: Condvar::new(),
         }
     }
 
-    fn admit(self: &Arc<Self>, socket: &TcpStream) -> io::Result<HandshakeTicket> {
+    fn admit(
+        self: &Arc<Self>,
+        socket: &TcpStream,
+        deadline: Instant,
+    ) -> io::Result<HandshakeTicket> {
         let duplicate = socket.try_clone()?;
-        let mut pending = self
-            .pending
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while pending.1.len() >= self.capacity {
-            if let Some((_, oldest)) = pending.1.pop_front() {
-                // Its thread sees EOF and leaves; it holds no worker slot,
-                // since the ticket is dropped only once one is reserved.
-                let _ = oldest.shutdown(Shutdown::Both);
+        while state.pending.len() >= self.capacity {
+            if let Some(oldest) = state.pending.pop_front() {
+                // A TLS read observes shutdown; an authenticated permit
+                // waiter observes cancellation. Neither releases task
+                // capacity until its connection task actually exits.
+                oldest.cancelled.store(true, Ordering::Release);
+                let _ = oldest.socket.shutdown(Shutdown::Both);
             }
         }
-        let id = pending.0;
-        pending.0 = pending.0.wrapping_add(1);
-        pending.1.push_back((id, duplicate));
+        while state.live >= self.task_capacity {
+            state = self
+                .released
+                .wait_timeout(state, remaining(deadline)?)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        remaining(deadline)?;
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.pending.push_back(PendingHandshake {
+            id,
+            socket: duplicate,
+            cancelled: cancelled.clone(),
+        });
+        state.live += 1;
         Ok(HandshakeTicket {
             table: self.clone(),
             id,
+            cancelled,
         })
+    }
+}
+
+impl HandshakeTicket {
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "witness pending connection evicted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn worker_acquired(&self) -> io::Result<()> {
+        let mut state = self
+            .table
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_cancelled()?;
+        state.pending.retain(|pending| pending.id != self.id);
+        Ok(())
     }
 }
 
 impl Drop for HandshakeTicket {
     fn drop(&mut self) {
-        let mut pending = self
+        let mut state = self
             .table
-            .pending
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.1.retain(|(id, _)| *id != self.id);
+        state.pending.retain(|pending| pending.id != self.id);
+        state.live -= 1;
+        self.table.released.notify_one();
     }
 }
 
@@ -662,13 +730,16 @@ impl Server {
     ///
     /// A worker slot (`max_connections`) is taken only after TLS has
     /// authenticated a listed certificate, and an authenticated connection
-    /// waits for one until its deadline instead of being closed. Before
+    /// waits for one until its deadline or eviction. Before
     /// that, a connection only holds a handshake slot: those are bounded at
     /// four per worker, and when they are all taken the oldest pending
-    /// handshake is cut off. Idle unauthenticated sockets therefore cannot
-    /// starve a client that completes TLS promptly (BUG-104).
+    /// handshake is cancelled and cut off. A separate lifetime charge bounds
+    /// all connection tasks (including evicted tasks and their TLS objects)
+    /// to five per worker. Admission waits for reclamation before spawning
+    /// another task. Idle unauthenticated sockets therefore cannot starve a
+    /// client that completes TLS promptly (BUG-104).
     pub fn serve(self: Arc<Self>, listener: TcpListener, handler: Arc<Handler>) -> io::Result<()> {
-        let handshakes = Arc::new(Handshakes::new(self.max_connections * 4));
+        let handshakes = Arc::new(Handshakes::new(self.max_connections));
         for accepted in listener.incoming() {
             let socket = match accepted {
                 Ok(socket) => socket,
@@ -685,7 +756,7 @@ impl Server {
                 }
             };
             let deadline = Instant::now() + self.timeout;
-            let Ok(ticket) = handshakes.admit(&socket) else {
+            let Ok(ticket) = handshakes.admit(&socket, deadline) else {
                 continue;
             };
             let server = self.clone();
@@ -693,11 +764,14 @@ impl Server {
             std::thread::Builder::new()
                 .name("maki-witness-rpc".into())
                 .spawn(move || {
+                    // Keep this outside the inner closure so TLS state is
+                    // destroyed before the task's lifetime charge releases.
+                    let ticket = ticket;
                     // No application payloads or remote error text are logged.
                     let _ = (|| {
                         let (tls, role) = server.authenticate(socket, deadline)?;
-                        let _permit = server.reserve_until(deadline)?;
-                        drop(ticket);
+                        let _permit = server.reserve_until(deadline, &ticket)?;
+                        ticket.worker_acquired()?;
                         server.respond(tls, role, deadline, handler.as_ref())
                     })();
                 })?;
@@ -705,13 +779,19 @@ impl Server {
         Ok(())
     }
 
-    /// Wait for a worker slot until `deadline`.
-    fn reserve_until(&self, deadline: Instant) -> io::Result<ConnectionPermit> {
+    /// Wait for a worker slot until `deadline`, observing handshake eviction.
+    fn reserve_until(
+        &self,
+        deadline: Instant,
+        ticket: &HandshakeTicket,
+    ) -> io::Result<ConnectionPermit> {
         loop {
+            ticket.check_cancelled()?;
+            let remaining = remaining(deadline)?;
             if let Ok(permit) = self.try_reserve_connection() {
                 return Ok(permit);
             }
-            std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(2)));
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
     }
 }
@@ -763,6 +843,9 @@ fn write_frame(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     output.write_all(bytes)?;
     output.flush()
 }
+
+#[cfg(test)]
+mod server_tests;
 
 #[cfg(test)]
 mod tests {
