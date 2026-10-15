@@ -55,3 +55,19 @@ async fn network_receives_only_the_budget_left_after_tls_preparation() {
         "TLS preparation must not grant the network a fresh full timeout"
     );
 }
+
+#[tokio::test]
+async fn unrepresentable_deadline_allows_a_successful_handshake() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = provider(listener.local_addr().unwrap(), Duration::MAX);
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(socket).await.unwrap()
+    });
+    let connection = tokio::time::timeout(Duration::from_secs(5), provider.connect())
+        .await
+        .expect("local handshake must complete")
+        .expect("an unrepresentable deadline must not panic or reject the connection");
+    let peer = server.await.unwrap();
+    drop((connection, peer));
+}

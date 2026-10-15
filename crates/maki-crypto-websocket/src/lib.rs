@@ -360,12 +360,12 @@ impl WsCryptoProvider {
         &self,
         prepare_tls: impl FnOnce() -> Result<Option<Connector>, CryptoError>,
     ) -> Result<Connection, CryptoError> {
-        let deadline = tokio::time::Instant::now() + self.spec.timeout;
+        let deadline = tokio::time::Instant::now().checked_add(self.spec.timeout);
         let connector = prepare_tls()?;
         // Native-root discovery is synchronous and cannot be preempted here.
         // Once it returns, an exhausted budget must not open a socket, and
         // network setup receives only the time left from this same deadline.
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(retryable("websocket connect timeout"));
         }
         let config = WebSocketConfig::default()
@@ -374,17 +374,20 @@ impl WsCryptoProvider {
         // TCP connect and the HTTP upgrade have no timeout of their own: a
         // peer that accepts and never answers would hold the connection
         // mutex forever, and with it every request on this provider (C-05).
-        let (ws, _response) = tokio::time::timeout_at(
-            deadline,
-            tokio_tungstenite::connect_async_tls_with_config(
-                &self.spec.url,
-                Some(config),
-                false,
-                connector,
-            ),
-        )
-        .await
-        .map_err(|_| retryable("websocket connect timeout"))?
+        let connection = tokio_tungstenite::connect_async_tls_with_config(
+            &self.spec.url,
+            Some(config),
+            false,
+            connector,
+        );
+        let (ws, _response) = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, connection)
+                .await
+                .map_err(|_| retryable("websocket connect timeout"))?,
+            // Match Tokio's relative timeout behavior for durations too large
+            // to represent as an Instant: keep polling without a deadline.
+            None => connection.await,
+        }
         .map_err(|e| retryable(format!("websocket connect failed: {e}")))?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
