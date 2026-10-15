@@ -44,6 +44,13 @@ The 0.23.46 update imports the published upstream fixes for
 All seven source files with local plaintext-erasure edits retain those edits;
 upstream handshake, record-limit, and decompression changes remain intact.
 
+The unbuffered TLS 1.3 regression tests lower the record limit and send the
+bytes returned by `WriteTraffic::encrypt` directly to a peer. They verify that
+an automatic KeyUpdate precedes application data in the same output, including
+a retry after an insufficient-buffer error. The queued KeyUpdate contributes
+to the required buffer size; the retry preserves the wire order. These tests
+retain upstream record encryption and output behavior.
+
 `bytes` erases discarded exclusive `BytesMut` regions and retired backing
 allocations, including growth and compaction. Shared backing storage is erased
 before its last owner releases it. Live immutable `Bytes` aliases keep their

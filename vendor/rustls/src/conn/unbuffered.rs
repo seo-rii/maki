@@ -13,6 +13,9 @@ use crate::client::ClientConnectionData;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
 use crate::server::ServerConnectionData;
 
+#[cfg(all(test, feature = "std"))]
+mod maki_key_update_tests;
+
 #[cfg(all(test, feature = "std", feature = "ring"))]
 mod maki_erasure_tests {
     use super::ReadTraffic;
