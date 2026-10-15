@@ -316,7 +316,7 @@ struct EngineInner {
     checkpoint_stop: AtomicBool,
     checkpoint_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Serializes snapshots through publication, including inline reclaim.
-    checkpoint_gate: AsyncMutex<()>,
+    checkpoint_gate: Arc<AsyncMutex<()>>,
     state: parking_lot::Mutex<EngineState>,
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
@@ -666,7 +666,7 @@ impl Engine {
             checkpoint_notify: notify.clone(),
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_worker: AsyncMutex::new(None),
-            checkpoint_gate: AsyncMutex::new(()),
+            checkpoint_gate: Arc::new(AsyncMutex::new(())),
             state: parking_lot::Mutex::new(EngineState::Ready),
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
@@ -1740,9 +1740,13 @@ impl EngineInner {
     /// and metadata publication finish. New writes keep their live overlay
     /// versions while the immutable checkpoint snapshot is applied.
     async fn checkpoint(self: &Arc<Self>) -> Result<u64, CoreError> {
+        // Waiting callers own only their cancellable future. Create a durable
+        // owner only after admission, so aborting queued calls cannot leave
+        // an unbounded set of detached checkpoint owners behind the gate.
+        let checkpoint = self.checkpoint_gate.clone().lock_owned().await;
         let inner = self.clone();
         tokio::spawn(async move {
-            let _checkpoint = inner.checkpoint_gate.lock().await;
+            let _checkpoint = checkpoint;
             let completed = async {
                 let mut volume = inner.write_volume().await?;
                 let prepared = storage_task(move || volume.prepare_checkpoint()).await??;

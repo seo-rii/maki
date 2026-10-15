@@ -215,3 +215,32 @@ async fn cancelled_checkpoint_keeps_publication_serialized() {
     assert_eq!(sequence, 3);
     assert_eq!(engine.read(0, 1024).await.unwrap(), vec![0x43; 1024]);
 }
+
+#[tokio::test]
+async fn cancelled_waiters_do_not_leave_detached_checkpoint_owners() {
+    let _serial = failpoints::test_lock();
+    let (_backing, engine) = fixture().await;
+    engine.stop_checkpoint_worker().await;
+    let completed_before = engine.stats().await.checkpoints_total;
+    let gate = Arc::new(Gate::default());
+    let _injection = gate.pause(false);
+    let first_engine = engine.clone();
+    let first = tokio::spawn(async move { first_engine.checkpoint().await });
+    gate.entered.notified().await;
+
+    // Poll each future through the gate wait, then cancel it. Polling here
+    // directly makes cancellation deterministic without sleeps/scheduling
+    // assumptions about whether a spawned caller has started.
+    for _ in 0..128 {
+        let pending = engine.checkpoint();
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+    }
+
+    gate.release();
+    first.await.unwrap().unwrap();
+    // A final live caller is ordered after any leaked owners. The old code
+    // completes all 128 abandoned checkpoints before this barrier.
+    engine.checkpoint().await.unwrap();
+    assert_eq!(engine.stats().await.checkpoints_total, completed_before + 2);
+}
