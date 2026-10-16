@@ -199,6 +199,13 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                     probed += 1;
                 }
                 if let Err(e) = store.read_slot(unit) {
+                    // An unavailable read did not validate the slot's bytes.
+                    // Keep this check inconclusive, even with a replay source;
+                    // only proven slot damage contributes to either verdict.
+                    let e = match e {
+                        CoreError::Io(error) => return Err(CoreError::Io(error)),
+                        error => error,
+                    };
                     if journal_ok && replay_units.contains(&unit) {
                         recoverable += 1;
                         if recoverable as usize <= MAX_SLOT_ERRORS {
