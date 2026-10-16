@@ -211,6 +211,17 @@ enum Probe {
     Damaged,
 }
 
+/// A short slot is damage, but other read failures do not establish what
+/// bytes are stored there. Preserve their kind and errno for live callers
+/// and for the offline check, which must not diagnose unread data as corrupt.
+fn slot_read_error(unit: u64, part: &str, error: std::io::Error) -> CoreError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        CoreError::Corrupt(format!("unit {unit}: {part} read failed: {error}"))
+    } else {
+        CoreError::Io(error)
+    }
+}
+
 /// Probe the header of a slot whose allocation bit is clear.
 fn probe_header(
     geometry: &Geometry,
@@ -237,7 +248,7 @@ fn probe_header(
     shard
         .data
         .read_at(offset, &mut header_bytes)
-        .map_err(|e| CoreError::Corrupt(format!("unit {unit}: slot read failed: {e}")))?;
+        .map_err(|error| slot_read_error(unit, "slot", error))?;
     if header_bytes.iter().all(|b| *b == 0) {
         return Ok(Probe::Unwritten);
     }
@@ -1140,7 +1151,7 @@ impl SlotStore {
             shard
                 .data
                 .read_at(offset, &mut header_bytes)
-                .map_err(|e| CoreError::Corrupt(format!("unit {unit}: slot read failed: {e}")))?;
+                .map_err(|error| slot_read_error(unit, "slot", error))?;
             let header = SlotHeader::decode(&header_bytes).map_err(|e| {
                 CoreError::Corrupt(format!(
                     "unit {unit}: allocated but slot header invalid: {e}"
@@ -1199,7 +1210,7 @@ impl SlotStore {
         shard
             .data
             .read_at(offset + 64, &mut data)
-            .map_err(|e| CoreError::Corrupt(format!("unit {unit}: ciphertext read failed: {e}")))?;
+            .map_err(|error| slot_read_error(unit, "ciphertext", error))?;
         if crc32fast::hash(&data) != header.ciphertext_crc {
             return Err(CoreError::Corrupt(format!(
                 "unit {unit}: ciphertext CRC mismatch"
