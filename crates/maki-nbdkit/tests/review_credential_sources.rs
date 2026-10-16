@@ -41,7 +41,7 @@ fn conflicting_credential_sources_are_rejected_before_attach() {
             .validate()
             .expect_err("the same name cannot refer to different credential sources")
             .to_string();
-        assert!(error.contains("shared-token"));
+        assert!(!error.contains("shared-token"));
         assert!(error.contains("conflicting"));
     }
 }
