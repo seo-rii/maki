@@ -117,6 +117,16 @@ The encoded allocation remains owned through the WebSocket message queue and
 optional page lock. Cancellation before connecting also drops the owner. The
 existing wire order, escaping and payload encoding are preserved.
 
+Cancelling a multiplexed request removes its reply entry and clears its queued
+frame owner immediately. Its connection stops admitting new requests, while
+existing callers retain it until they finish; the final owner retires the
+socket and reader/writer task. A late response to the cancelled request is
+discarded through the guarded response path. A frame already handed to the
+socket writer may finish while live siblings keep that connection; its framing
+buffers retain their existing consumption/Drop cleanup. Cancelling the final
+caller aborts that writer immediately. New callers can use a replacement while
+the old connection drains, without resending any retry-unsafe request.
+
 This protects Maki's owned request storage. Stack serializer/base64 scratch
 remains outside this guarantee. Tungstenite's internal output/framing copies
 have separate guarded owners described below.
