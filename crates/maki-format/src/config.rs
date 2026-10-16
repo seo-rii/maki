@@ -934,17 +934,22 @@ impl VolumeConfig {
 
     /// Credential consumers resolve by name. Repeated references may share
     /// that name only when they also declare the same source (BUG-007).
+    /// Validate each reference here too: public provider construction uses
+    /// this preflight without validating unrelated volume settings.
     pub fn validate_credential_sources(&self) -> Result<(), ConfigError> {
         let mut sources = BTreeMap::new();
-        for credential in self.credential_refs() {
+        let credentials = self.credential_refs();
+        for credential in &credentials {
             if let Some(previous) = sources.insert(&credential.name, &credential.source) {
                 if previous != &credential.source {
-                    return Err(invalid(format!(
-                        "credential {:?} has conflicting sources {:?} and {:?}; use distinct names",
-                        credential.name, previous, credential.source
-                    )));
+                    return Err(invalid(
+                        "credential references with the same name have conflicting sources; use distinct names",
+                    ));
                 }
             }
+        }
+        for credential in credentials {
+            validate_credential(credential)?;
         }
         Ok(())
     }
@@ -1256,6 +1261,8 @@ impl VolumeConfig {
 }
 
 fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
+    // A malformed reference may contain a pasted secret in either field.
+    // Keep semantic errors value-free, just like TOML/schema errors.
     if c.source == "keyring" {
         return Err(ConfigError::Invalid(
             "credential source \"keyring\" is not implemented by this build; \
@@ -1264,10 +1271,7 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
         ));
     }
     if !["credential", "file", "env"].contains(&c.source.as_str()) {
-        return Err(ConfigError::Invalid(format!(
-            "credential source {:?} must be credential|file|env",
-            c.source
-        )));
+        return Err(invalid("credential source must be credential|file|env"));
     }
     if c.name.is_empty() {
         return Err(ConfigError::Invalid("credential name is empty".to_string()));
@@ -1276,10 +1280,7 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     // working directory of whichever process reads it, which is not the one
     // that validated it (BUG-122).
     if c.source == "file" && !is_absolute_path(&c.name) {
-        return Err(ConfigError::Invalid(format!(
-            "file credential {:?} must be an absolute path",
-            c.name
-        )));
+        return Err(invalid("file credential name must be an absolute path"));
     }
     Ok(())
 }
