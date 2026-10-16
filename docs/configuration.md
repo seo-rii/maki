@@ -403,6 +403,14 @@ and free-space operations resolve through directory descriptors without
 following symlinks. Renaming the root and replacing its old pathname cannot
 redirect an existing backing instance to another volume.
 
+When the backing creates missing root directories, it synchronizes their
+directory entries before returning. Creation therefore requires read access
+to each parent that will receive a new directory, as well as write and search
+access. Existing ancestors still need only search access. Opening a root also
+retries directory synchronization on writable, readable ancestors on its own
+filesystem, so a previously failed creation cannot bypass the durability
+barrier merely because its directories now exist.
+
 Keep the backing tree writable only by its owner. Descriptor confinement does
 not authenticate file contents or prevent a process with direct write access
 from altering the volume. Other development platforms retain pathname-based

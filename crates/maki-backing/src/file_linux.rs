@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -57,16 +58,88 @@ fn child_dir(parent: &File, child: &CStr, create: bool) -> io::Result<File> {
     open_at(parent, child, libc::O_PATH | libc::O_DIRECTORY)
 }
 
+fn writable_directory(directory: &File) -> io::Result<bool> {
+    // Use the held directory and effective credentials, including ACLs and
+    // read-only mounts. This call cannot create a child in search-only
+    // ancestors, so it does not require a publication barrier for them.
+    if unsafe {
+        libc::faccessat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::W_OK,
+            libc::AT_EACCESS,
+        )
+    } == 0
+    {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::EROFS) => Ok(false),
+        _ => Err(error),
+    }
+}
+
 impl Directory {
     pub(super) fn new(root: &Path) -> io::Result<Self> {
+        Self::new_with_sync(root, File::sync_all)
+    }
+
+    fn new_with_sync(
+        root: &Path,
+        mut sync: impl FnMut(&File) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let mut directory = File::open(if root.is_absolute() { "/" } else { "." })?;
+        let mut parents = Vec::new();
         for component in root.components() {
             match component {
                 Component::RootDir | Component::CurDir => continue,
                 // The configured root may be relative on development callers;
                 // parent traversal is allowed only while selecting that root.
                 Component::Normal(_) | Component::ParentDir => {
-                    directory = child_dir(&directory, &name(component.as_os_str())?, true)?;
+                    let child = name(component.as_os_str())?;
+                    let mut sync_parent = None;
+                    let next = match open_at(&directory, &child, libc::O_PATH | libc::O_DIRECTORY) {
+                        Ok(next) => next,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            // O_PATH cannot be fsynced. Establish the ability
+                            // to sync before mkdir, so an unreadable parent
+                            // cannot leave an entry that retries would skip.
+                            sync_parent = Some(open_at(
+                                &directory,
+                                c".",
+                                libc::O_RDONLY | libc::O_DIRECTORY,
+                            )?);
+                            child_dir(&directory, &child, true)?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if directory.metadata()?.dev() != next.metadata()?.dev() {
+                        // Ancestors on another filesystem cannot contain
+                        // entries created while opening this backing root.
+                        // Do not flush unrelated mounts or retain their FDs.
+                        parents.clear();
+                    } else {
+                        if sync_parent.is_none() && writable_directory(&directory)? {
+                            sync_parent =
+                                match open_at(&directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)
+                                {
+                                    Ok(parent) => Some(parent),
+                                    // Existing known paths need only search
+                                    // permission; this call did not create them.
+                                    Err(error)
+                                        if error.kind() == io::ErrorKind::PermissionDenied =>
+                                    {
+                                        None
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                        }
+                        if let Some(parent) = sync_parent {
+                            parents.push(parent);
+                        }
+                    }
+                    directory = next;
                 }
                 Component::Prefix(_) => {
                     return Err(io::Error::new(
@@ -76,11 +149,17 @@ impl Directory {
                 }
             }
         }
-        Ok(Self(open_at(
-            &directory,
-            c".",
-            libc::O_RDONLY | libc::O_DIRECTORY,
-        )?))
+        let root = open_at(&directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
+        if writable_directory(&root)? {
+            sync(&root)?;
+        }
+        // Re-sync existing writable parents too: after a failed directory
+        // sync, the next opener sees EEXIST but still owes the same barrier.
+        // Bottom-up order persists each new directory before its own name.
+        for parent in parents.iter().rev() {
+            sync(parent)?;
+        }
+        Ok(Self(root))
     }
 
     fn directory(&self, path: &str, create: bool) -> io::Result<File> {
@@ -116,6 +195,10 @@ impl Directory {
         Ok(file)
     }
 }
+
+#[cfg(test)]
+#[path = "root_directory_tests.rs"]
+mod root_directory_tests;
 
 fn entry_exists(parent: &File, child: &CStr) -> io::Result<bool> {
     // SAFETY: stat storage is initialized, parent is open and child is a valid
