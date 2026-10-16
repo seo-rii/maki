@@ -124,14 +124,14 @@ type Pending =
     Arc<parking_lot::Mutex<HashMap<u64, (u64, oneshot::Sender<Result<Value, CryptoError>>)>>>;
 
 struct Connection {
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<QueuedMessage>,
     generation: u64,
     cancellation: ConnectionCancellation,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.cancellation.retire();
+        self.cancellation.stop_accepting();
     }
 }
 
@@ -141,10 +141,57 @@ struct ConnectionCancellation {
     pending: Pending,
     dead_generation: Arc<AtomicU64>,
     generation: u64,
+    owners: Arc<parking_lot::Mutex<RequestOwners>>,
 }
 
+struct RequestOwners {
+    accepting: bool,
+    active: usize,
+}
+
+// The queue retains a revocable owner, so cancelling a queued request erases
+// its serialized frame even while another request's socket write is blocked.
+type QueuedMessage = Arc<parking_lot::Mutex<Option<Message>>>;
+
 impl ConnectionCancellation {
+    fn register(&self) -> bool {
+        let mut owners = self.owners.lock();
+        if !owners.accepting || self.dead_generation.load(Ordering::SeqCst) >= self.generation {
+            return false;
+        }
+        owners.active += 1;
+        true
+    }
+
+    fn stop_accepting(&self) {
+        let idle = {
+            let mut owners = self.owners.lock();
+            owners.accepting = false;
+            owners.active == 0
+        };
+        if idle {
+            self.retire();
+        }
+    }
+
+    fn finish_request(&self, completed: bool) {
+        let retire = {
+            let mut owners = self.owners.lock();
+            owners.active -= 1;
+            if !completed {
+                // Drain this generation without failing its live siblings.
+                // New callers get a replacement; the final owner closes it.
+                owners.accepting = false;
+            }
+            !owners.accepting && owners.active == 0
+        };
+        if retire {
+            self.retire();
+        }
+    }
+
     fn retire(&self) {
+        self.owners.lock().accepting = false;
         WsCryptoProvider::fail_pending_generation(
             &self.pending,
             &self.dead_generation,
@@ -158,15 +205,19 @@ impl ConnectionCancellation {
 struct PendingRequest {
     id: u64,
     pending: Pending,
-    cancellation: Option<ConnectionCancellation>,
+    cancellation: ConnectionCancellation,
+    queued: QueuedMessage,
+    // Keep the writer alive when a replacement evicts a draining connection
+    // from the provider's cache while this request still awaits a response.
+    _sender: mpsc::Sender<QueuedMessage>,
+    completed: bool,
 }
 
 impl Drop for PendingRequest {
     fn drop(&mut self) {
         self.pending.lock().remove(&self.id);
-        if let Some(cancellation) = &self.cancellation {
-            cancellation.retire();
-        }
+        self.queued.lock().take();
+        self.cancellation.finish_request(self.completed);
     }
 }
 
@@ -392,12 +443,14 @@ impl WsCryptoProvider {
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (mut sink, mut source) = ws.split();
-        let (tx, mut rx) = mpsc::channel::<Message>(64);
+        let (tx, mut rx) = mpsc::channel::<QueuedMessage>(64);
 
         // One task owns both halves. Completion of either future drops the
         // other, and aborting the owner always releases the whole socket.
         let writer = async move {
-            while let Some(msg) = rx.recv().await {
+            while let Some(queued) = rx.recv().await {
+                let message = queued.lock().take();
+                let Some(msg) = message else { continue };
                 if sink.send(msg).await.is_err() {
                     return;
                 }
@@ -532,41 +585,71 @@ impl WsCryptoProvider {
                 pending: self.pending.clone(),
                 dead_generation: self.dead_generation.clone(),
                 generation,
+                owners: Arc::new(parking_lot::Mutex::new(RequestOwners {
+                    accepting: true,
+                    active: 0,
+                })),
             },
         })
     }
 
     async fn request_once(&self, id: u64, encoded: SecretBuffer) -> Result<Value, CryptoError> {
-        let message = request::into_message(encoded)?;
+        let queued = Arc::new(parking_lot::Mutex::new(Some(request::into_message(
+            encoded,
+        )?)));
 
         let (tx, rx) = oneshot::channel();
+        let mut reply = Some(tx);
         let mut pending_request = {
             let mut guard = self.connection.lock().await;
-            // Discard a connection whose reader has already exited.
-            if let Some(conn) = guard.as_ref() {
-                if self.dead_generation.load(Ordering::SeqCst) >= conn.generation {
-                    *guard = None;
+            loop {
+                let connecting = guard.is_none();
+                if connecting {
+                    *guard = Some(self.connect().await?);
                 }
-            }
-            if guard.is_none() {
-                *guard = Some(self.connect().await?);
+                let conn = guard.as_ref().unwrap();
+                // Publish the owner and reply under the same lock used to
+                // mark/sweep dead generations, so a dying reader cannot miss
+                // a request registered just after its final sweep.
+                let registered = {
+                    let mut pending = self.pending.lock();
+                    if conn.cancellation.register() {
+                        pending.insert(id, (conn.generation, reply.take().unwrap()));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if registered {
+                    break;
+                }
+                // A cancelled request stops new admissions to its generation.
+                // Existing request owners retain the old socket until done.
+                *guard = None;
+                if connecting {
+                    // A peer may close immediately after its handshake. Let
+                    // the bounded outer attempt policy handle that failure.
+                    return Err(retryable(
+                        "websocket connection closed before request registration",
+                    ));
+                }
             }
             let conn = guard.as_ref().unwrap();
             let generation = conn.generation;
-            // Register under this connection's generation before sending, so
-            // a fast response cannot be "stale" and a dying connection's
-            // sweep can target exactly its own requests.
-            self.pending.lock().insert(id, (generation, tx));
             let pending_request = PendingRequest {
                 id,
                 pending: self.pending.clone(),
-                cancellation: Some(conn.cancellation.clone()),
+                cancellation: conn.cancellation.clone(),
+                queued: queued.clone(),
+                _sender: conn.sender.clone(),
+                completed: false,
             };
-            let sent = tokio::time::timeout(self.spec.timeout, conn.sender.send(message)).await;
+            let sent = tokio::time::timeout(self.spec.timeout, conn.sender.send(queued)).await;
             if !matches!(sent, Ok(Ok(()))) {
                 // Writer gone or wedged: drop this connection if it's still
                 // the registered one.
                 if guard.as_ref().map(|c| c.generation) == Some(generation) {
+                    conn.cancellation.retire();
                     *guard = None;
                 }
                 return Err(retryable("websocket send failed"));
@@ -577,18 +660,14 @@ impl WsCryptoProvider {
         match tokio::time::timeout(self.spec.timeout, rx).await {
             Ok(Ok(result)) => {
                 if result.is_ok() {
-                    // A completed exchange leaves the connection reusable.
-                    // Any error or future cancellation instead retires only
-                    // this request's generation via the guard.
-                    pending_request.cancellation = None;
+                    pending_request.completed = true;
                 }
                 result
             }
             Ok(Err(_)) => Err(retryable("websocket response channel closed")),
             Err(_) => {
-                // A peer that stopped answering (half-open TCP session,
-                // hung service) must not be reused: every later request
-                // would burn the full timeout on the same corpse (C-05).
+                // Stop reusing this generation, allowing live sibling
+                // requests to finish before its final owner closes it.
                 Err(retryable("websocket request timeout"))
             }
         }
@@ -793,3 +872,6 @@ mod response_secret_tests;
 #[cfg(test)]
 #[path = "connect_deadline_tests.rs"]
 mod connect_deadline_tests;
+
+#[cfg(test)]
+mod cancellation_tests;
