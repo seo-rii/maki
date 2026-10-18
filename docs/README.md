@@ -62,6 +62,7 @@ hold everywhere:
 | Dated external campaigns, reviews and readiness records | [Qualification evidence](qualification/README.md) |
 | Unattended local repetition of storage suites | [Background storage runs](background-storage-validation.md) |
 | Review findings and their regression tests | [Review remediation log](review-remediation.md) |
+| October boundary findings, merged fixes and same-revision CI | [Boundary review verification](review-boundaries-2026-10-15.md#main-verification--2026-10-19) |
 
 ## Contributing and policy
 

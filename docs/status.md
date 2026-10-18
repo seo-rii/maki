@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-12. External campaign evidence below runs through
+Last updated: 2026-10-19. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -68,6 +68,13 @@ enumerated, with its status, in the [support matrix](deployment/support-matrix.m
 | Remote provider-host hard reset | One scoped Debian 12 cross-host campaign passed for HTTP, WebSocket and gRPC; sequential fsync'd files, reference provider, approximately 12–20 s stalls |
 | Physical power loss, QEMU power cuts, 72-hour mixed soak | **Open** |
 
+The October boundary-review fixes are merged in `main`. The scheduled
+[CI run 39109347979](https://github.com/seo-rii/maki/actions/runs/39109347979)
+passed all six jobs on `e50bcea0857de5750ef8ae4f06d40bbb51dfce0d`, including
+both Windows toolchains, release/native gates and real three-member etcd
+qualification. The [boundary review record](review-boundaries-2026-10-15.md#main-verification--2026-10-19)
+maps the original findings to corrections and their remaining scope.
+
 ## Runtime cache settings
 
 An enabled read cache accepts byte-limit and TTL updates through the control
@@ -78,6 +85,14 @@ See [cache reload](operations.md#growth-and-cache-reload).
 
 ## Known limitations
 
+- Admission limits cover Maki-owned engine work and plugin handles.
+  nbdkit owns sockets and threads before plugin open; these limits do not
+  establish a process-wide cap on negotiation resources.
+- Dirty-XFS full stop, repeated recovery timeout/OOM convergence, and
+  interruption at every attach step still need campaigns on the current
+  integrated revision. Shutdown procedures now allow unmount writes before
+  drain; bounded replay memory does not establish persistent progress across
+  repeated interruptions ([review scope](review-boundaries-2026-10-15.md#known-operational-items)).
 - Default v2/v3 backings cannot detect restoration of an older, internally
   valid volume image (historical rollback). Only the experimental
   rollback-protected backing addresses this, and it is not qualified.

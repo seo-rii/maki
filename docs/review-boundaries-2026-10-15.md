@@ -1,5 +1,56 @@
 # Boundary review follow-up — 2026-10-15
 
+## Main verification — 2026-10-19
+
+The October 14 review predates the integration now on remote `main`.
+Rechecking on October 19 found local and remote `main` at
+`e50bcea0857de5750ef8ae4f06d40bbb51dfce0d`, with no open pull requests.
+[#68](https://github.com/seo-rii/maki/pull/68) was merged on October 15 as
+`a7b2abb1750e316cd1443129e4b3406296a72424`; subsequent fixes through
+[#81](https://github.com/seo-rii/maki/pull/81) are also merged. The
+implementation hashes in the tables below identify the original source PR
+commits; #68 combined their contents in a squash merge.
+
+Source review confirms the corrections for R-01–R-09 and the four additional
+witness, serialization and diagnostic findings described below. R-01 still
+has the documented upstream nbdkit negotiation boundary. The live-task
+witness charges, cancellation checks and TLS teardown ordering are present;
+spawn failure cleans up and continues accepting. Configuration parsing
+discards value-bearing TOML/Serde text, and transport bounds account for the
+declared serializer and encoding. Existing regressions exercise the original
+counterexamples, including stale benchmark generations and live tombstones.
+
+The completed scheduled [CI run 39109347979](https://github.com/seo-rii/maki/actions/runs/39109347979)
+on October 18 tested that exact `e50bcea` revision:
+
+| Job | Result | Evidence covered |
+| --- | --- | --- |
+| Baseline — Ubuntu | Passed | Workspace tests, strict Clippy, audit, dependency contracts and documentation checks |
+| Baseline — Windows | Passed | Workspace tests, formatting and strict Clippy |
+| Latest stable — Ubuntu | Passed | Workspace tests, formatting and strict Clippy |
+| Latest stable — Windows | Passed | Workspace tests, formatting and strict Clippy |
+| Nightly gates | Passed | Ignored release gates, plugin symbol, installed-header ABI and release fake-provider refusal |
+| etcd qualification | Passed | Verified etcd v3.6.5 and matching etcdctl, frontend built from this revision, real three-member quorum/failover tests |
+
+The October 19 local recheck of this product revision with Rust 1.94.0 passed
+187 focused Rust tests, with zero failures or ignored tests. It covered
+witness task/spawn lifetimes; cache empty entries and retained owners; the
+benchmark generation oracle; Engine admission, canary, checkpoint cancellation
+and tombstones; manifest loader and public attach/takeover errors; native NBD
+startup, connection admission and chunking; all three transports' actual
+serialization boundaries; gRPC established-channel replacement; and CLI
+configuration diagnostics and remote authority inspection. Nineteen Python
+documentation, shutdown-procedure and CI-gate contract tests also passed,
+along with the documentation link checker and `git diff --check`.
+This focused local run supplements the complete CI run above.
+
+Dirty-XFS full stop, repeated recovery interruption convergence, and
+step-by-step partial-attach cleanup campaigns on this revision remain pending
+as described under [Known operational items](#known-operational-items).
+Automated CI success does not change the [production approval status](status.md).
+
+## Original review and integration record
+
 This is a map of reviewed changes and evidence, not a release approval.
 At the start of this review, remote `main` was
 `0cc3539c9af9671099e5c7d2cdf19cbc99977d58`.
