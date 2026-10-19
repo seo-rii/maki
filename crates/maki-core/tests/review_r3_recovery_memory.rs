@@ -92,6 +92,10 @@ impl Fixture {
     }
 
     fn with_units(units: u64) -> Self {
+        Self::with_geometry(Geometry::compute(512, 512, 512, 4096, units * 512, 1 << 16).unwrap())
+    }
+
+    fn with_geometry(geometry: Geometry) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let backing: Arc<dyn Backing> = Arc::new(FileBacking::new(directory.path()).unwrap());
         let superblock = Superblock {
@@ -100,7 +104,7 @@ impl Fixture {
             provider_type: "fake".into(),
             crypto_compatibility_id: "recovery-memory".into(),
             key_identity: "key".into(),
-            geometry: Geometry::compute(512, 512, 512, 4096, units * 512, 1 << 16).unwrap(),
+            geometry,
             format_version: 1,
             created_unix: 0,
         };
@@ -730,5 +734,42 @@ fn normalized_prefix_fingerprint_matches_rewrite_chunk_boundaries() {
         assert_eq!(volume.journal_segment_count(), 0);
         assert_eq!(volume.read_ct(0).unwrap().unwrap(), (257, vec![1; 512]));
         assert!(!fixture.backing.exists(&layout::journal_segment(0)).unwrap());
+    }
+}
+
+// F06: 1 MiB is a batching target; one permitted ciphertext can be larger.
+// Oversized records must be applied before the scanner allocates their successor.
+#[test]
+fn review_f06_large_ciphertexts_do_not_overlap_in_replay_or_slot_encoding() {
+    for payload_size in [(1 << 20) - 33, (1 << 20) - 32, 1 << 20, 16 << 20] {
+        let fixture = Fixture::with_geometry(
+            Geometry::compute(512, 512, 512, payload_size, 1024, 1024).unwrap(),
+        );
+        let mut volume =
+            Volume::recover(fixture.backing.clone(), VolumeOptions::default()).unwrap();
+        for unit in 0..2 {
+            volume
+                .write_ct(unit, &vec![0x71 + unit as u8; payload_size as usize], true)
+                .unwrap();
+        }
+        drop(volume);
+        ALLOCATIONS.with(|cell| cell.set(Some(Allocations::default())));
+        let recovered = Volume::recover(fixture.backing.clone(), VolumeOptions::default());
+        let stats = ALLOCATIONS.with(|cell| cell.replace(None).unwrap());
+        let recovered = recovered.unwrap();
+        let budget = (1 << 20) + payload_size as usize + (256 << 10);
+        assert!(stats.peak <= budget,
+            "replay held excess large payloads: size={payload_size}, stats={stats:?}, budget={budget}");
+        assert!(
+            stats.largest <= (payload_size as usize).max(128 << 10),
+            "slot encoding copied a full ciphertext: size={payload_size}, stats={stats:?}"
+        );
+        assert_eq!(recovered.checkpoint_sequence(), 2);
+        for unit in 0..2 {
+            assert_eq!(
+                recovered.read_ct(unit).unwrap().unwrap(),
+                (unit + 1, vec![0x71 + unit as u8; payload_size as usize])
+            );
+        }
     }
 }

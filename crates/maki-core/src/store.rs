@@ -142,10 +142,10 @@ impl CheckpointSlotPlan {
             flags: 0,
             ciphertext_crc: crc32fast::hash(ciphertext),
         };
-        let mut buf = Vec::with_capacity(64 + ciphertext.len());
-        buf.extend_from_slice(&header.encode());
-        buf.extend_from_slice(ciphertext);
-        target.data.write_at(target.offset, &buf)?;
+        // Header and payload are journal-protected until the shard barrier;
+        // keeping them separate avoids a second ciphertext-sized allocation.
+        target.data.write_at(target.offset, &header.encode())?;
+        target.data.write_at(target.offset + 64, ciphertext)?;
         Ok(())
     }
 
@@ -887,13 +887,10 @@ impl SlotStore {
             flags: 0,
             ciphertext_crc: crc32fast::hash(ciphertext),
         };
-        let mut buf = Vec::with_capacity(64 + ciphertext.len());
-        buf.extend_from_slice(&header.encode());
-        buf.extend_from_slice(ciphertext);
         let shard = self.shards.get_mut(&shard_idx).unwrap();
-        shard
-            .data
-            .write_at(self.geometry.slot_offset(in_shard), &buf)?;
+        let offset = self.geometry.slot_offset(in_shard);
+        shard.data.write_at(offset, &header.encode())?;
+        shard.data.write_at(offset + 64, ciphertext)?;
         Ok(())
     }
 

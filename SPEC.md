@@ -1332,12 +1332,17 @@ lower the horizon to make a damaged volume attach.
 
 The first scan streams segment data and retains no replay payloads. After all
 durability checks and repairs succeed, a second scan replays accepted records
-through a ciphertext batch capped at 1 MiB and advances the checkpoint before
-READY. A crash during that replay leaves the durable journal available for an
-idempotent retry. Shard catalogs, allocation maps, runtime state, provider
-buffers and filesystem cache remain separate memory costs. This establishes a
-payload replay bound, not a whole-process RSS limit or hardware/DB power-loss
-qualification.
+through a ciphertext batch with a 1 MiB grouping target and advances the
+checkpoint before READY. A single record MAY exceed that target up to the
+geometry's `max_ciphertext_size`; a batch reaching the target MUST be applied
+and released before the next payload is scanned. Slot writes MUST avoid an
+additional ciphertext-sized encoding copy. With target T and maximum payload C,
+replay payload storage is at most T + C (a partial batch plus the next record).
+Record/index metadata, shard catalogs, allocation maps, runtime state, provider
+buffers and filesystem cache remain separate memory costs. A crash during that
+replay leaves the durable journal available for an idempotent retry. This is a
+geometry-dependent payload bound, not a whole-process RSS limit or hardware/DB
+power-loss qualification.
 
 Key canary: on the first attach of a pristine volume, Maki encrypts a fixed,
 volume-bound plaintext at a reserved unit index and stores it A/B-replicated

@@ -190,7 +190,11 @@ Journal scanning streams segment contents. Volume attach first validates the
 complete accepted journal while discarding replay payloads. After durable
 prefix rewrite, proof publication and metadata repair, it scans the journal a
 second time and applies accepted records to checkpoint slots through a
-ciphertext batch capped at 1 MiB. Within each batch, only the final sequence
+ciphertext batch with a 1 MiB grouping target. A geometry-valid record may
+exceed the target; full or oversized batches are applied immediately, before
+the scanner allocates another payload. Slot headers and ciphertext are written
+separately, avoiding an additional payload-sized encoding copy. Within each
+batch, only the final sequence
 for each unit writes slot data; a final discard skips earlier writes. All
 records still contribute allocation/discard evidence in sequence order, and
 batch boundaries are unchanged. Shard data and allocation metadata are
@@ -198,6 +202,16 @@ synchronized before checkpoint state advances, and covered segments are
 removed only afterward. A crash anywhere in that replay can retry from the
 still-durable journal. Every record still undergoes sequence, CRC, geometry and
 required-boundary checks; a damaged superseded record cannot be skipped.
+
+For a target T = 1 MiB and maximum ciphertext payload C, the replay's live
+payload storage is bounded by T + C: a partial batch plus the next scanned
+record. Batch record/index metadata, shard maps/catalogs, allocator overhead,
+provider/cache state and filesystem cache are additional costs. For example,
+C = 4 KiB gives a payload allowance of 1 MiB + 4 KiB; C = 16 MiB gives 17 MiB.
+These are payload allowances, not RSS limits or minimum RAM recommendations.
+The `review_f06_large_ciphertexts_do_not_overlap_in_replay_or_slot_encoding`
+allocator regression covers records just below, at and above the batching
+boundary and two consecutive 16 MiB records, including recovered data checks.
 
 The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
 

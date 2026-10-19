@@ -54,6 +54,7 @@ the recovery unit's `OnSuccess=`. Details are in the
 |---|---|---|
 | Measured `security.memory_budget` with Linux cgroup v2 | Expected | Requires a finite matching leaf `memory.max`, adequate visible ancestor headroom and `RLIMIT_MEMLOCK`, checked before recovery and READY. The service manager applies the limit; full host cgroup visibility is required for ancestor assessment. No universal minimum RAM or sustained headroom guarantee ([configuration](../configuration.md#measured-memory-budget)) |
 | Budget with missing/mismatched/unlimited leaf cgroup policy | Refused | No guessed limit or silent downgrade; omit the optional stanza to retain existing behavior |
+| Replay payload storage | Geometry-dependent | 1 MiB grouping target plus one `max_ciphertext_size` payload; metadata, provider/cache buffers and filesystem cache are separate costs. This is not a total-RSS ceiling ([recovery](../durable-recovery.md)) |
 
 ## Backing store (below Maki)
 
