@@ -170,15 +170,19 @@ class DebianPackageTests(unittest.TestCase):
         self.assertIn("systemd-tmpfiles", postinst)
         self.assertIn("daemon-reload", postinst)
         # No maintainer script may start, stop or restart a volume: the
-        # operator owns the lifecycle (drain, then stop the target).
+        # operator owns the lifecycle (stop workloads, unmount, then drain).
         for script in ("preinst", "postinst", "prerm", "postrm"):
             path = control / script
             if not path.exists():
                 continue
             subprocess.run(["sh", "-n", path], check=True)
             text = path.read_text()
-            for unsafe_action in (" enable ", " start ", " stop ", " restart ", " try-restart "):
-                self.assertNotIn(unsafe_action, text, f"{script} must not run systemctl{unsafe_action}")
+            for unsafe_action in ("enable", "start", "stop", "restart", "try-restart"):
+                self.assertNotRegex(
+                    text,
+                    rf'(?m)^\s*(?:systemctl|"\$systemctl_bin")\s+{unsafe_action}\b',
+                    f"{script} must not run systemctl {unsafe_action}",
+                )
 
     # --- R4-003: removal must not orphan a live attachment -----------------
 
@@ -196,6 +200,20 @@ class DebianPackageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("pg", result.stderr)
         self.assertIn("maki-workload@", result.stderr, "the message must name the stop procedure")
+
+    def test_review_f01_removal_guidance_unmounts_before_final_drain(self):
+        package = self.build()
+        _, control = self.extract(package, "prerm-stop-order")
+        state = self.work / "state-stop-order"
+        state.mkdir()
+        (state / "pg.nbd").write_text("{}")
+        result = self.run_prerm(control, "remove", state, fake_systemctl(self.work / "systemctl"))
+        self.assertNotEqual(result.returncode, 0)
+        message = result.stderr
+        self.assertLess(message.index("stop workloads"), message.index("unmount/detach"))
+        self.assertLess(message.index("unmount/detach"), message.index("final drain/checkpoint"))
+        self.assertIn("while the daemon still accepts I/O", message)
+        self.assertNotIn("maki drain <config>", message)
 
     def test_prerm_refuses_removal_while_a_maki_unit_is_active(self):
         package = self.build()

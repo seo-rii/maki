@@ -49,6 +49,42 @@ impl Drop for Server {
 }
 
 impl Server {
+    async fn refuse_upgrade(status: u16) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0; 4096];
+                let mut used = 0;
+                loop {
+                    assert!(
+                        used < request.len(),
+                        "upgrade request header exceeded fixture limit"
+                    );
+                    let received = socket.read(&mut request[used..]).await.unwrap();
+                    if received == 0 {
+                        return;
+                    }
+                    used += received;
+                    if request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                socket.write_all(format!("HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        Self {
+            url,
+            calls,
+            error: Arc::new(Mutex::new(None)),
+            task,
+        }
+    }
+
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -271,4 +307,24 @@ async fn recognized_request_and_retry_classes_keep_their_meaning() {
         assert_eq!(error.class(), expected);
     }
     assert_eq!(server.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn f04_auth_upgrade_refusal_fails_over_without_repeating_bad_credentials() {
+    for status in [401, 403, 407] {
+        let bad = Server::refuse_upgrade(status).await;
+        let good = Server::start().await;
+        let set = dispatcher(
+            &[("bad", bad.provider(true)), ("good", good.provider(true))],
+            true,
+        );
+        let output = set.encrypt_batch(&context(), &input()).await.unwrap();
+        assert_eq!(output[0].data, vec![0x42 ^ 0x5a; UNIT]);
+        assert_eq!(
+            bad.calls.load(Ordering::SeqCst),
+            1,
+            "HTTP {status} repeated rejected authentication"
+        );
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+    }
 }

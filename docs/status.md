@@ -101,9 +101,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Remote transport libraries may keep plaintext copies outside `SecretBuffer`,
   and stack temporaries of the local cipher implementations are outside the
   `secure-buffers` page lock ([transport memory](transport-memory.md)).
-- Recovery memory is bounded by a 1 MiB replay batch and the journaled overlay
-  by `limits.max_overlay_bytes`/`max_overlay_entries`, but a total-RSS bound for
-  arbitrary geometry, provider and cache settings has not been established.
+- Recovery uses a 1 MiB replay grouping target; a permitted single record
+  can be larger. Live replay payload storage is bounded by 1 MiB plus
+  `max_ciphertext_size`, with record/index metadata and shard maps/catalogs
+  additional ([recovery memory](durable-recovery.md)). The journaled overlay is
+  bounded by `limits.max_overlay_bytes`/`max_overlay_entries`, but a total-RSS
+  bound for arbitrary geometry, provider and cache settings is unestablished.
   Opt-in `security.memory_budget` now checks an explicitly measured cgroup-v2
   ceiling, visible ancestor headroom and memlock before recovery and READY.
   The service manager applies the kernel limit; this does not establish a

@@ -287,10 +287,10 @@ case "$1" in
         fi
         if [ -n "$busy" ]; then
             echo "maki: refusing to remove the package while volumes are attached:$busy" >&2
-            echo "maki: for each volume run 'maki drain <config>' after the workload has" \\
-                "quiesced, deactivate its lifecycle target maki-workload@<volume>.target," \\
-                "wait for maki-attach@, maki-recover@ and maki@ to become inactive, and retry" \\
-                "the removal" >&2
+            echo "maki: for each volume stop workloads, then deactivate its lifecycle target" \\
+                "maki-workload@<volume>.target: unmount/detach while the daemon still accepts I/O," \\
+                "then let daemon shutdown perform the final drain/checkpoint. Wait for" \\
+                "maki-attach@, maki-recover@ and maki@ to become inactive, and retry the removal" >&2
             exit 1
         fi
         ;;

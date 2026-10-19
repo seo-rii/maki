@@ -455,23 +455,32 @@ impl JournalWriter {
         }
     }
 
+    /// Validate counters and choose whether an append must roll before any
+    /// caller reserves or synchronizes storage on its behalf.
+    pub(crate) fn check_append(&self, payload_len: usize) -> Result<(u64, bool), CoreError> {
+        // MAX is a next-value sentinel, not a writable sequence.
+        let next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Corrupt("journal sequence exhausted".into()))?;
+        let record_len = 32 + payload_len as u64;
+        let needs_roll = match &self.active {
+            None => true,
+            Some(a) => a.info.record_count > 0 && a.write_offset + record_len > self.segment_size,
+        };
+        if needs_roll && self.next_segment_index == u64::MAX {
+            return Err(CoreError::Corrupt("journal segment index exhausted".into()));
+        }
+        Ok((next_sequence, needs_roll))
+    }
+
     /// Append one ciphertext record. Returns its sequence. On error, no
     /// sequence is consumed and the journal remains consistent — but
     /// `durable_sequence` may still have advanced (an automatic roll seals
     /// the previous segment before the failure).
     pub fn append(&mut self, unit_index: u64, payload: &[u8]) -> Result<u64, CoreError> {
-        // MAX is a next-value sentinel, not a writable sequence: publishing
-        // it would break both the writer invariant and durable-proof bounds.
-        // Check before a roll or any append/truncation can mutate storage.
+        let (next_sequence, needs_roll) = self.check_append(payload.len())?;
         let sequence = self.next_sequence;
-        let next_sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| CoreError::Corrupt("journal sequence exhausted".into()))?;
-        let record_len = 32 + payload.len() as u64;
-        let needs_roll = match &self.active {
-            None => true,
-            Some(a) => a.info.record_count > 0 && a.write_offset + record_len > self.segment_size,
-        };
         if needs_roll {
             self.roll()?;
         }

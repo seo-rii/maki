@@ -89,8 +89,11 @@ pub trait BackingFile: Send + Sync {
     /// work that will later depend on writing it. Real Linux files override
     /// this with `posix_fallocate`, whose successful return guarantees that
     /// later writes to the range do not fail for lack of filesystem space.
-    /// In-memory and test backings model the reservation by extending the
-    /// file; fault injection can therefore exercise the same ordering.
+    /// Allocation metadata may remain volatile after this call even when
+    /// the file length is already durable. Call `sync_all` before publishing
+    /// a journal record that depends on crash-surviving completion space.
+    /// In-memory backings may model allocation by extending the file;
+    /// extent-aware tests must track unwritten reservations separately.
     fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
         let end = offset
             .checked_add(len)
@@ -119,6 +122,12 @@ pub trait BackingFile: Send + Sync {
 
     /// Make all previously written data durable (fdatasync).
     fn sync_data(&self) -> io::Result<()>;
+
+    /// Make data and allocation metadata durable. In-memory/transactional
+    /// backings commit both together; filesystem backings must use fsync.
+    fn sync_all(&self) -> io::Result<()> {
+        self.sync_data()
+    }
 }
 
 /// Held while a volume is attached; dropping releases the lock.

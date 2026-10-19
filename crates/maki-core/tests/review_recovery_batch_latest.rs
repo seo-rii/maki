@@ -46,8 +46,10 @@ fn count_slot_writes(backing: &CrashableBacking) -> Arc<Mutex<Vec<u64>>> {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let observed = writes.clone();
     backing.set_fault_hook(Some(Arc::new(move |op| {
-        if let FaultOp::WriteAt { path, offset, .. } = op {
-            if path.ends_with(".dat") {
+        if let FaultOp::WriteAt { path, offset, len } = op {
+            // Count complete logical slot publications by their fixed header;
+            // ciphertext now uses a separate write without another allocation.
+            if path.ends_with(".dat") && *len == 64 {
                 observed.lock().unwrap().push(*offset);
             }
         }
@@ -210,6 +212,7 @@ fn superseded_record_corruption_is_still_rejected_before_slot_application() {
 #[derive(Clone, Copy, Debug)]
 enum ReplayFault {
     SlotWrite,
+    SlotPayloadWrite,
     SlotSync,
     AllocationSync,
     DiscardSync,
@@ -222,6 +225,7 @@ fn failed_latest_replay_remains_recoverable_after_restart_or_power_loss() {
     let _guard = failpoints::test_lock();
     for fault in [
         ReplayFault::SlotWrite,
+        ReplayFault::SlotPayloadWrite,
         ReplayFault::SlotSync,
         ReplayFault::AllocationSync,
         ReplayFault::DiscardSync,
@@ -252,6 +256,8 @@ fn failed_latest_replay_remains_recoverable_after_restart_or_power_loss() {
                     let fail = match fault {
                         ReplayFault::SlotWrite => matches!(op, FaultOp::WriteAt { path, .. }
                             if path.ends_with(".dat")),
+                        ReplayFault::SlotPayloadWrite => matches!(op, FaultOp::WriteAt { path, len, .. }
+                            if path.ends_with(".dat") && *len == 540),
                         ReplayFault::SlotSync => matches!(op, FaultOp::SyncData { path }
                             if path.ends_with(".dat")),
                         ReplayFault::AllocationSync => matches!(op, FaultOp::SyncData { path }

@@ -1676,3 +1676,15 @@ The first group needs a design decision.
 
 See the [PR, regression, commit and remaining-boundary map](review-boundaries-2026-10-15.md).
 Open-PR evidence is separate from remote-main integration and release qualification.
+
+
+## Ownership, recovery resources and operational follow-up (2026-10-19)
+
+The review of `44d60ea` identified F01–F09 in package shutdown guidance,
+volume identity, encrypted response cleanup/work, transport error and
+cancellation ownership, recovery memory, native listener identity and durable
+slot reservations. The [follow-up record](review-followup-2026-10-19.md)
+tracks each fix's failing regression and post-fix evidence, with explicit
+limits on the unexecuted host campaigns. F10–F15 remain an operational design
+and qualification backlog; I01–I27 and T01–T56 are mapped there without being
+reported as completed. Production qualification remains Pending.

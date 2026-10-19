@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
 
 use crate::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
-use crate::checked::{validate_decrypt_result, validate_encrypt_result, CheckedProvider};
+use crate::checked::{validate_decrypt_result, validate_owned_encrypt_result, CheckedProvider};
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
 use crate::flow::{DualPermit, DualSemaphore};
@@ -848,12 +848,12 @@ impl EndpointSet {
         // per-peer checks, so an invalid Ok response charges its breaker and
         // follows the existing retry-safe failover path (BUG-056).
         let result = result.and_then(|response| {
-            match (request, &response) {
+            match (request, response) {
                 (Request::Encrypt(items), Response::Encrypted(output)) => {
-                    validate_encrypt_result(items, output, caps)?;
+                    validate_owned_encrypt_result(items, output, caps).map(Response::Encrypted)
                 }
                 (Request::Decrypt(items), Response::Decrypted(output)) => {
-                    validate_decrypt_result(items, output, caps)?;
+                    validate_decrypt_result(items, &output, caps)?;
                     if let Some(size) = self.plaintext_size {
                         if let Some(unit) = output.iter().find(|unit| unit.data.len() != size as usize)
                         {
@@ -864,10 +864,10 @@ impl EndpointSet {
                             )));
                         }
                     }
+                    Ok(Response::Decrypted(output))
                 }
                 _ => unreachable!(),
             }
-            Ok(response)
         });
         let elapsed = self.clock.now().saturating_sub(started);
         self.metrics.rpc_count.fetch_add(1, Ordering::SeqCst);

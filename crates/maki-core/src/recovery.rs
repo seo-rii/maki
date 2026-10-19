@@ -327,6 +327,7 @@ fn recover_with_replay(
     })
 }
 
+// A target for grouped records, not a cap on a geometry-valid single record.
 const REPLAY_BATCH_BYTES: usize = 1 << 20;
 
 fn checkpoint_validated_replay(
@@ -385,6 +386,13 @@ fn checkpoint_validated_replay(
             }
             batch_bytes = batch_bytes.saturating_add(record_bytes);
             batch.push(record);
+            // Do not retain a full/oversized batch while the scanner allocates
+            // its next payload. A single permitted ciphertext can exceed the
+            // target, but is applied and dropped before the scan continues.
+            if batch_bytes >= REPLAY_BATCH_BYTES {
+                apply_replay_batch(store, &mut batch, allow_discard)?;
+                batch_bytes = 0;
+            }
             Ok(())
         })?;
         if replayed.record_count != segment.record_count

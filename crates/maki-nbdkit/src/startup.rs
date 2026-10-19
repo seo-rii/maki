@@ -85,6 +85,94 @@ pub(super) fn notify_ready(destination: Option<&OsStr>) -> io::Result<()> {
     Ok(())
 }
 
+/// nbdkit binds its listener before after_fork. Inspect owned listening FDs,
+/// rather than treating a pathname's existence as evidence of this listener.
+/// See https://github.com/libguestfs/nbdkit/blob/master/server/main.c
+pub(super) fn effective_nbd_socket(configured: Option<&str>) -> io::Result<Option<String>> {
+    use std::mem::{size_of, zeroed};
+    use std::path::Path;
+
+    let mut listeners = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let mut accepting: libc::c_int = 0;
+        let mut option_len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: both output pointers refer to initialized, correctly sized
+        // storage. ENOTSOCK/EBADF also covers the iterator's own closed FD.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepting as *mut libc::c_int).cast(),
+                &mut option_len,
+            )
+        } != 0
+            || accepting != 1
+        {
+            continue;
+        }
+        // SAFETY: a sockaddr_un is large enough for all supported listener
+        // addresses; inspect its family and returned length before sun_path.
+        let mut address: libc::sockaddr_un = unsafe { zeroed() };
+        let mut address_len = size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockname(
+                fd,
+                (&mut address as *mut libc::sockaddr_un).cast(),
+                &mut address_len,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if address.sun_family != libc::AF_UNIX as libc::sa_family_t {
+            continue;
+        }
+        let path_len = (address_len as usize)
+            .saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path))
+            .min(address.sun_path.len());
+        let bytes: Vec<u8> = address.sun_path[..path_len]
+            .iter()
+            .map(|byte| *byte as u8)
+            .take_while(|byte| *byte != 0)
+            .collect();
+        // Abstract/unnamed sockets cannot satisfy a pathname used by helper.
+        if bytes.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native NBD listener is not a UTF-8 pathname",
+            )
+        })?;
+        listeners.push(path);
+    }
+    let actual = if listeners.len() == 1 {
+        listeners.pop()
+    } else {
+        None
+    };
+    if let Some(configured) = configured {
+        if actual
+            .as_deref()
+            .is_none_or(|actual| Path::new(actual) != Path::new(configured))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("nbd.socket {configured:?} does not match the unique native pathname listener {actual:?}; set nbdkit -U and nbd.socket to the same path")));
+        }
+    }
+    Ok(actual)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

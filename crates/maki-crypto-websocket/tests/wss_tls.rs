@@ -198,27 +198,38 @@ async fn custom_ca_and_hostname_verification_allow_wss_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn untrusted_ca_and_wrong_hostname_are_rejected() {
+async fn f04_untrusted_ca_is_endpoint_fatal() {
     let server = identity(TLS_HOST);
     let addr = wss_server(server, None, "/").await;
-    assert!(provider(addr, None)
-        .encrypt_batch(&ctx(), &[pt()])
-        .await
-        .is_err());
+    assert_eq!(
+        provider(addr, None)
+            .encrypt_batch(&ctx(), &[pt()])
+            .await
+            .unwrap_err()
+            .class(),
+        ErrorClass::EndpointFatal
+    );
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f04_wrong_hostname_is_endpoint_fatal() {
     let server = identity("wrong.invalid");
     let ca_pem = server.cert_pem.clone();
     let addr = wss_server(server, None, "/").await;
-    assert!(provider(
-        addr,
-        Some(WsTlsOptions {
-            ca_pem: Some(ca_pem),
-            ..Default::default()
-        })
-    )
-    .encrypt_batch(&ctx(), &[pt()])
-    .await
-    .is_err());
+    assert_eq!(
+        provider(
+            addr,
+            Some(WsTlsOptions {
+                ca_pem: Some(ca_pem),
+                ..Default::default()
+            })
+        )
+        .encrypt_batch(&ctx(), &[pt()])
+        .await
+        .unwrap_err()
+        .class(),
+        ErrorClass::EndpointFatal
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -3,6 +3,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const UUID: &str = "11111111-2222-3333-4444-555555555555";
 
+#[test]
+fn review_f05_existing_sentinel_accepts_volume_uuid_case_change() {
+    let fixture = Fixture::new();
+    let lower = "abcdef01-2345-6789-abcd-ef0123456789";
+    let upper = lower.to_ascii_uppercase();
+    write_sentinel(&fixture.step(), fixture.mountpoint(), &upper).unwrap();
+    write_sentinel(&fixture.step(), fixture.mountpoint(), lower).unwrap();
+    write_sentinel(&fixture.step(), fixture.mountpoint(), &upper).unwrap();
+    assert!(write_sentinel(
+        &fixture.step(),
+        fixture.mountpoint(),
+        "00000000-2345-6789-abcd-ef0123456789"
+    )
+    .is_err());
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {

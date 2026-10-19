@@ -190,7 +190,11 @@ Journal scanning streams segment contents. Volume attach first validates the
 complete accepted journal while discarding replay payloads. After durable
 prefix rewrite, proof publication and metadata repair, it scans the journal a
 second time and applies accepted records to checkpoint slots through a
-ciphertext batch capped at 1 MiB. Within each batch, only the final sequence
+ciphertext batch with a 1 MiB grouping target. A geometry-valid record may
+exceed the target; full or oversized batches are applied immediately, before
+the scanner allocates another payload. Slot headers and ciphertext are written
+separately, avoiding an additional payload-sized encoding copy. Within each
+batch, only the final sequence
 for each unit writes slot data; a final discard skips earlier writes. All
 records still contribute allocation/discard evidence in sequence order, and
 batch boundaries are unchanged. Shard data and allocation metadata are
@@ -198,6 +202,35 @@ synchronized before checkpoint state advances, and covered segments are
 removed only afterward. A crash anywhere in that replay can retry from the
 still-durable journal. Every record still undergoes sequence, CRC, geometry and
 required-boundary checks; a damaged superseded record cannot be skipped.
+
+Checkpoint destination ranges are physically reserved before journal append.
+Sequence and impending segment-roll exhaustion are checked before any
+reservation or barrier; refused appends must leave storage untouched.
+Each reservation is followed by a full shard-file `fsync` barrier, including
+allocation metadata inside an already durable EOF. A failed barrier refuses
+the append before sequence/overlay publication; retry re-reserves and syncs the
+range. Since checkpoint slot I/O runs outside the volume lock, prepared plans
+also record a reservation-failure generation. A concurrent reservation fsync
+failure invalidates checkpoint publication even if its later shard sync
+succeeds: Linux may have cleared the dirty checkpoint writes. The journal is
+retained and the next checkpoint rewrites the complete snapshot. Foreground
+writes still progress while checkpoint slot I/O is blocked. Doing this before append also covers implicit journal-roll durability,
+as well as explicit FUA and FLUSH. This conservative policy adds a shard-file
+barrier to each reservation; no throughput or latency improvement is claimed.
+`review_reservation_durability` separates pending/committed unwritten extents
+from durable file length and checks replay after simulated power loss plus
+external ENOSPC. Actual ext4/XFS power-cut qualification remains pending.
+See the [fsync metadata contract](https://man7.org/linux/man-pages/man2/fsync.2.html).
+
+For a target T = 1 MiB and maximum ciphertext payload C, the replay's live
+payload storage is bounded by T + C: a partial batch plus the next scanned
+record. Batch record/index metadata, shard maps/catalogs, allocator overhead,
+provider/cache state and filesystem cache are additional costs. For example,
+C = 4 KiB gives a payload allowance of 1 MiB + 4 KiB; C = 16 MiB gives 17 MiB.
+These are payload allowances, not RSS limits or minimum RAM recommendations.
+The `review_f06_large_ciphertexts_do_not_overlap_in_replay_or_slot_encoding`
+allocator regression covers records just below, at and above the batching
+boundary and two consecutive 16 MiB records, including recovered data checks.
 
 The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
 

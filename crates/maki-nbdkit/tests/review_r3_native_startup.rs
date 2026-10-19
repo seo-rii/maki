@@ -365,7 +365,12 @@ fn abstract_notification_completes_before_the_first_client() {
         .unwrap();
     let mut server = Server::start(&fixture, Some(Path::new(&format!("@{name}"))));
     server.wait_ready(&notify);
-    assert_eq!(status(&fixture.control)["ok"], true);
+    let response = status(&fixture.control);
+    assert_eq!(response["ok"], true);
+    assert_eq!(
+        response["data"]["nbd_socket"],
+        fixture.dir.path().join("nbd.sock").to_str().unwrap()
+    );
 }
 
 #[test]
@@ -422,4 +427,69 @@ fn first_nbd_opens_do_not_reinitialize_or_send_duplicate_ready() {
     }
     assert!(!ready(&notify), "first opens must not send another READY");
     assert_eq!(status(&fixture.control)["ok"], true);
+}
+
+// F08: an explicit helper endpoint must name this nbdkit listener.
+#[test]
+fn review_f08_socket_mismatch_fails_before_ready_and_recovery() {
+    if !native_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let configured = fixture.dir.path().join("configured.sock");
+    let raw = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!("{raw}\n[nbd]\nsocket = {configured:?}\n"),
+    )
+    .unwrap();
+    let (notify, notify_path) = fixture.notify();
+    let mut server = Server::start(&fixture, Some(&notify_path));
+    server.wait_failure_without_ready(&notify);
+    assert!(server.diagnostics().contains("nbd.socket"));
+    assert!(!fixture.control.exists());
+    assert!(!configured.exists());
+}
+
+#[test]
+fn review_f08_matching_explicit_socket_becomes_ready() {
+    if !native_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let configured = fixture.dir.path().join("nbd.sock");
+    let raw = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!("{raw}\n[nbd]\nsocket = {configured:?}\n"),
+    )
+    .unwrap();
+    let (notify, notify_path) = fixture.notify();
+    let mut server = Server::start(&fixture, Some(&notify_path));
+    server.wait_ready(&notify);
+    let response = status(&fixture.control);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["data"]["nbd_socket"], configured.to_str().unwrap());
+}
+
+#[test]
+fn review_f08_unrelated_configured_socket_does_not_prove_this_listener() {
+    if !native_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let configured = fixture.dir.path().join("other-process.sock");
+    let _other_listener = std::os::unix::net::UnixListener::bind(&configured).unwrap();
+    let raw = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!("{raw}\n[nbd]\nsocket = {configured:?}\n"),
+    )
+    .unwrap();
+    let (notify, notify_path) = fixture.notify();
+    let mut server = Server::start(&fixture, Some(&notify_path));
+    server.wait_failure_without_ready(&notify);
+    assert!(server.diagnostics().contains("nbd.socket"));
+    assert!(!fixture.control.exists());
+    assert!(configured.exists());
 }

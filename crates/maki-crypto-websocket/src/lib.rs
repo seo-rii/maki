@@ -261,6 +261,50 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
     CryptoError::Retryable(msg.to_string())
 }
 
+/// HTTP upgrade authentication and TLS identity errors are endpoint failures,
+/// just as in HTTP/gRPC. Only transient transport failures may reconnect with
+/// the same credentials. Never format a remote body/header or credentialed URL.
+fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError {
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
+
+    match error {
+        Error::Http(response) => {
+            let code = response.status().as_u16();
+            match code {
+                300..=399 | 401 | 403 | 404 | 405 | 407 | 410 => {
+                    CryptoError::EndpointFatal(format!("websocket upgrade HTTP {code}"))
+                }
+                429 => CryptoError::Throttled(format!("websocket upgrade HTTP {code}")),
+                408 => retryable(format!("websocket upgrade HTTP {code}")),
+                400..=499 => {
+                    CryptoError::NonRetryableRequest(format!("websocket upgrade HTTP {code}"))
+                }
+                500..=599 => retryable(format!("websocket upgrade HTTP {code}")),
+                _ => CryptoError::EndpointFatal(format!("invalid websocket upgrade HTTP {code}")),
+            }
+        }
+        // tokio-tungstenite's rustls connector carries handshake errors in
+        // io::Error, so matching only Error::Tls misses certificate failures.
+        Error::Io(error)
+            if error
+                .get_ref()
+                .is_some_and(|source| source.is::<rustls::Error>()) =>
+        {
+            CryptoError::EndpointFatal("websocket TLS authentication or protocol failure".into())
+        }
+        Error::Tls(_) => CryptoError::EndpointFatal(
+            "websocket TLS authentication or configuration failure".into(),
+        ),
+        Error::Io(_)
+        | Error::ConnectionClosed
+        | Error::AlreadyClosed
+        | Error::Protocol(ProtocolError::HandshakeIncomplete) => {
+            retryable("websocket connection failed before upgrade completed")
+        }
+        _ => CryptoError::EndpointFatal("invalid websocket upgrade or configuration".into()),
+    }
+}
+
 impl WsCryptoProvider {
     pub fn new(spec: WsProviderSpec) -> Self {
         // Preserve deferred default-root loading: a WSS connection without
@@ -439,7 +483,7 @@ impl WsCryptoProvider {
             // to represent as an Instant: keep polling without a deadline.
             None => connection.await,
         }
-        .map_err(|e| retryable(format!("websocket connect failed: {e}")))?;
+        .map_err(classify_connect)?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (mut sink, mut source) = ws.split();

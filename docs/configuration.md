@@ -418,6 +418,16 @@ checks; this Linux confinement guarantee does not apply to them.
 
 ## NBD request limits
 
+`nbd.socket`, when set, is a startup contract with the native nbdkit
+listener. The plugin verifies the actual listening descriptor's pathname
+before recovery, control binding and READY; a mismatching `nbdkit -U` path
+fails startup. Merely creating another socket at the configured path does not
+satisfy that check. The packaged unit uses `/run/maki/<volume>/nbd.sock`;
+custom paths require a matching service launch and directory/sandbox policy.
+When unset, the manual launch chooses its listener. Native control `status`
+reports the observed pathname as `nbd_socket` (or null if there is no unique
+pathname listener). Non-native adapter contexts have no observed listener.
+
 `nbd.connections` must be `1`; multi-connection operation is disabled.
 
 `nbd.threads` sets the number of Tokio runtime worker threads used by the

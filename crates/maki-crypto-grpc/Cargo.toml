@@ -23,7 +23,7 @@ prost = "0.13"
 http-body = "1"
 zeroize.workspace = true
 # The TCP connector handed to tonic, so its connect timeout also covers the
-# TLS handshake (`connect_with_connector_lazy`); the same version tonic uses.
+# TLS handshake (`connect_with_connector`); the same version tonic uses.
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 
 [dev-dependencies]

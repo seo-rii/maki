@@ -247,7 +247,7 @@ pub struct Plan {
     pub steps: Vec<PlannedStep>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentIdentity {
     pub volume_uuid: String,
@@ -257,6 +257,20 @@ pub struct AttachmentIdentity {
     pub lv_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lvm_identity: Option<LvmIdentityPins>,
+}
+
+impl PartialEq for AttachmentIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        // Config and trusted records validate this hexadecimal UUID. Keep
+        // old record spellings compatible without folding LVM's distinct,
+        // case-sensitive alphanumeric identifiers or filesystem paths.
+        self.volume_uuid.eq_ignore_ascii_case(&other.volume_uuid)
+            && self.nbd_socket == other.nbd_socket
+            && self.mountpoint == other.mountpoint
+            && self.vg_name == other.vg_name
+            && self.lv_name == other.lv_name
+            && self.lvm_identity == other.lvm_identity
+    }
 }
 
 impl From<&AttachRequest> for AttachmentIdentity {

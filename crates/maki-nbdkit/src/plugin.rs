@@ -28,6 +28,10 @@ use crate::adapter::{AdapterError, NbdAdapter};
 #[path = "startup.rs"]
 mod startup;
 
+pub(crate) fn effective_nbd_socket(configured: Option<&str>) -> std::io::Result<Option<String>> {
+    startup::effective_nbd_socket(configured)
+}
+
 /// Values from `nbdkit-common.h` / `nbdkit-plugin.h` the shim depends on.
 /// `tests/review_abi.rs` compiles a C probe against the installed header
 /// and checks every one of them plus the struct layout (third review,
@@ -136,7 +140,7 @@ unsafe extern "C" fn after_fork() -> c_int {
         // provider quarantine) must reach the captured stderr (R4-001).
         maki_core::logging::install_default_logging();
         let path = CONFIG_PATH.lock().clone().ok_or("missing config path")?;
-        let adapter = NbdAdapter::open_config(&path).map_err(|error| error.to_string())?;
+        let adapter = NbdAdapter::open_native_config(&path).map_err(|error| error.to_string())?;
         ADAPTER
             .set(adapter)
             .map_err(|_| "adapter already initialized")?;

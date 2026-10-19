@@ -114,6 +114,33 @@ fn gate_is_repeatable_without_commands_record_changes_or_probe_files() {
 }
 
 #[test]
+fn review_f05_existing_record_and_sentinel_accept_volume_uuid_case_changes() {
+    for record_upper in [false, true] {
+        for config_upper in [false, true] {
+            for sentinel_upper in [false, true] {
+                let (_fixture, state, mut req, system) = fixture();
+                let _lock = state.lock_existing().unwrap();
+                let mut record = state.read("pg").unwrap().unwrap();
+                if record_upper {
+                    record.attachment.volume_uuid.make_ascii_uppercase();
+                    state.write(&record).unwrap();
+                }
+                let sentinel = if sentinel_upper {
+                    req.volume_uuid.to_ascii_uppercase()
+                } else {
+                    req.volume_uuid.clone()
+                };
+                std::fs::write(Path::new(&req.mountpoint).join(SENTINEL_FILE), sentinel).unwrap();
+                if config_upper {
+                    req.volume_uuid.make_ascii_uppercase();
+                }
+                workload_verify::verify_request(&req, &state, &system).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn absent_foreign_or_unreadable_backend_never_opens_the_filesystem() {
     for fault in [
         BackendFault::Missing,
