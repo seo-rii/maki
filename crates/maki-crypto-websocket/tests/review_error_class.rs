@@ -58,7 +58,21 @@ impl Server {
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                let mut used = 0;
+                loop {
+                    assert!(
+                        used < request.len(),
+                        "upgrade request header exceeded fixture limit"
+                    );
+                    let received = socket.read(&mut request[used..]).await.unwrap();
+                    if received == 0 {
+                        return;
+                    }
+                    used += received;
+                    if request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
                 count.fetch_add(1, Ordering::SeqCst);
                 socket.write_all(format!("HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
             }

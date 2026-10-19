@@ -36,8 +36,22 @@ async fn f04_upgrade_status_controls_class_and_retry_count() {
             let counter = calls.clone();
             let server = tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
-                    let mut header = vec![0; 4096];
-                    socket.read(&mut header).await.unwrap();
+                    let mut header = [0; 4096];
+                    let mut used = 0;
+                    loop {
+                        assert!(
+                            used < header.len(),
+                            "upgrade request header exceeded fixture limit"
+                        );
+                        let received = socket.read(&mut header[used..]).await.unwrap();
+                        if received == 0 {
+                            return;
+                        }
+                        used += received;
+                        if header[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
                     counter.fetch_add(1, Ordering::SeqCst);
                     if status == 0 {
                         continue;
