@@ -20,6 +20,7 @@ pub struct EngineControlBackend {
     engine: Engine,
     admission: Arc<crate::drain::DrainGate>,
     volume_name: String,
+    nbd_socket: Option<String>,
     crypto_stats: Option<Arc<SchedulerStats>>,
     endpoints: Option<Arc<EndpointSet>>,
 }
@@ -30,6 +31,7 @@ impl EngineControlBackend {
             engine,
             admission: Arc::default(),
             volume_name: volume_name.into(),
+            nbd_socket: None,
             crypto_stats: None,
             endpoints: None,
         }
@@ -38,6 +40,12 @@ impl EngineControlBackend {
     #[cfg(unix)]
     pub(crate) fn with_admission(mut self, admission: Arc<crate::drain::DrainGate>) -> Self {
         self.admission = admission;
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_nbd_socket(mut self, socket: Option<String>) -> Self {
+        self.nbd_socket = socket;
         self
     }
 
@@ -148,6 +156,7 @@ impl ControlBackend for EngineControlBackend {
             "drain_error": drain_error,
             "degraded_reason": reason,
             "volume": self.volume_name,
+            "nbd_socket": self.nbd_socket,
             "size": self.engine.size(),
             "durable_sequence": stats.durable_sequence,
             "appended_sequence": stats.appended_sequence,

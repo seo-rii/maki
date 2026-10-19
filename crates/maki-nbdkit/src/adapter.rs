@@ -112,10 +112,33 @@ impl NbdAdapter {
     /// run recovery + self-test, start the control socket, return a serving
     /// adapter.
     pub fn open_config(path: &str) -> Result<Self, AdapterError> {
+        Self::open_config_inner(path, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_native_config(path: &str) -> Result<Self, AdapterError> {
+        Self::open_config_inner(path, true)
+    }
+
+    fn open_config_inner(path: &str, native: bool) -> Result<Self, AdapterError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| AdapterError::new(EINVAL, format!("config {path}: {e}")))?;
         let config = daemon::parse_and_validate(&raw)
             .map_err(|e| AdapterError::new(EINVAL, e.to_string()))?;
+        // Validate the same parsed configuration used for recovery. A helper
+        // must never be directed to a different socket after native READY.
+        #[cfg(target_os = "linux")]
+        let nbd_socket = if native {
+            crate::plugin::effective_nbd_socket(config.nbd.socket.as_deref())
+                .map_err(|e| AdapterError::new(EINVAL, e.to_string()))?
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let nbd_socket: Option<String> = {
+            let _ = native;
+            None
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.nbd.threads as usize)
             .enable_all()
@@ -125,7 +148,7 @@ impl NbdAdapter {
             .block_on(daemon::attach_from_config_with_stats(&config))
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
         #[cfg(not(unix))]
-        let _ = (&crypto_stats, &endpoints); // only the Unix control socket reports them
+        let _ = (&crypto_stats, &endpoints, &nbd_socket); // only the Unix control socket reports them
 
         // The engine's request bound is `nbd.maximum_io` (see
         // `daemon::engine_options`, validated as a wire-sized value);
@@ -146,6 +169,7 @@ impl NbdAdapter {
                     config.volume.name.clone(),
                 )
                 .with_admission(admission.clone())
+                .with_nbd_socket(nbd_socket.clone())
                 .with_crypto_stats(crypto_stats.clone())
                 .with_endpoints(endpoints.clone()),
             );
