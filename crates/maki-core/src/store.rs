@@ -42,6 +42,7 @@
 //! read as EIO until rewritten (`ShortFile`, `prove_data_file`).
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use maki_backing::{Backing, BackingFile};
@@ -116,9 +117,22 @@ pub(crate) struct CheckpointSlotPlan {
     targets: Vec<CheckpointSlotTarget>,
     shards: Vec<Arc<dyn BackingFile>>,
     max_ciphertext_size: usize,
+    reservation_failures: Arc<AtomicU64>,
+    prepared_reservation_failures: u64,
 }
 
 impl CheckpointSlotPlan {
+    pub(crate) fn validate_reservation_barriers(&self) -> Result<(), CoreError> {
+        let failures = self.reservation_failures.load(Ordering::Acquire);
+        if failures == u64::MAX || failures != self.prepared_reservation_failures {
+            return Err(CoreError::Durability(
+                "reservation sync failed during checkpoint; retain journal and rewrite slots"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn write(
         &self,
         index: usize,
@@ -180,6 +194,9 @@ pub struct SlotStore {
     /// its cursor, but is not pending work until a later checkpoint, run
     /// for its own reasons, retries it.
     reclaim_stalled: bool,
+    /// Failed reservation fsync can clear another checkpoint's dirty pages.
+    /// Plans observe this counter before publication under the volume lock.
+    reservation_failures: Arc<AtomicU64>,
 }
 
 /// Shard index of a `shard-XXXXXXXX.dat` file name, verified by
@@ -326,6 +343,8 @@ impl SlotStore {
             targets,
             shards: shard_files.into_values().collect(),
             max_ciphertext_size: self.geometry.max_ciphertext_size as usize,
+            reservation_failures: self.reservation_failures.clone(),
+            prepared_reservation_failures: self.reservation_failures.load(Ordering::Acquire),
         })
     }
 
@@ -544,6 +563,7 @@ impl SlotStore {
             discard_enabled,
             reclaim_cursor: None,
             reclaim_stalled: false,
+            reservation_failures: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -643,7 +663,15 @@ impl SlotStore {
         // is still volatile. Persist allocation metadata before any journal
         // append can publish/acknowledge work that depends on this space,
         // including an implicit barrier inside an automatic journal roll.
-        shard.data.sync_all()?;
+        if let Err(error) = shard.data.sync_all() {
+            // The volume lock serializes counter writers, while immutable
+            // checkpoint I/O proceeds independently. Saturation permanently
+            // refuses publication rather than wrapping to an old generation.
+            let failures = self.reservation_failures.load(Ordering::Relaxed);
+            self.reservation_failures
+                .store(failures.saturating_add(1), Ordering::Release);
+            return Err(error.into());
+        }
         Ok(())
     }
 

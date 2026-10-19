@@ -207,7 +207,12 @@ Checkpoint destination ranges are physically reserved before journal append.
 Each reservation is followed by a full shard-file `fsync` barrier, including
 allocation metadata inside an already durable EOF. A failed barrier refuses
 the append before sequence/overlay publication; retry re-reserves and syncs the
-range. Doing this before append also covers implicit journal-roll durability,
+range. Since checkpoint slot I/O runs outside the volume lock, prepared plans
+also record a reservation-failure generation. A concurrent reservation fsync
+failure invalidates checkpoint publication even if its later shard sync
+succeeds: Linux may have cleared the dirty checkpoint writes. The journal is
+retained and the next checkpoint rewrites the complete snapshot. Foreground
+writes still progress while checkpoint slot I/O is blocked. Doing this before append also covers implicit journal-roll durability,
 as well as explicit FUA and FLUSH. This conservative policy adds a shard-file
 barrier to each reservation; no throughput or latency improvement is claimed.
 `review_reservation_durability` separates pending/committed unwritten extents

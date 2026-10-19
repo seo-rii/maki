@@ -78,6 +78,7 @@ impl PreparedCheckpoint {
             slot_index += 1;
         }
         self.slots.sync_shards()?;
+        self.slots.validate_reservation_barriers()?;
         Ok(CompletedCheckpoint(self))
     }
 }
@@ -464,6 +465,10 @@ impl Volume {
         &mut self,
         completed: CompletedCheckpoint,
     ) -> Result<u64, CoreError> {
+        // A foreground reservation may have failed fsync while the plan's
+        // slot writes ran without this lock, clearing their dirty bits.
+        // Recheck under the volume lock before publishing any metadata.
+        completed.0.slots.validate_reservation_barriers()?;
         let PreparedCheckpoint {
             base_checkpoint,
             horizon,
@@ -676,5 +681,64 @@ mod discard_tests {
         })));
         assert_eq!(volume.finish_checkpoint(completed).unwrap(), 2);
         backing.set_fault_hook(None);
+    }
+}
+
+#[cfg(test)]
+mod reservation_barrier_tests {
+    use super::{CompletedCheckpoint, Volume, VolumeOptions};
+    use maki_format::{geometry::Geometry, init, superblock::Superblock};
+    use maki_test_support::crash_backing::FaultOp;
+    use maki_test_support::CrashableBacking;
+    use std::io;
+    use std::sync::Arc;
+
+    #[test]
+    fn review_f09_concurrent_reservation_sync_failure_cannot_publish_checkpoint() {
+        let backing = Arc::new(CrashableBacking::new());
+        init::create_volume(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(0xf0902),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "reservation-checkpoint".into(),
+                key_identity: "key".into(),
+                geometry: Geometry::compute(512, 512, 512, 512, 4096, 4096).unwrap(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        volume.write_ct(0, &[0x86; 512], true).unwrap();
+        let prepared = volume.prepare_checkpoint().unwrap();
+        // Deterministically interleave the exact slot-write and shard-sync
+        // steps execute() runs without the volume lock. A foreground write
+        // is allowed to reserve another unit between these two steps.
+        prepared.slots.write(0, 1, &[0x86; 512]).unwrap();
+        backing.set_fault_hook(Some(Arc::new(|op| match op {
+            FaultOp::SyncData { path } if path.ends_with(".dat") => Some(io::Error::other(
+                "reservation sync lost checkpoint dirty bits",
+            )),
+            _ => None,
+        })));
+        assert!(volume.write_ct(1, &[0x97; 512], false).is_err());
+        backing.set_fault_hook(None);
+        // Linux-style failed writeback left the checkpoint bytes readable
+        // but clean and not durable. This later sync succeeds with no writes.
+        prepared.slots.sync_shards().unwrap();
+        assert!(
+            volume
+                .finish_checkpoint(CompletedCheckpoint(prepared))
+                .is_err(),
+            "checkpoint published after another fsync discarded its dirty writes"
+        );
+        assert_eq!(volume.checkpoint_sequence(), 0);
+        volume.checkpoint().unwrap(); // rewrite all slots from the kept journal
+        drop(volume);
+        backing.crash_all_lost();
+        let recovered = Volume::recover(backing, VolumeOptions::default()).unwrap();
+        assert_eq!(recovered.read_ct(0).unwrap().unwrap().1, vec![0x86; 512]);
     }
 }
