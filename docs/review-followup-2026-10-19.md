@@ -34,11 +34,28 @@ an entire numbered test proposal from the supplied report.
 | F08 — effective NBD listener | Validate an explicit configured socket against the native pathname listening descriptor before recovery/control binding/READY; reject disagreement and expose the effective `nbd_socket` in status. | All 12 native startup tests execute and pass with nbdkit 1.32.5/libnbd 1.14.2 installed, including matching/mismatched paths, a decoy socket owned by another process, and effective status. The mismatch regression announced READY before the fix; no native prerequisite skip occurred in this target. |
 | F09 — durable extent reservation | Add a full data/allocation-metadata barrier immediately after slot reservation and before journal append, covering FUA, FLUSH and implicit-roll publication. Filesystem-backed files use `fsync` through `BackingFile::sync_all`. | Commit `7e2fc69`; all five `review_reservation_durability.rs` cases pass. Four failed before the fix (FUA, FLUSH, implicit roll, barrier failure); the durable-EOF/volatile-extent control passes independently. The concurrent fsync/checkpoint regression also failed before its generation guard; 35 focused core/checkpoint/replay/reservation cases and 74 local/remote rollback cases pass. Physical rollback arena/manifest reservations use full metadata barriers too. Storage/release integration evidence follows below. The separate extent model distinguishes durable EOF from volatile reservations and exhausts space after crash. This conservative fix adds a shard sync per reservation; actual ext4/XFS power-loss behavior and performance remain unqualified. |
 
-Final integration evidence: **pending**. Record final SHA, Linux/Rust
-versions, package/native prerequisites, commands, exit statuses and bounded
-log locations here after completion. Preserve failed reproductions separately
-from successful post-fix runs and identify ignored or capability-skipped
-tests.
+Final integration evidence for code revision `65b51c58dc208a4e15b883f2b854f854b7e682a5` on
+Linux 6.1.0-54-cloud-amd64, rustc 1.94.0 (4a4ef493e 2026-03-02):
+
+| Check | Result | Exit |
+|---|---|---:|
+| Workspace default tests | 2018 passed, 0 failed, 13 ignored | 0 |
+| Optimized ignored release gates | 13 passed, 0 failed | 0 |
+| Workspace formatting and strict all-target Clippy | Passed | 0 |
+| Python script tests | 122 passed | 0 |
+| Markdown links | Passed | 0 |
+| Actual native startup target | 12 passed; native prerequisites present | 0 |
+| CI baseline/latest stable on Ubuntu/Windows | All four jobs passed at the code revision above | 0 |
+
+Private local evidence under `~/logs`: `maki-pr82-final-workspace-20261019-v2.log`,
+`maki-pr82-final-release-20261019-v2.log`, `maki-pr82-final-clippy-20261019-v2.log`,
+`maki-pr82-final-python-20261019-v2.log`, and
+`maki-pr82-verification-20261019.json`. The preliminary Clippy and journal-exhaustion CI failures,
+ENOSPC build failures and superseded/interrupted runs are excluded from the
+successful totals. Ignored default tests ran in the release command; opt-in
+operator campaigns remain outside these totals. These are repository test
+results, not a new installed-system or hardware power-loss qualification.
+The evidence update after this code revision changes documentation only.
 
 ## Current unresolved operational backlog
 
