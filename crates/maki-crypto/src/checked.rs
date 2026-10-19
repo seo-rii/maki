@@ -92,7 +92,7 @@ pub fn validate_encrypt_result(
         // reproduces a whole unit of plaintext with negligible probability.
         // The error charges the endpoint that answered.
         let plain = item.data.expose();
-        if !plain.is_empty() && ct.data.windows(plain.len()).any(|window| window == plain) {
+        if !plain.is_empty() && contains_plaintext(&ct.data, plain, |a, b| a == b) {
             return Err(CryptoError::Contract(format!(
                 "encrypt result {i} carries its plaintext: the provider is not encrypting"
             )));
@@ -170,5 +170,120 @@ impl CryptoProvider for CheckedProvider {
             }
         }
         Ok(out)
+    }
+}
+
+// Keep byte comparisons injectable so adversarial-work regressions measure
+// the algorithm's actual work without depending on clocks or CPU speed.
+fn contains_plaintext(
+    haystack: &[u8],
+    needle: &[u8],
+    mut equal: impl FnMut(u8, u8) -> bool,
+) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    // KMP retains the longest matched prefix instead of comparing it again
+    // at every candidate offset. Preprocessing and scanning are both linear,
+    // including long repeated prefixes and periodic near matches.
+    let mut prefix = vec![0; needle.len()];
+    let mut matched = 0;
+    for index in 1..needle.len() {
+        loop {
+            if equal(needle[index], needle[matched]) {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
+            matched = prefix[matched - 1];
+        }
+        prefix[index] = matched;
+    }
+    matched = 0;
+    for byte in haystack {
+        loop {
+            if equal(*byte, needle[matched]) {
+                matched += 1;
+                if matched == needle.len() {
+                    return true;
+                }
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
+            matched = prefix[matched - 1];
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod substring_tests {
+    use super::contains_plaintext;
+
+    #[test]
+    fn f03_search_matches_slice_windows_exhaustively() {
+        for haystack_length in 0..=8 {
+            for bits in 0..1usize << haystack_length {
+                let haystack: Vec<_> = (0..haystack_length)
+                    .map(|i| ((bits >> i) & 1) as u8)
+                    .collect();
+                for needle_length in 0..=5 {
+                    for bits in 0..1usize << needle_length {
+                        let needle: Vec<_> = (0..needle_length)
+                            .map(|i| ((bits >> i) & 1) as u8)
+                            .collect();
+                        let expected = needle.is_empty()
+                            || haystack
+                                .windows(needle.len())
+                                .any(|window| window == needle);
+                        assert_eq!(
+                            contains_plaintext(&haystack, &needle, |a, b| a == b),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f03_repeated_prefix_near_matches_have_linear_comparison_cost() {
+        for length in [64, 256, 1024] {
+            let haystack = vec![b'a'; length * 8];
+            let mut needle = vec![b'a'; length];
+            needle[length - 1] = b'b';
+            let mut comparisons = 0;
+            assert!(!contains_plaintext(&haystack, &needle, |a, b| {
+                comparisons += 1;
+                a == b
+            }));
+            assert!(
+                comparisons <= 4 * (haystack.len() + needle.len()),
+                "{comparisons} comparisons for needle length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn f03_periodic_near_matches_have_linear_comparison_cost() {
+        let haystack: Vec<_> = b"abab".iter().copied().cycle().take(8192).collect();
+        let mut needle: Vec<_> = b"abab".iter().copied().cycle().take(1024).collect();
+        needle[1023] = b'c';
+        let mut comparisons = 0;
+        assert!(!contains_plaintext(&haystack, &needle, |a, b| {
+            comparisons += 1;
+            a == b
+        }));
+        assert!(
+            comparisons <= 4 * (haystack.len() + needle.len()),
+            "{comparisons} comparisons"
+        );
     }
 }
