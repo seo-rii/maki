@@ -2,6 +2,7 @@
 //! System. These tests make no claim about tonic's separate codec buffers.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,6 +27,13 @@ static WATCH_NEXT_SIZE: AtomicUsize = AtomicUsize::new(0);
 static RELEASED: AtomicBool = AtomicBool::new(false);
 static ZEROIZED: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    // TLS tasks in unrelated unit tests may allocate the same common sizes.
+    // The EndpointSet regression uses one current-thread runtime, so select
+    // its request copy without observing another test's allocation.
+    static WATCH_THREAD_SIZE: Cell<usize> = const { Cell::new(0) };
+}
+
 struct InspectDeallocation;
 
 // SAFETY: all memory comes from and returns to System. Explicitly watched
@@ -37,9 +45,19 @@ unsafe impl GlobalAlloc for InspectDeallocation {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null()
             && layout.size() != 0
-            && WATCH_NEXT_SIZE
-                .compare_exchange(layout.size(), 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+            && (WATCH_THREAD_SIZE
+                .try_with(|size| {
+                    if size.get() == layout.size() {
+                        size.set(0);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+                || WATCH_NEXT_SIZE
+                    .compare_exchange(layout.size(), 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok())
         {
             unsafe { ptr.write_bytes(0, layout.size()) };
             WATCHED.store(ptr as usize, Ordering::SeqCst);
@@ -62,6 +80,7 @@ unsafe impl GlobalAlloc for InspectDeallocation {
 static ALLOCATOR: InspectDeallocation = InspectDeallocation;
 
 fn reset_observer() {
+    WATCH_THREAD_SIZE.with(|size| size.set(0));
     WATCHED.store(0, Ordering::SeqCst);
     WATCH_NEXT_SIZE.store(0, Ordering::SeqCst);
     RELEASED.store(false, Ordering::SeqCst);
@@ -449,7 +468,7 @@ fn test_provider(url: &str, max_message_bytes: usize) -> GrpcCryptoProvider {
         capabilities: maki_crypto::CryptoCapabilities {
             provider_id: "lifetime-test".into(),
             crypto_compatibility_id: "profile".into(),
-            supported_plaintext_sizes: vec![64, 8209],
+            supported_plaintext_sizes: vec![64, 512, 8209],
             max_ciphertext_size: 8209,
             stateless: true,
             retry_safe: true,
@@ -474,6 +493,212 @@ fn test_context() -> CryptoContext {
         format_version: 1,
         crypto_compatibility_id: "profile".into(),
     }
+}
+
+fn stalled_tls_provider(address: std::net::SocketAddr) -> GrpcCryptoProvider {
+    let mut spec = test_provider("http://127.0.0.1:1", 1 << 20).spec.clone();
+    spec.url = format!("https://{address}");
+    spec.timeout = std::time::Duration::from_secs(60);
+    GrpcCryptoProvider::new_with_tls(spec, super::GrpcTlsConfig::default()).unwrap()
+}
+
+#[test]
+fn review_f07_cancelled_tls_rpc_releases_plaintext_and_endpoint_charge_together() {
+    use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
+    use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
+
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Arc::new(stalled_tls_provider(listener.local_addr().unwrap()));
+        let endpoints = Arc::new(
+            EndpointSet::new(
+                vec![("tls-stall".into(), provider)],
+                DispatchConfig {
+                    retry: RetryPolicy {
+                        initial_delay: std::time::Duration::from_secs(1),
+                        max_delay: std::time::Duration::from_secs(1),
+                    },
+                    budget: RetryBudgetConfig {
+                        retry_ratio: 0.0,
+                        burst: 0,
+                        min_probe_per_sec: 0.0,
+                    },
+                    breaker: Default::default(),
+                    global_max_inflight_batches: 1,
+                    global_max_inflight_bytes: 1 << 20,
+                    per_endpoint_max_inflight: 1,
+                    per_endpoint_max_bytes: 1 << 20,
+                    max_attempts: Some(1),
+                    max_operation_time: None,
+                    retry_safe: true,
+                    validation_interval: std::time::Duration::from_secs(1),
+                },
+                Arc::new(maki_crypto::SystemClock::new()),
+            )
+            .with_plaintext_size(512),
+        );
+        let source = maki_crypto::PlaintextUnit {
+            unit_index: 7,
+            data: SecretBuffer::from_slice(&[0xC7; 512]),
+        };
+        let source_address = source.data.expose().as_ptr() as usize;
+        reset_observer();
+        WATCH_THREAD_SIZE.with(|size| size.set(512));
+        let call = tokio::spawn({
+            let endpoints = endpoints.clone();
+            async move { endpoints.encrypt_batch(&test_context(), &[source]).await }
+        });
+        // Keeping this TCP socket open without replying stalls the real TLS
+        // handshake. No timing assumption is needed to place the request.
+        let (_held_socket, _) = listener.accept().await.unwrap();
+        let watched = WATCHED.load(Ordering::SeqCst);
+        assert_ne!(watched, 0, "wire plaintext allocation was not observed");
+        assert_ne!(watched, source_address, "watch the transport copy");
+        // SAFETY: the selected allocation is still owned by the pending RPC;
+        // this single-threaded runtime cannot drop it during this assertion.
+        assert!(
+            unsafe { std::slice::from_raw_parts(watched as *const u8, 512) }
+                .iter()
+                .all(|byte| *byte == 0xC7)
+        );
+        assert_eq!(endpoints.global_inflight().0, 1);
+        assert!(endpoints.global_inflight().1 >= 512);
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert_eq!(endpoints.global_inflight(), (0, 0));
+        assert_zeroized();
+    });
+}
+
+#[test]
+fn review_f07_tls_rpc_timeout_erases_owned_payload_before_return() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Arc::new(stalled_tls_provider(listener.local_addr().unwrap()));
+        let call = tokio::spawn({
+            let provider = provider.clone();
+            let item = watched_item();
+            async move {
+                provider
+                    .call(provider.encrypt_path.clone(), &test_context(), vec![item])
+                    .await
+            }
+        });
+        let (_held_socket, _) = listener.accept().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(provider.spec.timeout).await;
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(CryptoError::Retryable(_))
+        ));
+        assert_zeroized();
+    });
+}
+
+#[test]
+fn review_f07_cancelled_tls_waiter_does_not_cancel_its_live_sibling() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend.local_addr().unwrap();
+        let identity = tonic::transport::Identity::from_pem(
+            certificate.cert.pem(),
+            certificate.key_pair.serialize_pem(),
+        );
+        let reply = FixedReply(Arc::new(Mutex::new(Some(super::CryptoBatchResponse {
+            items: vec![super::CryptoItem {
+                unit_index: 7,
+                data: vec![0x35; 64],
+            }],
+        }))));
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .unwrap()
+                .add_service(reply)
+                .serve_with_incoming(ListenerStream(backend))
+                .await
+                .unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spec = stalled_tls_provider(listener.local_addr().unwrap())
+            .spec
+            .clone();
+        let provider = Arc::new(
+            GrpcCryptoProvider::new_with_tls(
+                spec,
+                super::GrpcTlsConfig {
+                    ca_certificate_pem: Some(certificate.cert.pem().into_bytes()),
+                    client_identity: None,
+                },
+            )
+            .unwrap(),
+        );
+        let cancelled = tokio::spawn({
+            let provider = provider.clone();
+            let item = watched_item();
+            async move {
+                provider
+                    .call(provider.encrypt_path.clone(), &test_context(), vec![item])
+                    .await
+            }
+        });
+        let (mut client, _) = listener.accept().await.unwrap();
+        let pending = Arc::new(tokio::sync::Notify::new());
+        let live = tokio::spawn({
+            let provider = provider.clone();
+            let pending = pending.clone();
+            async move {
+                pending.notify_one();
+                provider
+                    .call(
+                        provider.encrypt_path.clone(),
+                        &test_context(),
+                        vec![WireItem {
+                            unit_index: 7,
+                            data: SecretBuffer::from_slice(&[0x11; 64]),
+                        }],
+                    )
+                    .await
+            }
+        });
+        // The current-thread task runs to its first await before delivering
+        // this notification, so both callers now share the blocked handshake.
+        pending.notified().await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert_zeroized();
+        let proxy = tokio::spawn(async move {
+            let mut upstream = tokio::net::TcpStream::connect(backend_address)
+                .await
+                .unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        });
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), live)
+            .await
+            .expect("live caller must finish the original TLS connection")
+            .unwrap()
+            .unwrap();
+        assert_eq!(output[0].data.expose(), &[0x35; 64]);
+        proxy.abort();
+        server.abort();
+    });
 }
 
 #[derive(Clone)]

@@ -1,6 +1,6 @@
 //! An established channel can remain TCP-open while no longer making RPC
 //! progress. Retire it on retryable failure, timeout or caller cancellation.
-//! Preserve unfinished connection attempts: their separate TLS/connect bound
+//! Preserve payload-free unfinished connection attempts: their separate bound
 //! allows a slow successful handshake to outlive one RPC deadline. A channel
 //! with no completed RPC is still retired after that initial progress window,
 //! covering a completed handshake followed by a silent first RPC.
@@ -8,26 +8,61 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use hyper_util::client::legacy::connect::HttpConnector;
 use tonic::transport::{Channel, Endpoint};
 
+use maki_crypto::CryptoError;
+
+#[derive(Clone)]
+enum ConnectionState {
+    Connecting,
+    Ready(Channel),
+    Failed,
+}
+
 struct CachedChannel {
-    inner: Channel,
+    state: watch::Receiver<ConnectionState>,
+    worker: JoinHandle<()>,
     established: AtomicBool,
     started: Instant,
 }
 
 impl CachedChannel {
-    fn new(endpoint: &Endpoint, connector: &HttpConnector) -> Arc<Self> {
+    fn new(endpoint: &Endpoint, connector: &HttpConnector, timeout: Duration) -> Arc<Self> {
+        let (state, receiver) = watch::channel(ConnectionState::Connecting);
+        let endpoint = endpoint.clone();
+        let connector = connector.clone();
+        // Channel::ready() only reserves a slot in tonic's tower buffer. A
+        // lazy channel can transfer the whole RPC body into that buffer while
+        // TLS is still pending, beyond the caller's cancellation lifetime.
+        // Establish the connection without a request body; every caller owns
+        // its plaintext until this shared attempt has completed.
+        let worker = tokio::spawn(async move {
+            let connected =
+                tokio::time::timeout(timeout, endpoint.connect_with_connector(connector)).await;
+            state.send_replace(match connected {
+                Ok(Ok(channel)) => ConnectionState::Ready(channel),
+                _ => ConnectionState::Failed,
+            });
+        });
         Arc::new(Self {
-            inner: endpoint
-                .clone()
-                .connect_with_connector_lazy(connector.clone()),
+            state: receiver,
+            worker,
             established: AtomicBool::new(false),
             started: Instant::now(),
         })
+    }
+}
+
+impl Drop for CachedChannel {
+    fn drop(&mut self) {
+        // An idle provider may preserve this bounded, payload-free worker,
+        // but destroying/retiring the cache must not leave it detached.
+        self.worker.abort();
     }
 }
 
@@ -56,8 +91,22 @@ impl ConnectionCache {
 
     pub(super) fn exchange(&self) -> Exchange<'_> {
         let mut current = self.current.lock().expect("gRPC connection mutex poisoned");
+        // A payload-free attempt can finish after its final waiter left.
+        // A later caller must reconnect rather than inherit that stale error.
+        if current
+            .as_ref()
+            .is_some_and(|channel| matches!(*channel.state.borrow(), ConnectionState::Failed))
+        {
+            *current = None;
+        }
         let channel = current
-            .get_or_insert_with(|| CachedChannel::new(&self.endpoint, &self.connector))
+            .get_or_insert_with(|| {
+                CachedChannel::new(
+                    &self.endpoint,
+                    &self.connector,
+                    self.initial_progress_timeout,
+                )
+            })
             .clone();
         Exchange {
             cache: self,
@@ -74,8 +123,23 @@ pub(super) struct Exchange<'a> {
 }
 
 impl Exchange<'_> {
-    pub(super) fn channel(&self) -> Channel {
-        self.channel.inner.clone()
+    pub(super) async fn channel(&self) -> Result<Channel, CryptoError> {
+        let mut state = self.channel.state.clone();
+        loop {
+            let observed = state.borrow_and_update().clone();
+            match observed {
+                ConnectionState::Ready(channel) => return Ok(channel),
+                ConnectionState::Failed => {
+                    return Err(CryptoError::Retryable("grpc connection failed".into()));
+                }
+                ConnectionState::Connecting => {}
+            }
+            if state.changed().await.is_err() {
+                return Err(CryptoError::Retryable(
+                    "grpc connection worker stopped".into(),
+                ));
+            }
+        }
     }
 
     pub(super) fn succeeded(&mut self) {
@@ -94,7 +158,8 @@ impl Exchange<'_> {
 impl Drop for Exchange<'_> {
     fn drop(&mut self) {
         if self.finished
-            || (!self.channel.established.load(Ordering::Acquire)
+            || (!matches!(*self.channel.state.borrow(), ConnectionState::Failed)
+                && !self.channel.established.load(Ordering::Acquire)
                 && self.channel.started.elapsed() < self.cache.initial_progress_timeout)
         {
             return;
@@ -134,6 +199,23 @@ mod tests {
         let original = pending.channel.clone();
         drop(pending);
         assert!(Arc::ptr_eq(&cache.exchange().channel, &original));
+    }
+
+    #[tokio::test]
+    async fn a_failed_payload_free_attempt_is_not_reused_by_the_next_caller() {
+        let cache = cache();
+        let pending = cache.exchange();
+        let original = pending.channel.clone();
+        let mut state = original.state.clone();
+        drop(pending);
+        loop {
+            let observed = state.borrow_and_update().clone();
+            if matches!(observed, ConnectionState::Failed) {
+                break;
+            }
+            state.changed().await.unwrap();
+        }
+        assert!(!Arc::ptr_eq(&cache.exchange().channel, &original));
     }
 
     #[tokio::test(start_paused = true)]

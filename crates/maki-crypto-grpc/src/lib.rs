@@ -666,11 +666,10 @@ impl GrpcCryptoProvider {
             }
             (None, _) => return Err(fatal("gRPC endpoint URL has no scheme")),
         }
-        // `connect_lazy` applies the connect timeout to the TCP connect only;
-        // a peer that accepts TCP and never answers the ClientHello then
-        // pins the channel's connection worker, and every later RPC queues
-        // behind that handshake (BUG-115). With an explicit connector, tonic
-        // bounds the whole connect, TLS included, and reconnects afterwards.
+        // An explicit connector bounds TLS as well as the TCP connect
+        // (BUG-115). ConnectionCache establishes the channel without an RPC
+        // body, so cancelling a handshake waiter erases its own payload
+        // immediately rather than leaving it in tonic's background queue.
         // The bound is several RPC timeouts: a slow but working handshake
         // still completes in the background for the next RPC, as before.
         // The TCP connector is configured like tonic's own: its timeout is
@@ -732,13 +731,6 @@ impl GrpcCryptoProvider {
         }
 
         let mut connection = self.connections.exchange();
-        let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
-            inner: connection.channel(),
-            limit: self.spec.max_message_bytes,
-        })
-        .max_decoding_message_size(self.spec.max_message_bytes)
-        .max_encoding_message_size(self.spec.max_message_bytes);
-
         let mut request = tonic::Request::new(message);
         for (key, value) in &self.spec.metadata {
             let key = MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes())
@@ -759,6 +751,13 @@ impl GrpcCryptoProvider {
         // by the configured operation timeout. The `bounded-error` policy's
         // outer deadline (BUG-013) is separate and still applies.
         let exchange = async {
+            let channel = connection.channel().await?;
+            let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
+                inner: channel,
+                limit: self.spec.max_message_bytes,
+            })
+            .max_decoding_message_size(self.spec.max_message_bytes)
+            .max_encoding_message_size(self.spec.max_message_bytes);
             grpc.ready()
                 .await
                 .map_err(|e| CryptoError::Retryable(format!("grpc endpoint not ready: {e}")))?;
