@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
+use zeroize::Zeroize;
 
 use crate::error::CryptoError;
 use crate::provider::CryptoProvider;
@@ -52,7 +53,36 @@ impl CheckedProvider {
     }
 }
 
+/// An encrypt response is untrusted until the entire batch passes validation.
+/// In particular, its purported ciphertext may still contain plaintext. Own all
+/// returned buffers through validation, including earlier and extra items.
+struct PendingEncryptResult(Vec<CiphertextUnit>);
+
+impl Drop for PendingEncryptResult {
+    fn drop(&mut self) {
+        for unit in &mut self.0 {
+            // Vec::zeroize also erases spare capacity: a provider may have
+            // shortened its buffer after writing sensitive bytes into it.
+            unit.data.zeroize();
+        }
+    }
+}
+
+/// Validate an owned encrypt response, erasing every payload on rejection.
+/// Successful validation transfers the existing allocations without copying.
+pub(crate) fn validate_owned_encrypt_result(
+    items: &[PlaintextUnit],
+    out: Vec<CiphertextUnit>,
+    caps: &CryptoCapabilities,
+) -> Result<Vec<CiphertextUnit>, CryptoError> {
+    let mut pending = PendingEncryptResult(out);
+    validate_encrypt_result(items, &pending.0, caps)?;
+    Ok(std::mem::take(&mut pending.0))
+}
+
 /// Validate an encrypt result against its inputs and the provider contract.
+/// This borrowed checker does not own or erase buffers. Internal response
+/// owners use `validate_owned_encrypt_result` to guard rejection paths.
 pub fn validate_encrypt_result(
     items: &[PlaintextUnit],
     out: &[CiphertextUnit],
@@ -148,8 +178,7 @@ impl CryptoProvider for CheckedProvider {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         let caps = self.caps().await?.clone();
         let out = self.inner.encrypt_batch(context, items).await?;
-        validate_encrypt_result(items, &out, &caps)?;
-        Ok(out)
+        validate_owned_encrypt_result(items, out, &caps)
     }
 
     async fn decrypt_batch(

@@ -1,6 +1,6 @@
 //! Provider self-test, run before a volume attaches (SPEC §27, §34, §44).
 
-use crate::checked::{validate_decrypt_result, validate_encrypt_result};
+use crate::checked::{validate_decrypt_result, validate_owned_encrypt_result};
 use crate::error::{ContextField, CryptoError, ErrorClass};
 use crate::provider::CryptoProvider;
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
@@ -55,8 +55,7 @@ async fn encrypt_chunked(
     for range in batch_ranges(items, caps, |p| p.data.len() as u64) {
         let chunk = &items[range];
         let cts = provider.encrypt_batch(context, chunk).await?;
-        validate_encrypt_result(chunk, &cts, caps)?;
-        out.extend(cts);
+        out.extend(validate_owned_encrypt_result(chunk, cts, caps)?);
     }
     Ok(out)
 }

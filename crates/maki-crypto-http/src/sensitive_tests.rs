@@ -979,3 +979,66 @@ fn http_request_mapping_errors_and_duplicate_keys_erase_owned_key_storage() {
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn f02_http_echo_response_is_erased_before_rejection() {
+    use maki_crypto::checked::CheckedProvider;
+    use maki_crypto::{CryptoProvider, PlaintextUnit};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    // Isolate the test server's intentionally unguarded plaintext copies from
+    // the caller thread's allocator observer. Only provider owners are measured.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let mut length = 0;
+        loop {
+            length += socket.read(&mut request[length..]).unwrap();
+            if let Some(end) = request[..length]
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+            {
+                if length >= end + 4 + PAYLOAD_LEN {
+                    break;
+                }
+            }
+        }
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {PAYLOAD_LEN}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        socket.write_all(&[FILL; PAYLOAD_LEN]).unwrap();
+    });
+    let op = test_op(BodySpec::Raw);
+    let mut provider = test_provider(&op);
+    provider.spec.base_url = format!("http://{address}");
+    provider.spec.timeout = Duration::from_secs(2);
+    provider.spec.max_response_bytes = PAYLOAD_LEN;
+    provider.spec.capabilities.supported_plaintext_sizes = vec![PAYLOAD_LEN as u32];
+    provider.spec.capabilities.max_ciphertext_size = PAYLOAD_LEN as u32;
+    let checked = CheckedProvider::new(Arc::new(provider));
+    let input = [PlaintextUnit {
+        unit_index: 0,
+        data: SecretBuffer::from_slice(&[FILL; PAYLOAD_LEN]),
+    }];
+    let context = test_context();
+    begin_inspection_for_size(PAYLOAD_LEN);
+    let result = checked.encrypt_batch(&context, &input).await;
+    let rejected = matches!(result, Err(maki_crypto::CryptoError::Contract(_)));
+    drop(result);
+    let inspection = finish_inspection();
+    server.join().unwrap();
+    assert!(rejected, "an HTTP plaintext echo was accepted");
+    assert!(
+        inspection.zeroized > 0,
+        "no provider allocation was observed"
+    );
+    assert_eq!(
+        inspection.plaintext_deallocations, 0,
+        "plaintext echo reached allocator without erasure: {inspection:?}"
+    );
+}
