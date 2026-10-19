@@ -465,13 +465,15 @@ fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -
     // failed writeback. Reassert them before the successful reservation sync.
     arena.set_len(capacity * 2)?;
     arena.allocate_range(0, capacity * 2)?;
-    arena.sync_data()?;
+    // Reopening a sparse restore can allocate unwritten extents inside an
+    // already durable EOF. Persist their metadata before promising space.
+    arena.sync_all()?;
     let bound = manifest_bound(capacity);
     for name in MANIFESTS {
         let file = disk.open(name, true)?;
         file.set_len(bound)?;
         file.allocate_range(0, bound)?;
-        file.sync_data()?;
+        file.sync_all()?;
     }
     disk.sync_dir("")
 }
@@ -569,6 +571,9 @@ impl State {
         let bytes = candidate.encode()?;
         let slot = 1 - self.manifest_slot;
         let result = (|| {
+            // reserve_storage fully syncs the entire physical footprint
+            // before State exists. Commits change data and logical mappings,
+            // without allocating new filesystem extents.
             self.arena.sync_data()?;
             write_manifest(self.disk.as_ref(), slot, &bytes)?;
             self.witness
@@ -818,6 +823,9 @@ impl BackingFile for CowFile {
         state.check()?;
         Ok(state.files.get(&self.id).ok_or_else(missing)?.len)
     }
+    // The inherited sync_all uses this transaction barrier too: physical
+    // arena/manifest reservations were fully synced before State assembly;
+    // logical reservations are authenticated manifest data committed here.
     fn sync_data(&self) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
@@ -1255,6 +1263,12 @@ mod tests {
             }
             self.file.sync_data()
         }
+        fn sync_all(&self) -> io::Result<()> {
+            if matches!(self.operation, "sync" | "full-sync") {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            self.file.sync_all()
+        }
     }
 
     impl Backing for ReservationFaultBacking {
@@ -1327,6 +1341,26 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn review_f09_physical_rollback_reservations_require_full_file_barriers() {
+        for path in [ARENA, MANIFESTS[0], MANIFESTS[1]] {
+            let root = tempfile::tempdir().unwrap();
+            let disk = ReservationFaultBacking {
+                disk: FileBacking::new(root.path()).unwrap(),
+                path,
+                operation: "full-sync",
+            };
+            let healthy_arena = disk.disk.open(ARENA, true).unwrap();
+            // Establish a durable EOF first: retrying allocation within that
+            // length must still require the distinct metadata barrier.
+            reserve_storage(&disk.disk, healthy_arena.as_ref(), PAGE).unwrap();
+            let arena = disk.open(ARENA, false).unwrap();
+            let error = reserve_storage(&disk, arena.as_ref(), PAGE)
+                .expect_err("fdatasync cannot substitute for the allocation fsync");
+            assert_eq!(error.raw_os_error(), Some(libc::EIO), "{path}");
         }
     }
 
