@@ -2134,7 +2134,8 @@ secret leakage                 0
 
 # 57. Default Configuration Example
 
-`volume.name` MUST contain 1–64 ASCII bytes from `[A-Za-z0-9_-]`.
+`volume.name` MUST contain 1–64 ASCII bytes from `[A-Za-z0-9_-]` and MUST NOT
+start with `-`, matching the privileged helper's argument contract.
 Configuration validation MUST reject an invalid name before creating or
 opening its backing; the operational identifier must fit the default control
 socket pathname and its bounded status response.

@@ -30,7 +30,8 @@ Durations use values such as `150us`, `50ms`, `5s`, or `2m` (minutes), always
 as a quoted string with a unit. Unlike byte sizes, a bare integer is rejected.
 
 `volume.name` is an operational identifier of 1–64 ASCII bytes, using only
-letters, digits, `_` and `-`. Validation rejects longer names before creating
+letters, digits, `_` and `-`, and must not start with `-`, matching the
+privileged helper's argument contract. Validation rejects invalid names before creating
 or opening the backing. The bound leaves room for the default control socket
 pathname and the name in the official bounded status response.
 
