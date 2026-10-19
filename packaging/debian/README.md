@@ -62,8 +62,12 @@ installed.
 record under `/run/maki-attach/`, or an active `maki@`, `maki-attach@`,
 `maki-recover@` or `maki-workload@` unit (R4-003, R5-015). A failed `systemctl` query also refuses the removal: it proves nothing about the units. The helper this package installs is what the
 lifecycle needs to detach cleanly, so removing it under a live attachment
-would strand the operator. Drain each volume, deactivate its lifecycle
-target, wait for the units to become inactive, then remove the package.
+would strand the operator. Stop workloads, then deactivate each volume's
+`maki-workload@<volume>.target` lifecycle target. The dependency ordering
+unmounts/detaches while the daemon still accepts I/O, then daemon shutdown
+performs the final drain/checkpoint. Wait for all units to become inactive,
+then remove the package. Do not explicitly drain before unmount: XFS may
+still need writeback or metadata I/O after workload processes have stopped.
 
 Upgrades are not blocked and no maintainer script starts, stops or restarts
 a service. Detaching before an upgrade remains the operator's step in the
