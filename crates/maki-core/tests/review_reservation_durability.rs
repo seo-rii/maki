@@ -160,7 +160,7 @@ fn review_f09_fua_reservation_survives_power_loss_and_external_enospc() {
     volume.write_ct(0, &[0x31; 512], true).unwrap();
     drop(volume);
     backing.power_loss_and_exhaust_space();
-    let mut recovered = Volume::recover(backing, VolumeOptions::default())
+    let recovered = Volume::recover(backing, VolumeOptions::default())
         .expect("FUA replay must retain its completion extent");
     assert_eq!(recovered.read_ct(0).unwrap().unwrap().1, vec![0x31; 512]);
 }
@@ -174,7 +174,7 @@ fn review_f09_flush_preserves_reservations_on_every_touched_shard() {
     volume.flush().unwrap();
     drop(volume);
     backing.power_loss_and_exhaust_space();
-    let mut recovered = Volume::recover(backing, VolumeOptions::default())
+    let recovered = Volume::recover(backing, VolumeOptions::default())
         .expect("FLUSH replay must retain every touched extent");
     for unit in [0, 3] {
         assert_eq!(recovered.read_ct(unit).unwrap().unwrap().1, vec![0x42; 512]);
