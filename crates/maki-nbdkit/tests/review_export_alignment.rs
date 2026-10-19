@@ -82,6 +82,7 @@ async fn attach_rejects_minimum_io_incompatible_with_stored_geometry() {
     let engine = attach_from_config(&config).await.unwrap();
     engine.write(4096, &[0x5a; 512], true).await.unwrap();
     engine.checkpoint().await.unwrap();
+    engine.stop_checkpoint_worker().await;
     drop(engine);
 
     // Direct callers can change runtime negotiation without repeating config
