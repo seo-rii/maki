@@ -273,6 +273,10 @@ impl BackingFile for RealFile {
     fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
     }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
 }
 
 #[cfg(unix)]

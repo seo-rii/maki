@@ -608,7 +608,8 @@ impl SlotStore {
     /// Make the complete on-disk slot range available before its journal
     /// record can be accepted. A successful Linux reservation uses
     /// `posix_fallocate`, so a later checkpoint cannot lose its completion
-    /// space to an unrelated filesystem consumer.
+    /// space to an unrelated filesystem consumer. A full file barrier makes
+    /// unwritten allocation metadata durable before the record is published.
     ///
     /// The reservation can extend a data file, so the file's size is proven
     /// first (see `ShortFile`): for a truncated file the damage marks made
@@ -638,6 +639,11 @@ impl SlotStore {
         shard
             .data
             .allocate_range(self.geometry.slot_offset(in_shard), self.geometry.slot_size)?;
+        // EOF may already be durable while the unwritten extent reservation
+        // is still volatile. Persist allocation metadata before any journal
+        // append can publish/acknowledge work that depends on this space,
+        // including an implicit barrier inside an automatic journal roll.
+        shard.data.sync_all()?;
         Ok(())
     }
 

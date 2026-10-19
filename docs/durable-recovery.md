@@ -203,6 +203,18 @@ removed only afterward. A crash anywhere in that replay can retry from the
 still-durable journal. Every record still undergoes sequence, CRC, geometry and
 required-boundary checks; a damaged superseded record cannot be skipped.
 
+Checkpoint destination ranges are physically reserved before journal append.
+Each reservation is followed by a full shard-file `fsync` barrier, including
+allocation metadata inside an already durable EOF. A failed barrier refuses
+the append before sequence/overlay publication; retry re-reserves and syncs the
+range. Doing this before append also covers implicit journal-roll durability,
+as well as explicit FUA and FLUSH. This conservative policy adds a shard-file
+barrier to each reservation; no throughput or latency improvement is claimed.
+`review_reservation_durability` separates pending/committed unwritten extents
+from durable file length and checks replay after simulated power loss plus
+external ENOSPC. Actual ext4/XFS power-cut qualification remains pending.
+See the [fsync metadata contract](https://man7.org/linux/man-pages/man2/fsync.2.html).
+
 For a target T = 1 MiB and maximum ciphertext payload C, the replay's live
 payload storage is bounded by T + C: a partial batch plus the next scanned
 record. Batch record/index metadata, shard maps/catalogs, allocator overhead,
