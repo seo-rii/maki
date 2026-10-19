@@ -278,11 +278,9 @@ impl Volume {
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
         self.check_freshness()?;
-        // Preserve the writer's exhaustion boundary: no storage mutation is
-        // allowed once the next sequence cannot advance.
-        if self.journal.next_sequence() == u64::MAX {
-            return Err(CoreError::Corrupt("journal sequence exhausted".into()));
-        }
+        // Counter refusal must precede physical reservation and its barrier,
+        // including an exhausted segment index when this append would roll.
+        self.journal.check_append(ciphertext.len())?;
         if ciphertext.len() > self.superblock.geometry.max_ciphertext_size as usize {
             return Err(CoreError::Corrupt(format!(
                 "ciphertext {} exceeds max {}",

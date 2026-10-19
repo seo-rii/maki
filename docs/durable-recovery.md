@@ -204,6 +204,8 @@ still-durable journal. Every record still undergoes sequence, CRC, geometry and
 required-boundary checks; a damaged superseded record cannot be skipped.
 
 Checkpoint destination ranges are physically reserved before journal append.
+Sequence and impending segment-roll exhaustion are checked before any
+reservation or barrier; refused appends must leave storage untouched.
 Each reservation is followed by a full shard-file `fsync` barrier, including
 allocation metadata inside an already durable EOF. A failed barrier refuses
 the append before sequence/overlay publication; retry re-reserves and syncs the
