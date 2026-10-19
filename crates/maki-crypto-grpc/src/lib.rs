@@ -135,10 +135,11 @@ pub fn class_of_code(code: tonic::Code) -> ErrorClass {
 
 // Tonic rejects oversized gRPC frames before calling the protobuf decoder,
 // using the same OutOfRange code a server can legitimately return for a bad
-// request. Observe only the five-byte framing header before tonic consumes
-// the body, so local receive errors have a private, unforgeable source. The
-// payload stays in tonic's existing erased Bytes allocation and both tonic
-// size limits remain enabled.
+// request, and its unary helper discards any extra messages while draining
+// trailers. Observe framing before tonic consumes the body, so local size,
+// truncation and unary cardinality errors have a private, unforgeable source.
+// The payload stays in tonic's existing erased Bytes allocation and both
+// tonic size limits remain enabled.
 #[derive(Debug)]
 struct ReceiveContractError(&'static str);
 
@@ -191,6 +192,12 @@ impl ResponseFraming {
                     self.messages += 1;
                 }
                 continue;
+            }
+            // There must be exactly one message in a successful unary
+            // response. Reject even a partial second header instead of
+            // allowing tonic's trailers() drain to discard another result.
+            if self.messages > 0 {
+                return Err("grpc unary response contains more than one message");
             }
             let consumed = (self.header.len() - self.header_bytes).min(bytes.len());
             self.header[self.header_bytes..self.header_bytes + consumed]
@@ -367,14 +374,26 @@ mod receive_contract_tests {
     }
 
     #[test]
-    fn payload_is_skipped_and_each_later_message_has_its_own_limit() {
+    fn payload_is_skipped_and_every_split_second_header_is_rejected() {
+        for split in 1..=5 {
+            let mut framing = ResponseFraming::new(8);
+            framing.observe(&[0, 0, 0, 0, 8]).unwrap();
+            framing.observe(&[255; 3]).unwrap();
+            framing.observe(&[255; 5]).unwrap();
+            framing.observe(&[]).unwrap();
+            assert_eq!(
+                framing.observe(&[0, 0, 0, 0, 8][..split]),
+                Err("grpc unary response contains more than one message")
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_length_message_still_uses_the_one_unary_message() {
         let mut framing = ResponseFraming::new(8);
-        framing.observe(&[0, 0, 0, 0, 8]).unwrap();
-        framing.observe(&[255; 3]).unwrap();
-        framing.observe(&[255; 5]).unwrap();
-        framing.observe(&[0, 0, 0, 0, 8]).unwrap();
-        framing.observe(&[255; 8]).unwrap();
-        assert!(framing.observe(&[0, 0, 0, 0, 9]).is_err());
+        framing.observe(&[0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(framing.messages, 1);
+        assert!(framing.observe(&[0]).is_err());
     }
 
     #[test]
