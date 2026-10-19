@@ -400,7 +400,7 @@ fn write_sentinel_with_boundary(
         (&mut file)
             .take(SENTINEL_MAX_BYTES)
             .read_to_string(&mut existing)?;
-        if existing.trim() != volume_uuid {
+        if !existing.trim().eq_ignore_ascii_case(volume_uuid) {
             return Err(ExecError::Step {
                 step: step.to_string(),
                 message: format!(

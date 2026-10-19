@@ -132,7 +132,7 @@ pub fn verify_mount_identity(
         observed.fs_uuid.as_deref(),
     )?;
     match &observed.sentinel_volume_uuid {
-        Some(uuid) if *uuid == expected.volume_uuid => {}
+        Some(uuid) if uuid.eq_ignore_ascii_case(&expected.volume_uuid) => {}
         other => {
             return Err(MountVerifyError(format!(
                 "Maki volume sentinel mismatch: {other:?} != {:?}",

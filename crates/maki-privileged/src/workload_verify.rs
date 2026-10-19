@@ -196,7 +196,10 @@ pub(super) fn verify_request(
             "workload mount changed during filesystem probe",
         ));
     }
-    if system.sentinel(&record, &after_probe)? != request.volume_uuid {
+    if !system
+        .sentinel(&record, &after_probe)?
+        .eq_ignore_ascii_case(&request.volume_uuid)
+    {
         return Err(identity_error("workload volume sentinel does not match"));
     }
     if live_mount(&record, system)? != before {
