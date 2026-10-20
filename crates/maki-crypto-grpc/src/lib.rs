@@ -279,18 +279,31 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
     for BoundedResponseChannel
 {
     type Response = tonic::codegen::http::Response<BoundedResponseBody>;
-    type Error = tonic::transport::Error;
+    type Error = tonic::codegen::StdError;
     type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        tonic::codegen::Service::poll_ready(&mut self.inner, cx)
+        tonic::codegen::Service::poll_ready(&mut self.inner, cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
         let response = tonic::codegen::Service::call(&mut self.inner, request);
         let limit = self.limit;
         Box::pin(async move {
-            Ok(response.await?.map(|inner| BoundedResponseBody {
+            let response = response.await?;
+            // A successful unary response needs a message followed by OK
+            // trailers. Initial status belongs to a trailers-only error.
+            // Tonic treats initial OK as an empty response and skips later
+            // status checks, accepting data even after an error trailer.
+            // Reject before its decoder sees the headers, including an
+            // already-ended body that would never reach our framing checks.
+            if response.headers().get("grpc-status").map(|v| v.as_bytes()) == Some(b"0") {
+                return Err(receive_contract_status(
+                    "grpc unary response reported success in initial headers",
+                )
+                .into());
+            }
+            Ok(response.map(|inner| BoundedResponseBody {
                 inner,
                 framing: ResponseFraming::new(limit),
             }))
