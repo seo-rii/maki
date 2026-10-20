@@ -1017,6 +1017,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "hyper",
  "libc",
  "maki-backing",
  "maki-core",

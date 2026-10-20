@@ -67,6 +67,15 @@ fragment collectors, masked formatting temporaries and handshake read/write
 storage before they can contain payload data. Their growth and error paths
 erase retired allocations. Public message/HTTP values remain caller-owned.
 
+Hyper's HTTP/1 body decoder also retains typed parse-error provenance for
+invalid chunk sizes, delimiters, extensions and trailers. These errors keep
+their original I/O kind and owned diagnostic beneath a `hyper::Error` whose
+`is_parse()` returns true; formatted trailer diagnostics retain their erasure
+owner. Maki uses the type to refuse retries of malformed HTTP responses without
+matching error text. Underlying transport I/O and incomplete bodies retain
+their original error types and retry policy. The decoder's accepted wire
+syntax is unchanged.
+
 HTTP/2's h2/tokio-util frame storage and tonic's gRPC encode/decode buffers use
 the patched `BytesMut`/`Bytes` backing. They do not require a separate protocol
 fork. These guarantees cover those byte allocations, not every container,

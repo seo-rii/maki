@@ -102,6 +102,8 @@ pub(super) enum Parse {
     TooLarge,
     Status,
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+    Body,
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
     Internal,
 }
 
@@ -175,9 +177,9 @@ impl Error {
     /// Returns true if this was an HTTP parse error.
     ///
     /// This can be caused by a malformed HTTP message, an invalid header,
-    /// an invalid URI, an invalid HTTP version, or a message head that is
-    /// too large. Use the more specific `is_parse_*` methods to determine
-    /// the exact cause.
+    /// an invalid URI, an invalid HTTP version, invalid HTTP/1 body framing,
+    /// or a message head that is too large. Use the more specific `is_parse_*`
+    /// methods to determine the exact cause.
     pub fn is_parse(&self) -> bool {
         matches!(self.inner.kind, Kind::Parse(_))
     }
@@ -406,6 +408,13 @@ impl Error {
         Error::new(Kind::Body).with(cause)
     }
 
+    /// Preserve definite HTTP/1 body syntax failures through the decoder's
+    /// io::Error return type. Socket I/O and incomplete bodies do not use this.
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+    pub(super) fn new_body_parse<E: Into<Cause>>(cause: E) -> Error {
+        Error::new(Kind::Parse(Parse::Body)).with(cause)
+    }
+
     #[cfg(all(
         any(feature = "client", feature = "server"),
         any(feature = "http1", feature = "http2")
@@ -525,6 +534,8 @@ impl Error {
             Kind::Parse(Parse::TooLarge) => "message head is too large",
             Kind::Parse(Parse::Status) => "invalid HTTP status-code parsed",
             #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+            Kind::Parse(Parse::Body) => "invalid HTTP body framing parsed",
+            #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
             Kind::Parse(Parse::Internal) => {
                 "internal error inside Hyper and/or its dependencies, please report"
             }
@@ -611,6 +622,14 @@ impl fmt::Debug for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The body decoder already exposed this diagnostic through io::Error.
+        // Adding typed provenance must preserve that formatting contract.
+        #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+        if matches!(self.inner.kind, Kind::Parse(Parse::Body)) {
+            if let Some(cause) = &self.inner.cause {
+                return fmt::Display::fmt(cause, f);
+            }
+        }
         f.write_str(self.description())
     }
 }
