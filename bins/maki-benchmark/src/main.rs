@@ -183,6 +183,7 @@ struct Report {
     flush: OperationReport,
     workload: workload::Description,
     setup: workload::SetupReport,
+    verification: workload::VerificationReport,
     resources: workload::ResourceReport,
 }
 
@@ -309,7 +310,7 @@ fn main() -> ExitCode {
     let result: Result<Report, String> = runtime.block_on(async {
         let measured = workload::run(engine, &options, working_set_bytes).await?;
         // Each recorded read has already passed the workload's comparison.
-        // A successful run without any reads has not checked readback.
+        // Keep the measured-read verdict separate from the final sweep.
         let verified_read_operations = measured.reads.report().samples;
         Ok(Report {
             schema_version: 1,
@@ -346,6 +347,7 @@ fn main() -> ExitCode {
                 seed: options.seed,
             },
             setup: measured.setup,
+            verification: measured.verification,
             resources: measured.resources,
         })
     });
@@ -397,6 +399,14 @@ fn main() -> ExitCode {
             } else {
                 "skipped: no read operations"
             }
+        );
+        println!(
+            "verification: {} slots written during measurement; {} slots read after a measured write; \
+             final sweep passed for {} slots in {:.3}s (excluded from throughput and latency)",
+            report.verification.written_slots,
+            report.verification.read_after_write_verified_slots,
+            report.verification.final_sweep_verified_slots,
+            report.verification.final_sweep_elapsed_seconds,
         );
     }
     ExitCode::SUCCESS
