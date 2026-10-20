@@ -88,6 +88,17 @@ fn real_concurrency_random_mixed_fua_and_periodic_flush_are_verified_and_reporte
         assert_eq!(report["workload"]["working_set_bytes"], 65536);
         assert_eq!(report["setup"]["writes"], 16);
         assert_eq!(report["setup"]["flushes"], 1);
+        // Seed 12 visits 15 distinct write slots and reads a measured
+        // generation at three slots. All 16 initialized slots are swept.
+        assert_eq!(report["verification"]["written_slots"], 15);
+        assert_eq!(report["verification"]["read_after_write_verified_slots"], 3);
+        assert_eq!(report["verification"]["final_sweep_verified_slots"], 16);
+        assert!(
+            report["verification"]["final_sweep_elapsed_seconds"]
+                .as_f64()
+                .unwrap()
+                >= 0.0
+        );
         let pending = report["resources"]["peak_pending_operations"]
             .as_u64()
             .unwrap();
@@ -162,6 +173,102 @@ fn sequential_concurrent_phases_keep_default_counts_and_verify_wrapped_addresses
     assert_eq!(report["flush"]["latency"]["samples"], 4);
     assert_eq!(report["setup"]["writes"], 0);
     assert_eq!(report["workload"]["mode"], "phased");
+    assert_eq!(report["verification"]["written_slots"], 4);
+    assert_eq!(report["verification"]["read_after_write_verified_slots"], 4);
+    assert_eq!(report["verification"]["final_sweep_verified_slots"], 4);
+}
+
+#[test]
+fn mixed_coverage_reports_the_sequential_address_and_ratio_correlation() {
+    // With four slots the 25/50/75% schedules visit disjoint write/read
+    // addresses. Passing measured reads must not imply write readback.
+    for (percent, written, read_after_write) in [
+        ("0", 4, 0),
+        ("1", 4, 0),
+        ("25", 3, 0),
+        ("50", 2, 0),
+        ("75", 1, 0),
+        ("99", 1, 1),
+        ("100", 0, 0),
+    ] {
+        let (_directory, config) = fixture();
+        let output = run(
+            &config,
+            &[
+                "--json",
+                "--concurrency",
+                "8",
+                "--read-percent",
+                percent,
+                "--working-set",
+                "16KiB",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "ratio {percent}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["setup"]["writes"], 4, "ratio {percent}");
+        assert_eq!(
+            report["verification"]["written_slots"], written,
+            "ratio {percent}"
+        );
+        assert_eq!(
+            report["verification"]["read_after_write_verified_slots"], read_after_write,
+            "ratio {percent}"
+        );
+        assert_eq!(
+            report["verification"]["final_sweep_verified_slots"], 4,
+            "ratio {percent}"
+        );
+        let reads = 32 * percent.parse::<u64>().unwrap() / 100;
+        assert_eq!(report["read"]["latency"]["samples"], reads);
+        assert_eq!(report["write"]["latency"]["samples"], 32 - reads);
+        assert_eq!(report["verified_read_operations"], reads);
+        assert_eq!(report["read_verified"], reads > 0);
+        assert_eq!(report["resources"]["oracle_generation_bytes"], 4 * 8);
+    }
+}
+
+#[test]
+fn phased_final_sweep_only_visits_written_slots_in_a_sparse_working_set() {
+    for (access, written) in [("sequential", 32), ("random", 30)] {
+        let (_directory, config) = fixture();
+        let output = run(
+            &config,
+            &[
+                "--json",
+                "--concurrency",
+                "8",
+                "--access",
+                access,
+                "--seed",
+                "12",
+                "--working-set",
+                "1MiB",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{access}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["workload"]["mode"], "phased");
+        assert_eq!(report["setup"]["writes"], 0);
+        assert_eq!(report["write"]["latency"]["samples"], 32);
+        assert_eq!(report["read"]["latency"]["samples"], 32);
+        for field in [
+            "written_slots",
+            "read_after_write_verified_slots",
+            "final_sweep_verified_slots",
+        ] {
+            assert_eq!(report["verification"][field], written, "{access}: {field}");
+        }
+        assert_eq!(report["resources"]["oracle_generation_bytes"], 256 * 8);
+    }
 }
 
 #[test]
@@ -214,5 +321,11 @@ fn entirely_read_or_write_mixed_workloads_have_finite_empty_operation_reports() 
         assert_eq!(report[empty]["latency"]["p99_upper_us"], 0.0);
         assert_eq!(report[empty]["iops"], 0.0);
         assert_eq!(report["read_verified"], percent != "0");
+        assert_eq!(
+            report["verification"]["written_slots"],
+            if percent == "0" { 32 } else { 0 }
+        );
+        assert_eq!(report["verification"]["read_after_write_verified_slots"], 0);
+        assert_eq!(report["verification"]["final_sweep_verified_slots"], 32);
     }
 }

@@ -10,7 +10,8 @@ the existing witness-backed format rather than starting enrollment again.
 Incomplete or invalid formats are rejected even with `--destroy-data`.
 
 The default remains one caller, sequential writes, one final FLUSH, then
-verified sequential reads. `ops` is the count in each phase; the JSON report
+verified sequential reads, followed by a separate final verification sweep.
+`ops` is the count in each phase; the JSON report
 keeps `schema_version = 1` and the existing `write`, `read`, `flush_us`,
 `concurrency`, `fua`, and `read_verified` fields.
 
@@ -21,6 +22,8 @@ including `--read-percent 0` or a short run rounded down to zero reads, reports
 `false`, `0`, and `"skipped"`; text output says `skipped: no read operations`.
 Read or comparison failures exit unsuccessfully without a success report.
 Working-set setup writes and attach self-tests are not measured read verification.
+The final sweep has its own `verification` section and never changes the
+measured-read verdict or sample count, including for `--read-percent 0`.
 
 ```sh
 maki-benchmark --json /path/to/disposable-volume.toml 10000 4096
@@ -57,6 +60,20 @@ Phased random reads repeat the written address sequence, including wraps and
 repeated draws. Choose a working set larger than the configured cache to measure
 storage/provider behavior beyond cache capacity.
 
+After all measured operations and resource sampling finish, a final sweep
+compares the latest expected generation at every initialized address. Mixed
+mode checks the entire working set, including addresses that received only a
+setup write. Phased mode checks every distinct address written during the write
+phase and skips unwritten addresses in a larger working set. A read failure or
+data mismatch in this sweep exits unsuccessfully without a success report.
+The check includes each slot's last measured write even when no measured read
+follows it. Sequential mixed schedules can assign disjoint addresses to reads
+and writes; successful measured reads alone do not validate those writes.
+
+The sweep uses live reads through the same engine and cache. It does not close
+and reopen the volume, bypass the cache, or qualify persistence after a crash or
+power loss. Those guarantees require separate recovery and durability campaigns.
+
 The oracle stores eight bytes per I/O slot, capped at 64 MiB (8,388,608 slots,
 or a 32 GiB working set for 4 KiB I/O). Larger working sets are rejected before
 backing creation. Only addresses with an outstanding job/result retain a lock,
@@ -79,7 +96,22 @@ latencies/throughput. `flush_us` is the last measured barrier latency; the
 `flush` histogram covers all measured barriers and excludes setup.
 
 `workload` records access, phase/mixed mode, read ratio, working-set bytes,
-barrier spacing and seed. `resources` distinguishes exact and sampled values:
+barrier spacing and seed. The additive `verification` section reports distinct
+slot coverage separately from the measured operation counts:
+
+| Field | Meaning |
+| --- | --- |
+| `written_slots` | Distinct slots with a successful measured write; setup writes are excluded. |
+| `read_after_write_verified_slots` | Distinct slots for which a measured read successfully compared a nonzero measured-write generation. A later write may have advanced the slot again. |
+| `final_sweep_verified_slots` | Slots whose latest expected generation passed the final sweep; all working-set slots in mixed mode, only written slots in phased mode. |
+| `final_sweep_elapsed_seconds` | Time spent in the separate final sweep, excluded from measured throughput, latency and resource sampling. |
+
+A 50% sequential mixed run over an even number of slots can therefore report
+successful measured reads with `read_after_write_verified_slots = 0`; its final
+sweep still checks all latest writes. A 100% read run has `written_slots = 0`
+and sweeps the complete initialized working set.
+
+`resources` distinguishes exact and sampled values:
 
 - `peak_pending_operations` counts submitted, unfinished engine calls and
   returns to `pending_operations_at_exit = 0` on success.
@@ -92,8 +124,8 @@ barrier spacing and seed. `resources` distinguishes exact and sampled values:
   lock is busy. `monitor_samples` and `monitor_interval_ms` describe that
   sampling cost.
 - `process_peak_rss_bytes` reads Linux `/proc/self/status` `VmHWM`, the
-  process lifetime RSS high-water mark, including attach and setup. Its
-  `rss_source` identifies this source. Other platforms or unavailable proc
+  process lifetime RSS high-water mark, including attach, setup and the final
+  sweep. Its `rss_source` identifies this source. Other platforms or unavailable proc
   data report both fields as `null`; they do not substitute a zero measurement.
 
 Compare runs with the same provider, geometry, working set, seed, cache, FUA and

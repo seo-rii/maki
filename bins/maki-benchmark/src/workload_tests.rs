@@ -54,6 +54,17 @@ impl CryptoProvider for ReplayProvider {
 }
 
 async fn fixture() -> (Engine, Arc<ReplayProvider>) {
+    let provider = Arc::new(ReplayProvider {
+        inner: FakeCryptoProvider::new(4096),
+        stale: AtomicBool::new(false),
+        writes: Mutex::new(Vec::new()),
+    });
+    let engine = attach_provider(provider.clone()).await;
+    provider.writes.lock().unwrap().clear();
+    (engine, provider)
+}
+
+async fn attach_provider(provider: Arc<dyn CryptoProvider>) -> Engine {
     let backing = Arc::new(CrashableBacking::new());
     init::create_volume(
         backing.as_ref(),
@@ -63,20 +74,15 @@ async fn fixture() -> (Engine, Arc<ReplayProvider>) {
             provider_type: "fake".into(),
             crypto_compatibility_id: "test-profile-v1".into(),
             key_identity: "k".into(),
-            geometry: Geometry::compute(512, 4096, 512, 4104, 64 * 4096, 16 * 4096).unwrap(),
+            geometry: Geometry::compute(512, 4096, 512, 4104, 128 * 4096, 16 * 4096).unwrap(),
             format_version: 1,
             created_unix: 0,
         },
     )
     .unwrap();
-    let provider = Arc::new(ReplayProvider {
-        inner: FakeCryptoProvider::new(4096),
-        stale: AtomicBool::new(false),
-        writes: Mutex::new(Vec::new()),
-    });
-    let engine = Engine::attach(
+    Engine::attach(
         backing,
-        provider.clone(),
+        provider,
         EngineOptions {
             checkpoint: CheckpointPolicy {
                 emergency_reserve_bytes: 0,
@@ -86,9 +92,111 @@ async fn fixture() -> (Engine, Arc<ReplayProvider>) {
         },
     )
     .await
-    .unwrap();
-    provider.writes.lock().unwrap().clear();
+    .unwrap()
+}
+
+/// Retain each setup ciphertext, then acknowledge selected encrypt calls with
+/// that old value. The real Engine completes writes successfully, while a later
+/// read sees the setup bytes. No production fault switch is needed.
+struct AckWithoutDataProvider {
+    inner: FakeCryptoProvider,
+    armed: AtomicBool,
+    discard_unit: Option<u64>,
+    setup_ciphertexts: Mutex<HashMap<u64, Vec<u8>>>,
+    discarded: AtomicU64,
+}
+
+#[async_trait]
+impl CryptoProvider for AckWithoutDataProvider {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.inner.capabilities().await
+    }
+
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        let mut encrypted = self.inner.encrypt_batch(context, items).await?;
+        if self.armed.load(Ordering::Acquire) {
+            let mut setup = self.setup_ciphertexts.lock().unwrap();
+            for item in &mut encrypted {
+                if let Some(old) = setup.get(&item.unit_index) {
+                    if self.discard_unit.is_none_or(|unit| unit == item.unit_index) {
+                        item.data.clone_from(old);
+                        self.discarded.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    setup.insert(item.unit_index, item.data.clone());
+                }
+            }
+        }
+        Ok(encrypted)
+    }
+
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.inner.decrypt_batch(context, items).await
+    }
+}
+
+async fn faulty_fixture(discard_unit: Option<u64>) -> (Engine, Arc<AckWithoutDataProvider>) {
+    let provider = Arc::new(AckWithoutDataProvider {
+        inner: FakeCryptoProvider::new(4096),
+        armed: AtomicBool::new(false),
+        discard_unit,
+        setup_ciphertexts: Mutex::new(HashMap::new()),
+        discarded: AtomicU64::new(0),
+    });
+    let engine = attach_provider(provider.clone()).await;
+    provider.armed.store(true, Ordering::Release);
     (engine, provider)
+}
+
+#[tokio::test]
+async fn mixed_final_verification_rejects_acknowledged_but_discarded_writes() {
+    // The wrapped 50% plan and the no-wrap default-sized working set both read
+    // only setup slots during measurement. Each must fail on final readback.
+    for (slots, ops, read_percent) in [(100, 1000, 50), (32, 32, 70)] {
+        let (engine, provider) = faulty_fixture(None).await;
+        let mut options = options();
+        options.ops = ops;
+        options.read_percent = Some(read_percent);
+        let result = run(engine, &options, slots * 4096).await;
+        let error = result
+            .err()
+            .expect("discarded measured writes passed the benchmark");
+        assert!(
+            error.starts_with("final verification failed at offset 0"),
+            "{error}"
+        );
+        assert_eq!(
+            provider.discarded.load(Ordering::Relaxed),
+            ops - ops * read_percent / 100
+        );
+    }
+}
+
+#[tokio::test]
+async fn mixed_final_verification_checks_the_last_write_without_a_later_measured_read() {
+    // Index 6 is the last measured operation, a write to unit 6. All earlier
+    // writes and every measured read are correct; only final readback can fail.
+    let (engine, provider) = faulty_fixture(Some(6)).await;
+    let mut options = options();
+    options.ops = 7;
+    options.read_percent = Some(50);
+    let result = run(engine, &options, 8 * 4096).await;
+    let error = result
+        .err()
+        .expect("the last discarded write passed the benchmark");
+    assert_eq!(
+        error,
+        "final verification failed at offset 24576 (expected generation 1)"
+    );
+    assert_eq!(provider.discarded.load(Ordering::Relaxed), 1);
 }
 
 fn options() -> Options {
@@ -187,6 +295,9 @@ async fn hot_address_mixed_reads_follow_successful_writes_in_submission_order() 
     assert_eq!(result.writes.report().samples, 16);
     assert_eq!(result.resources.oracle_generation_bytes, 8);
     assert_eq!(result.resources.pending_operations_at_exit, 0);
+    assert_eq!(result.verification.written_slots, 1);
+    assert_eq!(result.verification.read_after_write_verified_slots, 1);
+    assert_eq!(result.verification.final_sweep_verified_slots, 1);
     let generations: Vec<_> = provider
         .writes
         .lock()
@@ -195,6 +306,28 @@ async fn hot_address_mixed_reads_follow_successful_writes_in_submission_order() 
         .map(|bytes| u64::from_le_bytes(bytes[8..16].try_into().unwrap()))
         .collect();
     assert_eq!(generations, (0..=16).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn measured_read_coverage_survives_a_later_unread_overwrite() {
+    let (engine, _) = fixture().await;
+    let mut options = options();
+    options.ops = 1;
+    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    for kind in [Kind::Write, Kind::Read, Kind::Write] {
+        phase(&engine, &options, 1, kind, &oracle, &pending, &mut samples)
+            .await
+            .unwrap();
+    }
+    assert_eq!(oracle.generation(0), 2);
+    assert_eq!(samples.reads.report().samples, 1);
+    let verification = verify_final(&engine, &options, &oracle).await.unwrap();
+    assert_eq!(verification.written_slots, 1);
+    assert_eq!(verification.read_after_write_verified_slots, 1);
+    assert_eq!(verification.final_sweep_verified_slots, 1);
+    assert_eq!(samples.reads.report().samples, 1);
 }
 
 #[tokio::test]

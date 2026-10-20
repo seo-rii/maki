@@ -60,6 +60,18 @@ fn json_report_records_latency_durability_and_verified_workload() {
     assert_eq!(report["concurrency"], 1);
     assert_eq!(report["fua"], true);
     assert_eq!(report["read_verified"], true);
+    assert_eq!(report["verification"]["written_slots"], 256);
+    assert_eq!(
+        report["verification"]["read_after_write_verified_slots"],
+        256
+    );
+    assert_eq!(report["verification"]["final_sweep_verified_slots"], 256);
+    assert!(
+        report["verification"]["final_sweep_elapsed_seconds"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
     assert_eq!(report["provider"], "local-aes-gcm-siv");
     assert!(report["flush_us"].as_f64().unwrap() >= 0.0);
     for operation in ["write", "read"] {
