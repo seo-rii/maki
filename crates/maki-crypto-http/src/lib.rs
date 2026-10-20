@@ -643,6 +643,30 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
     if e.is_timeout() {
         return CryptoError::Retryable(format!("request timeout: {e}"));
     }
+    // The pinned hyper parser preserves typed provenance for definite HTTP
+    // head and chunk-framing violations. A decode/body error by itself is not
+    // proof: truncated bodies and arbitrary socket I/O remain retryable.
+    let mut cause: &(dyn std::error::Error + 'static) = &e;
+    loop {
+        if cause
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_parse)
+        {
+            return CryptoError::Contract("HTTP peer sent invalid response framing".into());
+        }
+        // io::Error::source() forwards to its custom owner's source, skipping
+        // the owner itself. Inspect that owner too so the body parser's typed
+        // error is not lost inside an io::Error.
+        match cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| cause.source())
+        {
+            Some(source) => cause = source,
+            None => break,
+        }
+    }
     let debug = format!("{e:?}");
     if debug.contains("certificate")
         || debug.contains("Certificate")

@@ -24,6 +24,16 @@ const CHUNKED_EXTENSIONS_LIMIT: u64 = 1024 * 16;
 /// TODO: remove this when we land `h1_max_header_size` support.
 const TRAILER_LIMIT: usize = 1024 * 16;
 
+// Only decoder-created syntax/limit failures earn parse provenance. Preserve
+// their io::ErrorKind and owned diagnostic, including TrailerError's erasure
+// guard. Propagated read errors and UnexpectedEof bypass this helper.
+fn invalid_body(
+    kind: io::ErrorKind,
+    cause: impl Into<Box<dyn StdError + Send + Sync>>,
+) -> io::Error {
+    io::Error::new(kind, crate::Error::new_body_parse(cause))
+}
+
 /// Decoders to handle different Transfer-Encodings.
 ///
 /// If a message body does not include a Transfer-Encoding, it *should*
@@ -265,7 +275,7 @@ macro_rules! or_overflow {
     ($e:expr) => (
         match $e {
             Some(val) => val,
-            None => return Poll::Ready(Err(io::Error::new(
+            None => return Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidData,
                 "invalid chunk size: overflow",
             ))),
@@ -278,7 +288,7 @@ macro_rules! put_u8 {
         $trailers_buf.put_u8($byte);
 
         if $trailers_buf.len() >= $limit {
-            return Poll::Ready(Err(io::Error::new(
+            return Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidData,
                 "chunk trailers bytes over limit",
             )));
@@ -361,7 +371,7 @@ impl ChunkedState {
                 *size = or_overflow!(size.checked_add(u64::from(b + 10 - b'A')));
             }
             _ => {
-                return Poll::Ready(Err(io::Error::new(
+                return Poll::Ready(Err(invalid_body(
                     io::ErrorKind::InvalidInput,
                     "Invalid chunk size line: missing size digit",
                 )));
@@ -396,7 +406,7 @@ impl ChunkedState {
             b';' => return Poll::Ready(Ok(ChunkedState::Extension)),
             b'\r' => return Poll::Ready(Ok(ChunkedState::SizeLf)),
             _ => {
-                return Poll::Ready(Err(io::Error::new(
+                return Poll::Ready(Err(invalid_body(
                     io::ErrorKind::InvalidInput,
                     "Invalid chunk size line: Invalid Size",
                 )));
@@ -414,7 +424,7 @@ impl ChunkedState {
             b'\t' | b' ' => Poll::Ready(Ok(ChunkedState::SizeLws)),
             b';' => Poll::Ready(Ok(ChunkedState::Extension)),
             b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
-            _ => Poll::Ready(Err(io::Error::new(
+            _ => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidInput,
                 "Invalid chunk size linear white space",
             ))),
@@ -434,14 +444,14 @@ impl ChunkedState {
         // well.
         match byte!(rdr, cx) {
             b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
-            b'\n' => Poll::Ready(Err(io::Error::new(
+            b'\n' => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidData,
                 "invalid chunk extension contains newline",
             ))),
             _ => {
                 *extensions_cnt += 1;
                 if *extensions_cnt >= CHUNKED_EXTENSIONS_LIMIT {
-                    Poll::Ready(Err(io::Error::new(
+                    Poll::Ready(Err(invalid_body(
                         io::ErrorKind::InvalidData,
                         "chunk extensions over limit",
                     )))
@@ -466,7 +476,7 @@ impl ChunkedState {
                     Poll::Ready(Ok(ChunkedState::Body))
                 }
             }
-            _ => Poll::Ready(Err(io::Error::new(
+            _ => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidInput,
                 "Invalid chunk size LF",
             ))),
@@ -508,7 +518,7 @@ impl ChunkedState {
     ) -> Poll<Result<ChunkedState, io::Error>> {
         match byte!(rdr, cx) {
             b'\r' => Poll::Ready(Ok(ChunkedState::BodyLf)),
-            _ => Poll::Ready(Err(io::Error::new(
+            _ => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidInput,
                 "Invalid chunk body CR",
             ))),
@@ -520,7 +530,7 @@ impl ChunkedState {
     ) -> Poll<Result<ChunkedState, io::Error>> {
         match byte!(rdr, cx) {
             b'\n' => Poll::Ready(Ok(ChunkedState::Start)),
-            _ => Poll::Ready(Err(io::Error::new(
+            _ => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidInput,
                 "Invalid chunk body LF",
             ))),
@@ -560,7 +570,7 @@ impl ChunkedState {
         match byte {
             b'\n' => {
                 if *trailers_cnt >= h1_max_headers {
-                    return Poll::Ready(Err(io::Error::new(
+                    return Poll::Ready(Err(invalid_body(
                         io::ErrorKind::InvalidData,
                         "chunk trailers count overflow",
                     )));
@@ -575,7 +585,7 @@ impl ChunkedState {
 
                 Poll::Ready(Ok(ChunkedState::EndCr))
             }
-            _ => Poll::Ready(Err(io::Error::new(
+            _ => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidInput,
                 "Invalid trailer end LF",
             ))),
@@ -627,7 +637,7 @@ impl ChunkedState {
                 }
                 Poll::Ready(Ok(ChunkedState::End))
             }
-            _ => Poll::Ready(Err(io::Error::new(
+            _ => Poll::Ready(Err(invalid_body(
                 io::ErrorKind::InvalidInput,
                 "Invalid chunk end LF",
             ))),
@@ -669,11 +679,10 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
 
             Ok(trailers)
         }
-        Ok(httparse::Status::Partial) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Partial header",
-        )),
-        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+        Ok(httparse::Status::Partial) => {
+            Err(invalid_body(io::ErrorKind::InvalidInput, "Partial header"))
+        }
+        Err(e) => Err(invalid_body(io::ErrorKind::InvalidInput, e)),
     }
 }
 
@@ -1293,7 +1302,7 @@ struct TrailerError(BytesMut);
 fn invalid_trailer_header(detail: fmt::Arguments<'_>) -> io::Error {
     let mut owner = TrailerError(BytesMut::new());
     fmt::write(&mut owner, detail).expect("trailer error formatting is infallible");
-    io::Error::new(io::ErrorKind::InvalidInput, owner)
+    invalid_body(io::ErrorKind::InvalidInput, owner)
 }
 
 impl fmt::Write for TrailerError {
@@ -1324,6 +1333,101 @@ impl fmt::Debug for TrailerError {
 impl StdError for TrailerError {}
 
 #[cfg(test)]
+mod maki_parse_provenance {
+    use super::*;
+
+    fn is_parse(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<crate::Error>())
+            .is_some_and(crate::Error::is_parse)
+    }
+
+    async fn decode_error(decoder: &mut Decoder, input: &mut impl MemRead) -> io::Error {
+        loop {
+            match decoder.decode_fut(input).await {
+                Err(error) => return error,
+                Ok(_) => assert!(!decoder.is_eof(), "expected a decoding failure"),
+            }
+        }
+    }
+
+    struct ReadFailure {
+        prefix: Bytes,
+        kind: io::ErrorKind,
+    }
+
+    impl MemRead for ReadFailure {
+        fn read_mem(&mut self, _: &mut Context<'_>, length: usize) -> Poll<io::Result<Bytes>> {
+            if self.prefix.is_empty() {
+                Poll::Ready(Err(io::Error::new(self.kind, "injected transport error")))
+            } else {
+                let length = length.min(self.prefix.len());
+                Poll::Ready(Ok(self.prefix.split_to(length)))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_invalid_input_and_data_are_not_peer_parse_failures() {
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::InvalidData] {
+            for prefix in [b"".as_slice(), b"1\r\n", b"1\r\nx", b"1\r\nx\r\n0\r\n"] {
+                let mut reader = ReadFailure {
+                    prefix: Bytes::copy_from_slice(prefix),
+                    kind,
+                };
+                let error = decode_error(&mut Decoder::chunked(None, None), &mut reader).await;
+                assert_eq!(error.kind(), kind);
+                assert!(!is_parse(&error), "{error:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_bodies_are_not_peer_parse_failures() {
+        for prefix in [b"".as_slice(), b"1", b"1\r\n", b"1\r\nx", b"0\r\n"] {
+            let error = decode_error(&mut Decoder::chunked(None, None), &mut &prefix[..]).await;
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(!is_parse(&error), "{error:?}");
+        }
+        let error = decode_error(&mut Decoder::length(10), &mut &b"short"[..]).await;
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(!is_parse(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn body_syntax_and_limits_keep_typed_parse_provenance() {
+        for body in [
+            b"Z\r\n".as_slice(),
+            b"1Z\r\n",
+            b"1 2\r\n",
+            b"10000000000000000\r\n",
+            b"1;extension\n",
+            b"1\rX",
+            b"1\r\nxX",
+            b"1\r\nx\rX",
+            b"0\r\ninvalid trailer\r\n\r\n",
+            b"0\r\nx-test: value\rX",
+            b"0\r\n\rX",
+        ] {
+            let error = decode_error(&mut Decoder::chunked(None, None), &mut &body[..]).await;
+            assert!(is_parse(&error), "{body:?}: {error:?}");
+        }
+        let extension = format!("1;{}", "x".repeat(CHUNKED_EXTENSIONS_LIMIT as usize));
+        let error =
+            decode_error(&mut Decoder::chunked(None, None), &mut extension.as_bytes()).await;
+        assert!(is_parse(&error), "{error:?}");
+        for mut decoder in [
+            Decoder::chunked(Some(0), None),
+            Decoder::chunked(None, Some(1)),
+        ] {
+            let error = decode_error(&mut decoder, &mut &b"0\r\nx-test: value\r\n\r\n"[..]).await;
+            assert!(is_parse(&error), "{error:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod maki_erasure {
     use super::*;
     use maki_test_allocator::watch;
@@ -1335,9 +1439,15 @@ mod maki_erasure {
             value: b"maki trailer secret",
         };
         let error = invalid_trailer_header(format_args!("Invalid header value: {:?}", &header));
-        let owner = error
+        let parsed = error
             .get_ref()
             .expect("trailer diagnostic must be owned")
+            .downcast_ref::<crate::Error>()
+            .expect("trailer diagnostic must preserve parse provenance");
+        assert!(parsed.is_parse());
+        let owner = parsed
+            .source()
+            .expect("parse error must retain its diagnostic")
             .downcast_ref::<TrailerError>()
             .expect("trailer diagnostic must use the guarded owner");
         let allocation = watch(owner.0.as_ptr());
