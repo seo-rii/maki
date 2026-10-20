@@ -799,6 +799,12 @@ trait System {
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         self.detach_observation(record)
     }
+    fn disconnected_recovery_observation(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<DetachObservation> {
+        self.recovery_observation(record)
+    }
     fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
         Err(identity_error("logical volume size cannot be observed"))
     }
@@ -870,6 +876,16 @@ impl System for LinuxSystem {
     }
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         recover::observe(
+            record,
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            Path::new("/sys/class/block"),
+        )
+    }
+    fn disconnected_recovery_observation(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<DetachObservation> {
+        recover::observe_disconnected(
             record,
             &std::fs::read_to_string("/proc/self/mountinfo")?,
             Path::new("/sys/class/block"),
