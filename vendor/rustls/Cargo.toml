@@ -164,7 +164,7 @@ version = "2.5.0"
 default-features = false
 
 [dependencies.webpki]
-version = "0.103.14"
+version = "0.103.16"
 features = ["alloc"]
 default-features = false
 package = "rustls-webpki"
@@ -217,7 +217,7 @@ version = "0.3.6"
 default-features = false
 
 [dev-dependencies.webpki-roots]
-version = "1"
+version = "1.0.10"
 
 [dev-dependencies.x509-parser]
 version = "0.17"
