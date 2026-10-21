@@ -47,6 +47,13 @@ package it unless its machine, class and byte order match the requested
 and the binaries are executables. A wrong artifact used to produce a
 "valid" package for the wrong CPU (R4-007).
 
+Both shared libraries and PIE executables use ELF type `ET_DYN`. For the
+plugin, the builder also rejects a `PT_INTERP` program header or the
+`DF_1_PIE` dynamic flag, including static PIE without an interpreter. These
+checks use program headers and work without section headers; they do not
+load or execute the artifact. PIE remains allowed for the CLI binaries.
+This checks artifact kind, not the plugin API or runtime compatibility.
+
 The builder then computes the native library dependencies of the binaries
 with `dpkg-shlibdeps` (package `dpkg-dev`) and appends them to `Depends`, for
 example `libc6 (>= 2.39), libgcc-s1 (>= 4.2)`. The scan is on by default and
