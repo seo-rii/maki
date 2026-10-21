@@ -127,7 +127,7 @@ readonly nbd_target
 
 required_commands=(
     blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
-    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs setpriv sqlite3
+    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs rustc setpriv sqlite3
     sync vgchange vgcreate vgremove vgs
 )
 
@@ -545,11 +545,20 @@ fi
 pass "required native tools available"
 
 log "building release binaries and nbdkit plugin"
+# Bind this run to its own build outputs, even when Cargo configuration or
+# environment variables select a shared directory or a cross-compilation target.
+native_target="$(rustc -vV | sed -n 's/^host: //p')"
+[[ "$native_target" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "cannot determine native Rust target"
+readonly native_target
+readonly build_target_dir="$run_dir/target"
+log "native build target: $native_target ($build_target_dir)"
+CARGO_BUILD_BUILD_DIR="$run_dir/build" \
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release --locked \
+    --target-dir "$build_target_dir" --target "$native_target" \
     -p maki -p maki-attach -p maki-nbdkit
-readonly maki_bin="$REPO_ROOT/target/release/maki"
-readonly attach_bin="$REPO_ROOT/target/release/maki-attach"
-readonly plugin_path="$REPO_ROOT/target/release/libmaki_nbdkit.so"
+readonly maki_bin="$build_target_dir/$native_target/release/maki"
+readonly attach_bin="$build_target_dir/$native_target/release/maki-attach"
+readonly plugin_path="$build_target_dir/$native_target/release/libmaki_nbdkit.so"
 [[ -x "$maki_bin" && -x "$attach_bin" && -f "$plugin_path" ]] ||
     die "release artifacts are incomplete"
 nm -D --defined-only "$plugin_path" | grep -Eq '[[:space:]]T[[:space:]]plugin_init$' ||
