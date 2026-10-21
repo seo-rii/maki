@@ -72,7 +72,10 @@ fn pointer_overhead(pointer: &str) -> Result<u64, ConfigError> {
 
 impl VolumeConfig {
     fn transport_batch_items(&self) -> Result<u64, ConfigError> {
-        Ok(u64::from(self.crypto.batch.max_items)
+        // HTTP exposes one batch capability for both operations. If either
+        // mapping is per-item, even the other operation's batch envelope can
+        // contain only one item under the provider's effective contract.
+        Ok(u64::from(self.effective_batch_max_items())
             .min(self.crypto.batch.max_bytes.0 / u64::from(self.provider_plaintext_size()?).max(1)))
     }
 
