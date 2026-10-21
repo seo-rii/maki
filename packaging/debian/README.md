@@ -47,6 +47,13 @@ package it unless its machine, class and byte order match the requested
 and the binaries are executables. A wrong artifact used to produce a
 "valid" package for the wrong CPU (R4-007).
 
+For `armel` and `armhf`, the builder also requires EABI version 5 and checks
+the ARM floating-point procedure-call flags in every artifact. `armhf`
+requires the hard-float flag; `armel` accepts the soft-float flag or the
+implicit base standard when neither flag is set. Conflicting flags are
+rejected. These meanings follow the
+[AAELF32 header contract](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst#elf-header).
+
 Both shared libraries and PIE executables use ELF type `ET_DYN`. For the
 plugin, the builder also rejects a `PT_INTERP` program header or the
 `DF_1_PIE` dynamic flag, including static PIE without an interpreter. These

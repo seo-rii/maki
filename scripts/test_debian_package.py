@@ -18,10 +18,11 @@ ET_DYN = 3
 EM_386 = 0x03
 EM_X86_64 = 0x3E
 EM_AARCH64 = 0xB7
+EM_ARM = 0x28
 DF_1_PIE = 0x08000000
 
 
-def elf_stub(machine, e_type, elf_class=64, endian="little"):
+def elf_stub(machine, e_type, elf_class=64, endian="little", e_flags=0):
     """A minimal ELF header (no sections) with the given identity fields."""
     order = "<" if endian == "little" else ">"
     ident = b"\x7fELF" + bytes([2 if elf_class == 64 else 1, 1 if endian == "little" else 2, 1, 0])
@@ -29,12 +30,12 @@ def elf_stub(machine, e_type, elf_class=64, endian="little"):
     if elf_class == 64:
         header = struct.pack(
             f"{order}HHIQQQIHHHHHH",
-            e_type, machine, 1, 0x1000, 0, 0, 0, 64, 56, 0, 64, 0, 0,
+            e_type, machine, 1, 0x1000, 0, 0, e_flags, 64, 56, 0, 64, 0, 0,
         )
     else:
         header = struct.pack(
             f"{order}HHIIIIIHHHHHH",
-            e_type, machine, 1, 0x1000, 0, 0, 0, 52, 32, 0, 40, 0, 0,
+            e_type, machine, 1, 0x1000, 0, 0, e_flags, 52, 32, 0, 40, 0, 0,
         )
     return ident + header
 
@@ -86,14 +87,14 @@ class DebianPackageTests(unittest.TestCase):
         self.release.mkdir()
         self.write_release_files()
 
-    def write_release_files(self, machine=EM_X86_64, elf_class=64, endian="little"):
+    def write_release_files(self, machine=EM_X86_64, elf_class=64, endian="little", e_flags=0):
         # Release artifacts are ELF images; the builder must check them
         # against the requested Debian architecture (R4-007).
         for name in RELEASE_NAMES:
             e_type = ET_DYN if name.endswith(".so") else ET_EXEC
             path = self.release / name
             path.write_bytes(
-                elf_stub(machine, e_type, elf_class, endian) + f"artifact:{name}\n".encode()
+                elf_stub(machine, e_type, elf_class, endian, e_flags) + f"artifact:{name}\n".encode()
             )
             path.chmod(0o755)
 
@@ -337,6 +338,38 @@ class DebianPackageTests(unittest.TestCase):
         self.build_failure("i386-as-amd64.deb", architecture="amd64")
         i386 = self.build("i386.deb", architecture="i386")
         self.assertEqual(self.field(i386, "Architecture"), "i386")
+
+    def test_arm_packages_accept_matching_float_abi(self):
+        # AAELF32: absent float flags imply the base PCS, just like FLOAT_SOFT.
+        for architecture, flags in (("armhf", 0x05000400),
+                                    ("armel", 0x05000200), ("armel", 0x05000000)):
+            with self.subTest(architecture=architecture, flags=flags):
+                self.write_release_files(EM_ARM, 32, e_flags=flags)
+                package = self.build(f"{architecture}-{flags:x}.deb", architecture=architecture)
+                self.assertEqual(self.field(package, "Architecture"), architecture)
+
+    def test_every_arm_artifact_must_match_package_float_abi(self):
+        for architecture, good, bad in (("armhf", 0x05000400, 0x05000200),
+                                       ("armhf", 0x05000400, 0x05000000),
+                                       ("armel", 0x05000200, 0x05000400)):
+            for name in RELEASE_NAMES:
+                with self.subTest(architecture=architecture, artifact=name, flags=bad):
+                    self.write_release_files(EM_ARM, 32, e_flags=good)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(EM_ARM, kind, 32, e_flags=bad))
+                    stderr = self.build_failure("wrong-arm-abi.deb", architecture=architecture)
+                    self.assertIn(name, stderr)
+                    self.assertIn("ABI", stderr)
+                    self.assertIn(architecture, stderr)
+
+    def test_arm_abi_flags_must_be_unambiguous_eabi5(self):
+        for architecture in ("armhf", "armel"):
+            for flags, reason in ((0x05000600, "conflicting"),
+                                  (0x04000400, "version 5"), (0, "version 5")):
+                with self.subTest(architecture=architecture, flags=flags):
+                    self.write_release_files(EM_ARM, 32, e_flags=flags)
+                    stderr = self.build_failure("invalid-arm-abi.deb", architecture=architecture)
+                    self.assertIn(reason, stderr)
 
     def test_release_files_must_be_elf_images_of_the_right_kind(self):
         (self.release / "maki-check").write_bytes(b"#!/bin/sh\necho not a binary\n")
