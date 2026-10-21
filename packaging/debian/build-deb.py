@@ -53,6 +53,8 @@ ET_REL, ET_EXEC, ET_DYN = 1, 2, 3
 PT_DYNAMIC, PT_INTERP = 2, 3
 DT_NULL, DT_FLAGS_1 = 0, 0x6FFFFFFB
 DF_1_PIE = 0x08000000
+EF_ARM_EABIMASK, EF_ARM_EABI_VER5 = 0xFF000000, 0x05000000
+EF_ARM_ABI_FLOAT_SOFT, EF_ARM_ABI_FLOAT_HARD = 0x200, 0x400
 
 
 def fail(message):
@@ -78,7 +80,7 @@ def parse_args():
 
 
 def inspect_elf(path):
-    """Return (e_type, e_machine, class, byte order) of an ELF file, or fail."""
+    """Return (e_type, e_machine, class, byte order, e_flags), or fail."""
     with path.open("rb") as handle:
         header = handle.read(64)
     if len(header) < 52 or header[:4] != b"\x7fELF":
@@ -91,7 +93,8 @@ def inspect_elf(path):
         fail(f"{path.name} has a truncated ELF64 header")
     order = "<" if endian == "little" else ">"
     e_type, e_machine = struct.unpack(f"{order}HH", header[16:20])
-    return e_type, e_machine, elf_class, endian
+    e_flags = struct.unpack_from(f"{order}I", header, 48 if elf_class == 64 else 36)[0]
+    return e_type, e_machine, elf_class, endian, e_flags
 
 
 def validate_shared_object(path, elf_class, endian):
@@ -162,13 +165,27 @@ def validate_release_files(args):
         path = args.release_dir / source_name
         if not path.is_file() or path.is_symlink():
             fail(f"required regular file is missing: {source_name}")
-        e_type, e_machine, file_class, file_endian = inspect_elf(path)
+        e_type, e_machine, file_class, file_endian, e_flags = inspect_elf(path)
         if (e_machine, file_class, file_endian) != (machine, elf_class, endian):
             fail(
                 f"{source_name} is {describe(e_machine, file_class, file_endian)} but the "
                 f"package architecture is {args.architecture} "
                 f"({describe(machine, elf_class, endian)})"
             )
+        if args.architecture in ("armel", "armhf"):
+            # Both Debian ports use ARM EABI5, but their floating-point
+            # procedure-call standards differ despite identical ELF identity.
+            if e_flags & EF_ARM_EABIMASK != EF_ARM_EABI_VER5:
+                fail(f"{source_name} must use ARM EABI version 5 for {args.architecture}")
+            float_flags = e_flags & (EF_ARM_ABI_FLOAT_SOFT | EF_ARM_ABI_FLOAT_HARD)
+            if float_flags == EF_ARM_ABI_FLOAT_SOFT | EF_ARM_ABI_FLOAT_HARD:
+                fail(f"{source_name} has conflicting ARM float ABI flags")
+            # AAELF32 specifies the base (soft-float) PCS when both flags are clear.
+            hard_float = bool(float_flags & EF_ARM_ABI_FLOAT_HARD)
+            if hard_float != (args.architecture == "armhf"):
+                actual_abi = "hard-float" if hard_float else "soft-float"
+                fail(f"{source_name} uses the ARM {actual_abi} ABI but the "
+                     f"package architecture is {args.architecture}")
         if source_name in SHARED_OBJECTS:
             if e_type != ET_DYN:
                 fail(f"{source_name} must be an ELF shared object (ET_DYN), found type {e_type}")
