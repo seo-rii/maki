@@ -32,6 +32,7 @@ pub const GCM_SIV_OVERHEAD: u32 = (NONCE_LEN + TAG_LEN) as u32;
 pub struct AesGcmSivProvider {
     cipher: SecretBox<Aes256GcmSiv>,
     unit_size: u32,
+    max_ciphertext_size: u32,
     compatibility_id: String,
     key_name: String,
 }
@@ -48,12 +49,19 @@ impl std::fmt::Debug for AesGcmSivProvider {
 }
 
 impl AesGcmSivProvider {
+    /// Rejects unit sizes whose nonce, ciphertext, and tag length cannot be
+    /// represented by [`CryptoCapabilities::max_ciphertext_size`].
     pub fn new(
         keys: &dyn KeySource,
         key_name: &str,
         unit_size: u32,
         compatibility_id: &str,
     ) -> Result<Self, CryptoError> {
+        let max_ciphertext_size = unit_size.checked_add(GCM_SIV_OVERHEAD).ok_or_else(|| {
+            CryptoError::ProviderFatal(
+                "AES-256-GCM-SIV ciphertext size exceeds u32::MAX".to_string(),
+            )
+        })?;
         let key = keys.load(key_name)?;
         if key.len() != 32 {
             return Err(CryptoError::ProviderFatal(format!(
@@ -68,6 +76,7 @@ impl AesGcmSivProvider {
         Ok(Self {
             cipher,
             unit_size,
+            max_ciphertext_size,
             compatibility_id: compatibility_id.to_string(),
             key_name: key_name.to_string(),
         })
@@ -106,7 +115,7 @@ impl CryptoProvider for AesGcmSivProvider {
             provider_id: "local-aes-256-gcm-siv".to_string(),
             crypto_compatibility_id: self.compatibility_id.clone(),
             supported_plaintext_sizes: vec![self.unit_size],
-            max_ciphertext_size: self.unit_size + GCM_SIV_OVERHEAD,
+            max_ciphertext_size: self.max_ciphertext_size,
             stateless: true,
             retry_safe: true,
             batch: BatchCapability {
