@@ -50,6 +50,9 @@ ELF_MACHINE_NAMES = {
     0x102: "LoongArch",
 }
 ET_REL, ET_EXEC, ET_DYN = 1, 2, 3
+PT_DYNAMIC, PT_INTERP = 2, 3
+DT_NULL, DT_FLAGS_1 = 0, 0x6FFFFFFB
+DF_1_PIE = 0x08000000
 
 
 def fail(message):
@@ -91,6 +94,57 @@ def inspect_elf(path):
     return e_type, e_machine, elf_class, endian
 
 
+def validate_shared_object(path, elf_class, endian):
+    """Reject PIE markers in ET_DYN using loader metadata, not section headers."""
+    order = "<" if endian == "little" else ">"
+    is_64 = elf_class == 64
+    program_format = f"{order}{'IIQQQQQQ' if is_64 else 'IIIIIIII'}"
+    dynamic_format = f"{order}{'qQ' if is_64 else 'iI'}"
+    program_size = struct.calcsize(program_format)
+    dynamic_size = struct.calcsize(dynamic_format)
+    with path.open("rb") as handle:
+        header = handle.read(64 if is_64 else 52)
+        if len(header) < (64 if is_64 else 52):
+            fail(f"{path.name} has a truncated ELF header")
+        program_offset = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header,
+                                            32 if is_64 else 28)[0]
+        entry_size, count = struct.unpack_from(f"{order}HH", header, 54 if is_64 else 42)
+        if count == 0:
+            return
+        if count == 0xFFFF:
+            fail(f"{path.name} uses an unsupported extended ELF program-header count")
+        if entry_size < program_size:
+            fail(f"{path.name} has truncated ELF program-header entries")
+        file_size = os.fstat(handle.fileno()).st_size
+        if program_offset + count * entry_size > file_size:
+            fail(f"{path.name} has a truncated ELF program-header table")
+        # Read one fixed-size entry at a time. Counts and segment ranges must
+        # fit the file; neither table nor segment contents are copied wholesale.
+        for index in range(count):
+            handle.seek(program_offset + index * entry_size)
+            program = handle.read(program_size)
+            if len(program) != program_size:
+                fail(f"{path.name} has a truncated ELF program-header entry")
+            fields = struct.unpack(program_format, program)
+            if fields[0] == PT_INTERP:
+                fail(f"{path.name} must be an ELF shared object, not a PIE executable (PT_INTERP)")
+            if fields[0] != PT_DYNAMIC:
+                continue
+            offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
+            if offset + size > file_size or size % dynamic_size:
+                fail(f"{path.name} has a truncated ELF dynamic table")
+            handle.seek(offset)
+            for _ in range(size // dynamic_size):
+                entry = handle.read(dynamic_size)
+                if len(entry) != dynamic_size:
+                    fail(f"{path.name} has a truncated ELF dynamic entry")
+                tag, value = struct.unpack(dynamic_format, entry)
+                if tag == DT_NULL:
+                    break
+                if tag == DT_FLAGS_1 and value & DF_1_PIE:
+                    fail(f"{path.name} must be an ELF shared object, not a PIE executable (DF_1_PIE)")
+
+
 def describe(e_machine, elf_class, endian):
     name = ELF_MACHINE_NAMES.get(e_machine, f"machine 0x{e_machine:x}")
     return f"{name}, {elf_class}-bit {endian}-endian"
@@ -118,6 +172,7 @@ def validate_release_files(args):
         if source_name in SHARED_OBJECTS:
             if e_type != ET_DYN:
                 fail(f"{source_name} must be an ELF shared object (ET_DYN), found type {e_type}")
+            validate_shared_object(path, file_class, file_endian)
         elif e_type not in (ET_EXEC, ET_DYN):
             fail(f"{source_name} must be an ELF executable (ET_EXEC or PIE), found type {e_type}")
 
