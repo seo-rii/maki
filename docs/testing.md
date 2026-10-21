@@ -79,9 +79,10 @@ nbdkit `VmHWM` was 11,415,552 bytes. Both 48 MiB cgroups touched their cap; both
 profile and does not define a universal deployment minimum.
 
 Linux PR, push, and scheduled CI installs the pinned `cargo-audit 0.22.1` and
-runs `cargo audit --deny warnings`. A known vulnerability, unmaintained or
-unsound advisory, or yanked crate therefore fails the job against the fetched
-RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
+runs `cargo audit --deny warnings` for the workspace and each standalone
+`vendor/*/Cargo.lock` used by the compatibility tests. A known vulnerability,
+unmaintained or unsound advisory, or yanked crate therefore fails the job
+against the fetched RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
 from affected 0.23.43 to 0.23.45 after `RUSTSEC-2026-0285`; the focused HTTP/TLS
 package suite and a fresh warning-denying audit passed locally.
 The current vendored pin is 0.23.46, which includes the subsequent
