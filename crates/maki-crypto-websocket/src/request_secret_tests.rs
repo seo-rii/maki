@@ -39,15 +39,15 @@ fn golden(context: &CryptoContext, items: &[PlaintextUnit]) -> String {
     .to_string()
 }
 
-#[test]
-fn cancelling_a_request_waiting_for_connection_wipes_its_owned_encodings() {
+#[tokio::test]
+async fn cancelling_a_request_waiting_for_connection_wipes_its_owned_encodings() {
     let provider = provider();
     let context = context();
     let items = input();
     let frame_len = golden(&context, &items).len();
     // The held mutex makes the real encrypt/request/request_once path stop
-    // after encoding and before opening a socket. No runtime or network is
-    // involved; the future's cancellation releases its owned encodings.
+    // after encoding and before opening a socket. The runtime supplies the
+    // attempt timer; cancellation releases the encodings without network IO.
     let _connection = provider.connection.try_lock().unwrap();
     let mut future = provider.encrypt_batch(&context, &items);
     let watch = Watch::sizes([UNIT.div_ceil(3) * 4, frame_len]);
