@@ -295,6 +295,49 @@ class HostContracts(unittest.TestCase):
                 process.expect("ready", timeout=0.05)
         self.assertEqual(process.child.returncode, -signal.SIGKILL)
 
+    def test_campaign_reaps_owned_child_on_each_post_launch_failure(self):
+        baseline = dict(instance_id="101", data_disk_id="202",
+                        data_disk_self_link="disk-url", attachment_source="disk-url",
+                        attachment_device_name="data", status="RUNNING")
+        for failure in ("boot", "ready", "resource-query", "resource-identity", "ack"):
+            with self.subTest(failure=failure):
+                args = types.SimpleNamespace(
+                    cycles=2, timeout=10, connect_timeout=1, project="test-project",
+                    zone="us-central1-a", instance="cleanup-fixture", data_disk="fixture",
+                    profile="v2", output=self.path / failure,
+                )
+                # Only a local sleeping child is real: no gcloud or guest I/O.
+                process = self.host.RemoteProcess(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    self.path / f"child-{failure}", self.token, 0,
+                )
+                self.addCleanup(process.close)
+                process.expect = mock.Mock(side_effect=ValueError("fixture ACK failure"))
+                ready = dict(event="ready", boot_id=self.boot_id,
+                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True,
+                             fs_uuid="00112233-4455-6677-8899-aabbccddeeff",
+                             witness_service="active", graceful_stop_witness="absent")
+                current = dict(baseline)
+                if failure == "boot":
+                    ready["boot_id"] = "invalid"
+                elif failure == "ready":
+                    ready["can_fua"] = False
+                elif failure == "resource-query":
+                    current = ValueError("fixture resource query failure")
+                elif failure == "resource-identity":
+                    current["data_disk_id"] = "changed"
+                with mock.patch.object(self.host, "resource_identity",
+                                       side_effect=[baseline, current]), \
+                        mock.patch.object(self.host, "launch_guest", return_value=(process, ready)):
+                    with self.assertRaises(ValueError):
+                        self.host.campaign(args)
+                self.assertEqual(process.child.returncode, -signal.SIGKILL,
+                                 "campaign must kill and reap its child before returning")
+                result = json.loads((args.output / "results.json").read_text())
+                self.assertFalse(result["passed"])
+                self.assertIn("ValueError", result["error"])
+                self.assertFalse((args.output / "host-acks.jsonl").exists())
+
     def test_post_reset_ssh_timeout_is_retried_with_a_fresh_owned_child(self):
         args = types.SimpleNamespace(timeout=60, connect_timeout=1)
         first = mock.Mock()

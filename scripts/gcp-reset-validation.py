@@ -472,13 +472,13 @@ def campaign(args):
             result["boots"].append(entry)
             process, ready = launch_guest(args, token, cycle, verify_only,
                                           args.output / f"cycle-{cycle}")
-            entry["ready"] = ready
-            current_boot = ready["boot_id"]
-            require_unique_boot(seen_boots, current_boot)
-            fs_uuid = validate_ready(ready, fs_uuid, args.profile)
-            current_resources = resource_identity(args, args.timeout)
-            validate_resource_identity(baseline, current_resources)
             try:
+                entry["ready"] = ready
+                current_boot = ready["boot_id"]
+                require_unique_boot(seen_boots, current_boot)
+                fs_uuid = validate_ready(ready, fs_uuid, args.profile)
+                current_resources = resource_identity(args, args.timeout)
+                validate_resource_identity(baseline, current_resources)
                 if cycle:
                     readback = process.expect("readback", args.timeout)
                     if readback.get("generation") != cycle - 1:
