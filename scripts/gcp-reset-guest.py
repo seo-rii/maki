@@ -282,7 +282,8 @@ def main():
     parser.add_argument("--profile", choices=("v2", "v3-discard"), default="v2")
     args = parser.parse_args()
     ensure(re.fullmatch(r"[0-9a-f]{32}", args.token) is not None, "invalid token")
-    mode_for_cycle(args.cycle)
+    # A verify-only boot reads the preceding write generation; boot 64 reads 63.
+    mode_for_cycle(args.cycle - 1 if args.verify_only else args.cycle)
     ensure(1 <= args.ready_timeout <= 300, "invalid READY timeout")
     config = pathlib.Path(args.config).resolve(strict=True)
     plugin = pathlib.Path(args.plugin).resolve(strict=True)
