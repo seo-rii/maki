@@ -72,33 +72,58 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
     began = time.monotonic()
     if stop.exists():
         return {"exit_code": 130, "reason": "cancelled", "seconds": 0}
-    with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
-        child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-        reason = "exited"
-        try:
-            while child.poll() is None:
-                if stop.exists():
-                    reason = "cancelled"
-                elif time.monotonic() - began >= timeout:
-                    reason = "timeout"
-                elif log.stat().st_size > max_bytes:
-                    reason = "output_limit"
-                if reason != "exited":
-                    break
-                time.sleep(.1)
-        finally:
-            # These test/build children own a process group. Kill the group also
-            # after an early leader exit, so descendants cannot outlive the job.
+
+    received_signal = None
+
+    def request_stop(number, _frame):
+        nonlocal received_signal
+        received_signal = number
+
+    previous = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        # Install before Popen, and only record the request in the handler. An
+        # exception during Popen could escape before we own its returned child.
+        for number in previous:
+            signal.signal(number, request_stop)
+        with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+            child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            reason = "exited"
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
+                # Keep the leader unreaped until group cleanup, so its PID
+                # cannot be reused for an unrelated process group.
+                while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    if received_signal is not None or stop.exists():
+                        reason = "cancelled"
+                    elif time.monotonic() - began >= timeout:
+                        reason = "timeout"
+                    elif log.stat().st_size > max_bytes:
+                        reason = "output_limit"
+                    if reason != "exited":
+                        break
+                    time.sleep(.1)
+            finally:
+                # Kill descendants also after an early leader exit.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    if received_signal is not None:
+        # Reuse the cancellation marker so build-time interruption also
+        # reaches worker() as cancellation rather than a build failure.
+        stop.touch(mode=0o600)
+        reason = "cancelled"
     if reason == "exited" and log.stat().st_size > max_bytes:
         reason = "output_limit"
-    return {"exit_code": child.returncode, "reason": reason,
-            "seconds": round(time.monotonic() - began, 3)}
+    result = {"exit_code": child.returncode, "reason": reason,
+              "seconds": round(time.monotonic() - began, 3)}
+    if received_signal is not None:
+        result["signal"] = received_signal
+    return result
 
 
 def prepare(directory, config, deadline):

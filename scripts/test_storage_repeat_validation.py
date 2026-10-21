@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -114,6 +115,7 @@ class BackgroundStorageTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_child_exit_timeout_and_cancellation_are_distinct(self):
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
         result = self.runner.run_child(
             [sys.executable, "-c", "raise SystemExit(7)"], self.root,
             self.root / "failed.log", self.root / "STOP", 10)
@@ -129,6 +131,137 @@ class BackgroundStorageTests(unittest.TestCase):
             self.root / "cancel.log", self.root / "STOP", 10)
         self.assertEqual(result["reason"], "cancelled")
         self.assertNotEqual(result["exit_code"], 0)
+        self.assertEqual({number: signal.getsignal(number) for number in handlers}, handlers)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
+    def test_supervisor_signal_cleans_build_and_suite_groups_and_records_cancellation(self):
+        module_path = Path(__file__).with_name("storage-repeat-validation.py").resolve()
+        for stage, number, during_launch in (("build", signal.SIGTERM, False),
+                                             ("suite", signal.SIGTERM, False),
+                                             ("suite", signal.SIGINT, False),
+                                             ("build", signal.SIGTERM, True)):
+            with self.subTest(stage=stage, signal=number, during_launch=during_launch):
+                directory = self.root / f"{stage}-{number}-{during_launch}"
+                directory.mkdir()
+                fixture = directory / ("cargo" if stage == "build" else "fixture")
+                fixture.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json, os, pathlib, subprocess, sys, time\n"
+                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                    f"ready = pathlib.Path({str(directory / 'children.json')!r})\n"
+                    "temporary = ready.with_suffix('.tmp')\n"
+                    "temporary.write_text(json.dumps([os.getpid(), child.pid]))\n"
+                    "temporary.replace(ready)\n"
+                    "time.sleep(30)\n")
+                fixture.chmod(0o700)
+                self.runner.save_json(directory / "config.json", {
+                    "rounds": 1, "max_seconds": 10, "suite_timeout": 5,
+                    "revision": "fixture", "source": str(directory),
+                    "target_dir": str(directory / "target"),
+                })
+                controller_code = (
+                    "import importlib.util, os, pathlib, signal, time\n"
+                    f"spec = importlib.util.spec_from_file_location('runner', {str(module_path)!r})\n"
+                    "runner = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(runner)\n"
+                    f"directory = pathlib.Path({str(directory)!r})\n")
+                if stage == "suite":
+                    controller_code += (
+                        "runner.prepare = lambda *args: {'fixture': directory / 'fixture'}\n")
+                if during_launch:
+                    controller_code += (
+                        "original = runner.subprocess.Popen\n"
+                        "def interrupted_launch(*args, **kwargs):\n"
+                        "    child = original(*args, **kwargs)\n"
+                        "    deadline = time.monotonic() + 5\n"
+                        "    while not (directory / 'SIGNAL').exists():\n"
+                        "        if time.monotonic() >= deadline:\n"
+                        "            os.killpg(child.pid, signal.SIGKILL)\n"
+                        "            child.wait()\n"
+                        "            raise RuntimeError('launch fixture timed out')\n"
+                        "        time.sleep(.01)\n"
+                        f"    os.kill(os.getpid(), {number})\n"
+                        "    return child\n"
+                        "runner.subprocess.Popen = interrupted_launch\n")
+                controller_code += "raise SystemExit(runner.worker(directory))\n"
+                environment = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ["PATH"])
+                with os.fdopen(os.open(directory / "controller.log",
+                                       os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+                    controller = subprocess.Popen(
+                        [sys.executable, "-B", "-c", controller_code], env=environment,
+                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+                self.addCleanup(self.stop_controller, controller)
+                deadline = time.monotonic() + 5
+                while not (directory / "children.json").exists():
+                    self.assertIsNone(controller.poll())
+                    self.assertLess(time.monotonic(), deadline, "fixture did not start")
+                    time.sleep(.01)
+                pids = json.loads((directory / "children.json").read_text())
+                identities = {pid: self.runner.process_identity(pid) for pid in pids}
+                self.assertTrue(all(identities.values()))
+                self.addCleanup(self.stop_owned_group, pids[0], identities)
+                if during_launch:
+                    (directory / "SIGNAL").touch()
+                else:
+                    controller.send_signal(number)
+                self.assertEqual(controller.wait(timeout=5), 1)
+                deadline = time.monotonic() + 3
+                while any(self.runner.process_identity(pid) == identity
+                          for pid, identity in identities.items()) and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(all(self.runner.process_identity(pid) != identity
+                                    for pid, identity in identities.items()),
+                                "supervisor termination left an owned process alive")
+                report = json.loads((directory / "status.json").read_text())
+                self.assertEqual(report["state"], "cancelled")
+                self.assertEqual(report["exit_code"], 1)
+                self.assertEqual(report["completed_rounds"], 0)
+                self.assertTrue((directory / "STOP").exists())
+                self.assertIn("cancelled", report["error"])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
+    def test_descendant_cleanup_preserves_early_leader_exit_status(self):
+        child_code = (
+            "import os, pathlib, time\n"
+            f"pathlib.Path({str(self.root / 'descendant.pid')!r}).write_text(str(os.getpid()))\n"
+            "time.sleep(30)\n")
+        leader_code = (
+            "import pathlib, subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"ready = pathlib.Path({str(self.root / 'descendant.pid')!r})\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not ready.exists():\n"
+            "    if time.monotonic() >= deadline:\n"
+            "        raise RuntimeError('descendant did not start')\n"
+            "    time.sleep(.01)\n")
+        result = self.runner.run_child(
+            [sys.executable, "-c", leader_code], self.root,
+            self.root / "leader.log", self.root / "STOP", 10)
+        self.assertEqual(result["reason"], "exited")
+        self.assertEqual(result["exit_code"], 0)
+        pid = int((self.root / "descendant.pid").read_text())
+        deadline = time.monotonic() + 3
+        while self.runner.process_identity(pid) is not None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertIsNone(self.runner.process_identity(pid), "leader exit left its descendant running")
+
+    @staticmethod
+    def stop_controller(controller):
+        if controller.poll() is None:
+            controller.kill()
+        controller.wait(timeout=5)
+
+    def stop_owned_group(self, group, identities):
+        # A matching live descendant still reserves this process group ID.
+        for pid, identity in identities.items():
+            if self.runner.process_identity(pid) == identity:
+                try:
+                    if os.getpgid(pid) == group:
+                        os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_output_limit_stops_noisy_child_and_logs_are_private(self):

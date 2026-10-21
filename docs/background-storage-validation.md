@@ -83,8 +83,10 @@ with none ignored or filtered out. Zero tests cannot pass. The passed count
 includes repeated invocations, not just unique cases.
 
 Cancellation creates `STOP`; the supervisor terminates its current child process
-group and records `cancelled`. A suite timeout or the campaign deadline leaves
-an incomplete result. The default suite timeout is 900 seconds; build timeout is
+group and records `cancelled`. `SIGTERM` or `SIGINT` while a build or suite is
+active follows the same cancellation path, kills that child's process group,
+and records a nonzero supervisor exit. A suite timeout or the campaign deadline
+leaves an incomplete result. The default suite timeout is 900 seconds; build timeout is
 at most 1,800 seconds within the overall budget. Output growth beyond 64 MiB per
 child is checked periodically and stops the child; this is a stop threshold,
 not an exact file-size cap. Less than 512 MiB free before a suite also stops the
@@ -92,7 +94,13 @@ run. Starting requires at least 2 GiB free.
 
 After host reboot or premature supervisor death, `status` detects a missing or
 reused PID using the boot ID and process start time and reports `interrupted`,
-never `passed`. There is no automatic restart. Use `cancel` for ordinary stops.
+never `passed`. There is no automatic restart. `SIGKILL`, an OOM kill of only the
+supervisor, or a supervisor crash cannot run child cleanup: a surviving child
+then has no supervisor to enforce `STOP`, time, or output budgets. Run the
+campaign in a host-managed cgroup that terminates all members if containment
+across those failures is required. Descendants that deliberately create another
+session or process group also fall outside process-group cleanup. Use `cancel`
+for ordinary stops.
 
 To validate the runner's exit/result accounting and cancellation:
 
