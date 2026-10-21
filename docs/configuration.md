@@ -343,20 +343,23 @@ ignored, and a close frame ends the connection. Pending requests are scoped to a
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
-Cancelling a request on an established connection, or timing out while waiting
-for its response, removes that request and stops new requests from joining its
-connection generation. Other in-flight requests
+Cancelling a request on an established connection, or expiring its overall
+attempt deadline or response-wait timeout, removes that request and stops new
+requests from joining its connection generation. Other in-flight requests
 keep their socket and reader/writer task until they finish; the final request
 then releases the draining generation. New requests use a replacement
 generation, whose socket and requests are unaffected by cleanup of the old
 one. Dropping the provider also closes an otherwise idle connection.
 
-Connection loss, a send failure (including a send-queue timeout), or a fatal
-frame error still fails the requests on that generation whose responses have
-not already arrived. Connection loss is retryable, while malformed frames are
-contract errors as described above. A provider with `retry_safe = false`
-returns errors without resending those requests. An individual request
-cancellation does not make its live siblings fail or require them to be resent.
+Connection loss, a send failure reported by the transport, or a fatal frame
+error still fails the requests on that generation whose responses have not
+already arrived. A timeout reported by the transport send queue can retire the
+generation; expiration of the request's overall attempt deadline while waiting
+to send follows the drain behavior above. Connection loss is retryable, while
+malformed frames are contract errors as described above. A provider with
+`retry_safe = false` returns errors without resending those requests. An
+individual request cancellation does not make its live siblings fail or
+require them to be resent.
 
 A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
