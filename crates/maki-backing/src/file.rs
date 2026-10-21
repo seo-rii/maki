@@ -48,15 +48,17 @@ impl FileBacking {
         }
     }
 
-    /// GC uses a bounded list and a pinned-directory retirement operation;
+    /// GC uses bounded, sorted pages after an exclusive name cursor and a
+    /// pinned-directory retirement operation;
     /// neither operation is available on pathname-only development backends.
-    pub(crate) fn gc_entries(&self) -> io::Result<Vec<String>> {
+    pub(crate) fn gc_entries(&self, after: Option<&str>) -> io::Result<Vec<String>> {
         #[cfg(target_os = "linux")]
         {
-            self.directory.gc_entries()
+            self.directory.gc_entries(after)
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = after;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "remote GC requires Linux",

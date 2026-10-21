@@ -433,6 +433,9 @@ maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and
-`retained` namespace arrays as JSON. Authority outages or changes fail closed;
+`retained` namespace arrays as JSON. Each array holds at most 4,096 names;
+use the corresponding `counts` fields for totals and `details_truncated` to
+detect omitted details. See [GC reports](remote-witness-service.md#retire-old-writer-namespaces).
+Authority outages or changes fail closed;
 inspect the cause and retry after recovery. Do not manually delete a live
 writer's namespace to recover space.

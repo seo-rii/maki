@@ -532,6 +532,8 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                     "skipped_live": report.skipped_live,
                     "skipped_unrecognized": report.skipped_unrecognized,
                     "retained": report.retained,
+                    "counts": report.counts,
+                    "details_truncated": report.details_truncated,
                 })
             );
         }

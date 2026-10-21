@@ -9,6 +9,7 @@ use crate::{Backing, FileBacking, VolumeLock};
 
 const TOMBSTONE: &str = ".remote-gc-";
 const MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
+const REPORT_DETAIL_LIMIT: usize = 4096;
 
 fn namespace_fence(name: &str) -> Option<u64> {
     let bytes = name.as_bytes();
@@ -39,12 +40,51 @@ fn inspect(rpc: &dyn Rpc) -> io::Result<Record> {
     Ok(record)
 }
 
+/// Totals across all pages, including names omitted from the report details.
+#[derive(Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct GcCounts {
+    pub removed: u64,
+    pub skipped_live: u64,
+    pub skipped_unrecognized: u64,
+    pub retained: u64,
+}
+
+/// Each name array contains at most the first 4,096 entries in its category.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct GcReport {
     pub removed: Vec<String>,
     pub skipped_live: Vec<String>,
     pub skipped_unrecognized: Vec<String>,
     pub retained: Vec<String>,
+    pub counts: GcCounts,
+    pub details_truncated: bool,
+}
+
+enum Disposition {
+    Removed,
+    Live,
+    Unrecognized,
+    Retained,
+}
+
+impl GcReport {
+    fn record(&mut self, disposition: Disposition, name: String) {
+        let (details, count) = match disposition {
+            Disposition::Removed => (&mut self.removed, &mut self.counts.removed),
+            Disposition::Live => (&mut self.skipped_live, &mut self.counts.skipped_live),
+            Disposition::Unrecognized => (
+                &mut self.skipped_unrecognized,
+                &mut self.counts.skipped_unrecognized,
+            ),
+            Disposition::Retained => (&mut self.retained, &mut self.counts.retained),
+        };
+        *count += 1;
+        if details.len() < REPORT_DETAIL_LIMIT {
+            details.push(name);
+        } else {
+            self.details_truncated = true;
+        }
+    }
 }
 
 /// Every physical remote fork holds this guard until activation completes.
@@ -99,39 +139,50 @@ impl<'a> OperationGuard<'a> {
         let pending = namespace(record.fence, record.session);
         retained.insert(pending.as_str());
         let mut report = GcReport::default();
-        for entry in self.disk.gc_entries()? {
-            if [
-                "rollback.format",
-                "remote.enroll.lock",
-                "remote.operation.lock",
-                "remote.enrollment",
-            ]
-            .contains(&entry.as_str())
-            {
-                continue;
+        let mut after = None;
+        loop {
+            let page = self.disk.gc_entries(after.as_deref())?;
+            if page.is_empty() {
+                break;
             }
-            let (original, retired) = entry
-                .strip_prefix(TOMBSTONE)
-                .map(|name| (name, true))
-                .unwrap_or((&entry, false));
-            let Some(fence) = namespace_fence(original) else {
-                report.skipped_unrecognized.push(entry);
-                continue;
-            };
-            if fence >= record.fence || retained.contains(original) {
-                report.retained.push(entry);
-                continue;
-            }
-            if inspect(rpc)? != record {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "GC authority changed",
-                ));
-            }
-            match self.disk.gc_retire(original, retired)? {
-                GcRemoval::Removed => report.removed.push(original.to_owned()),
-                GcRemoval::Live => report.skipped_live.push(entry),
-                GcRemoval::Unrecognized => report.skipped_unrecognized.push(entry),
+            // Save the original name before retirement can rename it. A
+            // successful retirement removes its tombstone in this pass; an
+            // error stops collection, and the next pass starts at the root.
+            after = page.last().cloned();
+            for entry in page {
+                if [
+                    "rollback.format",
+                    "remote.enroll.lock",
+                    "remote.operation.lock",
+                    "remote.enrollment",
+                ]
+                .contains(&entry.as_str())
+                {
+                    continue;
+                }
+                let (original, retired) = entry
+                    .strip_prefix(TOMBSTONE)
+                    .map(|name| (name, true))
+                    .unwrap_or((&entry, false));
+                let Some(fence) = namespace_fence(original) else {
+                    report.record(Disposition::Unrecognized, entry);
+                    continue;
+                };
+                if fence >= record.fence || retained.contains(original) {
+                    report.record(Disposition::Retained, entry);
+                    continue;
+                }
+                if inspect(rpc)? != record {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "GC authority changed",
+                    ));
+                }
+                match self.disk.gc_retire(original, retired)? {
+                    GcRemoval::Removed => report.record(Disposition::Removed, original.to_owned()),
+                    GcRemoval::Live => report.record(Disposition::Live, entry),
+                    GcRemoval::Unrecognized => report.record(Disposition::Unrecognized, entry),
+                }
             }
         }
         Ok(report)
