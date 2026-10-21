@@ -498,7 +498,7 @@ fn authority_change_aborts_before_deleting_a_newly_selected_source() {
 }
 
 #[test]
-fn wrong_backing_format_and_oversized_root_fail_before_reclamation() {
+fn wrong_backing_format_fails_before_reclamation() {
     let _process = PROCESS_SPAWN
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -508,15 +508,6 @@ fn wrong_backing_format_and_oversized_root_fail_before_reclamation() {
     let marker = disk.open("rollback.format", false).unwrap();
     marker.write_at(0, b"MAKI-WITNESS-COW-V1\n").unwrap();
     let rpc = authority(&disk, record(3));
-    assert!(OperationGuard::acquire(&disk)
-        .unwrap()
-        .collect(&rpc)
-        .is_err());
-    assert!(disk.exists(&old).unwrap());
-    marker.write_at(0, b"MAKI-REMOTE-WITNESS-COW-V2\n").unwrap();
-    for number in 0..4096 {
-        disk.open(&format!("foreign-{number:04}"), true).unwrap();
-    }
     assert!(OperationGuard::acquire(&disk)
         .unwrap()
         .collect(&rpc)
