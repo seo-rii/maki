@@ -77,7 +77,12 @@ For a read-only dependency preview, run:
 ## Logs and completion
 
 Every run creates a mode-`0700` directory below `~/logs` and mode-`0600`
-artifacts within it. A stable symlink points to the newest run:
+log artifacts within it. Release artifacts and intermediate build files are
+kept in that run's `target/` and `build/` directories. The build explicitly
+selects the native Rust host target and these directories, overriding Cargo
+target-directory and cross-compilation settings. Validation uses only those
+release artifacts; allow disk space for a fresh release build on the log
+filesystem. A stable symlink points to the newest run:
 
 ```text
 ~/logs/maki-privileged-validation.latest/
