@@ -343,9 +343,10 @@ ignored, and a close frame ends the connection. Pending requests are scoped to a
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
-Cancelling a request on an established connection, or expiring its overall
-attempt deadline or response-wait timeout, removes that request and stops new
-requests from joining its connection generation. Other in-flight requests
+Once a request has registered on an established connection, cancelling it or
+expiring its overall attempt deadline or response-wait timeout removes that
+request and stops new requests from joining its connection generation.
+Other in-flight requests
 keep their socket and reader/writer task until they finish; the final request
 then releases the draining generation. New requests use a replacement
 generation, whose socket and requests are unaffected by cleanup of the old
