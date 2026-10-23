@@ -265,7 +265,7 @@ class HostContracts(unittest.TestCase):
     def test_reset_finishes_before_old_ssh_is_accepted_as_dead(self):
         order = []
         process = mock.Mock()
-        process.child.poll.return_value = None
+        process.poll.return_value = None
         process.wait_after_reset.side_effect = lambda timeout: order.append("ssh-dead")
         args = types.SimpleNamespace(timeout=30)
         def reset_done(*_args, **_kwargs):
@@ -278,7 +278,7 @@ class HostContracts(unittest.TestCase):
 
     def test_cut_refuses_an_ssh_child_that_died_before_reset(self):
         process = mock.Mock()
-        process.child.poll.return_value = 255
+        process.poll.return_value = 255
         args = types.SimpleNamespace(timeout=30)
         with mock.patch.object(self.host, "reset_instance") as reset:
             with self.assertRaisesRegex(RuntimeError, "before reset"):
