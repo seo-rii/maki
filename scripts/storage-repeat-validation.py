@@ -36,14 +36,17 @@ def suite_groups(config):
     return PROFILES[profile]
 
 
-def save_json(path, value):
+def save_json(path, value, before_publish=None):
     temporary = path.with_name(path.name + ".tmp")
     with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as out:
         json.dump(value, out, indent=2, sort_keys=True)
         out.write("\n")
         out.flush()
         os.fsync(out.fileno())
+    if before_publish is not None and not before_publish():
+        return False
     os.replace(temporary, path)
+    return True
 
 
 def process_identity(pid):
@@ -116,9 +119,16 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
         # Reuse the cancellation marker so build-time interruption also
         # reaches worker() as cancellation rather than a build failure.
         stop.touch(mode=0o600)
+    # The leader can exit during the polling interval, skipping the loop's
+    # limit checks. Cancellation also takes precedence during group cleanup;
+    # otherwise retain any limit reason already observed while it was alive.
+    if received_signal is not None or stop.exists():
         reason = "cancelled"
-    if reason == "exited" and log.stat().st_size > max_bytes:
-        reason = "output_limit"
+    elif reason == "exited":
+        if time.monotonic() - began >= timeout:
+            reason = "timeout"
+        elif log.stat().st_size > max_bytes:
+            reason = "output_limit"
     result = {"exit_code": child.returncode, "reason": reason,
               "seconds": round(time.monotonic() - began, 3)}
     if received_signal is not None:
@@ -237,6 +247,11 @@ def worker(directory):
                     os.fsync(out.fileno())
             status["completed_rounds"] = round_number
             save_json(directory / "status.json", status)
+        # Include final result parsing and persistence in the campaign budget.
+        if (directory / "STOP").exists():
+            raise RuntimeError("campaign cancelled")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("campaign wall-time limit reached")
         status["state"] = "passed"
         exit_code = 0
     except Exception as error:
@@ -250,7 +265,24 @@ def worker(directory):
     finally:
         status.update(exit_code=exit_code, elapsed_seconds=round(time.monotonic() - began, 1),
                       finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        save_json(directory / "status.json", status)
+
+        def eligible_to_publish():
+            # Completion is decided after the candidate report's blocking
+            # flush/fsync, immediately before its atomic publication. Requests
+            # arriving after that decision do not revoke a completed campaign.
+            return status["state"] != "passed" or (
+                not (directory / "STOP").exists() and time.monotonic() < deadline)
+
+        if not save_json(directory / "status.json", status, before_publish=eligible_to_publish):
+            cancelled = (directory / "STOP").exists()
+            exit_code = 1
+            status.update(state="cancelled" if cancelled else "incomplete", exit_code=exit_code,
+                          error="campaign cancelled" if cancelled else "campaign wall-time limit reached",
+                          elapsed_seconds=round(time.monotonic() - began, 1),
+                          finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            # A rejected candidate remains private. Publish a non-pass once;
+            # further cancellation or delay cannot turn it back into success.
+            save_json(directory / "status.json", status)
     return exit_code
 
 
