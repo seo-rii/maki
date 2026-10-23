@@ -1688,3 +1688,20 @@ tracks each fix's failing regression and post-fix evidence, with explicit
 limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
+
+## BUG-157: fractional retry-budget credit
+
+Retry credit uses compensated accumulation for both earning and consumption,
+so ten requests earn two retries at the default `0.2` ratio (one at `0.1`).
+Eligibility includes the retained rounding error instead of granting credit
+within an epsilon of one token; burst clipping discards the compensation too.
+The ratio is the supplied binary `f64` value, not a rounded decimal fraction:
+ten credits of `0.3` or `0.7` remain below three or seven tokens respectively.
+Their retained deficits survive consumption of the preceding whole tokens.
+Invalid ratios supplied directly to the library disable earning while the
+minimum probe rate remains independent.
+
+`review_retry_credit.rs` reproduces the lost fractional credits and covers
+interleaved spending, values below the threshold, burst clipping, zero burst,
+large finite credits and invalid direct-API ratios. This records the change
+and regression coverage, not remote-main integration or release qualification.
