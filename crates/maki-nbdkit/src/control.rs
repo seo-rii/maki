@@ -204,7 +204,11 @@ impl ControlBackend for EngineControlBackend {
             "maki_crypto_latency_seconds_count": dispatch.map(|m| m.rpc_count()).unwrap_or(0),
             "maki_crypto_retries_total": dispatch.map(|m| m.retries_total()).unwrap_or(0),
             "maki_crypto_retries_refused_unsafe_total": dispatch.map(|m| m.retries_refused_unsafe_total()).unwrap_or(0),
-            "maki_crypto_deadline_exceeded_total": dispatch.map(|m| m.deadline_exceeded_total()).unwrap_or(0),
+            // The scheduler owns caller outcomes, including queue expiry.
+            // Adding the dispatcher count would count some deadlines twice.
+            "maki_crypto_deadline_exceeded_total": self.crypto_stats.as_ref()
+                .map(|s| s.deadline_exceeded_total())
+                .unwrap_or_else(|| dispatch.map(|m| m.deadline_exceeded_total()).unwrap_or(0)),
             "maki_retry_budget_tokens": self.per_endpoint(|set| {
                 set.endpoint_budget_tokens()
                     .into_iter()
