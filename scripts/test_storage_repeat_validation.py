@@ -375,14 +375,15 @@ class BackgroundStorageTests(unittest.TestCase):
                 })
                 original_save = self.runner.save_json
 
-                def save(path, value):
-                    original_save(path, value)
+                def save(path, value, **kwargs):
+                    result = original_save(path, value, **kwargs)
                     if value.get("state") == "running" and value.get("completed_rounds") == 1:
                         # The last child completed successfully, but persisting
                         # its results can consume time or race with cancellation.
                         clock[0] = elapsed
                         if cancelled:
                             (directory / "STOP").touch()
+                    return result
 
                 def child(_command, _cwd, log, _stop, _timeout):
                     log.write_text("test result: ok. 1 passed; 0 failed; 0 ignored; "
@@ -403,6 +404,71 @@ class BackgroundStorageTests(unittest.TestCase):
                 self.assertEqual(exit_code, 0 if expected == "passed" else 1)
                 self.assertEqual(report["completed_rounds"], 1)
                 self.assertEqual(report["passed_tests"], 1)
+
+    def test_bug160_terminal_fsync_rechecks_limits_before_publishing_pass(self):
+        for name, cancelled, elapsed, expected in (
+                ("normal", False, 29, "passed"),
+                ("cancelled", True, 0, "cancelled"),
+                ("deadline", False, 30, "incomplete"),
+                ("late", False, 31, "incomplete"),
+                ("cancel-before-deadline", True, 31, "cancelled")):
+            with self.subTest(case=name):
+                directory = self.root / name
+                directory.mkdir()
+                clock = [0]
+                published = []
+                terminal_syncs = []
+                self.runner.save_json(directory / "config.json", {
+                    "rounds": 1, "max_seconds": 30, "suite_timeout": 10,
+                    "revision": "fixture", "source": str(directory),
+                })
+                original_sync, original_replace = os.fsync, os.replace
+                temporary = directory / "status.json.tmp"
+
+                def sync(fd):
+                    # Exercise the real final JSON flush/fsync, after all
+                    # suite/result checks but before atomic status publication.
+                    if temporary.exists():
+                        candidate = json.loads(temporary.read_text())
+                        if candidate["state"] in self.runner.TERMINAL:
+                            terminal_syncs.append(candidate["state"])
+                        if candidate["state"] == "passed":
+                            clock[0] = elapsed
+                            if cancelled:
+                                (directory / "STOP").touch()
+                    original_sync(fd)
+
+                def replace(source, target):
+                    if target == directory / "status.json":
+                        published.append(json.loads(source.read_text())["state"])
+                    original_replace(source, target)
+
+                def child(_command, _cwd, log, _stop, _timeout):
+                    log.write_text("test result: ok. 1 passed; 0 failed; 0 ignored; "
+                                   "0 measured; 0 filtered out;\n")
+                    return {"exit_code": 0, "reason": "exited", "seconds": 0}
+
+                with mock.patch.object(self.runner, "prepare",
+                                       return_value={"fixture": directory / "fixture"}), \
+                        mock.patch.object(self.runner, "run_child", side_effect=child), \
+                        mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                        mock.patch.object(self.runner.shutil, "disk_usage",
+                                          return_value=types.SimpleNamespace(free=1 << 30)), \
+                        mock.patch.object(self.runner.os, "fsync", side_effect=sync), \
+                        mock.patch.object(self.runner.os, "replace", side_effect=replace):
+                    exit_code = self.runner.worker(directory)
+                report = json.loads((directory / "status.json").read_text())
+                self.assertEqual(report["state"], expected)
+                self.assertEqual(report["exit_code"], exit_code)
+                self.assertEqual(exit_code, 0 if expected == "passed" else 1)
+                self.assertEqual(published[-1], expected)
+                if expected == "passed":
+                    self.assertEqual(terminal_syncs, ["passed"])
+                else:
+                    self.assertNotIn("passed", published, "an ineligible pass must stay private")
+                    self.assertEqual(terminal_syncs, ["passed", expected])
+                    self.assertEqual(report["elapsed_seconds"], elapsed)
+                self.assertFalse(temporary.exists())
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_supervisor_signal_cleans_build_and_suite_groups_and_records_cancellation(self):
