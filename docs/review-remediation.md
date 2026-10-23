@@ -1688,3 +1688,25 @@ tracks each fix's failing regression and post-fix evidence, with explicit
 limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
+
+## Additional reproduced boundaries (2026-10-19)
+
+The additional audit used `b679b80`, whose source tree is identical to the
+PR #82 merge `42e725a`. These five fixes preserve the on-disk format and do
+not extend production qualification. Each has an executed failing regression
+before implementation; passing observation tests from the audit were converted
+to expected-behavior regressions for this change.
+
+| Finding | Change | Regression and limits |
+|---|---|---|
+| BUG-134: rejected first-write reservations invisible to TRIM | A zero-only v3 TRIM marks existing unwritten slots in the discard bitmap and queues bounded checkpoint reclamation. No shard or journal record is created. Overlay versions and freshness checks still protect live reservations. | `review_failed_reservations.rs`: actual allocated-block release through Volume and Engine, TRIM after restart, both bitmap publications and directory-sync failure, failed punch retry, and later rewrite. Core unit tests cover overlapping checkpoint publication and revoked writers. Four additional reservation regressions failed before the fix. Physical power-loss qualification is separate; v2 does not gain TRIM. |
+| BUG-135: gRPC TLS identity failures reported retryable | Preserve a safe typed connection-failure category and report TLS authentication/protocol errors as EndpointFatal; reset and timeout remain Retryable. | `review_grpc_tls_classification.rs`: wrong hostname and unknown CA failed before the fix; the server's TLS alert distinguishes both from socket errors. Reset is a passing control. Error text cannot spoof the classifier or expose the original URL. |
+| BUG-136: inaccessible export tail | Require configured and stored export sizes to be multiples of the effective NBD minimum I/O size. Invalid creation refuses before backing files are created. | `review_export_alignment.rs`: config, creation and existing-volume attach regressions failed before the fix; aligned 512-byte and 4096-byte settings retain whole-export access. Actual new kernel attachment is not claimed. |
+| BUG-137: extra unary gRPC response silently discarded | Reject bytes after the first complete unary response message, including partial second headers, before tonic can drain and ignore them. | `review_grpc_unary_cardinality.rs`: the original two-message regression failed; fragmented and partial-header cases reject, while singleton and remote-status controls preserve their contract. No data-loss or unbounded-memory claim. |
+| BUG-138: daemon accepts names the helper rejects | Reject a leading `-` during configuration validation, preserving the helper's argument checks. | `review_volume_name_bound.rs` and `review_volume_name_helper.rs`: expected rejection failed before the fix; safe names and the existing 64-byte boundary remain valid. |
+
+The targeted Linux storage suites, complete gRPC crate, and NBD/configuration
+regressions passed after implementation. The pull request records final
+workspace, strict lint, release-gate and platform-CI results against its code
+revision. No installed systemd/LVM operation, physical power cut or long soak
+is implied by these repository tests.

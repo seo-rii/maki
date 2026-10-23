@@ -616,6 +616,24 @@ impl SlotStore {
             .map(|idx| (idx, 0));
     }
 
+    /// An existing, logically unwritten slot may still own a reservation
+    /// from a rejected append. Its caller has excluded live overlay versions
+    /// and verified that the slot reads as zero. Queue it through the ordinary durable
+    /// discard metadata path; never punch it in the foreground or create a
+    /// shard merely to discard a hole.
+    pub(crate) fn reclaim_unwritten(&mut self, unit: u64) -> Result<(), CoreError> {
+        let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
+        if !self.shards.contains_key(&shard_idx) {
+            return Ok(());
+        }
+        self.set_discarded(unit, true)?;
+        let cursor = (shard_idx, in_shard);
+        self.reclaim_cursor = Some(self.reclaim_cursor.map_or(cursor, |old| old.min(cursor)));
+        // Preserve a failed punch's backoff policy. A later checkpoint can
+        // retry the cursor; new trim hints must not spin on the same failure.
+        Ok(())
+    }
+
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
     }

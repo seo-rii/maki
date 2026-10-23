@@ -39,10 +39,10 @@ fn volume_names_have_an_exact_64_byte_boundary() {
 
 #[test]
 fn existing_name_character_rules_are_preserved() {
-    for name in ["v", "postgres-prod_2", "A_9-z"] {
+    for name in ["v", "postgres-prod_2", "A_9-z", "_vol", "vol-"] {
         validate_name(name).unwrap();
     }
-    for name in ["", "bad.name", "bad/name", "볼륨"] {
+    for name in ["", "bad.name", "bad/name", "볼륨", "-vol", "--vol", "-"] {
         assert!(
             validate_name(name).is_err(),
             "invalid name {name:?} accepted"

@@ -347,7 +347,7 @@ impl Volume {
                 self.sanitize();
                 return Ok(sequence);
             }
-        } else if matches!(self.store.slot_sequence(unit), Ok(None)) {
+        } else if self.reclaim_unwritten(unit)? {
             // Only a header proving the unit unwritten skips the tombstone;
             // a damaged slot is retired by one rather than refused (R5-012).
             return Ok(self.journal.appended_sequence());
@@ -372,6 +372,22 @@ impl Volume {
         }
         self.sanitize();
         Ok(sequence)
+    }
+
+    /// Skip a zero-only TRIM's journal record while retaining its physical
+    /// release hint. A volatile overlay tombstone must not expose the older
+    /// durable write's reservation to reclamation. Header errors still take
+    /// the normal tombstone path so damaged units can be retired (R5-012).
+    pub(crate) fn reclaim_unwritten(&mut self, unit: u64) -> Result<bool, CoreError> {
+        self.check_freshness()?;
+        if let Some(version) = self.overlay.get(unit) {
+            return Ok(version.ciphertext.is_empty());
+        }
+        if !matches!(self.store.slot_sequence(unit), Ok(None)) {
+            return Ok(false);
+        }
+        self.store.reclaim_unwritten(unit)?;
+        Ok(true)
     }
 
     /// FLUSH barrier (SPEC §25): everything appended becomes durable.
@@ -643,6 +659,42 @@ mod discard_tests {
     use super::{Volume, VolumeOptions};
 
     #[test]
+    fn zero_trim_registered_during_checkpoint_preserves_its_durable_write() {
+        let backing = Arc::new(CrashableBacking::new());
+        create_volume_with_discard(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(0x134c1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "zero-trim-checkpoint".into(),
+                key_identity: "key".into(),
+                geometry: Geometry::compute(512, 512, 512, 520, 4096, 4096).unwrap(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        volume.write_ct(0, &[0x41; 520], true).unwrap();
+        let prepared = volume.prepare_checkpoint().unwrap();
+        backing.set_fault_hook(Some(Arc::new(|operation| {
+            matches!(operation, FaultOp::WriteAt { path, .. } if path.starts_with("journal/seg-"))
+                .then(|| io::Error::new(io::ErrorKind::StorageFull, "rejected new reservation"))
+        })));
+        assert!(volume.write_ct(1, &[0x42; 520], false).is_err());
+        backing.set_fault_hook(None);
+        volume.discard_ct(1, false).unwrap();
+        let completed = prepared.execute().unwrap();
+        assert_eq!(volume.finish_checkpoint(completed).unwrap(), 1);
+        drop(volume);
+        backing.crash_all_lost();
+        let recovered = Volume::recover(backing, VolumeOptions::default()).unwrap();
+        assert_eq!(recovered.read_ct(0).unwrap().unwrap().1, vec![0x41; 520]);
+        assert!(recovered.read_ct(1).unwrap().is_none());
+    }
+
+    #[test]
     fn newer_tombstone_cannot_hide_an_intermediate_write_reservation_from_punch() {
         let backing = Arc::new(CrashableBacking::new());
         let geometry = Geometry::compute(512, 1024, 512, 1032, 16 * 1024, 8 * 1024).unwrap();
@@ -738,5 +790,101 @@ mod reservation_barrier_tests {
         backing.crash_all_lost();
         let recovered = Volume::recover(backing, VolumeOptions::default()).unwrap();
         assert_eq!(recovered.read_ct(0).unwrap().unwrap().1, vec![0x86; 512]);
+    }
+}
+
+#[cfg(test)]
+mod zero_trim_freshness_tests {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use maki_backing::{Backing, BackingFile, MemBacking, VolumeLock};
+    use maki_format::{geometry::Geometry, init, superblock::Superblock};
+
+    use super::{Volume, VolumeOptions};
+
+    #[derive(Default)]
+    struct FreshnessGate {
+        inner: MemBacking,
+        revoked: AtomicBool,
+    }
+
+    impl Backing for FreshnessGate {
+        fn check_freshness(&self) -> io::Result<()> {
+            if self.revoked.load(Ordering::SeqCst) {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "test writer revoked",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
+            self.inner.open(path, create)
+        }
+
+        fn exists(&self, path: &str) -> io::Result<bool> {
+            self.inner.exists(path)
+        }
+
+        fn remove(&self, path: &str) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+
+        fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+
+        fn create_dir_all(&self, path: &str) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+
+        fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+
+        fn sync_dir(&self, dir: &str) -> io::Result<()> {
+            self.inner.sync_dir(dir)
+        }
+
+        fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+            self.inner.try_lock(path)
+        }
+    }
+
+    #[test]
+    fn zero_trim_prefilter_rechecks_freshness_before_skipping_overlay_tombstone() {
+        let backing = Arc::new(FreshnessGate::default());
+        init::create_volume_with_discard(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(0x134f1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "zero-trim-freshness".into(),
+                key_identity: "key".into(),
+                geometry: Geometry::compute(512, 512, 512, 520, 4096, 4096).unwrap(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        volume.write_ct(0, &[0x41; 520], true).unwrap();
+        volume.discard_ct(0, false).unwrap();
+        assert!(volume.reclaim_unwritten(0).unwrap());
+
+        // The engine's initial guard may pass before a request waits for its
+        // unit locks. The zero-only publication path must check again even
+        // when an overlay tombstone lets it skip all storage and journaling.
+        backing.revoked.store(true, Ordering::SeqCst);
+        assert!(volume.check_freshness().is_err());
+        let error = volume
+            .reclaim_unwritten(0)
+            .expect_err("a revoked session must not accept a zero-only TRIM");
+        assert!(error.to_string().contains("test writer revoked"));
     }
 }

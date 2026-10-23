@@ -1001,6 +1001,7 @@ impl VolumeConfig {
             )));
         }
         if self.volume.name.is_empty()
+            || self.volume.name.starts_with('-')
             || !self
                 .volume
                 .name
@@ -1008,7 +1009,7 @@ impl VolumeConfig {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err(ConfigError::Invalid(format!(
-                "volume name {:?} must be non-empty [A-Za-z0-9_-]",
+                "volume name {:?} must be non-empty [A-Za-z0-9_-] and must not start with '-'",
                 self.volume.name
             )));
         }
@@ -1818,6 +1819,18 @@ impl VolumeConfig {
             return Err(invalid(
                 "nbd I/O sizes must satisfy device_block_size <= minimum_io <= preferred_io <= maximum_io",
             ));
+        }
+        if !self
+            .volume
+            .max_virtual_size
+            .0
+            .is_multiple_of(u64::from(n.minimum_io))
+        {
+            return Err(invalid(format!(
+                "volume.max_virtual_size {} must be a multiple of nbd.minimum_io {} \
+                 so every exported byte is accessible",
+                self.volume.max_virtual_size.0, n.minimum_io
+            )));
         }
         // The engine charges a request every crypto unit it touches; a
         // maximal request (unaligned to units) touches maximum_io plus one

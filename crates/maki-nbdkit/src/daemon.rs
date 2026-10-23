@@ -1025,6 +1025,16 @@ fn validate_recovered_geometry(config: &VolumeConfig, volume: &Volume) -> Result
     if config.nbd.minimum_io < block || !config.nbd.minimum_io.is_multiple_of(block) {
         return Err(DaemonError::Unsupported(format!("NBD minimum_io {} is incompatible with stored volume geometry device_block_size {block}", config.nbd.minimum_io)));
     }
+    if !stored
+        .max_virtual_size
+        .is_multiple_of(u64::from(config.nbd.minimum_io))
+    {
+        return Err(DaemonError::Unsupported(format!(
+            "NBD minimum_io {} is incompatible with stored volume geometry max_virtual_size {}; \
+             every exported byte must be accessible",
+            config.nbd.minimum_io, stored.max_virtual_size
+        )));
+    }
     Ok(())
 }
 
