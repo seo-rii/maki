@@ -1688,3 +1688,18 @@ tracks each fix's failing regression and post-fix evidence, with explicit
 limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
+
+## BUG-153: admitted queue time and batch waiting (2026-10-23)
+
+This change records when each group enters the admitted scheduler queue and
+retains that time through dispatch-slot waits and incompatible-group carryover.
+Coalescing uses the oldest live group's original `max_wait` deadline; cancelling
+that group selects the surviving group's deadline. Queue admission waits remain
+outside the coalescing window, and dispatch capacity still bounds concurrency.
+The eleven ManualClock cases in
+[`review_scheduler_queue_wait.rs`](../crates/maki-crypto/tests/review_scheduler_queue_wait.rs)
+cover both lanes, expired and partly elapsed windows, a 180 ms operation budget,
+context/unit incompatibility, cancellation, admission, and full/zero-wait/fresh
+batch controls. Before this change, seven cases failed and four controls passed;
+all eleven pass with the change. This is branch-local regression evidence;
+integration and release qualification are separate.

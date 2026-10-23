@@ -602,8 +602,12 @@ using its valid batch limit.
 Remote providers are called through a batch scheduler (SPEC §30). Concurrent
 requests are coalesced into one provider call when their items fit
 `crypto.batch.max_items` / `max_bytes`; a batch is dispatched as soon as
-`target_items` or `target_bytes` is reached, and at the latest `max_wait`
-after its first item arrived. A request's items are never split and keep
+`target_items` or `target_bytes` is reached, subject to dispatch capacity.
+Otherwise, coalescing stops `max_wait` after the oldest live request entered
+the admitted queue. Time spent queued behind other batches counts toward this
+window, while time waiting for queue admission does not. A full lane can delay
+dispatch beyond that deadline; available capacity does not start a new window.
+A request's items are never split and keep
 their order. Requests that touch the same unit are never coalesced: one
 provider call never carries a unit twice. Each lane keeps up to `limits.max_crypto_inflight_batches`
 batches in flight at once (the dispatcher's own limits bound what reaches the
