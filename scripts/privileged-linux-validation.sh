@@ -127,7 +127,7 @@ readonly nbd_target
 
 required_commands=(
     blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
-    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs rustc setpriv sqlite3
+    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sqlite3
     sync vgchange vgcreate vgremove vgs
 )
 
@@ -528,7 +528,7 @@ if [[ "$install_missing" == true ]]; then
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" update
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" \
         install -y --no-install-recommends binutils fio kmod libnbd-bin lvm2 \
-        nbd-client nbdkit nbdkit-plugin-dev sqlite3 util-linux xfsprogs
+        nbd-client nbdkit nbdkit-plugin-dev python3 sqlite3 util-linux xfsprogs
     pass "native validation dependencies installed"
 fi
 
@@ -626,11 +626,23 @@ config_path="$run_dir/volume.toml"
 key_path="$work_dir/local-aes-gcm-siv.key"
 dd if=/dev/urandom of="$key_path" bs=32 count=1 status=none
 chmod 0600 "$key_path"
-cat >"$config_path" <<EOF
-config_schema_version = 1
+python3 - "$config_path" "$volume_name" "$key_path" "$work_dir/backing" \
+    "$socket_path" "$control_socket_path" <<'PY'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+# JSON's quoted strings use TOML basic-string escapes. Preserve Unicode to avoid
+# surrogate-pair escapes, and escape DEL, which JSON allows but TOML forbids.
+volume_name, key_path, backing_root, socket_path, control_socket_path = (
+    json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
+    for value in sys.argv[2:]
+)
+config_path.write_text(f"""config_schema_version = 1
 
 [volume]
-name = "$volume_name"
+name = {volume_name}
 max_virtual_size = "512MiB"
 device_block_size = 4096
 crypto_unit_size = 4096
@@ -639,21 +651,21 @@ shard_logical_size = "16MiB"
 [crypto]
 provider = "local-aes-gcm-siv"
 crypto_compatibility_id = "privileged-validation-v1"
-key = { source = "file", name = "$key_path" }
+key = {{ source = "file", name = {key_path} }}
 
 [crypto.capabilities]
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4124
 
 [backing]
-root = "$work_dir/backing"
+root = {backing_root}
 journal_segment_size = "16MiB"
 journal_max_bytes = "128MiB"
 checkpoint_reserve_bytes = "16MiB"
 journal_emergency_reserve_bytes = "8MiB"
 
 [nbd]
-socket = "$socket_path"
+socket = {socket_path}
 device_block_size = 4096
 minimum_io = 4096
 preferred_io = 4096
@@ -661,8 +673,9 @@ maximum_io = "1MiB"
 connections = 1
 
 [control]
-socket = "$control_socket_path"
-EOF
+socket = {control_socket_path}
+""", encoding="utf-8")
+PY
 
 if [[ "$discard" == true ]]; then
     "$maki_bin" volume create "$config_path" --discard
