@@ -1761,3 +1761,17 @@ decrypt, multiple peers and an exhausted pass with no admissible peer. It
 also covers zero attempts, success, unlimited retries and operation deadlines.
 This records the change and regression coverage, not remote-main integration
 or release qualification.
+
+## Scheduler deadline metrics (BUG-154, 2026-10-23)
+
+The scheduler counts each encrypt/decrypt caller that receives an operation
+deadline error, including expiry before dispatch. The control metric selects
+this caller counter when batching is enabled and retains the dispatcher
+counter otherwise; the two counters are never added. Coalesced callers each
+contribute once, while ordinary errors and cancellation contribute nothing.
+
+`maki-nbdkit/tests/review_deadline_metrics.rs` exercises both lanes, admission,
+coalescing, batch-slot and RPC waits, inner-timer propagation, direct dispatch,
+and cancellation/success/error controls with `ManualClock`. Five cases failed
+before the change. This branch's tests are separate from main integration and
+release qualification.

@@ -88,6 +88,7 @@ pub struct SchedulerStats {
     batched_items: AtomicU64,
     coalesced_batches: AtomicU64,
     inflight_batches: AtomicU64,
+    deadline_exceeded: AtomicU64,
 }
 
 impl SchedulerStats {
@@ -118,6 +119,13 @@ impl SchedulerStats {
     /// Provider calls that carried more than one request.
     pub fn coalesced_batches_total(&self) -> u64 {
         self.coalesced_batches.load(Ordering::SeqCst)
+    }
+
+    /// Completed encrypt/decrypt callers that received an operation deadline
+    /// error, including admission, coalescing and slot waits. Each caller is
+    /// counted once even when several callers share the same provider RPC.
+    pub fn deadline_exceeded_total(&self) -> u64 {
+        self.deadline_exceeded.load(Ordering::SeqCst)
     }
 }
 
@@ -762,14 +770,25 @@ impl BatchScheduler {
         &self,
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
-        let Some(limit) = self.max_operation_time() else {
-            return operation.await;
+        let result = match self.max_operation_time() {
+            Some(limit) => tokio::select! {
+                biased;
+                _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
+                result = operation => result,
+            },
+            None => operation.await,
         };
-        tokio::select! {
-            biased;
-            _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
-            result = operation => result,
+        // The caller owns this outcome, whether its queue timer or the inner
+        // dispatcher's timer expired first. Ordinary cancellation never
+        // reaches this point and must not be counted as a timeout (BUG-154).
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(crate::endpoint::is_deadline_error)
+        {
+            self.stats.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
         }
+        result
     }
 }
 
