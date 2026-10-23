@@ -1747,3 +1747,17 @@ minimum probe rate remains independent.
 interleaved spending, values below the threshold, burst clipping, zero burst,
 large finite credits and invalid direct-API ratios. This records the change
 and regression coverage, not remote-main integration or release qualification.
+
+## BUG-158: return exhausted retry results before backoff
+
+The endpoint dispatcher checks the completed pass against `max_attempts`
+before scheduling backoff. A failed final pass returns its last provider
+error immediately; peers within the pass still receive failover attempts.
+Backoff remains between permitted passes, including the unlimited policy,
+and the operation deadline still bounds in-flight RPCs.
+
+`review_final_backoff.rs` reproduces the extra final sleep for encrypt,
+decrypt, multiple peers and an exhausted pass with no admissible peer. It
+also covers zero attempts, success, unlimited retries and operation deadlines.
+This records the change and regression coverage, not remote-main integration
+or release qualification.
