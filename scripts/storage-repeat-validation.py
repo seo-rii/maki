@@ -116,9 +116,16 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
         # Reuse the cancellation marker so build-time interruption also
         # reaches worker() as cancellation rather than a build failure.
         stop.touch(mode=0o600)
+    # The leader can exit during the polling interval, skipping the loop's
+    # limit checks. Cancellation also takes precedence during group cleanup;
+    # otherwise retain any limit reason already observed while it was alive.
+    if received_signal is not None or stop.exists():
         reason = "cancelled"
-    if reason == "exited" and log.stat().st_size > max_bytes:
-        reason = "output_limit"
+    elif reason == "exited":
+        if time.monotonic() - began >= timeout:
+            reason = "timeout"
+        elif log.stat().st_size > max_bytes:
+            reason = "output_limit"
     result = {"exit_code": child.returncode, "reason": reason,
               "seconds": round(time.monotonic() - began, 3)}
     if received_signal is not None:
@@ -237,6 +244,11 @@ def worker(directory):
                     os.fsync(out.fileno())
             status["completed_rounds"] = round_number
             save_json(directory / "status.json", status)
+        # Include final result parsing and persistence in the campaign budget.
+        if (directory / "STOP").exists():
+            raise RuntimeError("campaign cancelled")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("campaign wall-time limit reached")
         status["state"] = "passed"
         exit_code = 0
     except Exception as error:
