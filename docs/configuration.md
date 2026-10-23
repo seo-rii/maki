@@ -200,7 +200,11 @@ schema, geometry, and secret-literal checks validation rejects:
   layout (a raw body sends no fields, and a per-item body never sends
   `item_fields`);
 - a transport limit that cannot carry one full crypto batch, including the
-  declared maximum ciphertext size. gRPC `max_message_bytes` (default 4 MiB)
+  declared maximum ciphertext size. The maximum batch is bounded by both
+  `crypto.batch.max_items` and the number of provider plaintext units that fit
+  `crypto.batch.max_bytes`; unused byte capacity does not enlarge it. Thus a
+  one-item batch can use a smaller transport cap even if its plaintext-byte
+  ceiling is large. gRPC `max_message_bytes` (default 4 MiB)
   includes protobuf field tags, lengths, indices, context and the singleton
   negative profile probe used by attach self-tests. WebSocket
   `max_frame_bytes` (default 8 MiB) includes each item's base64 padding, JSON

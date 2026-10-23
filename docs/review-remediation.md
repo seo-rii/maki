@@ -516,7 +516,7 @@ stance, not data-loss bugs.
 | ID | Finding | Fix | Regression tests |
 |---|---|---|---|
 | BUG-025 | **`resolve_leaf_devices` dropped an over-deep subtree instead of failing closed.** The F02 topology walk (`probe.rs`) skipped any node past `MAX_DEPTH` with a bare `continue`, so a branching sysfs `slaves` stack with a *foreign* leaf hidden below depth 16 resolved to just the shallow NBD leaf; `verify_mount_device` then passed on an incomplete picture and the helper wrote plaintext onto a filesystem partly backed by a non-Maki device. (Low reachability — building an 18-deep dm/MD stack needs `CAP_SYS_ADMIN`, which the untrusted tenant lacks — but a genuine fail-open contradicting its sibling walker `detach.rs::depends_only_on`, which errors on the same condition.) | Exceeding the depth bound now returns *no leaves*, so the caller refuses (empty `backing_devices` ⇒ `verify_mount_device` fails). A diamond (a device reached by two paths) is still merely not re-walked. | `an_over_deep_topology_resolves_to_no_leaves_not_a_partial_set` (maki-privileged `review_priv.rs`) |
-| BUG-026 | **`crypto.batch.max_bytes` was never validated against the transport frame/message limit.** A whole batch is sent as one gRPC message / one WebSocket frame; a `batch.max_bytes` above `grpc.max_message_bytes` (default 4 MiB) or the base64-inflated `ws.max_frame_bytes` (default 8 MiB) validated cleanly but then failed *every* large batch at runtime with a non-retryable transport error (EIO to the client) on a volume that attached fine. A zero `max_message_bytes`/`max_frame_bytes` also passed (unlike HTTP's `max_response_bytes`). | `validate_provider_sections` now checks the batch fits: gRPC `batch.max_bytes ≤ max_message_bytes`, WebSocket `base64(batch.max_bytes) ≤ max_frame_bytes` (necessary bounds; the error advises leaving headroom for framing/JSON structure), and both limits must be positive. The default is a shared constant (`DEFAULT_WS_MAX_FRAME_BYTES`, `DEFAULT_GRPC_MAX_MESSAGE_BYTES`) used by both validation and the daemon wiring so a config that validates also runs. | `remote_transport_batch_must_fit_the_frame_or_message_limit` (maki-format `review_config.rs`) |
+| BUG-026 | **Transport limits did not cover a reachable full crypto batch.** A whole batch is sent as one gRPC message / one WebSocket frame; an undersized limit validated but rejected large batches at runtime. Zero limits also passed. | `validate_provider_sections` checks the serialized maximum batch reachable under both the item and plaintext-byte limits, including maximum ciphertext and framing. Both transport limits must be positive and share defaults with the daemon. BUG-162 removes the old raw-byte floor, which incorrectly treated unused byte capacity as a message that could be sent. | `remote_transport_batch_must_fit_the_frame_or_message_limit` (maki-format `review_config.rs`), plus the singleton transport regressions described below |
 
 ## Fast-checker / recovery drift (2026-09-07): BUG-027
 
@@ -1775,3 +1775,19 @@ coalescing, batch-slot and RPC waits, inner-timer propagation, direct dispatch,
 and cancellation/success/error controls with `ManualClock`. Five cases failed
 before the change. This branch's tests are separate from main integration and
 release qualification.
+
+## Reachable transport batch capacity (BUG-162, 2026-10-23)
+
+The gRPC and WebSocket configuration bounds use the number of provider units
+that can fit both the item and plaintext-byte ceilings. They retain the
+maximum ciphertext size, protobuf/JSON framing, and attach probe overhead,
+without requiring a transport to carry an unreachable raw byte ceiling.
+For example, one 4096-byte unit with a 4384-byte maximum ciphertext fits a
+16 KiB transport cap even when `batch.max_bytes` is 1 MiB.
+
+Permanent transport regressions validate that configuration and exercise
+maximum-size ciphertext roundtrips plus provider self-tests over real local
+connections. They retain larger-batch rejection and byte-limit controls.
+The older full-batch configuration regression now selects enough items to
+make its large byte budget reachable. This describes the change and its
+local regression coverage; remote CI and main integration remain separate.
