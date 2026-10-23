@@ -68,6 +68,21 @@ fn review_auto_allocation_skips_direct_and_partition_mounts() {
 }
 
 #[test]
+fn mountinfo_whitespace_in_paths_keeps_mounted_devices_occupied() {
+    let fixture = Fixture::new();
+    fixture.partition();
+    for number in ["43:32", "43:33"] {
+        for space in [
+            '\r', '\u{000b}', '\u{000c}', '\u{00a0}', '\u{2003}', '\u{3000}',
+        ] {
+            let mounts =
+                format!("91 20 {number} / /srv/old{space}data rw - xfs /dev/old{space}device rw\n");
+            assert_eq!(choose(&fixture.0, &mounts).unwrap(), "/dev/nbd3");
+        }
+    }
+}
+
+#[test]
 fn review_auto_allocation_skips_backend_without_pid() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("nbd2/backend"), "old-connection\n").unwrap();
