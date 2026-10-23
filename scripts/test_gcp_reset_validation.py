@@ -367,6 +367,130 @@ host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)
         self.assertFalse(self.ledger.exists())
 
 
+class ResourceDeadlineContracts(unittest.TestCase):
+    def setUp(self):
+        self.host = load("gcp_resource_deadline", "gcp-reset-validation.py")
+        self.args = types.SimpleNamespace(
+            gcloud="fixture-gcloud", project="fixture-project", zone="fixture-zone",
+            instance="fixture-instance", data_disk="fixture-data",
+        )
+        self.disk = "projects/fixture-project/zones/fixture-zone/disks/fixture-data"
+        self.baseline = dict(
+            instance_id="1", data_disk_id="2", data_disk_self_link=self.disk,
+            attachment_source=self.disk, attachment_device_name="fixture-data",
+            status="RUNNING",
+        )
+        self.now = 0.0
+        self.durations = iter([2, 2])
+        self.statuses = iter(["RUNNING"])
+        self.calls = []
+        for patch in (
+                mock.patch.object(self.host.time, "monotonic", side_effect=lambda: self.now),
+                mock.patch.object(self.host.time, "sleep", side_effect=self.advance),
+                mock.patch.object(self.host, "bounded_run", side_effect=self.rpc)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def rpc(self, command, timeout):
+        resource = command[2]
+        self.calls.append((resource, timeout))
+        duration = next(self.durations)
+        # Enforce each subprocess's timeout, without executing gcloud or sleeping.
+        self.advance(min(duration, timeout))
+        if duration > timeout:
+            raise TimeoutError("fixture RPC deadline")
+        if resource == "instances":
+            value = dict(id="1", status=next(self.statuses), disks=[dict(
+                boot=False, deviceName="fixture-data", source=self.disk,
+            )])
+        else:
+            value = dict(id="2", selfLink=self.disk)
+        return subprocess.CompletedProcess(command, 0, json.dumps(value).encode(), b"")
+
+    def test_two_slow_queries_share_one_wait_budget(self):
+        self.durations = iter([6, 6])
+        with self.assertRaises(TimeoutError):
+            self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(self.now, 10)
+        self.assertEqual(self.calls, [("instances", 10), ("disks", 4)])
+
+    def test_short_queries_succeed_with_shrinking_budget(self):
+        current = self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(current, self.baseline)
+        self.assertEqual(self.now, 4)
+        self.assertEqual(self.calls, [("instances", 10), ("disks", 8)])
+
+    def test_first_query_exhaustion_prevents_disk_query(self):
+        for duration in (10, 11):
+            with self.subTest(duration=duration):
+                self.now = 0
+                self.calls.clear()
+                self.durations = iter([duration, 1])
+                self.statuses = iter(["RUNNING"])
+                with self.assertRaises(TimeoutError):
+                    self.host.wait_for_running(self.args, 10, self.baseline)
+                self.assertEqual(self.now, 10)
+                self.assertEqual(self.calls, [("instances", 10)])
+
+    def test_expired_identity_budget_does_not_start_a_query(self):
+        with self.assertRaises(TimeoutError):
+            self.host.resource_identity(self.args, 0)
+        self.assertEqual(self.calls, [])
+
+    def test_identity_response_at_deadline_is_rejected(self):
+        self.durations = iter([4, 6])
+        with self.assertRaises(TimeoutError):
+            self.host.resource_identity(self.args, 10)
+        self.assertEqual(self.now, 10)
+
+    def test_json_processing_counts_toward_identity_deadline(self):
+        original = self.host.decode_json_result
+        for delayed_resource, overhead, expected_calls in (
+                ("instance describe", 8, 1), ("disk describe", 6, 2)):
+            with self.subTest(resource=delayed_resource):
+                self.now = 0
+                self.calls.clear()
+                self.durations = iter([2, 2])
+                self.statuses = iter(["RUNNING"])
+
+                def decode(result, what):
+                    value = original(result, what)
+                    if what == delayed_resource:
+                        self.advance(overhead)
+                    return value
+
+                with mock.patch.object(self.host, "decode_json_result", side_effect=decode):
+                    with self.assertRaises(TimeoutError):
+                        self.host.resource_identity(self.args, 10)
+                self.assertEqual(self.now, 10)
+                self.assertEqual(len(self.calls), expected_calls)
+
+    def test_final_identity_validation_cannot_accept_running_after_deadline(self):
+        original = self.host.validate_resource_identity
+
+        def validate(*args, **kwargs):
+            original(*args, **kwargs)
+            self.advance(6)
+
+        with mock.patch.object(self.host, "validate_resource_identity", side_effect=validate):
+            with self.assertRaises(TimeoutError):
+                self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(self.now, 10)
+
+    def test_wait_retries_non_running_state_with_remaining_budget(self):
+        self.durations = iter([1, 1, 1, 1])
+        self.statuses = iter(["STOPPING", "RUNNING"])
+        current = self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(current, self.baseline)
+        self.assertEqual(self.now, 6)
+        self.assertEqual(self.calls, [
+            ("instances", 10), ("disks", 9), ("instances", 6), ("disks", 5),
+        ])
+
+
 class GuestContracts(unittest.TestCase):
     def setUp(self):
         self.guest = load("gcp_reset_guest", "gcp-reset-guest.py")

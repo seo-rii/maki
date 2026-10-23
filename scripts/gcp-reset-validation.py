@@ -214,9 +214,14 @@ def decode_json_result(result, what):
 
 
 def resource_identity(args, timeout):
+    # Both describes and their response processing share this lookup's budget.
+    until = time.monotonic() + timeout
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("resource identity deadline")
     instance_result = bounded_run(
         [args.gcloud, "compute", "instances", "describe", args.instance,
-         "--project", args.project, "--zone", args.zone, "--format=json"], timeout)
+         "--project", args.project, "--zone", args.zone, "--format=json"], remaining)
     instance = decode_json_result(instance_result, "instance describe")
     attachments = instance.get("disks")
     if not isinstance(attachments, list):
@@ -228,9 +233,12 @@ def resource_identity(args, timeout):
     if len(matches) != 1:
         raise ValueError("expected one attached persistent data disk")
     attachment = matches[0]
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("resource identity deadline")
     disk_result = bounded_run(
         [args.gcloud, "compute", "disks", "describe", args.data_disk,
-         "--project", args.project, "--zone", args.zone, "--format=json"], timeout)
+         "--project", args.project, "--zone", args.zone, "--format=json"], remaining)
     disk = decode_json_result(disk_result, "disk describe")
     values = {
         "instance_id": str(instance.get("id", "")),
@@ -244,6 +252,8 @@ def resource_identity(args, timeout):
                   "attachment_source", "attachment_device_name", "status"):
         if not isinstance(values[field], str) or not values[field]:
             raise ValueError(f"missing resource identity field: {field}")
+    if time.monotonic() >= until:
+        raise TimeoutError("resource identity deadline")
     return values
 
 
@@ -266,6 +276,8 @@ def wait_for_running(args, timeout, baseline):
         current = resource_identity(args, min(remaining, 30))
         validate_resource_identity(baseline, current, require_running=False)
         last_status = current["status"]
+        if time.monotonic() >= until:
+            raise TimeoutError(f"instance did not return to RUNNING state: {last_status}")
         if last_status == "RUNNING":
             return current
         time.sleep(min(2, max(0, until - time.monotonic())))
