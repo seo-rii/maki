@@ -192,7 +192,7 @@ class SerialProcess:
         return frame
 
     def crash(self):
-        if self.child.poll() is not None:
+        if self.poll() is not None:
             raise RuntimeError("Firecracker already exited before requested SIGKILL")
         os.killpg(self.child.pid, signal.SIGKILL)
         status = self.child.wait(timeout=5)
@@ -200,10 +200,22 @@ class SerialProcess:
             raise RuntimeError(f"unexpected Firecracker termination: {status}")
         return {"pid": self.child.pid, "returncode": status, "signal": "SIGKILL"}
 
+    def poll(self):
+        if self.child.returncode is not None:
+            return self.child.returncode
+        # Do not release the leader's PID before its process group is cleaned.
+        status = os.waitid(os.P_PID, self.child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if status is None:
+            return None
+        return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+
     def close(self):
         if self.child is not None:
-            if self.child.poll() is None:
-                os.killpg(self.child.pid, signal.SIGKILL)
+            if self.child.returncode is None:
+                try:
+                    os.killpg(self.child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             self.child.wait(timeout=5)
             self.child.stdin.close()
             self.child.stdout.close()
@@ -212,7 +224,7 @@ class SerialProcess:
         self.stderr.close()
 
     def diagnostics(self):
-        if self.child is None or self.child.poll() is None:
+        if self.child is None or self.child.returncode is None:
             raise RuntimeError("diagnostics require reaped child")
         self.serial.flush() if not self.serial.closed else None
         self.stderr.flush() if not self.stderr.closed else None

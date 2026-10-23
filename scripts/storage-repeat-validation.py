@@ -129,6 +129,16 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
 def prepare(directory, config, deadline):
     groups = suite_groups(config)
     source = Path(config["source"])
+    stop = directory / "STOP"
+
+    def remaining(limit):
+        if stop.exists():
+            raise RuntimeError("preparation cancelled")
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("campaign wall-time limit reached during preparation")
+        return min(limit, budget)
+
     environment = os.environ.copy()
     environment.update(CARGO_TARGET_DIR=config["target_dir"], CARGO_BUILD_JOBS="2")
     executables = {}
@@ -139,10 +149,12 @@ def prepare(directory, config, deadline):
         for suite in selected:
             command.extend(["--test", suite])
         log = directory / ("build.log" if len(groups) == 1 else f"build-{package}.log")
-        result = run_child(command, source, log, directory / "STOP",
-                           min(1800, deadline - time.monotonic()), env=environment)
+        result = run_child(command, source, log, stop, remaining(1800), env=environment)
+        if result["reason"] == "timeout":
+            raise TimeoutError(f"{package} build did not complete: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"{package} build did not complete: {result}")
+        remaining(1800)
         for line in log.read_text(errors="replace").splitlines():
             if not line.startswith("{"):
                 continue
@@ -157,13 +169,16 @@ def prepare(directory, config, deadline):
     binary_dir.mkdir(mode=0o700)
     manifest = {}
     for name, original in executables.items():
+        remaining(30)
         frozen = binary_dir / name
         shutil.copyfile(original, frozen)
         frozen.chmod(0o500)
         executables[name] = frozen
         manifest[name] = {"sha256": hashlib.sha256(frozen.read_bytes()).hexdigest()}
         result = run_child([str(frozen), "--list", "--include-ignored"], source,
-                           directory / f"list-{name}.log", directory / "STOP", 30)
+                           directory / f"list-{name}.log", stop, remaining(30))
+        if result["reason"] == "timeout":
+            raise TimeoutError(f"cannot enumerate {name}: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"cannot enumerate {name}: {result}")
         count = sum(line.endswith(": test") for line in
@@ -171,6 +186,7 @@ def prepare(directory, config, deadline):
         if count < 1:
             raise RuntimeError(f"empty suite: {name}")
         manifest[name]["expected_tests"] = count
+    remaining(30)
     save_json(directory / "binaries.json", manifest)
     return executables
 
@@ -226,6 +242,8 @@ def worker(directory):
     except Exception as error:
         if (directory / "STOP").exists():
             status["state"] = "cancelled"
+        elif isinstance(error, TimeoutError):
+            status["state"] = "incomplete"
         elif status["state"] not in TERMINAL:
             status["state"] = "failed"
         status["error"] = f"{type(error).__name__}: {error}"

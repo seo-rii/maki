@@ -1102,6 +1102,17 @@ impl EndpointSet {
                 }
             }
 
+            // Backoff only separates permitted passes. Once the final pass
+            // failed (or had nothing admissible), its result is already final.
+            if self
+                .config
+                .max_attempts
+                .is_some_and(|max| pass.saturating_add(1) >= max)
+            {
+                return Err(last_error
+                    .unwrap_or_else(|| CryptoError::Retryable("attempts exhausted".to_string())));
+            }
+
             // Whole pass failed (or nothing admissible): back off with full
             // jitter — no permits are held here (SPEC §31) — never past
             // the deadline.
