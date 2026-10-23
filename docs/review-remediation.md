@@ -1716,3 +1716,17 @@ with local launcher/descendant processes, including EOF, normal SSH waits,
 pre-reset and crash checks, repeated cleanup, and preserved exit status. These
 tests require no cloud resources, guest images, or devices; external GCE and
 Firecracker qualification is unchanged.
+
+## BUG-156 — test enumeration exceeds the campaign deadline (2026-10-23)
+
+Storage-repeat preparation uses the remaining campaign budget for every build
+and test-list invocation, checks the deadline around binary freezing, and starts
+no further child after expiry or cancellation. A preparation timeout records
+`incomplete`; an explicit stop retains `cancelled`. Per-child caps remain
+1,800 seconds for builds and 30 seconds for enumeration.
+
+The `bug156` regressions in `scripts/test_storage_repeat_validation.py` advance
+an injected clock across build, binary copy, and enumeration stages. They check
+shared-budget exhaustion, no launch after expiry, and terminal status alongside
+successful preparation and explicit-stop controls. No Rust build or external
+storage campaign is needed to exercise these scheduling boundaries.
