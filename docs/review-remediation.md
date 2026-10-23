@@ -1704,6 +1704,19 @@ batch controls. Before this change, seven cases failed and four controls passed;
 all eleven pass with the change. This is branch-local regression evidence;
 integration and release qualification are separate.
 
+## Mountinfo path whitespace (BUG-164, 2026-10-24)
+
+Mount observation, detach, recovery and NBD allocation now split mountinfo
+fields only at ASCII spaces. Unicode whitespace and unescaped control bytes
+inside kernel path fields remain part of the path; the existing octal escapes
+for spaces, tabs, newlines and backslashes still decode normally.
+
+`maki-privileged/tests/regression_mountinfo_fields.rs` reproduces the missing
+mount observation for accepted Unicode paths and covers source fields and
+existing escapes. Fixture tests cover detach, nested mounts, recovery and
+allocation. These are parser and simulated-sysfs regressions, not a new
+privileged NBD/LVM/XFS qualification campaign.
+
 ## BUG-155 — validation launcher exits before its descendants (2026-10-23)
 
 The GCP and Firecracker controllers retain their launcher PID until process-group
