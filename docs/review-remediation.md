@@ -1688,3 +1688,16 @@ tracks each fix's failing regression and post-fix evidence, with explicit
 limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
+
+## BUG-155 — validation launcher exits before its descendants (2026-10-23)
+
+The GCP and Firecracker controllers retain their launcher PID until process-group
+cleanup. Exit probes use `waitid(WNOWAIT)`, and normal SSH waits terminate the
+owned group before reaping its leader. `close()` also cleans descendants after
+an early launcher exit and never signals a group after its leader was reaped.
+
+`scripts/test_validation_process_cleanup_validation.py` covers both controllers
+with local launcher/descendant processes, including EOF, normal SSH waits,
+pre-reset and crash checks, repeated cleanup, and preserved exit status. These
+tests require no cloud resources, guest images, or devices; external GCE and
+Firecracker qualification is unchanged.
