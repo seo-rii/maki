@@ -1688,3 +1688,17 @@ tracks each fix's failing regression and post-fix evidence, with explicit
 limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
+
+## BUG-156 — test enumeration exceeds the campaign deadline (2026-10-23)
+
+Storage-repeat preparation uses the remaining campaign budget for every build
+and test-list invocation, checks the deadline around binary freezing, and starts
+no further child after expiry or cancellation. A preparation timeout records
+`incomplete`; an explicit stop retains `cancelled`. Per-child caps remain
+1,800 seconds for builds and 30 seconds for enumeration.
+
+The `bug156` regressions in `scripts/test_storage_repeat_validation.py` advance
+an injected clock across build, binary copy, and enumeration stages. They check
+shared-budget exhaustion, no launch after expiry, and terminal status alongside
+successful preparation and explicit-stop controls. No Rust build or external
+storage campaign is needed to exercise these scheduling boundaries.
