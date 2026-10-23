@@ -1688,3 +1688,17 @@ tracks each fix's failing regression and post-fix evidence, with explicit
 limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
+
+## BUG-158: return exhausted retry results before backoff
+
+The endpoint dispatcher checks the completed pass against `max_attempts`
+before scheduling backoff. A failed final pass returns its last provider
+error immediately; peers within the pass still receive failover attempts.
+Backoff remains between permitted passes, including the unlimited policy,
+and the operation deadline still bounds in-flight RPCs.
+
+`review_final_backoff.rs` reproduces the extra final sleep for encrypt,
+decrypt, multiple peers and an exhausted pass with no admissible peer. It
+also covers zero attempts, success, unlimited retries and operation deadlines.
+This records the change and regression coverage, not remote-main integration
+or release qualification.
