@@ -91,9 +91,9 @@ impl VolumeConfig {
                 self.crypto.effective_compatibility_id().len() as u64,
             ))
             .saturating_add(6);
-        let normal = context
-            .saturating_add(count.saturating_mul(delimited_len(item)))
-            .max(self.crypto.batch.max_bytes.0);
+        // max_bytes is an admission ceiling, not a payload size. The item
+        // ceiling (and any incomplete final unit) can make it unreachable.
+        let normal = context.saturating_add(count.saturating_mul(delimited_len(item)));
         // Attach's context-binding probe appends this suffix to the profile
         // and decrypts one ciphertext at unit zero. The longer string can
         // cross a protobuf varint boundary even when a normal singleton fits.
@@ -121,11 +121,10 @@ impl VolumeConfig {
         let envelope = r#"{"format":4294967295,"id":18446744073709551615,"items":[],"op":"decrypt","profile":,"volume":"00000000-0000-0000-0000-000000000000"}"#.len() as u64;
         let item = (r#"{"data":"","unit":18446744073709551615}"#.len() as u64)
             .saturating_add(base64_len(payload));
-        let bound = envelope
+        Ok(envelope
             .saturating_add(json_string_len(&self.crypto.effective_compatibility_id()))
             .saturating_add(count.saturating_mul(item))
-            .saturating_add(count.saturating_sub(1));
-        Ok(bound.max(base64_len(self.crypto.batch.max_bytes.0)))
+            .saturating_add(count.saturating_sub(1)))
     }
 
     pub(super) fn http_response_bound(
