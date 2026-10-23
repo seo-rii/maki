@@ -64,6 +64,143 @@ class BackgroundStorageTests(unittest.TestCase):
                 self.runner.prepare(self.root, {"profile": "typo"}, time.monotonic() + 30)
             child.assert_not_called()
 
+    def prepare_with_clock(self, budget, build_seconds=0, list_seconds=0,
+                           after_child=None, groups=None):
+        """Advance a fake clock while exercising real prepare orchestration."""
+        clock = [0]
+        calls = []
+        groups = groups or {"fixture": ("one", "two", "three")}
+
+        def child(command, _cwd, log, stop, timeout, **_kwargs):
+            calls.append((command, timeout))
+            is_build = command[0] == "cargo"
+            seconds = build_seconds if is_build else list_seconds
+            clock[0] += min(seconds, max(0, timeout))
+            if stop.exists():
+                result = {"exit_code": 130, "reason": "cancelled"}
+            elif timeout < seconds:
+                result = {"exit_code": -9, "reason": "timeout"}
+            else:
+                result = {"exit_code": 0, "reason": "exited"}
+            if is_build:
+                package = command[command.index("-p") + 1]
+                events = []
+                for name in groups[package]:
+                    artifact = self.root / (name + "-built")
+                    artifact.write_bytes(b"fixture binary")
+                    events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
+                                              "executable": str(artifact)}))
+                log.write_text("\n".join(events))
+            else:
+                log.write_text("fixture: test\n")
+            if after_child is not None:
+                after_child(command, clock)
+            return result
+
+        config = {"source": str(self.root), "target_dir": str(self.root / "target")}
+        with mock.patch.object(self.runner, "suite_groups", return_value=groups), \
+                mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.runner, "run_child", side_effect=child):
+            error = None
+            try:
+                self.runner.prepare(self.root, config, budget)
+            except Exception as caught:
+                error = caught
+        return calls, clock[0], error
+
+    def test_bug156_enumeration_uses_remaining_campaign_budget(self):
+        calls, elapsed, error = self.prepare_with_clock(1, build_seconds=.2, list_seconds=.6)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(len(calls), 3, "expired campaign must not enumerate another binary")
+        self.assertAlmostEqual(calls[1][1], .8)
+        self.assertAlmostEqual(calls[2][1], .2)
+        self.assertAlmostEqual(elapsed, 1)
+        self.assertFalse((self.root / "binaries.json").exists())
+
+    def test_bug156_expired_preparation_starts_no_build(self):
+        calls, _, error = self.prepare_with_clock(0)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(calls, [])
+        self.assertFalse((self.root / "bin").exists())
+
+    def test_bug156_no_new_build_or_enumeration_after_budget_expires(self):
+        calls, _, error = self.prepare_with_clock(
+            1, build_seconds=1, groups={"first": ("one",), "second": ("two",)})
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse((self.root / "bin").exists())
+
+    def test_bug156_time_spent_freezing_binary_is_in_campaign_budget(self):
+        def child_completed(command, clock):
+            if command[0] == "cargo":
+                # Reading/copying artifacts can exhaust the remaining budget
+                # even when the preceding child completed successfully.
+                original = self.runner.shutil.copyfile
+
+                def copyfile(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    clock[0] = 1
+                    return result
+
+                patch = mock.patch.object(self.runner.shutil, "copyfile", side_effect=copyfile)
+                patch.start()
+                self.addCleanup(patch.stop)
+
+        calls, _, error = self.prepare_with_clock(1, after_child=child_completed)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse((self.root / "binaries.json").exists())
+
+    def test_preparation_preserves_per_child_caps_with_enough_budget(self):
+        calls, elapsed, error = self.prepare_with_clock(2000, build_seconds=1, list_seconds=1)
+        self.assertIsNone(error)
+        self.assertEqual([timeout for _, timeout in calls], [1800, 30, 30, 30])
+        self.assertEqual(elapsed, 4)
+        manifest = json.loads((self.root / "binaries.json").read_text())
+        self.assertEqual(set(manifest), {"one", "two", "three"})
+        self.assertTrue(all(item["expected_tests"] == 1 for item in manifest.values()))
+
+    def test_preparation_child_cap_timeout_remains_incomplete(self):
+        for stage, build_seconds, list_seconds, expected in (
+                ("build", 1801, 0, 1800), ("list", 0, 31, 30)):
+            with self.subTest(stage=stage):
+                self.root = Path(self.temp.name) / stage
+                self.root.mkdir()
+                _, elapsed, error = self.prepare_with_clock(
+                    2000, build_seconds=build_seconds, list_seconds=list_seconds)
+                self.assertIsInstance(error, TimeoutError)
+                self.assertEqual(elapsed, expected)
+                self.assertFalse((self.root / "binaries.json").exists())
+
+    def test_preparation_does_not_launch_next_child_after_stop(self):
+        def stop_after_build(command, _clock):
+            if command[0] == "cargo":
+                (self.root / "STOP").touch()
+
+        calls, _, error = self.prepare_with_clock(100, after_child=stop_after_build)
+        self.assertIsNotNone(error)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse((self.root / "binaries.json").exists())
+
+    def test_bug156_preparation_timeout_is_incomplete_and_stop_is_cancelled(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                directory = self.root / str(cancelled)
+                directory.mkdir()
+                self.runner.save_json(directory / "config.json", {
+                    "rounds": 1, "max_seconds": 10, "suite_timeout": 5,
+                    "revision": "fixture", "source": str(directory),
+                })
+                if cancelled:
+                    (directory / "STOP").touch()
+                with mock.patch.object(self.runner, "prepare", side_effect=TimeoutError("preparation deadline")):
+                    self.assertEqual(self.runner.worker(directory), 1)
+                report = json.loads((directory / "status.json").read_text())
+                self.assertEqual(report["state"], "cancelled" if cancelled else "incomplete")
+                self.assertEqual(report["completed_rounds"], 0)
+                self.assertEqual(report["passed_tests"], 0)
+                self.assertIn("preparation deadline", report["error"])
+
     def test_each_started_campaign_uses_its_own_target_directory(self):
         def completed(command, **_kwargs):
             if command[:2] == ["git", "archive"]:

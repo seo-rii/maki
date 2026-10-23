@@ -87,7 +87,11 @@ group and records `cancelled`. `SIGTERM` or `SIGINT` while a build or suite is
 active follows the same cancellation path, kills that child's process group,
 and records a nonzero supervisor exit. A suite timeout or the campaign deadline
 leaves an incomplete result. The default suite timeout is 900 seconds; build timeout is
-at most 1,800 seconds within the overall budget. Output growth beyond 64 MiB per
+at most 1,800 seconds within the overall budget. Preparation shares that budget:
+each test-list invocation gets at most 30 seconds and no more than the remaining
+campaign time. The runner checks the deadline between builds, binary copies and
+list invocations; an expired preparation records `incomplete` and starts no
+further child. Output growth beyond 64 MiB per
 child is checked periodically and stops the child; this is a stop threshold,
 not an exact file-size cap. Less than 512 MiB free before a suite also stops the
 run. Starting requires at least 2 GiB free.
