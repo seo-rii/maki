@@ -1689,6 +1689,34 @@ limits on the unexecuted host campaigns. F10–F15 remain an operational design
 and qualification backlog; I01–I27 and T01–T56 are mapped there without being
 reported as completed. Production qualification remains Pending.
 
+## BUG-153: admitted queue time and batch waiting (2026-10-23)
+
+This change records when each group enters the admitted scheduler queue and
+retains that time through dispatch-slot waits and incompatible-group carryover.
+Coalescing uses the oldest live group's original `max_wait` deadline; cancelling
+that group selects the surviving group's deadline. Queue admission waits remain
+outside the coalescing window, and dispatch capacity still bounds concurrency.
+The eleven ManualClock cases in
+[`review_scheduler_queue_wait.rs`](../crates/maki-crypto/tests/review_scheduler_queue_wait.rs)
+cover both lanes, expired and partly elapsed windows, a 180 ms operation budget,
+context/unit incompatibility, cancellation, admission, and full/zero-wait/fresh
+batch controls. Before this change, seven cases failed and four controls passed;
+all eleven pass with the change. This is branch-local regression evidence;
+integration and release qualification are separate.
+
+## BUG-155 — validation launcher exits before its descendants (2026-10-23)
+
+The GCP and Firecracker controllers retain their launcher PID until process-group
+cleanup. Exit probes use `waitid(WNOWAIT)`, and normal SSH waits terminate the
+owned group before reaping its leader. `close()` also cleans descendants after
+an early launcher exit and never signals a group after its leader was reaped.
+
+`scripts/test_validation_process_cleanup_validation.py` covers both controllers
+with local launcher/descendant processes, including EOF, normal SSH waits,
+pre-reset and crash checks, repeated cleanup, and preserved exit status. These
+tests require no cloud resources, guest images, or devices; external GCE and
+Firecracker qualification is unchanged.
+
 ## BUG-156 — test enumeration exceeds the campaign deadline (2026-10-23)
 
 Storage-repeat preparation uses the remaining campaign budget for every build

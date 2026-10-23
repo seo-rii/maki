@@ -359,7 +359,7 @@ class RemoteProcess:
                 raise TimeoutError("guest SSH event deadline")
             chunk = os.read(self.child.stdout.fileno(), 4096)
             if not chunk:
-                status = self.child.poll()
+                status = self.poll()
                 raise RuntimeError(f"guest SSH closed before expected event: {status}")
             self.total += len(chunk)
             if self.total > MAX_OUTPUT:
@@ -378,7 +378,7 @@ class RemoteProcess:
 
     def wait_after_reset(self, timeout):
         try:
-            status = self.child.wait(timeout=timeout)
+            status = self._wait_owned(timeout)
         except subprocess.TimeoutExpired as error:
             self._kill_owned()
             raise TimeoutError("old guest SSH remained alive after reset") from error
@@ -386,16 +386,40 @@ class RemoteProcess:
 
     def wait_clean(self, timeout):
         try:
-            status = self.child.wait(timeout=timeout)
+            status = self._wait_owned(timeout)
         except subprocess.TimeoutExpired as error:
             self._kill_owned()
             raise TimeoutError("verification SSH did not exit") from error
         if status != 0:
             raise RuntimeError(f"verification SSH exited {status}")
 
+    def poll(self):
+        if self.child.returncode is not None:
+            return self.child.returncode
+        # Retain the leader, including a zombie, until group cleanup. Reaping
+        # it here could let the PID/PGID be reused before close().
+        status = os.waitid(os.P_PID, self.child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if status is None:
+            return None
+        return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+
+    def _wait_owned(self, timeout):
+        until = time.monotonic() + timeout
+        while self.poll() is None:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.child.args, timeout)
+            time.sleep(min(.05, remaining))
+        self._kill_owned()
+        return self.child.returncode
+
     def _kill_owned(self):
-        if self.child is not None and self.child.poll() is None:
-            os.killpg(self.child.pid, signal.SIGKILL)
+        if self.child is not None and self.child.returncode is None:
+            # The leader is still ours even if it exited before its children.
+            try:
+                os.killpg(self.child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             self.child.wait(timeout=5)
 
     def close(self):
@@ -408,7 +432,7 @@ class RemoteProcess:
 
 
 def cut_instance(args, process, baseline=None):
-    if process.child.poll() is not None:
+    if process.poll() is not None:
         raise RuntimeError("guest SSH exited before reset was invoked")
     reset_result = reset_instance(args, args.timeout)
     running = None
