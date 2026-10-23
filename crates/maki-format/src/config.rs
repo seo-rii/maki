@@ -1364,6 +1364,7 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 
 /// Scheme and host of an endpoint URL. Rejects userinfo (credentials in a
 /// URL) and anything that does not look like `scheme://host[:port][/...]`.
+/// An explicit nonempty port must be a decimal number that fits in `u16`.
 pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
     let (scheme, rest) = url
         .split_once("://")
@@ -1385,14 +1386,25 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             redacted_url(url)
         )));
     }
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        stripped.split(']').next().unwrap_or("").to_string()
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let (host, suffix) = stripped
+            .split_once(']')
+            .ok_or_else(|| invalid("endpoint url has an unclosed IPv6 host"))?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or_else(|| invalid("endpoint url has an invalid port suffix"))?,
+            )
+        };
+        (host, port)
     } else {
         authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-            .to_string()
+            .split_once(':')
+            .map(|(host, port)| (host, Some(port)))
+            .unwrap_or((authority, None))
     };
     if host.is_empty() {
         return Err(invalid(format!(
@@ -1400,7 +1412,19 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             redacted_url(url)
         )));
     }
-    Ok((scheme.to_ascii_lowercase(), host))
+    // An empty port means the scheme's default, as in the transport URL
+    // parsers. Do not silently accept a nonnumeric or out-of-range port
+    // and defer a permanent configuration error until the first request.
+    if let Some(port) = port {
+        if !port.is_empty()
+            && (!port.bytes().all(|byte| byte.is_ascii_digit()) || port.parse::<u16>().is_err())
+        {
+            return Err(invalid(
+                "endpoint url has an invalid port; expected a decimal number from 0 to 65535",
+            ));
+        }
+    }
+    Ok((scheme.to_ascii_lowercase(), host.to_string()))
 }
 
 /// Hosts a plaintext transport may talk to without crossing the network.
