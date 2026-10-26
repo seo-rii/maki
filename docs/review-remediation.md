@@ -17,6 +17,22 @@ proposed PR fixes from remote-main changes and combined qualification.
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
+## Sentinel diagnostic contents (BUG-167, 2026-10-26)
+
+Mount identity rejection and an initialization attempt over an existing
+sentinel included the observed file contents in their errors. The workload
+owns that file, so a malformed sentinel could send decrypted payload bytes
+to helper stderr or a service log. Both paths now report a value-free mismatch;
+the verifier identifies a missing or unreadable sentinel separately. UUID
+case handling and the atomic, no-replacement write/retry protocol are unchanged.
+
+`maki-privileged`'s `review_sentinel_diagnostics.rs` first reproduced both
+leaks, then checks `Display`, `Debug`, and the error source chain for arbitrary
+text and a different well-formed UUID. It also covers missing sentinels,
+preservation of rejected files, creation, and identical case-insensitive
+retries. The executor tests use only disposable regular files; no mount,
+LVM, NBD, service, or physical qualification runs are implied.
+
 ## Further reliability review (2026-09-05)
 
 The next pass started from `aae6ee9` and reproduced seven more defects in the
