@@ -17,6 +17,22 @@ proposed PR fixes from remote-main changes and combined qualification.
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
+## Sentinel diagnostic contents (BUG-167, 2026-10-26)
+
+Mount identity rejection and an initialization attempt over an existing
+sentinel included the observed file contents in their errors. The workload
+owns that file, so a malformed sentinel could send decrypted payload bytes
+to helper stderr or a service log. Both paths now report a value-free mismatch;
+the verifier identifies a missing or unreadable sentinel separately. UUID
+case handling and the atomic, no-replacement write/retry protocol are unchanged.
+
+`maki-privileged`'s `review_sentinel_diagnostics.rs` first reproduced both
+leaks, then checks `Display`, `Debug`, and the error source chain for arbitrary
+text and a different well-formed UUID. It also covers missing sentinels,
+preservation of rejected files, creation, and identical case-insensitive
+retries. The executor tests use only disposable regular files; no mount,
+LVM, NBD, service, or physical qualification runs are implied.
+
 ## Further reliability review (2026-09-05)
 
 The next pass started from `aae6ee9` and reproduced seven more defects in the
@@ -529,6 +545,23 @@ attach). Not a durability bug; a fail-*open* diagnostic gap.
 | ID | Finding | Fix | Regression tests |
 |---|---|---|---|
 | BUG-027 | **`maki check` passed a volume `maki attach` would reject: a cataloged shard with a missing data file was only a warning when its allocation map was empty.** The fast checker errored on a missing data file *only* inside the `map.set_count() > 0` arm, then pushed an unconditional "data file not yet created" warning otherwise — so a cataloged shard with a valid but empty allocation map and no data file left the report error-free (`ok() == true`). `SlotStore::open`, though, opens every cataloged shard's data file with `create=false` regardless of its allocation map and returns `CoreError::Corrupt` if it is absent, so recovery refuses to attach. The "not yet created" state the warning described cannot arise for a *cataloged* shard: `ensure_shard` creates and `sync_dir`s the data file's dirent *before* the catalog names the shard (the reverse ordering only ever yields an orphan data file, which is adopted, not a cataloged shard with no file). | The missing-data-file check is a single unconditional error per cataloged shard, matching recovery, and the misleading warning is removed. `maki check` now fails exactly when attach would. | `fast_check_flags_a_cataloged_shard_with_no_data_file` (maki-core `review_check.rs`) |
+
+## Deep-check metadata I/O failures (BUG-133, 2026-10-26)
+
+An I/O failure while inspecting checkpoint copies, loading checkpoint state or
+reading the key canary now stops the deep check with the original error kind
+and OS error number. The same rule covers wrapped metadata I/O errors from the
+journal scanner and slot store after the fast check has succeeded. An unreadable
+file no longer contributes to an `unrecoverable` verdict; invalid bytes and
+foreign-volume metadata retain their existing corruption classification.
+
+[`review_deep_metadata_io.rs`](../crates/maki-core/tests/review_deep_metadata_io.rs)
+injects one-shot failures into those five boundaries, including a successful
+earlier inspection or later read. It checks that removing the fault restores a
+clean report and the original checkpointed and journaled ciphertext. Controls
+cover fast-check I/O propagation, damaged checkpoint copies, a foreign canary,
+and valid A/B fallback. This changes diagnostics only; disk formats, recovery
+ordering and durability guarantees are unchanged.
 
 ## Supplementary review (2026-09-07): R01–R08
 
@@ -1704,6 +1737,19 @@ batch controls. Before this change, seven cases failed and four controls passed;
 all eleven pass with the change. This is branch-local regression evidence;
 integration and release qualification are separate.
 
+## Mountinfo path whitespace (BUG-164, 2026-10-24)
+
+Mount observation, detach, recovery and NBD allocation now split mountinfo
+fields only at ASCII spaces. Unicode whitespace and unescaped control bytes
+inside kernel path fields remain part of the path; the existing octal escapes
+for spaces, tabs, newlines and backslashes still decode normally.
+
+`maki-privileged/tests/regression_mountinfo_fields.rs` reproduces the missing
+mount observation for accepted Unicode paths and covers source fields and
+existing escapes. Fixture tests cover detach, nested mounts, recovery and
+allocation. These are parser and simulated-sysfs regressions, not a new
+privileged NBD/LVM/XFS qualification campaign.
+
 ## BUG-155 — validation launcher exits before its descendants (2026-10-23)
 
 The GCP and Firecracker controllers retain their launcher PID until process-group
@@ -1790,6 +1836,20 @@ and cancellation/success/error controls with `ManualClock`. Five cases failed
 before the change. This branch's tests are separate from main integration and
 release qualification.
 
+## Endpoint port preflight (BUG-165, 2026-10-24)
+
+Shared HTTP, WebSocket and gRPC configuration validation rejects nondecimal
+and out-of-range endpoint ports. HTTP provider construction also parses its
+actual endpoint URL, including direct construction and a `from_config` URL
+override, so these errors surface before the first request.
+
+`maki-format/tests/review_config.rs` calls semantic configuration validation
+and covers IPv4, bracketed IPv6 and port boundaries. HTTP's
+`review_endpoint_ports.rs` exercises both constructors and a real loopback
+roundtrip with path and query composition. Empty/default ports, zero and
+65535 retain their existing URL-parser behavior. No new dependency or
+production-provider qualification is introduced.
+
 ## Reachable transport batch capacity (BUG-162, 2026-10-23)
 
 The gRPC and WebSocket configuration bounds use the number of provider units
@@ -1805,3 +1865,37 @@ connections. They retain larger-batch rejection and byte-limit controls.
 The older full-batch configuration regression now selects enough items to
 make its large byte budget reachable. This describes the change and its
 local regression coverage; remote CI and main integration remain separate.
+
+## GCE configuration BOM compatibility (BUG-172, 2026-10-26)
+
+The guest's provider check accepts one leading UTF-8 BOM, matching Maki's
+Rust TOML parser. The provider-evidence check added in PR #114 previously
+rejected such an otherwise valid configuration before starting nbdkit.
+Strict UTF-8 decoding, TOML validation, provider matching and value-free
+error diagnostics remain in place.
+
+`scripts.test_gcp_provider_validation` uses a complete local-provider
+configuration with and without a BOM through the guest's actual `main()`
+for both reset profiles and write/verify-only boots. All four BOM subcases
+failed before the fix; the plain-input controls passed. The suite also
+checks malformed UTF-8/TOML, a different provider, repeated or misplaced
+BOMs and a BOM inside the provider value. VM, NBD and process boundaries
+are mocked; these tests do not perform an external reset campaign.
+
+## Attach configuration diagnostics (BUG-168, 2026-10-26)
+
+Attach configuration parsing retained `toml::de::Error`, whose renderings can
+include rejected values, unknown field names, and the input document. An
+accidentally pasted credential could therefore reach helper stderr even when
+the configuration was rejected. Parsing now retains only a fixed error
+classification and its line/column, following the volume parser's existing
+policy. The original parser error is neither stored nor exposed as a source.
+Accepted attach settings and request validation are unchanged.
+
+`review_attach_config_diagnostics.rs` in `maki-privileged` covers type,
+unknown-field, syntax, and nested-schema failures through `Display`, `Debug`,
+and the error source chain, plus location and successful-parse controls. The
+same-named `maki-attach` suite exercises actual unprivileged `--plan` processes
+and a valid plan. The regressions failed before the change. These tests do not
+perform mount, LVM, NBD, service, or physical qualification operations, and
+the privileged crate gains no crypto dependency.

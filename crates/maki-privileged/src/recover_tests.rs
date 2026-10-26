@@ -672,3 +672,27 @@ fn recovery_refuses_an_extra_mount_and_never_reads_the_sentinel() {
             .mounted
     );
 }
+
+#[test]
+fn mountinfo_unicode_whitespace_preserves_recovery_and_complete_mount_identity() {
+    let (_fixture, state, _req, system) = attached();
+    let mut record = state.read("pg").unwrap().unwrap();
+    for space in ['\u{00a0}', '\u{2003}', '\u{3000}'] {
+        record.attachment.mountpoint = format!("/srv/audit{space}data");
+        let mounts = system.mounts(&record);
+        assert!(
+            recover::observe(&record, &mounts, &system.sysfs)
+                .unwrap()
+                .mounted
+        );
+        assert_eq!(
+            recover::observe_complete(&record, &mounts, &system.sysfs)
+                .unwrap()
+                .device,
+            (253, 0)
+        );
+
+        let extra = format!("{mounts}41 25 253:0 / /srv/other{space}data rw - xfs /dev/dm-0 rw\n");
+        assert!(recover::observe(&record, &extra, &system.sysfs).is_err());
+    }
+}
