@@ -149,19 +149,19 @@ class HostContracts(unittest.TestCase):
             "disks": [
                 {"boot": True, "deviceName": "boot", "source": "zones/z/disks/boot"},
                 {"boot": False, "deviceName": "maki-data",
-                 "source": "https://compute.googleapis.com/compute/v1/projects/p/zones/z/disks/maki-reset-data"},
+                 "source": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data"},
             ],
         }
         disk = {"id": "202", "selfLink":
-                "https://compute.googleapis.com/compute/v1/projects/p/zones/z/disks/maki-reset-data"}
+                "https://compute.googleapis.com/compute/v1/projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data"}
         replies = [subprocess.CompletedProcess([], 0, json.dumps(instance).encode(), b""),
                    subprocess.CompletedProcess([], 0, json.dumps(disk).encode(), b"")]
         with mock.patch.object(self.host, "bounded_run", side_effect=replies):
             identity = self.host.resource_identity(args, 30)
         self.assertEqual(identity, {
             "instance_id": "101", "data_disk_id": "202",
-            "data_disk_self_link": disk["selfLink"],
-            "attachment_source": instance["disks"][1]["source"],
+            "data_disk_self_link": "projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data",
+            "attachment_source": "projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data",
             "attachment_device_name": "maki-data", "status": "RUNNING",
         })
 
@@ -365,6 +365,154 @@ host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"ValueError", result.stderr)
         self.assertFalse(self.ledger.exists())
+
+
+class ResourceIdentityContracts(unittest.TestCase):
+    """Resource descriptions must identify the disk actually attached to the VM."""
+
+    def setUp(self):
+        self.host = load("gcp_resource_identity", "gcp-reset-validation.py")
+        self.args = types.SimpleNamespace(
+            gcloud="never-run-gcloud", project="test-project", zone="test-zone-a",
+            instance="fixture", data_disk="expected-disk",
+        )
+        self.disk_path = "projects/test-project/zones/test-zone-a/disks/expected-disk"
+        self.disk_url = "https://compute.googleapis.com/compute/v1/" + self.disk_path
+        self.instance = {
+            "id": "101", "status": "RUNNING", "disks": [
+                {"boot": False, "deviceName": "expected-disk", "source": self.disk_url},
+            ],
+        }
+        self.disk = {"id": "202", "selfLink": self.disk_url}
+
+    def identity(self, instance=None, disk=None):
+        values = (self.instance if instance is None else instance,
+                  self.disk if disk is None else disk)
+        replies = [subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b"")
+                   for value in values]
+        with mock.patch.object(self.host, "bounded_run", side_effect=replies) as run:
+            value = self.host.resource_identity(self.args, 30)
+        self.assertEqual(run.call_count, 2)
+        command = run.call_args.args[0]
+        self.assertEqual(command[2:5], ["disks", "describe", "expected-disk"])
+        self.assertEqual(command[command.index("--project") + 1], "test-project")
+        self.assertEqual(command[command.index("--zone") + 1], "test-zone-a")
+        self.host.validate_resource_identity(value, value)
+        return value
+
+    def test_matching_attached_disk_is_accepted(self):
+        identity = self.identity()
+        self.assertEqual(identity["instance_id"], "101")
+        self.assertEqual(identity["data_disk_id"], "202")
+        self.assertEqual(identity["attachment_source"], identity["data_disk_self_link"])
+
+    def test_attached_disk_and_described_disk_must_match(self):
+        self.instance["disks"][0]["source"] = self.disk_url.replace("expected-disk", "another-disk")
+        with self.assertRaises(ValueError):
+            self.identity()
+
+    def test_null_disk_id_must_not_become_a_valid_string(self):
+        self.disk["id"] = None
+        with self.assertRaises(ValueError):
+            self.identity()
+
+    def test_same_name_in_another_project_or_zone_is_not_the_requested_disk(self):
+        for old, new in (("test-project", "other-project"), ("test-zone-a", "other-zone-a")):
+            for both in (False, True):
+                with self.subTest(scope=old, descriptions_agree=both):
+                    instance = json.loads(json.dumps(self.instance))
+                    wrong = self.disk_url.replace(old, new)
+                    instance["disks"][0]["source"] = wrong
+                    disk = dict(self.disk, selfLink=wrong) if both else self.disk
+                    with self.assertRaises(ValueError):
+                        self.identity(instance, disk)
+
+    def test_described_disk_must_match_the_requested_resource(self):
+        for old, new in (("test-project", "other-project"), ("test-zone-a", "other-zone-a"),
+                         ("expected-disk", "another-disk")):
+            with self.subTest(field=old):
+                disk = dict(self.disk, selfLink=self.disk_url.replace(old, new))
+                with self.assertRaises(ValueError):
+                    self.identity(disk=disk)
+
+    def test_equivalent_google_api_references_have_one_stable_identity(self):
+        references = (self.disk_path, self.disk_url,
+                      "https://www.googleapis.com/compute/v1/" + self.disk_path)
+        baseline = None
+        for source in references:
+            for self_link in references:
+                with self.subTest(source=source, self_link=self_link):
+                    instance = json.loads(json.dumps(self.instance))
+                    instance["disks"][0].update(source=source, deviceName="data-alias")
+                    current = self.identity(instance, dict(self.disk, selfLink=self_link))
+                    self.assertEqual(current["attachment_source"], self.disk_path)
+                    self.assertEqual(current["data_disk_self_link"], self.disk_path)
+                    if baseline is not None:
+                        self.host.validate_resource_identity(baseline, current)
+                    baseline = current
+
+    def test_missing_or_malformed_resource_ids_are_rejected(self):
+        invalid = (None, True, False, -1, 101.0, 1.5, "", "None", "101.0", "+101",
+                   "-101", " 101", "101 ", "1e2", "0101", "١٠١", [], {},
+                   1 << 64, str(1 << 64))
+        for resource in ("instance", "disk"):
+            for bad in invalid:
+                with self.subTest(resource=resource, value=bad):
+                    instance, disk = dict(self.instance), dict(self.disk)
+                    (instance if resource == "instance" else disk)["id"] = bad
+                    with self.assertRaises(ValueError):
+                        self.identity(instance, disk)
+            with self.subTest(resource=resource, missing=True):
+                instance, disk = dict(self.instance), dict(self.disk)
+                del (instance if resource == "instance" else disk)["id"]
+                with self.assertRaises(ValueError):
+                    self.identity(instance, disk)
+
+    def test_uint64_string_and_integer_ids_have_the_same_identity(self):
+        for value in (0, 1, (1 << 53) + 1, (1 << 64) - 1):
+            with self.subTest(value=value):
+                integer = self.identity(dict(self.instance, id=value), dict(self.disk, id=value))
+                string = self.identity(dict(self.instance, id=str(value)), dict(self.disk, id=str(value)))
+                self.assertEqual(integer, string)
+                self.assertEqual(integer["data_disk_id"], str(value))
+
+    def test_ambiguous_nonboot_attachments_are_rejected(self):
+        duplicate = dict(self.instance["disks"][0], deviceName="other-alias")
+        alias_collision = dict(self.instance["disks"][0],
+                               source=self.disk_url.replace("expected-disk", "another-disk"))
+        for other in (duplicate, alias_collision):
+            with self.subTest(attachment=other):
+                instance = dict(self.instance, disks=self.instance["disks"] + [other])
+                with self.assertRaises(ValueError):
+                    self.identity(instance)
+
+    def test_boot_attachment_cannot_be_the_data_disk(self):
+        self.instance["disks"][0]["boot"] = True
+        with self.assertRaises(ValueError):
+            self.identity()
+
+    def test_unrelated_boot_and_data_disks_do_not_change_selection(self):
+        self.instance["disks"].extend([
+            {"boot": True, "deviceName": "boot", "source": "projects/p/zones/z/disks/boot"},
+            {"boot": False, "deviceName": "other", "source": self.disk_url.replace("expected-disk", "other")},
+        ])
+        self.assertEqual(self.identity()["attachment_device_name"], "expected-disk")
+
+    def test_missing_or_malformed_resource_references_are_rejected(self):
+        invalid = (None, 202, "", "expected-disk", self.disk_url + "/", self.disk_url + "?x=1",
+                   self.disk_url + "#fragment", self.disk_url.replace("https:", "http:"),
+                   self.disk_url.replace("compute.googleapis.com", "foreign.invalid"),
+                   self.disk_url.replace("/zones/", "/regions/"),
+                   self.disk_url.replace("/disks/", "/instances/"),
+                   self.disk_url.replace("/expected-disk", "/%65xpected-disk"))
+        for field in ("source", "selfLink"):
+            for bad in invalid:
+                with self.subTest(field=field, value=bad):
+                    instance = json.loads(json.dumps(self.instance))
+                    disk = dict(self.disk)
+                    (instance["disks"][0] if field == "source" else disk)[field] = bad
+                    with self.assertRaises(ValueError):
+                        self.identity(instance, disk)
 
 
 class ResourceDeadlineContracts(unittest.TestCase):

@@ -213,26 +213,59 @@ def decode_json_result(result, what):
     return value
 
 
+def canonical_disk_reference(value):
+    # gcloud/API responses can use a resource path or either Google API host.
+    # Compare the complete resource, never just the basename or device alias.
+    pattern = (r"(?:https://(?:www|compute)\.googleapis\.com/compute/v1/)?"
+               r"(projects/[a-z][a-z0-9-]*/zones/[a-z0-9-]+/disks/"
+               r"[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)")
+    match = re.fullmatch(pattern, value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError("invalid GCE disk resource reference")
+    return match.group(1)
+
+
+def resource_id(value, resource):
+    # Compute IDs are uint64 values, normally encoded as decimal JSON strings.
+    # Do not turn null, booleans or rounded floating-point IDs into evidence.
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]{0,19}", value):
+        number = int(value)
+    else:
+        raise ValueError(f"invalid {resource} resource ID")
+    if not 0 <= number < 1 << 64:
+        raise ValueError(f"invalid {resource} resource ID")
+    return str(number)
+
+
 def resource_identity(args, timeout):
     # Both describes and their response processing share this lookup's budget.
     until = time.monotonic() + timeout
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("resource identity deadline")
+    expected_disk = canonical_disk_reference(
+        f"projects/{args.project}/zones/{args.zone}/disks/{args.data_disk}")
     instance_result = bounded_run(
         [args.gcloud, "compute", "instances", "describe", args.instance,
          "--project", args.project, "--zone", args.zone, "--format=json"], remaining)
     instance = decode_json_result(instance_result, "instance describe")
+    instance_id = resource_id(instance.get("id"), "instance")
     attachments = instance.get("disks")
     if not isinstance(attachments, list):
         raise ValueError("instance disk attachments missing")
     matches = [attachment for attachment in attachments
                if isinstance(attachment, dict) and attachment.get("boot") is False
                and (attachment.get("deviceName") == args.data_disk
-                    or str(attachment.get("source", "")).rsplit("/", 1)[-1] == args.data_disk)]
+                    or (isinstance(attachment.get("source"), str)
+                        and attachment["source"].rsplit("/", 1)[-1] == args.data_disk))]
     if len(matches) != 1:
         raise ValueError("expected one attached persistent data disk")
     attachment = matches[0]
+    attached_disk = canonical_disk_reference(attachment.get("source"))
+    if attached_disk != expected_disk:
+        raise ValueError("attached data disk does not match requested project, zone and name")
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("resource identity deadline")
@@ -240,11 +273,14 @@ def resource_identity(args, timeout):
         [args.gcloud, "compute", "disks", "describe", args.data_disk,
          "--project", args.project, "--zone", args.zone, "--format=json"], remaining)
     disk = decode_json_result(disk_result, "disk describe")
+    described_disk = canonical_disk_reference(disk.get("selfLink"))
+    if described_disk != attached_disk:
+        raise ValueError("described data disk does not match the attached resource")
     values = {
-        "instance_id": str(instance.get("id", "")),
-        "data_disk_id": str(disk.get("id", "")),
-        "data_disk_self_link": disk.get("selfLink"),
-        "attachment_source": attachment.get("source"),
+        "instance_id": instance_id,
+        "data_disk_id": resource_id(disk.get("id"), "disk"),
+        "data_disk_self_link": described_disk,
+        "attachment_source": attached_disk,
         "attachment_device_name": attachment.get("deviceName"),
         "status": instance.get("status"),
     }
