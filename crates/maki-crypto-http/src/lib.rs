@@ -736,6 +736,10 @@ fn classify_status(
 
 impl HttpCryptoProvider {
     pub fn new(spec: HttpProviderSpec) -> Result<Self, CryptoError> {
+        // Public callers can bypass config validation or override its URL.
+        // Refuse malformed endpoints before constructing a usable provider,
+        // rather than failing the first encryption request (BUG-165).
+        reqwest::Url::parse(&spec.base_url).map_err(|_| fatal("invalid HTTP endpoint URL"))?;
         // Never follow redirects: reqwest would replay the body (plaintext
         // on encrypt) to whatever `Location` the server names — possibly a
         // different host, possibly over plaintext HTTP — and turn a POST

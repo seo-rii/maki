@@ -1822,6 +1822,20 @@ and cancellation/success/error controls with `ManualClock`. Five cases failed
 before the change. This branch's tests are separate from main integration and
 release qualification.
 
+## Endpoint port preflight (BUG-165, 2026-10-24)
+
+Shared HTTP, WebSocket and gRPC configuration validation rejects nondecimal
+and out-of-range endpoint ports. HTTP provider construction also parses its
+actual endpoint URL, including direct construction and a `from_config` URL
+override, so these errors surface before the first request.
+
+`maki-format/tests/review_config.rs` calls semantic configuration validation
+and covers IPv4, bracketed IPv6 and port boundaries. HTTP's
+`review_endpoint_ports.rs` exercises both constructors and a real loopback
+roundtrip with path and query composition. Empty/default ports, zero and
+65535 retain their existing URL-parser behavior. No new dependency or
+production-provider qualification is introduced.
+
 ## Reachable transport batch capacity (BUG-162, 2026-10-23)
 
 The gRPC and WebSocket configuration bounds use the number of provider units
