@@ -14,7 +14,7 @@
     },
     "hyper": {
       "files": {
-        "Cargo.lock": "106ba6ed2ad49a9c24588d56d45e8a82d0d6c6ce949065f40c22519aa9ad13ea",
+        "Cargo.lock": "4cbf3872850360d8a623138475f40d6b0bfbaf9578d38697155d4b1b8275f5b4",
         "Cargo.toml": "bbb0fdb53bf741687878c824773a5489fea829ccb7089e05200f85155e857b8c",
         "src/common/date.rs": "a0f90ed9115d766b450322ea57594610afc5411871d41cba8acc411ed4555c07",
         "src/error.rs": "1f8ffa4998ee431840fc623c8ad43925aa8f21346e427ef8eb9dd59950675480",

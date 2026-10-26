@@ -133,11 +133,17 @@ pub fn verify_mount_identity(
     )?;
     match &observed.sentinel_volume_uuid {
         Some(uuid) if uuid.eq_ignore_ascii_case(&expected.volume_uuid) => {}
-        other => {
-            return Err(MountVerifyError(format!(
-                "Maki volume sentinel mismatch: {other:?} != {:?}",
-                expected.volume_uuid
-            )))
+        Some(_) => {
+            // The workload owns this file: a mismatch can contain arbitrary
+            // decrypted data, not just a UUID. Never retain it in an error.
+            return Err(MountVerifyError(
+                "Maki volume sentinel does not match the expected volume UUID".into(),
+            ));
+        }
+        None => {
+            return Err(MountVerifyError(
+                "Maki volume sentinel is missing or unreadable".into(),
+            ));
         }
     }
     if !observed.nbd_connected {

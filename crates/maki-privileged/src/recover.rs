@@ -180,7 +180,7 @@ fn check_mounts(
         let (left, _) = line
             .split_once(" - ")
             .ok_or_else(|| invalid("incomplete mountinfo"))?;
-        let fields: Vec<_> = left.split_whitespace().collect();
+        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
         if fields.len() < 6 {
             return Err(invalid("incomplete mountinfo"));
         }
@@ -499,8 +499,8 @@ pub(super) fn observe_complete(
         let (left, right) = line
             .split_once(" - ")
             .ok_or_else(|| invalid("incomplete mountinfo"))?;
-        let fields: Vec<_> = left.split_whitespace().collect();
-        let filesystem: Vec<_> = right.split_whitespace().collect();
+        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
+        let filesystem: Vec<_> = crate::probe::mountinfo_fields(right).collect();
         if fields.len() < 6 || filesystem.len() < 3 {
             return Err(invalid("incomplete mountinfo"));
         }
