@@ -1791,3 +1791,21 @@ connections. They retain larger-batch rejection and byte-limit controls.
 The older full-batch configuration regression now selects enough items to
 make its large byte budget reachable. This describes the change and its
 local regression coverage; remote CI and main integration remain separate.
+
+## Attach configuration diagnostics (BUG-168, 2026-10-26)
+
+Attach configuration parsing retained `toml::de::Error`, whose renderings can
+include rejected values, unknown field names, and the input document. An
+accidentally pasted credential could therefore reach helper stderr even when
+the configuration was rejected. Parsing now retains only a fixed error
+classification and its line/column, following the volume parser's existing
+policy. The original parser error is neither stored nor exposed as a source.
+Accepted attach settings and request validation are unchanged.
+
+`review_attach_config_diagnostics.rs` in `maki-privileged` covers type,
+unknown-field, syntax, and nested-schema failures through `Display`, `Debug`,
+and the error source chain, plus location and successful-parse controls. The
+same-named `maki-attach` suite exercises actual unprivileged `--plan` processes
+and a valid plan. The regressions failed before the change. These tests do not
+perform mount, LVM, NBD, service, or physical qualification operations, and
+the privileged crate gains no crypto dependency.
