@@ -1794,6 +1794,20 @@ interleaved spending, values below the threshold, burst clipping, zero burst,
 large finite credits and invalid direct-API ratios. This records the change
 and regression coverage, not remote-main integration or release qualification.
 
+## Initial attach retry safety (BUG-166, 2026-10-24)
+
+Multi-endpoint attach probes honor the validation provider's `retry_safe`
+capability. A provider that does not permit resending receives one attempt;
+retry-safe providers retain up to three. This applies to both the self-test
+and the key-canary probe. A failed endpoint remains quarantined while a
+validated peer can serve requests, and no final backoff runs after exhaustion.
+
+`maki-nbdkit/tests/review_attach_retry.rs` drops HTTP response bodies after
+the server receives each complete request. It reproduces duplicate unsafe
+self-test and canary requests, preserves safe retries and normal dispatcher
+behavior, and checks the healthy peer's roundtrip. This is local transport
+regression evidence; it does not establish external-provider qualification.
+
 ## BUG-158: return exhausted retry results before backoff
 
 The endpoint dispatcher checks the completed pass against `max_attempts`
