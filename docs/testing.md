@@ -551,6 +551,8 @@ or different-provider configuration fails before launch. The guest's READY
 provider field comes from that validated configuration. These checks bind the
 reported provider to configuration; they do not replace binary provenance or
 the campaign's native I/O and durability checks.
+A single leading UTF-8 BOM is accepted, matching Maki's configuration parser;
+invalid UTF-8 or TOML and a different provider still fail before launch.
 This removes the workload VM's RAM, kernel, and page cache, while the Persistent
 Disk service and physical storage path stay operational. It is whole-VM reset
 evidence rather than physical power-loss evidence.

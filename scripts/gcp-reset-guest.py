@@ -176,7 +176,9 @@ def configured_provider(path):
     """Validate the campaign's provider before launching its data plane."""
     try:
         with path.open("rb") as stream:
-            config = tomllib.load(stream)
+            # Maki's TOML parser accepts one leading UTF-8 BOM. Decode it
+            # here too while retaining strict UTF-8 and TOML validation.
+            config = tomllib.loads(stream.read().decode("utf-8-sig"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         # Parser and file errors may include supplied configuration values.
         # Keep those values out of both the diagnostic and exception chain.

@@ -7,8 +7,25 @@ import os
 import pathlib
 import sys
 import tempfile
+import traceback
 import unittest
 from unittest import mock
+
+
+VALID_CONFIG = '''config_schema_version = 1
+[volume]
+name = "provider-contract"
+max_virtual_size = "1GiB"
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "v1"
+key = { source = "env", name = "synthetic-provider-key" }
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[backing]
+root = "/mnt/maki-data/synthetic-provider-backing"
+'''
 
 
 def load(name, filename):
@@ -96,17 +113,42 @@ class GuestProviderContracts(unittest.TestCase):
     def test_expected_provider_runs_both_profiles_and_reports_validated_identity(self):
         for profile in ("v2", "v3-discard"):
             for verify_only in (False, True):
-                with self.subTest(profile=profile, verify_only=verify_only):
-                    error, events, launch, _ = self.run_guest(
-                        '[crypto]\nprovider = "local-aes-gcm-siv"\n',
-                        profile=profile, verify_only=verify_only)
-                    self.assertIsNone(error)
-                    launch.assert_called_once()
-                    ready = events[0]
-                    self.assertEqual(ready["event"], "ready")
-                    self.assertEqual(ready["provider"], "local-aes-gcm-siv")
-                    self.host.validate_ready(ready, None, profile)
-                    self.assertEqual(events[-1]["event"], "verified" if verify_only else "ack")
+                for bom in ("", "\ufeff"):
+                    with self.subTest(profile=profile, verify_only=verify_only, bom=bool(bom)):
+                        error, events, launch, _ = self.run_guest(
+                            bom + VALID_CONFIG, profile=profile, verify_only=verify_only)
+                        self.assertIsNone(error)
+                        launch.assert_called_once()
+                        ready = events[0]
+                        self.assertEqual(ready["event"], "ready")
+                        self.assertEqual(ready["provider"], "local-aes-gcm-siv")
+                        self.host.validate_ready(ready, None, profile)
+                        self.assertEqual(events[-1]["event"], "verified" if verify_only else "ack")
+
+    def test_bom_does_not_admit_wrong_provider_or_malformed_config(self):
+        marker = "synthetic-bom-private-marker"
+        cases = {
+            "wrong-provider": "\ufeff" + VALID_CONFIG.replace(
+                'provider = "local-aes-gcm-siv"', f'provider = "{marker}"'),
+            "invalid-toml": "\ufeff" + VALID_CONFIG + f'\ninvalid = ["{marker}",',
+            "invalid-utf8": b"\xef\xbb\xbf" + VALID_CONFIG.encode()
+                + b"#" + marker.encode() + b"\xff",
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                error = self.assert_rejected(text)
+                self.assertNotIn(marker, str(error))
+                self.assertNotIn(marker, "".join(traceback.format_exception(error)))
+
+    def test_only_one_initial_bom_is_accepted(self):
+        for text in ("\ufeff\ufeff" + VALID_CONFIG,
+                     "\ufeff" + VALID_CONFIG.replace("[crypto]", "\ufeff[crypto]")):
+            with self.subTest(text=text):
+                self.assert_rejected(text)
+
+    def test_bom_inside_provider_value_is_preserved(self):
+        self.assert_rejected("\ufeff" + VALID_CONFIG.replace(
+            'provider = "local-aes-gcm-siv"', 'provider = "local-aes-\ufeffgcm-siv"'))
 
     def test_other_local_provider_is_rejected_before_launch(self):
         self.assert_rejected('[crypto]\nprovider = "local-aes-xts"\n')

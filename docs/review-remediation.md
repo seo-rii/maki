@@ -1808,3 +1808,19 @@ connections. They retain larger-batch rejection and byte-limit controls.
 The older full-batch configuration regression now selects enough items to
 make its large byte budget reachable. This describes the change and its
 local regression coverage; remote CI and main integration remain separate.
+
+## GCE configuration BOM compatibility (BUG-172, 2026-10-26)
+
+The guest's provider check accepts one leading UTF-8 BOM, matching Maki's
+Rust TOML parser. The provider-evidence check added in PR #114 previously
+rejected such an otherwise valid configuration before starting nbdkit.
+Strict UTF-8 decoding, TOML validation, provider matching and value-free
+error diagnostics remain in place.
+
+`scripts.test_gcp_provider_validation` uses a complete local-provider
+configuration with and without a BOM through the guest's actual `main()`
+for both reset profiles and write/verify-only boots. All four BOM subcases
+failed before the fix; the plain-input controls passed. The suite also
+checks malformed UTF-8/TOML, a different provider, repeated or misplaced
+BOMs and a BOM inside the provider value. VM, NBD and process boundaries
+are mocked; these tests do not perform an external reset campaign.
