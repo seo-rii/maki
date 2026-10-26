@@ -530,6 +530,23 @@ attach). Not a durability bug; a fail-*open* diagnostic gap.
 |---|---|---|---|
 | BUG-027 | **`maki check` passed a volume `maki attach` would reject: a cataloged shard with a missing data file was only a warning when its allocation map was empty.** The fast checker errored on a missing data file *only* inside the `map.set_count() > 0` arm, then pushed an unconditional "data file not yet created" warning otherwise — so a cataloged shard with a valid but empty allocation map and no data file left the report error-free (`ok() == true`). `SlotStore::open`, though, opens every cataloged shard's data file with `create=false` regardless of its allocation map and returns `CoreError::Corrupt` if it is absent, so recovery refuses to attach. The "not yet created" state the warning described cannot arise for a *cataloged* shard: `ensure_shard` creates and `sync_dir`s the data file's dirent *before* the catalog names the shard (the reverse ordering only ever yields an orphan data file, which is adopted, not a cataloged shard with no file). | The missing-data-file check is a single unconditional error per cataloged shard, matching recovery, and the misleading warning is removed. `maki check` now fails exactly when attach would. | `fast_check_flags_a_cataloged_shard_with_no_data_file` (maki-core `review_check.rs`) |
 
+## Deep-check metadata I/O failures (BUG-133, 2026-10-26)
+
+An I/O failure while inspecting checkpoint copies, loading checkpoint state or
+reading the key canary now stops the deep check with the original error kind
+and OS error number. The same rule covers wrapped metadata I/O errors from the
+journal scanner and slot store after the fast check has succeeded. An unreadable
+file no longer contributes to an `unrecoverable` verdict; invalid bytes and
+foreign-volume metadata retain their existing corruption classification.
+
+[`review_deep_metadata_io.rs`](../crates/maki-core/tests/review_deep_metadata_io.rs)
+injects one-shot failures into those five boundaries, including a successful
+earlier inspection or later read. It checks that removing the fault restores a
+clean report and the original checkpointed and journaled ciphertext. Controls
+cover fast-check I/O propagation, damaged checkpoint copies, a foreign canary,
+and valid A/B fallback. This changes diagnostics only; disk formats, recovery
+ordering and durability guarantees are unchanged.
+
 ## Supplementary review (2026-09-07): R01–R08
 
 A follow-up review (`maki-review-20260907`) of the privileged attach/detach/grow
