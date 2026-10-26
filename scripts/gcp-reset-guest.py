@@ -5,6 +5,7 @@ The data disk and its config must already be mounted at /mnt/maki-data. After
 the complete ACK frame this process deliberately remains alive without global
 sync, unmount, Maki drain, or daemon cleanup. The external host must reset the
 whole instance. `--verify-only` is the final read-only campaign boot and exits.
+Python 3.11 or later is required for standard-library TOML parsing.
 """
 import argparse
 import ctypes
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
@@ -170,6 +172,22 @@ def capabilities(client, profile="v2"):
     return result
 
 
+def configured_provider(path):
+    """Validate the campaign's provider before launching its data plane."""
+    try:
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        # Parser and file errors may include supplied configuration values.
+        # Keep those values out of both the diagnostic and exception chain.
+        raise ValueError("cannot read valid qualification TOML configuration") from None
+    crypto = config.get("crypto")
+    provider = crypto.get("provider") if isinstance(crypto, dict) else None
+    ensure(provider == "local-aes-gcm-siv",
+           'qualification requires crypto.provider = "local-aes-gcm-siv"')
+    return provider
+
+
 def run_output(command, timeout=10):
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                             timeout=timeout, env=dict(os.environ, PATH=SYSTEM_PATH), check=False)
@@ -290,6 +308,8 @@ def main():
     ensure(config.is_file() and plugin.is_file(), "config and plugin must be regular files")
     mount = pathlib.Path("/mnt/maki-data").resolve(strict=True)
     ensure(config == mount / "config.toml", "qualification config must be on the persistent data mount")
+    provider = configured_provider(config)
+    args.config = str(config)
     fs_uuid = filesystem_uuid(mount)
     witness = shutdown_witness(mount / "graceful-stop.jsonl")
     boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -310,7 +330,7 @@ def main():
         child, log, socket_path = run_nbdkit(args, runtime)
         client = Nbd(socket_path)
         features = capabilities(client, args.profile)
-        emit("ready", provider="local-aes-gcm-siv", config=str(config),
+        emit("ready", provider=provider, config=str(config),
              kernel=os.uname().release, fs_uuid=fs_uuid, **features, **witness)
         execute_cycle(args, client, emit)
     except BaseException as error:
