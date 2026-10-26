@@ -187,10 +187,20 @@ impl Directory {
             &child,
             libc::O_RDWR | libc::O_NONBLOCK | if create { libc::O_CREAT } else { 0 },
         )?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backing entry is not a regular file",
+            ));
+        }
+        // O_NOFOLLOW does not reject hardlinks. Inspect the opened inode,
+        // including existing files opened with O_CREAT and volume locks.
+        // This cannot prevent another link from being added after the check.
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backing entry must have exactly one hard link",
             ));
         }
         Ok(file)

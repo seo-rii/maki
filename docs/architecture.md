@@ -46,6 +46,25 @@ crypto credentials.
 | `maki-witness` | Remote witness client and server, etcd quorum store, and frontend failover |
 | `maki-test-support` | Durability oracle, crash backing, fake provider, manual clock, and failpoints |
 
+## Backing namespace
+
+Linux `FileBacking` resolves paths through pinned directory descriptors without
+following symlinks. Each file open checks the opened descriptor for a regular
+file with exactly one hard link, including existing files opened with creation
+enabled and volume lock files. This rejects existing aliases to another backing
+file or a file outside the root before returning a writable handle, using the
+same single-link policy as remote namespace garbage collection. Hardlink-based
+backing copies are unsupported while the extra links exist; see the
+[backing support requirements](deployment/support-matrix.md#backing-store-below-maki).
+
+The link count is checked only when a file is opened. A process able to change
+the namespace can add a hardlink after that check, and previously returned
+handles remain usable. This check does not isolate the backing from an actor
+with permission to modify its namespace or inodes; deployment must protect
+them through filesystem permissions and ownership. Non-Linux development
+backends retain pathname validation and do not provide this single-link check;
+the supported data plane is Linux-only.
+
 ## Read and write semantics
 
 The engine divides the device into fixed crypto units. Reads take a consistent

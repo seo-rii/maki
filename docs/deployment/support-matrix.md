@@ -79,6 +79,12 @@ locks and atomic rename.
 
 The backing directory and its ancestors must be real directories (no
 symlinks) on Linux, owned by the daemon user, mode `0700`.
+Backing files, including volume locks, must be regular files with exactly one
+hard link. Linux checks this on open and refuses existing hardlink aliases,
+including hardlink-based backing copies. The check cannot prevent later link
+creation or revoke already-open handles; filesystem ownership and permissions
+must protect the backing namespace and inodes
+([details](../architecture.md#backing-namespace)).
 
 ## Exported stack (above Maki)
 
