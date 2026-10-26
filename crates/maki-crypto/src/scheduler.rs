@@ -5,8 +5,9 @@
 //! `BatchScheduler` wraps a provider and coalesces concurrent requests into
 //! fewer, larger provider calls: a batch is flushed as soon as
 //! `target_items` / `target_bytes` are reached, and at the latest
-//! `max_wait` after its first item arrived; it never exceeds `max_items` /
-//! `max_bytes`. Requests are whole groups: a request's items are never
+//! `max_wait` after its oldest live group entered the admitted queue,
+//! subject to dispatch capacity; it never exceeds `max_items` / `max_bytes`.
+//! Requests are whole groups: a request's items are never
 //! split across batches and their order is preserved, so per-position
 //! validation in `CheckedProvider` keeps working. Requests that share a unit
 //! are never coalesced: two versions of one unit are interchangeable to
@@ -87,6 +88,7 @@ pub struct SchedulerStats {
     batched_items: AtomicU64,
     coalesced_batches: AtomicU64,
     inflight_batches: AtomicU64,
+    deadline_exceeded: AtomicU64,
 }
 
 impl SchedulerStats {
@@ -118,6 +120,13 @@ impl SchedulerStats {
     pub fn coalesced_batches_total(&self) -> u64 {
         self.coalesced_batches.load(Ordering::SeqCst)
     }
+
+    /// Completed encrypt/decrypt callers that received an operation deadline
+    /// error, including admission, coalescing and slot waits. Each caller is
+    /// counted once even when several callers share the same provider RPC.
+    pub fn deadline_exceeded_total(&self) -> u64 {
+        self.deadline_exceeded.load(Ordering::SeqCst)
+    }
 }
 
 /// A batch item addressed by its crypto unit.
@@ -148,6 +157,9 @@ struct Group<I, O> {
     context: CryptoContext,
     items: Vec<I>,
     logical_bytes: u64,
+    /// Queue age survives waiting behind another batch or being carried
+    /// over because the group does not fit the current batch (BUG-153).
+    enqueued_at: Duration,
     reply: Reply<O>,
     /// Queue capacity, released when the group is dispatched.
     _pending: PendingCharge,
@@ -343,6 +355,7 @@ async fn run_retries<I: Send + 'static, O: Send + 'static>(
 
 struct Lane<I, O> {
     tx: mpsc::Sender<Group<I, O>>,
+    clock: Arc<dyn Clock>,
     admission: DualSemaphore,
     /// The largest single request this lane can admit whole: the batch
     /// maxima capped by the lane's pending capacity. A request beyond it is
@@ -372,7 +385,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         tokio::spawn(run_lane(
             rx,
             config,
-            clock,
+            clock.clone(),
             stats,
             call,
             resend_safe,
@@ -380,6 +393,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         ));
         Self {
             tx,
+            clock,
             admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
             max_admit_items,
             max_admit_logical_bytes,
@@ -433,6 +447,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
             context: context.clone(),
             items,
             logical_bytes,
+            enqueued_at: self.clock.now(),
             reply: reply_tx,
             _pending: PendingCharge {
                 stats: stats.clone(),
@@ -481,7 +496,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         if first.reply.is_closed() {
             continue;
         }
-        let deadline = clock.now().saturating_add(config.max_wait);
+        let mut deadline = first.enqueued_at.saturating_add(config.max_wait);
         let mut batch: Vec<Group<I, O>> = vec![first];
         let mut items: usize = batch[0].items.len();
         let mut bytes: u64 = batch[0].logical_bytes;
@@ -499,6 +514,8 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                     _ = queued_caller_closed(&mut batch, &mut queued) => {
                         batch.retain(|g| !g.reply.is_closed());
                         if batch.is_empty() { continue 'lane; }
+                        deadline = batch.iter().map(|g| g.enqueued_at).min()
+                            .expect("live batch").saturating_add(config.max_wait);
                         items = batch.iter().map(|g| g.items.len()).sum();
                         bytes = batch.iter().map(|g| g.logical_bytes).sum();
                         units = units_of(&batch);
@@ -530,6 +547,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
             }
             items += group.items.len();
             bytes += group.logical_bytes;
+            deadline = deadline.min(group.enqueued_at.saturating_add(config.max_wait));
             units.extend(group.items.iter().map(UnitIndexed::unit_index));
             batch.push(group);
         }
@@ -752,14 +770,25 @@ impl BatchScheduler {
         &self,
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
-        let Some(limit) = self.max_operation_time() else {
-            return operation.await;
+        let result = match self.max_operation_time() {
+            Some(limit) => tokio::select! {
+                biased;
+                _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
+                result = operation => result,
+            },
+            None => operation.await,
         };
-        tokio::select! {
-            biased;
-            _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
-            result = operation => result,
+        // The caller owns this outcome, whether its queue timer or the inner
+        // dispatcher's timer expired first. Ordinary cancellation never
+        // reaches this point and must not be counted as a timeout (BUG-154).
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(crate::endpoint::is_deadline_error)
+        {
+            self.stats.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
         }
+        result
     }
 }
 

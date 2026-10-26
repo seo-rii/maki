@@ -522,10 +522,16 @@ fn gc_keeps_live_revoked_writer_and_reclaims_it_after_drop() {
     let output = success(&["volume", "gc", f.path(false)]);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["skipped_live"].as_array().unwrap().len(), 1);
+    assert_eq!(report["counts"]["skipped_live"], 1);
+    assert_eq!(report["counts"]["removed"], 0);
+    assert_eq!(report["details_truncated"], false);
     drop(old);
     let output = success(&["volume", "gc", f.path(false)]);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(report["counts"]["removed"], 1);
+    assert_eq!(report["counts"]["skipped_live"], 0);
+    assert_eq!(report["details_truncated"], false);
 }
 struct LoseClaims(Arc<dyn Rpc>);
 impl Rpc for LoseClaims {

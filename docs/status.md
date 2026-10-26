@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-19. External campaign evidence below runs through
+Last updated: 2026-10-26. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -85,6 +85,10 @@ See [cache reload](operations.md#growth-and-cache-reload).
 
 ## Known limitations
 
+- Linux backing files and locks must be regular files with one hard link.
+  Hardlink-based backing copies are unsupported while the extra links exist.
+  The check occurs on open; later link creation and already-open handles are
+  outside its protection ([namespace boundary](architecture.md#backing-namespace)).
 - Admission limits cover Maki-owned engine work and plugin handles.
   nbdkit owns sockets and threads before plugin open; these limits do not
   establish a process-wide cap on negotiation resources.

@@ -14,10 +14,11 @@
     },
     "hyper": {
       "files": {
-        "Cargo.lock": "106ba6ed2ad49a9c24588d56d45e8a82d0d6c6ce949065f40c22519aa9ad13ea",
+        "Cargo.lock": "4cbf3872850360d8a623138475f40d6b0bfbaf9578d38697155d4b1b8275f5b4",
         "Cargo.toml": "bbb0fdb53bf741687878c824773a5489fea829ccb7089e05200f85155e857b8c",
         "src/common/date.rs": "a0f90ed9115d766b450322ea57594610afc5411871d41cba8acc411ed4555c07",
-        "src/proto/h1/decode.rs": "157391efd33fcc163751b79015819c653c19f4e84cc288fc1d43d460a1cdd5b2",
+        "src/error.rs": "1f8ffa4998ee431840fc623c8ad43925aa8f21346e427ef8eb9dd59950675480",
+        "src/proto/h1/decode.rs": "bdaf1232922da6197f35a53de2dc48161551fa41bc7efbdace45326d26f7ca6e",
         "src/proto/h1/encode.rs": "e6e171161739ed09eabd6e48e4276d3974100b817454e6723b642877790dcccc",
         "src/proto/h1/io.rs": "21422d6c8f08aa35b9a11d74e0c2eaca80c9d185c654caa759c0335d74067288",
         "src/proto/h1/io/maki_erasure.rs": "21d836c8c84c1877e08373c87882effb4c36c0fd090d2ee3f53790ba5b5d3a55",
@@ -29,8 +30,8 @@
     },
     "rustls": {
       "files": {
-        "Cargo.lock": "502100e707b2536ce4e29ae01a6eb900e8d05a9d7a1e482226298b71404bc507",
-        "Cargo.toml": "eca5ee90f61d28f57b67c81ca15aafd7a4a8fd0996ff50bb49b29a7cb19853ab",
+        "Cargo.lock": "302eb89ebe7288bce7d007849d4a8b8eb436249e1866b242bce72eddbf0d186f",
+        "Cargo.toml": "00dd3b8b7ac1cc718dc2235c5c1cefe4dd1881322595a42629d116ee06ad7db2",
         "src/common_state.rs": "256138ec7e706383a8396a9361c5882d2b14ec42808a02f410bc2fb6b3381166",
         "src/conn/unbuffered.rs": "b59dcfc7b2db98e53519ecd0cd640866ad9daec077fa7be9ba6e53b8c98b99e7",
         "src/conn/unbuffered/maki_key_update_tests.rs": "6f5132ac4b39f8963d5ac11bd4d89f9557ebd6e10273f4251cbc9c880d4c397a",
@@ -118,8 +119,8 @@
     },
     "tungstenite": {
       "files": {
-        "Cargo.lock": "418bfe24603ea2f737a364106162818e4eba167c4f0f2f33d2aed28fc03dcddf",
-        "Cargo.toml": "c0497558aed79c21a8656c1848a63b73eedbb5815b2565a5e0e4255ae62d8b0c",
+        "Cargo.lock": "582342e15cdfe54f5dcdfbf4c315010cb3b042a5a4bdc63df7cd2b79736b85d5",
+        "Cargo.toml": "dbf154a766d01bfc2f27054c6e6ed922d4a8368ad9cb2636f47cddac56c6d4c6",
         "src/buffer.rs": "67102a9adde8421ce61e12da72d87ce4d920cf3de4ba4c8d7bb45d5e6eae506f",
         "src/handshake/client.rs": "909326c12e65ca520c31a8291f643b4b1e1213046b8d3784212abe26ed4b57af",
         "src/handshake/machine.rs": "45fd42992175c5fe5a374180d059b6ad03363d947018c26de5910fe7e8079cf6",

@@ -44,6 +44,26 @@ The 0.23.46 update imports the published upstream fixes for
 All seven source files with local plaintext-erasure edits retain those edits;
 upstream handshake, record-limit, and decompression changes remain intact.
 
+The certificate-distrust follow-up requires `rustls-webpki` 0.103.16 and
+`webpki-roots` 1.0.10 for
+[RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html) and
+[RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html).
+The workspace and standalone vendor lockfiles resolve these fixed versions.
+The optional `tungstenite` bundled-root feature uses the same 1.x root package;
+Maki supplies its own WebSocket TLS connector and does not enable
+`tokio-tungstenite`'s fallback bundled roots from the older 0.26 line.
+These dependency-manifest changes are recorded in `patches.json`; the original
+archive inventory and plaintext-erasure source patches remain intact.
+The standalone `tungstenite` test graph also updates its registry `rustls`,
+`crossbeam-epoch`, and `rand` dependencies and replaces a yanked `yoke-derive`
+release. These test-only resolutions are separate from the workspace lockfile.
+
+The workspace and standalone `hyper` lockfiles resolve Tokio 1.53.3, which
+addresses the I/O-safety warning
+[RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+The standalone lockfile hash is recorded in `patches.json`; the vendored
+plaintext-erasure source patches are unchanged.
+
 The unbuffered TLS 1.3 regression tests lower the record limit and send the
 bytes returned by `WriteTraffic::encrypt` directly to a peer. They verify that
 an automatic KeyUpdate precedes application data in the same output, including
@@ -66,6 +86,15 @@ reusing storage erase discarded bytes. `tungstenite` guards its output queue,
 fragment collectors, masked formatting temporaries and handshake read/write
 storage before they can contain payload data. Their growth and error paths
 erase retired allocations. Public message/HTTP values remain caller-owned.
+
+Hyper's HTTP/1 body decoder also retains typed parse-error provenance for
+invalid chunk sizes, delimiters, extensions and trailers. These errors keep
+their original I/O kind and owned diagnostic beneath a `hyper::Error` whose
+`is_parse()` returns true; formatted trailer diagnostics retain their erasure
+owner. Maki uses the type to refuse retries of malformed HTTP responses without
+matching error text. Underlying transport I/O and incomplete bodies retain
+their original error types and retry policy. The decoder's accepted wire
+syntax is unchanged.
 
 HTTP/2's h2/tokio-util frame storage and tonic's gRPC encode/decode buffers use
 the patched `BytesMut`/`Bytes` backing. They do not require a separate protocol

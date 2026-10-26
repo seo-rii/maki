@@ -31,7 +31,12 @@ jobs:
         run: cargo install cargo-audit --version 0.22.1 --locked
       - name: RustSec dependency audit (Linux)
         if: runner.os == 'Linux'
-        run: cargo audit --deny warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lockfile in Cargo.lock vendor/*/Cargo.lock; do
+            cargo audit --deny warnings --file "$lockfile"
+          done
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

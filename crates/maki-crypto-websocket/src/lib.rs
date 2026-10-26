@@ -737,7 +737,16 @@ impl WsCryptoProvider {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             let encoded =
                 request::encode_request(id, op, context, items, self.spec.max_frame_bytes)?;
-            match self.request_once(id, encoded).await {
+            // A single attempt budget includes the connection mutex queue,
+            // connection setup, send queue and response wait. Timing each IO
+            // stage alone lets concurrent callers wait through every earlier
+            // handshake before starting their own full timeout. Dropping the
+            // attempt keeps PendingRequest's generation-scoped cleanup and
+            // live-sibling ownership unchanged.
+            let result = tokio::time::timeout(self.spec.timeout, self.request_once(id, encoded))
+                .await
+                .unwrap_or_else(|_| Err(retryable("websocket request timeout")));
+            match result {
                 Ok(response) => return self.parse_response(&response, items),
                 Err(e) if e.is_retryable() => last_err = Some(e),
                 Err(e) => return Err(e),

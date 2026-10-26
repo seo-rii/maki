@@ -127,7 +127,7 @@ readonly nbd_target
 
 required_commands=(
     blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
-    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs setpriv sqlite3
+    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sqlite3
     sync vgchange vgcreate vgremove vgs
 )
 
@@ -359,8 +359,12 @@ cleanup() {
 
     disconnect_test_nbd || cleanup_rc=1
 
-    stop_process_normally "$duplicate_pid" "duplicate nbdkit" || cleanup_rc=1
-    duplicate_pid=""
+    if stop_process_normally "$duplicate_pid" "duplicate nbdkit"; then
+        duplicate_pid=""
+    else
+        cleanup_rc=1
+        cleanup_safe=false
+    fi
     if ! stop_process_normally "$nbdkit_pid" "nbdkit"; then
         cleanup_rc=1
         cleanup_safe=false
@@ -528,7 +532,7 @@ if [[ "$install_missing" == true ]]; then
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" update
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" \
         install -y --no-install-recommends binutils fio kmod libnbd-bin lvm2 \
-        nbd-client nbdkit nbdkit-plugin-dev sqlite3 util-linux xfsprogs
+        nbd-client nbdkit nbdkit-plugin-dev python3 sqlite3 util-linux xfsprogs
     pass "native validation dependencies installed"
 fi
 
@@ -545,11 +549,20 @@ fi
 pass "required native tools available"
 
 log "building release binaries and nbdkit plugin"
+# Bind this run to its own build outputs, even when Cargo configuration or
+# environment variables select a shared directory or a cross-compilation target.
+native_target="$(rustc -vV | sed -n 's/^host: //p')"
+[[ "$native_target" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "cannot determine native Rust target"
+readonly native_target
+readonly build_target_dir="$run_dir/target"
+log "native build target: $native_target ($build_target_dir)"
+CARGO_BUILD_BUILD_DIR="$run_dir/build" \
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release --locked \
+    --target-dir "$build_target_dir" --target "$native_target" \
     -p maki -p maki-attach -p maki-nbdkit
-readonly maki_bin="$REPO_ROOT/target/release/maki"
-readonly attach_bin="$REPO_ROOT/target/release/maki-attach"
-readonly plugin_path="$REPO_ROOT/target/release/libmaki_nbdkit.so"
+readonly maki_bin="$build_target_dir/$native_target/release/maki"
+readonly attach_bin="$build_target_dir/$native_target/release/maki-attach"
+readonly plugin_path="$build_target_dir/$native_target/release/libmaki_nbdkit.so"
 [[ -x "$maki_bin" && -x "$attach_bin" && -f "$plugin_path" ]] ||
     die "release artifacts are incomplete"
 nm -D --defined-only "$plugin_path" | grep -Eq '[[:space:]]T[[:space:]]plugin_init$' ||
@@ -617,11 +630,26 @@ config_path="$run_dir/volume.toml"
 key_path="$work_dir/local-aes-gcm-siv.key"
 dd if=/dev/urandom of="$key_path" bs=32 count=1 status=none
 chmod 0600 "$key_path"
-cat >"$config_path" <<EOF
-config_schema_version = 1
+# Both daemons must reach the same backing with the same crypto identity.
+# Only their NBD and control listener paths differ.
+write_validation_config() {
+python3 - "$1" "$volume_name" "$key_path" "$work_dir/backing" \
+    "$2" "$3" <<'PY'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+# JSON's quoted strings use TOML basic-string escapes. Preserve Unicode to avoid
+# surrogate-pair escapes, and escape DEL, which JSON allows but TOML forbids.
+volume_name, key_path, backing_root, socket_path, control_socket_path = (
+    json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
+    for value in sys.argv[2:]
+)
+config_path.write_text(f"""config_schema_version = 1
 
 [volume]
-name = "$volume_name"
+name = {volume_name}
 max_virtual_size = "512MiB"
 device_block_size = 4096
 crypto_unit_size = 4096
@@ -630,21 +658,21 @@ shard_logical_size = "16MiB"
 [crypto]
 provider = "local-aes-gcm-siv"
 crypto_compatibility_id = "privileged-validation-v1"
-key = { source = "file", name = "$key_path" }
+key = {{ source = "file", name = {key_path} }}
 
 [crypto.capabilities]
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4124
 
 [backing]
-root = "$work_dir/backing"
+root = {backing_root}
 journal_segment_size = "16MiB"
 journal_max_bytes = "128MiB"
 checkpoint_reserve_bytes = "16MiB"
 journal_emergency_reserve_bytes = "8MiB"
 
 [nbd]
-socket = "$socket_path"
+socket = {socket_path}
 device_block_size = 4096
 minimum_io = 4096
 preferred_io = 4096
@@ -652,8 +680,11 @@ maximum_io = "1MiB"
 connections = 1
 
 [control]
-socket = "$control_socket_path"
-EOF
+socket = {control_socket_path}
+""", encoding="utf-8")
+PY
+}
+write_validation_config "$config_path" "$socket_path" "$control_socket_path"
 
 if [[ "$discard" == true ]]; then
     "$maki_bin" volume create "$config_path" --discard
@@ -697,20 +728,29 @@ fi
 pass "unrelated user is denied by the runtime-directory boundary"
 
 duplicate_socket="$work_dir/duplicate.sock"
+duplicate_config_path="$run_dir/duplicate-volume.toml"
+write_validation_config "$duplicate_config_path" "$duplicate_socket" "$work_dir/duplicate-control.sock"
 "${nbdkit_launcher[@]}" nbdkit --foreground -U "$duplicate_socket" "$plugin_path" \
-    config="$config_path" >"$run_dir/duplicate-nbdkit.log" 2>&1 &
+    config="$duplicate_config_path" >"$run_dir/duplicate-nbdkit.log" 2>&1 &
 duplicate_pid=$!
+# nbdkit binds its socket before plugin startup. A socket or failed client
+# negotiation alone cannot establish that recovery reached the volume lock.
 for _ in $(seq 1 100); do
-    [[ -S "$duplicate_socket" ]] && break
     kill -0 "$duplicate_pid" 2>/dev/null || break
     sleep 0.05
 done
-if [[ -S "$duplicate_socket" ]] &&
-    nbdinfo "nbd+unix:///?socket=$duplicate_socket" >"$run_dir/duplicate-client.txt" 2>&1; then
-    die "a second nbdkit process opened the already-attached Maki volume"
+if kill -0 "$duplicate_pid" 2>/dev/null; then
+    die "duplicate nbdkit did not exit after volume-lock rejection; see duplicate-nbdkit.log"
 fi
-stop_process_normally "$duplicate_pid" "duplicate nbdkit" || die "duplicate nbdkit did not stop"
+duplicate_status=0
+wait "$duplicate_pid" || duplicate_status=$?
 duplicate_pid=""
+printf '%s\n' "$duplicate_status" >"$run_dir/duplicate-nbdkit.exit"
+[[ "$duplicate_status" == 1 ]] ||
+    die "duplicate nbdkit exited with status $duplicate_status, expected startup failure status 1"
+grep -Fxq 'maki-nbdkit: startup failed: adapter error (errno 5): VOLUME_ALREADY_ATTACHED' \
+    "$run_dir/duplicate-nbdkit.log" ||
+    die "duplicate nbdkit failed without the volume-lock rejection; see duplicate-nbdkit.log"
 pass "duplicate volume attach fails closed"
 
 requested_devices=$((nbd_index + 1))

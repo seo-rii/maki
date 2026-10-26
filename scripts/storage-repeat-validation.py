@@ -36,14 +36,17 @@ def suite_groups(config):
     return PROFILES[profile]
 
 
-def save_json(path, value):
+def save_json(path, value, before_publish=None):
     temporary = path.with_name(path.name + ".tmp")
     with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as out:
         json.dump(value, out, indent=2, sort_keys=True)
         out.write("\n")
         out.flush()
         os.fsync(out.fileno())
+    if before_publish is not None and not before_publish():
+        return False
     os.replace(temporary, path)
+    return True
 
 
 def process_identity(pid):
@@ -72,38 +75,80 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
     began = time.monotonic()
     if stop.exists():
         return {"exit_code": 130, "reason": "cancelled", "seconds": 0}
-    with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
-        child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-        reason = "exited"
-        try:
-            while child.poll() is None:
-                if stop.exists():
-                    reason = "cancelled"
-                elif time.monotonic() - began >= timeout:
-                    reason = "timeout"
-                elif log.stat().st_size > max_bytes:
-                    reason = "output_limit"
-                if reason != "exited":
-                    break
-                time.sleep(.1)
-        finally:
-            # These test/build children own a process group. Kill the group also
-            # after an early leader exit, so descendants cannot outlive the job.
+
+    received_signal = None
+
+    def request_stop(number, _frame):
+        nonlocal received_signal
+        received_signal = number
+
+    previous = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        # Install before Popen, and only record the request in the handler. An
+        # exception during Popen could escape before we own its returned child.
+        for number in previous:
+            signal.signal(number, request_stop)
+        with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+            child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            reason = "exited"
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
-    if reason == "exited" and log.stat().st_size > max_bytes:
-        reason = "output_limit"
-    return {"exit_code": child.returncode, "reason": reason,
-            "seconds": round(time.monotonic() - began, 3)}
+                # Keep the leader unreaped until group cleanup, so its PID
+                # cannot be reused for an unrelated process group.
+                while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    if received_signal is not None or stop.exists():
+                        reason = "cancelled"
+                    elif time.monotonic() - began >= timeout:
+                        reason = "timeout"
+                    elif log.stat().st_size > max_bytes:
+                        reason = "output_limit"
+                    if reason != "exited":
+                        break
+                    time.sleep(.1)
+            finally:
+                # Kill descendants also after an early leader exit.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    if received_signal is not None:
+        # Reuse the cancellation marker so build-time interruption also
+        # reaches worker() as cancellation rather than a build failure.
+        stop.touch(mode=0o600)
+    # The leader can exit during the polling interval, skipping the loop's
+    # limit checks. Cancellation also takes precedence during group cleanup;
+    # otherwise retain any limit reason already observed while it was alive.
+    if received_signal is not None or stop.exists():
+        reason = "cancelled"
+    elif reason == "exited":
+        if time.monotonic() - began >= timeout:
+            reason = "timeout"
+        elif log.stat().st_size > max_bytes:
+            reason = "output_limit"
+    result = {"exit_code": child.returncode, "reason": reason,
+              "seconds": round(time.monotonic() - began, 3)}
+    if received_signal is not None:
+        result["signal"] = received_signal
+    return result
 
 
 def prepare(directory, config, deadline):
     groups = suite_groups(config)
     source = Path(config["source"])
+    stop = directory / "STOP"
+
+    def remaining(limit):
+        if stop.exists():
+            raise RuntimeError("preparation cancelled")
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("campaign wall-time limit reached during preparation")
+        return min(limit, budget)
+
     environment = os.environ.copy()
     environment.update(CARGO_TARGET_DIR=config["target_dir"], CARGO_BUILD_JOBS="2")
     executables = {}
@@ -114,10 +159,12 @@ def prepare(directory, config, deadline):
         for suite in selected:
             command.extend(["--test", suite])
         log = directory / ("build.log" if len(groups) == 1 else f"build-{package}.log")
-        result = run_child(command, source, log, directory / "STOP",
-                           min(1800, deadline - time.monotonic()), env=environment)
+        result = run_child(command, source, log, stop, remaining(1800), env=environment)
+        if result["reason"] == "timeout":
+            raise TimeoutError(f"{package} build did not complete: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"{package} build did not complete: {result}")
+        remaining(1800)
         for line in log.read_text(errors="replace").splitlines():
             if not line.startswith("{"):
                 continue
@@ -132,13 +179,16 @@ def prepare(directory, config, deadline):
     binary_dir.mkdir(mode=0o700)
     manifest = {}
     for name, original in executables.items():
+        remaining(30)
         frozen = binary_dir / name
         shutil.copyfile(original, frozen)
         frozen.chmod(0o500)
         executables[name] = frozen
         manifest[name] = {"sha256": hashlib.sha256(frozen.read_bytes()).hexdigest()}
         result = run_child([str(frozen), "--list", "--include-ignored"], source,
-                           directory / f"list-{name}.log", directory / "STOP", 30)
+                           directory / f"list-{name}.log", stop, remaining(30))
+        if result["reason"] == "timeout":
+            raise TimeoutError(f"cannot enumerate {name}: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"cannot enumerate {name}: {result}")
         count = sum(line.endswith(": test") for line in
@@ -146,6 +196,7 @@ def prepare(directory, config, deadline):
         if count < 1:
             raise RuntimeError(f"empty suite: {name}")
         manifest[name]["expected_tests"] = count
+    remaining(30)
     save_json(directory / "binaries.json", manifest)
     return executables
 
@@ -196,18 +247,42 @@ def worker(directory):
                     os.fsync(out.fileno())
             status["completed_rounds"] = round_number
             save_json(directory / "status.json", status)
+        # Include final result parsing and persistence in the campaign budget.
+        if (directory / "STOP").exists():
+            raise RuntimeError("campaign cancelled")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("campaign wall-time limit reached")
         status["state"] = "passed"
         exit_code = 0
     except Exception as error:
         if (directory / "STOP").exists():
             status["state"] = "cancelled"
+        elif isinstance(error, TimeoutError):
+            status["state"] = "incomplete"
         elif status["state"] not in TERMINAL:
             status["state"] = "failed"
         status["error"] = f"{type(error).__name__}: {error}"
     finally:
         status.update(exit_code=exit_code, elapsed_seconds=round(time.monotonic() - began, 1),
                       finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        save_json(directory / "status.json", status)
+
+        def eligible_to_publish():
+            # Completion is decided after the candidate report's blocking
+            # flush/fsync, immediately before its atomic publication. Requests
+            # arriving after that decision do not revoke a completed campaign.
+            return status["state"] != "passed" or (
+                not (directory / "STOP").exists() and time.monotonic() < deadline)
+
+        if not save_json(directory / "status.json", status, before_publish=eligible_to_publish):
+            cancelled = (directory / "STOP").exists()
+            exit_code = 1
+            status.update(state="cancelled" if cancelled else "incomplete", exit_code=exit_code,
+                          error="campaign cancelled" if cancelled else "campaign wall-time limit reached",
+                          elapsed_seconds=round(time.monotonic() - began, 1),
+                          finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            # A rejected candidate remains private. Publish a non-pass once;
+            # further cancellation or delay cannot turn it back into success.
+            save_json(directory / "status.json", status)
     return exit_code
 
 

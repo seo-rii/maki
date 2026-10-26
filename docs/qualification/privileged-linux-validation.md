@@ -37,6 +37,17 @@ OOM, interrupt power, test a real disk, or modify installed Maki systemd
 units. Those scenarios need an isolated destructive-test host and are outside
 this safe runner.
 
+The duplicate-attach check uses the same backing, volume and crypto settings
+with separate NBD and control socket paths. Its NBD path matches the second
+nbdkit process's `-U` argument, so listener validation can reach recovery.
+The check passes only when that process exits with startup-failure status 1
+and reports the native startup error `VOLUME_ALREADY_ATTACHED`. A missing
+plugin, invalid configuration, listener mismatch or process that stays alive
+fails qualification. The duplicate configuration, stderr log and exit code
+are retained as `duplicate-volume.toml`, `duplicate-nbdkit.log` and
+`duplicate-nbdkit.exit` in the run directory; an unfinished process is stopped
+by the normal exit cleanup and supplies no successful lock verdict.
+
 ## Run
 
 The current helper requires nbd-client 3.27.0 or later built with netlink and
@@ -77,7 +88,12 @@ For a read-only dependency preview, run:
 ## Logs and completion
 
 Every run creates a mode-`0700` directory below `~/logs` and mode-`0600`
-artifacts within it. A stable symlink points to the newest run:
+log artifacts within it. Release artifacts and intermediate build files are
+kept in that run's `target/` and `build/` directories. The build explicitly
+selects the native Rust host target and these directories, overriding Cargo
+target-directory and cross-compilation settings. Validation uses only those
+release artifacts; allow disk space for a fresh release build on the log
+filesystem. A stable symlink points to the newest run:
 
 ```text
 ~/logs/maki-privileged-validation.latest/

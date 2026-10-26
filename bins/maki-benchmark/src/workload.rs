@@ -23,6 +23,13 @@ pub struct SetupReport {
     pub elapsed_seconds: f64,
 }
 #[derive(Default, Serialize)]
+pub struct VerificationReport {
+    pub written_slots: u64,
+    pub read_after_write_verified_slots: u64,
+    pub final_sweep_verified_slots: u64,
+    pub final_sweep_elapsed_seconds: f64,
+}
+#[derive(Default, Serialize)]
 pub struct ResourceReport {
     pub oracle_generation_bytes: u64,
     pub peak_pending_operations: u64,
@@ -45,6 +52,7 @@ pub struct Measurements {
     pub read_elapsed: Duration,
     pub final_flush_us: f64,
     pub setup: SetupReport,
+    pub verification: VerificationReport,
     pub resources: ResourceReport,
 }
 #[derive(Default)]
@@ -79,6 +87,11 @@ enum Kind {
 }
 
 const MAX_ORACLE_BYTES: u64 = 64 * 1024 * 1024;
+// At most MAX_OPERATIONS (< 2^63) successful writes can reach a slot. Keep
+// measured read coverage in the spare bit without increasing the oracle's
+// eight-byte-per-slot allocation. A later write retains this historical flag.
+const READ_AFTER_WRITE_FLAG: u64 = 1 << 63;
+const _: () = assert!(crate::MAX_OPERATIONS < READ_AFTER_WRITE_FLAG);
 
 pub fn validate_oracle_capacity(slots: u64) -> Result<(), String> {
     if slots == 0 || slots > MAX_ORACLE_BYTES / std::mem::size_of::<AtomicU64>() as u64 {
@@ -101,6 +114,10 @@ impl Oracle {
             .map_err(|_| "cannot allocate the bounded generation oracle")?;
         generations.resize_with(slots, || AtomicU64::new(0));
         Ok(Self { generations })
+    }
+
+    fn generation(&self, slot: usize) -> u64 {
+        self.generations[slot].load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG
     }
 }
 fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
@@ -184,7 +201,7 @@ async fn phase(
                 jobs.spawn(async move {
                     let _guard = guard;
                     let _sequence = sequence;
-                    let previous = oracle.generations[slot as usize].load(Ordering::Acquire);
+                    let previous = oracle.generation(slot as usize);
                     let generation = if read { previous } else { previous + 1 };
                     let expected = data_for(offset, generation, size);
                     let began = Instant::now();
@@ -198,6 +215,10 @@ async fn phase(
                         if actual != expected {
                             return Err(format!("read verification failed at offset {offset} (expected generation {generation})"));
                         }
+                        if generation > 0 {
+                            oracle.generations[slot as usize]
+                                .fetch_or(READ_AFTER_WRITE_FLAG, Ordering::Release);
+                        }
                     } else {
                         engine
                             .write(offset, &expected, fua)
@@ -206,7 +227,7 @@ async fn phase(
                         elapsed = began.elapsed();
                         // A rejected/cancelled write must not advance the
                         // expected value used by a later read.
-                        oracle.generations[slot as usize].store(generation, Ordering::Release);
+                        oracle.generations[slot as usize].fetch_add(1, Ordering::Release);
                     }
                     Ok::<_, String>((slot, read, elapsed))
                 });
@@ -244,6 +265,46 @@ async fn phase(
         first = end;
     }
     Ok(final_flush_us)
+}
+
+/// Check the final expected value after measurement has drained. Sequential
+/// mixed plans can read only setup slots, so measured reads are insufficient.
+/// One request at a time keeps this independent sweep's memory bounded by I/O
+/// size. Unwritten phased slots were never initialized and must be skipped.
+async fn verify_final(
+    engine: &Engine,
+    options: &Options,
+    oracle: &Oracle,
+) -> Result<VerificationReport, String> {
+    let began = Instant::now();
+    let mut report = VerificationReport::default();
+    for (slot, state) in oracle.generations.iter().enumerate() {
+        let generation = oracle.generation(slot);
+        if generation > 0 {
+            report.written_slots += 1;
+        } else if options.read_percent.is_none() {
+            continue;
+        }
+        if state.load(Ordering::Acquire) & READ_AFTER_WRITE_FLAG != 0 {
+            report.read_after_write_verified_slots += 1;
+        }
+        let offset = slot as u64 * options.io_size as u64;
+        let expected = data_for(offset, generation, options.io_size);
+        let actual = engine
+            .read(offset, options.io_size)
+            .await
+            .map_err(|error| {
+                format!("final verification read at offset {offset} failed: {error}")
+            })?;
+        if actual != expected {
+            return Err(format!(
+                "final verification failed at offset {offset} (expected generation {generation})"
+            ));
+        }
+        report.final_sweep_verified_slots += 1;
+    }
+    report.final_sweep_elapsed_seconds = began.elapsed().as_secs_f64();
+    Ok(report)
 }
 
 fn observe(engine: &Engine, resources: &Mutex<ResourceReport>) {
@@ -391,6 +452,9 @@ pub async fn run(
         (oracle.generations.len() * std::mem::size_of::<AtomicU64>()) as u64;
     resources.pending_operations_at_exit = pending.current.load(Ordering::SeqCst);
     resources.monitor_interval_ms = 1;
+    // Keep sweep I/O outside measured latency/throughput and sampled resources.
+    // Lifetime RSS below includes all allocations through final verification.
+    let verification = verify_final(&engine, options, &oracle).await?;
     resources.process_peak_rss_bytes = peak_rss();
     resources.rss_source =
         if cfg!(target_os = "linux") && resources.process_peak_rss_bytes.is_some() {
@@ -412,6 +476,7 @@ pub async fn run(
         read_elapsed,
         final_flush_us,
         setup,
+        verification,
         resources,
     })
 }

@@ -651,6 +651,7 @@ fn verify_recovery_devices(
     record: &BoundDeviceRecord,
     verified: &VerifiedLvm,
     sysfs: &Path,
+    allow_empty_reset: bool,
 ) -> io::Result<()> {
     let nbd = record
         .device
@@ -677,16 +678,27 @@ fn verify_recovery_devices(
                 .map(str::to_owned)
         })
         .collect::<io::Result<_>>()?;
-    if actual != expected {
+    if actual != expected
+        && !(allow_empty_reset && actual.contains(nbd) && actual.is_subset(&expected))
+    {
         return Err(invalid(
             "current NBD devices do not match the pre-activation identity",
         ));
     }
     for device in &verified.devices {
         let name = device.path.strip_prefix("/dev/").unwrap();
+        // Disconnection can remove old partitions. It cannot authorize a
+        // newly present partition or a replacement NBD device, and every
+        // remaining partition still has to match its recorded geometry.
+        if allow_empty_reset && name != nbd && !actual.contains(name) {
+            continue;
+        }
         let path = sysfs.join(name);
+        let sectors = kernel_u64(&path.join("size"))?;
+        let size_matches =
+            sectors == device.sectors || (allow_empty_reset && name == nbd && sectors == 0);
         if device_number(&std::fs::read_to_string(path.join("dev"))?)? != device.number
-            || kernel_u64(&path.join("size"))? != device.sectors
+            || !size_matches
             || (name != nbd
                 && (kernel_u64(&path.join("start"))? != device.start
                     || !crate::detach::is_nbd_partition(sysfs, name, nbd)?))
@@ -705,7 +717,7 @@ pub(super) fn verify_recovery_rollback_mapping(
     verified: &VerifiedLvm,
     sysfs: &Path,
 ) -> io::Result<()> {
-    verify_recovery_devices(record, verified, sysfs)?;
+    verify_recovery_devices(record, verified, sysfs, false)?;
     verify_mappings(record, verified, sysfs, false)
 }
 
@@ -713,8 +725,9 @@ pub(super) fn verify_recovery_device_identity(
     record: &BoundDeviceRecord,
     verified: &VerifiedLvm,
     sysfs: &Path,
+    allow_empty_reset: bool,
 ) -> io::Result<()> {
-    verify_recovery_devices(record, verified, sysfs)
+    verify_recovery_devices(record, verified, sysfs, allow_empty_reset)
 }
 
 fn verify_mappings(

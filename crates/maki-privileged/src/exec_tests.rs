@@ -105,7 +105,10 @@ struct FakeSystem {
     extra_holders: bool,
     observation_error: bool,
     observation_error_after: Option<&'static str>,
+    process_death_before_activation: bool,
     process_death_after_activation: bool,
+    holder_after_recovery_observation: bool,
+    recovery_observations: std::cell::Cell<usize>,
     scoped_lvm_deactivations: usize,
     backend_fault_after: Option<(&'static str, BackendFault)>,
     backend_fault_on_probe: Option<(usize, BackendFault)>,
@@ -1363,6 +1366,9 @@ impl System for ObservedSystem {
         verified: &lvm_preflight::VerifiedLvm,
         attempted: &mut bool,
     ) -> Result<(), ExecError> {
+        if self.fake.process_death_before_activation {
+            panic!("fixture process died after intent publication, before LVM activation");
+        }
         if &self.fake.lvm_preflight(record)? != verified {
             return Err(identity_error("fixture LVM metadata changed"));
         }
@@ -1432,6 +1438,18 @@ impl System for ObservedSystem {
     }
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         recover::observe(record, &self.mounts(record), &self.sysfs)
+    }
+    fn disconnected_recovery_observation(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<DetachObservation> {
+        let observed = recover::observe_disconnected(record, &self.mounts(record), &self.sysfs)?;
+        let count = self.fake.recovery_observations.get() + 1;
+        self.fake.recovery_observations.set(count);
+        if self.fake.holder_after_recovery_observation && count == 1 {
+            std::fs::write(self.sysfs.join("nbd3/holders/dm-99"), "")?;
+        }
+        Ok(observed)
     }
     fn run_step(&mut self, step: &PlannedStep, id: Option<&str>) -> Result<(), ExecError> {
         let result = self.fake.run_step(step, id);

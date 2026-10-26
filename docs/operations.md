@@ -845,6 +845,15 @@ unsuccessful outcomes; explicit journal-sync time is separate. See
 Do not add unit indexes, LBAs, request IDs, or other high-cardinality values as
 metric labels.
 
+With batching enabled, `maki_crypto_deadline_exceeded_total` counts completed
+scheduler encrypt/decrypt calls that return an operation-deadline error.
+Queue admission, coalescing, batch-slot waits and RPC time share that caller's
+budget. Two expired callers in one coalesced RPC contribute two; a caller
+contributes only once even if the dispatcher also observes the deadline.
+Success, other errors and caller cancellation do not increment it. Without a
+scheduler, the metric uses the dispatcher's deadline counter. These are crypto
+calls, not Engine or NBD requests, which may issue several crypto calls.
+
 ## Failure handling
 
 - Provider contract or compatibility failures refuse attach.

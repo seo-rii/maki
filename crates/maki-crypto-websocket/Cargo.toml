@@ -16,11 +16,13 @@ tracing.workspace = true
 uuid.workspace = true
 base64.workspace = true
 parking_lot.workspace = true
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# Maki supplies its own connector with native and bundled roots. Avoid the
+# unused fallback feature, which pulls in the older webpki-roots 0.26 line.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 rustls.workspace = true
 rustls-native-certs = "0.8"
-webpki-roots = "0.26"
+webpki-roots = "1.0.10"
 
 [dev-dependencies]
 maki-backing.workspace = true

@@ -1,6 +1,7 @@
 //! Linux namespace operations are relative to open directories, never a
 //! previously checked absolute pathname. A renamed root stays the same volume.
 
+use std::collections::BinaryHeap;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io;
@@ -186,10 +187,20 @@ impl Directory {
             &child,
             libc::O_RDWR | libc::O_NONBLOCK | if create { libc::O_CREAT } else { 0 },
         )?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backing entry is not a regular file",
+            ));
+        }
+        // O_NOFOLLOW does not reject hardlinks. Inspect the opened inode,
+        // including existing files opened with O_CREAT and volume locks.
+        // This cannot prevent another link from being added after the check.
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backing entry must have exactly one hard link",
             ));
         }
         Ok(file)
@@ -238,7 +249,8 @@ impl Drop for DirectoryStream {
     }
 }
 
-fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
+fn visit_names(directory: &File, mut visit: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+    // A fresh open file description gives each scan its own directory offset.
     let fd = open_at(directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?.into_raw_fd();
     // SAFETY: fdopendir takes ownership on success; on failure we close fd.
     let raw = unsafe { libc::fdopendir(fd) };
@@ -248,7 +260,6 @@ fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
         return Err(error);
     }
     let stream = DirectoryStream(raw);
-    let mut names = Vec::new();
     loop {
         // SAFETY: stream is private, and each name is copied before readdir.
         unsafe { *libc::__errno_location() = 0 };
@@ -264,19 +275,47 @@ fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
         if name == c"." || name == c".." {
             continue;
         }
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 GC directory entry")
+        })?;
+        visit(name)?;
+    }
+    Ok(())
+}
+
+fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    visit_names(directory, |name| {
         if names.len() == maximum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "GC directory entry bound exceeded",
             ));
         }
-        let name = name.to_str().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 GC directory entry")
-        })?;
         names.push(name.to_owned());
-    }
+        Ok(())
+    })?;
     names.sort();
     Ok(names)
+}
+
+fn names_after(directory: &File, after: Option<&str>, maximum: usize) -> io::Result<Vec<String>> {
+    assert!(maximum > 0);
+    let mut page = BinaryHeap::<String>::new();
+    visit_names(directory, |name| {
+        if after.is_some_and(|after| name <= after) {
+            return Ok(());
+        }
+        if page.len() < maximum {
+            page.push(name.to_owned());
+        } else if let Some(mut largest) = page.peek_mut() {
+            if name < largest.as_str() {
+                *largest = name.to_owned();
+            }
+        }
+        Ok(())
+    })?;
+    Ok(page.into_sorted_vec())
 }
 
 fn same_entry(parent: &File, name: &CStr, file: &File) -> io::Result<bool> {
@@ -337,8 +376,8 @@ fn unexpected(error: &io::Error) -> bool {
 }
 
 impl Directory {
-    pub(super) fn gc_entries(&self) -> io::Result<Vec<String>> {
-        names(&self.0, 4096)
+    pub(super) fn gc_entries(&self, after: Option<&str>) -> io::Result<Vec<String>> {
+        names_after(&self.0, after, 4096)
     }
 
     pub(super) fn gc_scope(&self, namespace: &str) -> io::Result<Self> {

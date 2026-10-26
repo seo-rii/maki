@@ -79,9 +79,10 @@ nbdkit `VmHWM` was 11,415,552 bytes. Both 48 MiB cgroups touched their cap; both
 profile and does not define a universal deployment minimum.
 
 Linux PR, push, and scheduled CI installs the pinned `cargo-audit 0.22.1` and
-runs `cargo audit --deny warnings`. A known vulnerability, unmaintained or
-unsound advisory, or yanked crate therefore fails the job against the fetched
-RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
+runs `cargo audit --deny warnings` for the workspace and each standalone
+`vendor/*/Cargo.lock` used by the compatibility tests. A known vulnerability,
+unmaintained or unsound advisory, or yanked crate therefore fails the job
+against the fetched RustSec database. Revision `8ed9c03` raised the direct rustls minimum and lockfile
 from affected 0.23.43 to 0.23.45 after `RUSTSEC-2026-0285`; the focused HTTP/TLS
 package suite and a fresh warning-denying audit passed locally.
 The current vendored pin is 0.23.46, which includes the subsequent
@@ -543,6 +544,15 @@ fsyncs each validated ACK to its own ledger, then invokes only
 `gcloud compute instances reset`. It requires the old SSH session to die and a
 globally new boot ID to appear. The guest systemd `ExecStop` witness must
 remain absent.
+The guest agent requires Python 3.11 or later and reads the selected TOML
+configuration before launching nbdkit. Both reset profiles require
+`crypto.provider = "local-aes-gcm-siv"`; an unreadable, invalid, missing-provider,
+or different-provider configuration fails before launch. The guest's READY
+provider field comes from that validated configuration. These checks bind the
+reported provider to configuration; they do not replace binary provenance or
+the campaign's native I/O and durability checks.
+A single leading UTF-8 BOM is accepted, matching Maki's configuration parser;
+invalid UTF-8 or TOML and a different provider still fail before launch.
 This removes the workload VM's RAM, kernel, and page cache, while the Persistent
 Disk service and physical storage path stay operational. It is whole-VM reset
 evidence rather than physical power-loss evidence.

@@ -18,9 +18,11 @@ ET_DYN = 3
 EM_386 = 0x03
 EM_X86_64 = 0x3E
 EM_AARCH64 = 0xB7
+EM_ARM = 0x28
+DF_1_PIE = 0x08000000
 
 
-def elf_stub(machine, e_type, elf_class=64, endian="little"):
+def elf_stub(machine, e_type, elf_class=64, endian="little", e_flags=0):
     """A minimal ELF header (no sections) with the given identity fields."""
     order = "<" if endian == "little" else ">"
     ident = b"\x7fELF" + bytes([2 if elf_class == 64 else 1, 1 if endian == "little" else 2, 1, 0])
@@ -28,14 +30,44 @@ def elf_stub(machine, e_type, elf_class=64, endian="little"):
     if elf_class == 64:
         header = struct.pack(
             f"{order}HHIQQQIHHHHHH",
-            e_type, machine, 1, 0x1000, 0, 0, 0, 64, 56, 0, 64, 0, 0,
+            e_type, machine, 1, 0x1000, 0, 0, e_flags, 64, 56, 0, 64, 0, 0,
         )
     else:
         header = struct.pack(
             f"{order}HHIIIIIHHHHHH",
-            e_type, machine, 1, 0x1000, 0, 0, 0, 52, 32, 0, 40, 0, 0,
+            e_type, machine, 1, 0x1000, 0, 0, e_flags, 52, 32, 0, 40, 0, 0,
         )
     return ident + header
+
+
+def elf_with_segments(machine, elf_class=64, endian="little", *, interpreter=False, flags_1=None):
+    """ET_DYN fixture with program headers, deliberately without section headers."""
+    order = "<" if endian == "little" else ">"
+    header = bytearray(elf_stub(machine, ET_DYN, elf_class, endian))
+    segments = []
+    if interpreter:
+        segments.append((3, b"/fixture/ld.so\0"))  # PT_INTERP
+    if flags_1 is not None:
+        dynamic_format = f"{order}{'qQ' if elf_class == 64 else 'iI'}"
+        segments.append((2, struct.pack(dynamic_format, 0x6FFFFFFB, flags_1)
+                         + struct.pack(dynamic_format, 0, 0)))  # DT_FLAGS_1, DT_NULL
+    program_size = 56 if elf_class == 64 else 32
+    struct.pack_into(f"{order}{'Q' if elf_class == 64 else 'I'}", header,
+                     32 if elf_class == 64 else 28, len(header))
+    struct.pack_into(f"{order}HH", header, 54 if elf_class == 64 else 42,
+                     program_size, len(segments))
+    programs = bytearray()
+    payload = bytearray()
+    for kind, contents in segments:
+        offset = len(header) + program_size * len(segments) + len(payload)
+        if elf_class == 64:
+            programs.extend(struct.pack(f"{order}IIQQQQQQ", kind, 4, offset, 0, 0,
+                                        len(contents), len(contents), 1))
+        else:
+            programs.extend(struct.pack(f"{order}IIIIIIII", kind, offset, 0, 0,
+                                        len(contents), len(contents), 4, 1))
+        payload.extend(contents)
+    return header + programs + payload
 
 
 def fake_systemctl(path, active_units=()):
@@ -55,14 +87,14 @@ class DebianPackageTests(unittest.TestCase):
         self.release.mkdir()
         self.write_release_files()
 
-    def write_release_files(self, machine=EM_X86_64, elf_class=64, endian="little"):
+    def write_release_files(self, machine=EM_X86_64, elf_class=64, endian="little", e_flags=0):
         # Release artifacts are ELF images; the builder must check them
         # against the requested Debian architecture (R4-007).
         for name in RELEASE_NAMES:
             e_type = ET_DYN if name.endswith(".so") else ET_EXEC
             path = self.release / name
             path.write_bytes(
-                elf_stub(machine, e_type, elf_class, endian) + f"artifact:{name}\n".encode()
+                elf_stub(machine, e_type, elf_class, endian, e_flags) + f"artifact:{name}\n".encode()
             )
             path.chmod(0o755)
 
@@ -307,6 +339,38 @@ class DebianPackageTests(unittest.TestCase):
         i386 = self.build("i386.deb", architecture="i386")
         self.assertEqual(self.field(i386, "Architecture"), "i386")
 
+    def test_arm_packages_accept_matching_float_abi(self):
+        # AAELF32: absent float flags imply the base PCS, just like FLOAT_SOFT.
+        for architecture, flags in (("armhf", 0x05000400),
+                                    ("armel", 0x05000200), ("armel", 0x05000000)):
+            with self.subTest(architecture=architecture, flags=flags):
+                self.write_release_files(EM_ARM, 32, e_flags=flags)
+                package = self.build(f"{architecture}-{flags:x}.deb", architecture=architecture)
+                self.assertEqual(self.field(package, "Architecture"), architecture)
+
+    def test_every_arm_artifact_must_match_package_float_abi(self):
+        for architecture, good, bad in (("armhf", 0x05000400, 0x05000200),
+                                       ("armhf", 0x05000400, 0x05000000),
+                                       ("armel", 0x05000200, 0x05000400)):
+            for name in RELEASE_NAMES:
+                with self.subTest(architecture=architecture, artifact=name, flags=bad):
+                    self.write_release_files(EM_ARM, 32, e_flags=good)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(EM_ARM, kind, 32, e_flags=bad))
+                    stderr = self.build_failure("wrong-arm-abi.deb", architecture=architecture)
+                    self.assertIn(name, stderr)
+                    self.assertIn("ABI", stderr)
+                    self.assertIn(architecture, stderr)
+
+    def test_arm_abi_flags_must_be_unambiguous_eabi5(self):
+        for architecture in ("armhf", "armel"):
+            for flags, reason in ((0x05000600, "conflicting"),
+                                  (0x04000400, "version 5"), (0, "version 5")):
+                with self.subTest(architecture=architecture, flags=flags):
+                    self.write_release_files(EM_ARM, 32, e_flags=flags)
+                    stderr = self.build_failure("invalid-arm-abi.deb", architecture=architecture)
+                    self.assertIn(reason, stderr)
+
     def test_release_files_must_be_elf_images_of_the_right_kind(self):
         (self.release / "maki-check").write_bytes(b"#!/bin/sh\necho not a binary\n")
         stderr = self.build_failure("text.deb")
@@ -323,6 +387,71 @@ class DebianPackageTests(unittest.TestCase):
         (self.release / "maki").write_bytes(elf_stub(EM_X86_64, e_type=1))  # ET_REL
         stderr = self.build_failure("rel-bin.deb")
         self.assertIn("maki", stderr)
+
+    def test_plugin_rejects_pie_markers_without_section_headers(self):
+        for architecture, machine, elf_class, endian in (
+            ("amd64", EM_X86_64, 64, "little"),
+            ("i386", EM_386, 32, "little"),
+            ("s390x", 0x16, 64, "big"),
+        ):
+            # Older PIE may have only PT_INTERP; static PIE has no interpreter.
+            for markers in ({"interpreter": True}, {"flags_1": DF_1_PIE}):
+                with self.subTest(architecture=architecture, markers=markers):
+                    self.write_release_files(machine, elf_class, endian)
+                    (self.release / "libmaki_nbdkit.so").write_bytes(
+                        elf_with_segments(machine, elf_class, endian, **markers)
+                    )
+                    stderr = self.build_failure("pie-plugin.deb", architecture=architecture)
+                    self.assertIn("libmaki_nbdkit.so", stderr)
+                    self.assertIn("PIE", stderr)
+                    self.assertNotIn("Traceback", stderr)
+
+    def test_shared_plugin_and_cli_pie_metadata_remain_allowed(self):
+        for architecture, machine, elf_class, endian in (
+            ("amd64", EM_X86_64, 64, "little"),
+            ("i386", EM_386, 32, "little"),
+            ("s390x", 0x16, 64, "big"),
+        ):
+            with self.subTest(architecture=architecture):
+                for name in RELEASE_NAMES:
+                    plugin = name.endswith(".so")
+                    (self.release / name).write_bytes(elf_with_segments(
+                        machine, elf_class, endian,
+                        interpreter=not plugin, flags_1=1 if plugin else DF_1_PIE,
+                    ))
+                package = self.build(f"shared-{architecture}.deb", architecture=architecture)
+                self.assertEqual(self.field(package, "Architecture"), architecture)
+
+    def test_plugin_metadata_must_fit_in_the_file(self):
+        valid = elf_with_segments(EM_X86_64, flags_1=1)
+        bad_program_table = bytearray(valid)
+        struct.pack_into("<Q", bad_program_table, 32, len(valid) + 1)
+        for contents in (bad_program_table, valid[:-1]):
+            with self.subTest(contents=bytes(contents).hex()):
+                (self.release / "libmaki_nbdkit.so").write_bytes(contents)
+                stderr = self.build_failure("truncated-plugin.deb")
+                self.assertIn("libmaki_nbdkit.so", stderr)
+                self.assertIn("truncated", stderr)
+                self.assertNotIn("Traceback", stderr)
+
+    @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
+                         "native C compiler and dpkg-shlibdeps required")
+    def test_native_pie_plugin_is_rejected_before_packaging(self):
+        # The real dependency scanner accepts a PIE renamed as the plugin.
+        # A filename or ET_DYN check alone therefore produces an unusable .deb.
+        source = self.work / "pie.c"
+        source.write_text('#include <stdio.h>\nint main(void) { puts("fixture"); return 0; }\n')
+        executable = self.work / "pie"
+        subprocess.run(["cc", str(source), "-fPIE", "-pie", "-rdynamic", "-o", str(executable)],
+                       check=True, capture_output=True, text=True)
+        for name in RELEASE_NAMES:
+            shutil.copyfile(executable, self.release / name)
+        architecture = subprocess.run(["dpkg", "--print-architecture"], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+        stderr = self.build_failure("native-pie.deb", architecture=architecture, opt_out=False)
+        self.assertIn("libmaki_nbdkit.so", stderr)
+        self.assertIn("PIE", stderr)
+        self.assertNotIn("dpkg-shlibdeps failed", stderr)
 
     def test_unknown_debian_architecture_is_refused_before_building(self):
         stderr = self.build_failure("unknown-arch.deb", architecture="vax")

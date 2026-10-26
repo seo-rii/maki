@@ -193,11 +193,9 @@ root = "/x"
 #[test]
 fn remote_transport_batch_must_fit_the_frame_or_message_limit() {
     // A whole crypto batch is sent as one gRPC message / one WebSocket
-    // frame. A crypto.batch.max_bytes larger than the transport can carry
-    // validates cleanly today but then fails every large batch at runtime
-    // with a non-retryable transport error (EIO to the client) on a volume
-    // that attached fine. Reject the mismatch up front, and reject a zero
-    // transport limit (consistent with HTTP's max_response_bytes check).
+    // frame. Make the byte ceiling reachable with enough item slots so the
+    // full serialized batch must fit. Reject a zero transport limit too
+    // (consistent with HTTP's max_response_bytes check).
     let grpc = |batch: &str, grpc_extra: &str| -> String {
         format!(
             r#"
@@ -212,6 +210,7 @@ crypto_compatibility_id = "v1"
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
 [crypto.batch]
+max_items = 2048
 max_bytes = "{batch}"
 [crypto.grpc]
 {grpc_extra}
@@ -220,10 +219,12 @@ name = "a"
 url = "http://localhost:7000"
 [backing]
 root = "/x"
+[limits]
+max_inflight_bytes_per_endpoint = "16MiB"
 "#
         )
     };
-    // 8 MiB batch exceeds the 4 MiB default gRPC message limit.
+    // 2048 units reach the 8 MiB ceiling and exceed the 4 MiB gRPC limit.
     assert!(err(&grpc("8MiB", "")).contains("max_message_bytes"));
     // Raising the message limit above the batch makes it valid again.
     ok(&grpc("8MiB", "max_message_bytes = \"16MiB\""));
@@ -244,6 +245,7 @@ crypto_compatibility_id = "v1"
 supported_plaintext_sizes = [4096]
 max_ciphertext_size = 4384
 [crypto.batch]
+max_items = 2048
 max_bytes = "{batch}"
 [crypto.websocket]
 {ws_extra}
@@ -252,10 +254,12 @@ name = "a"
 url = "ws://127.0.0.1:7000"
 [backing]
 root = "/x"
+[limits]
+max_inflight_bytes_per_endpoint = "16MiB"
 "#
         )
     };
-    // 7 MiB raw base64-encodes to ~9.3 MiB, past the 8 MiB default frame.
+    // 1792 units reach 7 MiB; base64 alone exceeds the 8 MiB default frame.
     assert!(err(&ws("7MiB", "")).contains("max_frame_bytes"));
     // 4 MiB raw (~5.3 MiB encoded) fits the 8 MiB frame.
     ok(&ws("4MiB", ""));
@@ -308,6 +312,75 @@ fn endpoint_url_parsing_and_loopback_detection() {
     assert!(!is_loopback_host("127.0.0.1.evil"));
     assert!(!is_loopback_host("10.0.0.1"));
     assert!(!is_loopback_host("localhost.example"));
+}
+
+#[test]
+fn endpoint_ports_preserve_valid_ipv4_ipv6_and_default_ports() {
+    for scheme in ["http", "https", "ws", "wss"] {
+        for (authority, host) in [
+            ("localhost", "localhost"),
+            ("127.0.0.1:", "127.0.0.1"),
+            ("127.0.0.1:0", "127.0.0.1"),
+            ("Host.Example:65535", "Host.Example"),
+            ("[::1]", "::1"),
+            ("[::1]:", "::1"),
+            ("[::1]:00080", "::1"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+        ] {
+            let url = format!("{scheme}://{authority}/v1?profile=1#fragment");
+            assert_eq!(
+                parse_endpoint_url(&url).unwrap(),
+                (scheme.to_string(), host.to_string()),
+                "{url}"
+            );
+        }
+    }
+}
+
+#[test]
+fn endpoint_ports_reject_invalid_syntax_and_overflow() {
+    for scheme in ["http", "https", "ws", "wss"] {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            for port in [
+                "65536",
+                "9999999999999999999999",
+                "not-a-port",
+                "-1",
+                "+80",
+                "80:90",
+            ] {
+                let url = format!("{scheme}://{host}:{port}/v1?profile=1");
+                let error = parse_endpoint_url(&url).expect_err(&url);
+                assert!(error.to_string().contains("port"), "{url}: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_endpoint_ports_fail_all_remote_transport_preflights() {
+    for (document, old_url, scheme) in [
+        (base(), "https://crypto.internal", "https"),
+        (
+            remote_batch("remote-websocket", "[crypto.websocket]"),
+            "ws://127.0.0.1:7000",
+            "ws",
+        ),
+        (
+            remote_batch("remote-grpc", "[crypto.grpc]"),
+            "http://localhost:7000",
+            "http",
+        ),
+    ] {
+        ok(&document);
+        for host in ["127.0.0.1", "[::1]"] {
+            for port in ["65536", "not-a-port"] {
+                let url = format!("{scheme}://{host}:{port}");
+                let message = err(&document.replace(old_url, &url));
+                assert!(message.contains("port"), "{url}: {message}");
+            }
+        }
+    }
 }
 
 #[test]

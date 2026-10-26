@@ -715,8 +715,9 @@ async fn dispatch_endpoint_set(
     };
 
     // 1. Reachability: every endpoint on its own, tolerating a few transient
-    //    failures. A single endpoint has nothing to cross-validate against:
-    //    the engine self-test (through the retrying dispatcher) covers it.
+    //    failures only when it permits resending a request. A single endpoint
+    //    has nothing to cross-validate against: the engine self-test (through
+    //    the retry-safe-aware dispatcher) covers it.
     let mut reachable: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     let single = endpoints.len() == 1;
@@ -728,8 +729,16 @@ async fn dispatch_endpoint_set(
         }
         let validation_provider =
             apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
+        // Self-tests and canary checks make real RPCs. A lost response does
+        // not prove the operation was unapplied, so the whole probe must not
+        // be restarted for a provider that does not promise retry safety.
+        let probe_attempts = if validation_provider.capabilities().await?.retry_safe {
+            3
+        } else {
+            1
+        };
         let mut last: Option<maki_crypto::CryptoError> = None;
-        for attempt in 0..3 {
+        for attempt in 0..probe_attempts {
             match provider_self_test(validation_provider.as_ref(), &context, unit, &compat).await {
                 Ok(()) => {
                     let caps = validation_provider.capabilities().await?;
@@ -748,24 +757,21 @@ async fn dispatch_endpoint_set(
                         }
                         Err(AttachError::Crypto(e)) if transport_failure(&e) => {
                             last = Some(e);
-                            if attempt < 2 {
-                                tokio::time::sleep(probe_delay).await;
-                            }
                         }
                         Err(e) => return Err(e.into()),
                     }
                 }
                 Err(e) if transport_failure(&e) => {
                     last = Some(e);
-                    if attempt < 2 {
-                        tokio::time::sleep(probe_delay).await;
-                    }
                 }
                 Err(e) => {
                     return Err(DaemonError::Unsupported(format!(
                         "endpoint {name:?} failed its self-test: {e}"
                     )))
                 }
+            }
+            if attempt + 1 < probe_attempts {
+                tokio::time::sleep(probe_delay).await;
             }
         }
         match last {

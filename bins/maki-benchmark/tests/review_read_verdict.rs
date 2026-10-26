@@ -58,6 +58,16 @@ fn zero_percent_and_short_mixed_runs_report_skipped_verification() {
         assert_eq!(report["read_verified"], false, "{report}");
         assert_eq!(report["read_verification"], "skipped");
         assert_eq!(report["verified_read_operations"], 0);
+        // The independent final sweep is not a measured read sample.
+        assert_eq!(
+            report["verification"]["final_sweep_verified_slots"],
+            ops.parse::<u64>().unwrap()
+        );
+        assert_eq!(
+            report["verification"]["written_slots"],
+            ops.parse::<u64>().unwrap()
+        );
+        assert_eq!(report["verification"]["read_after_write_verified_slots"], 0);
     }
 }
 
@@ -71,6 +81,7 @@ fn actual_reads_report_passed_and_the_verified_sample_count() {
         assert_eq!(report["read_verified"], true);
         assert_eq!(report["read_verification"], "passed");
         assert_eq!(report["verified_read_operations"], expected);
+        assert_eq!(report["verification"]["final_sweep_verified_slots"], 10);
     }
 }
 
@@ -83,4 +94,9 @@ fn text_report_does_not_claim_passed_when_there_were_no_reads() {
         "{text}"
     );
     assert!(!text.contains("read verification: passed"), "{text}");
+    assert!(text.contains("final sweep passed for 3 slots"), "{text}");
+    assert!(
+        text.contains("excluded from throughput and latency"),
+        "{text}"
+    );
 }

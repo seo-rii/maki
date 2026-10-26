@@ -378,7 +378,7 @@ pub(crate) fn deadline_error() -> CryptoError {
 
 /// The *operation's* wall-clock budget ran out; says nothing about the
 /// health of whichever endpoint happened to be in flight.
-fn is_deadline_error(err: &CryptoError) -> bool {
+pub(crate) fn is_deadline_error(err: &CryptoError) -> bool {
     matches!(err, CryptoError::Retryable(m) if m == DEADLINE_MESSAGE)
 }
 
@@ -1100,6 +1100,17 @@ impl EndpointSet {
                         }
                     }
                 }
+            }
+
+            // Backoff only separates permitted passes. Once the final pass
+            // failed (or had nothing admissible), its result is already final.
+            if self
+                .config
+                .max_attempts
+                .is_some_and(|max| pass.saturating_add(1) >= max)
+            {
+                return Err(last_error
+                    .unwrap_or_else(|| CryptoError::Retryable("attempts exhausted".to_string())));
             }
 
             // Whole pass failed (or nothing admissible): back off with full

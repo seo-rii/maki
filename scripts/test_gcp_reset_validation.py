@@ -149,19 +149,19 @@ class HostContracts(unittest.TestCase):
             "disks": [
                 {"boot": True, "deviceName": "boot", "source": "zones/z/disks/boot"},
                 {"boot": False, "deviceName": "maki-data",
-                 "source": "https://compute.googleapis.com/compute/v1/projects/p/zones/z/disks/maki-reset-data"},
+                 "source": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data"},
             ],
         }
         disk = {"id": "202", "selfLink":
-                "https://compute.googleapis.com/compute/v1/projects/p/zones/z/disks/maki-reset-data"}
+                "https://compute.googleapis.com/compute/v1/projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data"}
         replies = [subprocess.CompletedProcess([], 0, json.dumps(instance).encode(), b""),
                    subprocess.CompletedProcess([], 0, json.dumps(disk).encode(), b"")]
         with mock.patch.object(self.host, "bounded_run", side_effect=replies):
             identity = self.host.resource_identity(args, 30)
         self.assertEqual(identity, {
             "instance_id": "101", "data_disk_id": "202",
-            "data_disk_self_link": disk["selfLink"],
-            "attachment_source": instance["disks"][1]["source"],
+            "data_disk_self_link": "projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data",
+            "attachment_source": "projects/test-project/zones/asia-northeast3-a/disks/maki-reset-data",
             "attachment_device_name": "maki-data", "status": "RUNNING",
         })
 
@@ -265,7 +265,7 @@ class HostContracts(unittest.TestCase):
     def test_reset_finishes_before_old_ssh_is_accepted_as_dead(self):
         order = []
         process = mock.Mock()
-        process.child.poll.return_value = None
+        process.poll.return_value = None
         process.wait_after_reset.side_effect = lambda timeout: order.append("ssh-dead")
         args = types.SimpleNamespace(timeout=30)
         def reset_done(*_args, **_kwargs):
@@ -278,7 +278,7 @@ class HostContracts(unittest.TestCase):
 
     def test_cut_refuses_an_ssh_child_that_died_before_reset(self):
         process = mock.Mock()
-        process.child.poll.return_value = 255
+        process.poll.return_value = 255
         args = types.SimpleNamespace(timeout=30)
         with mock.patch.object(self.host, "reset_instance") as reset:
             with self.assertRaisesRegex(RuntimeError, "before reset"):
@@ -294,6 +294,49 @@ class HostContracts(unittest.TestCase):
             with process:
                 process.expect("ready", timeout=0.05)
         self.assertEqual(process.child.returncode, -signal.SIGKILL)
+
+    def test_campaign_reaps_owned_child_on_each_post_launch_failure(self):
+        baseline = dict(instance_id="101", data_disk_id="202",
+                        data_disk_self_link="disk-url", attachment_source="disk-url",
+                        attachment_device_name="data", status="RUNNING")
+        for failure in ("boot", "ready", "resource-query", "resource-identity", "ack"):
+            with self.subTest(failure=failure):
+                args = types.SimpleNamespace(
+                    cycles=2, timeout=10, connect_timeout=1, project="test-project",
+                    zone="us-central1-a", instance="cleanup-fixture", data_disk="fixture",
+                    profile="v2", output=self.path / failure,
+                )
+                # Only a local sleeping child is real: no gcloud or guest I/O.
+                process = self.host.RemoteProcess(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    self.path / f"child-{failure}", self.token, 0,
+                )
+                self.addCleanup(process.close)
+                process.expect = mock.Mock(side_effect=ValueError("fixture ACK failure"))
+                ready = dict(event="ready", boot_id=self.boot_id,
+                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True,
+                             fs_uuid="00112233-4455-6677-8899-aabbccddeeff",
+                             witness_service="active", graceful_stop_witness="absent")
+                current = dict(baseline)
+                if failure == "boot":
+                    ready["boot_id"] = "invalid"
+                elif failure == "ready":
+                    ready["can_fua"] = False
+                elif failure == "resource-query":
+                    current = ValueError("fixture resource query failure")
+                elif failure == "resource-identity":
+                    current["data_disk_id"] = "changed"
+                with mock.patch.object(self.host, "resource_identity",
+                                       side_effect=[baseline, current]), \
+                        mock.patch.object(self.host, "launch_guest", return_value=(process, ready)):
+                    with self.assertRaises(ValueError):
+                        self.host.campaign(args)
+                self.assertEqual(process.child.returncode, -signal.SIGKILL,
+                                 "campaign must kill and reap its child before returning")
+                result = json.loads((args.output / "results.json").read_text())
+                self.assertFalse(result["passed"])
+                self.assertIn("ValueError", result["error"])
+                self.assertFalse((args.output / "host-acks.jsonl").exists())
 
     def test_post_reset_ssh_timeout_is_retried_with_a_fresh_owned_child(self):
         args = types.SimpleNamespace(timeout=60, connect_timeout=1)
@@ -322,6 +365,278 @@ host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"ValueError", result.stderr)
         self.assertFalse(self.ledger.exists())
+
+
+class ResourceIdentityContracts(unittest.TestCase):
+    """Resource descriptions must identify the disk actually attached to the VM."""
+
+    def setUp(self):
+        self.host = load("gcp_resource_identity", "gcp-reset-validation.py")
+        self.args = types.SimpleNamespace(
+            gcloud="never-run-gcloud", project="test-project", zone="test-zone-a",
+            instance="fixture", data_disk="expected-disk",
+        )
+        self.disk_path = "projects/test-project/zones/test-zone-a/disks/expected-disk"
+        self.disk_url = "https://compute.googleapis.com/compute/v1/" + self.disk_path
+        self.instance = {
+            "id": "101", "status": "RUNNING", "disks": [
+                {"boot": False, "deviceName": "expected-disk", "source": self.disk_url},
+            ],
+        }
+        self.disk = {"id": "202", "selfLink": self.disk_url}
+
+    def identity(self, instance=None, disk=None):
+        values = (self.instance if instance is None else instance,
+                  self.disk if disk is None else disk)
+        replies = [subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b"")
+                   for value in values]
+        with mock.patch.object(self.host, "bounded_run", side_effect=replies) as run:
+            value = self.host.resource_identity(self.args, 30)
+        self.assertEqual(run.call_count, 2)
+        command = run.call_args.args[0]
+        self.assertEqual(command[2:5], ["disks", "describe", "expected-disk"])
+        self.assertEqual(command[command.index("--project") + 1], "test-project")
+        self.assertEqual(command[command.index("--zone") + 1], "test-zone-a")
+        self.host.validate_resource_identity(value, value)
+        return value
+
+    def test_matching_attached_disk_is_accepted(self):
+        identity = self.identity()
+        self.assertEqual(identity["instance_id"], "101")
+        self.assertEqual(identity["data_disk_id"], "202")
+        self.assertEqual(identity["attachment_source"], identity["data_disk_self_link"])
+
+    def test_attached_disk_and_described_disk_must_match(self):
+        self.instance["disks"][0]["source"] = self.disk_url.replace("expected-disk", "another-disk")
+        with self.assertRaises(ValueError):
+            self.identity()
+
+    def test_null_disk_id_must_not_become_a_valid_string(self):
+        self.disk["id"] = None
+        with self.assertRaises(ValueError):
+            self.identity()
+
+    def test_same_name_in_another_project_or_zone_is_not_the_requested_disk(self):
+        for old, new in (("test-project", "other-project"), ("test-zone-a", "other-zone-a")):
+            for both in (False, True):
+                with self.subTest(scope=old, descriptions_agree=both):
+                    instance = json.loads(json.dumps(self.instance))
+                    wrong = self.disk_url.replace(old, new)
+                    instance["disks"][0]["source"] = wrong
+                    disk = dict(self.disk, selfLink=wrong) if both else self.disk
+                    with self.assertRaises(ValueError):
+                        self.identity(instance, disk)
+
+    def test_described_disk_must_match_the_requested_resource(self):
+        for old, new in (("test-project", "other-project"), ("test-zone-a", "other-zone-a"),
+                         ("expected-disk", "another-disk")):
+            with self.subTest(field=old):
+                disk = dict(self.disk, selfLink=self.disk_url.replace(old, new))
+                with self.assertRaises(ValueError):
+                    self.identity(disk=disk)
+
+    def test_equivalent_google_api_references_have_one_stable_identity(self):
+        references = (self.disk_path, self.disk_url,
+                      "https://www.googleapis.com/compute/v1/" + self.disk_path)
+        baseline = None
+        for source in references:
+            for self_link in references:
+                with self.subTest(source=source, self_link=self_link):
+                    instance = json.loads(json.dumps(self.instance))
+                    instance["disks"][0].update(source=source, deviceName="data-alias")
+                    current = self.identity(instance, dict(self.disk, selfLink=self_link))
+                    self.assertEqual(current["attachment_source"], self.disk_path)
+                    self.assertEqual(current["data_disk_self_link"], self.disk_path)
+                    if baseline is not None:
+                        self.host.validate_resource_identity(baseline, current)
+                    baseline = current
+
+    def test_missing_or_malformed_resource_ids_are_rejected(self):
+        invalid = (None, True, False, -1, 101.0, 1.5, "", "None", "101.0", "+101",
+                   "-101", " 101", "101 ", "1e2", "0101", "١٠١", [], {},
+                   1 << 64, str(1 << 64))
+        for resource in ("instance", "disk"):
+            for bad in invalid:
+                with self.subTest(resource=resource, value=bad):
+                    instance, disk = dict(self.instance), dict(self.disk)
+                    (instance if resource == "instance" else disk)["id"] = bad
+                    with self.assertRaises(ValueError):
+                        self.identity(instance, disk)
+            with self.subTest(resource=resource, missing=True):
+                instance, disk = dict(self.instance), dict(self.disk)
+                del (instance if resource == "instance" else disk)["id"]
+                with self.assertRaises(ValueError):
+                    self.identity(instance, disk)
+
+    def test_uint64_string_and_integer_ids_have_the_same_identity(self):
+        for value in (0, 1, (1 << 53) + 1, (1 << 64) - 1):
+            with self.subTest(value=value):
+                integer = self.identity(dict(self.instance, id=value), dict(self.disk, id=value))
+                string = self.identity(dict(self.instance, id=str(value)), dict(self.disk, id=str(value)))
+                self.assertEqual(integer, string)
+                self.assertEqual(integer["data_disk_id"], str(value))
+
+    def test_ambiguous_nonboot_attachments_are_rejected(self):
+        duplicate = dict(self.instance["disks"][0], deviceName="other-alias")
+        alias_collision = dict(self.instance["disks"][0],
+                               source=self.disk_url.replace("expected-disk", "another-disk"))
+        for other in (duplicate, alias_collision):
+            with self.subTest(attachment=other):
+                instance = dict(self.instance, disks=self.instance["disks"] + [other])
+                with self.assertRaises(ValueError):
+                    self.identity(instance)
+
+    def test_boot_attachment_cannot_be_the_data_disk(self):
+        self.instance["disks"][0]["boot"] = True
+        with self.assertRaises(ValueError):
+            self.identity()
+
+    def test_unrelated_boot_and_data_disks_do_not_change_selection(self):
+        self.instance["disks"].extend([
+            {"boot": True, "deviceName": "boot", "source": "projects/p/zones/z/disks/boot"},
+            {"boot": False, "deviceName": "other", "source": self.disk_url.replace("expected-disk", "other")},
+        ])
+        self.assertEqual(self.identity()["attachment_device_name"], "expected-disk")
+
+    def test_missing_or_malformed_resource_references_are_rejected(self):
+        invalid = (None, 202, "", "expected-disk", self.disk_url + "/", self.disk_url + "?x=1",
+                   self.disk_url + "#fragment", self.disk_url.replace("https:", "http:"),
+                   self.disk_url.replace("compute.googleapis.com", "foreign.invalid"),
+                   self.disk_url.replace("/zones/", "/regions/"),
+                   self.disk_url.replace("/disks/", "/instances/"),
+                   self.disk_url.replace("/expected-disk", "/%65xpected-disk"))
+        for field in ("source", "selfLink"):
+            for bad in invalid:
+                with self.subTest(field=field, value=bad):
+                    instance = json.loads(json.dumps(self.instance))
+                    disk = dict(self.disk)
+                    (instance["disks"][0] if field == "source" else disk)[field] = bad
+                    with self.assertRaises(ValueError):
+                        self.identity(instance, disk)
+
+
+class ResourceDeadlineContracts(unittest.TestCase):
+    def setUp(self):
+        self.host = load("gcp_resource_deadline", "gcp-reset-validation.py")
+        self.args = types.SimpleNamespace(
+            gcloud="fixture-gcloud", project="fixture-project", zone="fixture-zone",
+            instance="fixture-instance", data_disk="fixture-data",
+        )
+        self.disk = "projects/fixture-project/zones/fixture-zone/disks/fixture-data"
+        self.baseline = dict(
+            instance_id="1", data_disk_id="2", data_disk_self_link=self.disk,
+            attachment_source=self.disk, attachment_device_name="fixture-data",
+            status="RUNNING",
+        )
+        self.now = 0.0
+        self.durations = iter([2, 2])
+        self.statuses = iter(["RUNNING"])
+        self.calls = []
+        for patch in (
+                mock.patch.object(self.host.time, "monotonic", side_effect=lambda: self.now),
+                mock.patch.object(self.host.time, "sleep", side_effect=self.advance),
+                mock.patch.object(self.host, "bounded_run", side_effect=self.rpc)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def rpc(self, command, timeout):
+        resource = command[2]
+        self.calls.append((resource, timeout))
+        duration = next(self.durations)
+        # Enforce each subprocess's timeout, without executing gcloud or sleeping.
+        self.advance(min(duration, timeout))
+        if duration > timeout:
+            raise TimeoutError("fixture RPC deadline")
+        if resource == "instances":
+            value = dict(id="1", status=next(self.statuses), disks=[dict(
+                boot=False, deviceName="fixture-data", source=self.disk,
+            )])
+        else:
+            value = dict(id="2", selfLink=self.disk)
+        return subprocess.CompletedProcess(command, 0, json.dumps(value).encode(), b"")
+
+    def test_two_slow_queries_share_one_wait_budget(self):
+        self.durations = iter([6, 6])
+        with self.assertRaises(TimeoutError):
+            self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(self.now, 10)
+        self.assertEqual(self.calls, [("instances", 10), ("disks", 4)])
+
+    def test_short_queries_succeed_with_shrinking_budget(self):
+        current = self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(current, self.baseline)
+        self.assertEqual(self.now, 4)
+        self.assertEqual(self.calls, [("instances", 10), ("disks", 8)])
+
+    def test_first_query_exhaustion_prevents_disk_query(self):
+        for duration in (10, 11):
+            with self.subTest(duration=duration):
+                self.now = 0
+                self.calls.clear()
+                self.durations = iter([duration, 1])
+                self.statuses = iter(["RUNNING"])
+                with self.assertRaises(TimeoutError):
+                    self.host.wait_for_running(self.args, 10, self.baseline)
+                self.assertEqual(self.now, 10)
+                self.assertEqual(self.calls, [("instances", 10)])
+
+    def test_expired_identity_budget_does_not_start_a_query(self):
+        with self.assertRaises(TimeoutError):
+            self.host.resource_identity(self.args, 0)
+        self.assertEqual(self.calls, [])
+
+    def test_identity_response_at_deadline_is_rejected(self):
+        self.durations = iter([4, 6])
+        with self.assertRaises(TimeoutError):
+            self.host.resource_identity(self.args, 10)
+        self.assertEqual(self.now, 10)
+
+    def test_json_processing_counts_toward_identity_deadline(self):
+        original = self.host.decode_json_result
+        for delayed_resource, overhead, expected_calls in (
+                ("instance describe", 8, 1), ("disk describe", 6, 2)):
+            with self.subTest(resource=delayed_resource):
+                self.now = 0
+                self.calls.clear()
+                self.durations = iter([2, 2])
+                self.statuses = iter(["RUNNING"])
+
+                def decode(result, what):
+                    value = original(result, what)
+                    if what == delayed_resource:
+                        self.advance(overhead)
+                    return value
+
+                with mock.patch.object(self.host, "decode_json_result", side_effect=decode):
+                    with self.assertRaises(TimeoutError):
+                        self.host.resource_identity(self.args, 10)
+                self.assertEqual(self.now, 10)
+                self.assertEqual(len(self.calls), expected_calls)
+
+    def test_final_identity_validation_cannot_accept_running_after_deadline(self):
+        original = self.host.validate_resource_identity
+
+        def validate(*args, **kwargs):
+            original(*args, **kwargs)
+            self.advance(6)
+
+        with mock.patch.object(self.host, "validate_resource_identity", side_effect=validate):
+            with self.assertRaises(TimeoutError):
+                self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(self.now, 10)
+
+    def test_wait_retries_non_running_state_with_remaining_budget(self):
+        self.durations = iter([1, 1, 1, 1])
+        self.statuses = iter(["STOPPING", "RUNNING"])
+        current = self.host.wait_for_running(self.args, 10, self.baseline)
+        self.assertEqual(current, self.baseline)
+        self.assertEqual(self.now, 6)
+        self.assertEqual(self.calls, [
+            ("instances", 10), ("disks", 9), ("instances", 6), ("disks", 5),
+        ])
 
 
 class GuestContracts(unittest.TestCase):

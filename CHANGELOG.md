@@ -208,6 +208,14 @@ documents.
 
 ### Fixed
 
+- **Mixed benchmark write verification** (BUG-134, 2026-10-20): check the
+  latest expected value at every initialized slot after measurement, including
+  writes that no measured read visits. Reports separate written/read-after-write
+  slot coverage and final sweep count/time from measured read verdicts, IOPS and
+  latency. Fault controls reject discarded measured writes and a lost final
+  write; the sweep uses the current engine/cache rather than crash recovery
+  ([benchmark guide](docs/benchmark.md)).
+
 - **2026-10-14 project review**: inline reclaim keeps reclaiming while a
   checkpoint has not covered every append, so a concurrent FUA no longer turns
   a write into ENOSPC (BUG-089). `maki-check --deep` fails instead of passing

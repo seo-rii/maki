@@ -424,7 +424,18 @@ maki volume gc /etc/maki/volume-writer.toml
 ```
 
 The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
-and `retained` namespace arrays. GC authenticates the current physical root against its authority,
+and `retained` namespace arrays. Each array retains at most the first 4,096
+names in that category. The corresponding fields in `counts` give the total
+numbers processed, including any omitted details; `details_truncated` is true
+if any array omitted names. Use `counts`, not array lengths, for totals.
+
+GC walks the root in sorted pages of at most 4,096 names and continues past
+pages containing only retained, live or unrecognized entries. Each page scans
+the directory anew, so enumeration scratch and report details stay bounded,
+while total scan time grows with directory size and page count. This is not a
+wall-clock deadline or a bound on the entire process's memory.
+
+GC authenticates the current physical root against its authority,
 retains current/pending/restore-source namespaces and unknown entries, and only
 considers namespaces with a lower fence. An old writer's lifetime lock keeps
 its namespace live even after revocation; GC skips it until every handle has

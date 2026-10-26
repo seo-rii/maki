@@ -401,12 +401,12 @@ fn write_sentinel_with_boundary(
             .take(SENTINEL_MAX_BYTES)
             .read_to_string(&mut existing)?;
         if !existing.trim().eq_ignore_ascii_case(volume_uuid) {
+            // Existing bytes belong to the workload and can be plaintext
+            // unrelated to any UUID. Keep them out of every error rendering.
             return Err(ExecError::Step {
                 step: step.to_string(),
-                message: format!(
-                    "sentinel already holds a different volume uuid {:?}; refusing to overwrite",
-                    existing.trim()
-                ),
+                message: "sentinel does not match the expected volume UUID; refusing to overwrite"
+                    .into(),
             });
         }
         persist(&mut file, boundary)?;
@@ -799,6 +799,12 @@ trait System {
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         self.detach_observation(record)
     }
+    fn disconnected_recovery_observation(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<DetachObservation> {
+        self.recovery_observation(record)
+    }
     fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
         Err(identity_error("logical volume size cannot be observed"))
     }
@@ -870,6 +876,16 @@ impl System for LinuxSystem {
     }
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         recover::observe(
+            record,
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            Path::new("/sys/class/block"),
+        )
+    }
+    fn disconnected_recovery_observation(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<DetachObservation> {
+        recover::observe_disconnected(
             record,
             &std::fs::read_to_string("/proc/self/mountinfo")?,
             Path::new("/sys/class/block"),

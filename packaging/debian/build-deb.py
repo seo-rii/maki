@@ -50,6 +50,11 @@ ELF_MACHINE_NAMES = {
     0x102: "LoongArch",
 }
 ET_REL, ET_EXEC, ET_DYN = 1, 2, 3
+PT_DYNAMIC, PT_INTERP = 2, 3
+DT_NULL, DT_FLAGS_1 = 0, 0x6FFFFFFB
+DF_1_PIE = 0x08000000
+EF_ARM_EABIMASK, EF_ARM_EABI_VER5 = 0xFF000000, 0x05000000
+EF_ARM_ABI_FLOAT_SOFT, EF_ARM_ABI_FLOAT_HARD = 0x200, 0x400
 
 
 def fail(message):
@@ -75,7 +80,7 @@ def parse_args():
 
 
 def inspect_elf(path):
-    """Return (e_type, e_machine, class, byte order) of an ELF file, or fail."""
+    """Return (e_type, e_machine, class, byte order, e_flags), or fail."""
     with path.open("rb") as handle:
         header = handle.read(64)
     if len(header) < 52 or header[:4] != b"\x7fELF":
@@ -88,7 +93,59 @@ def inspect_elf(path):
         fail(f"{path.name} has a truncated ELF64 header")
     order = "<" if endian == "little" else ">"
     e_type, e_machine = struct.unpack(f"{order}HH", header[16:20])
-    return e_type, e_machine, elf_class, endian
+    e_flags = struct.unpack_from(f"{order}I", header, 48 if elf_class == 64 else 36)[0]
+    return e_type, e_machine, elf_class, endian, e_flags
+
+
+def validate_shared_object(path, elf_class, endian):
+    """Reject PIE markers in ET_DYN using loader metadata, not section headers."""
+    order = "<" if endian == "little" else ">"
+    is_64 = elf_class == 64
+    program_format = f"{order}{'IIQQQQQQ' if is_64 else 'IIIIIIII'}"
+    dynamic_format = f"{order}{'qQ' if is_64 else 'iI'}"
+    program_size = struct.calcsize(program_format)
+    dynamic_size = struct.calcsize(dynamic_format)
+    with path.open("rb") as handle:
+        header = handle.read(64 if is_64 else 52)
+        if len(header) < (64 if is_64 else 52):
+            fail(f"{path.name} has a truncated ELF header")
+        program_offset = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header,
+                                            32 if is_64 else 28)[0]
+        entry_size, count = struct.unpack_from(f"{order}HH", header, 54 if is_64 else 42)
+        if count == 0:
+            return
+        if count == 0xFFFF:
+            fail(f"{path.name} uses an unsupported extended ELF program-header count")
+        if entry_size < program_size:
+            fail(f"{path.name} has truncated ELF program-header entries")
+        file_size = os.fstat(handle.fileno()).st_size
+        if program_offset + count * entry_size > file_size:
+            fail(f"{path.name} has a truncated ELF program-header table")
+        # Read one fixed-size entry at a time. Counts and segment ranges must
+        # fit the file; neither table nor segment contents are copied wholesale.
+        for index in range(count):
+            handle.seek(program_offset + index * entry_size)
+            program = handle.read(program_size)
+            if len(program) != program_size:
+                fail(f"{path.name} has a truncated ELF program-header entry")
+            fields = struct.unpack(program_format, program)
+            if fields[0] == PT_INTERP:
+                fail(f"{path.name} must be an ELF shared object, not a PIE executable (PT_INTERP)")
+            if fields[0] != PT_DYNAMIC:
+                continue
+            offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
+            if offset + size > file_size or size % dynamic_size:
+                fail(f"{path.name} has a truncated ELF dynamic table")
+            handle.seek(offset)
+            for _ in range(size // dynamic_size):
+                entry = handle.read(dynamic_size)
+                if len(entry) != dynamic_size:
+                    fail(f"{path.name} has a truncated ELF dynamic entry")
+                tag, value = struct.unpack(dynamic_format, entry)
+                if tag == DT_NULL:
+                    break
+                if tag == DT_FLAGS_1 and value & DF_1_PIE:
+                    fail(f"{path.name} must be an ELF shared object, not a PIE executable (DF_1_PIE)")
 
 
 def describe(e_machine, elf_class, endian):
@@ -108,16 +165,31 @@ def validate_release_files(args):
         path = args.release_dir / source_name
         if not path.is_file() or path.is_symlink():
             fail(f"required regular file is missing: {source_name}")
-        e_type, e_machine, file_class, file_endian = inspect_elf(path)
+        e_type, e_machine, file_class, file_endian, e_flags = inspect_elf(path)
         if (e_machine, file_class, file_endian) != (machine, elf_class, endian):
             fail(
                 f"{source_name} is {describe(e_machine, file_class, file_endian)} but the "
                 f"package architecture is {args.architecture} "
                 f"({describe(machine, elf_class, endian)})"
             )
+        if args.architecture in ("armel", "armhf"):
+            # Both Debian ports use ARM EABI5, but their floating-point
+            # procedure-call standards differ despite identical ELF identity.
+            if e_flags & EF_ARM_EABIMASK != EF_ARM_EABI_VER5:
+                fail(f"{source_name} must use ARM EABI version 5 for {args.architecture}")
+            float_flags = e_flags & (EF_ARM_ABI_FLOAT_SOFT | EF_ARM_ABI_FLOAT_HARD)
+            if float_flags == EF_ARM_ABI_FLOAT_SOFT | EF_ARM_ABI_FLOAT_HARD:
+                fail(f"{source_name} has conflicting ARM float ABI flags")
+            # AAELF32 specifies the base (soft-float) PCS when both flags are clear.
+            hard_float = bool(float_flags & EF_ARM_ABI_FLOAT_HARD)
+            if hard_float != (args.architecture == "armhf"):
+                actual_abi = "hard-float" if hard_float else "soft-float"
+                fail(f"{source_name} uses the ARM {actual_abi} ABI but the "
+                     f"package architecture is {args.architecture}")
         if source_name in SHARED_OBJECTS:
             if e_type != ET_DYN:
                 fail(f"{source_name} must be an ELF shared object (ET_DYN), found type {e_type}")
+            validate_shared_object(path, file_class, file_endian)
         elif e_type not in (ET_EXEC, ET_DYN):
             fail(f"{source_name} must be an ELF executable (ET_EXEC or PIE), found type {e_type}")
 

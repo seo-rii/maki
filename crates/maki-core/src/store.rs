@@ -643,6 +643,16 @@ impl SlotStore {
         self.shards.len()
     }
 
+    fn validate_unit(&self, unit: u64) -> Result<(), CoreError> {
+        if unit >= self.geometry.num_units() {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit} beyond the device ({} units)",
+                self.geometry.num_units()
+            )));
+        }
+        Ok(())
+    }
+
     /// Make the complete on-disk slot range available before its journal
     /// record can be accepted. A successful Linux reservation uses
     /// `posix_fallocate`, so a later checkpoint cannot lose its completion
@@ -654,12 +664,7 @@ impl SlotStore {
     /// at open reach disk before the extension zero-fills the slots they
     /// stand for.
     pub fn reserve_slot(&mut self, unit: u64) -> Result<(), CoreError> {
-        if unit >= self.geometry.num_units() {
-            return Err(CoreError::Corrupt(format!(
-                "unit {unit} beyond the device ({} units)",
-                self.geometry.num_units()
-            )));
-        }
+        self.validate_unit(unit)?;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let prepared = self
             .ensure_shard(shard_idx)
@@ -922,6 +927,7 @@ impl SlotStore {
         write_sequence: u64,
         ciphertext: &[u8],
     ) -> Result<(), CoreError> {
+        self.validate_unit(unit)?;
         if ciphertext.len() > self.geometry.max_ciphertext_size as usize {
             return Err(CoreError::Corrupt(format!(
                 "ciphertext {} exceeds max {}",
@@ -947,6 +953,7 @@ impl SlotStore {
     }
 
     pub fn mark_allocated(&mut self, unit: u64) -> Result<(), CoreError> {
+        self.validate_unit(unit)?;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         self.ensure_shard(shard_idx)?;
         let shard = self.shards.get_mut(&shard_idx).unwrap();

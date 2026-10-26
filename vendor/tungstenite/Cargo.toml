@@ -163,7 +163,7 @@ optional = true
 version = "0.7.5"
 
 [dependencies.webpki-roots]
-version = "0.26"
+version = "1.0.10"
 optional = true
 
 [dev-dependencies.criterion]

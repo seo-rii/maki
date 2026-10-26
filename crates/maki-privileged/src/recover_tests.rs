@@ -48,6 +48,12 @@ fn attached() -> (Fixture, TrustedState, AttachRequest, ObservedSystem) {
 }
 
 fn activation_crashed() -> (Fixture, TrustedState, AttachRequest, ObservedSystem) {
+    activation_interrupted(false)
+}
+
+fn activation_interrupted(
+    before_activation: bool,
+) -> (Fixture, TrustedState, AttachRequest, ObservedSystem) {
     let fixture = Fixture::new();
     let state = fixture.state();
     let req = request();
@@ -57,7 +63,8 @@ fn activation_crashed() -> (Fixture, TrustedState, AttachRequest, ObservedSystem
     std::fs::write(sysfs.join("nbd3/size"), "1024\n").unwrap();
     let mut system = ObservedSystem {
         fake: FakeSystem {
-            process_death_after_activation: true,
+            process_death_before_activation: before_activation,
+            process_death_after_activation: !before_activation,
             ..Default::default()
         },
         sysfs,
@@ -65,10 +72,7 @@ fn activation_crashed() -> (Fixture, TrustedState, AttachRequest, ObservedSystem
     let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = execute_with(&plan_attach(&req), Some(&state), &mut system);
     }));
-    assert!(
-        death.is_err(),
-        "fixture must stop between activation and proof"
-    );
+    assert!(death.is_err(), "fixture must stop after publishing intent");
     let record = state.read("pg").unwrap().unwrap();
     let serialized = serde_json::to_value(&record).unwrap();
     assert!(
@@ -76,11 +80,178 @@ fn activation_crashed() -> (Fixture, TrustedState, AttachRequest, ObservedSystem
         "verified pre-activation identity was not durably published: {serialized}"
     );
     assert!(record.recovery.is_none());
-    assert!(system.fake.vg_active);
+    assert_eq!(system.fake.vg_active, !before_activation);
+    system.fake.process_death_before_activation = false;
     system.fake.process_death_after_activation = false;
     system.fake.steps.clear();
     system.fake.backends.clear();
     (fixture, state, req, system)
+}
+
+#[test]
+fn empty_intent_cleanup_accepts_disconnected_capacity_reset() {
+    let (_fixture, state, req, mut system) = activation_interrupted(true);
+    let record = state.read("pg").unwrap().unwrap();
+    assert!(!system.fake.vg_active && !system.fake.mounted);
+    std::fs::write(system.sysfs.join("nbd3/size"), "0\n").unwrap();
+
+    cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+
+    assert!(system.fake.steps.is_empty(), "empty cleanup is record-only");
+    assert!(state.read("pg").unwrap().is_none());
+    assert!(record.recovery_intent.is_some());
+    cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+    assert!(system.fake.steps.is_empty(), "cleanup retry is idempotent");
+}
+
+fn record_intent_partition(state: &TrustedState) -> BoundDeviceRecord {
+    let mut value = serde_json::to_value(state.read("pg").unwrap().unwrap()).unwrap();
+    value["recovery_intent"]["verified"]["devices"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "path": "/dev/nbd3p1", "number": [43, 4], "start": 8, "sectors": 512,
+        }));
+    let record = serde_json::from_value(value).unwrap();
+    state.write(&record).unwrap();
+    record
+}
+
+fn add_intent_partition(system: &ObservedSystem, name: &str) {
+    let root = system.sysfs.join(name);
+    std::fs::create_dir_all(root.join("holders")).unwrap();
+    std::fs::write(root.join("dev"), "43:4\n").unwrap();
+    std::fs::write(root.join("partition"), "1\n").unwrap();
+    std::fs::write(root.join("start"), "8\n").unwrap();
+    std::fs::write(root.join("size"), "512\n").unwrap();
+}
+
+#[test]
+fn empty_intent_cleanup_accepts_disappeared_or_unchanged_recorded_partitions() {
+    for partition_present in [false, true] {
+        let (_fixture, state, req, mut system) = activation_interrupted(true);
+        record_intent_partition(&state);
+        if partition_present {
+            add_intent_partition(&system, "nbd3p1");
+        }
+        std::fs::write(system.sysfs.join("nbd3/size"), "0\n").unwrap();
+
+        cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+
+        assert!(system.fake.steps.is_empty());
+        assert!(state.read("pg").unwrap().is_none());
+    }
+}
+
+#[test]
+fn empty_intent_cleanup_rejects_changed_present_device_identity() {
+    for (path, value) in [
+        ("nbd3/dev", "43:9\n"),
+        ("nbd3/size", "2048\n"),
+        ("nbd3p1/dev", "43:9\n"),
+        ("nbd3p1/start", "16\n"),
+        ("nbd3p1/size", "256\n"),
+        ("nbd3p1/partition", "2\n"),
+    ] {
+        let (_fixture, state, req, mut system) = activation_interrupted(true);
+        let record = record_intent_partition(&state);
+        add_intent_partition(&system, "nbd3p1");
+        std::fs::write(system.sysfs.join("nbd3/size"), "0\n").unwrap();
+        std::fs::write(system.sysfs.join(path), value).unwrap();
+
+        assert!(
+            cleanup_with(&plan_detach(&req), &state, &mut system).is_err(),
+            "accepted changed device at {path}"
+        );
+        assert!(system.fake.steps.is_empty());
+        assert_eq!(state.read("pg").unwrap(), Some(record));
+    }
+}
+
+#[test]
+fn empty_intent_cleanup_rejects_new_partitions_holders_and_mounts() {
+    for foreign in ["partition", "holder", "mount", "missing-device"] {
+        let (_fixture, state, req, mut system) = activation_interrupted(true);
+        let record = state.read("pg").unwrap().unwrap();
+        std::fs::write(system.sysfs.join("nbd3/size"), "0\n").unwrap();
+        match foreign {
+            "partition" => add_intent_partition(&system, "nbd3p1"),
+            "holder" => {
+                std::fs::write(system.sysfs.join("nbd3/holders/dm-99"), "").unwrap();
+            }
+            "mount" => system.fake.mounted = true,
+            "missing-device" => std::fs::remove_dir_all(system.sysfs.join("nbd3")).unwrap(),
+            _ => unreachable!(),
+        }
+
+        assert!(
+            cleanup_with(&plan_detach(&req), &state, &mut system).is_err(),
+            "accepted {foreign}"
+        );
+        assert!(system.fake.steps.is_empty());
+        assert_eq!(state.read("pg").unwrap(), Some(record));
+    }
+}
+
+#[test]
+fn empty_intent_cleanup_rechecks_backend_before_retiring_record() {
+    for fault in [BackendFault::Foreign, BackendFault::Unreadable] {
+        for probe in [1, 3, 4] {
+            let (_fixture, state, req, mut system) = activation_interrupted(true);
+            let record = state.read("pg").unwrap().unwrap();
+            system.fake.backend_probes.set(0);
+            system.fake.backend_fault_on_probe = Some((probe, fault));
+
+            assert!(
+                cleanup_with(&plan_detach(&req), &state, &mut system).is_err(),
+                "retired after backend fault at probe {probe}"
+            );
+            assert!(system.fake.steps.is_empty());
+            assert_eq!(state.read("pg").unwrap(), Some(record));
+        }
+    }
+}
+
+#[test]
+fn empty_intent_cleanup_rechecks_resources_before_retiring_record() {
+    let (_fixture, state, req, mut system) = activation_interrupted(true);
+    let record = state.read("pg").unwrap().unwrap();
+    system.fake.recovery_observations.set(0);
+    system.fake.holder_after_recovery_observation = true;
+
+    assert!(
+        cleanup_with(&plan_detach(&req), &state, &mut system).is_err(),
+        "a holder appeared after the empty observation"
+    );
+    assert!(system.fake.steps.is_empty());
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+#[test]
+fn empty_intent_relaxation_never_authorizes_live_mapping_cleanup() {
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let record = state.read("pg").unwrap().unwrap();
+    assert!(system.fake.vg_active);
+    std::fs::write(system.sysfs.join("nbd3/size"), "0\n").unwrap();
+
+    assert!(cleanup_with(&plan_detach(&req), &state, &mut system).is_err());
+    assert!(system.fake.steps.is_empty());
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+#[test]
+fn empty_intent_capacity_reset_exception_requires_an_absent_backend() {
+    let (_fixture, state, req, mut system) = activation_interrupted(true);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    std::fs::write(system.sysfs.join("nbd3/size"), "0\n").unwrap();
+
+    assert!(cleanup_with(&plan_detach(&req), &state, &mut system).is_err());
+    assert!(system.fake.steps.is_empty());
+    assert_eq!(state.read("pg").unwrap(), Some(record));
 }
 
 #[test]
@@ -500,4 +671,28 @@ fn recovery_refuses_an_extra_mount_and_never_reads_the_sentinel() {
             .unwrap()
             .mounted
     );
+}
+
+#[test]
+fn mountinfo_unicode_whitespace_preserves_recovery_and_complete_mount_identity() {
+    let (_fixture, state, _req, system) = attached();
+    let mut record = state.read("pg").unwrap().unwrap();
+    for space in ['\u{00a0}', '\u{2003}', '\u{3000}'] {
+        record.attachment.mountpoint = format!("/srv/audit{space}data");
+        let mounts = system.mounts(&record);
+        assert!(
+            recover::observe(&record, &mounts, &system.sysfs)
+                .unwrap()
+                .mounted
+        );
+        assert_eq!(
+            recover::observe_complete(&record, &mounts, &system.sysfs)
+                .unwrap()
+                .device,
+            (253, 0)
+        );
+
+        let extra = format!("{mounts}41 25 253:0 / /srv/other{space}data rw - xfs /dev/dm-0 rw\n");
+        assert!(recover::observe(&record, &extra, &system.sysfs).is_err());
+    }
 }

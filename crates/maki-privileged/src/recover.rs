@@ -180,7 +180,7 @@ fn check_mounts(
         let (left, _) = line
             .split_once(" - ")
             .ok_or_else(|| invalid("incomplete mountinfo"))?;
-        let fields: Vec<_> = left.split_whitespace().collect();
+        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
         if fields.len() < 6 {
             return Err(invalid("incomplete mountinfo"));
         }
@@ -401,6 +401,26 @@ pub(super) fn observe(
     mounts: &str,
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
+    observe_with_empty_reset(record, mounts, sysfs, false)
+}
+
+/// Only disconnected recovery may retire an empty activation intent after
+/// Linux resets the NBD capacity. The executor brackets these observations
+/// with absent-backend checks and reobserves before retiring the record.
+pub(super) fn observe_disconnected(
+    record: &BoundDeviceRecord,
+    mounts: &str,
+    sysfs: &Path,
+) -> io::Result<DetachObservation> {
+    observe_with_empty_reset(record, mounts, sysfs, true)
+}
+
+fn observe_with_empty_reset(
+    record: &BoundDeviceRecord,
+    mounts: &str,
+    sysfs: &Path,
+    permit_empty_reset: bool,
+) -> io::Result<DetachObservation> {
     let observed = crate::detach::observe_kernel(record, mounts, sysfs)?;
     let Some(proof) = &record.recovery else {
         if let Some(intent) = &record.recovery_intent {
@@ -409,7 +429,16 @@ pub(super) fn observe(
                     "pre-activation recovery identity never authorized an upper layer",
                 ));
             }
-            lvm_preflight::verify_recovery_device_identity(record, intent.verified(), sysfs)?;
+            // A fully disconnected NBD can have size zero and lose its
+            // partitions. This permits record-only retirement, never
+            // deactivation of a live mapping under changed geometry.
+            let empty_reset = permit_empty_reset && !observed.vg_active && !observed.nbd_in_use;
+            lvm_preflight::verify_recovery_device_identity(
+                record,
+                intent.verified(),
+                sysfs,
+                empty_reset,
+            )?;
             if observed.vg_active {
                 lvm_preflight::verify_recovery_rollback_mapping(record, intent.verified(), sysfs)?;
             } else if observed.nbd_in_use {
@@ -470,8 +499,8 @@ pub(super) fn observe_complete(
         let (left, right) = line
             .split_once(" - ")
             .ok_or_else(|| invalid("incomplete mountinfo"))?;
-        let fields: Vec<_> = left.split_whitespace().collect();
-        let filesystem: Vec<_> = right.split_whitespace().collect();
+        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
+        let filesystem: Vec<_> = crate::probe::mountinfo_fields(right).collect();
         if fields.len() < 6 || filesystem.len() < 3 {
             return Err(invalid("incomplete mountinfo"));
         }
@@ -545,7 +574,7 @@ pub(super) fn execute(
     }
     for _ in 0..4 {
         absent_backend(&record, system)?;
-        let observed = system.recovery_observation(&record)?;
+        let observed = system.disconnected_recovery_observation(&record)?;
         absent_backend(&record, system)?;
         let step = if observed.mounted {
             PlannedStep::Umount {
@@ -560,6 +589,16 @@ pub(super) fn execute(
                 "NBD still has users; keeping recovery state",
             ));
         } else {
+            // A new holder/mapping can appear while observing the kernel,
+            // even if the backend remains absent. Never retire its cleanup
+            // authority based only on the earlier empty snapshot.
+            let confirmed = system.disconnected_recovery_observation(&record)?;
+            absent_backend(&record, system)?;
+            if confirmed.mounted || confirmed.vg_active || confirmed.nbd_in_use {
+                return Err(identity_error(
+                    "attachment gained live resources before record retirement",
+                ));
+            }
             state.remove(&plan.volume)?;
             return Ok(());
         };

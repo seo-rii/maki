@@ -16,6 +16,9 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+#[path = "common/paused_time.rs"]
+mod paused_time;
+
 struct Request {
     generation: usize,
     id: Value,
@@ -242,4 +245,28 @@ async fn successful_concurrent_requests_keep_the_connection_reusable() {
     let third = launch(&provider, 3);
     server.request(3, 1).await.respond();
     success(third, 3).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_deadline_preserves_a_younger_sibling() {
+    paused_time::bounded(async {
+        let mut server = Server::start().await;
+        let provider = server.provider();
+        let expired = launch(&provider, 1);
+        let late = server.request(1, 1).await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let survivor = launch(&provider, 2);
+        let response = server.request(2, 1).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(expired.await.unwrap().unwrap_err().is_retryable());
+        late.respond();
+        response.respond();
+        success(survivor, 2).await;
+        server.closed(1).await;
+        assert!(
+            server.requests.try_recv().is_err(),
+            "retry-unsafe requests were resent"
+        );
+    })
+    .await;
 }
