@@ -58,6 +58,12 @@ The standalone `tungstenite` test graph also updates its registry `rustls`,
 `crossbeam-epoch`, and `rand` dependencies and replaces a yanked `yoke-derive`
 release. These test-only resolutions are separate from the workspace lockfile.
 
+The workspace and standalone `hyper` lockfiles resolve Tokio 1.53.3, which
+addresses the I/O-safety warning
+[RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+The standalone lockfile hash is recorded in `patches.json`; the vendored
+plaintext-erasure source patches are unchanged.
+
 The unbuffered TLS 1.3 regression tests lower the record limit and send the
 bytes returned by `WriteTraffic::encrypt` directly to a peer. They verify that
 an automatic KeyUpdate precedes application data in the same output, including
