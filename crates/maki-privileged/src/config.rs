@@ -21,8 +21,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// Fixed classification and location only; never retain the TOML error.
     #[error("attach config parse error: {0}")]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("attach config invalid: {0}")]
     Invalid(String),
 }
@@ -58,8 +59,23 @@ pub fn default_path(volume: &str) -> String {
     format!("/etc/maki/attach/{volume}.toml")
 }
 
+/// Parse attach configuration without retaining its contents in diagnostics.
+/// Values and unknown field names can contain accidentally pasted secrets;
+/// the TOML error, message, and source text must not escape through any of
+/// `Display`, `Debug`, or the error source chain.
 pub fn parse(text: &str) -> Result<AttachConfig, ConfigError> {
-    Ok(toml::from_str(text)?)
+    toml::from_str(text).map_err(|error| {
+        let location = error
+            .span()
+            .and_then(|span| text.get(..span.start))
+            .map(|before| {
+                let line = before.matches('\n').count() + 1;
+                let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                format!(" at line {line}, column {column}")
+            })
+            .unwrap_or_default();
+        ConfigError::Parse(format!("invalid TOML or configuration schema{location}"))
+    })
 }
 
 pub fn load(path: &str) -> Result<AttachConfig, ConfigError> {

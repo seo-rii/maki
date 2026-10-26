@@ -33,11 +33,12 @@ fn choose(sysfs: &Path, mountinfo: &str) -> Result<String, ExecError> {
         let (left, right) = line
             .split_once(" - ")
             .ok_or_else(|| invalid("incomplete mount inventory during NBD allocation"))?;
-        let mut fields = left.split_whitespace();
+        let mut fields = crate::probe::mountinfo_fields(left);
         let number = fields
             .nth(2)
             .ok_or_else(|| invalid("incomplete mount inventory during NBD allocation"))?;
-        if fields.take(3).count() != 3 || right.split_whitespace().take(3).count() != 3 {
+        if fields.take(3).count() != 3 || crate::probe::mountinfo_fields(right).take(3).count() != 3
+        {
             return Err(invalid("incomplete mount inventory during NBD allocation").into());
         }
         mounted.insert(crate::detach::device_number(number)?);

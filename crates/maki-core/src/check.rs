@@ -35,7 +35,8 @@ const MAX_SLOT_ERRORS: usize = 64;
 
 /// Run the fast checks, then verify checkpoint state, the key canary, the
 /// durable mark, the whole journal (read-only, with the recovery scanner),
-/// and every allocated slot.
+/// and every allocated slot. I/O failures make the check inconclusive and
+/// return an error; they do not establish corruption in the report.
 pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckReport, CoreError> {
     let mut report = maki_format::checker::check_volume(backing.as_ref())?;
     report.info.push("deep check: enabled".to_string());
@@ -93,6 +94,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                 );
             }
         }
+        Err(FormatError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("checkpoint state: {e}")),
     }
     let checkpoint_sequence = match load_checkpoint_state(&backing) {
@@ -103,7 +105,9 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             ));
             state.checkpoint_sequence
         }
-        Err(RecoveryError::Io(e)) => return Err(CoreError::Io(e)),
+        Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
+            return Err(CoreError::Io(e))
+        }
         Err(e) => {
             report.errors.push(e.to_string());
             return Ok(report);
@@ -124,6 +128,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
              integrity-capable provider for that)"
                 .to_string(),
         ),
+        Err(FormatError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("key canary: {e}")),
     }
 
@@ -171,7 +176,9 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             replay_units = scan.replay_units;
             journal_ok = true;
         }
-        Err(RecoveryError::Io(e)) => return Err(CoreError::Io(e)),
+        Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
+            return Err(CoreError::Io(e))
+        }
         Err(e) => report.errors.push(format!("journal: {e}")),
     }
 
@@ -262,7 +269,9 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                 ));
             }
         }
-        Err(CoreError::Io(e)) => return Err(CoreError::Io(e)),
+        Err(CoreError::Io(e) | CoreError::Format(FormatError::Io(e))) => {
+            return Err(CoreError::Io(e))
+        }
         Err(e) => report.errors.push(format!("slot store: {e}")),
     }
 

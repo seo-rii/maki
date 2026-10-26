@@ -359,8 +359,12 @@ cleanup() {
 
     disconnect_test_nbd || cleanup_rc=1
 
-    stop_process_normally "$duplicate_pid" "duplicate nbdkit" || cleanup_rc=1
-    duplicate_pid=""
+    if stop_process_normally "$duplicate_pid" "duplicate nbdkit"; then
+        duplicate_pid=""
+    else
+        cleanup_rc=1
+        cleanup_safe=false
+    fi
     if ! stop_process_normally "$nbdkit_pid" "nbdkit"; then
         cleanup_rc=1
         cleanup_safe=false
@@ -626,8 +630,11 @@ config_path="$run_dir/volume.toml"
 key_path="$work_dir/local-aes-gcm-siv.key"
 dd if=/dev/urandom of="$key_path" bs=32 count=1 status=none
 chmod 0600 "$key_path"
-python3 - "$config_path" "$volume_name" "$key_path" "$work_dir/backing" \
-    "$socket_path" "$control_socket_path" <<'PY'
+# Both daemons must reach the same backing with the same crypto identity.
+# Only their NBD and control listener paths differ.
+write_validation_config() {
+python3 - "$1" "$volume_name" "$key_path" "$work_dir/backing" \
+    "$2" "$3" <<'PY'
 import json
 import pathlib
 import sys
@@ -676,6 +683,8 @@ connections = 1
 socket = {control_socket_path}
 """, encoding="utf-8")
 PY
+}
+write_validation_config "$config_path" "$socket_path" "$control_socket_path"
 
 if [[ "$discard" == true ]]; then
     "$maki_bin" volume create "$config_path" --discard
@@ -719,20 +728,29 @@ fi
 pass "unrelated user is denied by the runtime-directory boundary"
 
 duplicate_socket="$work_dir/duplicate.sock"
+duplicate_config_path="$run_dir/duplicate-volume.toml"
+write_validation_config "$duplicate_config_path" "$duplicate_socket" "$work_dir/duplicate-control.sock"
 "${nbdkit_launcher[@]}" nbdkit --foreground -U "$duplicate_socket" "$plugin_path" \
-    config="$config_path" >"$run_dir/duplicate-nbdkit.log" 2>&1 &
+    config="$duplicate_config_path" >"$run_dir/duplicate-nbdkit.log" 2>&1 &
 duplicate_pid=$!
+# nbdkit binds its socket before plugin startup. A socket or failed client
+# negotiation alone cannot establish that recovery reached the volume lock.
 for _ in $(seq 1 100); do
-    [[ -S "$duplicate_socket" ]] && break
     kill -0 "$duplicate_pid" 2>/dev/null || break
     sleep 0.05
 done
-if [[ -S "$duplicate_socket" ]] &&
-    nbdinfo "nbd+unix:///?socket=$duplicate_socket" >"$run_dir/duplicate-client.txt" 2>&1; then
-    die "a second nbdkit process opened the already-attached Maki volume"
+if kill -0 "$duplicate_pid" 2>/dev/null; then
+    die "duplicate nbdkit did not exit after volume-lock rejection; see duplicate-nbdkit.log"
 fi
-stop_process_normally "$duplicate_pid" "duplicate nbdkit" || die "duplicate nbdkit did not stop"
+duplicate_status=0
+wait "$duplicate_pid" || duplicate_status=$?
 duplicate_pid=""
+printf '%s\n' "$duplicate_status" >"$run_dir/duplicate-nbdkit.exit"
+[[ "$duplicate_status" == 1 ]] ||
+    die "duplicate nbdkit exited with status $duplicate_status, expected startup failure status 1"
+grep -Fxq 'maki-nbdkit: startup failed: adapter error (errno 5): VOLUME_ALREADY_ATTACHED' \
+    "$run_dir/duplicate-nbdkit.log" ||
+    die "duplicate nbdkit failed without the volume-lock rejection; see duplicate-nbdkit.log"
 pass "duplicate volume attach fails closed"
 
 requested_devices=$((nbd_index + 1))
