@@ -37,6 +37,17 @@ OOM, interrupt power, test a real disk, or modify installed Maki systemd
 units. Those scenarios need an isolated destructive-test host and are outside
 this safe runner.
 
+The duplicate-attach check uses the same backing, volume and crypto settings
+with separate NBD and control socket paths. Its NBD path matches the second
+nbdkit process's `-U` argument, so listener validation can reach recovery.
+The check passes only when that process exits with startup-failure status 1
+and reports the native startup error `VOLUME_ALREADY_ATTACHED`. A missing
+plugin, invalid configuration, listener mismatch or process that stays alive
+fails qualification. The duplicate configuration, stderr log and exit code
+are retained as `duplicate-volume.toml`, `duplicate-nbdkit.log` and
+`duplicate-nbdkit.exit` in the run directory; an unfinished process is stopped
+by the normal exit cleanup and supplies no successful lock verdict.
+
 ## Run
 
 The current helper requires nbd-client 3.27.0 or later built with netlink and

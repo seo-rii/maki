@@ -401,12 +401,12 @@ fn write_sentinel_with_boundary(
             .take(SENTINEL_MAX_BYTES)
             .read_to_string(&mut existing)?;
         if !existing.trim().eq_ignore_ascii_case(volume_uuid) {
+            // Existing bytes belong to the workload and can be plaintext
+            // unrelated to any UUID. Keep them out of every error rendering.
             return Err(ExecError::Step {
                 step: step.to_string(),
-                message: format!(
-                    "sentinel already holds a different volume uuid {:?}; refusing to overwrite",
-                    existing.trim()
-                ),
+                message: "sentinel does not match the expected volume UUID; refusing to overwrite"
+                    .into(),
             });
         }
         persist(&mut file, boundary)?;

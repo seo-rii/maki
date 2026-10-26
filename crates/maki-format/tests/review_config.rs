@@ -315,6 +315,75 @@ fn endpoint_url_parsing_and_loopback_detection() {
 }
 
 #[test]
+fn endpoint_ports_preserve_valid_ipv4_ipv6_and_default_ports() {
+    for scheme in ["http", "https", "ws", "wss"] {
+        for (authority, host) in [
+            ("localhost", "localhost"),
+            ("127.0.0.1:", "127.0.0.1"),
+            ("127.0.0.1:0", "127.0.0.1"),
+            ("Host.Example:65535", "Host.Example"),
+            ("[::1]", "::1"),
+            ("[::1]:", "::1"),
+            ("[::1]:00080", "::1"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+        ] {
+            let url = format!("{scheme}://{authority}/v1?profile=1#fragment");
+            assert_eq!(
+                parse_endpoint_url(&url).unwrap(),
+                (scheme.to_string(), host.to_string()),
+                "{url}"
+            );
+        }
+    }
+}
+
+#[test]
+fn endpoint_ports_reject_invalid_syntax_and_overflow() {
+    for scheme in ["http", "https", "ws", "wss"] {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            for port in [
+                "65536",
+                "9999999999999999999999",
+                "not-a-port",
+                "-1",
+                "+80",
+                "80:90",
+            ] {
+                let url = format!("{scheme}://{host}:{port}/v1?profile=1");
+                let error = parse_endpoint_url(&url).expect_err(&url);
+                assert!(error.to_string().contains("port"), "{url}: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_endpoint_ports_fail_all_remote_transport_preflights() {
+    for (document, old_url, scheme) in [
+        (base(), "https://crypto.internal", "https"),
+        (
+            remote_batch("remote-websocket", "[crypto.websocket]"),
+            "ws://127.0.0.1:7000",
+            "ws",
+        ),
+        (
+            remote_batch("remote-grpc", "[crypto.grpc]"),
+            "http://localhost:7000",
+            "http",
+        ),
+    ] {
+        ok(&document);
+        for host in ["127.0.0.1", "[::1]"] {
+            for port in ["65536", "not-a-port"] {
+                let url = format!("{scheme}://{host}:{port}");
+                let message = err(&document.replace(old_url, &url));
+                assert!(message.contains("port"), "{url}: {message}");
+            }
+        }
+    }
+}
+
+#[test]
 fn duplicate_or_empty_endpoint_names_are_rejected() {
     let dup = format!(
         "{}\n[[crypto.http.endpoint]]\nname = \"a\"\nurl = \"https://b.internal\"\n",
