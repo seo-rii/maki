@@ -546,6 +546,23 @@ attach). Not a durability bug; a fail-*open* diagnostic gap.
 |---|---|---|---|
 | BUG-027 | **`maki check` passed a volume `maki attach` would reject: a cataloged shard with a missing data file was only a warning when its allocation map was empty.** The fast checker errored on a missing data file *only* inside the `map.set_count() > 0` arm, then pushed an unconditional "data file not yet created" warning otherwise — so a cataloged shard with a valid but empty allocation map and no data file left the report error-free (`ok() == true`). `SlotStore::open`, though, opens every cataloged shard's data file with `create=false` regardless of its allocation map and returns `CoreError::Corrupt` if it is absent, so recovery refuses to attach. The "not yet created" state the warning described cannot arise for a *cataloged* shard: `ensure_shard` creates and `sync_dir`s the data file's dirent *before* the catalog names the shard (the reverse ordering only ever yields an orphan data file, which is adopted, not a cataloged shard with no file). | The missing-data-file check is a single unconditional error per cataloged shard, matching recovery, and the misleading warning is removed. `maki check` now fails exactly when attach would. | `fast_check_flags_a_cataloged_shard_with_no_data_file` (maki-core `review_check.rs`) |
 
+## Deep-check metadata I/O failures (BUG-133, 2026-10-26)
+
+An I/O failure while inspecting checkpoint copies, loading checkpoint state or
+reading the key canary now stops the deep check with the original error kind
+and OS error number. The same rule covers wrapped metadata I/O errors from the
+journal scanner and slot store after the fast check has succeeded. An unreadable
+file no longer contributes to an `unrecoverable` verdict; invalid bytes and
+foreign-volume metadata retain their existing corruption classification.
+
+[`review_deep_metadata_io.rs`](../crates/maki-core/tests/review_deep_metadata_io.rs)
+injects one-shot failures into those five boundaries, including a successful
+earlier inspection or later read. It checks that removing the fault restores a
+clean report and the original checkpointed and journaled ciphertext. Controls
+cover fast-check I/O propagation, damaged checkpoint copies, a foreign canary,
+and valid A/B fallback. This changes diagnostics only; disk formats, recovery
+ordering and durability guarantees are unchanged.
+
 ## Supplementary review (2026-09-07): R01–R08
 
 A follow-up review (`maki-review-20260907`) of the privileged attach/detach/grow
@@ -1720,6 +1737,19 @@ batch controls. Before this change, seven cases failed and four controls passed;
 all eleven pass with the change. This is branch-local regression evidence;
 integration and release qualification are separate.
 
+## Mountinfo path whitespace (BUG-164, 2026-10-24)
+
+Mount observation, detach, recovery and NBD allocation now split mountinfo
+fields only at ASCII spaces. Unicode whitespace and unescaped control bytes
+inside kernel path fields remain part of the path; the existing octal escapes
+for spaces, tabs, newlines and backslashes still decode normally.
+
+`maki-privileged/tests/regression_mountinfo_fields.rs` reproduces the missing
+mount observation for accepted Unicode paths and covers source fields and
+existing escapes. Fixture tests cover detach, nested mounts, recovery and
+allocation. These are parser and simulated-sysfs regressions, not a new
+privileged NBD/LVM/XFS qualification campaign.
+
 ## BUG-155 — validation launcher exits before its descendants (2026-10-23)
 
 The GCP and Firecracker controllers retain their launcher PID until process-group
@@ -1807,3 +1837,19 @@ connections. They retain larger-batch rejection and byte-limit controls.
 The older full-batch configuration regression now selects enough items to
 make its large byte budget reachable. This describes the change and its
 local regression coverage; remote CI and main integration remain separate.
+
+## GCE configuration BOM compatibility (BUG-172, 2026-10-26)
+
+The guest's provider check accepts one leading UTF-8 BOM, matching Maki's
+Rust TOML parser. The provider-evidence check added in PR #114 previously
+rejected such an otherwise valid configuration before starting nbdkit.
+Strict UTF-8 decoding, TOML validation, provider matching and value-free
+error diagnostics remain in place.
+
+`scripts.test_gcp_provider_validation` uses a complete local-provider
+configuration with and without a BOM through the guest's actual `main()`
+for both reset profiles and write/verify-only boots. All four BOM subcases
+failed before the fix; the plain-input controls passed. The suite also
+checks malformed UTF-8/TOML, a different provider, repeated or misplaced
+BOMs and a BOM inside the provider value. VM, NBD and process boundaries
+are mocked; these tests do not perform an external reset campaign.

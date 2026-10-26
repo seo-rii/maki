@@ -99,6 +99,13 @@ pub(crate) fn unescape(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Mountinfo fields are separated by ASCII spaces. Linux escapes spaces,
+/// tabs, newlines and backslashes inside paths, but preserves other whitespace
+/// (including Unicode, carriage return and form-feed) as part of the field.
+pub(crate) fn mountinfo_fields(record: &str) -> impl Iterator<Item = &str> {
+    record.split(' ').filter(|field| !field.is_empty())
+}
+
 /// Find the entry mounted exactly at `mountpoint`. When a path is mounted
 /// more than once the *last* line wins (it is the visible mount).
 pub fn parse_mountinfo(text: &str, mountpoint: &str) -> Option<MountEntry> {
@@ -109,14 +116,14 @@ pub fn parse_mountinfo(text: &str, mountpoint: &str) -> Option<MountEntry> {
             Some(parts) => parts,
             None => continue,
         };
-        let left: Vec<&str> = left.split_whitespace().collect();
+        let left: Vec<&str> = mountinfo_fields(left).collect();
         if left.len() < 6 {
             continue;
         }
         if unescape(left[4]) != mountpoint {
             continue;
         }
-        let right: Vec<&str> = right.split_whitespace().collect();
+        let right: Vec<&str> = mountinfo_fields(right).collect();
         if right.len() < 2 {
             continue;
         }
