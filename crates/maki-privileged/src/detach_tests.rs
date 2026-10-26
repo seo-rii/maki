@@ -225,3 +225,22 @@ fn mounts_below_the_mountpoint_are_observed_by_path_component() {
     let observed = fixture.observe(&own).unwrap();
     assert!(observed.mounted && !observed.nested);
 }
+
+#[test]
+fn mountinfo_unicode_whitespace_preserves_detach_mount_and_nested_identity() {
+    let mut fixture = Fixture::new();
+    fixture.mapping("vg--maki-data--lv", "nbd3");
+    for space in ['\u{00a0}', '\u{2003}', '\u{3000}'] {
+        fixture.record.attachment.mountpoint = format!("/srv/audit{space}data");
+        let own = fixture.mountinfo("253:0", "/", "xfs");
+        let observed = fixture.observe(&own).unwrap();
+        assert!(observed.mounted && observed.vg_active && !observed.nested);
+
+        let nested = format!(
+            "{own}41 25 253:9 / {}/wal rw - xfs /dev/x rw\n",
+            fixture.record.attachment.mountpoint
+        );
+        let observed = fixture.observe(&nested).unwrap();
+        assert!(observed.mounted && observed.nested);
+    }
+}
