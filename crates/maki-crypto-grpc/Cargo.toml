@@ -19,6 +19,8 @@ tonic = { version = "0.13", features = ["tls-native-roots", "tls-ring"] }
 # Probes whether the host trust store has any roots before asking tonic for
 # them (tonic refuses an empty store even when a CA is configured).
 rustls-native-certs = "0.8"
+# Preserve typed TLS handshake failures through tonic/hyper error wrappers.
+rustls.workspace = true
 prost = "0.13"
 http-body = "1"
 zeroize.workspace = true
@@ -33,7 +35,6 @@ maki-format.workspace = true
 maki-crypto-local.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rcgen.workspace = true
-rustls.workspace = true
 # Raw HTTP/2 responses tonic's server would never produce (truncated
 # messages); the version tonic already uses.
 h2 = "0.4"

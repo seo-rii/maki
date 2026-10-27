@@ -47,6 +47,15 @@ Physical release happens during checkpointing. Thus completion of `fstrim`
 does not imply that the backing filesystem has already reclaimed the space;
 `maki checkpoint <config.toml>` applies durable discards.
 
+A rejected first write can leave a physical reservation beneath a logically
+unwritten slot. TRIM of that zero slot queues its existing shard in the discard
+bitmap without creating a shard or appending a journal record. Checkpointing
+persists both bitmap copies and their directory before reclaiming the range.
+This also works when TRIM follows a restart; no in-memory list of failed writes
+is needed. A live overlay version, including a volatile tombstone hiding an
+older durable write, keeps its reservation protected. Ordinary writes acquire
+no additional discard-metadata barriers from this cleanup path.
+
 Linux backing files use `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`: complete
 filesystem blocks in the range can be released, partial blocks are zeroed, and
 file length remains unchanged. Checkpointing combines adjacent eligible slots

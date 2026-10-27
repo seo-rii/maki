@@ -30,7 +30,8 @@ Durations use values such as `150us`, `50ms`, `5s`, or `2m` (minutes), always
 as a quoted string with a unit. Unlike byte sizes, a bare integer is rejected.
 
 `volume.name` is an operational identifier of 1–64 ASCII bytes, using only
-letters, digits, `_` and `-`. Validation rejects longer names before creating
+letters, digits, `_` and `-`, and must not start with `-`, matching the
+privileged helper's argument contract. Validation rejects invalid names before creating
 or opening the backing. The bound leaves room for the default control socket
 pathname and the name in the official bounded status response.
 
@@ -173,7 +174,8 @@ schema, geometry, and secret-literal checks validation rejects:
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
   `nbd.device_block_size` that differs from the volume's, a `minimum_io`
-  above 64 KiB, a `maximum_io` that does not fit in the NBD 32-bit wire
+  above 64 KiB, an export size that is not a multiple of `minimum_io`, a
+  `maximum_io` that does not fit in the NBD 32-bit wire
   field, or a `limits.max_plaintext_bytes` smaller than `nbd.maximum_io`
   plus one crypto unit (the admission budget must hold one maximal request;
   a request is charged every unit it touches, in full);
@@ -455,7 +457,10 @@ and `limits.max_plaintext_bytes`. Increasing the runtime worker count does
 not increase those limits or establish a tested throughput guarantee.
 
 The plugin advertises `minimum_io`, `preferred_io`, and `maximum_io` through
-nbdkit's block-size callback. The adapter rejects read/write requests with zero
+nbdkit's block-size callback. The configured and stored export size must be a
+multiple of `minimum_io`, so every exported byte is accessible. A larger
+minimum can therefore require a different setting for an existing small volume.
+The adapter rejects read/write requests with zero
 length, invalid minimum-size alignment or an out-of-range end with EINVAL,
 before copying write plaintext or entering the engine. Negotiation is advisory
 and the Linux NBD driver does not honour the maximum (Debian 13's 6.12 kernel

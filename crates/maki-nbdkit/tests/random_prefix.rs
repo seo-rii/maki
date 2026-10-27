@@ -162,6 +162,7 @@ async fn prefixed_volume_preserves_rmw_discard_and_restart() {
     engine.trim(UNIT as u64, UNIT, true).await.unwrap();
     expected[UNIT..].fill(0);
     engine.checkpoint().await.unwrap();
+    engine.stop_checkpoint_worker().await;
     drop(engine);
 
     let engine = attach_from_config(&parsed).await.unwrap();
@@ -170,6 +171,9 @@ async fn prefixed_volume_preserves_rmw_discard_and_restart() {
         .write(UNIT as u64, &[0x61; UNIT], true)
         .await
         .unwrap();
+    // A background reclamation pass may still own the volume lock. Join it,
+    // as the adapter shutdown path does, before immediately reattaching.
+    engine.stop_checkpoint_worker().await;
     drop(engine);
     let engine = attach_from_config(&parsed).await.unwrap();
     assert_eq!(
@@ -188,6 +192,7 @@ async fn changing_or_removing_prefix_refuses_existing_volume_even_with_same_geom
         let engine = attach_from_config(&parsed).await.unwrap();
         engine.write(0, &[0x72; UNIT], true).await.unwrap();
         engine.checkpoint().await.unwrap();
+        engine.stop_checkpoint_worker().await;
         drop(engine);
         for changed in [0, 32, 64].into_iter().filter(|value| *value != original) {
             let changed = parse_and_validate(&config(&directory, changed)).unwrap();

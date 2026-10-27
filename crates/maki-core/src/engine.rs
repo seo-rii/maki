@@ -1304,7 +1304,8 @@ impl Engine {
                     if matches!(outcome, Ok(true))
                         && (volume.journal_total_bytes()
                             >= io_engine.inner.policy.journal_high_watermark_bytes
-                            || io_engine.inner.overlay_above_watermark(&volume))
+                            || io_engine.inner.overlay_above_watermark(&volume)
+                            || volume.has_pending_reclamation())
                     {
                         io_engine.inner.checkpoint_notify.notify_one();
                     }
@@ -1341,7 +1342,7 @@ impl Engine {
         let mut filtered = Vec::new();
         let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
             for ct in cts {
-                if !matches!(volume.current_sequence(ct.unit_index), Ok(None)) {
+                if !volume.reclaim_unwritten(ct.unit_index)? {
                     filtered.push(CiphertextUnit {
                         unit_index: ct.unit_index,
                         data: Vec::new(),
