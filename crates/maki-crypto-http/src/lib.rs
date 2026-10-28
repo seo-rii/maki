@@ -379,8 +379,8 @@ impl Drop for OpSpec {
     }
 }
 
-/// Header and query *values* are resolved credentials: never printed
-/// (C-11). Names stay visible for diagnostics.
+/// Paths and resolved header/query values can contain credentials: never
+/// printed (C-11, BUG-174). Header and query names stay visible.
 impl std::fmt::Debug for OpSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redact = |pairs: &[(String, String)]| -> Vec<String> {
@@ -391,7 +391,7 @@ impl std::fmt::Debug for OpSpec {
         };
         f.debug_struct("OpSpec")
             .field("method", &self.method)
-            .field("path", &self.path)
+            .field("path", &"<redacted>")
             .field("headers", &redact(&self.headers))
             .field("query", &redact(&self.query))
             .field("body", &self.body)
@@ -432,7 +432,7 @@ impl std::fmt::Debug for TlsSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpProviderSpec {
     pub base_url: String,
     pub encrypt: OpSpec,
@@ -441,6 +441,21 @@ pub struct HttpProviderSpec {
     pub timeout: Duration,
     pub max_response_bytes: usize,
     pub tls: Option<TlsSpec>,
+}
+
+/// Mask the complete URL, including malformed values awaiting validation.
+impl std::fmt::Debug for HttpProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpProviderSpec")
+            .field("base_url", &"<redacted>")
+            .field("encrypt", &self.encrypt)
+            .field("decrypt", &self.decrypt)
+            .field("capabilities", &self.capabilities)
+            .field("timeout", &self.timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------- provider
@@ -453,7 +468,7 @@ pub struct HttpCryptoProvider {
 impl std::fmt::Debug for HttpCryptoProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpCryptoProvider")
-            .field("base_url", &self.spec.base_url)
+            .field("base_url", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
