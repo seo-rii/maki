@@ -1921,3 +1921,24 @@ same-named `maki-attach` suite exercises actual unprivileged `--plan` processes
 and a valid plan. The regressions failed before the change. These tests do not
 perform mount, LVM, NBD, service, or physical qualification operations, and
 the privileged crate gains no crypto dependency.
+
+## Secure-swap filename identity (BUG-173, 2026-10-28)
+
+When `security.require_secure_swap_policy` is enabled, `/proc/swaps` filenames
+reach the device classifier without changing their identity. Only space and
+tab separate the kernel's columns; Unicode whitespace and literal vertical
+tab, form feed, or carriage return remain filename characters. The four
+kernel filename escapes for space, tab, newline, and backslash are decoded
+once, so an escaped literal backslash cannot become a second escape.
+
+The parser requires the complete five-column header and rows, known swap
+types, numeric counters and priority, and an absolute filename without NUL.
+Malformed rows fail before any classification; diagnostics report the row
+number without repeating its contents. Device-identity and independent-backing
+checks are unchanged, and the optional policy still defaults to disabled.
+
+`review_swap_filename_identity.rs` covers full path preservation, rejection of
+a different safe prefix, escaped safe devices, one-pass decoding, malformed
+headers/rows/escapes, and numeric type boundaries. Ten assertions failed before
+the fix while three controls passed. The tests use synthetic inventories and
+classifiers and do not change host swap, device nodes, or security policy.
