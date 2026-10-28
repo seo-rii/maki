@@ -1922,6 +1922,31 @@ and a valid plan. The regressions failed before the change. These tests do not
 perform mount, LVM, NBD, service, or physical qualification operations, and
 the privileged crate gains no crypto dependency.
 
+
+## Provider URL Debug redaction (BUG-174, 2026-10-28)
+
+Public HTTP and gRPC specifications retained credential-bearing URL components
+in their Debug output after the earlier header, query-field and metadata
+redaction. HTTP's provider Debug also printed its endpoint URL, and operation
+paths could contain the same path or query tokens. The observed boundary is
+an API consumer formatting these objects; this does not establish an automatic
+daemon or CLI log leak.
+
+HTTP `HttpProviderSpec`, `HttpCryptoProvider` and `OpSpec`, and gRPC
+`GrpcProviderSpec`, now render complete endpoint URLs and operation/method paths
+as `<redacted>`. Masking the entire field covers invalid, not-yet-validated
+values as well as userinfo, path, query and fragment tokens. Field names,
+methods, header/metadata names, capabilities, limits and the existing TLS
+redaction remain available for diagnostics. Request composition and stored
+configuration values are unaffected.
+
+The HTTP and gRPC `review_url_debug.rs` suites cover compact and pretty Debug,
+valid and malformed endpoint values, endpoint and operation path/query tokens,
+userinfo and fragments. Constructor-only gRPC coverage confirms that accepted
+method paths can carry the same tokens. Controls retain existing header/query
+and metadata redaction and useful nonsecret diagnostics. All credentials are
+synthetic; these regressions do not make network requests.
+
 ## Secure-swap filename identity (BUG-173, 2026-10-28)
 
 When `security.require_secure_swap_policy` is enabled, `/proc/swaps` filenames
