@@ -99,31 +99,85 @@ pub struct SwapEntry {
     pub kind: String,
 }
 
+fn swap_fields(line: &str) -> impl Iterator<Item = &str> {
+    // swap_show separates columns with space/tab. Other ASCII controls and
+    // Unicode whitespace can be literal filename bytes, so neither Rust's
+    // Unicode nor ASCII whitespace split preserves the device identity.
+    line.split([' ', '\t']).filter(|field| !field.is_empty())
+}
+
+fn decode_swap_filename(name: &str) -> Option<String> {
+    if !name.starts_with('/') || name.contains('\0') {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'\\' {
+            // seq_file_path escapes exactly space, tab, newline and
+            // backslash. Decode once so a literal "\\040" stays literal.
+            decoded.push(match bytes.get(offset + 1..offset + 4)? {
+                b"040" => b' ',
+                b"011" => b'\t',
+                b"012" => b'\n',
+                b"134" => b'\\',
+                _ => return None,
+            });
+            offset += 4;
+        } else {
+            decoded.push(bytes[offset]);
+            offset += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 /// Parse `/proc/swaps`. The file always starts with a `Filename` header
 /// line, even with no swap; anything else is not the file's format and is
 /// an error, never "no swap" (a read failure must not pass the policy).
 pub fn parse_proc_swaps(text: &str) -> Result<Vec<SwapEntry>, String> {
     let mut lines = text.lines();
     match lines.next() {
-        Some(header) if header.trim_start().starts_with("Filename") => {}
-        other => {
-            return Err(format!(
-                "/proc/swaps does not start with the Filename header (got {:?})",
-                other.unwrap_or("")
-            ))
+        Some(header)
+            if swap_fields(header).eq(["Filename", "Type", "Size", "Used", "Priority"]) => {}
+        _ => {
+            return Err(
+                "/proc/swaps does not start with the Filename Type Size Used Priority header"
+                    .to_string(),
+            )
         }
     }
     let mut entries = Vec::new();
-    for line in lines {
-        if line.trim().is_empty() {
+    for (index, line) in lines.enumerate() {
+        let invalid = || format!("unparseable /proc/swaps row at line {}", index + 2);
+        let mut fields = swap_fields(line);
+        let Some(name) = fields.next() else {
             continue;
-        }
-        let mut fields = line.split_whitespace();
-        let (Some(name), Some(kind)) = (fields.next(), fields.next()) else {
-            return Err(format!("unparseable /proc/swaps line {line:?}"));
         };
+        let (Some(kind), Some(size), Some(used), Some(priority)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(invalid());
+        };
+        let unsigned = |value: &str| {
+            !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u64>().is_ok()
+        };
+        let priority_digits = priority.strip_prefix('-').unwrap_or(priority);
+        if fields.next().is_some()
+            || !matches!(kind, "file" | "partition")
+            || !unsigned(size)
+            || !unsigned(used)
+            || priority_digits.is_empty()
+            || !priority_digits.bytes().all(|byte| byte.is_ascii_digit())
+            || priority.parse::<i32>().is_err()
+        {
+            return Err(invalid());
+        }
         entries.push(SwapEntry {
-            name: name.to_string(),
+            name: decode_swap_filename(name).ok_or_else(invalid)?,
             kind: kind.to_string(),
         });
     }
