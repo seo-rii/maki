@@ -582,7 +582,8 @@ impl std::fmt::Debug for GrpcTlsConfig {
     }
 }
 
-/// Metadata values are resolved credentials: never printed (C-11).
+/// Endpoint/method paths and resolved metadata can carry credentials: never
+/// printed (C-11, BUG-174). Metadata names stay visible for diagnostics.
 impl std::fmt::Debug for GrpcProviderSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let keys: Vec<String> = self
@@ -591,9 +592,9 @@ impl std::fmt::Debug for GrpcProviderSpec {
             .map(|(k, _)| format!("{k}: <redacted>"))
             .collect();
         f.debug_struct("GrpcProviderSpec")
-            .field("url", &self.url)
-            .field("encrypt_path", &self.encrypt_path)
-            .field("decrypt_path", &self.decrypt_path)
+            .field("url", &"<redacted>")
+            .field("encrypt_path", &"<redacted>")
+            .field("decrypt_path", &"<redacted>")
             .field("metadata", &keys)
             .field("capabilities", &self.capabilities)
             .field("timeout", &self.timeout)
