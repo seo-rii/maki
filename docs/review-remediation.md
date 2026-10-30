@@ -1967,3 +1967,29 @@ a different safe prefix, escaped safe devices, one-pass decoding, malformed
 headers/rows/escapes, and numeric type boundaries. Ten assertions failed before
 the fix while three controls passed. The tests use synthetic inventories and
 classifiers and do not change host swap, device nodes, or security policy.
+
+## gRPC proxy error pages (BUG-175, 2026-10-30)
+
+A gRPC endpoint behind an HTTP/2 proxy (nginx `grpc_pass`, an ingress)
+answers an upstream restart with an HTTP error page: `:status 502`,
+`content-type: text/html`, an HTML body and no `grpc-status`. The receive
+framing wrapper of BUG-057/121 framed that body, read `<` as a compression
+flag and reported a receive contract violation. `Contract` is `ProviderFatal`
+class, so a transient outage failed every request at once under the `stall`
+policy and refused attach as proven misconfiguration instead of quarantining
+the endpoint; an auth proxy's 401/403 page did not open the breaker either.
+Tonic itself maps the HTTP status only when such a body ends without framing.
+HTTP and WebSocket already classified 5xx by status.
+
+A non-200 response without `grpc-status` now maps through gRPC's
+HTTP-to-status table before its body is read: 429/502/503/504 `Unavailable`
+(Retryable), 401 `Unauthenticated` and 403 `PermissionDenied`
+(EndpointFatal), 404 `Unimplemented` (EndpointFatal), 400 `Internal`, others
+`Unknown`. A trailers-only error with its own `grpc-status` keeps that status,
+and an HTTP 200 response whose body is not gRPC framing remains a contract
+violation (R5-005).
+
+`maki-crypto-grpc/tests/review_http_status_mapping.rs` serves HTML error pages
+and empty error responses for seven statuses from a raw HTTP/2 server. Before
+the fix the first HTML page (502) was `Contract`; the empty-body cases and the
+HTTP 200 control passed. The tests use loopback sockets only.

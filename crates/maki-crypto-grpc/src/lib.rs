@@ -277,6 +277,32 @@ impl http_body::Body for BoundedResponseBody {
     }
 }
 
+/// gRPC's HTTP-to-status table for a response that carries no gRPC status
+/// (`doc/http-grpc-status-mapping.md`; tonic applies the same table only
+/// when such a body ends without framing).
+fn status_from_http(status: tonic::codegen::http::StatusCode) -> tonic::Status {
+    use tonic::codegen::http::StatusCode;
+    use tonic::Code;
+    let code = match status {
+        StatusCode::BAD_REQUEST => Code::Internal,
+        StatusCode::UNAUTHORIZED => Code::Unauthenticated,
+        StatusCode::FORBIDDEN => Code::PermissionDenied,
+        StatusCode::NOT_FOUND => Code::Unimplemented,
+        StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => Code::Unavailable,
+        _ => Code::Unknown,
+    };
+    tonic::Status::new(
+        code,
+        format!(
+            "grpc-status missing; mapped from HTTP status {}",
+            status.as_u16()
+        ),
+    )
+}
+
 struct BoundedResponseChannel {
     inner: Channel,
     limit: usize,
@@ -309,6 +335,16 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
                     "grpc unary response reported success in initial headers",
                 )
                 .into());
+            }
+            // A non-200 response without a gRPC status comes from an
+            // intermediary (a proxy's 502 page during an upstream restart),
+            // not from the gRPC peer: its body is not gRPC framing, and
+            // framing it would turn a transient outage into a contract
+            // violation (BUG-175). Map the HTTP status instead.
+            if response.status() != tonic::codegen::http::StatusCode::OK
+                && !response.headers().contains_key("grpc-status")
+            {
+                return Err(status_from_http(response.status()).into());
             }
             Ok(response.map(|inner| BoundedResponseBody {
                 inner,
