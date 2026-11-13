@@ -520,7 +520,7 @@ fn zero_and_inverted_bounds_are_rejected() {
         ("[nbd]\nminimum_io = 4096\npreferred_io = 512", "nbd I/O sizes"),
         ("[nbd]\nminimum_io = 3000", "power of two"),
         // F07: the admission budget must hold one maximal request.
-        ("[limits]\nmax_plaintext_bytes = \"1MiB\"\nmax_ciphertext_bytes = \"2MiB\"", "max_plaintext_bytes"),
+        ("[limits]\nmax_plaintext_bytes = 1048575\nmax_ciphertext_bytes = \"2MiB\"", "max_plaintext_bytes"),
         // Fourth pass: the backing root is never relative to the daemon's cwd.
         ("[backing]\nroot = \"relative/vol\"", "backing.root"),
         ("[backing]\nroot = \"\"", "backing.root"),

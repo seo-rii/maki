@@ -48,7 +48,7 @@ the values that need a decision:
 | `volume.max_virtual_size` | The exported device size. It cannot grow. Size for the cluster's lifetime; the backing filesystem only needs space for what is written plus reserves |
 | `backing.journal_max_bytes`, `checkpoint_reserve_bytes`, `journal_emergency_reserve_bytes` | The shipped 4 GiB / 4 GiB / 1 GiB suit a multi-GiB backing filesystem; keep the emergency reserve non-zero so ENOSPC is refused before acknowledgement |
 | `cache.mode` | `off` for a database that has its own buffer cache; `read` with `lock_memory = true` only when measured to help |
-| `nbd.maximum_io` | 1 MiB matches PostgreSQL's large sequential I/O; `limits.max_plaintext_bytes` must exceed it by at least one crypto unit |
+| `nbd.maximum_io` | 1 MiB matches PostgreSQL's large sequential I/O; `limits.max_plaintext_bytes` must cover every full crypto unit touched by one permitted request, including alignment and export bounds; configuration validation reports the required budget |
 | `security.require_secure_swap_policy` | `true`. Attach then refuses swap that depends on NBD, and requires readable `/proc/swaps` |
 
 Create the volume as the daemon user, then check it:
