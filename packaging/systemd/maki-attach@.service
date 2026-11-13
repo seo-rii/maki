@@ -16,6 +16,10 @@ Description=Maki attach helper for volume %i
 BindsTo=maki@%i.service
 After=maki@%i.service
 PartOf=maki-workload@%i.target
+# A repeatedly interrupted helper must eventually require operator diagnosis.
+# The failed-start hook never resets this counter.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 # A missing required config must fail the start job: a Condition would
 # merely skip attach and permit ordered Requires= workloads to start.
 AssertPathExists=/etc/maki/attach/%i.toml
@@ -36,3 +40,7 @@ TimeoutStopSec=120
 
 ExecStart=/usr/bin/maki-attach attach --volume %i
 ExecStop=/usr/bin/maki-attach cleanup --volume %i
+# ExecStop is skipped after a failed/timed-out ExecStart. The hook distinguishes
+# the main process's failed start from a later failed ExecStop, then queues the
+# existing workload-first recovery coordinator without waiting on its stop job.
+ExecStopPost=/usr/bin/maki-attach recover-failed-start --volume %i

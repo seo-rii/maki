@@ -35,6 +35,41 @@ jobs:
             cargo audit --deny warnings --file "$lockfile"
           done
 
+  systemd-lifecycle:
+    # A disposable runner exercises the real manager and failed-start hook.
+    # All resources are private marker files; no NBD/LVM/mount commands run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: systemd-lifecycle
+      - name: fixture contracts
+        run: python3 -B -m unittest scripts.test_systemd_lifecycle_validation -v
+      - name: build the actual recovery hook
+        run: cargo build --locked -p maki-attach
+      - name: packaged systemd lifecycle
+        run: |
+          sudo python3 -B scripts/systemd-lifecycle-validation.py \
+            --disposable-host --helper-binary "$PWD/target/debug/maki-attach" \
+            --output "$RUNNER_TEMP/maki-systemd-fixture"
+      - name: collect private fixture results
+        if: always()
+        run: |
+          if sudo test -d "$RUNNER_TEMP/maki-systemd-fixture"; then
+            sudo tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/maki-systemd-fixture.tar.gz" maki-systemd-fixture
+            sudo chmod 0644 "$RUNNER_TEMP/maki-systemd-fixture.tar.gz"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: systemd-lifecycle-results
+          path: ${{ runner.temp }}/maki-systemd-fixture.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
   pr:
     runs-on: ${{ matrix.os }}
     strategy:
