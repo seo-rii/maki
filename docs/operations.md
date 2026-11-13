@@ -725,15 +725,36 @@ This version boundary is recorded in the
 
 The attach oneshot's `ExecStopPost` invokes `maki-attach recover-failed-start`.
 It schedules the recovery coordinator only when systemd reports both a failed
-service result and a failed main (`ExecStart`) process. The coordinator stops
+service result and a failed main (`ExecStart`) process, and the exact attach
+unit still has a running start job. A stop, restart, missing or unrecognized
+job does not authorize recovery. The coordinator stops
 registered workloads before identity-checked cleanup and starts the lifecycle
 again only after cleanup succeeds. The hook does not clean up devices itself.
 Attach starts are limited to three in 300 seconds; inspect the failure before
 resetting a start-limit failure.
 
 A successful `ExecStart` followed by failed `ExecStop` cleanup does not request
-an automatic restart. Neither does an explicit stop during startup reported
-as a successful service stop. Stop ordering alone does not make cleanup success
+an automatic restart. A stop already replacing the attach start job also
+prevents the hook from scheduling recovery. The manager query and recovery
+request are separate operations: a concurrent operator stop can race that
+request, and stopping only the workload target does not cancel an already
+running coordinator's `OnSuccess` restart.
+
+For maintenance during a failed or recovering start, first block new recovery
+requests, then stop the coordinator before stopping the workload lifecycle:
+
+```bash
+systemctl mask --runtime maki-recover@pg.service &&
+    systemctl stop maki-recover@pg.service &&
+    systemctl stop maki-workload@pg.target
+```
+
+Wait for all workload, attach and daemon units as described above, and inspect
+any failed unit. Keep the runtime mask until recovery is deliberately re-enabled
+with `systemctl unmask --runtime maki-recover@pg.service`; a reboot removes a
+runtime mask. This procedure must be qualified on the installed stack.
+
+Stop ordering alone does not make cleanup success
 a prerequisite for daemon termination: if unmount fails during a planned
 target stop, preserve the live mount/device state and inspect all lifecycle
 units before retrying or taking a backup. The installed-stack cases in the
