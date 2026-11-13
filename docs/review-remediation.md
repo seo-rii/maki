@@ -1993,3 +1993,27 @@ violation (R5-005).
 and empty error responses for seven statuses from a raw HTTP/2 server. Before
 the fix the first HTML page (502) was `Contract`; the empty-body cases and the
 HTTP 200 control passed. The tests use loopback sockets only.
+
+## Remote witness transient state reads (BUG-176, 2026-10-30)
+
+The local remote-witness authority (`StateStore`) re-reads its published
+state before every request. Any failure of that read poisoned the open
+handle for good, including errors that prove nothing about the file: EMFILE
+from a flood of unauthenticated connections pending TLS, ENOMEM, a transient
+EIO. Nothing had been written and the in-memory state was still the durably
+published one, yet every later request answered "reopen required" until the
+witness was restarted, so every volume using it refused reads, writes and
+FLUSHes long after the cause was gone.
+
+Only proof of an external change poisons now: bytes that differ from the
+published state, or a missing, short or undecodable file (`NotFound`,
+`UnexpectedEof`, `InvalidData`). Other read failures refuse only their
+request; the next request reads and compares again. A failed publication
+still poisons, as before. `maki-witness serve` also raises its open-file soft
+limit toward the hard limit, as BUG-124 did for the daemon and CLIs.
+
+`maki-backing/tests/remote_witness.rs` injects a failure into opening and into
+reading the state file; before the fix the following inspect answered "reopen
+required". A removed-then-restored state file stays poisoned, alongside the
+existing corrupt-file and publication-failure tests. The tests use private
+temporary directories.

@@ -98,6 +98,12 @@ fn run(args: &[String]) -> io::Result<()> {
                     "serve requires exactly one local or etcd authority",
                 ));
             }
+            // Each pending handshake and worker holds descriptors; systemd's
+            // default soft limit of 1024 is reachable at max_connections =
+            // 256 (BUG-124 raised it for the other binaries).
+            if let Err(error) = maki_backing::raise_open_file_limit() {
+                eprintln!("maki-witness: warning: cannot raise the open-file soft limit: {error}");
+            }
             // Validate credentials before opening state; never create state during serve.
             let server = Arc::new(Server::new(config.server)?);
             let handler = if let Some(etcd) = config.etcd {

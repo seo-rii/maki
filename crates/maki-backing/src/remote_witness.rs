@@ -559,10 +559,23 @@ impl StateStore {
                 self.poisoned = true;
                 return Err(invalid("remote witness changed while locked"));
             }
-            Err(error) => {
+            // Missing, short or undecodable bytes prove an external change.
+            // Any other read failure (EMFILE, a transient EIO) proves
+            // nothing: nothing was written, `stored` is still the published
+            // state and the next request reads and compares again, so only
+            // this request fails.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::NotFound
+                ) =>
+            {
                 self.poisoned = true;
                 return Err(error);
             }
+            Err(error) => return Err(error),
         }
         let candidate = CanonicalState {
             stored: self.stored.clone(),
