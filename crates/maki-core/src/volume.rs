@@ -22,7 +22,7 @@ use crate::error::CoreError;
 use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
-use crate::recovery::{recover_bounded, Recovered, RecoveryError};
+use crate::recovery::{recover_bounded, Recovered, RecoveryError, RecoveryProgress};
 use crate::store::{CheckpointSlotPlan, SlotRead, SlotStore};
 
 #[derive(Debug, Clone)]
@@ -89,6 +89,17 @@ impl Volume {
         backing: Arc<dyn Backing>,
         options: VolumeOptions,
     ) -> Result<Self, RecoveryError> {
+        Self::recover_with_progress(backing, options, &|| {})
+    }
+
+    /// Like [`Self::recover`], observing completed recovery work. Progress is
+    /// not a persistent replay cursor or evidence that the volume is ready;
+    /// the observer must return promptly and is not retained after attach.
+    pub fn recover_with_progress(
+        backing: Arc<dyn Backing>,
+        options: VolumeOptions,
+        progress: &RecoveryProgress<'_>,
+    ) -> Result<Self, RecoveryError> {
         let segment_size = effective_segment_size(options.journal_segment_size);
         let Recovered {
             lock,
@@ -100,7 +111,7 @@ impl Volume {
             next_segment_index,
             segments,
             replay,
-        } = recover_bounded(&backing, segment_size)?;
+        } = recover_bounded(&backing, segment_size, progress)?;
 
         let mut journal = JournalWriter::resume(
             backing.clone(),

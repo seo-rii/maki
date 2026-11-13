@@ -58,10 +58,14 @@ def prepare(output):
     architecture = run(["dpkg", "--print-architecture"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", architecture):
         fail("dpkg returned an invalid native architecture")
-    rustc = run(["rustc", "-vV"])
-    host = next((line[6:] for line in rustc.splitlines() if line.startswith("host: ")), None)
-    if not host or not re.fullmatch(r"[A-Za-z0-9_-]+", host):
-        fail("rustc did not report a native host target")
+    # Make the compiler selection explicit instead of probing PATH's rustc
+    # while Cargo may select another one from the environment or its config.
+    compiler = shutil.which(os.environ.get("RUSTC") or os.environ.get("CARGO_BUILD_RUSTC") or "rustc")
+    if compiler is None:
+        fail("selected Rust compiler is not executable or was not found")
+    # Preserve symlinks: rustup's proxy chooses its tool from the invoked name.
+    # Relative selections refer to the caller's directory, before extraction.
+    compiler = os.path.abspath(compiler)
     distribution = {}
     for line in pathlib.Path("/etc/os-release").read_text().splitlines():
         key, separator, value = line.partition("=")
@@ -70,11 +74,6 @@ def prepare(output):
             distribution[key.lower()] = values[0] if values else ""
     if not distribution.get("id") or not distribution.get("version_id"):
         fail("/etc/os-release must identify the build distribution and version")
-    toolchain = {
-        "rustc": rustc,
-        "cargo": run(["cargo", "--version"]),
-        "dpkg_deb": run(["dpkg-deb", "--version"]).splitlines()[0],
-    }
     output.parent.mkdir(parents=True, exist_ok=True)
     # Keep the bundle staging directory on the output filesystem; publish it
     # with a single rename only after packaging and all hashes succeed.
@@ -109,11 +108,26 @@ def prepare(output):
         environment = os.environ.copy()
         environment["SOURCE_DATE_EPOCH"] = str(epoch)
         environment["CARGO_TARGET_DIR"] = str(work / "target")
+        environment["CARGO_BUILD_BUILD_DIR"] = str(work / "build")
+        environment["RUSTC"] = compiler
+        # Probe in the same directory and environment as the build. This also
+        # keeps rustup's per-directory toolchain selection consistent.
+        rustc = run([compiler, "-vV"], cwd=source, env=environment)
+        host = next((line[6:] for line in rustc.splitlines() if line.startswith("host: ")), None)
+        if not host or not re.fullmatch(r"[A-Za-z0-9_-]+", host):
+            fail("rustc did not report a native host target")
+        toolchain = {
+            "rustc": rustc,
+            "rustc_executable": compiler,
+            "cargo": run(["cargo", "--version"], cwd=source, env=environment),
+            "dpkg_deb": run(["dpkg-deb", "--version"]).splitlines()[0],
+        }
         # Record inherited compiler customization rather than claiming a
         # reproducible build across machines or silently changing its flags.
         build_environment = {
             key: environment[key]
-            for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+            for key in ("RUSTC", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                        "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
             if key in environment
         }
         command = [

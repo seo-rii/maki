@@ -5,6 +5,11 @@ into acceptance criteria for one deployment. A filled-out record is a plan;
 approval requires the linked evidence. Reference-provider campaigns and a
 passing CI run do not automatically approve another provider or environment.
 
+For the first Debian 12/local-AES/single-volume candidate, use the
+[first production candidate campaign](first-production-candidate.md). It gives
+the cases and evidence to attach to this record; workload sizing and acceptance
+limits still need a deployment-specific decision before execution.
+
 ## Record the intended deployment
 
 | Field | Required value |

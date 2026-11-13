@@ -55,17 +55,29 @@ class ReleasePreparationTests(unittest.TestCase):
         cargo = self.tools / "cargo"
         cargo.write_text(
             f"#!{sys.executable}\n"
-            "import json, os, pathlib, shutil, sys\n"
+            "import json, os, pathlib, shutil, subprocess, sys, tomllib\n"
             "if sys.argv[1:] == ['--version']:\n"
             "    print('cargo 1.99.0 (release fixture)'); sys.exit(0)\n"
             "if os.environ.get('CANDIDATE_FIXTURE_BUILD_FAIL'):\n"
             "    print('fixture build failed', file=sys.stderr); sys.exit(7)\n"
             "args = sys.argv[1:]\n"
             "target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])\n"
+            "config_path = pathlib.Path('.cargo/config.toml')\n"
+            "config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}\n"
+            "build_config = config.get('build', {})\n"
+            "build = pathlib.Path(os.environ.get('CARGO_BUILD_BUILD_DIR', "
+            "build_config.get('build-dir', str(target))))\n"
+            "build.mkdir(parents=True, exist_ok=True)\n"
+            "(build / 'intermediate-fixture').write_text('candidate compilation')\n"
+            "compiler = os.environ.get('RUSTC') or os.environ.get('CARGO_BUILD_RUSTC') "
+            "or build_config.get('rustc', 'rustc')\n"
+            "compiler_version = subprocess.check_output([compiler, '-vV'], text=True).strip()\n"
             "output = target / args[args.index('--target') + 1] / 'release'\n"
             "output.mkdir(parents=True)\n"
             f"pathlib.Path({str(self.cargo_trace)!r}).write_text(json.dumps({{"
             "'args': args, 'cwd': os.getcwd(), "
+            "'target': str(target), 'build': str(build), "
+            "'compiler': compiler, 'compiler_version': compiler_version, "
             "'source': pathlib.Path('Cargo.toml').read_text(), "
             "'epoch': os.environ['SOURCE_DATE_EPOCH']}))\n"
             "for name in ('maki', 'maki-attach', 'maki-check'):\n"
@@ -76,8 +88,13 @@ class ReleasePreparationTests(unittest.TestCase):
         rustc = self.tools / "rustc"
         rustc.write_text("#!/bin/sh\nprintf 'rustc 1.99.0 (fixture)\\nhost: fixture-native-linux-gnu\\n'\n")
         rustc.chmod(0o755)
-        self.environment = os.environ.copy()
-        self.environment["PATH"] = str(self.tools) + os.pathsep + self.environment["PATH"]
+        # Fixtures need tools, not the caller's credentials or Cargo overrides.
+        # Keep subprocess diagnostics safe even when an assertion fails.
+        self.environment = {
+            "PATH": str(self.tools) + os.pathsep + os.defpath,
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
 
     def git(self, *args):
         return subprocess.run(
@@ -140,6 +157,73 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertIn("tracked", result.stderr)
         self.assertFalse(output.exists())
         self.assertFalse(self.cargo_trace.exists())
+
+    def test_candidate_isolates_intermediates_from_environment_and_cargo_config(self):
+        for setting in ("environment", "config"):
+            with self.subTest(setting=setting):
+                outside = self.work / f"shared-{setting}"
+                outside.mkdir()
+                (outside / "sentinel").write_text("preserve")
+                if setting == "environment":
+                    self.environment["CARGO_BUILD_BUILD_DIR"] = str(outside)
+                else:
+                    self.environment.pop("CARGO_BUILD_BUILD_DIR", None)
+                    (self.repo / ".cargo").mkdir()
+                    (self.repo / ".cargo/config.toml").write_text(
+                        f"[build]\nbuild-dir = {json.dumps(str(outside))}\n"
+                    )
+                    self.git("add", ".cargo/config.toml")
+                    self.git("commit", "-qm", "test: external Cargo intermediate directory")
+                self.prepare(f"candidate-{setting}")
+                invocation = json.loads(self.cargo_trace.read_text())
+                target = pathlib.Path(invocation["target"])
+                build = pathlib.Path(invocation["build"])
+                self.assertEqual(build.parent, target.parent)
+                self.assertNotEqual(build, target)
+                self.assertFalse(build.exists(), "temporary intermediates must be cleaned")
+                self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
+                self.assertEqual((outside / "sentinel").read_text(), "preserve")
+
+    def test_compiler_overrides_match_the_recorded_toolchain_and_target(self):
+        alternate = self.tools / "alternate-rustc"
+        alternate.write_text(
+            "#!/bin/sh\nprintf 'rustc 1.98.0 (alternate fixture)\\nhost: alternate-linux-gnu\\n'\n"
+        )
+        alternate.chmod(0o755)
+        cases = (
+            ("RUSTC", {"RUSTC": str(alternate)}),
+            ("CARGO_BUILD_RUSTC", {"CARGO_BUILD_RUSTC": str(alternate)}),
+            ("relative", {"RUSTC": str(alternate.relative_to(self.work))}),
+            ("precedence", {"RUSTC": str(alternate),
+                            "CARGO_BUILD_RUSTC": str(self.tools / "rustc")}),
+        )
+        for setting, overrides in cases:
+            with self.subTest(setting=setting):
+                self.environment.pop("RUSTC", None)
+                self.environment.pop("CARGO_BUILD_RUSTC", None)
+                self.environment.update(overrides)
+                output, _ = self.prepare(f"candidate-{setting}")
+                invocation = json.loads(self.cargo_trace.read_text())
+                manifest = json.loads((output / "manifest.json").read_text())
+                self.assertEqual(manifest["toolchain"]["rustc"], invocation["compiler_version"])
+                self.assertEqual(manifest["build_host"]["rust_target"], "alternate-linux-gnu")
+                self.assertEqual(invocation["args"][invocation["args"].index("--target") + 1],
+                                 "alternate-linux-gnu")
+                self.assertEqual(manifest["toolchain"]["rustc_executable"], str(alternate))
+                self.assertEqual(manifest["build"]["compiler_environment"]["RUSTC"], str(alternate))
+
+    def test_default_compiler_selection_overrides_cargo_config(self):
+        (self.repo / ".cargo").mkdir()
+        (self.repo / ".cargo/config.toml").write_text(
+            '[build]\nrustc = "must-not-select-this-configured-compiler"\n'
+        )
+        self.git("add", ".cargo/config.toml")
+        self.git("commit", "-qm", "test: configured compiler differs from selected compiler")
+        output, _ = self.prepare()
+        invocation = json.loads(self.cargo_trace.read_text())
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(invocation["compiler"], str(self.tools / "rustc"))
+        self.assertEqual(manifest["toolchain"]["rustc"], invocation["compiler_version"])
 
     def test_staged_changes_are_refused_before_building(self):
         (self.repo / "new-tracked").write_text("pending addition")

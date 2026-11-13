@@ -1063,6 +1063,20 @@ pub async fn attach_from_config_with_stats(
     ),
     DaemonError,
 > {
+    attach_from_config_with_progress(config, None).await
+}
+
+pub(crate) async fn attach_from_config_with_progress(
+    config: &VolumeConfig,
+    progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+) -> Result<
+    (
+        Engine,
+        Option<Arc<maki_crypto::scheduler::SchedulerStats>>,
+        Option<Arc<EndpointSet>>,
+    ),
+    DaemonError,
+> {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
     // Every cataloged shard keeps a descriptor (BUG-124). A refusal leaves
@@ -1074,10 +1088,15 @@ pub async fn attach_from_config_with_stats(
     let options = engine_options(config);
     let recovery_options = options.volume.clone();
     let volume = Arc::new(
-        tokio::task::spawn_blocking(move || Volume::recover(backing, recovery_options))
-            .await
-            .map_err(|e| DaemonError::Unsupported(format!("recovery worker failed: {e}")))?
-            .map_err(AttachError::from)?,
+        tokio::task::spawn_blocking(move || match progress {
+            Some(progress) => {
+                Volume::recover_with_progress(backing, recovery_options, progress.as_ref())
+            }
+            None => Volume::recover(backing, recovery_options),
+        })
+        .await
+        .map_err(|e| DaemonError::Unsupported(format!("recovery worker failed: {e}")))?
+        .map_err(AttachError::from)?,
     );
     validate_recovered_geometry(config, &volume)?;
     let (provider, endpoints) = build_provider_for_volume(config, Some(&volume)).await?;

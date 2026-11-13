@@ -12,6 +12,8 @@ use std::process::ExitCode;
 use maki_privileged::config::{self, AttachConfig, AttachOverrides};
 use maki_privileged::plan::{plan_attach, plan_detach, plan_grow, GrowRequest};
 
+mod failed_start;
+
 fn usage() -> ExitCode {
     eprintln!(
         "usage:
@@ -21,6 +23,7 @@ fn usage() -> ExitCode {
   maki-attach detach --volume <v> [...]
   maki-attach recover --volume <v> [...] (disconnected storage only; stop workloads first)
   maki-attach cleanup --volume <v> [...] (record-driven detach or recovery; stop workloads first)
+  maki-attach recover-failed-start --volume <v> [--plan] (systemd ExecStopPost hook)
   maki-attach verify --volume <v> [--config <attach.toml>] [--plan]
   maki-attach grow   --volume <v> --size-bytes <n> [...]
 
@@ -43,7 +46,7 @@ fn validate_arguments(args: &[String]) -> Result<(), String> {
     let verb = args.first().map(String::as_str).ok_or("missing command")?;
     if !matches!(
         verb,
-        "attach" | "detach" | "recover" | "cleanup" | "grow" | "verify"
+        "attach" | "detach" | "recover" | "cleanup" | "grow" | "verify" | "recover-failed-start"
     ) {
         return Err(format!("unknown command {verb:?}"));
     }
@@ -54,13 +57,14 @@ fn validate_arguments(args: &[String]) -> Result<(), String> {
             return Err(format!("duplicate option {argument}"));
         }
         let takes_value = match argument.as_str() {
-            "--volume" | "--config" => true,
+            "--volume" => true,
+            "--config" if verb != "recover-failed-start" => true,
             "--plan" => false,
             "--init-sentinel" if verb == "attach" => false,
             "--size-bytes" if verb == "grow" => true,
             "--nbd-device" | "--vg" | "--lv" | "--mountpoint" | "--socket" | "--uuid"
             | "--fs-uuid"
-                if verb != "verify" =>
+                if !matches!(verb, "verify" | "recover-failed-start") =>
             {
                 true
             }
@@ -100,6 +104,16 @@ fn main() -> ExitCode {
         return usage();
     };
     let plan_only = args.iter().any(|a| a == "--plan");
+
+    if verb == "recover-failed-start" {
+        return match failed_start::run(&volume, plan_only) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let config_path = flag(&args, "--config").unwrap_or_else(|| config::default_path(&volume));
     if verb == "verify" {

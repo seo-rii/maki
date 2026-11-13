@@ -7,6 +7,10 @@ Description=Recover Maki workload lifecycle %i
 Conflicts=maki-workload@%i.target maki-attach@%i.service maki@%i.service
 After=maki-workload@%i.target maki-attach@%i.service maki@%i.service
 OnSuccess=maki-workload@%i.target
+# Bound coordinator jobs as well as daemon/helper starts. A refused restart
+# must not cycle through OnFailure/OnSuccess indefinitely.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 # Include time spent waiting for workload and storage stop jobs. A timeout
 # leaves the lifecycle stopped and never reaches OnSuccess.
 JobTimeoutSec=360

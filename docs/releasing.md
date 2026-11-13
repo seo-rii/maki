@@ -32,10 +32,22 @@ Source links are rejected during extraction. No cross-compilation or
 
 Cargo can download locked dependencies, so arrange registry access/cache before
 an offline build. An independent release build needs enough free temporary
-space for its own target directory; it does not reuse the checkout's target
-cache. The temporary build is placed beside the requested output and removed
-on ordinary success or failure. A machine crash can leave a
+space for its own final and intermediate artifacts. Both `CARGO_TARGET_DIR`
+and `CARGO_BUILD_BUILD_DIR` are set inside the unique candidate directory,
+overriding inherited environment and Cargo configuration paths; the build does
+not reuse the checkout's build cache. The temporary build is placed beside the
+requested output and removed on ordinary success or failure. A machine crash can leave a
 `.maki-candidate-*` temporary directory for manual inspection and cleanup.
+
+The compiler is selected from a nonempty `RUSTC`, then `CARGO_BUILD_RUSTC`, then
+`rustc` on `PATH`. Relative compiler paths refer to the directory invoking the
+preparation command. The selected executable is passed to Cargo through
+`RUSTC`, overriding `build.rustc` in Cargo configuration, and recorded in the
+manifest. Its version and host are queried in the extracted source directory
+with the build environment, so rustup uses the same toolchain selection.
+Compiler wrappers and flags remain supported and recorded as below; this
+selection policy does not make an arbitrary wrapper or Cargo configuration
+hermetic.
 
 ## Prepare and inspect
 
@@ -145,6 +157,7 @@ python3 -B scripts/check_docs_links.py
 The preparation contract uses a temporary Git repository, small native C ELF
 fixtures, a simulated Cargo build and the real Debian package/dependency tools.
 It checks committed-source provenance, checksums, deterministic packaging,
-dirty-source refusal, output preservation, source-link refusal and failure
-cleanup without rebuilding the Rust workspace. The Linux PR job runs it;
+dirty-source refusal, output preservation, source-link refusal, intermediate
+build isolation, compiler selection and failure cleanup without rebuilding the
+Rust workspace. The Linux PR job runs it;
 successful contract tests are not a full candidate-build or installation result.

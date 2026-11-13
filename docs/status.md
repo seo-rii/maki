@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-10-26. External campaign evidence below runs through
+Last updated: 2026-11-13. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -95,8 +95,11 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Dirty-XFS full stop, repeated recovery timeout/OOM convergence, and
   interruption at every attach step still need campaigns on the current
   integrated revision. Shutdown procedures now allow unmount writes before
-  drain; bounded replay memory does not establish persistent progress across
-  repeated interruptions ([review scope](review-boundaries-2026-10-15.md#known-operational-items)).
+  drain. Failed attach startup can schedule the workload recovery coordinator,
+  and completed recovery work can extend the daemon startup deadline; neither
+  establishes installed-stack convergence or persistent replay progress across
+  repeated interruptions. Follow the [first production campaign](deployment/first-production-candidate.md)
+  and [review scope](review-boundaries-2026-10-15.md#known-operational-items).
 - Default v2/v3 backings cannot detect restoration of an older, internally
   valid volume image (historical rollback). Only the experimental
   rollback-protected backing addresses this, and it is not qualified.

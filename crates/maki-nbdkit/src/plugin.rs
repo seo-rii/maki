@@ -18,7 +18,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -140,13 +140,19 @@ unsafe extern "C" fn after_fork() -> c_int {
         // provider quarantine) must reach the captured stderr (R4-001).
         maki_core::logging::install_default_logging();
         let path = CONFIG_PATH.lock().clone().ok_or("missing config path")?;
-        let adapter = NbdAdapter::open_native_config(&path).map_err(|error| error.to_string())?;
+        let notifier = Arc::new(startup::RecoveryNotifier::new(std::env::var_os(
+            "NOTIFY_SOCKET",
+        )));
+        let observer = notifier.clone();
+        let adapter = NbdAdapter::open_native_config(&path, Arc::new(move || observer.progress()))
+            .map_err(|error| error.to_string())?;
         ADAPTER
             .set(adapter)
             .map_err(|_| "adapter already initialized")?;
         // Publication precedes notification. If notification fails, open
         // remains disabled and unload can still shut down the stored adapter.
-        startup::notify_ready(std::env::var_os("NOTIFY_SOCKET").as_deref())
+        notifier
+            .ready()
             .map_err(|error| format!("readiness notification: {error}"))?;
         Ok(())
     })

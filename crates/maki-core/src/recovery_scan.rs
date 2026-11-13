@@ -12,13 +12,17 @@ use maki_format::journal::{
     JournalRecord, ScanOutcome, MAX_PAYLOAD, RECORD_HEADER_SIZE, RECORD_MAGIC, SEGMENT_HEADER_SIZE,
 };
 
-use super::RecoveryError;
+use super::{RecoveryError, RecoveryProgress};
 
 const READ_CHUNK: usize = 64 * 1024;
 
 /// A zero-filled creation/tail artifact must be zero throughout its range,
 /// including bytes beyond the first read buffer.
-pub(super) fn range_is_zero(file: &dyn BackingFile, range: Range<u64>) -> std::io::Result<bool> {
+pub(super) fn range_is_zero(
+    file: &dyn BackingFile,
+    range: Range<u64>,
+    progress: &RecoveryProgress<'_>,
+) -> std::io::Result<bool> {
     let mut buffer = [0u8; READ_CHUNK];
     let mut offset = range.start;
     let mut zero = true;
@@ -29,6 +33,7 @@ pub(super) fn range_is_zero(file: &dyn BackingFile, range: Range<u64>) -> std::i
             zero = false;
         }
         offset += count as u64;
+        progress();
     }
     Ok(zero)
 }
@@ -75,6 +80,7 @@ pub(super) struct SegmentScanner<'a> {
     pub geometry: &'a Geometry,
     pub checkpoint_sequence: u64,
     pub name: &'a str,
+    pub progress: &'a RecoveryProgress<'a>,
 }
 
 impl SegmentScanner<'_> {
@@ -115,6 +121,7 @@ impl SegmentScanner<'_> {
                     self.file,
                     SEGMENT_HEADER_SIZE as u64 + position
                         ..SEGMENT_HEADER_SIZE as u64 + self.body_len,
+                    self.progress,
                 )?;
                 read_end = self.body_len;
                 break if in_durable {
@@ -189,6 +196,7 @@ impl SegmentScanner<'_> {
                 crc.update(chunk);
                 candidate_fingerprint.write(chunk);
                 read += count;
+                (self.progress)();
             }
             if crc.finalize() != header.payload_crc {
                 break if in_durable {
@@ -247,6 +255,7 @@ impl SegmentScanner<'_> {
             fingerprint = candidate_fingerprint;
             position += record_len;
             record_count += 1;
+            (self.progress)();
         };
 
         // The old whole-image read surfaced I/O errors anywhere in a file
@@ -256,6 +265,7 @@ impl SegmentScanner<'_> {
             range_is_zero(
                 self.file,
                 SEGMENT_HEADER_SIZE as u64 + read_end..SEGMENT_HEADER_SIZE as u64 + self.body_len,
+                self.progress,
             )?;
         }
         if let Some((sequence, end)) = self.required_boundary.filter(|_| !required_boundary_seen) {
@@ -326,7 +336,7 @@ mod tests {
             bytes: vec![1; READ_CHUNK * 2 + 17],
         };
         assert!(
-            range_is_zero(&file, 0..file.bytes.len() as u64).is_err(),
+            range_is_zero(&file, 0..file.bytes.len() as u64, &|| {}).is_err(),
             "the old whole-image read would report the final-sector EIO"
         );
     }
@@ -362,6 +372,7 @@ mod tests {
             geometry: &geometry,
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
+            progress: &|| {},
         }
         .scan(|_| Ok(()));
         assert!(
@@ -405,6 +416,7 @@ mod tests {
             geometry: &geometry,
             checkpoint_sequence: 0,
             name: "seg-0000000000000000",
+            progress: &|| {},
         }
         .scan(|_| Ok(()))
     }
