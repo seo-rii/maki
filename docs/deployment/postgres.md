@@ -67,9 +67,37 @@ metadata and PostgreSQL's own temporary space
 ## 3. Credential
 
 ```bash
-head -c 32 /dev/urandom > /etc/maki/secrets/postgres.token
-chmod 0400 /etc/maki/secrets/postgres.token
+bash <<'BASH'
+set -euo pipefail
+umask 077
+install -d -m 0700 -o root -g root /etc/maki/secrets
+python3 - <<'PY'
+import os
+import tempfile
+
+target = "/etc/maki/secrets/postgres.token"
+directory = os.path.dirname(target)
+directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".maki-key-") as key:
+        os.fchmod(key.fileno(), 0o400)
+        key.write(os.urandom(32))
+        key.flush()
+        os.fsync(key.fileno())
+        # Atomic publication refuses every existing path, including symlinks.
+        os.link(key.name, target, follow_symlinks=False)
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+BASH
 ```
+
+Run the whole block and continue only on success. Existing files and symlinks
+are refused without changing their contents. Preserve an existing key; do not
+delete it to make initialization succeed. The complete `0400` key is published
+only after its bytes are synced. A later directory-sync failure leaves that
+key in place for inspection, rather than removing or regenerating it.
 
 The packaged unit loads it as `crypto-token`. Store a copy in the
 deployment's secret store, never in the same backup as the backing directory.
