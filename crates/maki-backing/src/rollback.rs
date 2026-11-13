@@ -19,6 +19,8 @@ use crate::witness::FileWitness;
 
 mod enrollment;
 pub mod gc;
+#[cfg(all(test, target_os = "linux"))]
+mod local_load_tests;
 mod remote;
 #[cfg(all(test, target_os = "linux"))]
 mod review_restore;
@@ -325,6 +327,7 @@ impl RollbackBacking {
         let witness = FileWitness::open(witness)?;
         let anchor = witness.anchor();
         let mut selected = None;
+        let mut storage_error = None;
         for (slot, name) in MANIFESTS.iter().enumerate() {
             let candidate = (|| {
                 let file = disk.open(name, false)?;
@@ -339,10 +342,15 @@ impl RollbackBacking {
                 if digest(b"maki.rollback.manifest.v1\0", &bytes) != anchor.root {
                     return Err(invalid("manifest does not match independent witness"));
                 }
-                let manifest: Manifest =
-                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                manifest.validate()?;
-                if manifest.encode()? != bytes
+                let manifest: Manifest = serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid("invalid rollback manifest encoding"))?;
+                manifest
+                    .validate()
+                    .map_err(|_| invalid("invalid rollback manifest content"))?;
+                if manifest
+                    .encode()
+                    .map_err(|_| invalid("invalid rollback manifest size"))?
+                    != bytes
                     || manifest.identity != anchor.identity
                     || manifest.generation != anchor.generation
                     || file.len()? != manifest_bound(manifest.capacity)
@@ -351,13 +359,32 @@ impl RollbackBacking {
                 }
                 Ok(manifest)
             })();
-            if let Ok(manifest) = candidate {
-                selected = Some((slot, manifest));
-                break;
+            match candidate {
+                Ok(manifest) => {
+                    selected = Some((slot, manifest));
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::InvalidData
+                    ) => {}
+                Err(error) => {
+                    // A readable exact copy can still recover the backing.
+                    // If neither candidate can be authenticated, preserve
+                    // inability to read storage instead of claiming rollback.
+                    if storage_error.is_none() {
+                        storage_error = Some(error);
+                    }
+                }
             }
         }
         let (slot, manifest) = selected.ok_or_else(|| {
-            invalid("no exact witnessed manifest: backing may be rolled back or incomplete")
+            storage_error.unwrap_or_else(|| {
+                invalid("no exact witnessed manifest: backing may be rolled back or incomplete")
+            })
         })?;
         let arena = disk.open(ARENA, false)?;
         if arena.len()? != manifest.capacity * 2 {
