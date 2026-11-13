@@ -14,7 +14,7 @@ Release, start services, or qualify a production deployment.
 ## Build prerequisites and source boundary
 
 Use a native Debian build host for the intended deployment distribution, with
-Python 3.11 or newer, Git, a working Rust/Cargo toolchain, a native C toolchain,
+Python 3.11 or newer, Git, Rust/Cargo 1.94.0 (the CI baseline), a native C toolchain,
 `dpkg-dev`, and the dependencies in the
 [Debian installation guide](getting-started/installation-debian.md). Packages
 inherit the build host's native library requirements; an ELF architecture
@@ -53,7 +53,7 @@ candidate_output="$HOME/maki-candidates/$(git rev-parse --short=12 HEAD)-$(dpkg 
 candidate_log="$(mktemp "$HOME/logs/maki-candidate.XXXXXX.log")"
 candidate_status="${candidate_log%.log}.status"
 (
-  python3 -B scripts/prepare_release.py --output "$candidate_output"
+  rustup run 1.94.0 python3 -B scripts/prepare_release.py --output "$candidate_output"
   candidate_rc=$?
   printf '%s\n' "$candidate_rc" > "$candidate_status"
   exit "$candidate_rc"
@@ -93,6 +93,25 @@ they are not a hermetic-build attestation. Review those overrides before
 sharing the manifest. Checksums establish bundle consistency, not publisher
 authenticity; a public release additionally needs the chosen signing or
 attestation policy.
+
+## Retain the complete deployment inputs
+
+The Maki candidate builder does not build or include `nbd-client`. Keep the
+versioned `nbd-client >= 3.27.0` package alongside the candidate, with its source
+revision or source-package checksum, Debian packaging/patches, exact build
+commands and build log. Record the resulting package version, architecture,
+SHA-256 and netlink-enabled build configuration. The historical 3.27.1 package
+recipe has not been preserved; the installation guide's backport outline must
+be executed and validated on the selected build host before calling a new
+bundle reproducible or qualified.
+
+For the first deployment profile, retain one manifest of all installed package
+versions and the kernel, filesystem and Maki configuration. Qualify fresh-host
+installation, stopped-workload upgrade, and backup restore using those exact
+Maki and nbd-client artifacts on Debian 12 with local AES-GCM-SIV and a single
+NBD/PV/VG/XFS LV. Attach results to the final integrated commit and package
+hashes. Changes to packages or configuration require the affected checks to be
+run again; creating a PR or passing unit tests does not supply those results.
 
 ## Qualification and publication handoff
 
