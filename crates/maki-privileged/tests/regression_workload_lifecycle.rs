@@ -43,11 +43,10 @@ fn daemon_failure_enters_the_single_recovery_path() {
         "StartLimitIntervalSec=300"
     ));
     assert!(has_directive(&daemon, "[Unit]", "StartLimitBurst=3"));
-    assert!(has_directive(
-        &daemon,
-        "[Unit]",
-        "PartOf=maki-workload@%i.target"
-    ));
+    assert!(
+        !has_directive(&daemon, "[Unit]", "PartOf=maki-workload@%i.target"),
+        "a planned target stop must not bypass failed attachment cleanup"
+    );
     assert!(
         !daemon
             .lines()
@@ -124,11 +123,19 @@ fn lifecycle_target_owns_attach_start_and_stop() {
     ] {
         assert!(has_directive(&attach, "[Unit]", dependency));
     }
-    assert!(has_directive(
-        &attach,
-        "[Service]",
-        "ExecStop=/usr/bin/maki-attach cleanup --volume %i"
-    ));
+    let stop_commands: Vec<_> = attach
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("ExecStop="))
+        .collect();
+    assert_eq!(
+        stop_commands,
+        [
+            "ExecStop=/usr/bin/maki-attach cleanup --volume %i",
+            "ExecStop=-/usr/bin/systemctl --no-ask-password --no-block --job-mode=fail stop maki@%i.service",
+        ],
+        "daemon stop must follow successful cleanup without replacing queued restarts"
+    );
     assert!(
         !has_directive(&attach, "[Install]", "WantedBy=multi-user.target"),
         "attach must be enabled only through the lifecycle target"

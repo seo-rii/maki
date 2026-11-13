@@ -40,6 +40,13 @@ TimeoutStopSec=120
 
 ExecStart=/usr/bin/maki-attach attach --volume %i
 ExecStop=/usr/bin/maki-attach cleanup --volume %i
+# systemd skips later ExecStop commands when cleanup fails or times out. Do
+# not propagate target stops directly to the daemon: it must keep serving a
+# still-mounted filesystem after a refused cleanup. Never replace a concurrent
+# start/restart job with this stop. Such a conflict intentionally keeps the
+# daemon alive; a complete shutdown must still wait for every unit inactive.
+# Queue without waiting: daemon stop is ordered after this unit finishes.
+ExecStop=-/usr/bin/systemctl --no-ask-password --no-block --job-mode=fail stop maki@%i.service
 # ExecStop is skipped after a failed/timed-out ExecStart. The hook distinguishes
 # the main process's failed start from a later failed ExecStop, then queues the
 # existing workload-first recovery coordinator without waiting on its stop job.

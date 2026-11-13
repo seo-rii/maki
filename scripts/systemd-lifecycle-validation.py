@@ -24,8 +24,11 @@ SYSTEMCTL = "/usr/bin/systemctl"
 CASES = (
     "exit-once", "timeout-once", "kill-once", "cleanup-failure",
     "foreign-resource", "repeated-failure", "normal-stop", "failed-stop",
-    "cancel-start",
+    "timeout-stop", "kill-stop", "retry-failed-stop", "target-restart",
+    "stop-start", "active-recovery", "cancel-start",
 )
+STOP_REQUEST = ("ExecStop=-/usr/bin/systemctl --no-ask-password --no-block "
+                "--job-mode=fail stop maki@%i.service")
 
 
 def require(condition, message):
@@ -81,8 +84,14 @@ def fixture_units(volume, directory, helper):
     attach = packaged_unit_section("maki-attach@.service", volume)
     attach += ("\n[Service]\nType=oneshot\nRemainAfterExit=yes\n"
                "TimeoutStartSec=2\nTimeoutStopSec=3\n"
-               f"ExecStart={actor_command} attach\n"
-               f"ExecStop={actor_command} cleanup-stop\n")
+               f"ExecStart={actor_command} attach\n")
+    # Replace storage cleanup only. Keep the actual success-dependent stop
+    # request, its failure policy and command order from the shipped unit.
+    stops = [line for line in (ROOT / "packaging/systemd/maki-attach@.service").read_text().splitlines()
+             if line.startswith("ExecStop=")]
+    if stops != ["ExecStop=/usr/bin/maki-attach cleanup --volume %i", STOP_REQUEST]:
+        raise ValueError("unexpected cleanup/daemon-stop command contract")
+    attach += f"ExecStop={actor_command} cleanup-stop\n" + stops[1].replace("%i", volume) + "\n"
     # Exercise the actual packaged hook command, including any future changes.
     hooks = [line for line in (ROOT / "packaging/systemd/maki-attach@.service").read_text().splitlines()
              if line.startswith("ExecStopPost=")]
@@ -146,7 +155,7 @@ def actor(directory, action):
             os.kill(os.getpid(), signal.SIGKILL)
         event(directory, "attach-ready", attempt=attempt)
         return 0
-    if action in ("cleanup-stop", "cleanup-recover"):
+    if action in ("cleanup-stop", "cleanup-recover", "cleanup-manual"):
         event(directory, action)
         if workload.exists():
             event(directory, "unsafe-cleanup-before-workload-stop")
@@ -154,8 +163,14 @@ def actor(directory, action):
         if resource.exists() and resource.read_text() != "owned":
             event(directory, "foreign-resource-preserved")
             return 41
+        if action == "cleanup-stop" and mode == "timeout-stop":
+            time.sleep(60)
+            return 42
+        if action == "cleanup-stop" and mode == "kill-stop":
+            os.kill(os.getpid(), signal.SIGKILL)
         if ((action == "cleanup-recover" and mode == "cleanup-failure")
-                or (action == "cleanup-stop" and mode == "failed-stop")):
+                or (action == "cleanup-stop" and mode == "failed-stop")
+                or (mode == "retry-failed-stop" and not (directory / "allow-cleanup").exists())):
             event(directory, "cleanup-refused")
             return 42
         resource.unlink(missing_ok=True)
@@ -274,16 +289,31 @@ class Fixture:
         journal = subprocess.run(command, capture_output=True, text=True, timeout=10)
         (self.directory / "journal.txt").write_text(journal.stdout[-32000:])
 
+    def stop_normally(self):
+        self.ctl("stop", self.units["target"], check=False)
+        # An accepted target stop is not proof that the later stop request was
+        # accepted, or that asynchronous daemon shutdown has completed.
+        self.wait(lambda: all(self.state(which) == "inactive"
+                              for which in ("target", "workload", "attach", "daemon")),
+                  "lifecycle including daemon stopped")
+        require(not (self.directory / "resource").exists(), "normal stop did not clean up")
+
+    def manual_cleanup(self):
+        return subprocess.run([sys.executable, str(Path(__file__).resolve()), "actor",
+                               str(self.directory), "cleanup-manual"], timeout=10)
+
     def verify(self, mode):
         self.ctl("start", "--no-block", self.units["target"])
         if mode == "cancel-start":
             self.wait(lambda: self.count("attach-start") == 1, "attach started")
             self.ctl("stop", self.units["target"])
-            # A stopped target does not imply dependent ExecStopPost hooks have
-            # finished. Observe their terminal states before checking the trace.
-            self.wait(lambda: all(self.state(which) in ("inactive", "failed")
-                                  for which in ("attach", "daemon")), "cancelled services stopped")
+            # A cancelled start skips ExecStop. Its partial attachment is not
+            # evidence that shutting down the still-healthy daemon is safe.
+            self.wait(lambda: self.state("attach") in ("inactive", "failed"),
+                      "cancelled attach stopped")
             time.sleep(0.5)
+            require(self.state("daemon") == "active", "cancelled start stopped daemon")
+            require((self.directory / "resource").exists(), "cancelled start lost recovery state")
             require(self.count("cleanup-recover") == 0, "operator cancellation restarted recovery")
             require(self.count("attach-start") == 1, "cancelled start was retried")
             require(self.count("workload-start") == 0, "cancelled start ran a workload")
@@ -315,18 +345,51 @@ class Fixture:
             self.wait(lambda: self.count("workload-start") == 1, "workload start")
             self.ctl("start", self.units["target"], self.units["attach"])
             require(self.count("attach-start") == 1, "duplicate start reran attachment")
-            self.ctl("stop", self.units["target"], check=False)
-            self.wait(lambda: self.state("daemon") == "inactive", "daemon stopped")
-            time.sleep(0.5)
-            require(self.count("cleanup-recover") == 0, "planned stop scheduled recovery")
-            require(self.count("attach-start") == 1, "planned stop allowed a new attach")
-            require(self.count("workload-stop") == 1, "planned stop did not quiesce workload")
-            if mode == "failed-stop":
+            if mode in ("failed-stop", "timeout-stop", "kill-stop", "retry-failed-stop"):
+                self.ctl("stop", self.units["target"], check=False)
+                self.wait(lambda: self.state("attach") == "failed", "failed cleanup reported")
+                time.sleep(0.5)
+                require(self.state("daemon") == "active", "failed cleanup stopped daemon")
                 require(self.state("attach") == "failed", "failed stop was not reported")
                 require((self.directory / "resource").exists(), "failed stop lost recovery state")
+                require(self.state("target") == "inactive", "failed stop left target active")
+                require(self.state("workload") == "inactive", "failed stop left workload active")
+                if mode == "retry-failed-stop":
+                    require(self.manual_cleanup().returncode != 0, "blocked manual cleanup succeeded")
+                    require(self.state("daemon") == "active", "refused manual cleanup stopped daemon")
+                    require((self.directory / "resource").exists(), "refused manual cleanup lost state")
+                    (self.directory / "allow-cleanup").touch()
+                    require(self.manual_cleanup().returncode == 0, "released manual cleanup failed")
+                    require(not (self.directory / "resource").exists(), "manual cleanup left resource")
+                    self.ctl("stop", self.units["daemon"])
+                    self.wait(lambda: self.state("daemon") == "inactive", "explicit daemon stop")
+            elif mode in ("target-restart", "stop-start", "active-recovery"):
+                if mode == "stop-start":
+                    self.stop_normally()
+                    self.ctl("start", self.units["target"])
+                elif mode == "target-restart":
+                    self.ctl("restart", self.units["target"])
+                else:
+                    self.ctl("start", self.units["recovery"])
+                self.wait(lambda: self.count("workload-start") == 2
+                          and self.state("target") == "active", "second workload start")
+                require(self.count("attach-start") == 2, "restart did not reattach exactly once")
+                require(self.state("attach") == "active", "restart marked attachment failed")
+                require(self.state("daemon") == "active", "restart stopped daemon")
+                expected_daemon_starts = 1 if mode == "target-restart" else 2
+                require(self.count("daemon-start") == expected_daemon_starts,
+                        "unexpected daemon restart; only a completed stop/start reloads it")
+                require(self.count("daemon-stop") == expected_daemon_starts - 1,
+                        "target restart interrupted the daemon")
+                self.stop_normally()
             else:
-                require(self.state("attach") == "inactive", "normal attach stop did not finish")
-                require(not (self.directory / "resource").exists(), "normal stop did not clean up")
+                self.stop_normally()
+            time.sleep(0.5)
+            expected_recoveries = 1 if mode == "active-recovery" else 0
+            require(self.count("cleanup-recover") == expected_recoveries, "unexpected recovery count")
+            expected_cycles = 2 if mode in ("target-restart", "stop-start", "active-recovery") else 1
+            require(self.count("attach-start") == expected_cycles, "planned stop allowed a new attach")
+            require(self.count("workload-stop") == expected_cycles, "planned stop did not quiesce workload")
         needs_cleanup = False
         for record in self.events():
             name = record["event"]
@@ -338,6 +401,10 @@ class Fixture:
                 needs_cleanup = True
             elif name == "cleanup-complete":
                 needs_cleanup = False
+            elif name == "daemon-stop" and mode in (
+                    "normal-stop", "failed-stop", "timeout-stop", "kill-stop",
+                    "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
+                require(not needs_cleanup, "daemon stopped before successful cleanup")
 
 
 def main():

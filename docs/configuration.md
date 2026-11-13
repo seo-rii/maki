@@ -176,9 +176,12 @@ schema, geometry, and secret-literal checks validation rejects:
   `nbd.device_block_size` that differs from the volume's, a `minimum_io`
   above 64 KiB, an export size that is not a multiple of `minimum_io`, a
   `maximum_io` that does not fit in the NBD 32-bit wire
-  field, or a `limits.max_plaintext_bytes` smaller than `nbd.maximum_io`
-  plus one crypto unit (the admission budget must hold one maximal request;
-  a request is charged every unit it touches, in full);
+  field, or a `limits.max_plaintext_bytes` too small for every crypto unit
+  touched by one permitted NBD request. The charge rounds to whole crypto
+  units, including partial units at both ends, and accounts for `minimum_io`
+  alignment and the export size. For example, 1 KiB requests with 512-byte
+  alignment and 4 KiB crypto units can touch two units and need 8 KiB, not
+  5 KiB;
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at

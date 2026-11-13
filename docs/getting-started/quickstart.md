@@ -24,10 +24,38 @@ The packaged data-plane unit loads one credential named `crypto-token` from
 the 32-byte AES key (raw bytes or 64 hex characters).
 
 ```bash
+bash <<'BASH'
+set -euo pipefail
+umask 077
 install -d -m 0700 -o root -g root /etc/maki/secrets
-head -c 32 /dev/urandom > /etc/maki/secrets/demo.token
-chmod 0400 /etc/maki/secrets/demo.token
+python3 - <<'PY'
+import os
+import tempfile
+
+target = "/etc/maki/secrets/demo.token"
+directory = os.path.dirname(target)
+directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".maki-key-") as key:
+        os.fchmod(key.fileno(), 0o400)
+        key.write(os.urandom(32))
+        key.flush()
+        os.fsync(key.fileno())
+        # Atomic publication refuses every existing path, including symlinks.
+        os.link(key.name, target, follow_symlinks=False)
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+BASH
 ```
+
+Run the whole block and continue only if it succeeds. It publishes a complete
+key with mode `0400` and refuses to replace an existing file or symlink, even
+as root. If the name already exists, preserve it and inspect the existing
+volume instead of deleting it to retry. A failure before publication removes
+the temporary file; a failure after publication leaves the complete key in
+place for inspection. Never regenerate that key to bypass an error.
 
 Back this file up separately from the backing directory. Without it the
 volume is unreadable; with it and the backing directory the volume is
@@ -146,7 +174,9 @@ and unmount while admission is still open: unmount may write filesystem data
 or metadata even after `sync`. Only after unmount succeeds, drain, stop the
 target, and wait for every unit to become inactive before an offline check.
 For a normal stop without a separate acknowledgement, stop the target directly;
-its ordered cleanup unmounts before daemon unload drains the engine.
+successful cleanup unmounts before requesting daemon shutdown and final drain.
+If cleanup fails, the daemon stays running for the remaining mount; follow the
+[failed-stop procedure](../operations.md#retry-a-failed-planned-stop).
 
 ```bash
 # Succeeds once every named unit is inactive; fails at once if one failed

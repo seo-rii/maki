@@ -1856,19 +1856,39 @@ impl VolumeConfig {
                 self.volume.max_virtual_size.0, n.minimum_io
             )));
         }
-        // The engine charges a request every crypto unit it touches; a
-        // maximal request (unaligned to units) touches maximum_io plus one
-        // unit. The budget must admit it whole, or the semaphore would have
-        // to cap the charge and the limit would stop being a bound (F07).
-        let maximal_request = n
-            .maximum_io
-            .0
-            .saturating_add(self.volume.crypto_unit_size as u64);
+        // The engine charges every touched crypto unit in full (F07). Adding
+        // one unit to the byte length undercounts a sub-unit request that
+        // crosses a unit boundary (BUG-084). Consider only offsets permitted
+        // by NBD and requests that fit the export. Shorter requests cannot
+        // cost more: each can be extended to this length within the export.
+        let unit = u64::from(self.volume.crypto_unit_size);
+        let minimum = u64::from(n.minimum_io);
+        let request_len = n.maximum_io.0.min(self.volume.max_virtual_size.0);
+        // Units need not be powers of two. Offset phases repeat after
+        // unit/gcd(unit, minimum) steps; validated geometry bounds this to
+        // 32768 (16 MiB / 512), without allocating or scanning the export.
+        let (mut gcd, mut remainder) = (unit, minimum);
+        while remainder != 0 {
+            (gcd, remainder) = (remainder, gcd % remainder);
+        }
+        let offset_count =
+            (unit / gcd).min((self.volume.max_virtual_size.0 - request_len) / minimum + 1);
+        let maximal_units = (0..offset_count)
+            .map(|step| {
+                let offset = step * minimum;
+                (offset + request_len - 1) / unit - offset / unit + 1
+            })
+            .max()
+            .unwrap(); // A validated nonempty export always permits offset 0.
+                       // The offsets above span at most one phase cycle and maximum_io
+                       // fits u32; their sum and full-unit charge are representable in u64.
+        let maximal_request = maximal_units * unit;
         if self.limits.max_plaintext_bytes.0 < maximal_request {
             return Err(invalid(format!(
-                "limits.max_plaintext_bytes {} must be at least nbd.maximum_io {} plus one \
-                 crypto unit ({}): the admission budget must hold one maximal request",
-                self.limits.max_plaintext_bytes.0, n.maximum_io.0, self.volume.crypto_unit_size
+                "limits.max_plaintext_bytes {} must be at least {maximal_request}: one maximal \
+                 NBD request can touch {maximal_units} crypto units of {unit} bytes each \
+                 (minimum_io {minimum}, maximum_io {}, export size {})",
+                self.limits.max_plaintext_bytes.0, n.maximum_io.0, self.volume.max_virtual_size.0
             )));
         }
         // Progress guarantee for the overlay bound (R4-005): after an inline

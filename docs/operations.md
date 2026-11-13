@@ -658,8 +658,10 @@ old container safe; the lifecycle must stop and create the container again.
 For a normal packaged shutdown, stop `maki-workload@pg.target` while engine
 admission is still open. Filesystem unmount may need to write dirty data or
 metadata; running `maki drain` before unmount prevents those writes. The
-ordered target stop unmounts through attach cleanup before daemon unload drains
-the engine. Do not stop only the workload or attach unit: the
+target stop unmounts through attach cleanup. Only successful cleanup queues
+daemon shutdown and its final drain. A cleanup failure, timeout or killed
+helper leaves the daemon running so a remaining mount keeps its backend.
+Do not stop only the workload or attach unit: the
 `Requires=` and `PartOf=` relationships can deactivate the rest of the graph.
 For an explicit durability acknowledgement, first quiesce and close the
 application through its own shutdown interface, unmount its verified filesystem
@@ -667,8 +669,13 @@ while the daemon is running, then run `maki drain` and require success before
 stopping the target. If unmount fails, keep admission open and resolve that
 failure; a successful drain cannot substitute for a successful unmount.
 
-The target stop orders the workload before attach cleanup and attach cleanup
-before daemon shutdown. The target's own stop job may finish while those
+The target stop orders the workload before attach cleanup; successful cleanup
+requests daemon shutdown without waiting inside the attach stop job. The
+request uses `--job-mode=fail`, so it cannot replace an already queued
+start/restart. Such a conflict preserves the daemon instead of failing the
+completed detach. Any other stop-request error also leaves the daemon running
+and must be diagnosed if the full-stop wait below does not finish.
+The target's own stop job may finish while those
 dependent stop jobs are still deactivating. Wait for every lifecycle unit to
 become inactive before running an offline check, taking a snapshot, or removing
 backing storage:
@@ -702,6 +709,11 @@ forcing NBD, LVM, or device-mapper cleanup.
 The 2026-09-17 combined qualification observed this asynchronous tail directly;
 after all named units became inactive, no mount, mapping, NBD connection,
 trusted volume record, or workload container remained.
+
+`systemctl restart maki-workload@pg.target` restarts the attachment and registered
+workloads while retaining the daemon when their restart job prevents its stop.
+For a new daemon process, configuration or credential reload, use the full
+stop, wait for every unit to become inactive, then start the target.
 
 > [!CAUTION]
 > For attach, detach, recover and grow, removing `--plan` executes the planned
@@ -749,17 +761,33 @@ systemctl mask --runtime maki-recover@pg.service &&
     systemctl stop maki-workload@pg.target
 ```
 
-Wait for all workload, attach and daemon units as described above, and inspect
-any failed unit. Keep the runtime mask until recovery is deliberately re-enabled
+Wait for the workload and attach stop jobs to finish and inspect any failed
+unit. A cancelled attach start skips `ExecStop` and preserves the daemon and
+any partial attachment for explicit cleanup. A failed cleanup also keeps the
+daemon running. Keep the runtime mask until recovery is deliberately re-enabled
 with `systemctl unmask --runtime maki-recover@pg.service`; a reboot removes a
 runtime mask. This procedure must be qualified on the installed stack.
 
-Stop ordering alone does not make cleanup success
-a prerequisite for daemon termination: if unmount fails during a planned
-target stop, preserve the live mount/device state and inspect all lifecycle
-units before retrying or taking a backup. The installed-stack cases in the
-[first production campaign](deployment/first-production-candidate.md) cover
-these remaining operational boundaries.
+### Retry a failed planned stop
+
+Keep the recovery coordinator masked as above and every registered workload
+stopped. Resolve the reported holder, open file or working directory without
+forcing NBD or device-mapper removal. Retry identity-checked cleanup; stop the
+daemon only after that succeeds:
+
+```bash
+maki-attach cleanup --volume pg &&
+    systemctl stop maki@pg.service &&
+    systemctl reset-failed maki-attach@pg.service
+```
+
+Then use the bounded `wait_stopped` above for the workload, attach and daemon
+before an offline check or backup. If cleanup fails again, preserve the backend
+and state for diagnosis. Re-enable recovery only when ready to start the target.
+The success gate applies to planned target stops: an explicit daemon stop,
+host shutdown, crash or recovery coordinator can independently stop the daemon.
+The [installed-stack campaign](deployment/first-production-candidate.md) remains
+separate from service-manager tests using simulated storage resources.
 
 Before production use, verify the installed units on the target distribution:
 

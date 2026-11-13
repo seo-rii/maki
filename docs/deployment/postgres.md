@@ -48,7 +48,7 @@ the values that need a decision:
 | `volume.max_virtual_size` | The exported device size. It cannot grow. Size for the cluster's lifetime; the backing filesystem only needs space for what is written plus reserves |
 | `backing.journal_max_bytes`, `checkpoint_reserve_bytes`, `journal_emergency_reserve_bytes` | The shipped 4 GiB / 4 GiB / 1 GiB suit a multi-GiB backing filesystem; keep the emergency reserve non-zero so ENOSPC is refused before acknowledgement |
 | `cache.mode` | `off` for a database that has its own buffer cache; `read` with `lock_memory = true` only when measured to help |
-| `nbd.maximum_io` | 1 MiB matches PostgreSQL's large sequential I/O; `limits.max_plaintext_bytes` must exceed it by at least one crypto unit |
+| `nbd.maximum_io` | 1 MiB matches PostgreSQL's large sequential I/O; `limits.max_plaintext_bytes` must cover every full crypto unit touched by one permitted request, including alignment and export bounds; configuration validation reports the required budget |
 | `security.require_secure_swap_policy` | `true`. Attach then refuses swap that depends on NBD, and requires readable `/proc/swaps` |
 
 Create the volume as the daemon user, then check it:
@@ -67,9 +67,37 @@ metadata and PostgreSQL's own temporary space
 ## 3. Credential
 
 ```bash
-head -c 32 /dev/urandom > /etc/maki/secrets/postgres.token
-chmod 0400 /etc/maki/secrets/postgres.token
+bash <<'BASH'
+set -euo pipefail
+umask 077
+install -d -m 0700 -o root -g root /etc/maki/secrets
+python3 - <<'PY'
+import os
+import tempfile
+
+target = "/etc/maki/secrets/postgres.token"
+directory = os.path.dirname(target)
+directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".maki-key-") as key:
+        os.fchmod(key.fileno(), 0o400)
+        key.write(os.urandom(32))
+        key.flush()
+        os.fsync(key.fileno())
+        # Atomic publication refuses every existing path, including symlinks.
+        os.link(key.name, target, follow_symlinks=False)
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+BASH
 ```
+
+Run the whole block and continue only on success. Existing files and symlinks
+are refused without changing their contents. Preserve an existing key; do not
+delete it to make initialization succeed. The complete `0400` key is published
+only after its bytes are synced. A later directory-sync failure leaves that
+key in place for inspection, rather than removing or regenerating it.
 
 The packaged unit loads it as `crypto-token`. Store a copy in the
 deployment's secret store, never in the same backup as the backing directory.
@@ -136,8 +164,11 @@ Keep the durability settings the campaign used: `fsync = on`,
 ## 6. Planned stop and start
 
 Stop the target with engine I/O admission open. Its ordered stop shuts down
-PostgreSQL, unmounts the filesystem through attach cleanup, then drains and
-stops the daemon. Do not drain before unmount or stop only the PostgreSQL or
+PostgreSQL, unmounts the filesystem through attach cleanup, then requests
+daemon shutdown only if cleanup succeeds. Failed or timed-out cleanup keeps
+the backend running; resolve the cause and use the
+[failed-stop procedure](../operations.md#retry-a-failed-planned-stop).
+Do not drain before unmount or stop only the PostgreSQL or
 attach unit. For a separate durability acknowledgement, use the
 [explicit unmount-then-drain procedure](../operations.md#privileged-helper).
 
@@ -169,6 +200,10 @@ Start with `systemctl start maki-workload@postgres.target`; the target starts
 the daemon, waits for its readiness notification, attaches, runs the gate,
 and starts PostgreSQL. Do not start `maki@` or `maki-attach@` by hand in
 production.
+
+A target `restart` may retain the daemon. To reload its configuration or key,
+use the full stop/wait/start sequence above; attachment and PostgreSQL restart
+alone do not reload the provider.
 
 ## 7. Failure behaviour to expect
 
