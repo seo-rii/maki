@@ -1,8 +1,7 @@
-//! Locate only the plugin produced for the current Cargo test invocation.
-//! Cargo 1.100 moved each compilation unit out of the shared `deps` directory:
-//! https://doc.rust-lang.org/cargo/reference/build-cache.html
+//! Use the artifact selected from the current Cargo compiler messages.
+//! Cargo 1.100 puts tests and cdylibs in different compilation-unit directories
+//! and does not put cdylibs on LD_LIBRARY_PATH. Never scan cached unit hashes.
 
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -10,50 +9,33 @@ const PLUGIN: &str = "libmaki_nbdkit.so";
 
 pub fn path() -> PathBuf {
     let executable = std::env::current_exe().expect("native test executable path");
-    let search_path = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
-    resolve(&executable, &search_path).unwrap_or_else(|error| panic!("{error}"))
+    let selected = std::env::var_os("MAKI_NBDKIT_TEST_PLUGIN");
+    resolve(&executable, selected.as_deref()).unwrap_or_else(|error| panic!("{error}"))
 }
 
-pub fn resolve(executable: &Path, search_path: &OsStr) -> Result<PathBuf, String> {
-    let directory = executable
-        .parent()
-        .ok_or_else(|| format!("native test has no parent directory: {executable:?}"))?;
-    // Cargo <= 1.99 puts the test and its cdylib dependency together.
-    if directory.file_name() == Some(OsStr::new("deps")) {
-        let plugin = directory.join(PLUGIN);
-        return plugin
-            .is_file()
-            .then_some(plugin.clone())
-            .ok_or_else(|| format!("missing cargo-built plugin: {plugin:?}"));
-    }
-
-    // Cargo >= 1.100 gives the test and library different unit hashes:
-    // <build-dir>/<profile>/build/maki-nbdkit/<unit>/out/<artifact>.
-    // Cargo supplies the active dependency directories in LD_LIBRARY_PATH.
-    // Search only those entries in this package/profile, never enumerate old
-    // unit hashes or fall back to another profile's possibly stale artifact.
-    let package = directory
-        .parent()
-        .and_then(Path::parent)
-        .filter(|package| {
-            directory.file_name() == Some(OsStr::new("out"))
-                && package.file_name() == Some(OsStr::new("maki-nbdkit"))
-                && package.parent().and_then(Path::file_name) == Some(OsStr::new("build"))
-        })
-        .ok_or_else(|| format!("unrecognized Cargo native test layout: {executable:?}"))?;
-    let candidates: BTreeSet<_> = std::env::split_paths(search_path)
-        .filter(|path| {
-            path.file_name() == Some(OsStr::new("out"))
-                && path.parent().and_then(Path::parent) == Some(package)
-        })
-        .map(|path| path.join(PLUGIN))
-        .filter(|path| path.is_file())
-        .collect();
-    if candidates.len() != 1 {
+pub fn resolve(executable: &Path, selected: Option<&OsStr>) -> Result<PathBuf, String> {
+    if let Some(selected) = selected {
+        let path = PathBuf::from(selected);
+        if path.is_absolute() && path.file_name() == Some(OsStr::new(PLUGIN)) && path.is_file() {
+            return Ok(path);
+        }
         return Err(format!(
-            "expected exactly one cargo-built plugin for {executable:?} in Cargo's \
-             active dependency directories beneath {package:?}; found {candidates:?}"
+            "MAKI_NBDKIT_TEST_PLUGIN is not an existing absolute {PLUGIN} path: {path:?}"
         ));
     }
-    Ok(candidates.into_iter().next().unwrap())
+    // Preserve direct `cargo test` support on Cargo <= 1.99. Newer Cargo
+    // requires the wrapper to pass the exact library from compiler-artifact
+    // JSON; test and library unit hashes cannot be inferred from each other.
+    if let Some(directory) = executable.parent() {
+        if directory.file_name() == Some(OsStr::new("deps")) {
+            let plugin = directory.join(PLUGIN);
+            if plugin.is_file() {
+                return Ok(plugin);
+            }
+        }
+    }
+    Err(format!(
+        "missing cargo-built native plugin for {executable:?}; run \
+         python scripts/run_cargo_tests.py with the same cargo test arguments"
+    ))
 }

@@ -106,7 +106,7 @@ the privileged helper are Linux-only.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+python3 -B scripts/run_cargo_tests.py --workspace --locked
 cargo test --workspace --release --locked -- --ignored   # release gates
 ```
 

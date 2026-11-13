@@ -64,8 +64,11 @@ jobs:
       # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
       # smoke — all part of the default workspace suite. `--locked` keeps
       # the build reproducible against Cargo.lock (third review).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: workspace tests
-        run: cargo test --workspace --locked
+        run: python scripts/run_cargo_tests.py --workspace --locked
       # A separate package invocation avoids workspace dev dependencies
       # supplying tonic's TLS backend and hiding missing production features.
       - name: standalone gRPC TLS provider selection (Linux)
@@ -145,8 +148,11 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: workspace tests
-        run: cargo test --workspace --locked
+        run: python scripts/run_cargo_tests.py --workspace --locked
 
   nightly-gates:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))
