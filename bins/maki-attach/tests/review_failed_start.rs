@@ -28,12 +28,15 @@ fn failed_start_plan_uses_the_workload_coordinator_without_configuration() {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("schedule maki-recover@recovery-fixture.service"));
+        assert!(
+            stdout.contains("only if the manager still has the original attach start job running")
+        );
         assert!(stdout.contains("stops workloads before identity-checked cleanup"));
     }
 }
 
 #[test]
-fn failed_stop_and_operator_cancellation_plans_do_not_restart() {
+fn successful_main_or_unknown_result_plans_do_not_restart() {
     for (result, code, status) in [
         ("success", "exited", "0"),
         ("exit-code", "exited", "0"),
