@@ -13,6 +13,17 @@ WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
 
 
 class DependencyAuditContract(unittest.TestCase):
+    def test_audit_is_an_independent_always_enabled_job(self):
+        workflow = WORKFLOW.read_text()
+        jobs = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow))
+        audit = jobs["dependency-audit"]
+        self.assertIn("runs-on: ubuntu-latest", audit)
+        self.assertIn('cargo audit --deny warnings --file "$lockfile"', audit)
+        self.assertNotRegex(audit, r"(?m)^    (?:if|needs|continue-on-error):")
+        self.assertNotRegex(audit, r"(?m)^        continue-on-error:")
+        self.assertNotIn("cargo audit", jobs["pr"])
+        self.assertNotRegex(jobs["pr"], r"(?m)^    needs:")
+
     def test_linux_ci_installs_a_pinned_auditor_and_denies_all_warnings(self):
         workflow = WORKFLOW.read_text()
         install = """      - name: install pinned RustSec auditor (Linux)
