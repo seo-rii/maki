@@ -2017,3 +2017,44 @@ reading the state file; before the fix the following inspect answered "reopen
 required". A removed-then-restored state file stays poisoned, alongside the
 existing corrupt-file and publication-failure tests. The tests use private
 temporary directories.
+
+## Readiness review follow-up (2026-11-13)
+
+This change integrates the existing gRPC HTTP-status fix (PR #125) and remote
+StateStore read-error fix (PR #126), then closes the corresponding local
+witness recovery gap. A failed local freshness read now rejects that operation
+without poisoning either FileWitness or its parent RollbackBacking. Missing,
+truncated, corrupt or mismatched anchors and uncertain publications still stop
+the session. A real, isolated EMFILE regression restores descriptors and uses
+the existing handles to read, write and sync, then reopens to verify durability.
+
+The first-volume guide now owns one fail-closed bootstrap script, linked from
+Quickstart. It rejects occupied NBD/VG/LV names, checks size and unique backend
+identity, verifies the live device-mapper UUID and backing device immediately
+before formatting, and invokes mkfs.xfs without force. Mocked execution of the
+actual documentation block checks failures without formatting real storage.
+
+SlotStore now remembers reservations whose allocation and sync_all succeeded
+in the current open session. TRIM punching invalidates the affected ranges
+before the operation, including partial failures; reopening starts with no
+reservation knowledge. The 256-unit, 4 KiB counting regression observes 256
+allocation/sync calls initially and zero additional calls for overwrites after
+checkpoint. It verifies flushed data after simulated power loss and ENOSPC.
+The cost is one extra in-memory bit per loaded shard slot, with no disk-format
+change. New-slot reservation batching and device throughput measurement remain
+follow-up work; these counts do not establish an MB/s improvement.
+
+Both affected lockfiles use rustix 1.1.6 for RUSTSEC-2026-0486. CI audits all
+root/vendor lockfiles in an independent job, retaining --deny warnings, so an
+advisory cannot prevent the baseline job's tests from running. Required-check
+selection remains a repository branch-protection setting. The release guides
+pin the Rust 1.94.0 baseline, identify the missing nbd-client build provenance,
+and require installation/upgrade/restore evidence from the exact candidate
+artifacts. README now states the remote provider's plaintext and cryptographic
+trust boundary. These changes do not qualify or publish a production release.
+
+The gRPC regression also drives a real loopback HTTP/2 peer through an outage
+and recovery using EndpointSet's stall policy: encryption and decryption stay
+pending through 502 HTML pages and complete after valid gRPC responses return.
+It models an intermediary's wire behavior; it is not a deployed nginx, kernel
+NBD, filesystem or database qualification run.
