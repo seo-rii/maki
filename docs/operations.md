@@ -386,11 +386,21 @@ the configured volume in nbdkit's `after_fork` callback, before the first NBD
 client, and sends `READY=1` after recovery, the configured provider checks, and
 control socket binding succeed. `maki-attach@` therefore waits for this initial
 data-plane readiness through its existing `Requires=` and `After=` ordering.
-An initialization or notification failure fails startup. The unit has a
-180-second startup deadline; qualify and override that value for the expected
-recovery size and provider latency. The packaged foreground process is the
-notification sender. Manual runs without `NOTIFY_SOCKET` still initialize
-before accepting clients, without sending a service notification.
+An initialization or notification failure fails startup. The initial deadline
+is 180 seconds. During journal recovery, completed scan, repair and replay work
+can send `EXTEND_TIMEOUT_USEC=180000000`, at most once every 30 seconds. There
+is no timer sending extensions while an operation is blocked; without further
+progress the last granted deadline expires. Provider verification receives no
+unconditional heartbeat. Qualify startup and recovery time for the selected
+journal size, storage and provider, including a single slow operation that
+cannot report progress within the deadline.
+
+The packaged foreground process is the notification sender. A failed progress
+notification prevents `READY=1`, even if subsequent recovery completes. These
+messages do not persist a replay checkpoint across process termination or OOM;
+repeated interrupted recovery still needs the target-profile campaign. Manual
+runs without `NOTIFY_SOCKET` initialize before accepting clients without sending
+service notifications.
 
 This notification does not certify XFS attachment, database recovery, or
 continued health. Mount readiness still requires successful attach, and every
@@ -712,6 +722,23 @@ is a separate privileged oneshot service without credentials.
 The recovery template uses `OnSuccess=`, which requires systemd 249 or later.
 This version boundary is recorded in the
 [upstream v249 unit documentation](https://github.com/systemd/systemd/blob/v249/man/systemd.unit.xml).
+
+The attach oneshot's `ExecStopPost` invokes `maki-attach recover-failed-start`.
+It schedules the recovery coordinator only when systemd reports both a failed
+service result and a failed main (`ExecStart`) process. The coordinator stops
+registered workloads before identity-checked cleanup and starts the lifecycle
+again only after cleanup succeeds. The hook does not clean up devices itself.
+Attach starts are limited to three in 300 seconds; inspect the failure before
+resetting a start-limit failure.
+
+A successful `ExecStart` followed by failed `ExecStop` cleanup does not request
+an automatic restart. Neither does an explicit stop during startup reported
+as a successful service stop. Stop ordering alone does not make cleanup success
+a prerequisite for daemon termination: if unmount fails during a planned
+target stop, preserve the live mount/device state and inspect all lifecycle
+units before retrying or taking a backup. The installed-stack cases in the
+[first production campaign](deployment/first-production-candidate.md) cover
+these remaining operational boundaries.
 
 Before production use, verify the installed units on the target distribution:
 

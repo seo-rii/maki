@@ -49,6 +49,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 |---|---|---|---|
 | Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block |
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
+| Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
 
 Both platform matrices set `fail-fast: false`, so a Linux failure cannot
@@ -72,6 +73,18 @@ run is not native execution evidence.
 The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
 fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
 campaigns remain opt-in host qualification steps.
+
+The independent `systemd-lifecycle` job builds the actual `maki-attach` hook
+and runs `scripts/systemd-lifecycle-validation.py` on its disposable runner.
+Random instance units preserve the packaged lifecycle dependency graph; marker
+processes replace storage and workload commands. Cases cover failed start,
+timeout, SIGKILL, refusal of recovery cleanup, a simulated foreign resource,
+start-rate limiting, duplicate start, planned stop, failed stop and cancelled
+startup. The fixture removes only its own unit links and retains case results
+and bounded diagnostics as a CI artifact. It does not attach devices or qualify
+the Debian 12 NBD/LVM/XFS stack. The
+[first production campaign](deployment/first-production-candidate.md) requires
+those installed-package and workload results separately.
 
 The 2026-09-18 bounded-replay follow-up at revision `733833c` reran the Docker
 cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
