@@ -5,6 +5,10 @@
 //! selects the number of FLUSH/FUA crash/restart cycles (default 3 each).
 #![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_plugin.rs"]
+mod native_plugin;
+
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
@@ -347,12 +351,7 @@ impl Server {
         notify
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        let plugin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("libmaki_nbdkit.so");
-        assert!(plugin.is_file(), "missing cargo-built plugin");
+        let plugin = native_plugin::path();
         let mut command = Command::new("nbdkit");
         command
             .args(["--foreground", "--exit-with-parent", "-U"])

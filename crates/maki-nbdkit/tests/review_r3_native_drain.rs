@@ -2,6 +2,10 @@
 //! logs the failed unload barrier. This uses disposable files and userspace NBD.
 #![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_plugin.rs"]
+mod native_plugin;
+
 use maki_control::protocol::{read_response, send_command, Request};
 use std::path::Path;
 use std::process::Command;
@@ -105,8 +109,7 @@ socket = {socket:?}
     std::fs::write(&config_path, &config).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&config).unwrap();
     let exe = std::env::current_exe().unwrap();
-    let plugin = exe.parent().unwrap().join("libmaki_nbdkit.so");
-    assert!(plugin.is_file(), "missing cargo-built plugin: {plugin:?}");
+    let plugin = native_plugin::path();
     let output = Command::new("timeout")
         .args(["--kill-after=2s", "30s", "nbdkit"])
         .args(["--foreground", "--exit-with-parent", "-U", "-"])

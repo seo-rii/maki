@@ -2058,3 +2058,14 @@ and recovery using EndpointSet's stall policy: encryption and decryption stay
 pending through 502 HTML pages and complete after valid gRPC responses return.
 It models an intermediary's wire behavior; it is not a deployed nginx, kernel
 NBD, filesystem or database qualification run.
+
+Validation also exposed a native-test fixture assumption when the latest-stable
+CI job advanced to Rust/Cargo 1.100. Cargo now places the test executable and
+cdylib in separate unit directories. The shared test helper keeps the older
+adjacent `deps` lookup and, for the new layout, accepts exactly one plugin in
+Cargo's active dependency directories for the same package and profile. It
+does not enumerate cached unit hashes. Layout regressions cover missing,
+ambiguous, stale and foreign candidates; the production plugin is unchanged.
+The tungstenite lockfile's recorded hash in `vendor/patches.json` is updated
+along with the security dependency resolution and checked by the actual vendor
+source inventory gate.
