@@ -15,6 +15,90 @@ SPEC.loader.exec_module(fixture)
 
 
 class SystemdLifecycleFixtureTests(unittest.TestCase):
+    def verify_events(self, mode, events, target_state):
+        """Run the campaign oracle against a trace without using a service manager."""
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), mode)
+            records = [{"event": name} for name in events]
+            with (patch.object(case, "ctl", return_value=subprocess.CompletedProcess([], 0, "", "")),
+                  patch.object(case, "events", return_value=records),
+                  patch.object(case, "state", return_value=target_state),
+                  patch.object(fixture.time, "sleep")):
+                case.verify(mode)
+
+    def test_recovery_oracle_accepts_cleanup_before_each_reattach(self):
+        self.verify_events("exit-once", (
+            "attach-start", "cleanup-recover", "cleanup-complete",
+            "attach-start", "attach-ready", "workload-start",
+        ), "active")
+        self.verify_events("repeated-failure", (
+            "attach-start", "cleanup-recover", "cleanup-complete",
+            "attach-start", "cleanup-recover", "cleanup-complete",
+            "attach-start", "cleanup-recover", "cleanup-complete",
+        ), "failed")
+
+    def test_recovery_oracle_rejects_reattach_before_cleanup_completion(self):
+        for completion in ((), ("cleanup-complete",)):
+            with self.subTest(completion=completion):
+                with self.assertRaisesRegex(AssertionError, "reattach"):
+                    self.verify_events("exit-once", (
+                        "attach-start", "cleanup-recover",
+                        "attach-start", "attach-ready", "workload-start",
+                        *completion,
+                    ), "active")
+
+    def test_recovery_oracle_rejects_stale_cleanup_completion(self):
+        with self.assertRaisesRegex(AssertionError, "reattach"):
+            self.verify_events("repeated-failure", (
+                "attach-start", "cleanup-recover", "cleanup-complete",
+                "attach-start", "cleanup-recover",
+                "attach-start", "cleanup-complete",
+            ), "failed")
+
+    def test_cancellation_oracle_rejects_unsafe_events(self):
+        self.verify_events("cancel-start", ("attach-start",), "inactive")
+        for event in ("unsafe-workload-start", "unsafe-cleanup-before-workload-stop"):
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(AssertionError, "unsafe"):
+                    self.verify_events("cancel-start", ("attach-start", event), "inactive")
+
+    def test_cancellation_waits_for_service_stop_jobs_before_checking_safety(self):
+        for terminal_state in ("inactive", "failed"):
+            with self.subTest(terminal_state=terminal_state), tempfile.TemporaryDirectory() as temporary:
+                case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "cancel-start")
+                records = [{"event": "attach-start"}]
+                stopping = {
+                    "attach": iter(("deactivating", terminal_state)),
+                    "daemon": iter(("deactivating", terminal_state)),
+                }
+
+                def state(which):
+                    if which == "target":
+                        return "inactive"
+                    result = next(stopping[which], terminal_state)
+                    if which == "daemon" and result == terminal_state:
+                        records.append({"event": "unsafe-workload-start"})
+                    return result
+
+                with (patch.object(case, "ctl", return_value=subprocess.CompletedProcess([], 0, "", "")),
+                      patch.object(case, "events", return_value=records),
+                      patch.object(case, "state", side_effect=state),
+                      patch.object(fixture.time, "sleep")):
+                    with self.assertRaisesRegex(AssertionError, "unsafe"):
+                        case.verify("cancel-start")
+
+    def test_attach_refuses_to_overwrite_an_existing_resource(self):
+        for contents in ("owned", "foreign"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                (directory / "mode").write_text("normal-stop")
+                resource = directory / "resource"
+                resource.write_text(contents)
+                self.assertNotEqual(fixture.actor(directory, "attach"), 0)
+                self.assertEqual(resource.read_text(), contents)
+                self.assertIn("unsafe-attach-existing-resource",
+                              (directory / "events.jsonl").read_text())
+
     def test_graph_uses_only_private_instances_and_the_real_hook(self):
         volume = "mkci_fixture123"
         units = fixture.names(volume)

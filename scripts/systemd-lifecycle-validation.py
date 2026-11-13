@@ -129,8 +129,13 @@ def actor(directory, action):
         attempts = directory / "attempts"
         attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
         attempts.write_text(str(attempt))
-        resource.write_text("foreign" if mode == "foreign-resource" else "owned")
         event(directory, "attach-start", attempt=attempt)
+        try:
+            with resource.open("x") as handle:
+                handle.write("foreign" if mode == "foreign-resource" else "owned")
+        except FileExistsError:
+            event(directory, "unsafe-attach-existing-resource")
+            return 44
         if mode == "repeated-failure" or (attempt == 1 and mode in
                 ("exit-once", "cleanup-failure", "foreign-resource")):
             return 1
@@ -274,20 +279,20 @@ class Fixture:
         if mode == "cancel-start":
             self.wait(lambda: self.count("attach-start") == 1, "attach started")
             self.ctl("stop", self.units["target"])
+            # A stopped target does not imply dependent ExecStopPost hooks have
+            # finished. Observe their terminal states before checking the trace.
+            self.wait(lambda: all(self.state(which) in ("inactive", "failed")
+                                  for which in ("attach", "daemon")), "cancelled services stopped")
             time.sleep(0.5)
             require(self.count("cleanup-recover") == 0, "operator cancellation restarted recovery")
             require(self.count("attach-start") == 1, "cancelled start was retried")
             require(self.count("workload-start") == 0, "cancelled start ran a workload")
             require(self.state("target") == "inactive", "cancelled target did not stop")
-            return
-        if mode in ("exit-once", "timeout-once", "kill-once"):
+        elif mode in ("exit-once", "timeout-once", "kill-once"):
             self.wait(lambda: self.count("attach-ready") == 1 and self.count("workload-start") == 1
                       and self.state("target") == "active", "failed target start recovered")
             require(self.count("attach-start") == 2, "unexpected attach attempt count")
             require(self.count("cleanup-recover") == 1, "failed start did not recover exactly once")
-            events = [record["event"] for record in self.events()]
-            require(events.index("cleanup-recover") < events.index("attach-ready"),
-                    "reattach preceded recovery cleanup")
         elif mode in ("cleanup-failure", "foreign-resource"):
             self.wait(lambda: self.state("recovery") == "failed", "coordinator refusal")
             time.sleep(0.5)
@@ -322,8 +327,17 @@ class Fixture:
             else:
                 require(self.state("attach") == "inactive", "normal attach stop did not finish")
                 require(not (self.directory / "resource").exists(), "normal stop did not clean up")
-        require(not any(record["event"].startswith("unsafe-") for record in self.events()),
-                "unsafe ordering in simulated lifecycle")
+        needs_cleanup = False
+        for record in self.events():
+            name = record["event"]
+            require(not name.startswith("unsafe-"), "unsafe ordering in simulated lifecycle")
+            if name == "attach-start":
+                require(not needs_cleanup, "reattach began before previous cleanup completed")
+                # Each attempt consumes the preceding cleanup. An earlier
+                # completion cannot authorize a later retry in a failure loop.
+                needs_cleanup = True
+            elif name == "cleanup-complete":
+                needs_cleanup = False
 
 
 def main():
