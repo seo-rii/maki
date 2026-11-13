@@ -236,7 +236,15 @@ ordering first stop registered workloads, the attach unit, and the daemon. It
 then runs convergent cleanup. `OnSuccess=` starts a fresh lifecycle only after
 cleanup succeeds; a cleanup failure leaves the workload stopped. Retry loops
 are bounded by the daemon start limit and the recovery job timeout. The target
-stop path runs attach cleanup before the daemon stops.
+stop path queues daemon shutdown only after attach cleanup succeeds. A failed,
+timed-out or killed cleanup preserves the daemon and the remaining attachment;
+follow [failed planned-stop recovery](operations.md#retry-a-failed-planned-stop).
+The daemon is not directly part of the target's stop propagation.
+
+A target restart can retain the daemon while restarting the attachment and
+workloads. For a full daemon/configuration/credential restart, stop the target,
+wait for all units to be inactive, then start it. Explicit daemon stops and
+host shutdown are separate from this planned-stop success gate.
 
 The daemon unit allows three starts in five minutes (`StartLimitBurst=3`,
 `StartLimitIntervalSec=300`). Once a crash loop reaches that limit, systemd

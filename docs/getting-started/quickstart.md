@@ -174,7 +174,9 @@ and unmount while admission is still open: unmount may write filesystem data
 or metadata even after `sync`. Only after unmount succeeds, drain, stop the
 target, and wait for every unit to become inactive before an offline check.
 For a normal stop without a separate acknowledgement, stop the target directly;
-its ordered cleanup unmounts before daemon unload drains the engine.
+successful cleanup unmounts before requesting daemon shutdown and final drain.
+If cleanup fails, the daemon stays running for the remaining mount; follow the
+[failed-stop procedure](../operations.md#retry-a-failed-planned-stop).
 
 ```bash
 # Succeeds once every named unit is inactive; fails at once if one failed

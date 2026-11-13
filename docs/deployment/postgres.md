@@ -164,8 +164,11 @@ Keep the durability settings the campaign used: `fsync = on`,
 ## 6. Planned stop and start
 
 Stop the target with engine I/O admission open. Its ordered stop shuts down
-PostgreSQL, unmounts the filesystem through attach cleanup, then drains and
-stops the daemon. Do not drain before unmount or stop only the PostgreSQL or
+PostgreSQL, unmounts the filesystem through attach cleanup, then requests
+daemon shutdown only if cleanup succeeds. Failed or timed-out cleanup keeps
+the backend running; resolve the cause and use the
+[failed-stop procedure](../operations.md#retry-a-failed-planned-stop).
+Do not drain before unmount or stop only the PostgreSQL or
 attach unit. For a separate durability acknowledgement, use the
 [explicit unmount-then-drain procedure](../operations.md#privileged-helper).
 
@@ -197,6 +200,10 @@ Start with `systemctl start maki-workload@postgres.target`; the target starts
 the daemon, waits for its readiness notification, attaches, runs the gate,
 and starts PostgreSQL. Do not start `maki@` or `maki-attach@` by hand in
 production.
+
+A target `restart` may retain the daemon. To reload its configuration or key,
+use the full stop/wait/start sequence above; attachment and PostgreSQL restart
+alone do not reload the provider.
 
 ## 7. Failure behaviour to expect
 

@@ -6,7 +6,9 @@
 Description=Maki encrypted volume %i
 After=network-online.target
 Wants=network-online.target
-PartOf=maki-workload@%i.target
+# Planned target stops must keep this backend alive if unmount/detach fails.
+# The attach unit queues our stop only after its cleanup succeeds. Explicit
+# daemon stops, crash recovery and host shutdown remain separate stop requests.
 OnFailure=maki-recover@%i.service
 OnFailureJobMode=replace-irreversibly
 # Bound automatic recovery loops when daemon startup cannot succeed.
