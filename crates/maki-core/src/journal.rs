@@ -723,6 +723,15 @@ pub(crate) fn rewrite_verified_range(
     range: Range<u64>,
     expected_fingerprint: u64,
 ) -> Result<(), CoreError> {
+    rewrite_verified_range_with_progress(file, range, expected_fingerprint, &|| {})
+}
+
+pub(crate) fn rewrite_verified_range_with_progress(
+    file: &dyn BackingFile,
+    range: Range<u64>,
+    expected_fingerprint: u64,
+    progress: &crate::recovery::RecoveryProgress<'_>,
+) -> Result<(), CoreError> {
     let mut buffer = [0u8; 64 * 1024];
     let mut fingerprint = DefaultHasher::new();
     let mut offset = range.start;
@@ -733,6 +742,7 @@ pub(crate) fn rewrite_verified_range(
         fingerprint.write(chunk);
         file.write_at(offset, chunk)?;
         offset += len as u64;
+        progress();
     }
     if fingerprint.finish() != expected_fingerprint {
         return Err(CoreError::Corrupt(

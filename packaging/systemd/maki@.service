@@ -18,6 +18,8 @@ StartLimitBurst=3
 # provider verification and control binding. Ordered attach jobs wait for it.
 Type=notify
 NotifyAccess=main
+# Completed recovery work may extend this deadline. There is no background
+# heartbeat while storage is stuck, and READY still requires all startup gates.
 TimeoutStartSec=180
 
 User=maki

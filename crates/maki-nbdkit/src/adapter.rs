@@ -112,15 +112,22 @@ impl NbdAdapter {
     /// run recovery + self-test, start the control socket, return a serving
     /// adapter.
     pub fn open_config(path: &str) -> Result<Self, AdapterError> {
-        Self::open_config_inner(path, false)
+        Self::open_config_inner(path, false, None)
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn open_native_config(path: &str) -> Result<Self, AdapterError> {
-        Self::open_config_inner(path, true)
+    pub(crate) fn open_native_config(
+        path: &str,
+        progress: Arc<maki_core::recovery::RecoveryProgress<'static>>,
+    ) -> Result<Self, AdapterError> {
+        Self::open_config_inner(path, true, Some(progress))
     }
 
-    fn open_config_inner(path: &str, native: bool) -> Result<Self, AdapterError> {
+    fn open_config_inner(
+        path: &str,
+        native: bool,
+        progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+    ) -> Result<Self, AdapterError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| AdapterError::new(EINVAL, format!("config {path}: {e}")))?;
         let config = daemon::parse_and_validate(&raw)
@@ -145,7 +152,7 @@ impl NbdAdapter {
             .build()
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
         let (engine, crypto_stats, endpoints) = runtime
-            .block_on(daemon::attach_from_config_with_stats(&config))
+            .block_on(daemon::attach_from_config_with_progress(&config, progress))
             .map_err(|e| AdapterError::new(EIO, e.to_string()))?;
         #[cfg(not(unix))]
         let _ = (&crypto_stats, &endpoints, &nbd_socket); // only the Unix control socket reports them

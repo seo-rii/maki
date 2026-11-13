@@ -282,11 +282,19 @@ fn probe_header(
 
 /// Units of `shard` whose bit is clear but whose slot holds a header for
 /// them. One header read per cleared slot.
-fn probe_shard(geometry: &Geometry, shard: &Shard, shard_idx: u64) -> Result<Vec<u64>, CoreError> {
+fn probe_shard(
+    geometry: &Geometry,
+    shard: &Shard,
+    shard_idx: u64,
+    progress: &crate::recovery::RecoveryProgress<'_>,
+) -> Result<Vec<u64>, CoreError> {
     let len = shard.data.len()?;
     let per_shard = geometry.units_per_shard();
     let mut out = Vec::new();
     for in_shard in 0..shard.alloc.units() {
+        if in_shard > 0 && in_shard.is_multiple_of(256) {
+            progress();
+        }
         if shard
             .discard
             .as_ref()
@@ -305,6 +313,7 @@ fn probe_shard(geometry: &Geometry, shard: &Shard, shard_idx: u64) -> Result<Vec
         if let Probe::Header(_) = probe_header(geometry, shard, unit, in_shard, len)? {
             out.push(unit);
         }
+        progress();
     }
     Ok(out)
 }
@@ -358,6 +367,14 @@ impl SlotStore {
     /// Data files the catalog copy does not list are adopted (see module
     /// docs); a missing allocation map for such a shard is an empty one.
     pub fn open(backing: Arc<dyn Backing>, geometry: Geometry) -> Result<Self, CoreError> {
+        Self::open_with_progress(backing, geometry, &|| {})
+    }
+
+    pub(crate) fn open_with_progress(
+        backing: Arc<dyn Backing>,
+        geometry: Geometry,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<Self, CoreError> {
         let discard_enabled =
             load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
         let catalog_ab = catalog_store(&geometry);
@@ -384,6 +401,7 @@ impl SlotStore {
             catalog_dirty = true;
         }
         let adopted: BTreeSet<u64> = orphans.into_iter().collect();
+        progress();
 
         let mut shards = HashMap::new();
         let mut repaired_units: Vec<u64> = Vec::new();
@@ -483,6 +501,9 @@ impl SlotStore {
                         marked += 1;
                         damaged_units.push(shard_idx * geometry.units_per_shard() + in_shard);
                     }
+                    if in_shard.is_multiple_of(256) {
+                        progress();
+                    }
                 }
                 dirty_alloc |= marked > 0;
                 tracing::warn!(
@@ -539,7 +560,7 @@ impl SlotStore {
             // by the next allocation persist). Healthy shards (both copies
             // valid) skip this.
             if side_a.is_none() || side_b.is_none() {
-                let found = probe_shard(&geometry, &shard, shard_idx)?;
+                let found = probe_shard(&geometry, &shard, shard_idx, progress)?;
                 if !found.is_empty() {
                     tracing::warn!(
                         shard = shard_idx,
@@ -555,6 +576,7 @@ impl SlotStore {
                 }
             }
             shards.insert(shard_idx, shard);
+            progress();
         }
 
         Ok(Self {
@@ -990,6 +1012,13 @@ impl SlotStore {
     /// any step leaves every affected shard dirty so a retry redoes the
     /// whole step.
     pub fn persist_allocations(&mut self) -> Result<(), CoreError> {
+        self.persist_allocations_with_progress(&|| {})
+    }
+
+    pub(crate) fn persist_allocations_with_progress(
+        &mut self,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<(), CoreError> {
         // Loaded pairs awaiting proof are stored here too, before the catalog
         // commit below can name an adopted shard (K-03 / BUG-043).
         let dirty: Vec<u64> = self
@@ -1010,6 +1039,7 @@ impl SlotStore {
                         .alloc_ab
                         .store(self.backing.as_ref(), &mut shard.alloc)?;
                 }
+                progress();
             }
             fp("checkpoint.alloc_dirsync")?;
             self.backing.sync_dir(layout::DATA_DIR)?;
@@ -1037,12 +1067,14 @@ impl SlotStore {
                 .collect();
             for idx in unproven {
                 self.prove_data_file(idx)?;
+                progress();
             }
             fp("store.catalog_store")?;
             self.catalog_ab
                 .store(self.backing.as_ref(), &mut self.catalog)?;
             self.backing.sync_dir("")?;
             self.catalog_dirty = false;
+            progress();
         }
         Ok(())
     }
@@ -1068,6 +1100,13 @@ impl SlotStore {
     }
 
     pub(crate) fn persist_discards(&mut self) -> Result<(), CoreError> {
+        self.persist_discards_with_progress(&|| {})
+    }
+
+    pub(crate) fn persist_discards_with_progress(
+        &mut self,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<(), CoreError> {
         let dirty: Vec<u64> = self
             .shards
             .iter()
@@ -1085,6 +1124,7 @@ impl SlotStore {
             let map = shard.discard.as_mut().unwrap();
             fp("discard.store")?;
             ab.store(self.backing.as_ref(), map)?;
+            progress();
             fp("discard.store")?;
             ab.store(self.backing.as_ref(), map)?;
         }
