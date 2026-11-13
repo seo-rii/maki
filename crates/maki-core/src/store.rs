@@ -87,6 +87,11 @@ enum ShortFile {
 
 struct Shard {
     alloc: AllocationMap,
+    /// Complete slot extents reserved and synced in this open session.
+    /// Logical allocation bits and loaded slot headers do not prove physical
+    /// extent durability after a failed barrier, so this starts empty on open.
+    /// Clear a range before attempting to punch it, including failed punches.
+    reserved: AllocationMap,
     alloc_ab: AbStore,
     data: Arc<dyn BackingFile>,
     dirty_alloc: bool,
@@ -188,7 +193,7 @@ pub struct SlotStore {
     damaged_units: Vec<u64>,
     discard_enabled: bool,
     /// A bounded post-recovery scan retries physical release of persisted
-    /// tombstones. No extra per-unit bitmap or payload history is retained.
+    /// tombstones. The scan retains no per-unit bitmap or payload history.
     reclaim_cursor: Option<(u64, u64)>,
     /// The last reclamation window failed to punch (BUG-123): the scan keeps
     /// its cursor, but is not pending work until a later checkpoint, run
@@ -492,6 +497,7 @@ impl SlotStore {
             };
             let mut shard = Shard {
                 alloc,
+                reserved: AllocationMap::new(geometry.units_per_shard()),
                 alloc_ab,
                 data,
                 dirty_alloc,
@@ -658,6 +664,9 @@ impl SlotStore {
     /// `posix_fallocate`, so a later checkpoint cannot lose its completion
     /// space to an unrelated filesystem consumer. A full file barrier makes
     /// unwritten allocation metadata durable before the record is published.
+    /// Successful reservations are reused within this open session until a
+    /// punch is attempted. Reopening starts with no remembered reservations;
+    /// the first subsequent write to each slot establishes its space again.
     ///
     /// The reservation can extend a data file, so the file's size is proven
     /// first (see `ShortFile`): for a truncated file the damage marks made
@@ -678,7 +687,10 @@ impl SlotStore {
                 error => error,
             });
         }
-        let shard = self.shards.get(&shard_idx).unwrap();
+        let shard = self.shards.get_mut(&shard_idx).unwrap();
+        if shard.reserved.get(in_shard) {
+            return Ok(());
+        }
         shard
             .data
             .allocate_range(self.geometry.slot_offset(in_shard), self.geometry.slot_size)?;
@@ -695,6 +707,7 @@ impl SlotStore {
                 .store(failures.saturating_add(1), Ordering::Release);
             return Err(error.into());
         }
+        shard.reserved.set(in_shard, true);
         Ok(())
     }
 
@@ -842,6 +855,7 @@ impl SlotStore {
             shard_idx,
             Shard {
                 alloc,
+                reserved: AllocationMap::new(self.geometry.units_per_shard()),
                 alloc_ab,
                 data,
                 dirty_alloc: false,
@@ -1105,18 +1119,20 @@ impl SlotStore {
             .discard
             .as_ref()
             .expect("reclaim cursor requires v3 map");
-        let end = start.saturating_add(4096).min(map.units());
+        let map_units = map.units();
+        let end = start.saturating_add(4096).min(map_units);
         let base = idx * self.geometry.units_per_shard();
-        let units = (start..end)
+        let units: Vec<u64> = (start..end)
             .filter(|in_shard| map.get(*in_shard))
             .map(|in_shard| base + in_shard)
-            .filter(|unit| can_punch(*unit));
+            .filter(|unit| can_punch(*unit))
+            .collect();
         if let Err(error) = self.punch_slots(units) {
             self.reclaim_stalled = true;
             return Err(error);
         }
         self.reclaim_stalled = false;
-        self.reclaim_cursor = if end < map.units() {
+        self.reclaim_cursor = if end < map_units {
             Some((idx, end))
         } else {
             self.catalog
@@ -1135,7 +1151,7 @@ impl SlotStore {
     }
 
     pub(crate) fn punch_slots(
-        &self,
+        &mut self,
         units: impl IntoIterator<Item = u64>,
     ) -> Result<(), CoreError> {
         let mut by_shard: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
@@ -1144,7 +1160,7 @@ impl SlotStore {
             by_shard.entry(shard_idx).or_default().push(in_shard);
         }
         for (shard_idx, mut slots) in by_shard {
-            let shard = self.shards.get(&shard_idx).ok_or_else(|| {
+            let shard = self.shards.get_mut(&shard_idx).ok_or_else(|| {
                 CoreError::Corrupt(format!("discard shard {shard_idx} does not exist"))
             })?;
             slots.sort_unstable();
@@ -1162,6 +1178,12 @@ impl SlotStore {
                     CoreError::Corrupt("discard punch range length overflow".into())
                 })?;
                 fp("discard.punch")?;
+                // A failed punch may already have released part of the range.
+                // A later write must reserve and sync it again even if the
+                // punch or its subsequent data barrier reports failure.
+                for in_shard in &slots[start..end] {
+                    shard.reserved.set(*in_shard, false);
+                }
                 match shard.data.punch_hole(self.geometry.slot_offset(first), len) {
                     Ok(()) => punched = true,
                     Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
