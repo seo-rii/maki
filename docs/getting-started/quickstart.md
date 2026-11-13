@@ -93,56 +93,27 @@ maki volume inspect /etc/maki/volumes/demo.toml
 maki check /etc/maki/volumes/demo.toml
 ```
 
-`inspect` prints the volume UUID you will pin in step 5 and the format-file
+`inspect` prints the volume UUID the bootstrap will pin and the format-file
 sizes at full allocation.
 
 ## 4. Provision LVM and XFS on the export
 
-This is the one-time bootstrap from [provisioning the first volume](first-volume.md),
-condensed:
+Follow [provisioning the first volume](first-volume.md#1-provision-and-record-the-layout)
+with the `demo` defaults. Run its entire Bash block, then return here only if
+it succeeds. It checks that the NBD device, VG/LV names and mountpoint are
+unused, stops on every failed command or size mismatch, and checks the live
+NBD and device-mapper identities immediately before creating XFS. It writes
+`/etc/maki/attach/demo.toml` with the observed UUIDs and releases the bootstrap
+layout.
+
+If it fails, preserve and inspect the partial layout using that guide's
+[recovery notes](first-volume.md#recovering-from-a-failed-bootstrap). Do not
+continue at the formatting command or overwrite an existing filesystem.
+
+## 5. Review the attach configuration
 
 ```bash
-systemctl start maki@demo.service           # data plane only; the key is bound on this first start
-dev=/dev/nbd0
-nbd-client -unix /run/maki/demo/nbd.sock ${dev#/dev/} -b 4096   # netlink: kernel name nbd0
-[ "$(blockdev --getsize64 $dev)" = 8589934592 ] || echo "unexpected device size"
-
-vg=vg_maki_demo; lv=data
-pvcreate --yes $dev
-vgcreate $vg $dev
-lvcreate --yes -L 6G -n $lv $vg
-mkfs.xfs -f /dev/$vg/$lv
-
-pv_uuid=$(pvs --readonly --noheadings -o pv_uuid $dev | tr -d ' ')
-vg_uuid=$(vgs --readonly --noheadings -o vg_uuid $vg | tr -d ' ')
-lv_uuid=$(lvs --readonly --noheadings -o lv_uuid $vg/$lv | tr -d ' ')
-fs_uuid=$(blkid --probe --cache-file /dev/null --match-tag UUID --output value /dev/$vg/$lv)
-volume_uuid=$(maki volume inspect /etc/maki/volumes/demo.toml | awk '/^uuid:/ {print $2}')
-
-vgchange -an $vg
-nbd-client -d ${dev#/dev/}
-systemctl stop maki@demo.service
-```
-
-## 5. Write the attach configuration
-
-```bash
-install -d -m 0700 -o root -g root /etc/maki/attach /srv/demo
-cat > /etc/maki/attach/demo.toml <<EOF
-volume_uuid = "$volume_uuid"
-device_block_size = 4096
-vg_name = "$vg"
-lv_name = "$lv"
-mountpoint = "/srv/demo"
-fs_uuid = "$fs_uuid"
-init_sentinel = true
-
-[lvm_identity]
-pv_uuids = ["$pv_uuid"]
-vg_uuid = "$vg_uuid"
-lv_uuid = "$lv_uuid"
-EOF
-chmod 0600 /etc/maki/attach/demo.toml
+cat /etc/maki/attach/demo.toml
 maki-attach attach --volume demo --plan
 ```
 
@@ -154,7 +125,7 @@ The plan lists every command the helper would run. Nothing has executed yet.
 systemctl start maki-workload@demo.target
 systemctl is-active maki@demo.service maki-attach@demo.service
 findmnt /srv/demo
-cat /srv/demo/.maki-sentinel                 # equals $volume_uuid
+cat /srv/demo/.maki-sentinel                 # equals volume_uuid in the attach configuration
 sed -i 's/^init_sentinel = true/init_sentinel = false/' /etc/maki/attach/demo.toml
 
 echo "hello from maki $(date -u +%FT%TZ)" > /srv/demo/hello.txt

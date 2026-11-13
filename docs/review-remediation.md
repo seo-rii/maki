@@ -1967,3 +1967,105 @@ a different safe prefix, escaped safe devices, one-pass decoding, malformed
 headers/rows/escapes, and numeric type boundaries. Ten assertions failed before
 the fix while three controls passed. The tests use synthetic inventories and
 classifiers and do not change host swap, device nodes, or security policy.
+
+## gRPC proxy error pages (BUG-175, 2026-10-30)
+
+A gRPC endpoint behind an HTTP/2 proxy (nginx `grpc_pass`, an ingress)
+answers an upstream restart with an HTTP error page: `:status 502`,
+`content-type: text/html`, an HTML body and no `grpc-status`. The receive
+framing wrapper of BUG-057/121 framed that body, read `<` as a compression
+flag and reported a receive contract violation. `Contract` is `ProviderFatal`
+class, so a transient outage failed every request at once under the `stall`
+policy and refused attach as proven misconfiguration instead of quarantining
+the endpoint; an auth proxy's 401/403 page did not open the breaker either.
+Tonic itself maps the HTTP status only when such a body ends without framing.
+HTTP and WebSocket already classified 5xx by status.
+
+A non-200 response without `grpc-status` now maps through gRPC's
+HTTP-to-status table before its body is read: 429/502/503/504 `Unavailable`
+(Retryable), 401 `Unauthenticated` and 403 `PermissionDenied`
+(EndpointFatal), 404 `Unimplemented` (EndpointFatal), 400 `Internal`, others
+`Unknown`. A trailers-only error with its own `grpc-status` keeps that status,
+and an HTTP 200 response whose body is not gRPC framing remains a contract
+violation (R5-005).
+
+`maki-crypto-grpc/tests/review_http_status_mapping.rs` serves HTML error pages
+and empty error responses for seven statuses from a raw HTTP/2 server. Before
+the fix the first HTML page (502) was `Contract`; the empty-body cases and the
+HTTP 200 control passed. The tests use loopback sockets only.
+
+## Remote witness transient state reads (BUG-176, 2026-10-30)
+
+The local remote-witness authority (`StateStore`) re-reads its published
+state before every request. Any failure of that read poisoned the open
+handle for good, including errors that prove nothing about the file: EMFILE
+from a flood of unauthenticated connections pending TLS, ENOMEM, a transient
+EIO. Nothing had been written and the in-memory state was still the durably
+published one, yet every later request answered "reopen required" until the
+witness was restarted, so every volume using it refused reads, writes and
+FLUSHes long after the cause was gone.
+
+Only proof of an external change poisons now: bytes that differ from the
+published state, or a missing, short or undecodable file (`NotFound`,
+`UnexpectedEof`, `InvalidData`). Other read failures refuse only their
+request; the next request reads and compares again. A failed publication
+still poisons, as before. `maki-witness serve` also raises its open-file soft
+limit toward the hard limit, as BUG-124 did for the daemon and CLIs.
+
+`maki-backing/tests/remote_witness.rs` injects a failure into opening and into
+reading the state file; before the fix the following inspect answered "reopen
+required". A removed-then-restored state file stays poisoned, alongside the
+existing corrupt-file and publication-failure tests. The tests use private
+temporary directories.
+
+## Readiness review follow-up (2026-11-13)
+
+This change integrates the existing gRPC HTTP-status fix (PR #125) and remote
+StateStore read-error fix (PR #126), then closes the corresponding local
+witness recovery gap. A failed local freshness read now rejects that operation
+without poisoning either FileWitness or its parent RollbackBacking. Missing,
+truncated, corrupt or mismatched anchors and uncertain publications still stop
+the session. A real, isolated EMFILE regression restores descriptors and uses
+the existing handles to read, write and sync, then reopens to verify durability.
+
+The first-volume guide now owns one fail-closed bootstrap script, linked from
+Quickstart. It rejects occupied NBD/VG/LV names, checks size and unique backend
+identity, verifies the live device-mapper UUID and backing device immediately
+before formatting, and invokes mkfs.xfs without force. Mocked execution of the
+actual documentation block checks failures without formatting real storage.
+
+SlotStore now remembers reservations whose allocation and sync_all succeeded
+in the current open session. TRIM punching invalidates the affected ranges
+before the operation, including partial failures; reopening starts with no
+reservation knowledge. The 256-unit, 4 KiB counting regression observes 256
+allocation/sync calls initially and zero additional calls for overwrites after
+checkpoint. It verifies flushed data after simulated power loss and ENOSPC.
+The cost is one extra in-memory bit per loaded shard slot, with no disk-format
+change. New-slot reservation batching and device throughput measurement remain
+follow-up work; these counts do not establish an MB/s improvement.
+
+Both affected lockfiles use rustix 1.1.6 for RUSTSEC-2026-0486. CI audits all
+root/vendor lockfiles in an independent job, retaining --deny warnings, so an
+advisory cannot prevent the baseline job's tests from running. Required-check
+selection remains a repository branch-protection setting. The release guides
+pin the Rust 1.94.0 baseline, identify the missing nbd-client build provenance,
+and require installation/upgrade/restore evidence from the exact candidate
+artifacts. README now states the remote provider's plaintext and cryptographic
+trust boundary. These changes do not qualify or publish a production release.
+
+The gRPC regression also drives a real loopback HTTP/2 peer through an outage
+and recovery using EndpointSet's stall policy: encryption and decryption stay
+pending through 502 HTML pages and complete after valid gRPC responses return.
+It models an intermediary's wire behavior; it is not a deployed nginx, kernel
+NBD, filesystem or database qualification run.
+
+Validation also exposed a native-test fixture assumption when the latest-stable
+CI job advanced to Rust/Cargo 1.100. Cargo now places the test executable and
+cdylib in separate unit directories, and does not include cdylibs in its dynamic
+Rust-library search path. The workspace test runner captures the exact nbdkit
+plugin filename from Cargo's compiler-artifact JSON for the same no-run test
+build, then supplies it to the test invocation. The fixture refuses a missing
+or malformed explicit path; older adjacent `deps` layouts remain supported.
+The production plugin is unchanged. The tungstenite lockfile's recorded hash in
+`vendor/patches.json` is updated along with the security dependency resolution
+and checked by the actual vendor source inventory gate.

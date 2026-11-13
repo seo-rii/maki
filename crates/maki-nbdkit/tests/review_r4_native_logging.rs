@@ -8,6 +8,10 @@
 //! `SlotStore::open` emit a `tracing::warn!` during recovery, before READY.
 #![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_plugin.rs"]
+mod native_plugin;
+
 use std::io;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
@@ -75,12 +79,7 @@ struct Server {
 
 impl Server {
     fn start(fixture: &Fixture, notify: &Path, env: &[(&str, &str)]) -> Self {
-        let plugin = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("libmaki_nbdkit.so");
-        assert!(plugin.is_file(), "missing cargo-built native plugin");
+        let plugin = native_plugin::path();
         let stderr = tempfile::NamedTempFile::new_in(fixture.dir.path()).unwrap();
         let stdout = tempfile::NamedTempFile::new_in(fixture.dir.path()).unwrap();
         let mut command = Command::new("nbdkit");

@@ -6,140 +6,187 @@ device, so the first attachment needs a one-time bootstrap that creates the
 physical volume, volume group, logical volume and filesystem, then records
 their identities in the root-owned attach configuration.
 
-This page is that bootstrap. It is the manual procedure the qualification
-runbook (`scripts/privileged-linux-validation.sh`) performs; a dedicated
-`maki-attach provision` command does not exist yet. The
-[quick start](quickstart.md) embeds these steps in a complete first run.
+This page is that bootstrap. A dedicated `maki-attach provision` command does
+not exist yet. The [quick start](quickstart.md) uses this same procedure.
 
-Prerequisites: the package is [installed](installation-debian.md), the
-volume configuration exists at `/etc/maki/volumes/<volume>.toml`, its
-credential is in place, and `maki volume create` has already run. Nothing
-below touches an existing attachment; pick a volume name that is not in use.
+Prerequisites: the package is [installed](installation-debian.md), the volume
+configuration exists at `/etc/maki/volumes/demo.toml`, its credential is in
+place, and `maki volume create` has already run. This example exports 8 GiB
+with 4096-byte blocks and creates a 6 GiB LV. Edit the variables together if
+your configuration differs. The socket must be the one in that volume's
+configuration.
 
-Replace `demo` with your volume name throughout. Run as root.
+Use a disposable host as root. The NBD device, VG name, attach configuration
+and mountpoint must be unused. Do not run other provisioning, LVM or NBD
+commands concurrently. The script takes the helper's attach lock, but that
+lock cannot coordinate unrelated administrator commands.
 
-## 1. Start the data plane alone
+## 1. Provision and record the layout
 
-The bootstrap needs the export online without the attach helper, so start the
-daemon unit directly (start, do not enable):
+Run this entire block as one Bash invocation. A failed command, unexpected
+size or identity stops it before the next mutation. It does not automatically
+clean up after an error: preserve the partially created layout and inspect
+it before doing anything else. Do not continue at an arbitrary later line.
 
-```bash
-systemctl start maki@demo.service
-systemctl is-active maki@demo.service      # active: recovery, key check and control socket are done
-maki status /etc/maki/volumes/demo.toml    # state: ready
-```
-
-The first start also binds the configured key to the volume through the key
-canary. Make sure this is the intended production key: a wrong key on an
-empty volume means deleting and recreating the volume, not re-binding it
-([key binding](../operations.md#key-binding-at-first-attach)).
-
-## 2. Connect a disposable NBD device
-
-Choose a free device. The helper later allocates the lowest free one itself,
-so any free device works here.
+The first daemon start binds the configured key through the key canary. Make
+sure it is the intended key: an empty volume bound to the wrong key must be
+recreated ([key binding](../operations.md#key-binding-at-first-attach)).
 
 ```bash
+bash <<'BASH'
+set -euo pipefail
+umask 077
+volume=demo
 dev=/dev/nbd0
-[ "$(blockdev --getsize64 $dev)" = 0 ] || echo "$dev is in use; pick another"
-nbd-client -unix /run/maki/demo/nbd.sock ${dev#/dev/} -b 4096
-blockdev --getsize64 $dev        # equals volume.max_virtual_size
-```
-
-`-b 4096` must match `device_block_size` in both the volume and the attach
-configuration. `nbd-client` 3.27 connects over netlink and takes the kernel
-device name (`nbd0`); it refuses `/dev/nbd0` with "Invalid nbd device target".
-Block tools such as `blockdev` and `pvcreate` keep the `/dev` path.
-
-## 3. Create PV, VG, LV and XFS
-
-Use the VG and LV names the attach configuration will use. The packaged
-defaults are `vg_maki_<volume>` and `data`.
-
-```bash
+expected_bytes=8589934592
+block_size=4096
 vg=vg_maki_demo
 lv=data
-pvcreate --yes $dev
-vgcreate $vg $dev
-lvcreate --yes -L 6G -n $lv $vg          # leave VG free space if you plan to `maki-attach grow`
-mkfs.xfs -f /dev/$vg/$lv
-```
+lv_size=6G
+mountpoint=/srv/demo
+config=/etc/maki/volumes/demo.toml
+socket=/run/maki/demo/nbd.sock
+attach_config=/etc/maki/attach/demo.toml
+nbd=${dev#/dev/}
+lv_path=/dev/$vg/$lv
 
-Size the LV below the exported device size. `maki-attach grow` later extends
-the LV within the VG and grows XFS; the exported size itself is fixed at
-`maki volume create`.
+die() { echo "$*" >&2; exit 1; }
+trap 'echo "Bootstrap stopped at line $LINENO; preserve the layout and inspect it before retrying." >&2' ERR
 
-Do not mount the filesystem here. The helper mounts it and writes the
-`.maki-sentinel` file on the first attach.
+[[ $nbd =~ ^nbd[0-9]+$ ]] || die "Expected a kernel NBD device name"
+[[ -b "$dev" ]] || die "NBD device is missing"
+[[ ! -e "$attach_config" && ! -L "$attach_config" ]] || die "Attach configuration already exists"
+[[ ! -e "$lv_path" && ! -L "$lv_path" ]] || die "LV path already exists"
+[[ ! -e "$mountpoint" ]] || die "Use a new mountpoint"
+# Coordinate with maki-attach; the packaged runtime directory is root-only.
+[[ ! -L /run/maki-attach/attach.lock ]] || die "Unexpected lock symlink"
+exec 9>>/run/maki-attach/attach.lock
+flock -n 9
 
-## 4. Record the identities
+existing_vgs=$(vgs --readonly --noheadings -o vg_name | awk '{$1=$1};1')
+while IFS= read -r name; do
+    [[ $name != "$vg" ]] || die "VG already exists: $vg"
+done <<< "$existing_vgs"
+# Query failure must also stop: absence is not inferred from a failed command.
+existing_lvs=$(lvs --readonly --noheadings -o vg_name,lv_name | awk '{print $1 "/" $2}')
+while IFS= read -r name; do
+    [[ $name != "$vg/$lv" ]] || die "LV already exists: $vg/$lv"
+done <<< "$existing_lvs"
+size=$(blockdev --getsize64 "$dev")
+[[ $size == 0 && ! -e /sys/block/$nbd/pid ]] || die "$dev is in use"
+if [[ -e /sys/block/$nbd/backend ]]; then
+    previous_backend=$(cat "/sys/block/$nbd/backend")
+    [[ -z $previous_backend ]] || die "$dev already has a backend"
+fi
+layout=$(lsblk -anr -o TYPE "$dev")
+[[ $layout == disk ]] || die "$dev has partitions or holders"
+mounts=$(lsblk -anr -o MOUNTPOINTS "$dev")
+[[ -z $mounts ]] || die "$dev is mounted"
 
-The production profile pins the filesystem UUID and the complete LVM
-identity. Collect them while the layout is still active:
+volume_uuid=$(maki volume inspect "$config" | awk '/^uuid:/ {print $2}')
+[[ $volume_uuid =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || die "Invalid volume UUID"
+maki check "$config"
+connection_id="maki-bootstrap-$(cat /proc/sys/kernel/random/uuid)"
+systemctl start "maki@$volume.service"
+systemctl is-active "maki@$volume.service"
+# A background nbd-client must not inherit the helper's lock descriptor.
+nbd-client -unix "$socket" "$nbd" -b "$block_size" -identifier "$connection_id" 9>&-
 
-```bash
-pv_uuid=$(pvs --readonly --noheadings -o pv_uuid $dev | tr -d ' ')
-vg_uuid=$(vgs --readonly --noheadings -o vg_uuid $vg | tr -d ' ')
-lv_uuid=$(lvs --readonly --noheadings -o lv_uuid $vg/$lv | tr -d ' ')
-fs_uuid=$(blkid --probe --cache-file /dev/null --match-tag UUID --output value /dev/$vg/$lv)
-volume_uuid=$(maki volume inspect /etc/maki/volumes/demo.toml | awk '/^uuid:/ {print $2}')
-printf 'volume %s\nfs %s\npv %s\nvg %s\nlv %s\n' "$volume_uuid" "$fs_uuid" "$pv_uuid" "$vg_uuid" "$lv_uuid"
-```
+verify_backend() {
+    local backend bytes
+    backend=$(cat "/sys/block/$nbd/backend")
+    [[ $backend == "$connection_id" ]] || die "NBD backend identity changed"
+    bytes=$(blockdev --getsize64 "$dev")
+    [[ $bytes == "$expected_bytes" ]] || die "Unexpected device size"
+}
+verify_backend
+# Refuse existing signatures; neither PV nor filesystem creation uses force.
+signatures=$(wipefs --no-act --noheadings --output TYPE "$dev")
+[[ -z $signatures ]] || die "Export already has signatures"
+pvcreate --devices "$dev" "$dev"
+verify_backend
+vgcreate --devices "$dev" "$vg" "$dev"
+verify_backend
+lvcreate --devices "$dev" --type linear -L "$lv_size" -n "$lv" "$vg"
 
-LVM UUIDs have the form `xxxxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxxxx`; the
-filesystem and volume UUIDs are RFC 4122 UUIDs. If any value looks different,
-stop and investigate before writing the configuration.
+pv_uuid=$(pvs --readonly --devices "$dev" --noheadings -o pv_uuid "$dev" | tr -d '[:space:]')
+vg_uuid=$(vgs --readonly --devices "$dev" --noheadings -o vg_uuid "$vg" | tr -d '[:space:]')
+lv_uuid=$(lvs --readonly --devices "$dev" --noheadings -o lv_uuid "$vg/$lv" | tr -d '[:space:]')
+for identity in "$pv_uuid" "$vg_uuid" "$lv_uuid"; do
+    [[ $identity =~ ^[[:alnum:]]{6}(-[[:alnum:]]{4}){5}-[[:alnum:]]{6}$ ]] || die "Invalid LVM UUID"
+done
+lv_device=$(readlink -e "$lv_path")
+[[ -b "$lv_device" && ${lv_device##*/} == dm-* ]] || die "LV is not a device-mapper device"
+dm=${lv_device##*/}
+# Recheck the backend and the live mapping immediately before formatting.
+verify_backend
+dm_uuid=$(cat "/sys/class/block/$dm/dm/uuid")
+[[ $dm_uuid == "LVM-${vg_uuid//-/}${lv_uuid//-/}" ]] || die "LV device identity mismatch"
+slaves=$(ls -A "/sys/class/block/$dm/slaves")
+[[ $slaves == "$nbd" ]] || die "LV does not map solely to the selected NBD device"
+current_lv_device=$(readlink -e "$lv_path")
+[[ $current_lv_device == "$lv_device" ]] || die "LV path changed"
+mkfs.xfs "$lv_device"
+fs_uuid=$(blkid --probe --cache-file /dev/null --match-tag UUID --output value "$lv_device")
+[[ $fs_uuid =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || die "Invalid filesystem UUID"
 
-## 5. Release the bootstrap layout
-
-The helper must find the device unused:
-
-```bash
-vgchange -an $vg
-nbd-client -d ${dev#/dev/}
-systemctl stop maki@demo.service
-```
-
-Stopping the daemon here is optional but keeps the next step identical to a
-normal boot: the lifecycle target starts it again.
-
-## 6. Write the attach configuration
-
-`/etc/maki/attach/demo.toml`, owner root, mode `0600`
-(template: [`packaging/examples/attach.toml`](../../packaging/examples/attach.toml)):
-
-```toml
-volume_uuid = "<volume_uuid>"
-device_block_size = 4096
-
-# Defaults shown; change them only if step 3 used other names.
-vg_name = "vg_maki_demo"
-lv_name = "data"
-mountpoint = "/srv/demo"
-
-fs_uuid = "<fs_uuid>"
-
-# First attach only: create <mountpoint>/.maki-sentinel on the empty filesystem.
+verify_backend
+vgchange --devices "$dev" -an "$vg"
+verify_backend
+nbd-client -d "$nbd"
+systemctl stop "maki@$volume.service"
+install -d -m 0700 -o root -g root /etc/maki/attach "$mountpoint"
+# noclobber prevents replacing a configuration created during this procedure.
+set -C
+cat > "$attach_config" <<EOF
+volume_uuid = "$volume_uuid"
+device_block_size = $block_size
+vg_name = "$vg"
+lv_name = "$lv"
+mountpoint = "$mountpoint"
+fs_uuid = "$fs_uuid"
 init_sentinel = true
 
 [lvm_identity]
-pv_uuids = ["<pv_uuid>"]
-vg_uuid = "<vg_uuid>"
-lv_uuid = "<lv_uuid>"
+pv_uuids = ["$pv_uuid"]
+vg_uuid = "$vg_uuid"
+lv_uuid = "$lv_uuid"
+EOF
+chmod 0600 "$attach_config"
+printf 'Created %s; review it before starting the lifecycle.\n' "$attach_config"
+BASH
 ```
+
+`nbd-client` 3.27+ takes the kernel name (`nbd0`) with netlink, while block
+and LVM tools take `/dev/nbd0`. Its unique `-identifier` must appear unchanged
+in the kernel's `backend` attribute. A missing or unreadable attribute is a
+failure. LVM queries and mutations after connection are restricted to that
+one device. Before formatting, the device-mapper UUID must contain the newly
+observed VG and LV UUIDs and its only backing device must be that NBD device.
+These checks assume a trusted root administrator; they cannot prevent another
+root process from replacing a mapping between a check and a command.
+
+The LV is deliberately smaller than the exported device. `maki-attach grow`
+later expands the LV within its VG and grows XFS; the export size is fixed at
+`maki volume create`. Do not mount the new filesystem during bootstrap. The
+helper mounts it and creates `.maki-sentinel` on the first attach.
+
+## 2. Review the attach configuration
+
+The script writes `/etc/maki/attach/demo.toml` as root with mode `0600`,
+including the filesystem UUID and complete LVM identity. Compare it with the
+[attach template](../../packaging/examples/attach.toml), then inspect the plan:
 
 ```bash
-install -d -m 0700 -o root -g root /etc/maki/attach
-install -m 0600 -o root -g root demo-attach.toml /etc/maki/attach/demo.toml
-install -d /srv/demo
-maki-attach attach --volume demo --plan     # review the plan; nothing is executed
+cat /etc/maki/attach/demo.toml
+maki-attach attach --volume demo --plan
 ```
 
-Omitting `fs_uuid` or `[lvm_identity]` is accepted for compatibility but is
-outside the production profile: without them the helper cannot authenticate
-the discovered layout against what you created.
+The plan is read-only. A failed bootstrap does not authorize continuing here.
+Omitting identity pins is outside the production profile: the helper needs
+them to authenticate the layout it discovers.
 
-## 7. First attach and sentinel
+## 3. First attach and sentinel
 
 ```bash
 systemctl start maki-workload@demo.target
@@ -161,13 +208,19 @@ with the [quick start](quickstart.md) for a restart round trip.
 
 ## Recovering from a failed bootstrap
 
-- `pvcreate` refuses a device with existing signatures: the device is not
-  empty. Check that `$dev` is the NBD device you connected and that the
-  volume is new, then use `wipefs -a $dev` only on a device you own.
-- The attach plan fails validation: a UUID was copied with whitespace or from
-  the wrong device. Re-run step 4.
-- Attach reports an LVM identity mismatch: the pins do not match what LVM
-  reports on the connected device. Never "fix" this by removing the pins;
-  re-derive them with the layout activated and confirm the device.
-- The helper refuses because the device already has a holder or partitions:
-  release the bootstrap layout (step 5) and retry.
+- Do not re-run just `mkfs.xfs`, add `-f`, or erase signatures to get past a
+  failed check. Inspect the NBD backend, LVM identities and any partial layout
+  first. The script intentionally leaves resources in place on failure.
+- A VG/LV name or attach configuration already exists: choose unused names
+  for a new volume, or use the existing volume's verified attach procedure.
+- The export contains signatures: it may already contain data. Confirm the
+  configuration, socket and volume UUID before considering a separate,
+  explicitly destructive reset.
+- The attach plan fails validation: inspect the root-owned configuration and
+  compare its UUIDs with the intended layout. Never remove pins to bypass a
+  mismatch.
+- The helper reports a holder or partitions after an interrupted bootstrap:
+  identify the layout first, then deactivate only the VG you created and
+  disconnect only an NBD backend that still has this run's connection identity.
+  The error path does not automatically stop a service or disconnect a device
+  whose ownership may have changed.

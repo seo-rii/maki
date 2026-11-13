@@ -2,6 +2,10 @@
 //! engine state, and exercise the actual sizing callback through nbdkit.
 //! R5-038: a request above the advertised maximum is split, not refused.
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_plugin.rs"]
+mod native_plugin;
+
 use maki_format::config::{parse_config, ByteSize};
 use maki_nbdkit::adapter::{NbdAdapter, EINVAL};
 
@@ -195,12 +199,7 @@ fn real_nbdkit_negotiates_configured_block_sizes() {
         }
     }
     let fixture = Fixture::new();
-    let plugin = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("libmaki_nbdkit.so");
-    assert!(plugin.is_file(), "missing cargo-built plugin: {plugin:?}");
+    let plugin = native_plugin::path();
     let output = Command::new("nbdkit")
         .args(["--foreground", "--exit-with-parent", "-U", "-"])
         .arg(plugin)
@@ -236,12 +235,7 @@ fn real_nbdkit_serves_requests_above_the_advertised_maximum() {
         }
     }
     let fixture = Fixture::new();
-    let plugin = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("libmaki_nbdkit.so");
-    assert!(plugin.is_file(), "missing cargo-built plugin: {plugin:?}");
+    let plugin = native_plugin::path();
     let script = r#"
 import ctypes as c, sys, time
 lib = c.CDLL('libnbd.so.0')

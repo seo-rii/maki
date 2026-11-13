@@ -103,13 +103,19 @@ apt-mark hold nbd-client
 ## Build the Maki package
 
 No prebuilt packages are published yet. Build the release binaries and the
-package on a build host with the current stable Rust toolchain (CI uses
-stable), then copy the `.deb` to the target:
+package on a native Debian 12 build host with Rust **1.94.0**, the pinned CI
+baseline (a separate job also checks latest stable), then copy the `.deb` to
+the target. For a candidate bundle that also records the exact committed
+source, tool versions and checksums, follow [release preparation](../releasing.md).
 
 ```bash
+set -euo pipefail
 git clone https://github.com/seo-rii/maki.git && cd maki
-apt install -y python3 dpkg-dev
-cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
+# Select and record the immutable revision being qualified before building.
+git rev-parse HEAD
+rustup toolchain install 1.94.0 --profile minimal
+apt install -y python3 dpkg-dev build-essential
+cargo +1.94.0 build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
   --release-dir target/release \

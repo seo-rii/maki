@@ -10,6 +10,10 @@
 //! follow-up campaign. The plugin now zeroes natively, in chunks, and
 //! discards whole units when the client allows it on a discard volume.
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_plugin.rs"]
+mod native_plugin;
+
 use maki_nbdkit::adapter::NbdAdapter;
 
 const UNIT: usize = 4096;
@@ -168,12 +172,7 @@ fn native_nbd_zero_longer_than_the_maximum_block_size() {
             return;
         }
     }
-    let plugin = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("libmaki_nbdkit.so");
-    assert!(plugin.is_file(), "missing cargo-built plugin: {plugin:?}");
+    let plugin = native_plugin::path();
     let script = r#"
 import ctypes as c, sys
 lib = c.CDLL('libnbd.so.0')

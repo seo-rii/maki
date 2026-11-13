@@ -28,8 +28,10 @@ use local AES-256-GCM-SIV or a remote HTTP, WebSocket or gRPC crypto service.
 - Privilege separation: the data plane runs without root; NBD, LVM and mount
   operations run in a separate helper that has no crypto code and pins the
   storage identity it manages.
-- Providers are untrusted: contracts are probed at attach and every response
-  is validated.
+- Provider contracts are probed at attach and every response is validated for
+  shape, size and ordering. Remote providers receive plaintext and must be
+  trusted for confidentiality and correct cryptographic behavior; these checks
+  do not establish that a provider encrypts securely.
 
 ## Status
 
@@ -104,7 +106,7 @@ the privileged helper are Linux-only.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+python3 -B scripts/run_cargo_tests.py --workspace --locked
 cargo test --workspace --release --locked -- --ignored   # release gates
 ```
 

@@ -388,6 +388,10 @@ fn independent_service_processes_cannot_share_one_authority_lock() {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Fault {
+    /// Opening the published state for reading fails (EMFILE, ENOMEM).
+    StateOpen,
+    /// Reading the published state fails (a transient EIO).
+    StateRead,
     TempWrite,
     TempSync,
     Rename,
@@ -401,6 +405,7 @@ struct FaultFile {
     inner: Arc<dyn BackingFile>,
     fault: Arc<Mutex<Option<Fault>>>,
     temporary: bool,
+    state: bool,
 }
 fn fail(fault: &Mutex<Option<Fault>>, point: Fault) -> io::Result<()> {
     let mut slot = fault.lock().unwrap();
@@ -413,6 +418,9 @@ fn fail(fault: &Mutex<Option<Fault>>, point: Fault) -> io::Result<()> {
 }
 impl BackingFile for FaultFile {
     fn read_at(&self, o: u64, b: &mut [u8]) -> io::Result<()> {
+        if self.state {
+            fail(&self.fault, Fault::StateRead)?;
+        }
         self.inner.read_at(o, b)
     }
     fn write_at(&self, o: u64, b: &[u8]) -> io::Result<()> {
@@ -436,10 +444,14 @@ impl BackingFile for FaultFile {
 }
 impl Backing for FaultBacking {
     fn open(&self, p: &str, c: bool) -> io::Result<Arc<dyn BackingFile>> {
+        if p == "remote.state" && !c {
+            fail(&self.fault, Fault::StateOpen)?;
+        }
         Ok(Arc::new(FaultFile {
             inner: self.inner.open(p, c)?,
             fault: self.fault.clone(),
             temporary: p == "remote.next",
+            state: p == "remote.state",
         }))
     }
     fn exists(&self, p: &str) -> io::Result<bool> {
@@ -673,4 +685,57 @@ fn deterministic_sequence_preserves_monotone_fences_generations_and_stale_reject
             assert_eq!(inspect(&mut store), current);
         }
     }
+}
+
+/// A read of the published state that fails without proving the file
+/// changed (EMFILE from a connection flood, a transient EIO) poisoned the
+/// open authority for good: every later request answered "reopen required"
+/// until the witness was restarted, so every volume using it refused all I/O
+/// long after the cause was gone. Nothing was written and the in-memory state
+/// is still the durably published one, and every request re-reads and
+/// compares, so only that request fails. Proof of an external change
+/// (different or undecodable bytes) still poisons permanently.
+#[test]
+fn a_transient_state_read_failure_refuses_only_that_request() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for point in [Fault::StateOpen, Fault::StateRead] {
+        let dir = tempdir().unwrap();
+        drop(StateStore::create(dir.path(), ID).unwrap());
+        let backing = Arc::new(FaultBacking {
+            inner: FileBacking::new(dir.path()).unwrap(),
+            fault: Arc::new(Mutex::new(None)),
+        });
+        let mut store = StateStore::open_backing(backing.clone()).unwrap();
+        let before = inspect(&mut store);
+        *backing.fault.lock().unwrap() = Some(point);
+        assert!(
+            store
+                .handle(Role::Writer, &op(1, &before, Action::Claim))
+                .is_err(),
+            "{point:?}: the failed read must refuse its request"
+        );
+        assert_eq!(inspect(&mut store), before, "{point:?}");
+        assert_eq!(claim(&mut store, 2).fence, 1, "{point:?}");
+    }
+}
+
+/// A published state that disappears while the authority holds its lock is
+/// proof of an external change: the handle stays poisoned even after the
+/// exact bytes come back.
+#[test]
+fn a_state_file_removed_while_locked_poisons_permanently() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().unwrap();
+    let mut store = StateStore::create(dir.path(), ID).unwrap();
+    let before = inspect(&mut store);
+    let path = dir.path().join("remote.state");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(store
+        .handle(Role::Writer, &op(1, &before, Action::Claim))
+        .is_err());
+    std::fs::write(&path, bytes).unwrap();
+    assert!(store
+        .handle(Role::Writer, &op(1, &before, Action::Claim))
+        .is_err());
 }

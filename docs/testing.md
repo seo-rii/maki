@@ -19,9 +19,18 @@ that summary, and the dated reports it cites live under
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+python3 -B scripts/run_cargo_tests.py --workspace --locked
 cargo test --workspace --release --locked -- --ignored
 ```
+
+On Linux, `run_cargo_tests.py` first compiles the same selection with
+`--no-run --message-format=json` and passes the exact reported nbdkit cdylib
+path into the test run. Cargo 1.100 puts integration tests and libraries in
+separate unit directories, so native fixtures cannot infer the plugin path
+from the test executable or loader search path. The wrapper uses the same
+Cargo options, features and profile for both phases; it does not search old
+build outputs. On other platforms it invokes Cargo directly. Use `CARGO` to
+select a Cargo executable, or `RUSTUP_TOOLCHAIN=1.94.0` for the baseline.
 
 The ignored release-mode suite is substantially more expensive than the default
 workspace suite. It uses simulated backing stores and does not perform real

@@ -119,7 +119,7 @@
     },
     "tungstenite": {
       "files": {
-        "Cargo.lock": "582342e15cdfe54f5dcdfbf4c315010cb3b042a5a4bdc63df7cd2b79736b85d5",
+        "Cargo.lock": "5891ea51070592aaa65557ffa51f01f5f4a1ac0d10844e7bb045f33f3ed51c1a",
         "Cargo.toml": "dbf154a766d01bfc2f27054c6e6ed922d4a8368ad9cb2636f47cddac56c6d4c6",
         "src/buffer.rs": "67102a9adde8421ce61e12da72d87ce4d920cf3de4ba4c8d7bb45d5e6eae506f",
         "src/handshake/client.rs": "909326c12e65ca520c31a8291f643b4b1e1213046b8d3784212abe26ed4b57af",

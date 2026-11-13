@@ -14,6 +14,27 @@ on:
     - cron: "0 3 * * *" # nightly gates
 
 jobs:
+  dependency-audit:
+    # Keep the security gate independent so an advisory cannot hide test results.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dependency-audit
+      - name: install pinned RustSec auditor (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: RustSec dependency audit (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lockfile in Cargo.lock vendor/*/Cargo.lock; do
+            cargo audit --deny warnings --file "$lockfile"
+          done
+
   pr:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -26,17 +47,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: install pinned RustSec auditor (Linux)
-        if: runner.os == 'Linux'
-        run: cargo install cargo-audit --version 0.22.1 --locked
-      - name: RustSec dependency audit (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          for lockfile in Cargo.lock vendor/*/Cargo.lock; do
-            cargo audit --deny warnings --file "$lockfile"
-          done
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -54,8 +64,11 @@ jobs:
       # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
       # smoke — all part of the default workspace suite. `--locked` keeps
       # the build reproducible against Cargo.lock (third review).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: workspace tests
-        run: cargo test --workspace --locked
+        run: python scripts/run_cargo_tests.py --workspace --locked
       # A separate package invocation avoids workspace dev dependencies
       # supplying tonic's TLS backend and hiding missing production features.
       - name: standalone gRPC TLS provider selection (Linux)
@@ -135,8 +148,11 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: workspace tests
-        run: cargo test --workspace --locked
+        run: python scripts/run_cargo_tests.py --workspace --locked
 
   nightly-gates:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))

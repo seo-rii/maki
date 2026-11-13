@@ -1,5 +1,9 @@
 //! New-volume discard qualification across the adapter and native NBD boundary.
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_plugin.rs"]
+mod native_plugin;
+
 use maki_nbdkit::adapter::{NbdAdapter, EINVAL, ESHUTDOWN};
 
 fn config(root: &std::path::Path, socket: &std::path::Path) -> String {
@@ -188,12 +192,7 @@ fn native_nbd_negotiates_and_executes_trim() {
         }
     }
     let fixture = Fixture::new(true);
-    let plugin = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("libmaki_nbdkit.so");
-    assert!(plugin.is_file(), "missing cargo-built plugin: {plugin:?}");
+    let plugin = native_plugin::path();
     let script = r#"
 import ctypes as c, sys
 lib = c.CDLL('libnbd.so.0')
