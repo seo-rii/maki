@@ -117,7 +117,9 @@ fn linux_pr_installs_native_test_tools_before_running_workspace_tests() {
     let install = pr
         .find("sudo apt-get install")
         .expect("Linux PR needs native tools");
-    let tests = pr.find("run: cargo test --workspace").unwrap();
+    let tests = pr
+        .find("run: python scripts/run_cargo_tests.py --workspace --locked")
+        .expect("Linux PR must use the same-build native plugin test runner");
     assert!(install < tests);
     assert!(pr[..install].contains("if: runner.os == 'Linux'"));
     let setup = &pr[install..tests];

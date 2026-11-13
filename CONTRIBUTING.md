@@ -10,7 +10,7 @@ in-repository development guide with the traps that already bit us.
 cargo build --workspace --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+python3 -B scripts/run_cargo_tests.py --workspace --locked
 cargo test --workspace --release --locked -- --ignored   # extended release gates
 python3 -B -m unittest scripts.test_docs_links -v         # link checker regressions
 python3 -B scripts/check_docs_links.py                    # documentation links
@@ -20,7 +20,10 @@ CI uses Rust 1.94.0 as its reproducible baseline on Linux and Windows. A
 separate job checks the latest stable compiler on both platforms, with strict
 Clippy and the workspace tests. Matrix jobs do not cancel one another after a
 failure. Use `cargo +1.94.0` for the baseline and `cargo +stable` after updating
-the local stable toolchain for compatibility checks.
+the local stable toolchain for compatibility checks. The workspace test runner
+uses the active Cargo executable; set `RUSTUP_TOOLCHAIN=1.94.0` or `stable`
+when selecting its toolchain. On Linux it passes the exact compiler-reported
+nbdkit plugin artifact into native tests (see [testing](docs/testing.md)).
 
 Formatting and strict Clippy block CI. The release gates are expensive; run
 them after touching recovery, journal, overlay, store or checkpoint code (the
