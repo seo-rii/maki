@@ -128,10 +128,22 @@ impl FileWitness {
                 ))
             }
         });
-        if result.is_err() {
-            self.poisoned.set(true);
+        if let Err(error) = &result {
+            // A failed read does not establish that the published anchor
+            // changed. Refuse this operation and compare again next time.
+            // Missing, incomplete or invalid records do prove a change.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+            ) {
+                self.poisoned.set(true);
+            }
         }
         result
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.get()
     }
 
     pub fn advance(&mut self, root: [u8; 32]) -> io::Result<()> {
@@ -418,6 +430,92 @@ mod tests {
     }
 
     #[test]
+    fn transient_anchor_reads_refuse_only_the_current_operation() {
+        for fail_at in [FailAt::AnchorOpen, FailAt::AnchorLen, FailAt::AnchorRead] {
+            let dir = tempdir().unwrap();
+            drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+            let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+            let mut witness = FileWitness::open_backing(fault.clone()).unwrap();
+            let before = witness.anchor().clone();
+
+            fault.arm(fail_at);
+            assert!(witness.verify_current().is_err(), "{fail_at:?}");
+            assert!(!witness.is_poisoned(), "{fail_at:?}");
+            witness.verify_current().unwrap();
+            assert_eq!(witness.anchor(), &before);
+
+            fault.arm(fail_at);
+            assert!(witness.advance(ROOT_B).is_err(), "{fail_at:?}");
+            assert!(!witness.is_poisoned(), "{fail_at:?}");
+            assert_eq!(witness.anchor(), &before);
+            assert_eq!(FileWitness::anchor(&witness).generation, 0);
+            witness.advance(ROOT_B).unwrap();
+            assert_eq!(witness.anchor().generation, 1);
+            assert_eq!(witness.anchor().root, ROOT_B);
+        }
+    }
+
+    #[test]
+    fn a_transient_read_is_followed_by_a_fresh_comparison() {
+        let dir = tempdir().unwrap();
+        drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+        let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+        let witness = FileWitness::open_backing(fault.clone()).unwrap();
+        fault.arm(FailAt::AnchorRead);
+        assert!(witness.verify_current().is_err());
+        fs::write(
+            dir.path().join("anchor"),
+            super::encode(&Anchor {
+                identity: IDENTITY,
+                generation: 1,
+                root: ROOT_B,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            witness.verify_current().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(witness.is_poisoned());
+    }
+
+    #[test]
+    fn missing_truncated_corrupt_and_short_read_anchors_poison_permanently() {
+        for fault in 0..4 {
+            let dir = tempdir().unwrap();
+            drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+            let backing = Arc::new(FaultBacking::new(dir.path()).unwrap());
+            let witness = FileWitness::open_backing(backing.clone()).unwrap();
+            let path = dir.path().join("anchor");
+            let original = fs::read(&path).unwrap();
+            let expected = match fault {
+                0 => {
+                    fs::remove_file(&path).unwrap();
+                    io::ErrorKind::NotFound
+                }
+                1 => {
+                    fs::write(&path, &original[..ENCODED_LEN - 1]).unwrap();
+                    io::ErrorKind::InvalidData
+                }
+                2 => {
+                    let mut corrupt = original.clone();
+                    corrupt[40] ^= 1;
+                    fs::write(&path, corrupt).unwrap();
+                    io::ErrorKind::InvalidData
+                }
+                _ => {
+                    backing.arm(FailAt::AnchorShortRead);
+                    io::ErrorKind::UnexpectedEof
+                }
+            };
+            assert_eq!(witness.verify_current().unwrap_err().kind(), expected);
+            fs::write(&path, original).unwrap();
+            assert!(witness.is_poisoned());
+            assert!(witness.verify_current().is_err());
+        }
+    }
+
+    #[test]
     fn advance_faults_poison_and_reopen_resolves_an_exact_record() {
         for fail_at in [
             FailAt::TempWrite,
@@ -550,6 +648,10 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FailAt {
+        AnchorOpen,
+        AnchorLen,
+        AnchorRead,
+        AnchorShortRead,
         TempWrite,
         TempSync,
         Rename,
@@ -595,10 +697,25 @@ mod tests {
         pending: Arc<Mutex<Option<FailAt>>>,
         trace: Arc<Mutex<Vec<&'static str>>>,
         temporary: bool,
+        anchor: bool,
     }
 
     impl BackingFile for FaultFile {
         fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            if self.anchor {
+                let mut pending = self.pending.lock().unwrap();
+                match *pending {
+                    Some(FailAt::AnchorRead) => {
+                        *pending = None;
+                        return Err(io::Error::other("injected anchor read failure"));
+                    }
+                    Some(FailAt::AnchorShortRead) => {
+                        *pending = None;
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                    }
+                    _ => {}
+                }
+            }
             self.inner.read_at(offset, buffer)
         }
 
@@ -627,6 +744,13 @@ mod tests {
         }
 
         fn len(&self) -> io::Result<u64> {
+            if self.anchor {
+                let mut pending = self.pending.lock().unwrap();
+                if *pending == Some(FailAt::AnchorLen) {
+                    *pending = None;
+                    return Err(io::Error::other("injected anchor stat failure"));
+                }
+            }
             self.inner.len()
         }
 
@@ -645,11 +769,15 @@ mod tests {
 
     impl Backing for FaultBacking {
         fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
+            if path == super::ANCHOR_FILE {
+                self.fail(FailAt::AnchorOpen)?;
+            }
             Ok(Arc::new(FaultFile {
                 inner: self.inner.open(path, create)?,
                 pending: Arc::clone(&self.pending),
                 trace: Arc::clone(&self.trace),
                 temporary: path == super::TEMP_FILE,
+                anchor: path == super::ANCHOR_FILE,
             }))
         }
 

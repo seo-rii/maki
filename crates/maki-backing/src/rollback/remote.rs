@@ -36,7 +36,9 @@ impl Witness {
         }
     }
     /// Whether a failed freshness check stops the session. A local witness
-    /// stops on any failure. A remote Inspect changes nothing, so a witness
+    /// records proven anchor changes and uncertain publications itself; a
+    /// transient read failure only refuses this operation. A remote Inspect
+    /// changes nothing, so a witness
     /// that could not be asked (timeout, refused or reset connection, an
     /// unavailable quorum) only refuses this operation; the next check
     /// either matches again or observes the change (BUG-103). A mismatch,
@@ -44,7 +46,7 @@ impl Witness {
     /// match the ones the failover client treats as final.
     pub(super) fn stops_session(&self, error: &io::Error) -> bool {
         match self {
-            Self::Local(_) => true,
+            Self::Local(witness) => witness.is_poisoned(),
             Self::Remote(_) => matches!(
                 error.kind(),
                 io::ErrorKind::InvalidData
