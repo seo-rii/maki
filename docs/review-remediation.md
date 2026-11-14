@@ -17,6 +17,43 @@ proposed PR fixes from remote-main changes and combined qualification.
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
+## Comprehensive review follow-up (2026-11-14)
+
+This revision addresses twelve actionable findings from the review of
+`d2380cf`. The changes preserve the volume format and the existing provider
+trust policy. They do not expand the project's qualified deployment scope.
+
+| Finding | Change | Portable regression evidence |
+|---|---|---|
+| BUG-178: ambiguous or missing final gRPC status | Require one valid final status before accepting a unary result; preserve legitimate remote errors and HTTP proxy failure classification. | `maki-crypto-grpc/tests/review_final_status.rs`, existing initial-status and HTTP-status suites |
+| BUG-181: unusable custom CA material | Reject empty, certificate-free, malformed, or invalid-DER bundles in HTTP and gRPC; accept multiple valid roots using the existing additive policy. | Both providers' `tests/review_ca_bundle.rs`, existing TLS and custom-CA suites |
+| BUG-083: capability lookup retains abandoned scheduler work | Cancel the asynchronous retry-safety lookup when the last caller cancels or expires, releasing inputs and the lane slot while preserving live siblings. | `maki-crypto/tests/review_scheduler_capability_cancellation.rs` |
+| BUG-183: idle worker misses late checkpoint cleanup failure | Track unfinished journal cleanup independently of the published checkpoint horizon and retry its directory barrier with backoff. | `maki-core/tests/review_checkpoint_cleanup_retry.rs` |
+| BUG-184: failed TRIM release blocks healthy ranges | Continue a bounded reclamation sweep past failed windows, then retry from the earliest failure after an independent interval. | `maki-core/tests/review_reclamation_progress.rs`, existing discard/reclamation and power-loss suites |
+| BUG-182: fast checker overlooks unusable v3 orphan metadata | Validate the required discard map before claiming an in-geometry orphan can be adopted; preserve fallback warnings and inconclusive I/O errors. | `maki-core/tests/review_orphan_discard_check.rs` |
+| BUG-179: disconnect acknowledgement prematurely retires cleanup state | Keep the trusted record until the backend is absent and resource observations are empty; incomplete teardown returns an error and remains retryable. | `maki-privileged/src/exec_tests.rs` |
+| BUG-080: supported LV inventory exceeds the record limit | Bound both encoded writes and reads at 256 KiB, reject oversize before creating a temporary file, and enforce the existing 64-LV recovery limit during preflight. | `maki-privileged/src/state_tests.rs`, `exec_tests.rs` |
+| BUG-137: hidden LV display names cannot be persisted | Normalize LVM's `[name]` spelling before recording identity; continue rejecting invalid, ambiguous, and hidden configured targets. | `maki-privileged/src/lvm_preflight_tests.rs`, `exec_tests.rs` |
+| BUG-168: semantic configuration errors echo input | Report the field and constraint without embedding arbitrary configuration values. | Both helper/API and CLI `review_attach_config_diagnostics.rs` suites |
+| DOC-002: failed workload startup still creates data | Gate quickstart writes and PostgreSQL initialization on successful start, active services, and attachment verification inside fail-fast subshells. | `scripts/test_workload_start_validation.py`, using the actual documentation blocks and harmless mocks |
+| BUG-180: shared libraries accepted as CLI package inputs | Require executable loader metadata and a nonzero entry point while retaining dynamic/static PIE and ET_EXEC support. | `scripts/test_debian_package.py`, including a native shared-library fixture |
+
+The retained regressions use private files, local providers, fault injection,
+virtual clocks, and simulated device observations. They do not demonstrate
+physical power-loss safety or qualify a real NBD/LVM/XFS stack. In particular,
+delayed kernel disconnect still needs target-stack verification; the helper
+now preserves the authority needed to retry it safely.
+
+Six findings remain outside these fixes: first-write synchronization of all
+adopted shard maps after reopen (PERF-006); crypto scratch/CPU budgets
+(ARCH-007); HTTP JSON node/allocation budgets (ARCH-008); physical memory
+retained by checkpoint snapshots beyond logical overlay accounting
+(ARCH-009); the fail-closed policy for optional durable-mark I/O errors
+(ARCH-010); and the non-atomic stop/recovery scheduling boundary (BUG-177).
+Those require separate durability, resource-budget, or lifecycle decisions.
+Keep using the documented maintenance serialization procedure for recovery
+and stop; these changes do not claim to resolve that race.
+
 ## Sentinel diagnostic contents (BUG-167, 2026-10-26)
 
 Mount identity rejection and an initialization attempt over an existing
