@@ -100,8 +100,13 @@ fn resolve_name(path: &str) -> io::Result<(u32, u32)> {
 fn multiple_pvs_and_hidden_metadata_lvs_are_supported_without_layout_restriction() {
     let verified = check(&fixture()).unwrap();
     assert_eq!(verified.lvs.len(), 3);
+    assert!(verified.lvs.contains_key("pool_tdata"));
+    assert!(verified.lvs.contains_key("pool_tmeta"));
     assert_eq!(verified.vg_uuid, VG);
     assert_eq!(verified.lv_uuid, LV);
+    let persisted: VerifiedLvm =
+        serde_json::from_slice(&serde_json::to_vec(&verified).unwrap()).unwrap();
+    validate_recovery_identity(&record(), &persisted).unwrap();
     let mut reordered = fixture();
     reordered["report"][0]["pv"]
         .as_array_mut()
@@ -112,6 +117,37 @@ fn multiple_pvs_and_hidden_metadata_lvs_are_supported_without_layout_restriction
         .unwrap()
         .reverse();
     assert_eq!(check(&reordered).unwrap(), verified);
+}
+
+#[test]
+fn hidden_lv_display_normalization_does_not_admit_invalid_or_ambiguous_names() {
+    for name in [
+        "[bad/name]",
+        "[[name]]",
+        "[name",
+        "name]",
+        "[-option]",
+        "[]",
+        ".",
+        "..",
+    ] {
+        let mut report = fixture();
+        report["report"][0]["lv"][1]["lv_name"] = name.into();
+        assert!(check(&report).is_err(), "accepted invalid LV name {name}");
+    }
+    let mut report = fixture();
+    report["report"][0]["lv"][0]["lv_name"] = "[data]".into();
+    assert!(check(&report).is_err(), "configured target became hidden");
+
+    let mut report = fixture();
+    report["report"][0]["lv"][1]["lv_name"] = "pool_tdata".into();
+    report["report"][0]["lv"][2]["lv_name"] = "[pool_tdata]".into();
+    assert!(check(&report).is_err(), "canonical LV names collided");
+
+    let mut invalid_persisted = check(&fixture()).unwrap();
+    let id = invalid_persisted.lvs.remove("pool_tdata").unwrap();
+    invalid_persisted.lvs.insert("[pool_tdata]".into(), id);
+    assert!(validate_recovery_identity(&record(), &invalid_persisted).is_err());
 }
 
 #[test]

@@ -144,6 +144,18 @@ fn uuid(value: &str) -> io::Result<String> {
     Ok(value.to_owned())
 }
 
+/// LVM reports hidden/internal LVs as `[name]`; persist the actual name
+/// used by device-mapper and validate it with the same rules as recovery.
+fn reported_lv_name(value: &str) -> io::Result<&str> {
+    let name = value
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(value);
+    crate::config::check_lvm_name("reported_lv_name", name)
+        .map_err(|_| invalid("invalid reported LV name"))?;
+    Ok(name)
+}
+
 fn verify_administrator_pins(
     verified: &VerifiedLvm,
     pins: Option<&LvmIdentityPins>,
@@ -497,6 +509,12 @@ pub(super) fn validate(
             return Err(invalid("LVM LV inventory exceeds the supported bound"));
         }
         for lv in group.lv {
+            let name = reported_lv_name(&lv.lv_name)?;
+            if name == lv_name && lv.lv_name != lv_name {
+                // A configured public LV must not resolve to an internal LV
+                // merely because its display brackets were removed.
+                return Err(invalid("configured LV is hidden in the LVM report"));
+            }
             let id = uuid(&lv.lv_uuid)?;
             let mut layout = BTreeSet::new();
             for token in lv.lv_layout.split(',').map(str::trim) {
@@ -519,9 +537,8 @@ pub(super) fn validate(
             }
             layouts.insert(id.clone(), layout);
             if lv.vg_uuid != vg_id
-                || lv.lv_name.is_empty()
                 || !lv_ids.insert(id.clone())
-                || lvs.insert(lv.lv_name, id).is_some()
+                || lvs.insert(name.to_owned(), id).is_some()
             {
                 return Err(invalid("LVM LV identity is foreign or ambiguous"));
             }

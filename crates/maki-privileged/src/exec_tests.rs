@@ -168,6 +168,13 @@ fn supported_lvm_inventory_sizes_persist_activation_intent_and_attach() {
 }
 
 #[test]
+fn hidden_lvm_names_persist_activation_intent_and_attach() {
+    for count in [3, 64] {
+        assert_inventory_attaches(count, true);
+    }
+}
+
+#[test]
 fn oversized_lvm_inventory_is_rejected_before_activation() {
     let fixture = Fixture::new();
     let state = fixture.state();
