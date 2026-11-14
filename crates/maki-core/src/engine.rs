@@ -1870,7 +1870,7 @@ impl EngineInner {
     /// the interval elapsed with work pending (unsynced records are synced
     /// first so they can be applied).
     async fn worker_pass(self: &Arc<Self>) {
-        let (total, appended, checkpointed, durable, covered, reclaim, by_overlay) = {
+        let (total, appended, checkpointed, durable, covered, cleanup, reclaim, by_overlay) = {
             let v = self.volume.read().await;
             (
                 v.journal_total_bytes(),
@@ -1878,6 +1878,7 @@ impl EngineInner {
                 v.checkpoint_sequence(),
                 v.journal_durable_sequence(),
                 v.journal_covered_segment_count(),
+                v.has_pending_checkpoint_cleanup(),
                 v.has_pending_reclamation(),
                 self.overlay_above_watermark(&v),
             )
@@ -1889,6 +1890,7 @@ impl EngineInner {
         // it is consumed below only when a pass can actually run.
         if appended <= checkpointed
             && covered == 0
+            && !cleanup
             && !reclaim
             && !self.space_refused.load(Ordering::SeqCst)
         {
@@ -1928,7 +1930,7 @@ impl EngineInner {
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
         let by_refusal = self.space_refused.swap(false, Ordering::SeqCst);
-        if !(by_size || by_space || by_time || by_overlay || reclaim || by_refusal) {
+        if !(by_size || by_space || by_time || by_overlay || cleanup || reclaim || by_refusal) {
             return;
         }
         // A checkpoint applies only durable records: when the trigger is

@@ -47,6 +47,9 @@ pub struct Volume {
     overlay: Overlay,
     ck_ab: AbStore,
     ck_state: CheckpointState,
+    /// Checkpoint state can be durable before journal deletion/fsync and
+    /// overlay retirement finish. Keep retry work after its horizon advances.
+    checkpoint_cleanup_pending: bool,
 }
 
 /// A fixed checkpoint horizon whose slot destinations have been captured
@@ -145,6 +148,7 @@ impl Volume {
             overlay,
             ck_ab: AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B),
             ck_state: checkpoint_state,
+            checkpoint_cleanup_pending: false,
         };
         volume.sanitize();
         Ok(volume)
@@ -250,6 +254,10 @@ impl Volume {
 
     pub(crate) fn has_pending_reclamation(&self) -> bool {
         self.store.has_pending_reclamation()
+    }
+
+    pub(crate) fn has_pending_checkpoint_cleanup(&self) -> bool {
+        self.checkpoint_cleanup_pending
     }
 
     /// True when no write has ever been acknowledged or applied: no
@@ -512,7 +520,6 @@ impl Volume {
             // interrupted checkpoint applied but could not clean up, and
             // persist metadata the store repaired at open (an adopted shard
             // or an allocation map rebuilt from slot headers).
-            self.overlay.retire(base_checkpoint);
             if self.store.has_pending_repairs() {
                 self.store.persist_discards()?;
                 self.store.persist_allocations()?;
@@ -521,10 +528,16 @@ impl Volume {
             // their deletion failed (state was stored first) or was lost in
             // a crash. Reclaim them, or the journal stays at its limit and
             // every write fails with ENOSPC while nothing is "new" (K-02).
-            if self.journal.delete_covered(base_checkpoint)? > 0 {
+            if self.journal_covered_segment_count() > 0 {
+                self.checkpoint_cleanup_pending = true;
+            }
+            self.journal.delete_covered(base_checkpoint)?;
+            if self.checkpoint_cleanup_pending {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
+                self.checkpoint_cleanup_pending = false;
             }
+            self.overlay.retire(base_checkpoint);
             // Physical reclamation is a space hint (R5-008): a window that
             // cannot be punched (ENOSPC splitting an extent, EIO) is logged
             // and retried by a later checkpoint, never failed here, or
@@ -582,6 +595,7 @@ impl Volume {
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
+        self.checkpoint_cleanup_pending = true;
         // Physical reclamation. The checkpoint is published from here on: a
         // failure only leaves space unreclaimed (the discard map is durable
         // and reads return zeros), so it never fails this call; the
@@ -599,6 +613,7 @@ impl Volume {
         // 6. fsync journal directory
         fp("checkpoint.dirsync")?;
         self.backing.sync_dir(layout::JOURNAL_DIR)?;
+        self.checkpoint_cleanup_pending = false;
 
         self.overlay.retire(horizon);
         // Not straight after a failed punch (the same units would fail
