@@ -273,14 +273,14 @@ pub(super) fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Ba
 /// another volume's witness would otherwise raise that volume's fence (or
 /// revoke its live writer) and only then fail to find the data (BUG-107).
 /// GC applies the same check before trusting an authority.
-fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<()> {
+fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<Manifest> {
     let current = record
         .current
         .as_ref()
         .ok_or_else(|| invalid("uninitialized remote backing"))?;
     let source = scope(disk.clone(), &current.namespace)
         .map_err(|_| invalid("remote authority's current namespace is not valid in this root"))?;
-    load_generation(source.as_ref(), current).map_err(|error| {
+    let (manifest, _) = load_generation(source.as_ref(), current).map_err(|error| {
         if error.kind() == io::ErrorKind::InvalidData {
             invalid(format!(
                 "this backing root does not hold the remote authority's current generation \
@@ -292,7 +292,7 @@ fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<()> {
             error
         }
     })?;
-    Ok(())
+    Ok(manifest)
 }
 
 pub(super) fn load_generation(
@@ -592,6 +592,7 @@ impl RollbackBacking {
         rpc: Arc<dyn Rpc>,
         expected: &Record,
     ) -> io::Result<Self> {
+        expected.validate()?;
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let backup = remote_root(source_root, false)?;
@@ -602,6 +603,24 @@ impl RollbackBacking {
             .current
             .as_ref()
             .ok_or_else(|| invalid("cannot restore an unenrolled witness"))?;
+        if manifest.identity != expected.identity {
+            return Err(invalid(
+                "snapshot identity differs from the approved authority",
+            ));
+        }
+        // The approved backup proves the source, not the target directory.
+        // Refuse a different enrolled volume before changing the authority or
+        // creating a namespace that automatic GC could mistake for its data.
+        // A valid binding still permits repair of a damaged current generation.
+        if !Enrollment::verify_if_present(disk.as_ref(), expected.identity, manifest.capacity)? {
+            // Older activated roots and snapshot copies have no supplementary
+            // binding. Only their exact current generation can establish the
+            // target identity; never synthesize a binding from the backup.
+            let target = holds_current(&disk, expected)?;
+            if target.capacity != manifest.capacity {
+                return Err(invalid("snapshot capacity differs from the target volume"));
+            }
+        }
         let generation = current
             .anchor
             .generation

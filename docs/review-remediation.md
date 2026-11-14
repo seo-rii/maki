@@ -2129,3 +2129,24 @@ remains rejected after restoration, and partial writes that still require
 reopen. The maintained tests use an injected memory arena and private witness
 files; the original reproduction used a real local arena with one failed
 positional read. Neither test is a physical power-loss qualification.
+
+## Remote restore target identity (BUG-187, 2026-11-14)
+
+An administrator-approved snapshot and authority from volume A could be restored
+into volume B's configured backing root. The new A namespace then satisfied GC's
+current-generation check, allowing automatic GC to delete B's quiescent data.
+Restore now checks the target's immutable enrollment identity and capacity before
+claiming the authority. A matching binding permits repair of damaged current
+data; an older root without that file must authenticate its exact current
+generation instead. Corrupt or mismatched bindings never fall back to the backup.
+GC independently checks an existing root binding against the authenticated
+current generation before any reclamation, preserving legacy roots, abandoned
+fork cleanup and partially removed tombstones.
+
+`review_remote_restore_identity.rs` covers foreign identity and capacity refusal
+without authority or data changes, source identity refusal, damaged-current
+restoration, and missing/corrupt enrollment boundaries. `remote_gc.rs` covers
+foreign/corrupt bindings despite a valid current manifest and successful partial
+tombstone cleanup under a matching binding. The tests use private file-backed
+roots and test authorities; they do not qualify a deployed witness or a physical
+power-loss scenario.

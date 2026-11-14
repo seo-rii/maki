@@ -16,6 +16,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct Server {
     url: String,
     accepted: Arc<AtomicUsize>,
@@ -116,6 +118,21 @@ impl Server {
             Some(generation)
         );
     }
+
+    async fn timeout_request(&mut self, provider: &Arc<WsCryptoProvider>, generation: usize) {
+        let request = tokio::spawn({
+            let provider = provider.clone();
+            async move { encrypt(&provider).await }
+        });
+        self.expect_request(generation).await;
+        // Finish real socket setup before advancing the request deadline;
+        // a short wall-clock budget can expire before the server sees it.
+        tokio::time::pause();
+        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_millis(1)).await;
+        let result = request.await.unwrap();
+        tokio::time::resume();
+        assert!(result.unwrap_err().is_retryable());
+    }
 }
 
 async fn encrypt(
@@ -139,10 +156,9 @@ async fn encrypt(
 #[tokio::test]
 async fn every_timeout_closes_its_socket_before_another_request() {
     let mut server = Server::start(usize::MAX).await;
-    let provider = server.provider(Duration::from_millis(100));
+    let provider = server.provider(REQUEST_TIMEOUT);
     for generation in 1..=4 {
-        assert!(encrypt(&provider).await.unwrap_err().is_retryable());
-        server.expect_request(generation).await;
+        server.timeout_request(&provider, generation).await;
         server.expect_closed(generation).await;
     }
     assert_eq!(server.accepted.load(Ordering::SeqCst), 4);
@@ -175,9 +191,8 @@ async fn cancelling_an_outer_request_closes_the_socket_without_waiting_for_trans
 #[tokio::test]
 async fn retirement_of_an_old_generation_leaves_a_healthy_successor_reusable() {
     let mut server = Server::start(2).await;
-    let provider = server.provider(Duration::from_millis(100));
-    assert!(encrypt(&provider).await.is_err());
-    server.expect_request(1).await;
+    let provider = server.provider(REQUEST_TIMEOUT);
+    server.timeout_request(&provider, 1).await;
     assert_eq!(encrypt(&provider).await.unwrap()[0].data, vec![0; 64]);
     server.expect_request(2).await;
     server.expect_closed(1).await;

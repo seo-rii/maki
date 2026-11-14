@@ -24,6 +24,25 @@ impl Enrollment {
         Self::decode(&bytes)
     }
 
+    /// Check the immutable root binding without creating or repairing it.
+    /// Legacy activated roots may lack this supplementary file; callers must
+    /// authenticate their current generation instead. An unreadable or corrupt
+    /// binding never permits that fallback.
+    pub(super) fn verify_if_present(
+        disk: &dyn Backing,
+        identity: [u8; 16],
+        capacity: u64,
+    ) -> io::Result<bool> {
+        match Self::load(disk) {
+            Ok(enrollment) if enrollment == (Self { identity, capacity }) => Ok(true),
+            Ok(_) => Err(invalid(
+                "backing root enrollment identity or capacity differs from the approved volume",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Bind only an explicitly approved, never-activated authority. Existing
     /// bytes must match exactly; this operation cannot replace another binding.
     /// The caller holds the root enrollment lock until its remote claim ends.
