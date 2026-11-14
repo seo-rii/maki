@@ -356,17 +356,19 @@ async fn stalled_http_response_remains_a_retryable_timeout() {
 
 #[tokio::test]
 async fn tcp_connection_refusal_remains_retryable() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Reserve the address without listening so another test cannot reuse it.
+    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
+    reservation.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let server = Server {
-        url: format!("http://{}", listener.local_addr().unwrap()),
+        url: format!("http://{}", reservation.local_addr().unwrap()),
         calls: Arc::new(AtomicUsize::new(0)),
         task: tokio::spawn(std::future::pending()),
     };
-    drop(listener);
     let error = server
         .provider(true, Duration::from_secs(5))
         .encrypt_batch(&context(), &plaintext())
         .await
         .unwrap_err();
     assert!(matches!(error, CryptoError::Retryable(_)), "{error}");
+    drop(reservation);
 }
