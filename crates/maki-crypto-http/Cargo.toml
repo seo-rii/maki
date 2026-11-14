@@ -17,6 +17,7 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 base64.workspace = true
 zeroize.workspace = true
 bytes.workspace = true
@@ -34,7 +35,6 @@ parking_lot.workspace = true
 tempfile.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
-rustls.workspace = true
 tracing-subscriber.workspace = true
 
 # O_NONBLOCK so a FIFO at a configured TLS path cannot hang attach.
