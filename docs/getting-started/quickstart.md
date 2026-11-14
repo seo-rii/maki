@@ -150,20 +150,25 @@ The plan lists every command the helper would run. Nothing has executed yet.
 ## 6. Start the lifecycle and write data
 
 ```bash
+(
+set -euo pipefail
 systemctl start maki-workload@demo.target
-systemctl is-active maki@demo.service maki-attach@demo.service
+systemctl is-active --quiet maki@demo.service
+systemctl is-active --quiet maki-attach@demo.service
+maki-attach verify --volume demo
 findmnt /srv/demo
 cat /srv/demo/.maki-sentinel                 # equals volume_uuid in the attach configuration
 sed -i 's/^init_sentinel = true/init_sentinel = false/' /etc/maki/attach/demo.toml
 
 echo "hello from maki $(date -u +%FT%TZ)" > /srv/demo/hello.txt
 sync
-maki-attach verify --volume demo && echo "identity gate ok"
 maki status /etc/maki/volumes/demo.toml
+)
 ```
 
 `verify` is the read-only gate a real workload runs in `ExecStartPre=`
-before every start. `status` should report `state: ready`.
+before every start. The subshell stops at the first failure, and the identity
+gate runs before creating any workload data. `status` should report `state: ready`.
 
 ## 7. Planned stop with a durability acknowledgement
 
