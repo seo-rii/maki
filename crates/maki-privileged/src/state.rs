@@ -16,8 +16,28 @@ use crate::config::{check_abs_path, check_lvm_name, check_uuid, check_volume_nam
 use crate::plan::{AttachmentIdentity, BOUND_DEVICE_RECORD_DIR};
 use crate::probe::nbd_index;
 
-const RECORD_MAX_BYTES: u64 = 4096;
 const CONFIG_MAX_BYTES: u64 = 64 * 1024;
+// A record can include both the 64 KiB configuration's identity and a
+// verified 64 KiB LVM report/topology. Allow JSON escaping and envelope
+// overhead while keeping reads and serialization strictly bounded.
+const RECORD_MAX_BYTES: u64 = 4 * CONFIG_MAX_BYTES;
+
+#[derive(Default)]
+struct RecordBuffer(Vec<u8>);
+
+impl Write for RecordBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > RECORD_MAX_BYTES as usize - self.0.len() {
+            return Err(invalid("attach record exceeds size limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +271,10 @@ impl TrustedState {
 
     pub fn write(&self, record: &BoundDeviceRecord) -> io::Result<()> {
         record.validate()?;
+        // Validate the actual encoded size before creating a temporary file.
+        // Oversized state never replaces an earlier cleanup authority.
+        let mut bytes = RecordBuffer::default();
+        serde_json::to_writer(&mut bytes, record).map_err(|e| invalid(e.to_string()))?;
         let destination = Self::record_name(&record.volume)?;
         let temporary = CString::new(format!(
             ".{}.{}.{}.tmp",
@@ -267,11 +291,7 @@ impl TrustedState {
         )?;
         let result = (|| {
             private_regular_file(&file, self.owner)?;
-            let bytes = serde_json::to_vec(record).map_err(|e| invalid(e.to_string()))?;
-            if bytes.len() as u64 > RECORD_MAX_BYTES {
-                return Err(invalid("attach record exceeds size limit"));
-            }
-            file.write_all(&bytes)?;
+            file.write_all(&bytes.0)?;
             file.sync_all()?;
             let rc = unsafe {
                 libc::renameat(

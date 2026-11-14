@@ -493,6 +493,9 @@ pub(super) fn validate(
         let mut lvs = BTreeMap::new();
         let mut layouts = BTreeMap::new();
         let mut lv_ids = BTreeSet::new();
+        if group.lv.len() > MAX_DEVICES {
+            return Err(invalid("LVM LV inventory exceeds the supported bound"));
+        }
         for lv in group.lv {
             let id = uuid(&lv.lv_uuid)?;
             let mut layout = BTreeSet::new();

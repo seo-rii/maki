@@ -127,6 +127,74 @@ fn lvm_report_fixture() -> serde_json::Value {
     }]})
 }
 
+fn assert_inventory_attaches(count: usize, hidden: bool) {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut report = lvm_report_fixture();
+    let lvs = report["report"][0]["lv"].as_array_mut().unwrap();
+    for index in 1..count {
+        let name = if hidden {
+            format!("[internal_{index}]")
+        } else {
+            format!("extra_{index}")
+        };
+        lvs.push(serde_json::json!({
+            "lv_name": name,
+            "lv_uuid": format!("{index:06}-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"),
+            "vg_uuid": "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg",
+            "lv_layout": "linear"
+        }));
+    }
+    let mut system = FakeSystem {
+        lvm_report: Some(report),
+        ..Default::default()
+    };
+    // The executor durably publishes and validates the full inventory
+    // before activation; the previous 4 KiB record bound rejected this.
+    execute_with(&plan_attach(&request()), Some(&state), &mut system)
+        .unwrap_or_else(|error| panic!("count={count}, hidden={hidden}: {error}"));
+    assert!(system.steps.contains(&"lvm-activate"));
+    assert!(system.mounted);
+    assert!(state.read("pg").unwrap().is_some());
+    cleanup_with(&plan_detach(&request()), &state, &mut system).unwrap();
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn supported_lvm_inventory_sizes_persist_activation_intent_and_attach() {
+    for count in [1, 40, 64] {
+        assert_inventory_attaches(count, false);
+    }
+}
+
+#[test]
+fn oversized_lvm_inventory_is_rejected_before_activation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut report = lvm_report_fixture();
+    for index in 1..65 {
+        report["report"][0]["lv"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "lv_name": format!("extra_{index}"),
+                "lv_uuid": format!("{index:06}-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"),
+                "vg_uuid": "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg",
+                "lv_layout": "linear"
+            }));
+    }
+    let mut system = FakeSystem {
+        lvm_report: Some(report),
+        ..Default::default()
+    };
+    let error = execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap_err();
+    assert!(error.to_string().contains("LVM LV inventory exceeds"));
+    assert!(!system.steps.contains(&"lvm-activate"));
+    assert!(!system.steps.contains(&"mount-xfs"));
+    assert!(system.backends.is_empty());
+    assert!(state.read("pg").unwrap().is_none());
+}
+
 #[test]
 fn lvm_preflight_rejects_foreign_pv_before_activation() {
     let fixture = Fixture::new();

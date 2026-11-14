@@ -80,6 +80,42 @@ fn records_round_trip_atomically_with_private_regular_files() {
 }
 
 #[test]
+fn encoded_record_bound_is_shared_by_reads_and_writes_without_losing_prior_state() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    let mut entry = record();
+    // JSON escaping counts toward the encoded bound, not just the input's
+    // string length. This remains a canonical absolute path.
+    entry.attachment.nbd_socket = format!("/{}", "\"".repeat(4096));
+    let initial_size = serde_json::to_vec(&entry).unwrap().len();
+    assert!(initial_size > 4096);
+    entry
+        .attachment
+        .nbd_socket
+        .push_str(&"x".repeat(RECORD_MAX_BYTES as usize - initial_size));
+    assert_eq!(
+        serde_json::to_vec(&entry).unwrap().len(),
+        RECORD_MAX_BYTES as usize
+    );
+    state.write(&entry).unwrap();
+    assert_eq!(state.read("pg").unwrap(), Some(entry.clone()));
+
+    let before = std::fs::read(fixture.0.join("state/pg.nbd")).unwrap();
+    entry.attachment.nbd_socket.push('x');
+    assert!(state.write(&entry).is_err());
+    assert_eq!(
+        std::fs::read(fixture.0.join("state/pg.nbd")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.0.join("state")).unwrap().count(),
+        1
+    );
+    entry.attachment.nbd_socket.pop();
+    assert_eq!(state.read("pg").unwrap(), Some(entry));
+}
+
+#[test]
 fn untrusted_directory_owner_and_writable_ancestors_are_rejected() {
     let fixture = Fixture::new();
     let uid = fixture.0.metadata().unwrap().uid();
