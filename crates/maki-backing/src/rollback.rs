@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::witness::FileWitness;
 
+#[cfg(all(test, target_os = "linux"))]
+mod arena_read_tests;
 mod enrollment;
 pub mod gc;
 #[cfg(all(test, target_os = "linux"))]
@@ -680,7 +682,19 @@ impl State {
         let mut bytes = vec![0; PAGE as usize];
         if let Some(page) = page {
             if let Err(error) = self.arena.read_at(page.slot * PAGE, &mut bytes) {
-                self.poisoned = true;
+                // No mutation or uncertain commit happened here. An ordinary
+                // I/O failure refuses this operation; the next one checks the
+                // witness and authenticates the page again. Missing, short or
+                // invalid referenced evidence still stops every handle, even
+                // if the original bytes are later restored.
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::InvalidData
+                ) {
+                    self.poisoned = true;
+                }
                 return Err(error);
             }
             if page_digest(&self.committed.identity, &bytes) != page.hash {
