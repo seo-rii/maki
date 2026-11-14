@@ -662,6 +662,7 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
     // head and chunk-framing violations. A decode/body error by itself is not
     // proof: truncated bodies and arbitrary socket I/O remain retryable.
     let mut cause: &(dyn std::error::Error + 'static) = &e;
+    let mut tls_failure = false;
     loop {
         if cause
             .downcast_ref::<hyper::Error>()
@@ -669,9 +670,13 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
         {
             return CryptoError::Contract("HTTP peer sent invalid response framing".into());
         }
+        // EOF/reset during a handshake is still a transport failure. Only
+        // rustls's typed authentication/protocol errors prove the endpoint
+        // unusable; the connector's generic "handshake" text does not.
+        tls_failure |= cause.is::<rustls::Error>();
         // io::Error::source() forwards to its custom owner's source, skipping
         // the owner itself. Inspect that owner too so the body parser's typed
-        // error is not lost inside an io::Error.
+        // error or a rustls error is not lost inside an io::Error.
         match cause
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
@@ -682,15 +687,8 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
             None => break,
         }
     }
-    let debug = format!("{e:?}");
-    if debug.contains("certificate")
-        || debug.contains("Certificate")
-        || debug.contains("Handshake")
-        || debug.contains("handshake")
-        || debug.contains("NotValidForName")
-        || debug.contains("UnknownIssuer")
-    {
-        return CryptoError::EndpointFatal(format!("TLS failure: {e}"));
+    if tls_failure {
+        return CryptoError::EndpointFatal("TLS authentication or protocol failure".into());
     }
     CryptoError::Retryable(format!("transport error: {e}"))
 }

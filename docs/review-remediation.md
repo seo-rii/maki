@@ -1250,11 +1250,16 @@ timing out one WebSocket request retires its connection and fails the other
 requests in flight on it as retryable, which a provider that is not
 retry-safe turns into EIO.
 
-Considered and left as is: the HTTP provider classifies TLS failures by
-searching the transport error's `Debug` text. A missed match makes a TLS
-failure `Retryable` instead of `EndpointFatal`; the dispatcher handles both
-the same way (failover, breaker charged), and the TLS suites pin the
-current classification.
+The HTTP TLS `Debug`-text classification was initially left unchanged.
+The later immediate circuit-open policy for `EndpointFatal` (BUG-094) made
+misclassification observable: an EOF before any certificate arrived matched
+"handshake" and immediately opened an otherwise healthy endpoint's circuit.
+The 2026-11-14 follow-up (BUG-186) walks typed rustls errors through transport
+and I/O wrappers instead. EOF/reset remains `Retryable`; certificate and TLS
+protocol errors remain `EndpointFatal`, and HTTP framing violations remain
+`Contract`. `maki-crypto-http/tests/review_tls_classification.rs` covers EOF,
+reset, invalid records, a fatal alert, and the first error's actual
+EndpointSet circuit state; the existing TLS suite retains CA/SAN/mTLS controls.
 
 Considered and left as is: the gRPC provider's local size estimate omits
 the context strings; an under-estimate is refused by tonic's encoder as
