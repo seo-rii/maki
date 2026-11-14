@@ -334,6 +334,9 @@ struct EngineInner {
     /// Clock time before which the worker does not retry after a failed
     /// pass (BUG-101); `None` after a success.
     checkpoint_retry_at: parking_lot::Mutex<Option<Duration>>,
+    /// A completed reclamation sweep left failed ranges. Its own backoff
+    /// must not postpone checkpoints needed by unrelated journal writes.
+    reclamation_retry_at: parking_lot::Mutex<Option<Duration>>,
     free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
     /// Published samples have their own memory-only locks: `free_space`
     /// may be held across a stalled statvfs, and `volume` across storage I/O.
@@ -679,6 +682,7 @@ impl Engine {
             policy: options.checkpoint,
             last_checkpoint_at: parking_lot::Mutex::new(clock.now()),
             checkpoint_retry_at: parking_lot::Mutex::new(None),
+            reclamation_retry_at: parking_lot::Mutex::new(None),
             clock,
             checkpoint_notify: notify.clone(),
             checkpoint_stop: AtomicBool::new(false),
@@ -1870,7 +1874,17 @@ impl EngineInner {
     /// the interval elapsed with work pending (unsynced records are synced
     /// first so they can be applied).
     async fn worker_pass(self: &Arc<Self>) {
-        let (total, appended, checkpointed, durable, covered, cleanup, reclaim, by_overlay) = {
+        let (
+            total,
+            appended,
+            checkpointed,
+            durable,
+            covered,
+            cleanup,
+            reclaim,
+            deferred,
+            by_overlay,
+        ) = {
             let v = self.volume.read().await;
             (
                 v.journal_total_bytes(),
@@ -1880,18 +1894,23 @@ impl EngineInner {
                 v.journal_covered_segment_count(),
                 v.has_pending_checkpoint_cleanup(),
                 v.has_pending_reclamation(),
+                v.has_deferred_reclamation(),
                 self.overlay_above_watermark(&v),
             )
         };
-        // A failed physical-release hint keeps its cursor but is excluded
-        // from immediate reclamation work to avoid a retry loop. A space
-        // refusal must still run an idle checkpoint after every journal
-        // record is gone. Keep the signal pending through retry backoff;
-        // it is consumed below only when a pass can actually run.
+        let retry_reclaim = deferred
+            && self
+                .reclamation_retry_at
+                .lock()
+                .is_none_or(|retry_at| self.clock.now() >= retry_at);
+        // An advanced checkpoint horizon does not prove that journal
+        // cleanup finished. Physical-release failures have their own retry
+        // interval while the remaining healthy ranges progress immediately.
         if appended <= checkpointed
             && covered == 0
             && !cleanup
             && !reclaim
+            && !retry_reclaim
             && !self.space_refused.load(Ordering::SeqCst)
         {
             return; // nothing to apply and no independent reclamation trigger
@@ -1930,7 +1949,15 @@ impl EngineInner {
             .saturating_sub(*self.last_checkpoint_at.lock());
         let by_time = elapsed >= self.policy.interval;
         let by_refusal = self.space_refused.swap(false, Ordering::SeqCst);
-        if !(by_size || by_space || by_time || by_overlay || cleanup || reclaim || by_refusal) {
+        if !(by_size
+            || by_space
+            || by_time
+            || by_overlay
+            || cleanup
+            || reclaim
+            || retry_reclaim
+            || by_refusal)
+        {
             return;
         }
         // A checkpoint applies only durable records: when the trigger is
@@ -1959,11 +1986,14 @@ impl EngineInner {
                 }
                 Ok(_) => {
                     *self.checkpoint_retry_at.lock() = None;
-                    if self.volume.read().await.has_pending_reclamation() {
-                        // Drain another bounded batch without sleeping an
-                        // entire checkpoint interval. Each pass releases the
-                        // volume lock; failures wait for the regular
-                        // interval before retrying.
+                    let volume = self.volume.read().await;
+                    *self.reclamation_retry_at.lock() = volume
+                        .has_deferred_reclamation()
+                        .then(|| self.clock.now() + self.policy.interval);
+                    if volume.has_pending_reclamation() {
+                        // Continue this bounded sweep past failed ranges;
+                        // retry those only after finishing the sweep and
+                        // waiting out its independent interval.
                         self.checkpoint_notify.notify_one();
                     }
                 }

@@ -256,6 +256,10 @@ impl Volume {
         self.store.has_pending_reclamation()
     }
 
+    pub(crate) fn has_deferred_reclamation(&self) -> bool {
+        self.store.has_deferred_reclamation()
+    }
+
     pub(crate) fn has_pending_checkpoint_cleanup(&self) -> bool {
         self.checkpoint_cleanup_pending
     }
@@ -617,8 +621,8 @@ impl Volume {
 
         self.overlay.retire(horizon);
         // Not straight after a failed punch (the same units would fail
-        // again). A scan failure keeps its cursor; the next idle checkpoint
-        // retries it and reports a persistent failure there.
+        // again). A scan failure is remembered for the next sweep while
+        // other ranges continue; deferred sweeps use the worker's backoff.
         if !reclamation_failed {
             if let Err(error) = self
                 .store
