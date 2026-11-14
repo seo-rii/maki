@@ -227,6 +227,27 @@ impl ResponseFraming {
 struct BoundedResponseBody {
     inner: tonic::body::Body,
     framing: ResponseFraming,
+    finished: bool,
+}
+
+/// Tonic reads the first status value. Reject ambiguous or malformed metadata
+/// before that selection can hide a conflicting result (BUG-178).
+fn response_status(
+    headers: &tonic::codegen::http::HeaderMap,
+) -> Result<Option<bool>, &'static str> {
+    let mut statuses = headers.get_all("grpc-status").iter();
+    let Some(status) = statuses.next() else {
+        return Ok(None);
+    };
+    if statuses.next().is_some() {
+        return Err("grpc response contains duplicate status values");
+    }
+    match status.as_bytes() {
+        b"0" => Ok(Some(true)),
+        b"1" | b"2" | b"3" | b"4" | b"5" | b"6" | b"7" | b"8" | b"9" | b"10" | b"11" | b"12"
+        | b"13" | b"14" | b"15" | b"16" => Ok(Some(false)),
+        _ => Err("grpc response contains an invalid status value"),
+    }
 }
 
 impl http_body::Body for BoundedResponseBody {
@@ -237,6 +258,9 @@ impl http_body::Body for BoundedResponseBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
         let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
         // A response that ends inside a message, or reports success without
         // one, broke the receive contract; tonic would surface either as a
@@ -246,30 +270,41 @@ impl http_body::Body for BoundedResponseBody {
                 if let Some(bytes) = frame.data_ref() {
                     self.framing.observe(bytes).err()
                 } else if let Some(trailers) = frame.trailers_ref() {
+                    self.finished = true;
                     if self.framing.inside_message() {
                         Some("grpc response ended inside a message")
-                    } else if self.framing.messages == 0
-                        && trailers.get("grpc-status").map(|v| v.as_bytes()) == Some(b"0")
-                    {
-                        Some("grpc response reported success without a message")
                     } else {
-                        None
+                        match response_status(trailers) {
+                            Err(message) => Some(message),
+                            Ok(None) => Some("grpc response is missing its final status"),
+                            Ok(Some(true)) if self.framing.messages == 0 => {
+                                Some("grpc response reported success without a message")
+                            }
+                            Ok(Some(_)) => None,
+                        }
                     }
                 } else {
                     None
                 }
             }
             None if self.framing.inside_message() => Some("grpc response ended inside a message"),
+            None => Some("grpc response is missing its final status"),
             _ => None,
         };
         if let Some(message) = violation {
+            self.finished = true;
             return Poll::Ready(Some(Err(receive_contract_status(message))));
+        }
+        if matches!(frame, Some(Err(_))) {
+            self.finished = true;
         }
         Poll::Ready(frame)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        // An underlying DATA END_STREAM still needs one poll to reject its
+        // missing status. Reporting it as ended lets tonic erase that check.
+        self.finished
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
@@ -330,7 +365,9 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
             // status checks, accepting data even after an error trailer.
             // Reject before its decoder sees the headers, including an
             // already-ended body that would never reach our framing checks.
-            if response.headers().get("grpc-status").map(|v| v.as_bytes()) == Some(b"0") {
+            let initial_status =
+                response_status(response.headers()).map_err(receive_contract_status)?;
+            if initial_status == Some(true) {
                 return Err(receive_contract_status(
                     "grpc unary response reported success in initial headers",
                 )
@@ -349,6 +386,7 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
             Ok(response.map(|inner| BoundedResponseBody {
                 inner,
                 framing: ResponseFraming::new(limit),
+                finished: false,
             }))
         })
     }
@@ -494,6 +532,7 @@ mod receive_contract_tests {
         let mut body = BoundedResponseBody {
             inner: tonic::body::Body::new(frames),
             framing: ResponseFraming::new(1),
+            finished: false,
         };
         for _ in 0..3 {
             let frame = std::future::poll_fn(|cx| super::Pin::new(&mut body).poll_frame(cx))
@@ -521,6 +560,7 @@ mod receive_contract_tests {
         let mut body = BoundedResponseBody {
             inner: tonic::body::Body::new(frames),
             framing: ResponseFraming::new(1),
+            finished: false,
         };
         std::future::poll_fn(|cx| super::Pin::new(&mut body).poll_frame(cx))
             .await
