@@ -103,32 +103,9 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             }
         }
         if envelope.metadata_version == SUPERBLOCK_VERSION_V3 {
-            let discard_ab = AbStore::new(
-                layout::shard_discard_a(shard),
-                layout::shard_discard_b(shard),
-            )
-            .with_max_len(map_len);
-            let sides = discard_ab.side_generations::<AllocationMap>(backing)?;
-            match discard_ab.load::<AllocationMap>(backing)? {
-                None => report
-                    .errors
-                    .push(format!("shard {shard}: no valid discard map")),
-                Some(map) => {
-                    if map.units() != geometry.units_per_shard() {
-                        report.errors.push(format!(
-                            "shard {shard}: discard map covers {} units, geometry says {}",
-                            map.units(),
-                            geometry.units_per_shard()
-                        ));
-                    }
-                    if matches!(sides, (Some(_), None) | (None, Some(_))) {
-                        report.warnings.push(format!(
-                            "shard {shard}: discard map has one valid copy; using fallback"
-                        ));
-                    }
-                }
-            }
+            check_discard_map(backing, shard, geometry.units_per_shard(), &mut report)?;
         }
+
         // A cataloged shard always has a data file: shard creation makes the
         // data file's dirent durable *before* the catalog names the shard, so
         // a missing one is not a pending state ("not yet created") but
@@ -157,19 +134,61 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             if catalog.contains(idx) {
                 continue;
             }
-            report.warnings.push(if idx < geometry.num_shards() {
+            let warning = if idx < geometry.num_shards() {
+                let adoptable = envelope.metadata_version != SUPERBLOCK_VERSION_V3
+                    || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
                 format!(
-                    "shard data file {name} (index {idx}) is not in the catalog; \
-                     recovery adopts it"
+                    "shard data file {name} (index {idx}) is not in the catalog; {}",
+                    if adoptable {
+                        "recovery adopts it"
+                    } else {
+                        "invalid discard metadata prevents recovery from adopting it"
+                    }
                 )
             } else {
                 format!(
                     "shard data file {name} (index {idx}) lies beyond the volume \
                      geometry and is ignored"
                 )
-            });
+            };
+            report.warnings.push(warning);
         }
     }
 
     Ok(report)
+}
+
+/// V3 adoption needs the same discard evidence as a cataloged shard. Keep
+/// both fast-check paths consistent; actual I/O errors remain inconclusive.
+fn check_discard_map(
+    backing: &dyn Backing,
+    shard: u64,
+    units: u64,
+    report: &mut CheckReport,
+) -> Result<bool, FormatError> {
+    let discard_ab = AbStore::new(
+        layout::shard_discard_a(shard),
+        layout::shard_discard_b(shard),
+    )
+    .with_max_len(AllocationMap::encoded_len(units));
+    let sides = discard_ab.side_generations::<AllocationMap>(backing)?;
+    let Some(map) = discard_ab.load::<AllocationMap>(backing)? else {
+        report
+            .errors
+            .push(format!("shard {shard}: no valid discard map"));
+        return Ok(false);
+    };
+    if map.units() != units {
+        report.errors.push(format!(
+            "shard {shard}: discard map covers {} units, geometry says {units}",
+            map.units()
+        ));
+        return Ok(false);
+    }
+    if matches!(sides, (Some(_), None) | (None, Some(_))) {
+        report.warnings.push(format!(
+            "shard {shard}: discard map has one valid copy; using fallback"
+        ));
+    }
+    Ok(true)
 }
