@@ -748,8 +748,22 @@ impl GrpcCryptoProvider {
                     config = config.with_native_roots();
                 }
                 if let Some(ca) = tls.ca_certificate_pem {
-                    if ca.is_empty() {
-                        return Err(fatal("custom TLS CA certificate is empty"));
+                    use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+                    // Tonic silently skips unparsable DER certificates and
+                    // accepts a PEM file with no certificates. Validate every
+                    // configured root before preserving its additive policy.
+                    let mut roots = rustls::RootCertStore::empty();
+                    for certificate in
+                        CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(&ca))
+                    {
+                        let certificate = certificate
+                            .map_err(|_| fatal("invalid custom TLS CA certificate encoding"))?;
+                        roots
+                            .add(certificate)
+                            .map_err(|_| fatal("invalid custom TLS CA certificate"))?;
+                    }
+                    if roots.is_empty() {
+                        return Err(fatal("custom TLS CA bundle contains no certificates"));
                     }
                     config = config.ca_certificate(Certificate::from_pem(ca));
                 }

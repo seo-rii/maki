@@ -769,9 +769,16 @@ impl HttpCryptoProvider {
             .use_rustls_tls();
         if let Some(tls) = &spec.tls {
             if let Some(ca) = &tls.ca_pem {
-                let cert = reqwest::Certificate::from_pem(ca)
+                let certificates = reqwest::Certificate::from_pem_bundle(ca)
                     .map_err(|e| fatal(format!("bad CA certificate: {e}")))?;
-                builder = builder.add_root_certificate(cert);
+                if certificates.is_empty() {
+                    return Err(fatal("custom TLS CA bundle contains no certificates"));
+                }
+                // Building the rustls client validates each DER certificate;
+                // a valid root must not hide an invalid member of the bundle.
+                for certificate in certificates {
+                    builder = builder.add_root_certificate(certificate);
+                }
             }
             if let Some(identity) = &tls.identity_pem {
                 let identity = reqwest::Identity::from_pem(identity)
