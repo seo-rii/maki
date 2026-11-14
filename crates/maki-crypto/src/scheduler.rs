@@ -620,8 +620,19 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                 && matches!(
                     &result,
                     Err(error) if error.class() == crate::error::ErrorClass::NonRetryableRequest
-                )
-                && resend_safe().await;
+                );
+            let per_request = if per_request {
+                // This public-provider capability call can itself wait. It
+                // owns the original inputs and lane slot until completion,
+                // so it must end when the last caller leaves too (BUG-083).
+                tokio::select! {
+                    biased;
+                    _ = all_replies_closed(replies.iter_mut()) => return,
+                    safe = resend_safe() => safe,
+                }
+            } else {
+                false
+            };
             if !per_request {
                 deliver(result, items, lengths, replies);
                 return;
