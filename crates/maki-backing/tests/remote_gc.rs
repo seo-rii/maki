@@ -125,6 +125,86 @@ fn authority(disk: &FileBacking, state: Record) -> Authority {
     Authority(Mutex::new(Ok(state)))
 }
 
+fn enrollment_bytes(identity: [u8; 16], capacity: u64) -> Vec<u8> {
+    let mut bytes = b"MAKIRE01".to_vec();
+    bytes.extend_from_slice(&identity);
+    bytes.extend_from_slice(&capacity.to_le_bytes());
+    let mut hash = Sha256::new();
+    hash.update(b"maki.remote.enrollment.v1\0");
+    hash.update(&bytes);
+    bytes.extend_from_slice(&hash.finalize());
+    bytes
+}
+
+#[test]
+fn foreign_or_corrupt_root_binding_blocks_gc_even_with_valid_current_manifest() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for mut binding in [
+        enrollment_bytes([2; 16], 4096),
+        enrollment_bytes([1; 16], 8192),
+        enrollment_bytes([1; 16], 4096),
+    ] {
+        // The last case corrupts an otherwise matching binding. Neither a
+        // foreign nor an unreadable identity may fall back to the planted
+        // current generation and authorize deletion of this root's contents.
+        if binding == enrollment_bytes([1; 16], 4096) {
+            binding[0] ^= 1;
+        }
+        let (_dir, disk) = root();
+        let old = descriptor(1).namespace;
+        let retired = format!(".remote-gc-{}", descriptor(2).namespace);
+        populate(&disk, &old);
+        populate(&disk, &retired);
+        let rpc = authority(&disk, record(3));
+        let file = disk.open("remote.enrollment", true).unwrap();
+        file.write_at(0, &binding).unwrap();
+        file.sync_data().unwrap();
+        let guard = OperationGuard::acquire(&disk).unwrap();
+        let before = disk.list("").unwrap();
+        let error = guard.collect(&rpc).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(disk.list("").unwrap(), before);
+        for name in [&old, &retired] {
+            assert!(disk.exists(&format!("{name}/rollback.arena")).unwrap());
+        }
+        let mut after = vec![0; binding.len()];
+        file.read_at(0, &mut after).unwrap();
+        assert_eq!(after, binding);
+    }
+}
+
+#[test]
+fn matching_root_binding_allows_old_and_partially_removed_namespaces_to_be_collected() {
+    let _process = PROCESS_SPAWN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, disk) = root();
+    let old = descriptor(1).namespace;
+    let retired_name = descriptor(2).namespace;
+    let retired = format!(".remote-gc-{retired_name}");
+    populate(&disk, &old);
+    populate(&disk, &retired);
+    for name in ["rollback.manifest.0", "rollback.manifest.1"] {
+        disk.remove(&format!("{retired}/{name}")).unwrap();
+    }
+    let rpc = authority(&disk, record(3));
+    let file = disk.open("remote.enrollment", true).unwrap();
+    file.write_at(0, &enrollment_bytes([1; 16], 4096)).unwrap();
+    file.sync_data().unwrap();
+    let report = OperationGuard::acquire(&disk)
+        .unwrap()
+        .collect(&rpc)
+        .unwrap();
+    assert_eq!(report.counts.removed, 2);
+    assert!(report.removed.contains(&old));
+    assert!(report.removed.contains(&retired_name));
+    assert!(!disk.exists(&old).unwrap());
+    assert!(!disk.exists(&retired).unwrap());
+    assert!(disk.exists(&descriptor(3).namespace).unwrap());
+}
+
 #[test]
 fn removes_only_quiescent_lower_fences_and_keeps_authority_root() {
     let _process = PROCESS_SPAWN

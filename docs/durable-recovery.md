@@ -92,6 +92,15 @@ flat manifest encoding, witness state envelope, inner superblock or crypto
 context. Already activated remote volumes without this supplementary file
 remain readable; there is no in-place conversion or authority recreation.
 
+Restore checks this binding against the approved storage identity and snapshot
+capacity before claiming the authority. A matching binding permits restoration
+even when the target's current generation is damaged. Without the supplementary
+file, restore must authenticate the exact current generation in the target to
+establish its identity and capacity; missing binding plus damaged current data
+cannot be safely rebound from the backup. A corrupt or mismatched binding is
+refused. GC also checks an existing binding against its authenticated current
+generation before reclaiming namespaces.
+
 Interrupted initial enrollment can be explicitly resumed under the same
 storage identity only when the independent authority has never selected any
 current descriptor. An administrator approves the exact observed fence,

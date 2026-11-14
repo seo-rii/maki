@@ -383,6 +383,16 @@ truncated, oversized, noncanonical or symlinked descriptors are refused. Wrong
 approval values and writer credentials cannot authorize restore or takeover.
 Snapshot, takeover and restore require Linux.
 
+The configured `backing.root` must belong to the approved storage identity.
+Restore checks its immutable `remote.enrollment` identity and capacity before
+claiming the authority, so accidentally selecting another volume's root is
+refused. A matching binding allows recovery when the current generation is
+damaged. For older roots without that file, the exact current generation must
+still authenticate in the target; otherwise restore refuses before changing
+the authority. Do not delete or replace a binding to bypass this check.
+GC refuses a root whose existing binding conflicts with its current generation,
+including one containing a foreign namespace left by an earlier faulty restore.
+
 ## Resume interrupted initial enrollment
 
 An initialized descriptor can never be cleared through enrollment recovery,

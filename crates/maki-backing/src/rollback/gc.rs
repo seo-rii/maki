@@ -131,7 +131,16 @@ impl<'a> OperationGuard<'a> {
         // physical current root before trusting this authority's fencing floor.
         // This also refuses accidentally configured authorities for other data.
         let current_disk = self.disk.gc_scope(&current.namespace)?;
-        super::remote::load_generation(&current_disk, current)?;
+        let (manifest, _) = super::remote::load_generation(&current_disk, current)?;
+        // A foreign current namespace may already have been copied into this
+        // root. Its valid manifest must not authorize deleting the enrolled
+        // volume's data. Legacy roots without a binding retain the exact
+        // current-generation proof above, including partial tombstone cleanup.
+        super::enrollment::Enrollment::verify_if_present(
+            self.disk,
+            record.identity,
+            manifest.capacity,
+        )?;
         let mut retained = BTreeSet::from([current.namespace.as_str()]);
         if let Some(source) = &record.restore_source {
             retained.insert(source.namespace.as_str());
