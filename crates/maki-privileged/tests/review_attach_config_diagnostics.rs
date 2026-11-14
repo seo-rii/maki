@@ -1,5 +1,5 @@
-//! BUG-168: parser diagnostics retain locations, never configuration input.
-use maki_privileged::config::parse;
+//! BUG-168: diagnostics retain locations/field names, never rejected input.
+use maki_privileged::config::{parse, AttachOverrides};
 use std::error::Error;
 
 const MARKER: &str = "synthetic-private-attach-config-bug168";
@@ -40,6 +40,81 @@ fn syntax_error_is_absent_from_error_chain() {
 #[test]
 fn nested_schema_error_is_absent_from_error_chain() {
     let error = parse(&format!("[lvm_identity]\n{MARKER} = true\n")).unwrap_err();
+    assert_redacted(&error);
+}
+
+#[test]
+fn semantic_errors_identify_fields_without_rejected_values() {
+    for (field, value) in [
+        ("nbd_device", format!("/dev/{MARKER}")),
+        ("nbd_socket", MARKER.to_string()),
+        ("nbd_socket", format!("-{MARKER}")),
+        ("nbd_socket", format!("/{MARKER}/")),
+        ("nbd_socket", format!("/{MARKER}/../socket")),
+        ("nbd_socket", format!("/{MARKER}//socket")),
+        ("mountpoint", MARKER.to_string()),
+        ("vg_name", format!("{MARKER}/invalid")),
+        ("lv_name", format!("{MARKER}/invalid")),
+        ("volume_uuid", MARKER.to_string()),
+        ("fs_uuid", MARKER.to_string()),
+    ] {
+        let config = parse(&format!("{field} = '{value}'\n")).unwrap();
+        let error = config
+            .into_request("review", AttachOverrides::default(), false)
+            .unwrap_err();
+        assert!(error.to_string().contains(field));
+        assert_redacted(&error);
+    }
+    for field in ["pv_uuids", "vg_uuid", "lv_uuid"] {
+        let mut pins = [
+            "pv_uuids = ['111111-2222-3333-4444-5555-6666-777777']".to_string(),
+            "vg_uuid = 'aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg'".to_string(),
+            "lv_uuid = 'hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn'".to_string(),
+        ];
+        let index = match field {
+            "pv_uuids" => 0,
+            "vg_uuid" => 1,
+            _ => 2,
+        };
+        pins[index] = if index == 0 {
+            format!("{field} = ['{MARKER}']")
+        } else {
+            format!("{field} = '{MARKER}'")
+        };
+        let config = parse(&format!("[lvm_identity]\n{}\n", pins.join("\n"))).unwrap();
+        let error = config
+            .into_request("review", AttachOverrides::default(), false)
+            .unwrap_err();
+        assert!(error.to_string().contains(&format!("lvm_identity.{field}")));
+        assert_redacted(&error);
+    }
+}
+
+#[test]
+fn invalid_overrides_and_volume_names_do_not_echo_values() {
+    let error = parse("")
+        .unwrap()
+        .into_request(
+            "review",
+            AttachOverrides {
+                nbd_socket: Some(MARKER.to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("nbd_socket"));
+    assert_redacted(&error);
+
+    let error = parse("")
+        .unwrap()
+        .into_request(
+            &format!("{MARKER}/invalid"),
+            AttachOverrides::default(),
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("volume name"));
     assert_redacted(&error);
 }
 

@@ -422,6 +422,53 @@ class DebianPackageTests(unittest.TestCase):
                 package = self.build(f"shared-{architecture}.deb", architecture=architecture)
                 self.assertEqual(self.field(package, "Architecture"), architecture)
 
+    def test_cli_rejects_shared_libraries_and_missing_entry_points(self):
+        for architecture, machine, elf_class, endian in (
+            ("amd64", EM_X86_64, 64, "little"),
+            ("i386", EM_386, 32, "little"),
+            ("s390x", 0x16, 64, "big"),
+        ):
+            for name in RELEASE_NAMES[:-1]:
+                with self.subTest(architecture=architecture, name=name):
+                    self.write_release_files(machine, elf_class, endian)
+                    (self.release / name).write_bytes(
+                        elf_with_segments(machine, elf_class, endian, flags_1=1))
+                    error = self.build_failure("shared-cli.deb", architecture=architecture)
+                    self.assertIn(name, error)
+                    self.assertIn("not a shared library", error)
+                    zero_entry = elf_with_segments(machine, elf_class, endian,
+                                                   interpreter=True, flags_1=DF_1_PIE)
+                    order = "<" if endian == "little" else ">"
+                    struct.pack_into(f"{order}{'Q' if elf_class == 64 else 'I'}", zero_entry, 24, 0)
+                    (self.release / name).write_bytes(zero_entry)
+                    error = self.build_failure("zero-entry.deb", architecture=architecture)
+                    self.assertIn("entry point", error)
+
+    def test_old_dynamic_and_static_pie_executables_are_allowed(self):
+        for markers in ({"interpreter": True}, {"flags_1": DF_1_PIE}):
+            with self.subTest(markers=markers):
+                self.write_release_files()
+                for name in RELEASE_NAMES[:-1]:
+                    (self.release / name).write_bytes(elf_with_segments(EM_X86_64, **markers))
+                self.build("pie-cli.deb")
+
+    @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
+                         "native C compiler and dpkg-shlibdeps required")
+    def test_native_shared_library_cli_is_rejected_before_packaging(self):
+        source = self.work / "library.c"
+        source.write_text("int harmless_fixture(void) { return 0; }\n")
+        library = self.work / "library.so"
+        subprocess.run(["cc", str(source), "-shared", "-fPIC", "-o", str(library)],
+                       check=True, capture_output=True, text=True)
+        shutil.copyfile(library, self.release / "maki")
+        architecture = subprocess.run(["dpkg", "--print-architecture"], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+        error = self.build_failure("native-shared-cli.deb", architecture=architecture,
+                                   opt_out=False)
+        self.assertIn("maki must", error)
+        self.assertIn("executable", error)
+        self.assertNotIn("dpkg-shlibdeps failed", error)
+
     def test_plugin_metadata_must_fit_in_the_file(self):
         valid = elf_with_segments(EM_X86_64, flags_1=1)
         bad_program_table = bytearray(valid)

@@ -122,10 +122,20 @@ Debian runs clusters as `postgresql@<version>-<cluster>.service`. Create the
 cluster on the mounted volume once the first attach has succeeded:
 
 ```bash
+(
+set -euo pipefail
 systemctl start maki-workload@postgres.target
+systemctl is-active --quiet maki@postgres.service
+systemctl is-active --quiet maki-attach@postgres.service
+maki-attach verify --volume postgres
 install -d -o postgres -g postgres -m 0700 /srv/postgres/15
 pg_createcluster -d /srv/postgres/15/main 15 main -- --data-checksums
+)
 ```
+
+This block stops at the first failure. The identity gate must succeed before
+creating the data directory, so an unattached mountpoint cannot receive the
+cluster's files on the host filesystem.
 
 Then install the drop-in
 [`postgresql.service.d/10-maki.conf`](../../examples/postgres-local/postgresql.service.d/10-maki.conf)

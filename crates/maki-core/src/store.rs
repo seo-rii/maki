@@ -195,9 +195,11 @@ pub struct SlotStore {
     /// A bounded post-recovery scan retries physical release of persisted
     /// tombstones. The scan retains no per-unit bitmap or payload history.
     reclaim_cursor: Option<(u64, u64)>,
-    /// The last reclamation window failed to punch (BUG-123): the scan keeps
-    /// its cursor, but is not pending work until a later checkpoint, run
-    /// for its own reasons, retries it.
+    /// Earliest failed window in this sweep. Remember one cursor, not a
+    /// per-slot queue; later healthy ranges still make bounded progress.
+    reclaim_retry_from: Option<(u64, u64)>,
+    /// A sweep containing failures finished. Defer its next sweep so an
+    /// always-failing hole punch cannot cause an immediate worker loop.
     reclaim_stalled: bool,
     /// Failed reservation fsync can clear another checkpoint's dirty pages.
     /// Plans observe this counter before publication under the volume lock.
@@ -590,6 +592,7 @@ impl SlotStore {
             damaged_units,
             discard_enabled,
             reclaim_cursor: None,
+            reclaim_retry_from: None,
             reclaim_stalled: false,
             reservation_failures: Arc::new(AtomicU64::new(0)),
         })
@@ -629,10 +632,14 @@ impl SlotStore {
         self.reclaim_cursor.is_some() && !self.reclaim_stalled
     }
 
+    pub(crate) fn has_deferred_reclamation(&self) -> bool {
+        self.reclaim_cursor.is_some() && self.reclaim_stalled
+    }
+
     /// Call only after bounded replay has applied every surviving record.
     /// A tombstone seen halfway through replay may precede a reserved write.
     pub(crate) fn schedule_reclamation(&mut self) {
-        self.reclaim_cursor = self
+        let first = self
             .catalog
             .shard_indices()
             .find(|idx| {
@@ -642,6 +649,27 @@ impl SlotStore {
                     .is_some_and(|map| map.set_count() > 0)
             })
             .map(|idx| (idx, 0));
+        if let Some(first) = first {
+            self.queue_reclamation(first);
+        }
+    }
+
+    /// An earlier new hint belongs to a later sweep; resetting a running
+    /// cursor on every hint could starve all later shards again.
+    fn queue_reclamation(&mut self, cursor: (u64, u64)) {
+        match self.reclaim_cursor {
+            None => {
+                self.reclaim_cursor = Some(cursor);
+                self.reclaim_stalled = false;
+            }
+            Some(current) if cursor < current => {
+                self.reclaim_retry_from = Some(
+                    self.reclaim_retry_from
+                        .map_or(cursor, |old| old.min(cursor)),
+                );
+            }
+            Some(_) => {}
+        }
     }
 
     /// An existing, logically unwritten slot may still own a reservation
@@ -656,7 +684,7 @@ impl SlotStore {
         }
         self.set_discarded(unit, true)?;
         let cursor = (shard_idx, in_shard);
-        self.reclaim_cursor = Some(self.reclaim_cursor.map_or(cursor, |old| old.min(cursor)));
+        self.queue_reclamation(cursor);
         // Preserve a failed punch's backoff policy. A later checkpoint can
         // retry the cursor; new trim hints must not spin on the same failure.
         Ok(())
@@ -1137,10 +1165,9 @@ impl SlotStore {
     }
 
     /// Retry at most 4096 slot positions from one shard per checkpoint.
-    /// The caller must hold the publication lock, stabilize discard metadata,
-    /// and exclude every unit with a newer overlay reservation. Advance only
-    /// after both hole punching and its data sync succeed, so a failure retries
-    /// the same bounded range. Unsupported punching completes the hint.
+    /// The caller stabilizes discard metadata and excludes newer overlay
+    /// reservations. Failed windows are retried in a later sweep, allowing
+    /// other ranges to progress without an unbounded failure queue.
     pub(crate) fn retry_reclamation(
         &mut self,
         can_punch: impl Fn(u64) -> bool,
@@ -1149,29 +1176,32 @@ impl SlotStore {
             return Ok(());
         };
         let shard = &self.shards[&idx];
-        if shard.dirty_discard {
-            self.reclaim_stalled = true;
-            return Err(CoreError::Durability(
-                "reclamation requires durable discard metadata".into(),
-            ));
-        }
         let map = shard
             .discard
             .as_ref()
             .expect("reclaim cursor requires v3 map");
         let map_units = map.units();
         let end = start.saturating_add(4096).min(map_units);
-        let base = idx * self.geometry.units_per_shard();
-        let units: Vec<u64> = (start..end)
-            .filter(|in_shard| map.get(*in_shard))
-            .map(|in_shard| base + in_shard)
-            .filter(|unit| can_punch(*unit))
-            .collect();
-        if let Err(error) = self.punch_slots(units) {
-            self.reclaim_stalled = true;
-            return Err(error);
+        let result = if shard.dirty_discard {
+            Err(CoreError::Durability(
+                "reclamation requires durable discard metadata".into(),
+            ))
+        } else {
+            let base = idx * self.geometry.units_per_shard();
+            let units: Vec<u64> = (start..end)
+                .filter(|in_shard| map.get(*in_shard))
+                .map(|in_shard| base + in_shard)
+                .filter(|unit| can_punch(*unit))
+                .collect();
+            self.punch_slots(units)
+        };
+        if result.is_err() {
+            let failed = (idx, start);
+            self.reclaim_retry_from = Some(
+                self.reclaim_retry_from
+                    .map_or(failed, |old| old.min(failed)),
+            );
         }
-        self.reclaim_stalled = false;
         self.reclaim_cursor = if end < map_units {
             Some((idx, end))
         } else {
@@ -1187,7 +1217,12 @@ impl SlotStore {
                 })
                 .map(|next| (next, 0))
         };
-        Ok(())
+        self.reclaim_stalled = false;
+        if self.reclaim_cursor.is_none() {
+            self.reclaim_cursor = self.reclaim_retry_from.take();
+            self.reclaim_stalled = self.reclaim_cursor.is_some();
+        }
+        result
     }
 
     pub(crate) fn punch_slots(
