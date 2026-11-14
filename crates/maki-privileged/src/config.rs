@@ -117,9 +117,9 @@ impl AttachConfig {
         if nbd_device != AUTO_NBD_DEVICE {
             check_abs_path("nbd_device", &nbd_device)?;
             if crate::probe::nbd_index(&nbd_device).is_none() {
-                return Err(ConfigError::Invalid(format!(
-                    "nbd_device {nbd_device:?} must be a /dev/nbdN device"
-                )));
+                return Err(ConfigError::Invalid(
+                    "nbd_device must be a /dev/nbdN device".into(),
+                ));
             }
         }
         let nbd_socket = overrides
@@ -153,9 +153,9 @@ impl AttachConfig {
         }
         let device_block_size = self.device_block_size.unwrap_or(4096);
         if device_block_size == 0 || !device_block_size.is_power_of_two() {
-            return Err(ConfigError::Invalid(format!(
-                "device_block_size {device_block_size} must be a power of two"
-            )));
+            return Err(ConfigError::Invalid(
+                "device_block_size must be a power of two".into(),
+            ));
         }
         let volume_uuid = match overrides.volume_uuid.or(self.volume_uuid) {
             Some(uuid) => {
@@ -218,14 +218,15 @@ pub(crate) fn check_lvm_identity(pins: &LvmIdentityPins) -> Result<(), ConfigErr
 }
 
 /// A value passed to a system utility: never empty, never option-like,
-/// never containing control characters.
+/// never containing control characters. Diagnostics name the field, never
+/// its rejected value: a valid TOML string can still contain a pasted secret.
 pub fn check_argument(name: &str, value: &str) -> Result<(), ConfigError> {
     if value.is_empty() {
         return Err(ConfigError::Invalid(format!("{name} is empty")));
     }
     if value.starts_with('-') {
         return Err(ConfigError::Invalid(format!(
-            "{name} {value:?} starts with '-' and could be parsed as an option"
+            "{name} starts with '-' and could be parsed as an option"
         )));
     }
     if value.chars().any(|c| c.is_control() || c == '\0') {
@@ -241,7 +242,7 @@ pub fn check_abs_path(name: &str, value: &str) -> Result<(), ConfigError> {
     check_argument(name, value)?;
     if !value.starts_with('/') {
         return Err(ConfigError::Invalid(format!(
-            "{name} {value:?} must be an absolute path"
+            "{name} must be an absolute path"
         )));
     }
     if value == "/" {
@@ -249,13 +250,13 @@ pub fn check_abs_path(name: &str, value: &str) -> Result<(), ConfigError> {
     }
     if value.ends_with('/') {
         return Err(ConfigError::Invalid(format!(
-            "{name} {value:?} must not end with '/'"
+            "{name} must not end with '/'"
         )));
     }
     for component in value.split('/').skip(1) {
         if component.is_empty() || component == "." || component == ".." {
             return Err(ConfigError::Invalid(format!(
-                "{name} {value:?} is not canonical (empty, '.' or '..' component)"
+                "{name} is not canonical (empty, '.' or '..' component)"
             )));
         }
     }
@@ -268,9 +269,9 @@ pub fn check_volume_name(value: &str) -> Result<(), ConfigError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(ConfigError::Invalid(format!(
-            "volume name {value:?} must be [A-Za-z0-9_-]"
-        )));
+        return Err(ConfigError::Invalid(
+            "volume name must be [A-Za-z0-9_-]".into(),
+        ));
     }
     Ok(())
 }
@@ -286,7 +287,7 @@ pub fn check_lvm_name(name: &str, value: &str) -> Result<(), ConfigError> {
         || value == ".."
     {
         return Err(ConfigError::Invalid(format!(
-            "{name} {value:?} is not a valid LVM name"
+            "{name} is not a valid LVM name"
         )));
     }
     Ok(())
@@ -304,7 +305,7 @@ pub fn check_uuid(name: &str, value: &str) -> Result<(), ConfigError> {
             .all(|(p, len)| p.len() == *len && p.chars().all(|c| c.is_ascii_hexdigit()));
     if !ok {
         return Err(ConfigError::Invalid(format!(
-            "{name} {value:?} is not a hyphenated UUID"
+            "{name} is not a hyphenated UUID"
         )));
     }
     Ok(())
@@ -320,9 +321,7 @@ pub fn check_lvm_uuid(name: &str, value: &str) -> Result<(), ConfigError> {
             part.len() == len && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
         });
     if !ok {
-        return Err(ConfigError::Invalid(format!(
-            "{name} {value:?} is not an LVM UUID"
-        )));
+        return Err(ConfigError::Invalid(format!("{name} is not an LVM UUID")));
     }
     Ok(())
 }
