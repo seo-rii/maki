@@ -374,9 +374,13 @@ impl WsCryptoProvider {
             if certificates.is_empty() {
                 return Err("bad CA certificate: PEM contains no certificates".into());
             }
-            let (added, _) = roots.add_parsable_certificates(certificates);
-            if added == 0 {
-                return Err("bad CA certificate: no valid certificates found".into());
+            // Configured trust material must be entirely valid. The
+            // best-effort parser used for native roots would otherwise let
+            // one valid root hide a malformed member of this bundle.
+            for certificate in certificates {
+                roots
+                    .add(certificate)
+                    .map_err(|_| "bad CA certificate: invalid certificate".to_string())?;
             }
         }
 
