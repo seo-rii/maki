@@ -95,6 +95,8 @@ struct FakeSystem {
     readiness_failure: bool,
     replace_on_failure: bool,
     replace_after_deactivate: bool,
+    defer_disconnect: bool,
+    resource_after_disconnect: Option<&'static str>,
     obstruct_record_cleanup: Option<PathBuf>,
     mounted: bool,
     lv_size: u64,
@@ -390,7 +392,15 @@ impl System for FakeSystem {
                     .insert(device.clone(), identifier.unwrap().to_string());
             }
             PlannedStep::NbdDisconnect { device } => {
-                self.backends.remove(device);
+                if !self.defer_disconnect {
+                    self.backends.remove(device);
+                }
+                match self.resource_after_disconnect {
+                    Some("mount") => self.mounted = true,
+                    Some("mapping") => self.vg_active = true,
+                    Some("holder") => self.extra_holders = true,
+                    _ => {}
+                }
                 if let Some(path) = &self.obstruct_record_cleanup {
                     std::fs::remove_file(path).unwrap();
                     std::fs::create_dir(path).unwrap();
@@ -573,6 +583,85 @@ fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
 
     assert_eq!(system.steps, ["umount", "lvm-deactivate"]);
     assert!(state.read("pg").unwrap().is_none());
+}
+
+#[test]
+fn acknowledged_but_incomplete_disconnect_preserves_cleanup_authority_for_retry() {
+    for disappears_between_retries in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.defer_disconnect = true;
+
+        let error = cleanup_with(&plan_detach(&request), &state, &mut system).unwrap_err();
+        assert!(error.to_string().contains("disconnect has not completed"));
+        assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+        assert_eq!(state.read("pg").unwrap(), Some(record.clone()));
+
+        system.steps.clear();
+        assert!(cleanup_with(&plan_detach(&request), &state, &mut system).is_err());
+        assert_eq!(system.steps, ["nbd-disconnect"]);
+        assert_eq!(state.read("pg").unwrap(), Some(record));
+
+        system.steps.clear();
+        system.defer_disconnect = false;
+        if disappears_between_retries {
+            system.backends.clear();
+        }
+        cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+        assert_eq!(
+            system.steps,
+            if disappears_between_retries {
+                vec![]
+            } else {
+                vec!["nbd-disconnect"]
+            }
+        );
+        assert!(state.read("pg").unwrap().is_none());
+        assert!(system.backends.is_empty());
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        assert!(system.mounted);
+    }
+}
+
+#[test]
+fn final_teardown_requires_absent_backend_and_empty_readable_resources() {
+    for fault in [
+        "foreign",
+        "unreadable",
+        "mount",
+        "mapping",
+        "holder",
+        "observation",
+    ] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        match fault {
+            "foreign" => {
+                system.backend_fault_after = Some(("nbd-disconnect", BackendFault::Foreign));
+            }
+            "unreadable" => {
+                system.backend_fault_after = Some(("nbd-disconnect", BackendFault::Unreadable));
+            }
+            "observation" => system.observation_error_after = Some("nbd-disconnect"),
+            _ => system.resource_after_disconnect = Some(fault),
+        }
+        assert!(
+            cleanup_with(&plan_detach(&request), &state, &mut system).is_err(),
+            "{fault}"
+        );
+        assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{fault}");
+    }
 }
 
 #[test]
@@ -1572,6 +1661,55 @@ impl System for ObservedSystem {
             String::new()
         };
         crate::detach::observe(record, &mounts, &self.sysfs)
+    }
+}
+
+#[test]
+fn connected_detach_rechecks_resources_after_the_first_empty_observation() {
+    for holder_appears in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let mut req = request();
+        req.mountpoint = fixture.0.join("mount").to_str().unwrap().into();
+        std::fs::create_dir(&req.mountpoint).unwrap();
+        let sysfs = fixture.0.join("sys");
+        std::fs::create_dir_all(sysfs.join("nbd3/holders")).unwrap();
+        std::fs::write(sysfs.join("nbd3/dev"), "43:3\n").unwrap();
+        let mut system = ObservedSystem {
+            fake: FakeSystem::default(),
+            sysfs,
+        };
+        execute_with(&plan_attach(&req), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        assert!(record.recovery.is_some());
+        assert_eq!(
+            system.backend(&record.device).unwrap(),
+            Some(record.connection_id.clone())
+        );
+        system.fake.steps.clear();
+        system.fake.recovery_observations.set(0);
+        system.fake.holder_after_recovery_observation = holder_appears;
+
+        let result = cleanup_with(&plan_detach(&req), &state, &mut system);
+        assert_eq!(
+            system.fake.steps,
+            ["umount", "lvm-deactivate", "nbd-disconnect"]
+        );
+        assert!(system.fake.backends.is_empty());
+        if holder_appears {
+            assert!(result.is_err(), "retired after a new holder appeared");
+            assert_eq!(state.read("pg").unwrap(), Some(record));
+            let holder = system.sysfs.join("nbd3/holders/dm-99");
+            assert!(holder.exists());
+            std::fs::remove_file(holder).unwrap();
+            system.fake.holder_after_recovery_observation = false;
+            system.fake.steps.clear();
+            cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+            assert!(system.fake.steps.is_empty());
+        } else {
+            result.unwrap();
+        }
+        assert!(state.read("pg").unwrap().is_none());
     }
 }
 

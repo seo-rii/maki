@@ -1470,9 +1470,42 @@ fn execute_with_options(
             });
         }
     }
-    // A completed detach retires the record; a failed one keeps it so the
-    // next attempt still knows the device.
+    // Disconnect acknowledgement can precede the kernel dropping its last
+    // open-device reference. Retire authority only after observing complete
+    // teardown; otherwise a retry must still know which device it owns.
     if disconnects && !connects {
+        let current = record.as_ref().unwrap();
+        if system.backend(&current.device)?.is_some() {
+            return Err(identity_error(
+                "disconnect has not completed; keeping the attach record for cleanup retry",
+            ));
+        }
+        let observed = system.disconnected_recovery_observation(current)?;
+        if observed.mounted || observed.vg_active || observed.nbd_in_use {
+            return Err(identity_error(
+                "disconnect left active attachment resources; keeping the attach record",
+            ));
+        }
+        if system.backend(&current.device)?.is_some() {
+            return Err(identity_error(
+                "backend appeared during final teardown verification; keeping the attach record",
+            ));
+        }
+        // Match disconnected recovery's retirement boundary: a holder or
+        // mapping can appear during the first empty observation even while
+        // the backend remains absent. Confirm resources again before
+        // surrendering the record's cleanup authority.
+        let confirmed = system.disconnected_recovery_observation(current)?;
+        if system.backend(&current.device)?.is_some() {
+            return Err(identity_error(
+                "backend appeared during final teardown verification; keeping the attach record",
+            ));
+        }
+        if confirmed.mounted || confirmed.vg_active || confirmed.nbd_in_use {
+            return Err(identity_error(
+                "attachment gained live resources before record retirement",
+            ));
+        }
         state.unwrap().remove(&plan.volume)?;
     }
     Ok(())
