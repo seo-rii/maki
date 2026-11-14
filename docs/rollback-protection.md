@@ -29,6 +29,13 @@ Replacing an old valid ciphertext page fails authentication against the current
 manifest. Restoring an older complete backing fails comparison with the current
 witness. Missing or corrupt committed evidence refuses attachment; an observed
 witness mismatch or uncertain storage commit stops every handle in that session.
+A transient arena read error refuses only that operation and preserves its I/O
+error. The next operation checks the witness and authenticates the page again;
+missing, short or invalid referenced pages and hash mismatches still stop the
+session, even if their original bytes are later restored. A read failure during
+a multi-page write may leave an already completed prefix in the working view;
+retrying the write can complete it. A failed arena write or commit still requires
+reopening against the witness.
 A remote witness that cannot be reached (a timeout, a refused or reset
 connection, an unavailable quorum) refuses each operation with no fallback, but
 does not stop the session: the next check either matches the claimed record

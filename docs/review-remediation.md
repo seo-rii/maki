@@ -2106,3 +2106,21 @@ or malformed explicit path; older adjacent `deps` layouts remain supported.
 The production plugin is unchanged. The tungstenite lockfile's recorded hash in
 `vendor/patches.json` is updated along with the security dependency resolution
 and checked by the actual vendor source inventory gate.
+
+## Rollback arena read availability (BUG-185, 2026-11-14)
+
+A transient EIO while reading a rollback arena page stopped the entire open
+session, even after storage recovered. The failed read changed neither the
+witness nor the referenced page. Ordinary I/O errors now refuse only that
+operation and preserve their original error; the next operation checks the
+witness and authenticates the page again. Missing, truncated or invalid pages,
+hash mismatches, failed arena writes and uncertain commits still stop every
+handle until reopen. Local and remote rollback modes share this page path.
+
+`maki-backing/src/rollback/arena_read_tests.rs` covers existing-handle and
+freshness recovery, original errno preservation, unchanged witness state,
+retry after a multi-page write prefix, damaged or truncated evidence that
+remains rejected after restoration, and partial writes that still require
+reopen. The maintained tests use an injected memory arena and private witness
+files; the original reproduction used a real local arena with one failed
+positional read. Neither test is a physical power-loss qualification.
