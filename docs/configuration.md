@@ -329,9 +329,14 @@ the endpoint path, and URL fragments are not sent. Configuration accepts `POST`
 and `PUT` in any ASCII case and sends their uppercase spelling; programmatic
 `OpSpec` methods retain their explicit spelling.
 
-Responses can be single-item or batched. If an item index is returned, Maki
-validates it; missing, duplicate, reordered, oversized, or partial responses are
-provider contract errors. Response bodies are read under a hard size limit.
+Responses can be single-item or batched. For JSON responses, a configured
+`item_index_path` requires an unsigned integer echo matching the requested unit
+index, relative to the whole single-item response or each batch element. Missing,
+wrong, or non-integer echoes are provider contract errors. Single-item mappings
+may omit this setting; batch mappings require it. Raw responses remain unchanged.
+The response-size limit includes the configured echo and JSON wrappers. Missing,
+duplicate, reordered, oversized, or partial batch responses are provider contract
+errors. Response bodies are read under a hard size limit.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
 

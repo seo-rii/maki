@@ -497,7 +497,7 @@ fn http_json_malformed_response_erases_completed_strings_and_keys() {
     for wire in wires {
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body);
+        let result = provider.parse_single(&op, body, 0);
         let failed = result.is_err();
         drop(result);
         let inspection = finish_inspection();
@@ -518,7 +518,7 @@ fn http_json_duplicate_values_are_erased_before_replacement() {
     let provider = test_provider(&op);
     let body = SecretBuffer::from_slice(wire.as_bytes());
     begin_inspection();
-    let result = provider.parse_single(&op, body).unwrap();
+    let result = provider.parse_single(&op, body, 0).unwrap();
     let inspection = finish_inspection();
     assert_eq!(result.expose(), b"a");
     assert_sensitive_allocations_wiped(inspection, 1);
@@ -534,7 +534,7 @@ fn http_json_duplicate_keys_are_erased_before_discarding() {
     let provider = test_provider(&op);
     let body = SecretBuffer::from_slice(wire.as_bytes());
     begin_inspection();
-    let result = provider.parse_single(&op, body).unwrap();
+    let result = provider.parse_single(&op, body, 0).unwrap();
     let inspection = finish_inspection();
     assert_eq!(result.expose(), b"a");
     assert_sensitive_allocations_wiped(inspection, 2);
@@ -551,7 +551,7 @@ fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
         let wire = format!(r#"{{"{secret}":["{secret}"],"data":{data}}}"#);
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body);
+        let result = provider.parse_single(&op, body, 0);
         let succeeded = result.is_ok();
         drop(result);
         let inspection = finish_inspection();
