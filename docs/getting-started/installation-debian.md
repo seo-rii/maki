@@ -115,11 +115,12 @@ git clone https://github.com/seo-rii/maki.git && cd maki
 git rev-parse HEAD
 rustup toolchain install 1.94.0 --profile minimal
 apt install -y python3 dpkg-dev build-essential
+maki_version="$(python3 -B scripts/prepare_release.py --print-version)"
 cargo +1.94.0 build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
   --release-dir target/release \
-  --version 0.1.0+git$(git rev-parse --short=12 HEAD) \
+  --version "$maki_version" \
   --architecture "$(dpkg --print-architecture)" \
   --output ../maki.deb
 ```
@@ -127,6 +128,11 @@ python3 packaging/debian/build-deb.py \
 The builder verifies that every artifact is an ELF image for the requested
 architecture and records the binaries' native library dependencies in
 `Depends` with `dpkg-shlibdeps` (which is why `dpkg-dev` is required).
+The version command requires a clean tracked checkout and complete Git history.
+It uses the same [candidate version policy](../releasing.md#candidate-version-ordering)
+as release bundles: descendant commits increase in version, and candidates sort
+below their final workspace version. Fetch missing history with
+`git fetch --unshallow` if the checkout is shallow.
 
 [`packaging/debian/README.md`](../../packaging/debian/README.md) describes what
 the package contains. It deliberately owns nothing below `/etc/maki`, does not
@@ -134,6 +140,11 @@ enable a volume, and never starts or restarts a service during install or
 upgrade.
 
 ## Install the Maki package
+
+If Maki was installed from an older `0.1.0+git<commit>` source-build recipe,
+first follow the [one-time migration guidance](../releasing.md#migrating-legacy-source-build-packages).
+Those legacy versions sort above the new candidates and final `0.1.0`;
+the normal command below intentionally refuses an unattended downgrade.
 
 ```bash
 apt install -y ./maki.deb

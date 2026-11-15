@@ -18,7 +18,7 @@ SCRIPT = ROOT / "scripts/prepare_release.py"
 
 @unittest.skipUnless(
     sys.platform.startswith("linux")
-    and all(shutil.which(tool) for tool in ("git", "cc", "dpkg-deb", "dpkg-shlibdeps")),
+    and all(shutil.which(tool) for tool in ("git", "cc", "dpkg", "dpkg-deb", "dpkg-shlibdeps")),
     "candidate package tests need native Linux Debian packaging tools and cc",
 )
 class ReleasePreparationTests(unittest.TestCase):
@@ -94,12 +94,35 @@ class ReleasePreparationTests(unittest.TestCase):
             "PATH": str(self.tools) + os.pathsep + os.defpath,
             "LANG": "C",
             "LC_ALL": "C",
+            "TMPDIR": str(self.work),
         }
 
-    def git(self, *args):
+    def git(self, *args, env=None):
         return subprocess.run(
-            ["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True
+            ["git", "-C", str(self.repo), *args], env=env, check=True, capture_output=True, text=True
         ).stdout.strip()
+
+    def print_version(self, succeeds=True):
+        result = subprocess.run(
+            [sys.executable, "-B", str(self.repo / "scripts/prepare_release.py"), "--print-version"],
+            cwd=self.work,
+            env=self.environment,
+            capture_output=True,
+            text=True,
+        )
+        if succeeds:
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(result.stdout.count("\n"), 1)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout, "")
+        return result
+
+    def assert_version_order(self, earlier, later):
+        result = subprocess.run(
+            ["dpkg", "--compare-versions", earlier, "lt", later], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, f"{earlier} must sort below {later}: {result.stderr}")
 
     def prepare(self, name="candidate", succeeds=True):
         output = self.work / name
@@ -129,7 +152,8 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertIn("host: fixture-native-linux-gnu", manifest["toolchain"]["rustc"])
         package = output / manifest["package"]["filename"]
         package_version = subprocess.check_output(["dpkg-deb", "--field", package, "Version"], text=True).strip()
-        self.assertEqual(package_version, f"0.1.0~rc+git{self.commit[:12]}")
+        self.assertEqual(package_version, f"0.1.0~rc+rev1.git{self.commit[:12]}")
+        self.assertEqual(package_version, self.print_version().stdout.strip())
         self.assertIn("libc6", manifest["package"]["depends"])
         self.assertIn("nbd-client (>= 1:3.27.0)", manifest["package"]["depends"])
         with tarfile.open(output / manifest["source"]["filename"], "r:gz") as archive:
@@ -150,6 +174,92 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertNotEqual(pathlib.Path(invocation["cwd"]), self.repo)
         self.assertEqual(invocation["epoch"], self.git("show", "-s", "--format=%ct", "HEAD"))
 
+    def test_print_version_needs_no_build_tools_or_output_directory(self):
+        # Only Git is needed: neither dpkg nor the selected compiler is usable.
+        (self.tools / "git").symlink_to(shutil.which("git"))
+        self.environment["PATH"] = str(self.tools)
+        self.environment["RUSTC"] = "compiler-must-not-be-probed"
+        self.environment["CANDIDATE_FIXTURE_BUILD_FAIL"] = "1"
+        before = set(self.work.iterdir())
+        version = self.print_version().stdout.strip()
+        self.assertEqual(version, f"0.1.0~rc+rev1.git{self.commit[:12]}")
+        self.assertEqual(self.print_version().stdout.strip(), version)
+        self.assertEqual(set(self.work.iterdir()), before)
+        self.assertFalse(self.cargo_trace.exists())
+
+    def test_descendant_version_increases_despite_reversed_hashes_and_timestamps(self):
+        tree = self.git("rev-parse", "HEAD^{tree}")
+
+        def commit_after(parent, epoch, prefix=""):
+            environment = self.environment | {
+                "GIT_AUTHOR_DATE": f"{epoch} +0000",
+                "GIT_COMMITTER_DATE": f"{epoch} +0000",
+            }
+            # Choose real Git objects with deliberately reversed hash order.
+            # Unreferenced trial objects do not affect the ancestor count.
+            for attempt in range(512):
+                commit = self.git(
+                    "commit-tree", tree, "-p", parent, "-m", f"version order fixture {attempt}",
+                    env=environment,
+                )
+                if commit.startswith(prefix):
+                    self.git("update-ref", "HEAD", commit)
+                    return commit
+            self.fail(f"could not make a fixture commit with prefix {prefix}")
+
+        parent = self.commit
+        for _ in range(7):
+            parent = commit_after(parent, 2_000_000_000)
+        ancestor = commit_after(parent, 2_000_000_000, "f")
+        earlier = self.print_version().stdout.strip()
+        descendant = commit_after(ancestor, 1_000_000_000, "0")
+        later = self.print_version().stdout.strip()
+        self.assertEqual(earlier, f"0.1.0~rc+rev9.git{ancestor[:12]}")
+        self.assertEqual(later, f"0.1.0~rc+rev10.git{descendant[:12]}")
+        self.assertLess(
+            int(self.git("show", "-s", "--format=%ct", descendant)),
+            int(self.git("show", "-s", "--format=%ct", ancestor)),
+        )
+        self.assert_version_order(f"0.1.0~rc+git{descendant[:12]}", f"0.1.0~rc+git{ancestor[:12]}")
+        self.assert_version_order(earlier, later)
+        self.assertFalse(self.cargo_trace.exists())
+
+    def test_candidate_order_covers_legacy_rc_final_and_workspace_bump(self):
+        candidate = self.print_version().stdout.strip()
+        for legacy_hash in ("000000000000", "ffffffffffff"):
+            self.assert_version_order(f"0.1.0~rc+git{legacy_hash}", candidate)
+        self.assert_version_order(candidate, "0.1.0")
+        # Old source-build packages need a reviewed downgrade migration: their
+        # suffix sorts above both the new prerelease and the same final version.
+        self.assert_version_order(candidate, "0.1.0+git000000000000")
+        self.assert_version_order("0.1.0", "0.1.0+git000000000000")
+        (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.1"\n')
+        self.git("add", "Cargo.toml")
+        self.git("commit", "-qm", "test: bump the workspace version")
+        next_candidate = self.print_version().stdout.strip()
+        self.assertEqual(next_candidate, f"0.1.1~rc+rev2.git{self.git('rev-parse', 'HEAD')[:12]}")
+        self.assert_version_order(candidate, next_candidate)
+        self.assert_version_order("0.1.0", next_candidate)
+        self.assert_version_order(next_candidate, "0.1.1")
+
+    def test_shallow_history_is_refused_before_output_or_building(self):
+        self.git("commit", "--allow-empty", "-qm", "test: complete history has two commits")
+        complete_version = self.print_version().stdout.strip()
+        shallow = self.work / "shallow"
+        self.git("clone", "--quiet", "--depth=1", self.repo.as_uri(), str(shallow))
+        self.repo = shallow
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.environment["RUSTC"] = "compiler-must-not-be-probed"
+        result = self.print_version(succeeds=False)
+        self.assertIn("complete Git history", result.stderr)
+        output, result = self.prepare("never-created/candidate", succeeds=False)
+        self.assertIn("complete Git history", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(output.parent.exists())
+        self.assertFalse(self.cargo_trace.exists())
+        self.git("fetch", "--quiet", "--unshallow")
+        self.assertEqual(self.print_version().stdout.strip(), complete_version)
+
     def test_tracked_worktree_changes_are_refused_before_building(self):
         with (self.repo / "Cargo.toml").open("a") as handle:
             handle.write("# not committed\n")
@@ -157,6 +267,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertIn("tracked", result.stderr)
         self.assertFalse(output.exists())
         self.assertFalse(self.cargo_trace.exists())
+        self.assertIn("tracked", self.print_version(succeeds=False).stderr)
 
     def test_candidate_isolates_intermediates_from_environment_and_cargo_config(self):
         for setting in ("environment", "config"):
@@ -231,6 +342,7 @@ class ReleasePreparationTests(unittest.TestCase):
         output, result = self.prepare(succeeds=False)
         self.assertIn("tracked", result.stderr)
         self.assertFalse(output.exists())
+        self.assertIn("tracked", self.print_version(succeeds=False).stderr)
 
     def test_existing_output_is_preserved(self):
         output = self.work / "candidate"
