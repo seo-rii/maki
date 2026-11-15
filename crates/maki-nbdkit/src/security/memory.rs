@@ -125,8 +125,14 @@ mod linux {
             let Some((before, after)) = line.split_once(" - ") else {
                 return Err("malformed mountinfo".into());
             };
-            let fields: Vec<_> = before.split_whitespace().collect();
-            let fs: Vec<_> = after.split_whitespace().collect();
+            // Linux separates fields with ASCII spaces and escapes spaces,
+            // tabs, newlines and backslashes within paths. Other whitespace,
+            // including Unicode, carriage return and form-feed, is path data.
+            let fields: Vec<_> = before
+                .split(' ')
+                .filter(|field| !field.is_empty())
+                .collect();
+            let fs: Vec<_> = after.split(' ').filter(|field| !field.is_empty()).collect();
             if fields.len() < 6 || fs.len() < 3 {
                 return Err("malformed mountinfo fields".into());
             }
@@ -383,6 +389,40 @@ mod tests {
     }
 
     #[test]
+    fn preserves_non_separator_whitespace_in_mountpoints_and_membership() {
+        for whitespace in ['\u{00a0}', '\u{2003}', '\r', '\u{000c}'] {
+            let mount = format!("/sys/fs/cgroup{whitespace}real");
+            let group = format!("/slice/service{whitespace}name");
+            let result = layout(&format!("0::{group}\n"), &mountinfo("/", &mount)).unwrap();
+            assert_eq!(result.mount, Path::new(&mount));
+            assert_eq!(result.leaf, Path::new(&format!("{mount}{group}")));
+        }
+    }
+
+    #[test]
+    fn whitespace_in_a_sibling_mountpoint_does_not_shadow_cgroup_policy() {
+        for whitespace in ['\u{00a0}', '\u{2003}', '\r', '\u{000c}'] {
+            let mounts = format!(
+                "{}44 31 0:55 / /sys/fs/cgroup{whitespace}backup rw - tmpfs tmpfs rw\n",
+                mountinfo("/", "/sys/fs/cgroup")
+            );
+            let result = layout("0::/slice/daemon\n", &mounts).unwrap();
+            assert_eq!(result.mount, Path::new("/sys/fs/cgroup"));
+            assert_eq!(result.leaf, Path::new("/sys/fs/cgroup/slice/daemon"));
+        }
+    }
+
+    #[test]
+    fn whitespace_named_subtrees_are_not_the_cgroup_hierarchy_root() {
+        for whitespace in ['\u{00a0}', '\u{2003}', '\r', '\u{000c}'] {
+            let root = format!("/{whitespace}");
+            let error =
+                layout("0::/slice/daemon\n", &mountinfo(&root, "/sys/fs/cgroup")).unwrap_err();
+            assert_eq!(error, "subtree cgroup mount hides ancestor limits");
+        }
+    }
+
+    #[test]
     fn refuses_escaping_ambiguous_hidden_and_missing_hierarchies() {
         for membership in [
             "",
@@ -407,6 +447,8 @@ mod tests {
             mountinfo("/", "/bad/../mount"),
             mountinfo("/", "/bad\\777mount"),
             mountinfo("/", "/sys/fs/cgroup").repeat(2),
+            "31\t22\t0:26\t/\t/sys/fs/cgroup\trw - cgroup2 cgroup2 rw\n".into(),
+            "31 22 0:26 / /sys/fs/cgroup rw - cgroup2\tcgroup2\trw\n".into(),
             String::new(),
         ] {
             assert!(layout("0::/slice/daemon\n", &info).is_err(), "{info}");
@@ -423,6 +465,18 @@ mod tests {
             layout("0::/slice/daemon\n", &mounts).is_err(),
             "a shadow mount cannot supply kernel policy"
         );
+    }
+
+    #[test]
+    fn whitespace_named_submounts_still_shadow_cgroup_policy() {
+        for whitespace in ['\u{00a0}', '\u{2003}', '\r', '\u{000c}'] {
+            let mounts = format!(
+                "{}44 31 0:55 / /sys/fs/cgroup/slice{whitespace}child rw - tmpfs tmpfs rw\n",
+                mountinfo("/", "/sys/fs/cgroup")
+            );
+            let error = layout("0::/slice/daemon\n", &mounts).unwrap_err();
+            assert_eq!(error, "nested mount can shadow cgroup memory policy");
+        }
     }
 
     #[test]
