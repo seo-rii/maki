@@ -49,13 +49,56 @@ Compiler wrappers and flags remain supported and recorded as below; this
 selection policy does not make an arbitrary wrapper or Cargo configuration
 hermetic.
 
+## Candidate version ordering
+
+For workspace version `0.1.0`, the package version is
+`0.1.0~rc+rev<count>.git<12-character-commit>`. The count is
+`git rev-list --count <commit>`: all commits reachable from the selected source,
+including merged ancestry. A descendant has a strictly larger count than its
+ancestor, so Debian orders it as an upgrade for the same workspace version even
+when its hash or commit timestamp sorts earlier. The numeric revision precedes
+the hash, so revision 10 also sorts above revision 9.
+
+This ordering applies along ancestry with complete history. It does not define
+a chronological order between incomparable branches or across rebased or
+rewritten histories. Use an approved source lineage for upgrades. Shallow
+repositories are refused before producing a version or starting a build;
+fetch their complete history with `git fetch --unshallow` before retrying.
+
+New candidates sort above the previous `0.1.0~rc+git<commit>` candidates and
+below the final `0.1.0`. After publishing a final release, bump the workspace
+version before preparing its successor's candidates. Both source-build recipes
+and the bundle builder use the same command for the version:
+
+```bash
+python3 -B scripts/prepare_release.py --print-version
+```
+
+This mode checks committed source and complete history, prints one version,
+and creates no build or output directory. It needs Python and Git, without
+probing Rust or Debian packaging tools.
+
+### Migrating legacy source-build packages
+
+Earlier source-build recipes used `0.1.0+git<commit>`. Debian orders those
+versions above both the new candidates and the final `0.1.0`. A prerelease
+cannot both upgrade those legacy packages and sort below that final version.
+Moving an installed legacy package to the new scheme therefore requires an
+explicitly reviewed one-time downgrade, even if the source commit is newer.
+
+Compare the installed version (`dpkg-query -W -f='${Version}\n' maki`) with the
+intended package (`dpkg-deb --field ./maki.deb Version`), review its source and
+checksums, and follow the stopped-workload
+[runtime upgrade procedure](operations.md#upgrading-the-runtime-layout).
+Only for that approved migration, add `--allow-downgrades` to the one-time
+`apt install -y` invocation. Keep normal installs and subsequent upgrades on
+the ordinary command without that flag.
+
 ## Prepare and inspect
 
-From the repository root, choose a new output directory. The candidate package
-version is `0.1.0~rc+git<12-character-commit>` while the workspace version is
-`0.1.0`; Debian orders that candidate below the final `0.1.0` release.
-The following Bash commands keep the long build in the background with a
-private log and preserve its PID and exit status:
+From the repository root, choose a new output directory. The following Bash
+commands keep the long build in the background with a private log and preserve
+its PID and exit status:
 
 ```bash
 umask 077
@@ -157,7 +200,8 @@ python3 -B scripts/check_docs_links.py
 The preparation contract uses a temporary Git repository, small native C ELF
 fixtures, a simulated Cargo build and the real Debian package/dependency tools.
 It checks committed-source provenance, checksums, deterministic packaging,
-dirty-source refusal, output preservation, source-link refusal, intermediate
-build isolation, compiler selection and failure cleanup without rebuilding the
-Rust workspace. The Linux PR job runs it;
+version ordering with real Git history and `dpkg`, shallow- and dirty-source
+refusal, output preservation, source-link refusal, intermediate build isolation,
+compiler selection and failure cleanup without rebuilding the Rust workspace.
+The Linux PR job runs it;
 successful contract tests are not a full candidate-build or installation result.

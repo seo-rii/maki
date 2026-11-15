@@ -4,18 +4,29 @@ For a reviewable candidate with source provenance, host metadata and checksums,
 use [the release preparation command](../../docs/releasing.md). It builds from
 committed source and always retains the native dependency scan described below.
 
-Build the release binaries first, then create the package from that immutable
-artifact directory:
+From a clean tracked checkout with complete Git history, obtain the candidate
+version, build the release binaries, then package that immutable artifact
+directory:
 
 ```bash
+set -euo pipefail
+maki_version="$(python3 -B scripts/prepare_release.py --print-version)"
 cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
   --release-dir target/release \
-  --version 0.1.0+git$(git rev-parse --short=12 HEAD) \
+  --version "$maki_version" \
   --architecture "$(dpkg --print-architecture)" \
   --output ../maki.deb
 ```
+
+The version command needs Python 3.11 or newer and Git. It shares the bundle
+builder's [version policy](../../docs/releasing.md#candidate-version-ordering):
+`<workspace>~rc+rev<ancestor-count>.git<commit>` increases along source ancestry
+and sorts below the final workspace version. Shallow checkouts must fetch their
+complete history before building. Existing packages made with the old
+`<workspace>+git<commit>` recipe require an
+[explicitly reviewed one-time downgrade migration](../../docs/releasing.md#migrating-legacy-source-build-packages).
 
 The package installs the daemon, helper, checker, plugin, service templates,
 sysusers/tmpfiles rules, and examples. It deliberately owns no file below

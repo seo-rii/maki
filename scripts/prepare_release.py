@@ -40,21 +40,31 @@ def digest(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def prepare(output):
+def candidate_source_version():
     # Capture only a committed source tree. Untracked files are excluded by
     # git archive, and staged/unstaged tracked changes must not be mistaken
     # for source included in this candidate.
-    if output.exists() or output.is_symlink():
-        fail(f"output already exists: {output}")
     if git("status", "--porcelain", "--untracked-files=no"):
         fail("tracked changes must be committed before preparing a candidate")
+    if git("rev-parse", "--is-shallow-repository") != "false":
+        fail("candidate versions require complete Git history; fetch --unshallow before retrying")
     commit = git("rev-parse", "HEAD")
-    tree = git("rev-parse", f"{commit}^{{tree}}")
-    epoch = int(git("show", "-s", "--format=%ct", commit))
     workspace_version = tomllib.loads(git("show", f"{commit}:Cargo.toml"))["workspace"]["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", workspace_version):
         fail("candidate preparation requires a numeric major.minor.patch workspace version")
-    version = f"{workspace_version}~rc+git{commit[:12]}"
+    # A descendant has strictly more reachable commits than its ancestor.
+    # Compare that number before the hash; neither hashes nor timestamps are
+    # monotonic. The 'rev' prefix also sorts above legacy '~rc+git' versions.
+    revision = int(git("rev-list", "--count", commit))
+    return commit, workspace_version, f"{workspace_version}~rc+rev{revision}.git{commit[:12]}"
+
+
+def prepare(output):
+    if output.exists() or output.is_symlink():
+        fail(f"output already exists: {output}")
+    commit, workspace_version, version = candidate_source_version()
+    tree = git("rev-parse", f"{commit}^{{tree}}")
+    epoch = int(git("show", "-s", "--format=%ct", commit))
     architecture = run(["dpkg", "--print-architecture"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", architecture):
         fail("dpkg returned an invalid native architecture")
@@ -169,9 +179,15 @@ def prepare(output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=pathlib.Path, help="new candidate directory")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--output", type=pathlib.Path, help="new candidate directory")
+    action.add_argument("--print-version", action="store_true",
+                        help="print the committed source's candidate version without building")
     args = parser.parse_args()
-    prepare(args.output.absolute())
+    if args.print_version:
+        print(candidate_source_version()[2])
+    else:
+        prepare(args.output.absolute())
 
 
 if __name__ == "__main__":
