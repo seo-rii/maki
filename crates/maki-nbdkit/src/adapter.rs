@@ -51,8 +51,14 @@ impl AdapterError {
 fn map_core_error(e: &CoreError) -> AdapterError {
     let errno = match e {
         CoreError::Invalid(_) => EINVAL,
+        // nbdkit classifies quota and file-size limits as capacity failures too.
         CoreError::Io(io) | CoreError::Format(maki_format::FormatError::Io(io))
-            if io.kind() == std::io::ErrorKind::StorageFull =>
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull
+                    | std::io::ErrorKind::QuotaExceeded
+                    | std::io::ErrorKind::FileTooLarge
+            ) =>
         {
             ENOSPC
         }
