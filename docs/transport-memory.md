@@ -60,6 +60,8 @@ validated as UTF-8 by borrowing the key-source buffer rather than copying it to
 an intermediate vector. The combined mTLS certificate/private-key PEM is
 guarded during construction and erased when its TLS specification is dropped,
 including construction and client-builder errors.
+The TLS-file reader owns erasure before its first read, so an I/O error after
+reading a combined PEM prefix also erases that buffer before returning.
 
 Maki-owned payloads, serialized request bodies, streamed response buffers and
 decoded outputs use page-lock-capable `SecretBuffer`s. Fixed-capacity allocation
