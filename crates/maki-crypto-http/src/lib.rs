@@ -351,7 +351,8 @@ pub struct RespSpec {
     pub data_path: Option<String>,
     pub encoding: PayloadEncoding,
     pub items_path: Option<String>,
-    /// Optional per-element unit-index echo, validated when configured.
+    /// Optional unit-index echo, required and validated in JSON responses when
+    /// configured. Relative to the whole document or each batch element.
     pub item_index_path: Option<String>,
 }
 
@@ -871,7 +872,12 @@ impl HttpCryptoProvider {
         Ok(out)
     }
 
-    fn parse_single(&self, op: &OpSpec, body: SecretBuffer) -> Result<SecretBuffer, CryptoError> {
+    fn parse_single(
+        &self,
+        op: &OpSpec,
+        body: SecretBuffer,
+        unit_index: u64,
+    ) -> Result<SecretBuffer, CryptoError> {
         match op.response.kind {
             RespKind::Raw => Ok(body),
             RespKind::Json => {
@@ -880,6 +886,14 @@ impl HttpCryptoProvider {
                 // The tree owns its strings; release the duplicate wire body
                 // before allocating the decoded payload.
                 drop(body);
+                if let Some(index_path) = &op.response.item_index_path {
+                    let echoed = value.pointer(index_path).and_then(|v| v.as_u64());
+                    if echoed != Some(unit_index) {
+                        return Err(CryptoError::Contract(format!(
+                            "response echoes unit {echoed:?}, expected {unit_index}"
+                        )));
+                    }
+                }
                 let path = op
                     .response
                     .data_path
@@ -963,7 +977,7 @@ impl HttpCryptoProvider {
                 }
             };
             let response = self.send(op, body, json).await?;
-            out.push(self.parse_single(op, response)?);
+            out.push(self.parse_single(op, response, *unit_index)?);
         }
         Ok(out)
     }

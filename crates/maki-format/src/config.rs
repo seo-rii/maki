@@ -512,7 +512,8 @@ pub struct ResponseConfig {
     /// Batch: pointer to the response array.
     #[serde(default)]
     pub items_path: Option<String>,
-    /// Optional per-element echo of the unit index, validated when present.
+    /// JSON pointer to the unit-index echo in the whole response or each batch
+    /// element. When configured, the echo is required and must match the request.
     #[serde(default)]
     pub item_index_path: Option<String>,
 }

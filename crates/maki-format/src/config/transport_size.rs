@@ -166,8 +166,7 @@ impl VolumeConfig {
         let mut item = pointer_overhead(data_path)?
             .saturating_add(encoded)
             .saturating_add(2);
-        if batch {
-            let index_path = response.item_index_path.as_deref().unwrap_or("");
+        if let Some(index_path) = response.item_index_path.as_deref() {
             // These must address separate leaves; otherwise a JSON element
             // cannot contain both a string payload and a numeric echo.
             if data_path.is_empty()
@@ -181,7 +180,7 @@ impl VolumeConfig {
                     .is_some_and(|tail| tail.starts_with('/'))
             {
                 return Err(invalid(
-                    "HTTP batch payload and index paths must address separate fields",
+                    "HTTP payload and index paths must address separate fields",
                 ));
             }
             item = item
@@ -190,6 +189,8 @@ impl VolumeConfig {
                 // Two independently wrapped objects merge into one: remove
                 // two braces and add a comma. Shared ancestors overestimate.
                 .saturating_sub(1);
+        }
+        if batch {
             let wrapper = pointer_overhead(response.items_path.as_deref().unwrap_or(""))?;
             Ok(wrapper
                 .saturating_add(2)
