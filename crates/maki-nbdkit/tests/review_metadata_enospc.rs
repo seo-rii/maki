@@ -1,4 +1,4 @@
-//! BUG-069: metadata I/O must preserve ENOSPC at the public NBD boundary.
+//! BUG-069 and capacity-errno follow-up: preserve backing capacity errors at NBD.
 
 use std::{io, sync::Arc};
 
@@ -162,7 +162,7 @@ fn slot_data_enospc_keeps_its_existing_classification() {
 }
 
 #[test]
-fn metadata_io_other_than_enospc_remains_eio() {
+fn metadata_non_capacity_io_remains_eio() {
     for kind in [io::ErrorKind::InvalidData, io::ErrorKind::PermissionDenied] {
         let (backing, adapter) = fixture();
         metadata_fault(&backing, MetadataOperation::Write, kind);
@@ -203,4 +203,77 @@ fn inline_checkpoint_without_a_fault_succeeds() {
         .pwrite(&[0x44; UNIT], 3 * UNIT as u64, true)
         .unwrap();
     adapter.checkpoint().unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WriteSite {
+    SlotData,
+    AllocationMetadata,
+}
+
+fn assert_write_failure(
+    site: WriteSite,
+    make_error: impl Fn() -> io::Error + Send + Sync + 'static,
+    expected_errno: i32,
+) {
+    let (backing, adapter) = fixture();
+    let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_hit = hit.clone();
+    backing.set_fault_hook(Some(Arc::new(move |event| {
+        let FaultOp::WriteAt { path, .. } = event else {
+            return None;
+        };
+        let selected = match site {
+            WriteSite::SlotData => path.ends_with(".dat"),
+            WriteSite::AllocationMetadata => path.contains("alloc"),
+        };
+        if !selected {
+            return None;
+        }
+        observed_hit.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(make_error())
+    })));
+    let error = adapter
+        .pwrite(&[0x44; UNIT], 3 * UNIT as u64, false)
+        .expect_err("the injected backing error must reach the adapter");
+    assert!(
+        hit.load(std::sync::atomic::Ordering::Relaxed),
+        "the {site:?} fault must be exercised"
+    );
+    assert_eq!(error.errno, expected_errno, "site={site:?}: {error}");
+}
+
+#[test]
+fn backing_error_kinds_keep_capacity_and_io_distinct() {
+    for site in [WriteSite::SlotData, WriteSite::AllocationMetadata] {
+        for (kind, expected) in [
+            (io::ErrorKind::StorageFull, ENOSPC),
+            (io::ErrorKind::QuotaExceeded, ENOSPC),
+            (io::ErrorKind::FileTooLarge, ENOSPC),
+            (io::ErrorKind::Other, EIO),
+        ] {
+            assert_write_failure(
+                site,
+                move || io::Error::new(kind, "injected backing I/O error"),
+                expected,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn raw_backing_errnos_keep_capacity_and_io_distinct() {
+    // Use the actual Linux errnos, including an EIO control, at both the
+    // direct slot-I/O and wrapped FormatError::Io metadata boundaries.
+    for site in [WriteSite::SlotData, WriteSite::AllocationMetadata] {
+        for (errno, expected) in [
+            (libc::EDQUOT, ENOSPC),
+            (libc::EFBIG, ENOSPC),
+            (libc::ENOSPC, ENOSPC),
+            (libc::EIO, EIO),
+        ] {
+            assert_write_failure(site, move || io::Error::from_raw_os_error(errno), expected);
+        }
+    }
 }
