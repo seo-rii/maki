@@ -57,7 +57,11 @@ Resolved header and query values are erased when their operation specification
 is dropped. Header values are guarded while the specification is assembled, so
 a later mapping error also erases values already resolved. Credential bytes are
 validated as UTF-8 by borrowing the key-source buffer rather than copying it to
-an intermediate vector. The combined mTLS certificate/private-key PEM is
+an intermediate vector. Credential templates compute and reserve the checked final
+size before copying secret fragments into a zeroizing owner. Suffixes and repeated
+placeholders therefore cannot release unguarded intermediate allocations during
+string growth; invalid header values also erase the completed buffer. The combined
+mTLS certificate/private-key PEM is
 guarded during construction and erased when its TLS specification is dropped,
 including construction and client-builder errors.
 The TLS-file reader owns erasure before its first read, so an I/O error after

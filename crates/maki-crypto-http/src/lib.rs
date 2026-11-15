@@ -1077,16 +1077,44 @@ impl HttpCryptoProvider {
                         "header name {name:?} is not a valid HTTP header"
                     )));
                 }
-                let resolved = match value {
-                    HeaderValue::Literal(v) => v.clone(),
+                let mut resolved = match value {
+                    HeaderValue::Literal(v) => Zeroizing::new(v.clone()),
                     HeaderValue::Credential(cred) => {
                         let secret = keys.load_text(&cred.name)?;
                         let text = std::str::from_utf8(secret.expose())
-                            .map_err(|_| fatal("credential is not valid UTF-8"))?;
+                            .map_err(|_| fatal("credential is not valid UTF-8"))?
+                            .trim();
+                        let length = match &cred.format {
+                            Some(template) => {
+                                let replacements = template.matches("{}").count();
+                                replacements
+                                    .checked_mul(text.len())
+                                    .and_then(|bytes| {
+                                        bytes.checked_add(template.len() - replacements * 2)
+                                    })
+                                    .ok_or_else(|| fatal("formatted credential is too large"))?
+                            }
+                            None => text.len(),
+                        };
+                        // Own erasure before copying any credential bytes. Reserve
+                        // the final size so appending a suffix or another placeholder
+                        // cannot release an earlier allocation containing the secret.
+                        let mut resolved = Zeroizing::new(String::new());
+                        resolved
+                            .try_reserve_exact(length)
+                            .map_err(|_| fatal("formatted credential is too large"))?;
                         match &cred.format {
-                            Some(template) => template.replace("{}", text.trim()),
-                            None => text.trim().to_string(),
+                            Some(template) => {
+                                for (index, part) in template.split("{}").enumerate() {
+                                    if index != 0 {
+                                        resolved.push_str(text);
+                                    }
+                                    resolved.push_str(part);
+                                }
+                            }
+                            None => resolved.push_str(text),
                         }
+                        resolved
                     }
                 };
                 // Likewise an invalid value; never echo a value that may be
@@ -1098,14 +1126,14 @@ impl HttpCryptoProvider {
                     .bytes()
                     .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f));
                 if !valid_value {
-                    let mut resolved = resolved;
-                    resolved.zeroize();
                     return Err(fatal(format!(
                         "header {name:?} resolves to an invalid HTTP header value \
                          (control character?)"
                     )));
                 }
-                headers.0.push((name.clone(), resolved));
+                headers
+                    .0
+                    .push((name.clone(), std::mem::take(&mut *resolved)));
             }
             let body = match &op_cfg.body {
                 None => BodySpec::Raw,
