@@ -94,7 +94,8 @@ mod linux {
 
     pub(super) fn layout(membership: &str, mountinfo: &str) -> Result<Layout, String> {
         let mut group = None;
-        for line in membership.lines() {
+        // procfs terminates records with LF; a preceding CR belongs to the path.
+        for line in membership.split_terminator('\n') {
             let mut fields = line.splitn(3, ':');
             let id = fields.next().ok_or("malformed cgroup membership")?;
             let controllers = fields.next().ok_or("malformed cgroup membership")?;
@@ -397,6 +398,49 @@ mod tests {
             assert_eq!(result.mount, Path::new(&mount));
             assert_eq!(result.leaf, Path::new(&format!("{mount}{group}")));
         }
+    }
+
+    #[test]
+    fn preserves_trailing_carriage_returns_in_membership() {
+        for group in ["/slice/service\r", "/slice/service\r\r"] {
+            for ending in ["", "\n"] {
+                let membership = format!("1:cpu:/legacy\r\n0::{group}{ending}");
+                let result = layout(&membership, &mountinfo("/", "/sys/fs/cgroup")).unwrap();
+                assert_eq!(result.leaf, Path::new(&format!("/sys/fs/cgroup{group}")));
+            }
+        }
+    }
+
+    #[test]
+    fn admission_checks_carriage_return_named_leaf_instead_of_sibling() {
+        let f = Fixture::new();
+        let actual = f.layout.mount.join("slice/service\r");
+        std::fs::create_dir(&actual).unwrap();
+        std::fs::write(actual.join("memory.max"), "4096\n").unwrap();
+        std::fs::write(actual.join("memory.current"), "4090\n").unwrap();
+        f.write(1, "memory.max", "16384\n");
+        f.write(1, "memory.current", "5114\n");
+        assert_eq!(
+            assess(&budget(), &f.layout, 2048).unwrap().available_bytes,
+            3072
+        );
+        let expected = Layout {
+            mount: f.layout.mount.clone(),
+            leaf: actual,
+        };
+        assert_eq!(
+            assess(&budget(), &expected, 2048).unwrap_err(),
+            "insufficient cgroup memory headroom"
+        );
+        let parsed = layout(
+            "0::/slice/service\r\n",
+            &mountinfo("/", f.layout.mount.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            assess(&budget(), &parsed, 2048).unwrap_err(),
+            "insufficient cgroup memory headroom"
+        );
     }
 
     #[test]
