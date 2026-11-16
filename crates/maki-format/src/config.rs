@@ -7,7 +7,12 @@
 //!   be `{ source = "credential", name = "…" }` references (SPEC §9),
 //! - human-friendly sizes ("128MiB"), durations ("150us"), rates ("1/s").
 
+mod http_mapping;
 mod transport_size;
+
+pub use http_mapping::{
+    decode_pointer_token, HttpFieldSource, HttpPayloadEncoding, HttpRequestMapping,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -493,8 +498,10 @@ fn d_json() -> String {
 #[serde(deny_unknown_fields)]
 pub struct FieldMapping {
     /// "payload", "unit_index", "volume_id", "compatibility_id",
-    /// "format_version", "batch_index".
+    /// "format_version", "batch_index" (see [`HttpFieldSource`]).
     pub source: String,
+    /// Payload encoding (see [`HttpPayloadEncoding`]); only
+    /// `source = "payload"` takes one.
     #[serde(default)]
     pub encoding: Option<String>,
 }
@@ -1582,6 +1589,11 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
                 body.body_type
             )));
         }
+        // The provider builds a JSON body with this same parser: whatever
+        // validates here is constructed and sent as written.
+        if body.body_type == "json" {
+            body.request_mapping(name)?;
+        }
     }
     if let Some(response) = &op.response {
         if !["json", "raw"].contains(&response.response_type.as_str()) {
@@ -2057,33 +2069,53 @@ impl VolumeConfig {
                 // receives: a declared context binding needs every context
                 // field on the wire, or the attach self-test's probes fail
                 // late with a confusing "decrypts to the original plaintext"
-                // (R3-006). WebSocket and gRPC always send all three.
+                // (R3-006). WebSocket and gRPC always send all three, and
+                // the unit index of every item.
                 if crypto.capabilities.context_binding != "none" {
                     for (name, op) in [("encrypt", encrypt), ("decrypt", decrypt)] {
                         // Only mappings that reach the wire count: a raw body
-                        // sends the payload alone, and item_fields are sent
-                        // only inside a batch (BUG-093).
-                        let sources: Vec<&str> = op
-                            .body
+                        // sends the payload alone, item_fields are sent only
+                        // inside a batch (BUG-093), and pointers that would
+                        // replace a counted field were refused above.
+                        let mapping = match op.body.as_ref().filter(|b| b.body_type == "json") {
+                            Some(body) => Some(body.request_mapping(name)?),
+                            None => None,
+                        };
+                        let sent: Vec<HttpFieldSource> = mapping
                             .iter()
-                            .filter(|b| b.body_type == "json")
-                            .flat_map(|b| {
-                                let items = b.is_batch().then_some(&b.item_fields);
-                                b.fields
-                                    .values()
-                                    .chain(items.into_iter().flatten().map(|(_, m)| m))
-                            })
-                            .map(|m| m.source.as_str())
+                            .flat_map(HttpRequestMapping::sent_fields)
+                            .map(|(_, source)| *source)
                             .collect();
-                        for required in ["volume_id", "compatibility_id", "format_version"] {
-                            if !sources.contains(&required) {
+                        for (required, label) in [
+                            (HttpFieldSource::VolumeId, "volume_id"),
+                            (HttpFieldSource::CompatibilityId, "compatibility_id"),
+                            (HttpFieldSource::FormatVersion, "format_version"),
+                        ] {
+                            if !sent.contains(&required) {
                                 return Err(invalid(format!(
                                     "[crypto.http.{name}.body]: capabilities.context_binding = \
-                                     {:?} but no field has source = {required:?}; a provider \
+                                     {:?} but no field has source = {label:?}; a provider \
                                      cannot bind ciphertext to a context it never receives",
                                     crypto.capabilities.context_binding
                                 )));
                             }
+                        }
+                        // The attach self-test also moves a ciphertext to
+                        // another unit index. Only per-item fields carry it:
+                        // top-level fields of a batch belong to no item.
+                        let unit_per_item = mapping.as_ref().is_some_and(|m| {
+                            m.per_item_fields()
+                                .iter()
+                                .any(|(_, source)| *source == HttpFieldSource::UnitIndex)
+                        });
+                        if !unit_per_item {
+                            return Err(invalid(format!(
+                                "[crypto.http.{name}.body]: capabilities.context_binding = {:?} \
+                                 but no per-item field has source = \"unit_index\" (in fields \
+                                 of a per-item body, in item_fields of a batch); the attach \
+                                 self-test refuses a binding that ignores the unit index",
+                                crypto.capabilities.context_binding
+                            )));
                         }
                     }
                 }

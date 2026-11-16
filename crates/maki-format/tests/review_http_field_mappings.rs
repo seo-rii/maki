@@ -383,4 +383,22 @@ fn shipped_http_configurations_still_validate() {
     ))
     .unwrap();
     validate(include_str!("data/full_config.toml")).unwrap();
+
+    // The SPEC §19 mapping example shows the encrypt operation of a
+    // per-item body; it carries the whole context, so it also satisfies a
+    // declared context binding.
+    let example = fences
+        .iter()
+        .find(|f| f.contains("[crypto.http.encrypt.body.fields]") && !f.contains("[volume]"))
+        .expect("SPEC §19 example not found");
+    let encrypt = &example[example.find("[crypto.http.encrypt]").unwrap()..];
+    let decrypt = encrypt.replace("crypto.http.encrypt", "crypto.http.decrypt");
+    for binding in ["none", "contractual"] {
+        let raw = config(binding, "", "");
+        let head = &raw[..raw.find("[crypto.http.encrypt]").unwrap()];
+        validate(&format!(
+            "{head}{encrypt}\n{decrypt}\n[backing]\nroot = \"/x\"\n"
+        ))
+        .unwrap();
+    }
 }

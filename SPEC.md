@@ -804,18 +804,30 @@ batch layout
 timeouts
 ```
 
-Supported encodings:
+Supported payload encodings:
 
 ```text
-raw
-base64
-base64url
-hex-lower
+raw         (HTTP body or response type = "raw": the bytes themselves)
+base64      (RFC 4648 §4, padded; the default)
+base64url   (RFC 4648 §5, unpadded)
+hex-lower   (alias hex)
 hex-upper
-utf8
-integer
-uuid
 ```
+
+Only the payload is encoded. Every other HTTP field source has one fixed JSON
+representation and takes no `encoding`: `unit_index`, `format_version` and
+`batch_index` are unsigned JSON integers, `volume_id` is the lowercase
+hyphenated UUID string, and `compatibility_id` is a JSON string. WebSocket
+and gRPC use the fixed request schemas of their reference contracts.
+
+HTTP request mappings are validated exactly as the provider builds them:
+configuration validation MUST reject an unknown field source or payload
+encoding, an `encoding` on a non-payload source, a request pointer that does
+not start with `/`, and request pointers that would replace one another on
+the wire. Pointers are applied in order and replace what they address, so two
+pointers of one JSON object conflict when, after RFC 6901 decoding, one
+equals the other or addresses a field inside it; a batch `items_path` also
+conflicts with any top-level field at, under or above it.
 
 Batch result identity: every batch element a remote provider returns MUST
 carry the unit index of the request item it answers, in request order. Maki
@@ -837,12 +849,17 @@ for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
 `CryptoBatchRequest`. A provider that declares context binding MUST tie
 ciphertext to all of them. Maki's attach self-test probes each field
 separately (plus the unit index) and refuses attach when a foreign value
-decrypts to the original plaintext. A schema-level refusal is accepted only as
-`CryptoError::UnsupportedContext` for the exact field that probe changed:
-`FormatVersion` or `CompatibilityId`. A generic bad request, provider failure,
-or a refusal of another field does not prove context binding. Definitive
-`CryptoError::Integrity` or a valid changed plaintext also satisfies a context
-probe; an unavailable endpoint remains inconclusive.
+decrypts to the original plaintext. WebSocket and gRPC always send each
+item's unit index; an HTTP mapping that declares context binding MUST also
+map a per-item `unit_index` field (in `fields` of a per-item body, in
+`item_fields` of a batch, whose top-level fields belong to no item), and
+configuration validation rejects one that omits any of these fields. A
+schema-level refusal is accepted only as `CryptoError::UnsupportedContext` for
+the exact field that probe changed: `FormatVersion` or `CompatibilityId`. A
+generic bad request, provider failure, or a refusal of another field does not
+prove context binding. Definitive `CryptoError::Integrity` or a valid changed
+plaintext also satisfies a context probe; an unavailable endpoint remains
+inconclusive.
 
 Explicit schema refusals use HTTP status `422` or gRPC status
 `FailedPrecondition` with exactly one `maki-crypto-error` header/metadata value:
@@ -870,22 +887,11 @@ path = "/encrypt"
 type = "json"
 
 [crypto.http.encrypt.body.fields]
-"/data" = {
-    source = "payload",
-    encoding = "base64"
-}
-
-"/volume" = {
-    source = "volume_id"
-}
-
-"/profile" = {
-    source = "compatibility_id"
-}
-
-"/format" = {
-    source = "format_version"
-}
+"/data" = { source = "payload", encoding = "base64" }
+"/unit" = { source = "unit_index" }
+"/volume" = { source = "volume_id" }
+"/profile" = { source = "compatibility_id" }
+"/format" = { source = "format_version" }
 
 [crypto.http.encrypt.response]
 type = "json"

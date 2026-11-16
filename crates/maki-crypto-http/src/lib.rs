@@ -20,6 +20,9 @@ use maki_crypto::{
     Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
     PlaintextUnit, SecretBuffer,
 };
+// Validation and the provider share one mapping parser and one RFC 6901
+// token decoder, so a validated mapping is exactly the one sent.
+use maki_format::config::{decode_pointer_token, HttpFieldSource, HttpPayloadEncoding};
 
 mod request;
 mod response;
@@ -175,17 +178,23 @@ pub enum PayloadEncoding {
     HexUpper,
 }
 
-impl PayloadEncoding {
-    pub fn parse(s: &str) -> Result<Self, CryptoError> {
-        match s {
-            "base64" => Ok(Self::Base64),
-            "base64url" => Ok(Self::Base64Url),
-            "hex-lower" | "hex" => Ok(Self::HexLower),
-            "hex-upper" => Ok(Self::HexUpper),
-            other => Err(CryptoError::ProviderFatal(format!(
-                "unknown payload encoding {other:?}"
-            ))),
+impl From<HttpPayloadEncoding> for PayloadEncoding {
+    fn from(encoding: HttpPayloadEncoding) -> Self {
+        match encoding {
+            HttpPayloadEncoding::Base64 => Self::Base64,
+            HttpPayloadEncoding::Base64Url => Self::Base64Url,
+            HttpPayloadEncoding::HexLower => Self::HexLower,
+            HttpPayloadEncoding::HexUpper => Self::HexUpper,
         }
+    }
+}
+
+impl PayloadEncoding {
+    /// The configuration spelling, as validation parses it.
+    pub fn parse(s: &str) -> Result<Self, CryptoError> {
+        HttpPayloadEncoding::parse(s)
+            .map(Self::from)
+            .ok_or_else(|| CryptoError::ProviderFatal(format!("unknown payload encoding {s:?}")))
     }
 
     pub fn encode(&self, data: &[u8]) -> String {
@@ -307,21 +316,26 @@ pub enum FieldSource {
     BatchIndex,
 }
 
-impl FieldSource {
-    pub fn parse(source: &str, encoding: Option<&str>) -> Result<Self, CryptoError> {
+impl From<HttpFieldSource> for FieldSource {
+    fn from(source: HttpFieldSource) -> Self {
         match source {
-            "payload" => Ok(Self::Payload(PayloadEncoding::parse(
-                encoding.unwrap_or("base64"),
-            )?)),
-            "unit_index" => Ok(Self::UnitIndex),
-            "volume_id" => Ok(Self::VolumeId),
-            "compatibility_id" => Ok(Self::CompatibilityId),
-            "format_version" => Ok(Self::FormatVersion),
-            "batch_index" => Ok(Self::BatchIndex),
-            other => Err(CryptoError::ProviderFatal(format!(
-                "unknown field source {other:?}"
-            ))),
+            HttpFieldSource::Payload(encoding) => Self::Payload(encoding.into()),
+            HttpFieldSource::UnitIndex => Self::UnitIndex,
+            HttpFieldSource::VolumeId => Self::VolumeId,
+            HttpFieldSource::CompatibilityId => Self::CompatibilityId,
+            HttpFieldSource::FormatVersion => Self::FormatVersion,
+            HttpFieldSource::BatchIndex => Self::BatchIndex,
         }
+    }
+}
+
+impl FieldSource {
+    /// A field mapping's `source` and `encoding`, as validation parses
+    /// them: only the payload takes an encoding.
+    pub fn parse(source: &str, encoding: Option<&str>) -> Result<Self, CryptoError> {
+        HttpFieldSource::parse(source, encoding)
+            .map(Self::from)
+            .map_err(CryptoError::ProviderFatal)
     }
 }
 
@@ -585,37 +599,6 @@ impl Drop for PendingIdentityPem {
     fn drop(&mut self) {
         self.0.zeroize();
     }
-}
-
-/// Decode one JSON Pointer reference token (RFC 6901 §4): `~1` is `/` and
-/// `~0` is `~`, in that order, so `~01` decodes to `~1` and a literal
-/// slash or tilde in a field name round-trips. The response side reads
-/// with `serde_json`'s `Value::pointer`, which decodes the same way; the
-/// request side must match it or a vendor field named `key/slot` is sent
-/// as the wrong field `key~1slot` (BUG-024).
-fn decode_pointer_token(token: &str) -> String {
-    // A single allocation also avoids abandoning an intermediate decoded key
-    // before the request mapping takes over its wipe duty.
-    let mut decoded = String::with_capacity(token.len());
-    let mut chars = token.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let replacement = if ch == '~' {
-            match chars.peek() {
-                Some('1') => Some('/'),
-                Some('0') => Some('~'),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(replacement) = replacement {
-            chars.next();
-            decoded.push(replacement);
-        } else {
-            decoded.push(ch);
-        }
-    }
-    decoded
 }
 
 /// Insert `value` at a JSON pointer, creating intermediate objects.
@@ -1080,7 +1063,9 @@ impl HttpCryptoProvider {
             .http
             .as_ref()
             .ok_or_else(|| fatal("missing [crypto.http] section"))?;
-        let build_op = |op_cfg: &maki_format::config::HttpOpConfig| -> Result<OpSpec, CryptoError> {
+        let build_op = |operation: &str,
+                        op_cfg: &maki_format::config::HttpOpConfig|
+         -> Result<OpSpec, CryptoError> {
             let mut headers = PendingHeaders::default();
             for (name, value) in &op_cfg.headers {
                 // An invalid name would fail every request at send time as
@@ -1153,22 +1138,21 @@ impl HttpCryptoProvider {
                 None => BodySpec::Raw,
                 Some(body_cfg) if body_cfg.body_type == "raw" => BodySpec::Raw,
                 Some(body_cfg) => {
-                    let parse_fields = |m: &std::collections::BTreeMap<
-                        String,
-                        maki_format::config::FieldMapping,
-                    >|
-                     -> Result<Vec<(String, FieldSource)>, CryptoError> {
-                        m.iter()
-                            .map(|(pointer, mapping)| {
-                                FieldSource::parse(&mapping.source, mapping.encoding.as_deref())
-                                    .map(|s| (pointer.clone(), s))
-                            })
+                    // The parser validation uses: sources, encodings and
+                    // pointers are refused here exactly as there.
+                    let mapping = body_cfg
+                        .request_mapping(operation)
+                        .map_err(|e| fatal(e.to_string()))?;
+                    let convert = |fields: Vec<(String, HttpFieldSource)>| {
+                        fields
+                            .into_iter()
+                            .map(|(pointer, source)| (pointer, FieldSource::from(source)))
                             .collect()
                     };
                     BodySpec::Json {
-                        fields: parse_fields(&body_cfg.fields)?,
-                        items_path: body_cfg.items_path.clone(),
-                        item_fields: parse_fields(&body_cfg.item_fields)?,
+                        fields: convert(mapping.fields),
+                        items_path: mapping.items_path,
+                        item_fields: convert(mapping.item_fields),
                     }
                 }
             };
@@ -1207,11 +1191,13 @@ impl HttpCryptoProvider {
         };
 
         let encrypt = build_op(
+            "encrypt",
             http.encrypt
                 .as_ref()
                 .ok_or_else(|| fatal("missing [crypto.http.encrypt]"))?,
         )?;
         let decrypt = build_op(
+            "decrypt",
             http.decrypt
                 .as_ref()
                 .ok_or_else(|| fatal("missing [crypto.http.decrypt]"))?,
