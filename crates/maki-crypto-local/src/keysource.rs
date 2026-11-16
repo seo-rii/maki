@@ -89,6 +89,10 @@ impl FileKeySource {
     }
 }
 
+/// Configuration validation applies the same rule before a volume is
+/// created (maki-format `config.rs`, `is_loadable_credential_name`): the
+/// key name becomes the volume's immutable key identity. Keep the two
+/// identical; maki-nbdkit `review_credential_name_rule.rs` compares them.
 fn valid_credential_name(name: &str) -> bool {
     !name.is_empty()
         && name

@@ -229,9 +229,10 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
 - the `keyring` credential source, which this build does not implement, the
-  same credential name declared with different sources, and a credential
-  `format` without exactly one `{}` placeholder or on a reference that is not
-  a header or metadata value (see [credentials](#credentials-and-secrets)).
+  same credential name declared with different sources, a credential name the
+  loaders cannot read, and a credential `format` without exactly one `{}`
+  placeholder or on a reference that is not a header or metadata value (see
+  [credentials](#credentials-and-secrets)).
 
 The providers additionally refuse unreadable or invalid TLS material at
 construction or handshake, and read `client_key` from its credential source to
@@ -288,6 +289,10 @@ one would resolve against whichever process's working directory reads it), `env`
 reads `MAKI_CREDENTIAL_<NAME>`. TLS `ca_file` and `client_cert_file` paths must
 be absolute for the same reason. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
+A `credential` name, and the file name that ends a `file` path, may contain
+only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
+the loaders refuse any other name, so validation refuses it before a volume is
+created (a key's name is stored as the volume's immutable key identity).
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header

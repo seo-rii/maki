@@ -1314,6 +1314,31 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     if c.source == "file" && !is_absolute_path(&c.name) {
         return Err(invalid("file credential name must be an absolute path"));
     }
+    // The loaders look up a `credential` name, and the file name of a
+    // `file` path, in a directory and refuse any other name. `volume create`
+    // never loads the key but stores its name as the volume's immutable key
+    // identity, so a name they refuse would leave a volume no attach can
+    // open. The daemon splits a `file` path with `Path::file_name` too.
+    match c.source.as_str() {
+        "credential" if !is_loadable_credential_name(&c.name) => {
+            return Err(invalid(
+                "credential name must consist of ASCII letters, digits, '.', '_' and '-' \
+                 and must not start with '.'",
+            ));
+        }
+        "file"
+            if !std::path::Path::new(&c.name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_loadable_credential_name) =>
+        {
+            return Err(invalid(
+                "file credential name must end in a file name of ASCII letters, digits, \
+                 '.', '_' and '-' that does not start with '.'",
+            ));
+        }
+        _ => {}
+    }
     // Consumers split the template on `{}` and insert the credential at
     // each placeholder. Without one the value sent is the template alone: a
     // literal secret written there would pass the SPEC §9 rule, and a typo
@@ -1328,6 +1353,18 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+/// The name rule of the credential loaders (`valid_credential_name` in
+/// maki-crypto-local `keysource.rs`, which does not depend on this crate).
+/// Keep the two identical; maki-nbdkit `review_credential_name_rule.rs`
+/// compares them.
+fn is_loadable_credential_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !name.starts_with('.')
 }
 
 /// Absolute on this platform, or rooted at `/` (the form the shipped
