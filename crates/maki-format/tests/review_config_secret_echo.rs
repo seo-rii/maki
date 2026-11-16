@@ -108,3 +108,42 @@ fn untrusted_error_fragments_never_reach_display_or_debug() {
         }
     }
 }
+
+/// HTTP operation paths can carry path or query tokens (their Debug output is
+/// redacted for that reason), but the error for a path without a leading
+/// slash printed the path itself into stderr and the journal.
+#[test]
+fn an_invalid_http_operation_path_is_not_echoed() {
+    for (operation, encrypt, decrypt) in [
+        (
+            "encrypt",
+            format!("v1/encrypt?api_key={SECRET}"),
+            "/decrypt".to_string(),
+        ),
+        (
+            "decrypt",
+            "/encrypt".to_string(),
+            format!("{SECRET}/decrypt"),
+        ),
+    ] {
+        let document = format!(
+            "{BASE}[crypto]\nprovider = \"remote-http\"\ncrypto_compatibility_id = \"x\"\n\
+             [crypto.capabilities]\nsupported_plaintext_sizes = [4096]\nmax_ciphertext_size = 4104\n\
+             [[crypto.http.endpoint]]\nname = \"primary\"\nurl = \"https://kms.example\"\n\
+             [crypto.http.encrypt]\npath = \"{encrypt}\"\n\
+             [crypto.http.encrypt.response]\ndata_path = \"/ct\"\n\
+             [crypto.http.decrypt]\npath = \"{decrypt}\"\n\
+             [crypto.http.decrypt.response]\ndata_path = \"/pt\"\n"
+        );
+        let config = parse_config(&document).unwrap();
+        let error = config.validate().expect_err("the path must be refused");
+        let (display, debug) = (error.to_string(), format!("{error:?}"));
+        assert!(!display.contains(SECRET), "{operation}: {display}");
+        assert!(!debug.contains(SECRET), "{operation}: {debug}");
+        assert!(
+            display.contains(&format!("[crypto.http.{operation}] path"))
+                && display.contains("slash"),
+            "the error lost its diagnosis: {display}"
+        );
+    }
+}
