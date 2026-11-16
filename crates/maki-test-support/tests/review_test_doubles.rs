@@ -9,7 +9,38 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use maki_crypto::{
+    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    SecretBuffer,
+};
 use maki_test_support::sched::{yield_now, DeterministicScheduler};
+use maki_test_support::FakeCryptoProvider;
+
+const UNIT: u32 = 4096;
+
+fn context() -> CryptoContext {
+    CryptoContext {
+        volume_uuid: uuid::Uuid::from_u128(0xD0_0B1E),
+        format_version: 1,
+        crypto_compatibility_id: "test-profile-v1".to_string(),
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+fn plaintexts(count: u64) -> Vec<PlaintextUnit> {
+    (0..count)
+        .map(|unit_index| PlaintextUnit {
+            unit_index,
+            data: SecretBuffer::from_vec(vec![unit_index as u8; UNIT as usize]),
+        })
+        .collect()
+}
 
 // ---------- DeterministicScheduler: wakers, not spurious polls ----------
 
@@ -146,5 +177,50 @@ fn interleavings_are_reproducible_per_seed() {
     assert!(
         (1..16).any(|seed| trace(seed) != trace(0)),
         "every seed produced the same interleaving"
+    );
+}
+
+// ---------- FakeCryptoProvider: the declared batch byte limit ----------
+
+fn assert_refused_as_request<T>(result: Result<T, CryptoError>, what: &str) {
+    match result {
+        Ok(_) => panic!("{what} was accepted"),
+        Err(error) => assert_eq!(
+            error.class(),
+            ErrorClass::NonRetryableRequest,
+            "{what}: {error}"
+        ),
+    }
+}
+
+/// `batch.max_bytes` is the plaintext bytes one batch may carry (SPEC §16,
+/// `BatchCapability`). A vendor endpoint refuses a larger request, so a
+/// caller that over-packs a batch by bytes must fail against the fake too.
+#[test]
+fn the_fake_refuses_an_encrypt_batch_over_its_declared_byte_limit() {
+    let provider = FakeCryptoProvider::new(UNIT).with_max_batch(128, 2 * UNIT as u64);
+    let caps = block_on(provider.capabilities()).unwrap();
+    assert_eq!(caps.batch.max_bytes, 2 * UNIT as u64);
+    let at_limit = block_on(provider.encrypt_batch(&context(), &plaintexts(2)));
+    assert_eq!(at_limit.unwrap().len(), 2, "a batch at the limit is valid");
+    assert_refused_as_request(
+        block_on(provider.encrypt_batch(&context(), &plaintexts(3))),
+        "a 3-unit encrypt batch under a 2-unit byte limit",
+    );
+}
+
+/// A decrypt batch is measured by the plaintext it produces (one unit per
+/// item), the way the dispatcher sizes decrypt chunks.
+#[test]
+fn the_fake_refuses_a_decrypt_batch_whose_plaintext_exceeds_the_byte_limit() {
+    let unlimited = FakeCryptoProvider::new(UNIT);
+    let ciphertexts: Vec<CiphertextUnit> =
+        block_on(unlimited.encrypt_batch(&context(), &plaintexts(3))).unwrap();
+    let provider = FakeCryptoProvider::new(UNIT).with_max_batch(128, 2 * UNIT as u64);
+    let at_limit = block_on(provider.decrypt_batch(&context(), &ciphertexts[..2]));
+    assert_eq!(at_limit.unwrap().len(), 2, "a batch at the limit is valid");
+    assert_refused_as_request(
+        block_on(provider.decrypt_batch(&context(), &ciphertexts)),
+        "a 3-unit decrypt batch under a 2-unit byte limit",
     );
 }
