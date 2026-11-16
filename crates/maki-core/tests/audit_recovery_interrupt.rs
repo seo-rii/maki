@@ -27,10 +27,21 @@ use maki_test_support::{failpoints, CrashableBacking};
 const UNITS: u64 = 24;
 /// [interrupted recoveries that failed, that succeeded, failed workload ops]
 static STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-const MAX_CT: usize = 640;
+/// Profile (tests are serialized by the failpoint lock): 0 = small records
+/// and 3000-byte segments, 1 = records up to ~70 KiB (rewrite/scan chunk
+/// boundaries) in 200 KB segments, 2 = the minimum segment size (every
+/// record rolls).
+static PROFILE: AtomicU64 = AtomicU64::new(0);
+
+fn max_ct() -> usize {
+    match PROFILE.load(Ordering::SeqCst) {
+        1 => 70_016,
+        _ => 640,
+    }
+}
 
 fn geometry() -> Geometry {
-    Geometry::compute(512, 512, 512, MAX_CT as u32, UNITS * 512, 8 * 512).unwrap()
+    Geometry::compute(512, 512, 512, max_ct() as u32, UNITS * 512, 8 * 512).unwrap()
 }
 
 fn superblock() -> Superblock {
@@ -48,7 +59,11 @@ fn superblock() -> Superblock {
 
 fn options() -> VolumeOptions {
     VolumeOptions {
-        journal_segment_size: 3000,
+        journal_segment_size: match PROFILE.load(Ordering::SeqCst) {
+            1 => 200_000,
+            2 => 1,
+            _ => 3000,
+        },
     }
 }
 
@@ -242,7 +257,7 @@ fn sweep(seed: u64, cycles: usize, discard: bool, permille: u32) -> Result<(), S
                     let unit = rng.random_range(0..UNITS);
                     let fua = rng.random_bool(0.25);
                     stamp += 1;
-                    let len = rng.random_range(1..=MAX_CT);
+                    let len = rng.random_range(1..=max_ct());
                     let v = value(unit, stamp, len);
                     let index = oracle.attempt(unit, Some(v.clone()));
                     let r = volume.write_ct(unit, &v, fua);
@@ -361,7 +376,18 @@ fn sweep(seed: u64, cycles: usize, discard: bool, permille: u32) -> Result<(), S
 }
 
 fn run(seeds: std::ops::Range<u64>, cycles: usize, discard: bool, permille: u32) {
+    run_profile(0, seeds, cycles, discard, permille)
+}
+
+fn run_profile(
+    profile: u64,
+    seeds: std::ops::Range<u64>,
+    cycles: usize,
+    discard: bool,
+    permille: u32,
+) {
     let _guard = failpoints::test_lock();
+    PROFILE.store(profile, Ordering::SeqCst);
     let mut failures = Vec::new();
     for seed in seeds {
         let outcome = std::panic::catch_unwind(|| sweep(seed, cycles, discard, permille));
@@ -418,6 +444,18 @@ fn v3_interrupted_recovery_with_workload_faults() {
     run(3000..3150, 6, true, 80);
 }
 
+#[test]
+fn large_records_interrupted_recovery() {
+    run_profile(1, 4000..4040, 5, false, 60);
+    run_profile(1, 4100..4140, 5, true, 60);
+}
+
+#[test]
+fn every_record_rolls_interrupted_recovery() {
+    run_profile(2, 5000..5100, 5, false, 60);
+    run_profile(2, 5100..5200, 5, true, 60);
+}
+
 /// Reproduce one seed with its full trace:
 /// `AUDIT_SEED=3032 AUDIT_DISCARD=1 AUDIT_PERMILLE=80 cargo test ... -- --ignored single_seed`
 #[test]
@@ -434,6 +472,7 @@ fn single_seed() {
     let discard = env("AUDIT_DISCARD", 0) == 1;
     let permille = env("AUDIT_PERMILLE", 0) as u32;
     let cycles = env("AUDIT_CYCLES", 6) as usize;
+    PROFILE.store(env("AUDIT_PROFILE", 0), Ordering::SeqCst);
     if let Err(e) = sweep(seed, cycles, discard, permille) {
         panic!("{e}");
     }
