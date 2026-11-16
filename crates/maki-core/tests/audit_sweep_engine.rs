@@ -76,6 +76,11 @@ pub struct Cfg {
     /// Above 1: some operations are issued as a batch of up to this many
     /// concurrent requests on disjoint units (plus FLUSH/checkpoint).
     pub concurrency: usize,
+    /// Simulated backing free space changes before every operation, with an
+    /// emergency reserve and checkpoint headroom enabled: some writes are
+    /// refused with ENOSPC (side-effect free) and the worker checkpoints on
+    /// low space and on refusals.
+    pub space: bool,
 }
 
 impl Cfg {
@@ -128,8 +133,16 @@ impl Cfg {
                 },
                 journal_max_bytes: self.journal_max_bytes,
                 max_pending_bytes: self.max_pending_bytes,
-                emergency_reserve_bytes: 0,
-                low_space_checkpoint_bytes: 0,
+                emergency_reserve_bytes: if self.space {
+                    4 * self.unit as u64
+                } else {
+                    0
+                },
+                low_space_checkpoint_bytes: if self.space {
+                    3 * self.unit as u64
+                } else {
+                    0
+                },
                 interval: Duration::from_secs(3600),
             },
             ..EngineOptions::default()
@@ -157,6 +170,7 @@ pub fn cfg(name: &str) -> Cfg {
         tear: 128,
         worker: false,
         concurrency: 1,
+        space: false,
     };
     let rec = |unit: u64| 32 + unit + 8;
     match name {
@@ -292,6 +306,41 @@ pub fn cfg(name: &str) -> Cfg {
             cache: Some(false),
             worker: true,
             concurrency: 4,
+            ..base
+        },
+        // Free-space admission (emergency reserve + checkpoint headroom).
+        "space-v3" => Cfg {
+            name: "space-v3",
+            segment_size: 48 + 3 * rec(512),
+            journal_max_bytes: 4 * (48 + 3 * rec(512)),
+            max_pending_bytes: 2 * rec(512),
+            discard: true,
+            worker: true,
+            space: true,
+            ..base
+        },
+        "space-rmw" => Cfg {
+            name: "space-rmw",
+            unit: 4096,
+            device_units: 22,
+            units_per_shard: 3,
+            segment_size: 48 + 2 * rec(4096),
+            max_overlay_entries: 5,
+            max_request_units: 4,
+            tear: 512,
+            space: true,
+            ..base
+        },
+        "space-conc-v3" => Cfg {
+            name: "space-conc-v3",
+            segment_size: 48 + 3 * rec(512),
+            journal_max_bytes: 4 * (48 + 3 * rec(512)),
+            max_pending_bytes: 2 * rec(512),
+            max_overlay_entries: 10,
+            discard: true,
+            worker: true,
+            concurrency: 4,
+            space: true,
             ..base
         },
         // Concurrency without the worker: only foreground races.
@@ -1242,6 +1291,17 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
 
         for _ in 0..ops {
             stats.bump("ops");
+            if cfg.space {
+                // Around the admission threshold: reserve + headroom + one or
+                // two records' footprint.
+                let need = 7 * unit + 2 * cfg.record_len();
+                let free = match rng.random_range(0..10) {
+                    0 => None,
+                    1..=3 => Some(rng.random_range(0..need)),
+                    _ => Some(rng.random_range(need..4 * need)),
+                };
+                raw.set_free_bytes(free);
+            }
             let roll = rng.random_range(0..100);
             // Resolve a failed request: every touched unit must show its
             // old or its new image; a new one counts as acknowledged-volatile.
@@ -1270,7 +1330,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                         }
                     } else {
                         assert!(
-                            transient,
+                            transient || cfg.space,
                             "UNEXPECTED-FAILURE: {} failed without faults: {error}\n{}",
                             $what,
                             history()
@@ -2357,6 +2417,19 @@ async fn audit2_lying() {
 async fn audit2_conc_lying() {
     sweep_owned(
         pairs_from_env(all_pairs(&CONC, &["lying", "chaos-lying"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit2_space() {
+    sweep_owned(
+        pairs_from_env(all_pairs(
+            &["space-v3", "space-rmw", "space-conc-v3"],
+            &["crash", "death", "chaos", "lying"],
+        )),
         seeds(),
         4,
     )

@@ -1,11 +1,12 @@
-//! Audit (core write path): a no-op checkpoint that fails while persisting
-//! the metadata a reopened store must re-establish (`has_pending_repairs`:
-//! loaded allocation pairs awaiting proof, adopted shards, repaired maps)
-//! degrades the engine, and the idle checkpoint worker never retries it:
-//! `worker_pass` has no trigger for pending repairs, unlike the BUG-183
-//! journal-cleanup flag. The volume stays `Degraded` indefinitely after the
-//! transient fault is gone, until an operator runs a checkpoint or a write
-//! arrives.
+//! Audit (core write path) probe — RULED OUT, kept as a passing control.
+//!
+//! Hypothesis: a no-op checkpoint that fails while persisting the metadata a
+//! reopened store must re-establish (`has_pending_repairs`) leaves an idle
+//! engine `Degraded` forever, because `worker_pass` has no trigger for
+//! pending repairs. Observed: after a reopen the recovered final segment is
+//! sealed and covered, so `covered > 0` keeps the worker retrying, and the
+//! volume returns to `Ready` once the fault clears. Pending repairs without
+//! another worker trigger were not reachable in practice.
 
 use std::io;
 use std::sync::{
@@ -77,7 +78,7 @@ fn options(clock: Option<Arc<dyn Clock>>) -> EngineOptions {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
-async fn idle_worker_never_retries_a_failed_repair_persist() {
+async fn idle_worker_retries_a_failed_repair_persist_after_reopen() {
     let _serial = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
     init::create_volume(backing.as_ref(), block()).unwrap();
@@ -136,11 +137,11 @@ async fn idle_worker_never_retries_a_failed_repair_persist() {
         parked(&clock, before + 1).await;
     }
     let st = engine.stats().await;
-    eprintln!("after intervals: checkpoints {} failures {}", st.checkpoints_total, st.checkpoint_failures_total);
+    eprintln!("after intervals: checkpoints {} failures {} segments {}", st.checkpoints_total, st.checkpoint_failures_total, st.journal_segments);
     let state = engine.state();
     eprintln!("state after four idle worker intervals: {state:?}");
-    // Expected (BUG-183 semantics): the worker retries and the volume
-    // returns to Ready. Observed: it stays Degraded.
+    // The worker retries (via the covered-segment trigger) and the volume
+    // returns to Ready.
     assert_eq!(
         state,
         EngineState::Ready,
