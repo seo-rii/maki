@@ -518,12 +518,14 @@ pub fn cfg_for(name: &str, seed: u64) -> Cfg {
         1
     };
     let worker = r.random_bool(0.4);
+    // An unaligned request of max_request_bytes touches one extra unit.
+    let request_records = (max_request_units + 1) * concurrency as u64;
     let journal_max_bytes = if r.random_bool(0.3) {
         BIG
     } else {
         2 * segment_size
-            + (max_request_units * concurrency as u64) * rec
-            + (max_request_units * concurrency as u64 + 2) * 48
+            + request_records * rec
+            + (request_records + 2) * 48
             + r.random_range(0..3 * segment_size)
     };
     let max_pending_bytes = if r.random_bool(0.3) {
@@ -531,7 +533,6 @@ pub fn cfg_for(name: &str, seed: u64) -> Cfg {
     } else {
         rec * r.random_range(1..=4u64)
     };
-    let request_records = max_request_units * concurrency as u64;
     let max_overlay_entries = if r.random_bool(0.5) {
         0
     } else {
