@@ -83,9 +83,10 @@ configuration; this configuration creates no infrastructure.
 | `remote-grpc` | gRPC | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
 | `fake` | In-process test provider | Test-only | Refused unless built with `--features fake-provider` |
 
-The `fake` provider is not compiled into a default build; `maki volume create`
-and attach reject it at validation time. Enable the `fake-provider` feature of
-`maki-nbdkit` only for development and benchmark builds.
+The `fake` provider is not compiled into a default build; `maki volume create`,
+`maki volume resume-enrollment` and attach reject it at validation time,
+before the backing or a remote witness changes. Enable the `fake-provider`
+feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
 endpoint URL. The TLS section is optional when system/default trust is enough.
