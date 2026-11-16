@@ -356,6 +356,36 @@ pub struct RespSpec {
     pub item_index_path: Option<String>,
 }
 
+impl RespSpec {
+    /// What a single-item response is read for: its payload and echo.
+    fn single_selection(&self) -> response::Selection {
+        let mut selection = response::Selection::default();
+        if let Some(path) = &self.data_path {
+            selection.string(path);
+        }
+        if let Some(path) = &self.item_index_path {
+            selection.number(path);
+        }
+        selection
+    }
+
+    /// What a batch response is read for: up to `count` elements at
+    /// `items_path`, each with its payload (the element itself without a
+    /// `data_path`) and echo. Further elements are only counted.
+    fn batch_selection(&self, count: usize) -> response::Selection {
+        let mut element = response::Selection::default();
+        element.string(self.data_path.as_deref().unwrap_or(""));
+        if let Some(path) = &self.item_index_path {
+            element.number(path);
+        }
+        let mut selection = response::Selection::default();
+        if let Some(path) = &self.items_path {
+            selection.elements(path, count, element);
+        }
+        selection
+    }
+}
+
 #[derive(Clone)]
 pub struct OpSpec {
     pub method: String,
@@ -923,10 +953,10 @@ impl HttpCryptoProvider {
         match op.response.kind {
             RespKind::Raw => Ok(body),
             RespKind::Json => {
-                let value = response::parse(body.expose())
+                let value = response::parse(body.expose(), &op.response.single_selection())
                     .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
-                // The tree owns its strings; release the duplicate wire body
-                // before allocating the decoded payload.
+                // The tree owns the strings it kept; release the duplicate
+                // wire body before allocating the decoded payload.
                 drop(body);
                 if let Some(index_path) = &op.response.item_index_path {
                     let echoed = value.pointer(index_path).and_then(|v| v.as_u64());
@@ -1053,7 +1083,8 @@ impl HttpCryptoProvider {
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let encoded = request::encode_batch(fields, items_path, item_fields, context, items)?;
         let response = self.send(op, body_from(encoded), true).await?;
-        let value = response::parse(response.expose())
+        let selection = op.response.batch_selection(items.len());
+        let value = response::parse(response.expose(), &selection)
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
         drop(response);
         Self::extract_batch(op, &value, items)
@@ -1070,21 +1101,22 @@ impl HttpCryptoProvider {
             .items_path
             .as_deref()
             .ok_or_else(|| fatal("response items_path missing for batch layout"))?;
-        let elements = value
+        let (length, elements) = value
             .pointer(resp_items_path)
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
                 CryptoError::Contract(format!("response missing array at {resp_items_path:?}"))
             })?;
-        if elements.len() != items.len() {
+        // The batch selection keeps each element up to the requested count,
+        // so an array of exactly that length was kept whole, in order.
+        if length != items.len() || elements.len() != length {
             return Err(CryptoError::Contract(format!(
-                "batch response has {} element(s) for {} item(s)",
-                elements.len(),
+                "batch response has {length} element(s) for {} item(s)",
                 items.len()
             )));
         }
         let mut out = Vec::with_capacity(items.len());
-        for (i, element) in elements.iter().enumerate() {
+        for (i, (_, element)) in elements.iter().enumerate() {
             if let Some(index_path) = &op.response.item_index_path {
                 let echoed = element.pointer(index_path).and_then(|v| v.as_u64());
                 if echoed != Some(items[i].0) {

@@ -344,6 +344,9 @@ mid-response. A raw encrypt response shorter than its plaintext is a contract
 error too: the whole body becomes the unit's ciphertext, and nothing else in it
 distinguishes ciphertext from, for example, a proxy's error page. Contract
 errors charge the endpoint that answered, and a retry-safe request fails over.
+JSON responses are parsed against the response mapping: values that no
+configured pointer reaches are validated but not kept, so the size limit also
+bounds the memory a response takes, not only its wire bytes.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
 

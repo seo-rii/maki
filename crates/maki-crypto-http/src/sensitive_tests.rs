@@ -480,21 +480,50 @@ fn test_provider(op: &OpSpec) -> HttpCryptoProvider {
     }
 }
 
+fn json_op(data_path: &str) -> OpSpec {
+    let mut op = test_op(BodySpec::Raw);
+    op.response.kind = RespKind::Json;
+    op.response.data_path = Some(data_path.into());
+    op
+}
+
+/// Parse with a selection built before the inspection starts: a pointer
+/// naming a sensitive key holds a copy of that key as configuration.
+fn inspect_parse(wire: &str, pointers: &[String]) -> (bool, Inspection) {
+    let mut selection = super::response::Selection::default();
+    for pointer in pointers {
+        selection.string(pointer);
+    }
+    begin_inspection();
+    let result = super::response::parse(wire.as_bytes(), &selection);
+    let parsed = result.is_ok();
+    drop(result);
+    (parsed, finish_inspection())
+}
+
+/// Strings and keys that no configured pointer reaches are validated but
+/// never copied out of the wire body, so nothing about them needs erasing.
+fn assert_never_copied(inspection: Inspection) {
+    assert_eq!(
+        (inspection.allocations, inspection.plaintext_deallocations),
+        (0, 0),
+        "an unselected sensitive string was copied: {inspection:?}"
+    );
+}
+
 #[test]
 fn http_json_malformed_response_erases_completed_strings_and_keys() {
     let secret = sensitive_string();
-    let wires = [
-        format!(r#"{{"secret":"{secret}","broken":["#),
-        format!(r#"{{"{secret}":0,"broken":["#),
-        format!(r#"{{"nested":[{{"secret":"{secret}"}},"#),
-        // The key is already owned when parsing its value fails.
-        format!(r#"{{"{secret}":"#),
+    let values = [
+        ("/secret", format!(r#"{{"secret":"{secret}","broken":["#)),
+        (
+            "/nested/0/secret",
+            format!(r#"{{"nested":[{{"secret":"{secret}"}},"#),
+        ),
     ];
-    let mut op = test_op(BodySpec::Raw);
-    op.response.kind = RespKind::Json;
-    op.response.data_path = Some("/data".into());
-    let provider = test_provider(&op);
-    for wire in wires {
+    for (data_path, wire) in &values {
+        let op = json_op(data_path);
+        let provider = test_provider(&op);
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
         let result = provider.parse_single(&op, body, 0);
@@ -504,51 +533,100 @@ fn http_json_malformed_response_erases_completed_strings_and_keys() {
         assert!(failed, "malformed JSON was accepted");
         assert_sensitive_allocations_wiped(inspection, 1);
     }
+    let keys = [
+        format!(r#"{{"{secret}":0,"broken":["#),
+        // The key is already owned when parsing its value fails.
+        format!(r#"{{"{secret}":"#),
+    ];
+    for wire in &keys {
+        let (parsed, inspection) = inspect_parse(wire, &[format!("/{secret}")]);
+        assert!(!parsed, "malformed JSON was accepted");
+        assert_sensitive_allocations_wiped(inspection, 1);
+    }
+    let op = json_op("/data");
+    let provider = test_provider(&op);
+    for wire in values.iter().map(|(_, wire)| wire).chain(&keys) {
+        let body = SecretBuffer::from_slice(wire.as_bytes());
+        begin_inspection();
+        let result = provider.parse_single(&op, body, 0);
+        let failed = result.is_err();
+        drop(result);
+        let inspection = finish_inspection();
+        assert!(failed, "malformed JSON was accepted");
+        assert_never_copied(inspection);
+    }
 }
 
 #[test]
 fn http_json_duplicate_values_are_erased_before_replacement() {
-    let wire = format!(
-        r#"{{"secret":"{}","secret":null,"data":"YQ=="}}"#,
-        sensitive_string()
-    );
-    let mut op = test_op(BodySpec::Raw);
-    op.response.kind = RespKind::Json;
-    op.response.data_path = Some("/data".into());
+    let secret = sensitive_string();
+    let op = json_op("/data");
     let provider = test_provider(&op);
-    let body = SecretBuffer::from_slice(wire.as_bytes());
-    begin_inspection();
-    let result = provider.parse_single(&op, body, 0).unwrap();
-    let inspection = finish_inspection();
-    assert_eq!(result.expose(), b"a");
-    assert_sensitive_allocations_wiped(inspection, 1);
+    for (wire, minimum) in [
+        // The replaced value is read by the mapping, so it was owned.
+        (format!(r#"{{"data":"{secret}","data":"YQ=="}}"#), 1),
+        (
+            format!(r#"{{"secret":"{secret}","secret":null,"data":"YQ=="}}"#),
+            0,
+        ),
+    ] {
+        let body = SecretBuffer::from_slice(wire.as_bytes());
+        begin_inspection();
+        let result = provider.parse_single(&op, body, 0).unwrap();
+        let inspection = finish_inspection();
+        assert_eq!(result.expose(), b"a");
+        if minimum == 0 {
+            assert_never_copied(inspection);
+        } else {
+            assert_sensitive_allocations_wiped(inspection, minimum);
+        }
+    }
 }
 
 #[test]
 fn http_json_duplicate_keys_are_erased_before_discarding() {
     let secret = sensitive_string();
     let wire = format!(r#"{{"{secret}":null,"{secret}":false,"data":"YQ=="}}"#);
-    let mut op = test_op(BodySpec::Raw);
-    op.response.kind = RespKind::Json;
-    op.response.data_path = Some("/data".into());
+    let (parsed, inspection) = inspect_parse(&wire, &[format!("/{secret}"), "/data".into()]);
+    assert!(parsed);
+    // The kept key and the discarded duplicate.
+    assert_sensitive_allocations_wiped(inspection, 2);
+
+    let op = json_op("/data");
     let provider = test_provider(&op);
     let body = SecretBuffer::from_slice(wire.as_bytes());
     begin_inspection();
     let result = provider.parse_single(&op, body, 0).unwrap();
     let inspection = finish_inspection();
     assert_eq!(result.expose(), b"a");
-    assert_sensitive_allocations_wiped(inspection, 2);
+    assert_never_copied(inspection);
 }
 
 #[test]
 fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
-    let secret = sensitive_string();
-    let mut op = test_op(BodySpec::Raw);
-    op.response.kind = RespKind::Json;
-    op.response.data_path = Some("/data".into());
+    // 256 'Q's are valid base64; 257 are not.
+    let valid = String::from_utf8(vec![JSON_FILL; PAYLOAD_LEN - 1]).unwrap();
+    let invalid = sensitive_string();
+    let mut op = json_op("/data");
+    op.response.item_index_path = Some("/unit".into());
     let provider = test_provider(&op);
+    for (wire, succeeds) in [
+        (format!(r#"{{"unit":0,"data":"{valid}"}}"#), true),
+        (format!(r#"{{"unit":0,"data":"{invalid}"}}"#), false),
+        (format!(r#"{{"unit":1,"data":"{valid}"}}"#), false),
+    ] {
+        let body = SecretBuffer::from_slice(wire.as_bytes());
+        begin_inspection();
+        let result = provider.parse_single(&op, body, 0);
+        let succeeded = result.is_ok();
+        drop(result);
+        let inspection = finish_inspection();
+        assert_eq!(succeeded, succeeds, "{}", &wire[..12]);
+        assert_sensitive_allocations_wiped(inspection, 1);
+    }
+    let secret = sensitive_string();
     for data in [r#""YQ==""#, "false", r#""invalid!""#] {
-        let wire = format!(r#"{{"{secret}":["{secret}"],"data":{data}}}"#);
+        let wire = format!(r#"{{"{secret}":["{secret}"],"unit":0,"data":{data}}}"#);
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
         let result = provider.parse_single(&op, body, 0);
@@ -556,7 +634,7 @@ fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
         drop(result);
         let inspection = finish_inspection();
         assert_eq!(succeeded, data == r#""YQ==""#);
-        assert_sensitive_allocations_wiped(inspection, 2);
+        assert_never_copied(inspection);
     }
 }
 
@@ -564,25 +642,47 @@ fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
 fn http_json_batch_rejection_erases_earlier_decoded_payloads_and_json_strings() {
     let secret = sensitive_string();
     let encoded = PayloadEncoding::HexLower.encode(&[FILL; PAYLOAD_LEN]);
-    let wire = format!(
-        r#"{{"items":[{{"unit":3,"data":"{encoded}"}},{{"unit":4,"data":false}}],"unknown":"{secret}"}}"#
-    );
     let mut op = test_op(BodySpec::Raw);
     op.response.items_path = Some("/items".into());
     op.response.data_path = Some("/data".into());
     op.response.item_index_path = Some("/unit".into());
     op.response.encoding = PayloadEncoding::HexLower;
     let items = [(3, SecretBuffer::zeroed(0)), (4, SecretBuffer::zeroed(0))];
+    let selection = op.response.batch_selection(items.len());
+    for (second, minimum) in [
+        // A later element's payload string is read, then refused (odd hex).
+        (format!(r#""{secret}""#), 2),
+        ("false".to_string(), 1),
+    ] {
+        let wire = format!(
+            r#"{{"items":[{{"unit":3,"data":"{encoded}"}},{{"unit":4,"data":{second}}}],"unknown":"{secret}"}}"#
+        );
+        begin_inspection();
+        let value = super::response::parse(wire.as_bytes(), &selection).unwrap();
+        let result = HttpCryptoProvider::extract_batch(&op, &value, &items);
+        let rejected = result.is_err();
+        drop(result);
+        drop(value);
+        let inspection = finish_inspection();
+        assert!(rejected);
+        // The completed first payload and any kept response string.
+        assert_sensitive_allocations_wiped(inspection, minimum);
+    }
+    // The unused response string is never copied: no allocation of its size
+    // ever held it, erased or not.
+    let wire = format!(
+        r#"{{"items":[{{"unit":3,"data":"6161"}},{{"unit":4,"data":false}}],"unknown":"{secret}"}}"#
+    );
     begin_inspection();
-    let value = super::response::parse(wire.as_bytes()).unwrap();
-    let result = HttpCryptoProvider::extract_batch(&op, &value, &items);
-    let rejected = result.is_err();
-    drop(result);
+    let value = super::response::parse(wire.as_bytes(), &selection).unwrap();
+    assert!(HttpCryptoProvider::extract_batch(&op, &value, &items).is_err());
     drop(value);
     let inspection = finish_inspection();
-    assert!(rejected);
-    // One completed payload plus the unused response string are erased.
-    assert_sensitive_allocations_wiped(inspection, 2);
+    assert_eq!(
+        (inspection.zeroized, inspection.plaintext_deallocations),
+        (0, 0),
+        "{inspection:?}"
+    );
 }
 
 fn sensitive_credentials_spec(tls: Option<super::TlsSpec>) -> HttpProviderSpec {
