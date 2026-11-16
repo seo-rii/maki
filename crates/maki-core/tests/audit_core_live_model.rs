@@ -45,8 +45,8 @@ fn options(verify_on_hit: bool, cache: bool) -> EngineOptions {
             verify_on_hit,
         }),
         checkpoint: CheckpointPolicy {
-            journal_high_watermark_bytes: 10 * 1024,
-            journal_max_bytes: 20 * 1024,
+            journal_high_watermark_bytes: 18 * 1024,
+            journal_max_bytes: 36 * 1024, // 2x the validated minimum: see audit_reclaim_starvation.rs
             max_pending_bytes: 4096,
             emergency_reserve_bytes: 0,
             low_space_checkpoint_bytes: 0,

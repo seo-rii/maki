@@ -54,8 +54,8 @@ fn is_segment_header_write(op: &FaultOp<'_>) -> bool {
 
 /// The next segment-header write persists only a 32-byte prefix and fails
 /// (the partial-write fault class the journal already handles for records,
-/// F03). `cleanup` chooses what else fails once: the cleanup's unlink, or
-/// its directory sync.
+/// F03). `fail_remove` chooses what else fails once: the cleanup's unlink
+/// (`true`), or its journal directory sync (`false`).
 fn arm_torn_header(backing: &CrashableBacking, fail_remove: bool) {
     let torn = Arc::new(AtomicBool::new(false));
     let tear = torn.clone();

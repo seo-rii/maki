@@ -1041,7 +1041,9 @@ fn damage_file(backing: &CrashableBacking, path: &str, rng: &mut StdRng) -> Stri
 /// header of a never-completed segment refuses attach. Recognised so that a
 /// sweep keeps looking for other classes; counted as `known-torn-header`.
 fn known_torn_header(error: &str, log: &[String]) -> bool {
-    error.contains("invalid header")
+    // AUDIT_STRICT_KNOWN=1 reports the known class as a failure again.
+    std::env::var_os("AUDIT_STRICT_KNOWN").is_none()
+        && error.contains("invalid header")
         && log.iter().any(|l| {
             l.contains("short write")
                 && l.contains("journal/seg-")
@@ -1278,6 +1280,143 @@ impl Backing for Lying {
     }
 }
 
+/// The durability oracle plus a journal-order *prefix* oracle. The engine
+/// journals every request in one sequence (records in ascending unit order)
+/// and recovery keeps a prefix of that sequence, so after any crash of a
+/// sequential workload the volume must equal "the cycle's starting image
+/// with the first S journaled writes applied", for some S at or beyond the
+/// last write a FUA/FLUSH made durable. The per-unit oracle alone accepts a
+/// later write surviving while an earlier one to another unit is lost (a
+/// hole in the replayed journal, the M-007 class).
+struct Tracked {
+    inner: ReferenceBlockModel,
+    prefix: bool,
+    baseline: Vec<Vec<u8>>,
+    log: Vec<(u64, Vec<u8>)>,
+    durable_upto: i64,
+}
+
+impl Tracked {
+    fn new(unit: usize, units: u64, prefix: bool) -> Self {
+        Self {
+            inner: ReferenceBlockModel::new(unit, units),
+            prefix,
+            baseline: (0..units).map(|_| vec![0u8; unit]).collect(),
+            log: Vec::new(),
+            durable_upto: -1,
+        }
+    }
+    fn write(&mut self, unit: u64, data: &[u8]) {
+        self.inner.write(unit, data);
+        self.log.push((unit, data.to_vec()));
+    }
+    fn write_fua(&mut self, unit: u64, data: &[u8]) {
+        self.inner.write_fua(unit, data);
+        self.log.push((unit, data.to_vec()));
+        self.durable_upto = self.log.len() as i64 - 1;
+    }
+    fn flush(&mut self) {
+        self.inner.flush();
+        self.durable_upto = self.log.len() as i64 - 1;
+    }
+    fn read(&self, unit: u64) -> Vec<u8> {
+        self.inner.read(unit)
+    }
+    fn crash_adopt(
+        &mut self,
+        unit: u64,
+        actual: &[u8],
+    ) -> Result<(), maki_test_support::model::OracleViolation> {
+        self.inner.crash_adopt(unit, actual)
+    }
+    /// Adopt a post-crash value (an in-flight request's) without logging it.
+    fn adopt(&mut self, unit: u64, actual: &[u8]) {
+        self.inner.write_fua(unit, actual);
+    }
+    /// The request in flight at a death: its records follow every
+    /// completed one, so they may extend the prefix.
+    fn in_flight(&mut self, unit: u64, image: &[u8]) {
+        self.log.push((unit, image.to_vec()));
+    }
+    fn start_cycle(&mut self) {
+        let units = self.inner.num_units();
+        self.baseline = (0..units).map(|u| self.inner.read(u)).collect();
+        self.log.clear();
+        self.durable_upto = -1;
+    }
+    fn check_prefix(&self, observed: &[Vec<u8>]) -> Result<(), String> {
+        if !self.prefix {
+            return Ok(());
+        }
+        let mut predicted = self.baseline.clone();
+        for (unit, image) in self.log.iter().take((self.durable_upto + 1) as usize) {
+            predicted[*unit as usize] = image.clone();
+        }
+        let mut mismatched: usize = (0..observed.len())
+            .filter(|&u| predicted[u] != observed[u])
+            .count();
+        let mut best = (mismatched, self.durable_upto);
+        let mut s = self.durable_upto;
+        loop {
+            if mismatched == 0 {
+                return Ok(());
+            }
+            s += 1;
+            if s >= self.log.len() as i64 {
+                break;
+            }
+            let (unit, image) = &self.log[s as usize];
+            let u = *unit as usize;
+            let before = predicted[u] != observed[u];
+            predicted[u] = image.clone();
+            let after = predicted[u] != observed[u];
+            mismatched = mismatched + usize::from(after) - usize::from(before);
+            if mismatched < best.0 {
+                best = (mismatched, s);
+            }
+        }
+        // Report the closest prefix.
+        let mut closest = self.baseline.clone();
+        for (unit, image) in self.log.iter().take((best.1 + 1) as usize) {
+            closest[*unit as usize] = image.clone();
+        }
+        let units: Vec<u64> = (0..observed.len())
+            .filter(|&u| closest[u] != observed[u])
+            .map(|u| u as u64)
+            .collect();
+        let entry_of = |u: u64, value: &Vec<u8>| -> String {
+            if *value == self.baseline[u as usize] {
+                return "cycle baseline".to_string();
+            }
+            self.log
+                .iter()
+                .enumerate()
+                .filter(|(_, (lu, img))| *lu == u && img == value)
+                .map(|(i, _)| format!("log#{i}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let detail: Vec<String> = units
+            .iter()
+            .map(|&u| {
+                format!(
+                    "unit {u}: observed {} vs prefix {}",
+                    entry_of(u, &observed[u as usize]),
+                    entry_of(u, &closest[u as usize])
+                )
+            })
+            .collect();
+        Err(format!(
+            "no journal prefix explains the recovered volume: {} journaled writes this cycle \
+             (durable through #{}), closest prefix #{} still differs at {}",
+            self.log.len(),
+            self.durable_upto,
+            best.1,
+            detail.join("; ")
+        ))
+    }
+}
+
 /// One member of a concurrent request batch.
 enum BatchOp {
     Flush,
@@ -1328,7 +1467,7 @@ fn apply_crash(kind: Crash, backing: &CrashableBacking, rng: &mut StdRng) {
 /// The unit images a write of `data` (or zeros) at `offset` produces.
 fn images_after_write(
     cfg: &Cfg,
-    model: &ReferenceBlockModel,
+    model: &Tracked,
     offset: u64,
     data: &[u8],
 ) -> Vec<(u64, Vec<u8>)> {
@@ -1417,7 +1556,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
     let block = cfg.block as u64;
     let bpu = unit / block;
     let total_blocks = cfg.device_units * bpu;
-    let mut model = ReferenceBlockModel::new(cfg.unit as usize, cfg.device_units);
+    let mut model = Tracked::new(cfg.unit as usize, cfg.device_units, cfg.concurrency == 1);
     let zeros = vec![0u8; cfg.unit as usize];
     let mut stamp: u32 = 0;
     // The first attach of a pristine volume establishes the key canary and
@@ -1463,6 +1602,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
     let mut recovery_mutations: u64 = 30;
 
     for cycle in 0..cycles {
+        model.start_cycle();
         let ops = rng.random_range(ops_lo..ops_hi);
         let death_armed = rng.random_range(0..100) < mode.midop_death_pct;
         // What the request in flight at a death may have left behind.
@@ -1518,6 +1658,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                     if injector.is_dead() {
                         for (u, image) in images {
                             maybe.entry(*u).or_default().push(image.clone());
+                            model.in_flight(*u, image);
                         }
                     } else {
                         assert!(
@@ -2280,6 +2421,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             s.durable_sequence,
             history()
         );
+        let mut observed: Vec<Vec<u8>> = Vec::with_capacity(cfg.device_units as usize);
         for u in 0..cfg.device_units {
             let live_before = model.read(u);
             let actual = match engine.read(u * unit, unit as usize).await {
@@ -2296,10 +2438,14 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                     history()
                 );
             }
+            observed.push(actual.clone());
             if let Err(violation) = model.crash_adopt(u, &actual) {
                 assert!(in_flight, "ORACLE: {violation}\n{}", history());
-                model.write_fua(u, &actual);
+                model.adopt(u, &actual);
             }
+        }
+        if let Err(text) = model.check_prefix(&observed) {
+            panic!("PREFIX-VIOLATION: {text}\n{}", history());
         }
         stats.bump("recoveries-checked");
 
@@ -2733,4 +2879,22 @@ async fn audit_one() {
         verbose: true,
     };
     run_seed(run, Arc::new(Stats::default())).await;
+}
+
+/// The prefix oracle is not vacuous: a later write surviving an earlier lost
+/// one (a hole in the replayed journal) is refused; every prefix is accepted.
+#[test]
+fn audit_prefix_oracle_refuses_holes() {
+    let (a, b, z) = (vec![1u8; 4], vec![2u8; 4], vec![0u8; 4]);
+    let mut model = Tracked::new(4, 2, true);
+    model.start_cycle();
+    model.write(0, &a);
+    model.write(1, &b);
+    assert!(model.check_prefix(&[z.clone(), z.clone()]).is_ok());
+    assert!(model.check_prefix(&[a.clone(), z.clone()]).is_ok());
+    assert!(model.check_prefix(&[a.clone(), b.clone()]).is_ok());
+    assert!(model.check_prefix(&[z.clone(), b.clone()]).is_err());
+    model.flush();
+    assert!(model.check_prefix(&[a.clone(), z.clone()]).is_err());
+    assert!(model.check_prefix(&[a.clone(), b.clone()]).is_ok());
 }
