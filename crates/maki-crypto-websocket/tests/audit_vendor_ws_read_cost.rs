@@ -67,6 +67,82 @@ fn read_one(len: usize) -> Duration {
     elapsed
 }
 
+/// A transport that returns at most one queued segment (one TLS record) per
+/// `read()`, so each small response frame costs exactly one `read_in`.
+struct SegmentedPeer {
+    segments: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl Read for SegmentedPeer {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(front) = self.segments.front_mut() else {
+            return Ok(0);
+        };
+        let n = buf.len().min(front.len());
+        buf[..n].copy_from_slice(&front[..n]);
+        front.drain(..n);
+        if front.is_empty() {
+            self.segments.pop_front();
+        }
+        Ok(n)
+    }
+}
+
+impl Write for SegmentedPeer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn small_frames_after(large: Option<usize>, count: usize) -> Duration {
+    let mut segments = std::collections::VecDeque::new();
+    if let Some(len) = large {
+        for piece in server_binary_frame(len).chunks(CHUNK) {
+            segments.push_back(piece.to_vec());
+        }
+    }
+    for _ in 0..count {
+        segments.push_back(vec![0x82, 4, b'p', b'i', b'n', b'g']);
+    }
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(64 << 20))
+        .max_frame_size(Some(64 << 20));
+    let mut socket = WebSocket::from_raw_socket(SegmentedPeer { segments }, Role::Client, Some(config));
+    if let Some(len) = large {
+        match socket.read().expect("large frame") {
+            Message::Binary(payload) => assert_eq!(payload.len(), len),
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    let start = Instant::now();
+    for _ in 0..count {
+        match socket.read().expect("small frame") {
+            Message::Binary(payload) => assert_eq!(&payload[..], b"ping"),
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    start.elapsed()
+}
+
+/// After one large frame the read buffer keeps a multi-MiB capacity, and every
+/// later read on the same connection resizes and wipes all of it, even for a
+/// 6-byte frame.
+#[test]
+fn audit_small_frames_stay_slow_after_one_large_frame() {
+    let count = 20;
+    let fresh = small_frames_after(None, count);
+    let after_large = small_frames_after(Some(2 << 20), count);
+    eprintln!(
+        "{count} six-byte frames: fresh connection {fresh:?}; after one 2 MiB frame {after_large:?} \
+         ({:.0}x)",
+        after_large.as_secs_f64() / fresh.as_secs_f64()
+    );
+    assert!(after_large > fresh * 20);
+}
+
 #[test]
 fn audit_large_frame_read_cost_scales_quadratically() {
     // Warm up allocator / page faults.

@@ -490,6 +490,94 @@ pub fn cfg(name: &str) -> Cfg {
     }
 }
 
+/// `random`/`random-v3`/`random-any`: a geometry and limit set drawn from
+/// the seed (edge shapes: one shard, one-unit shards, partial last shard,
+/// up to 8 blocks per unit, one to six records per segment, the smallest
+/// legal pending bound, tight overlay bounds, worker and concurrency on or
+/// off). Every limit is kept large enough that a lone request always fits.
+pub fn cfg_for(name: &str, seed: u64) -> Cfg {
+    if !name.starts_with("random") {
+        return cfg(name);
+    }
+    let mut r = StdRng::seed_from_u64(seed ^ 0x6E0_6E0);
+    let block: u32 = if r.random_bool(0.75) { 512 } else { 4096 };
+    let unit = block * [1u32, 1, 2, 4, 8][r.random_range(0..5)];
+    let device_units = r.random_range(2..=40u64);
+    let units_per_shard = match r.random_range(0..4) {
+        0 => 1,
+        1 => device_units, // a single shard
+        _ => r.random_range(1..=9u64),
+    };
+    let rec = 32 + unit as u64 + 8;
+    let per_segment = r.random_range(1..=6u64);
+    let segment_size = 48 + per_segment * rec + r.random_range(0..rec);
+    let max_request_units = r.random_range(1..=6u64).min(device_units);
+    let concurrency = if r.random_bool(0.35) {
+        r.random_range(2..=4usize)
+    } else {
+        1
+    };
+    let worker = r.random_bool(0.4);
+    let journal_max_bytes = if r.random_bool(0.3) {
+        BIG
+    } else {
+        2 * segment_size
+            + (max_request_units * concurrency as u64) * rec
+            + (max_request_units * concurrency as u64 + 2) * 48
+            + r.random_range(0..3 * segment_size)
+    };
+    let max_pending_bytes = if r.random_bool(0.3) {
+        BIG
+    } else {
+        rec * r.random_range(1..=4u64)
+    };
+    let request_records = max_request_units * concurrency as u64;
+    let max_overlay_entries = if r.random_bool(0.5) {
+        0
+    } else {
+        request_records + r.random_range(0..8u64)
+    };
+    let max_overlay_bytes = if r.random_bool(0.6) {
+        0
+    } else {
+        2 * request_records * (unit as u64 + 8) + r.random_range(0..6u64) * (unit as u64 + 8)
+    };
+    let discard = match name {
+        "random-v3" => true,
+        "random" => false,
+        _ => r.random_bool(0.5),
+    };
+    let cache = match r.random_range(0..3) {
+        0 => None,
+        1 => Some(false),
+        _ => Some(true),
+    };
+    let tear = [128usize, 512, 4096][r.random_range(0..3)].min(unit as usize);
+    Cfg {
+        name: match name {
+            "random-v3" => "random-v3",
+            "random" => "random",
+            _ => "random-any",
+        },
+        block,
+        unit,
+        device_units,
+        units_per_shard,
+        segment_size,
+        journal_max_bytes,
+        max_pending_bytes,
+        max_overlay_bytes,
+        max_overlay_entries,
+        max_request_units,
+        discard,
+        cache,
+        tear,
+        worker,
+        concurrency,
+        space: false,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Mode {
     pub name: &'static str,
@@ -2191,7 +2279,7 @@ pub async fn sweep(
         }
         seeds_run += 1;
         let run = Run {
-            cfg: cfg(cfg_name),
+            cfg: cfg_for(cfg_name, seed),
             mode: mode(mode_name),
             seed,
             cycles: env_or("AUDIT_CYCLES", cycles as u64) as usize,
@@ -2487,6 +2575,19 @@ async fn audit2_conc_lying() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit2_random_geometry() {
+    sweep_owned(
+        pairs_from_env(all_pairs(
+            &["random-any"],
+            &["crash", "death", "sync", "chaos", "chaos-death", "lying", "rfault", "damage"],
+        )),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit2_space() {
     sweep_owned(
         pairs_from_env(all_pairs(
@@ -2560,7 +2661,7 @@ async fn audit_one() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
     let run = Run {
-        cfg: cfg(&cfg_name),
+        cfg: cfg_for(&cfg_name, seed),
         mode: mode(&mode_name),
         seed,
         cycles,
