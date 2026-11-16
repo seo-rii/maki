@@ -26,6 +26,7 @@ url = "https://crypto.internal"
 path = "/encrypt"
 [crypto.http.encrypt.body.fields]
 "/data" = {{ source = "payload", encoding = "base64" }}
+"/unit" = {{ source = "unit_index" }}
 {fields}
 [crypto.http.encrypt.response]
 data_path = "/ct"
@@ -34,6 +35,7 @@ encoding = "base64"
 path = "/decrypt"
 [crypto.http.decrypt.body.fields]
 "/data" = {{ source = "payload", encoding = "base64" }}
+"/unit" = {{ source = "unit_index" }}
 {fields}
 [crypto.http.decrypt.response]
 data_path = "/pt"
