@@ -305,7 +305,9 @@ If the preferred frontend fails, the remaining frontends share the original
 overall deadline and a successful alternate becomes the next preferred address.
 Authentication failures, malformed records and predecessor conflicts remain
 terminal. A stalled former first address therefore consumes time once during
-failover rather than on every later successful call.
+failover rather than on every later successful call. A local socket error, such
+as the EPERM Linux returns from `connect()` when a firewall drops the
+connection, is a transport failure like a refused connection, not a denial.
 
 Inspect through the configured client without claiming a session:
 

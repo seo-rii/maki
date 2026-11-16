@@ -37,9 +37,13 @@ a multi-page write may leave an already completed prefix in the working view;
 retrying the write can complete it. A failed arena write or commit still requires
 reopening against the witness.
 A remote witness that cannot be reached (a timeout, a refused or reset
-connection, an unavailable quorum) refuses each operation with no fallback, but
-does not stop the session: the next check either matches the claimed record
-again or observes the change and stops it.
+connection, a local socket error such as the EPERM Linux returns from
+`connect()` when a firewall or a full conntrack table drops the connection, an
+unavailable quorum) refuses each operation with no fallback, but does not stop
+the session: the next check either matches the claimed record again or
+observes the change and stops it. Besides an observed change, only the
+witness's own denial, a predecessor conflict, an invalid answer or a TLS failure
+stops the session.
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.

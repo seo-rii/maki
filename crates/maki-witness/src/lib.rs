@@ -322,8 +322,9 @@ impl Client {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(invalid("witness request exceeds frame limit"));
         }
-        let socket = TcpStream::connect_timeout(&self.address, remaining(deadline)?)?;
-        socket.set_nodelay(true)?;
+        let socket = TcpStream::connect_timeout(&self.address, remaining(deadline)?)
+            .map_err(socket_error)?;
+        socket.set_nodelay(true).map_err(socket_error)?;
         let io = DeadlineIo { socket, deadline };
         let connection =
             rustls::ClientConnection::new(self.config.clone(), self.server_name.clone())
@@ -394,25 +395,46 @@ type ServerStream = rustls::StreamOwned<rustls::ServerConnection, DeadlineIo>;
 impl Read for DeadlineIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.socket
-            .set_read_timeout(Some(remaining(self.deadline)?))?;
-        self.socket.read(bytes).map_err(deadline_error)
+            .set_read_timeout(Some(remaining(self.deadline)?))
+            .map_err(socket_error)?;
+        self.socket.read(bytes).map_err(socket_error)
     }
 }
 impl Write for DeadlineIo {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.socket
-            .set_write_timeout(Some(remaining(self.deadline)?))?;
-        self.socket.write(bytes).map_err(deadline_error)
+            .set_write_timeout(Some(remaining(self.deadline)?))
+            .map_err(socket_error)?;
+        self.socket.write(bytes).map_err(socket_error)
     }
     fn flush(&mut self) -> io::Result<()> {
         remaining(self.deadline).map(|_| ())
     }
 }
-fn deadline_error(error: io::Error) -> io::Error {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        io::Error::new(io::ErrorKind::TimedOut, "witness RPC deadline expired")
-    } else {
-        error
+
+/// A socket-layer error means the witness could not be asked, never that it
+/// answered. Callers treat these kinds as the authority's final answer
+/// (failover stops, a remote rollback session ends), yet the socket layer
+/// produces them for local conditions: Linux returns EPERM or EACCES from
+/// connect() and send() when netfilter drops a locally generated packet
+/// (a full conntrack table, a firewall reload), and std reports both as
+/// `PermissionDenied`. Report them as a transport failure with the OS error
+/// text instead, so an outage refuses only the operation (BUG-103). Only the
+/// server's own answers and TLS failures, which rustls reports as
+/// `InvalidData` above this layer, keep a final kind.
+fn socket_error(error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::WouldBlock => {
+            io::Error::new(io::ErrorKind::TimedOut, "witness RPC deadline expired")
+        }
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::InvalidData
+        | io::ErrorKind::NotFound => io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("witness unreachable: local socket error: {error}"),
+        ),
+        _ => error,
     }
 }
 
@@ -869,6 +891,28 @@ mod server_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn local_socket_errors_are_transport_failures_not_final_answers() {
+        for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENOENT] {
+            let error = socket_error(io::Error::from_raw_os_error(errno));
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{errno}");
+            assert!(error.to_string().starts_with("witness unreachable"));
+        }
+        assert_eq!(
+            socket_error(io::Error::from(io::ErrorKind::WouldBlock)).kind(),
+            io::ErrorKind::TimedOut
+        );
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(socket_error(io::Error::from(kind)).kind(), kind);
+        }
+    }
 
     #[test]
     fn frame_roundtrip() {

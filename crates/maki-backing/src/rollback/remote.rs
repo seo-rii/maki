@@ -39,8 +39,9 @@ impl Witness {
     /// records proven anchor changes and uncertain publications itself; a
     /// transient read failure only refuses this operation. A remote Inspect
     /// changes nothing, so a witness
-    /// that could not be asked (timeout, refused or reset connection, an
-    /// unavailable quorum) only refuses this operation; the next check
+    /// that could not be asked (timeout, refused or reset connection, a
+    /// local socket error, an unavailable quorum) only refuses this
+    /// operation; the next check
     /// either matches again or observes the change (BUG-103). A mismatch,
     /// an invalid or denied answer stops the session for good. The kinds
     /// match the ones the failover client treats as final.
