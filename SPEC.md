@@ -661,16 +661,17 @@ catalog_ab_bytes        = 2 * (28 + 8 * num_shards)
 ```
 
 Geometry creation MUST reject more than 2^24 possible shards, matching the
-supported shard-catalog limit, and any capacity calculation that overflows an
-unsigned 64-bit byte count. `maki volume inspect` reports these five
-maximum-layout values. They exclude journal and checkpoint headroom,
-filesystem metadata and copy-on-write overhead, and application temporary
-space; they are not a full-volume physical reservation. Before accepting a
-journal record, a Linux backing MUST physically allocate the exact journal
-range and the record's complete checkpoint slot. Both allocation-map copies
-and the catalog entry of a newly touched shard MUST already be durable. A
-failed reservation MUST NOT consume a sequence or append the record. Untouched
-slots MAY remain sparse.
+supported shard-catalog limit, any capacity calculation that overflows an
+unsigned 64-bit byte count, and a unit count that reaches the reserved
+key-canary unit index (§27), which attach refuses. `maki volume inspect`
+reports these five maximum-layout values. They exclude journal and checkpoint
+headroom, filesystem metadata and copy-on-write overhead, and application
+temporary space; they are not a full-volume physical reservation. Before
+accepting a journal record, a Linux backing MUST physically allocate the exact
+journal range and the record's complete checkpoint slot. Both allocation-map
+copies and the catalog entry of a newly touched shard MUST already be durable.
+A failed reservation MUST NOT consume a sequence or append the record.
+Untouched slots MAY remain sparse.
 
 ---
 
