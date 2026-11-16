@@ -337,6 +337,13 @@ may omit this setting; batch mappings require it. Raw responses remain unchanged
 The response-size limit includes the configured echo and JSON wrappers. Missing,
 duplicate, reordered, oversized, or partial batch responses are provider contract
 errors. Response bodies are read under a hard size limit.
+A successful response must frame its body with `Content-Length` or chunked
+transfer coding. A body that only the connection close ends is a provider
+contract error, because it cannot be told apart from an endpoint that died
+mid-response. A raw encrypt response shorter than its plaintext is a contract
+error too: the whole body becomes the unit's ciphertext, and nothing else in it
+distinguishes ciphertext from, for example, a proxy's error page. Contract
+errors charge the endpoint that answered, and a retry-safe request fails over.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
 

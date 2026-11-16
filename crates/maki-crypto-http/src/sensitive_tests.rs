@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::{future::Future, task::Context};
 
 use super::{
-    append_response_chunk, pointer_set, zeroize_json, BodySpec, FieldSource, HttpCryptoProvider,
-    HttpProviderSpec, OpSpec, PayloadEncoding, RespKind, RespSpec,
+    append_response_chunk, pointer_set, zeroize_json, BodySpec, Direction, FieldSource,
+    HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding, RespKind, RespSpec,
 };
 use maki_crypto::{BatchCapability, Capability, CryptoCapabilities, CryptoContext, SecretBuffer};
 use maki_crypto_local::keysource::MapKeySource;
@@ -746,7 +746,9 @@ async fn per_item_build_error_does_not_copy_borrowed_request_metadata() {
     let items = vec![(0, SecretBuffer::from_slice(&[0]))];
 
     begin_inspection();
-    let result = provider.run_per_item(&op, &context, &items).await;
+    let result = provider
+        .run_per_item(&op, Direction::Encrypt, &context, &items)
+        .await;
     assert!(result.is_err());
     drop(result);
     let inspection = finish_inspection();
@@ -804,7 +806,8 @@ async fn http_request_borrows_compatibility_id_without_an_owned_copy() {
     let provider = test_provider(&op);
     let context = test_context();
     let items = [(3, SecretBuffer::zeroed(0))];
-    let mut operation = std::pin::pin!(provider.run_per_item(&op, &context, &items));
+    let mut operation =
+        std::pin::pin!(provider.run_per_item(&op, Direction::Encrypt, &context, &items));
     begin_inspection_for_size(PAYLOAD_LEN);
     let result = operation.as_mut().poll(&mut Context::from_waker(
         futures_util::task::noop_waker_ref(),
@@ -834,7 +837,8 @@ async fn http_request_streams_payload_encoding_without_an_owned_string() {
         let context = test_context();
         let items = [(3, SecretBuffer::from_slice(&[FILL; PAYLOAD_LEN]))];
         let length = encoding.encode(items[0].1.expose()).len();
-        let mut operation = std::pin::pin!(provider.run_per_item(&op, &context, &items));
+        let mut operation =
+            std::pin::pin!(provider.run_per_item(&op, Direction::Encrypt, &context, &items));
         begin_inspection_for_size(length);
         let result = operation.as_mut().poll(&mut Context::from_waker(
             futures_util::task::noop_waker_ref(),
@@ -898,7 +902,7 @@ async fn http_request_cancellation_erases_the_guarded_wire_body() {
         PayloadEncoding::Base64.encode(items[0].1.expose())
     )
     .len();
-    let mut operation = Box::pin(provider.run_per_item(&op, &context, &items));
+    let mut operation = Box::pin(provider.run_per_item(&op, Direction::Encrypt, &context, &items));
     begin_inspection_for_size(wire_len);
     let result = operation.as_mut().poll(&mut Context::from_waker(
         futures_util::task::noop_waker_ref(),
@@ -929,13 +933,18 @@ async fn empty_per_item_request_does_not_evaluate_invalid_mapping() {
     });
     let provider = test_provider(&op);
     assert!(provider
-        .run_per_item(&op, &test_context(), &[])
+        .run_per_item(&op, Direction::Encrypt, &test_context(), &[])
         .await
         .unwrap()
         .is_empty());
     assert!(matches!(
         provider
-            .run_per_item(&op, &test_context(), &[(1, SecretBuffer::zeroed(0))])
+            .run_per_item(
+                &op,
+                Direction::Encrypt,
+                &test_context(),
+                &[(1, SecretBuffer::zeroed(0))]
+            )
             .await,
         Err(maki_crypto::CryptoError::ProviderFatal(_))
     ));
