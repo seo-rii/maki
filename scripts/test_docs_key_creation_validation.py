@@ -20,6 +20,10 @@ GUIDES = {
     "quickstart": ("docs/getting-started/quickstart.md", "demo.token"),
     "postgres": ("docs/deployment/postgres.md", "postgres.token"),
 }
+ENTRYPOINTS = {
+    "README.md": ("quickstart", "1-create-the-key"),
+    "examples/postgres-local/README.md": ("postgres", "3-credential"),
+}
 SYNTHETIC_KEY = bytes(range(32))
 
 # The shell and the documentation's Python are unmodified. This private
@@ -49,6 +53,29 @@ else:
     os.fsync = sync
 exec(compile(sys.stdin.read(), "documented-key-creation", "exec"))
 '''
+
+
+class KeyCreationEntrypoints(unittest.TestCase):
+    def test_readmes_link_to_the_validated_key_creation_procedure(self):
+        for relative, (guide, anchor) in ENTRYPOINTS.items():
+            with self.subTest(document=relative):
+                document = ROOT / relative
+                guide_path = ROOT / GUIDES[guide][0]
+                target = Path(os.path.relpath(guide_path, document.parent)).as_posix()
+                links = re.findall(r"\[[^\]]*\]\(([^)]+)\)", document.read_text())
+                self.assertIn(f"{target}#{anchor}", links)
+                headings = re.findall(r"^#+\s+(.+)$", guide_path.read_text(), re.M)
+                anchors = {re.sub(r"[^\w\s-]", "", heading).lower().replace(" ", "-")
+                           for heading in headings}
+                self.assertIn(anchor, anchors, "key creation link must resolve to a section")
+
+    def test_readmes_do_not_duplicate_key_generation_commands(self):
+        for relative in ENTRYPOINTS:
+            with self.subTest(document=relative):
+                self.assertNotRegex(
+                    (ROOT / relative).read_text(), r"/dev/u?random|os\.urandom\s*\(",
+                    "README entry points must use the validated key creation procedure",
+                )
 
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires POSIX Bash")
