@@ -166,6 +166,30 @@ class CargoTestRunnerTests(unittest.TestCase):
                 build.assert_not_called()
                 self.assertEqual(tests.call_args.args[0][1:], ["test", *arguments])
 
+    def test_doc_test_selection_is_forwarded_without_a_compile_phase(self):
+        # Cargo refuses every `--doc --no-run` compile phase ("can't skip
+        # running doc tests with --no-run", exit 101). Doc tests never load
+        # the native plugin, so the selection is forwarded verbatim.
+        for arguments in (["--doc", "-p", "maki-core", "--locked"],
+                          ["--workspace", "--doc", "--", "--nocapture"]):
+            with self.subTest(arguments=arguments), mock.patch.dict(
+                    os.environ, {runner.PLUGIN_ENV: "/stale/plugin.so"}):
+                status, build, tests = self.invoke(
+                    [], arguments, compile_status=101, test_status=7, native_tests=False)
+                self.assertEqual(status, 7)
+                build.assert_not_called()
+                self.assertEqual(tests.call_args.args[0][1:], ["test", *arguments])
+                self.assertEqual(tests.call_args.kwargs["cwd"], runner.ROOT)
+                self.assertNotIn(runner.PLUGIN_ENV, tests.call_args.kwargs["env"])
+
+    def test_doc_after_the_harness_separator_is_not_a_cargo_selection(self):
+        arguments = ["-p", "maki-nbdkit", "--", "--doc"]
+        status, build, tests = self.invoke([self.artifact()], arguments)
+        self.assertEqual(status, 0)
+        self.assertEqual(build.call_args.args[0][2:], ["-p", "maki-nbdkit", "--no-run",
+                                                       "--message-format=json"])
+        self.assertEqual(tests.call_args.kwargs["env"][runner.PLUGIN_ENV], str(self.plugin))
+
     def test_wrapper_rejects_options_that_would_override_its_compile_contract(self):
         for argument in ["--no-run", "--message-format=json", "--message-format"]:
             status, build, tests = self.invoke([], [argument])
