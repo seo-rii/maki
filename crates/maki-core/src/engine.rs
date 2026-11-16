@@ -2093,6 +2093,7 @@ impl EngineInner {
         // that applied nothing. This is the FLUSH barrier (durable proof
         // included); it only makes acknowledged records durable sooner.
         // Cleanup and reclamation passes act on covered state and need none.
+        let mut sync_failed = false;
         if (by_size || by_space || by_time || by_overlay || by_refusal) && durable < appended {
             let Ok(mut volume) = self.write_volume().await else {
                 return;
@@ -2104,8 +2105,19 @@ impl EngineInner {
             let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
             if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
+                // The sync is retried only after an interval (BUG-101). A
+                // failed sync does not advance the durable mark, so a
+                // checkpoint still applies only records that were durable
+                // before it. The watermark and low-space triggers exist to
+                // give journal and backing space back, and deleting covered
+                // sealed segments needs no sync: they still checkpoint what
+                // is durable, as they did before they synced first, so a
+                // journal whose syncs keep failing does not also stop that.
                 self.defer_checkpoint_retry();
-                return;
+                if !(by_size || by_space) {
+                    return;
+                }
+                sync_failed = true;
             }
         }
         if !self.checkpoint_stop.load(Ordering::SeqCst) {
@@ -2115,12 +2127,16 @@ impl EngineInner {
                     self.defer_checkpoint_retry();
                 }
                 Ok(_) => {
-                    *self.checkpoint_retry_at.lock() = None;
+                    // A checkpoint after a failed sync keeps that sync's
+                    // deferral: the next pass waits out the interval.
+                    if !sync_failed {
+                        *self.checkpoint_retry_at.lock() = None;
+                    }
                     let volume = self.volume.read().await;
                     *self.reclamation_retry_at.lock() = volume
                         .has_deferred_reclamation()
                         .then(|| self.clock.now() + self.policy.interval);
-                    if volume.has_pending_reclamation() {
+                    if !sync_failed && volume.has_pending_reclamation() {
                         // Continue this bounded sweep past failed ranges;
                         // retry those only after finishing the sweep and
                         // waiting out its independent interval.

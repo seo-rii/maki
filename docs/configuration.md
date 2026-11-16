@@ -568,7 +568,11 @@ checkpoint applies durable records; a successful call that advances no sequence
 does not postpone the worker's periodic sync of pending writes. After a failed
 pass the worker waits one interval before it tries again, however many writes
 cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
-checkpoints inline, and a success clears the wait.
+checkpoints inline, and a success clears the wait. Each pass syncs unsynced
+records before it checkpoints; a failed sync counts as a failed pass, but a pass
+started by the watermark or by low free space still checkpoints the records
+that were durable before it (deleting the sealed segments they cover) and then
+waits, so a journal whose syncs keep failing still gives that space back.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
