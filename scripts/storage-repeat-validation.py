@@ -150,7 +150,10 @@ def prepare(directory, config, deadline):
         return min(limit, budget)
 
     environment = os.environ.copy()
-    environment.update(CARGO_TARGET_DIR=config["target_dir"], CARGO_BUILD_JOBS="2")
+    # Separate target directories do not isolate Cargo's intermediate cache
+    # when the shell or Cargo configuration supplies a shared build directory.
+    environment.update(CARGO_TARGET_DIR=config["target_dir"],
+                       CARGO_BUILD_BUILD_DIR=str(directory / "build"), CARGO_BUILD_JOBS="2")
     executables = {}
     suites = [suite for group in groups.values() for suite in group]
     for package, selected in groups.items():
@@ -312,6 +315,7 @@ def start(args):
     runner.chmod(0o400)
     save_json(directory / "config.json", {
         "revision": revision, "source": str(source), "target_dir": str(target),
+        "build_dir": str(directory / "build"),
         "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
         "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
