@@ -175,14 +175,15 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
   `nbd.device_block_size` that differs from the volume's, a `minimum_io`
-  above 64 KiB, an export size that is not a multiple of `minimum_io`, a
-  `maximum_io` that does not fit in the NBD 32-bit wire
-  field, or a `limits.max_plaintext_bytes` too small for every crypto unit
-  touched by one permitted NBD request. The charge rounds to whole crypto
-  units, including partial units at both ends, and accounts for `minimum_io`
-  alignment and the export size. For example, 1 KiB requests with 512-byte
-  alignment and 4 KiB crypto units can touch two units and need 8 KiB, not
-  5 KiB;
+  above 64 KiB, a configured or defaulted `preferred_io` above 32 MiB (nbdkit
+  refuses a larger preferred block size, failing every client handshake), an
+  export size that is not a multiple of `minimum_io`, a `maximum_io` that does
+  not fit in the NBD 32-bit wire field, or a `limits.max_plaintext_bytes` too
+  small for every crypto unit touched by one permitted NBD request. The charge
+  rounds to whole crypto units, including partial units at both ends, and
+  accounts for `minimum_io` alignment and the export size. For example, 1 KiB
+  requests with 512-byte alignment and 4 KiB crypto units can touch two units
+  and need 8 KiB, not 5 KiB;
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at

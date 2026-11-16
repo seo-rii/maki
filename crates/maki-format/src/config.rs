@@ -24,6 +24,10 @@ use crate::geometry::Geometry;
 /// leave room for the rest of a bounded control-protocol status response.
 pub const MAX_VOLUME_NAME_BYTES: usize = 64;
 
+/// The largest preferred block size nbdkit's `.block_size` callback may
+/// report (nbdkit-plugin(3)); nbdkit fails the handshake otherwise.
+const NBDKIT_MAX_PREFERRED_IO: u32 = 32 << 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// Where and what, never the document: see [`parse_config`].
@@ -1914,6 +1918,15 @@ impl VolumeConfig {
         }
         if n.minimum_io > 65536 {
             return Err(invalid("nbd.minimum_io must not exceed 65536 bytes"));
+        }
+        // nbdkit's `.block_size` contract: a larger preferred size fails the
+        // callback and every NBD handshake. Its 512-byte lower bound follows
+        // from device_block_size (at least 512) <= minimum_io <= preferred_io.
+        if preferred > NBDKIT_MAX_PREFERRED_IO {
+            return Err(invalid(format!(
+                "nbd.preferred_io {preferred} must not exceed {NBDKIT_MAX_PREFERRED_IO} bytes \
+                 (32 MiB, the largest preferred block size nbdkit accepts)"
+            )));
         }
         if n.maximum_io.0 > u32::MAX as u64 {
             return Err(invalid("nbd.maximum_io must fit in the NBD u32 wire field"));
