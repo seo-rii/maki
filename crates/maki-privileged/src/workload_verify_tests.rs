@@ -440,3 +440,99 @@ fn descriptor_sentinel_reader_rejects_wrong_devices_links_and_unbounded_files() 
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     assert!(read().is_err());
 }
+
+/// Run `f` on a fresh thread whose effective capability set lacks
+/// CAP_FOWNER, as in a workload unit whose `CapabilityBoundingSet=` drops
+/// it (`ExecStartPre=!` keeps the bounding set). Linux capabilities belong
+/// to a thread, so no other test is affected. None when the capability
+/// cannot be dropped this way.
+fn without_cap_fowner<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_FOWNER: u32 = 3;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut header = Header {
+                    version: CAPABILITY_VERSION_3,
+                    pid: 0,
+                };
+                let mut data = [Data::default(); 2];
+                // SAFETY: header and a two-element data array are the v3 ABI;
+                // pid 0 names the calling thread only.
+                let read = unsafe {
+                    libc::syscall(
+                        libc::SYS_capget,
+                        &mut header as *mut Header,
+                        data.as_mut_ptr(),
+                    )
+                };
+                if read != 0 || data[0].effective & (1 << CAP_FOWNER) == 0 {
+                    return None;
+                }
+                data[0].effective &= !(1 << CAP_FOWNER);
+                // SAFETY: as above; dropping an effective capability is always
+                // permitted and affects only this thread.
+                let set = unsafe {
+                    libc::syscall(libc::SYS_capset, &header as *const Header, data.as_ptr())
+                };
+                (set == 0).then(f)
+            })
+            .join()
+            .unwrap()
+    })
+}
+
+#[test]
+fn descriptor_sentinel_reader_does_not_need_cap_fowner_for_workload_owned_files() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: fixtures owned by another user need root");
+        return;
+    }
+    // The workload user owns the volume root (and may replace the sentinel);
+    // O_NOATIME on an inode the caller does not own needs CAP_FOWNER.
+    for workload_owns_root in [true, false] {
+        let fixture = Fixture::new();
+        let mount = fixture.0.join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        let sentinel = mount.join(SENTINEL_FILE);
+        std::fs::write(&sentinel, "volume\n").unwrap();
+        let owned = if workload_owns_root {
+            vec![&mount, &sentinel]
+        } else {
+            vec![&sentinel]
+        };
+        for path in owned {
+            std::os::unix::fs::chown(path, Some(65534), Some(65534)).unwrap();
+        }
+        let dev = mount.metadata().unwrap().dev();
+        let device = (libc::major(dev), libc::minor(dev));
+        let read = |device| workload_verify::read_mounted_sentinel(mount.to_str().unwrap(), device);
+        assert_eq!(read(device).unwrap(), "volume", "control: with CAP_FOWNER");
+        let Some(result) = without_cap_fowner(|| read(device)) else {
+            eprintln!("skipping: CAP_FOWNER cannot be dropped from a test thread");
+            return;
+        };
+        assert_eq!(
+            result.unwrap(),
+            "volume",
+            "the gate fails in a unit without CAP_FOWNER (root owned: {})",
+            !workload_owns_root
+        );
+        // The device binding still decides what is read.
+        let wrong = (device.0.wrapping_add(1), device.1);
+        assert!(without_cap_fowner(|| read(wrong)).unwrap().is_err());
+    }
+}
