@@ -21,8 +21,9 @@ PLUGIN_NAME = "libmaki_nbdkit.so"
 
 
 def compiler_artifacts(lines):
-    """Select only this workspace's non-test cdylib; preserve compiler diagnostics."""
+    """Find this workspace's cdylib and native test selection; preserve diagnostics."""
     paths = set()
+    needs_plugin = False
     for line in lines:
         try:
             event = json.loads(line)
@@ -36,17 +37,34 @@ def compiler_artifacts(lines):
             if rendered:
                 print(rendered, end="", file=sys.stderr)
         target = event.get("target", {})
+        manifest = event.get("manifest_path")
+        if manifest is not None:
+            native_package = Path(manifest).resolve() == MANIFEST.resolve()
+        else:
+            # Older Cargo messages may omit the manifest, but still identify
+            # the source of an integration test in this workspace.
+            source = target.get("src_path")
+            native_package = bool(source) and Path(source).resolve().is_relative_to(
+                (MANIFEST.parent / "tests").resolve())
+        # All consumers of native_plugin::path() are nbdkit integration tests.
+        # Package and lib-only selections do not necessarily build that cdylib.
+        if (event.get("reason") == "compiler-artifact" and native_package
+                and "test" in target.get("kind", [])
+                and event.get("profile", {}).get("test") is True):
+            needs_plugin = True
         if (event.get("reason") != "compiler-artifact"
                 or target.get("name") != "maki_nbdkit"
                 or "cdylib" not in target.get("crate_types", [])
                 or event.get("profile", {}).get("test") is not False):
             continue
-        manifest = event.get("manifest_path")
         if manifest is not None and Path(manifest).resolve() != MANIFEST.resolve():
             continue
+        # A reported plugin must still name the expected artifact, even when
+        # this selection has no native integration tests.
+        needs_plugin = True
         paths.update(Path(name) for name in event.get("filenames", [])
                      if Path(name).name == PLUGIN_NAME)
-    return paths
+    return paths, needs_plugin
 
 
 def run(arguments, platform=None):
@@ -69,10 +87,12 @@ def run(arguments, platform=None):
     with subprocess.Popen(compile_command, cwd=ROOT, env=environment,
                           stdout=subprocess.PIPE, text=True,
                           encoding="utf-8", errors="replace") as compiler:
-        paths = compiler_artifacts(compiler.stdout)
+        paths, needs_plugin = compiler_artifacts(compiler.stdout)
         status = compiler.wait()
     if status:
         return status
+    if not paths and not needs_plugin:
+        return subprocess.call(command, cwd=ROOT, env=environment)
     if len(paths) != 1:
         print(f"expected exactly one {PLUGIN_NAME} from this test compilation; "
               f"found {sorted(str(path) for path in paths)}", file=sys.stderr)
