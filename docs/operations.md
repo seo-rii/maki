@@ -20,8 +20,11 @@ Read [durable recovery and migration](durable-recovery.md) before replacing an
 existing installation. There is no automatic in-place format upgrade. Preserve
 an untouched source, old software and provider/key material, then use an
 isolated recovery copy and verified logical/DB-native transfer to a fresh v2
-volume. Do not remove proofs or change format bytes to bypass a refusal. The
-crypto context's `format_version` is unchanged by the envelope version.
+volume. Copy backing files with `cp --reflink=never`: a reflink copy shares
+extents with the source, which voids Maki's space reservation for both
+([backing store](deployment/support-matrix.md#backing-store-below-maki)). Do
+not remove proofs or change format bytes to bypass a refusal. The crypto
+context's `format_version` is unchanged by the envelope version.
 
 ## Prerequisites
 
@@ -859,6 +862,8 @@ the separate process in [durable recovery](durable-recovery.md).
    `maki-workload@<volume>.target` and wait until the workload, attach and daemon
    units are inactive. Run `maki check` before capture.
 2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
+   A same-host capture must copy data, not clone extents (`cp --reflink=never`;
+   see [backing store](deployment/support-matrix.md#backing-store-below-maki)).
    Capture the credential through the deployment's secret-backup mechanism,
    separately from ordinary logs and backups. Record hashes, Maki revision,
    volume UUID, provider identity, filesystem and LVM identities, tool versions,

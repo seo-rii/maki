@@ -66,7 +66,7 @@ locks and atomic rename.
 |---|---|---|
 | GCE balanced/standard Persistent Disk, ext4 | **Campaign passed** | Physical reservation, whole-instance reset, database and package campaigns |
 | Single local NVMe/SATA SSD or HDD, ext4 | Expected | Same code path; write-cache and power-loss behaviour of the device are not qualified |
-| Single local disk, XFS as the *backing* filesystem | Expected | Not exercised externally |
+| Single local disk, XFS as the *backing* filesystem | Expected | Not exercised externally. Backing files must not share extents with reflink copies (below) |
 | Software RAID (`mdadm`) below the backing filesystem | Not qualified | Correctness depends on the array honouring FLUSH/FUA to all members; see [RAID](raid.md) |
 | Hardware RAID controller below the backing filesystem | Not qualified | Depends on controller cache policy (battery-backed write cache or write-through) |
 | LVM (plain, thin, cache) below the backing filesystem | Not qualified | The daemon does not inspect what is under its filesystem |
@@ -85,6 +85,21 @@ including hardlink-based backing copies. The check cannot prevent later link
 creation or revoke already-open handles; filesystem ownership and permissions
 must protect the backing namespace and inodes
 ([details](../architecture.md#backing-namespace)).
+
+Backing files must not share extents with copies. On a filesystem with
+reflinks (XFS formatted with `reflink=1`, the `mkfs.xfs` default including
+Debian 12; btrfs), `cp --reflink` makes such a copy, and GNU coreutils 9 `cp`
+(Debian 12 ships 9.1) does so by default (`--reflink=auto`). `posix_fallocate`
+then succeeds without unsharing the extents, so Maki's space reservation does
+not cover an in-place overwrite: a checkpoint's slot write, or recovery's
+rewrite of journal records, is copy-on-write, needs new space and fails with
+ENOSPC when the filesystem has none left. This applies to the original and to
+the copy. A failed checkpoint degrades the volume and writes are refused
+once the journal cannot be reclaimed; acknowledged writes stay in the journal,
+so it is an availability failure, not data loss. Make backing copies with
+`cp --reflink=never` (or a tool that copies data rather than cloning extents),
+and do not run a volume while its files still share extents with another copy.
+Maki does not detect shared extents.
 
 ## Exported stack (above Maki)
 
