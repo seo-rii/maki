@@ -2,7 +2,7 @@
 //! it cannot allocate a device, run a mutation step, or repair attach state.
 
 use std::ffi::CString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
@@ -35,37 +35,51 @@ fn device_number(value: u64) -> (u32, u32) {
     (libc::major(value), libc::minor(value))
 }
 
+/// Open with `O_NOATIME`, or without that one flag when the kernel refuses
+/// it. `O_NOATIME` needs ownership of the inode or CAP_FOWNER; the volume
+/// root and sentinel can belong to the workload user, and `ExecStartPre=!`
+/// keeps the unit's `CapabilityBoundingSet=`, so the gate may lack it. The
+/// flag only spares an access-time update (the volume is mounted `noatime`
+/// in any case); every other flag stays, and the caller's device checks on
+/// the opened descriptor bind what is read either way.
+pub(super) fn open_noatime(
+    flags: libc::c_int,
+    open: impl Fn(libc::c_int) -> io::Result<File>,
+) -> io::Result<File> {
+    match open(flags | libc::O_NOATIME) {
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => open(flags),
+        result => result,
+    }
+}
+
 /// Bind the sentinel read to the observed mounted device. No write probe or
-/// sentinel initialization is used. O_NOATIME also avoids a read-side atime
-/// update; errors never fall back to less restrictive open flags.
+/// sentinel initialization is used.
 pub(super) fn read_mounted_sentinel(mountpoint: &str, device: (u32, u32)) -> io::Result<String> {
-    let root = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOATIME)
-        .open(mountpoint)?;
+    let root = open_noatime(libc::O_DIRECTORY | libc::O_NOFOLLOW, |flags| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(mountpoint)
+    })?;
     if device_number(root.metadata()?.dev()) != device {
         return Err(io::Error::other(
             "opened mount root is not the verified device",
         ));
     }
     let name = CString::new(SENTINEL_FILE).unwrap();
-    // SAFETY: root remains open and name is NUL-terminated. The returned
-    // descriptor is exclusively owned by the File created below.
-    let fd = unsafe {
-        libc::openat(
-            root.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY
-                | libc::O_CLOEXEC
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | libc::O_NOATIME,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let file = open_noatime(
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        |flags| {
+            // SAFETY: root remains open and name is NUL-terminated. The
+            // returned descriptor is exclusively owned by the File below.
+            let fd = unsafe { libc::openat(root.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(unsafe { File::from_raw_fd(fd) })
+            }
+        },
+    )?;
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.len() > super::SENTINEL_MAX_BYTES

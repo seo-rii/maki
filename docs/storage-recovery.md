@@ -202,9 +202,12 @@ foreign filesystem hiding a database data directory. A similarly named sibling
 path is unrelated; when the configured root is `/`, every other mount is nested.
 The filesystem probe reads an already opened and device-verified LV descriptor
 with uncached `blkid --probe`, then checks the configured XFS UUID. The bounded
-sentinel read uses held descriptors, refuses links and non-regular files, checks
-the mounted device, and suppresses access-time updates. Backend and mapping
-identity are checked again after both potentially blocking reads.
+sentinel read uses held descriptors, refuses links and non-regular files, and
+checks the mounted device. It opens with `O_NOATIME` and drops only that flag
+when the kernel refuses it (a workload-owned file in a unit without
+CAP_FOWNER); the attach mount's `noatime` option keeps access times unchanged
+then too. Backend and mapping identity are checked again after both
+potentially blocking reads.
 
 Verification does not initialize a sentinel, run a write probe, repair storage,
 change the attach record, or start a database. A configured first-attach

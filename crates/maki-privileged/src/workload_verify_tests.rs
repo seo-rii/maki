@@ -536,3 +536,35 @@ fn descriptor_sentinel_reader_does_not_need_cap_fowner_for_workload_owned_files(
         assert!(without_cap_fowner(|| read(wrong)).unwrap().is_err());
     }
 }
+
+#[test]
+fn sentinel_opens_drop_only_o_noatime_and_only_when_it_is_refused() {
+    let base = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    for (refusal, retried) in [
+        (libc::EPERM, true),
+        (libc::EACCES, false),
+        (libc::ENOENT, false),
+        (libc::ELOOP, false),
+    ] {
+        for retry_fails in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            let result = workload_verify::open_noatime(base, |flags| {
+                calls.borrow_mut().push(flags);
+                if flags & libc::O_NOATIME != 0 {
+                    Err(io::Error::from_raw_os_error(refusal))
+                } else if retry_fails {
+                    Err(io::Error::from_raw_os_error(libc::EACCES))
+                } else {
+                    File::open("/dev/null")
+                }
+            });
+            if retried {
+                assert_eq!(*calls.borrow(), [base | libc::O_NOATIME, base]);
+                assert_eq!(result.is_ok(), !retry_fails);
+            } else {
+                assert_eq!(*calls.borrow(), [base | libc::O_NOATIME], "{refusal}");
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(refusal));
+            }
+        }
+    }
+}
