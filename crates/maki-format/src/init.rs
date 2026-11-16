@@ -117,7 +117,10 @@ fn create_volume_with_metadata_version(
     backing.sync_dir("")?;
 
     // Both superblock copies, so a single later torn write can never leave
-    // the volume unreadable.
+    // the volume unreadable. A failure or a kill from here on can leave a
+    // readable copy that is not durable (or only copy A): the root is then a
+    // volume this function refuses, and writable recovery makes both copies
+    // durable before anything else (`persist_volume_superblock`).
     superblock.generation = 0;
     let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
     let mut envelope = VolumeSuperblock {
