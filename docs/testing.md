@@ -217,7 +217,7 @@ The ignored long-running and external-service gates were not part of this run.
 | Component | Purpose |
 |---|---|
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
-| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
+| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics follow Linux writeback: a failed `sync_data` marks its dirty operations clean with *unknown* persistence (the page cache keeps showing them, a retried sync writes nothing, a later power loss may keep any of them, whole or torn, and the worst-case crash loses them), a successful sync writes back every page a dirty write touched as a whole 4 KiB cached page, and the partial-write hook makes a `write_at` persist a prefix before failing |
 | `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses |
 | `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing |
 | `DeterministicScheduler` | Reproducible seeded interleavings |
@@ -554,7 +554,22 @@ including a cross-directory rename when either parent is synced. That is a
 model assumption, not a guarantee for every filesystem; directory-local rename
 persistence needs additional simulation or real-filesystem testing. The main
 power-loss gate (`phase12_powerloss.rs`) also enables tearing at 512-byte
-granularity, so an unsynced write can survive in part. Simulation is useful
+granularity, so an unsynced write can survive in part.
+
+A failed `sync_data` only reports that some writeback failed: the flusher, or
+the failing sync before the page that failed, may already have written the
+rest. The model therefore keeps a failed sync's operations as *uncertain*: a
+later crash keeps each one independently, exactly like an unsynced operation
+(torn too, with tearing enabled), while `crash_all_lost` and
+`crash_keep_torn_prefix` drop them. A retried sync has nothing dirty to write
+and makes none of them certain, so the rewrite-before-retry protocols remain
+required (F01). Writeback is page granular: a successful sync persists every
+page a dirty write touched as the page cache holds it (zero past end-of-file),
+which makes the uncertain bytes in a re-dirtied page durable; bytes a
+successful sync rewrote or truncated never come back. A length change dirties
+no page. One whose sync failed may survive a crash until the next successful
+sync of the file, after which the model treats it as lost, so a bare retry
+cannot be relied on to persist a truncation. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 
