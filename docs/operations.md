@@ -147,10 +147,13 @@ stored structure and volume identity; actual key verification happens at
 attach. Combine these checks with provider authentication and application
 recovery/backup verification before accepting recovered data.
 
-`--deep` takes the volume lock and refuses to run while a daemon is attached;
-when checking a backing
-root directly, pass `--journal-segment-size` if the volume uses a non-default
-size.
+`--deep` takes the volume lock and refuses to run while a daemon is attached.
+When checking a backing root directly, `maki-check` needs no segment size:
+like recovery, it bounds each journal segment file by the largest file a
+writer can produce under any valid `journal_segment_size` (at most 1 GiB), so
+segments written before the setting was lowered stay readable. Its
+`--journal-segment-size` flag is still accepted, but no value within that
+limit changes the verdict.
 
 The deep report states one of three verdicts as an `info: deep check verdict:`
 line, printed before any `warning:` and `ERROR:` lines; the report ends with

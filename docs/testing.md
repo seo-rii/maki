@@ -62,7 +62,8 @@ compatibility checks.
 The baseline workspace suite includes unit tests, parser mutation smokes,
 golden format vectors, provider conformance, transport chaos, failpoints,
 manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
-power-loss simulations, and real-process tests for all four binaries.
+power-loss simulations, and real-process tests for all five binaries (`maki`,
+`maki-attach`, `maki-check`, `maki-benchmark` and `maki-witness`).
 The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
 before the workspace tests and checks their executables. This runs the native
 startup, negotiation, drain, process-crash, and ABI regressions instead of relying on optional
