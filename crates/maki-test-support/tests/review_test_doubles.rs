@@ -11,12 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
+use maki_backing::Backing;
 use maki_crypto::{
     Capability, CiphertextUnit, Clock, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
     PlaintextUnit, SecretBuffer,
 };
 use maki_test_support::sched::{yield_now, DeterministicScheduler};
-use maki_test_support::{FakeCryptoProvider, ManualClock};
+use maki_test_support::{CrashableBacking, FakeCryptoProvider, ManualClock};
 
 const UNIT: u32 = 4096;
 
@@ -340,5 +341,20 @@ fn an_authenticated_fake_refuses_damaged_ciphertext() {
             "{what} ciphertext was not refused: {:?}",
             result.map(|units| units.len())
         );
+    }
+}
+
+// ---------- CrashableBacking: zero-length allocation ----------
+
+/// The crash simulator uses the trait's default `allocate_range`, which
+/// must agree with every other backing that `allocate_range(_, 0)` is a
+/// no-op: it neither fails nor extends the file to the offset.
+#[test]
+fn zero_length_allocation_does_not_change_a_crashable_file() {
+    let backing = CrashableBacking::new();
+    let file = backing.open("f", true).unwrap();
+    for offset in [0, 4096] {
+        file.allocate_range(offset, 0).unwrap();
+        assert_eq!(file.len().unwrap(), 0, "allocate_range({offset}, 0)");
     }
 }
