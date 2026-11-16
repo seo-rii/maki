@@ -153,11 +153,13 @@ operator can inspect the live process safely.
 
 ## Denial-check harness correction — 2026-11-16
 
-The results below were recorded by a runner that passed the unrelated-user
-socket check and the unprivileged NBD disconnect check on any nonzero exit,
-without reading `unrelated-user-socket.txt` or `unprivileged-nbd-ioctl.txt`.
-A sudo policy refusal or an nbd-client usage error would also have passed, so
-those rows show only that both commands failed. The runner now requires
+Until this date the runner passed its unrelated-user socket check and its
+unprivileged NBD disconnect check on any nonzero exit, without reading
+`unrelated-user-socket.txt` or `unprivileged-nbd-ioctl.txt`. A sudo policy
+refusal or an nbd-client usage error would also have passed, so in the results
+below and in the privileged run of the
+[R5 hardware validation](r5-hardware-validation-2026-10-03.md) those checks
+show only that both commands failed. The runner now requires
 `nbdinfo` to fail `connect` with `Permission denied`, and `nbd-client -d` to
 report `Operation not permitted`, `Cannot open NBD: Permission denied` or the
 netlink client's `Failed to disconnect device` while the run's own backend
