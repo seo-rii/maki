@@ -175,7 +175,13 @@ fn partial_hook(
 ) -> maki_test_support::crash_backing::PartialWriteHook {
     let rng = Mutex::new(StdRng::seed_from_u64(seed));
     Arc::new(move |op| match op {
-        FaultOp::WriteAt { path, len, .. } if path.starts_with("journal/seg-") && *len > 1 => {
+        // A torn *segment header* that the writer could not durably unlink
+        // fails closed by design (review_journal_creation_cleanup.rs,
+        // `an_unremoved_invalid_header_still_fails_closed_after_power_loss`),
+        // so only record writes are made partial here.
+        FaultOp::WriteAt {
+            path, len, offset, ..
+        } if path.starts_with("journal/seg-") && *len > 1 && *offset > 0 => {
             let mut rng = rng.lock();
             if rng.random_range(0..1000) < permille {
                 let keep = rng.random_range(1..*len);
@@ -209,9 +215,19 @@ fn sweep(seed: u64, cycles: usize, discard: bool, permille: u32) -> Result<(), S
 
     for cycle in 0..cycles {
         let counter = Arc::new(AtomicU64::new(0));
+        // Half of the cycles end in a fail-stop (a power loss in the middle
+        // of whatever storage operation was running) instead of random
+        // recoverable faults.
+        let mode = if rng.random_bool(0.5) {
+            Mode::FailStop {
+                at: rng.random_range(0..1500),
+            }
+        } else {
+            Mode::Workload { permille }
+        };
         backing.set_fault_hook(Some(hook(
             seed ^ (cycle as u64) << 8,
-            Mode::Workload { permille },
+            mode,
             counter,
             log.clone(),
         )));
@@ -400,4 +416,25 @@ fn v3_interrupted_recovery_without_workload_faults() {
 #[test]
 fn v3_interrupted_recovery_with_workload_faults() {
     run(3000..3150, 6, true, 80);
+}
+
+/// Reproduce one seed with its full trace:
+/// `AUDIT_SEED=3032 AUDIT_DISCARD=1 AUDIT_PERMILLE=80 cargo test ... -- --ignored single_seed`
+#[test]
+#[ignore]
+fn single_seed() {
+    let _guard = failpoints::test_lock();
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let seed = env("AUDIT_SEED", 0);
+    let discard = env("AUDIT_DISCARD", 0) == 1;
+    let permille = env("AUDIT_PERMILLE", 0) as u32;
+    let cycles = env("AUDIT_CYCLES", 6) as usize;
+    if let Err(e) = sweep(seed, cycles, discard, permille) {
+        panic!("{e}");
+    }
 }

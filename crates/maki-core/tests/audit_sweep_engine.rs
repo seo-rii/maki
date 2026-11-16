@@ -474,6 +474,9 @@ pub struct Mode {
     /// Percent chance per cycle of media damage to one or two non-journal
     /// files after the crash; the seed ends after checking that cycle.
     pub damage_pct: u32,
+    /// Permille of successful syncs (file or directory) reported as failed
+    /// after they persisted everything (see `Lying`).
+    pub lying_sync: u32,
 }
 
 impl Mode {
@@ -483,6 +486,7 @@ impl Mode {
 
     fn any_faults(&self) -> bool {
         self.sync_data
+            + self.lying_sync
             + self.sync_dir
             + self.write
             + self.partial
@@ -602,6 +606,42 @@ pub fn mode(name: &str) -> Mode {
             damage_pct: 30,
             ..Mode::default()
         },
+        "lying" => Mode {
+            name: "lying",
+            strict_restart: true,
+            lying_sync: 120,
+            heal_pct: 4,
+            double_crash_pct: 10,
+            ..Mode::default()
+        },
+        "chaos-lying" => Mode {
+            name: "chaos-lying",
+            strict_restart: true,
+            sync_data: 50,
+            sync_dir: 50,
+            lying_sync: 80,
+            write: 25,
+            partial: 25,
+            set_len: 25,
+            remove: 50,
+            rename: 25,
+            create: 25,
+            heal_pct: 4,
+            recovery_fault_pct: 50,
+            double_crash_pct: 10,
+            ..Mode::default()
+        },
+        "rfault-lying" => Mode {
+            name: "rfault-lying",
+            strict_restart: true,
+            sync_data: 100,
+            sync_dir: 100,
+            lying_sync: 100,
+            recovery_fault_pct: 80,
+            recovery_only: true,
+            double_crash_pct: 15,
+            ..Mode::default()
+        },
         other => panic!("unknown mode {other}"),
     }
 }
@@ -621,6 +661,8 @@ struct Injector {
     single: AtomicI64,
     /// The single fault chose to be a short write of this `write_at`.
     single_partial: AtomicBool,
+    /// The single fault chose to be a lying sync (persist, then fail).
+    lie_next: AtomicBool,
     mutations: AtomicU64,
     rng: Mutex<StdRng>,
     log: Arc<Mutex<Vec<String>>>,
@@ -635,6 +677,7 @@ impl Injector {
             countdown: AtomicI64::new(-1),
             single: AtomicI64::new(-1),
             single_partial: AtomicBool::new(false),
+            lie_next: AtomicBool::new(false),
             mutations: AtomicU64::new(0),
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0xFA17_FA17)),
             log,
@@ -666,6 +709,7 @@ impl Injector {
     fn disarm_single(&self) {
         self.single.store(-1, Ordering::SeqCst);
         self.single_partial.store(false, Ordering::SeqCst);
+        self.lie_next.store(false, Ordering::SeqCst);
     }
 
     fn hook(self: &Arc<Self>) -> FaultHook {
@@ -697,6 +741,13 @@ impl Injector {
                             me.single_partial.store(true, Ordering::SeqCst);
                             return None;
                         }
+                    }
+                    if matches!(op, FaultOp::SyncData { .. } | FaultOp::SyncDir { .. })
+                        && me.mode.lying_sync > 0
+                        && me.rng.lock().random_bool(0.5)
+                    {
+                        me.lie_next.store(true, Ordering::SeqCst);
+                        return None;
                     }
                     me.log.lock().push(format!("      !! SINGLE fault {op:?}"));
                     return Some(io::Error::other("audit: single injected failure"));
@@ -757,6 +808,30 @@ impl Injector {
             None
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offline deep check, run on the crashed (not yet recovered) volume: it must
+// be read-only, and it promises that "anything that would refuse attach or
+// return EIO at runtime is reported here, and nothing the runtime accepts is
+// reported as an error" (crates/maki-core/src/check.rs). `None` = the check
+// was inconclusive (an I/O error).
+
+fn run_deep_check(
+    cfg: &Cfg,
+    backing: &Arc<CrashableBacking>,
+    injector: &Injector,
+) -> Result<Option<maki_format::checker::CheckReport>, String> {
+    let before = injector.mutations();
+    let result = maki_core::check::deep_check(backing.clone() as Arc<dyn Backing>, cfg.segment_size);
+    let after = injector.mutations();
+    if after != before {
+        return Err(format!(
+            "CHECK-MUTATED: the offline deep check performed {} backing mutation(s)",
+            after - before
+        ));
+    }
+    Ok(result.ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -871,13 +946,128 @@ fn pattern(stamp: u32, offset: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn try_attach(cfg: &Cfg, backing: &Arc<CrashableBacking>) -> Result<Engine, AttachError> {
+async fn try_attach(cfg: &Cfg, backing: &Arc<dyn Backing>) -> Result<Engine, AttachError> {
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.clone(),
         Arc::new(FakeCryptoProvider::new(cfg.unit)),
         cfg.options(),
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// A "lying" sync: the inner `fdatasync`/directory sync really happens and
+// persists everything, and then an error is reported anyway (Linux reports a
+// writeback error even when most or all pages reached the disk). The engine
+// must never rely on the bytes of a failed barrier being absent.
+
+struct Lying {
+    inner: Arc<CrashableBacking>,
+    injector: Arc<Injector>,
+}
+
+struct LyingFile {
+    inner: Arc<dyn maki_backing::BackingFile>,
+    path: String,
+    injector: Arc<Injector>,
+}
+
+impl Injector {
+    fn lie(&self, what: &str) -> bool {
+        if self.lie_next.swap(false, Ordering::SeqCst) {
+            self.log.lock().push(format!("      !! SINGLE lying sync of {what}"));
+            return true;
+        }
+        if self.dead.load(Ordering::SeqCst)
+            || self.countdown.load(Ordering::SeqCst) >= 0
+            || !self.enabled.load(Ordering::SeqCst)
+            || self.mode.lying_sync == 0
+        {
+            return false;
+        }
+        if self.rng.lock().random_range(0..1000) < self.mode.lying_sync {
+            self.log.lock().push(format!("      ! lying sync of {what}"));
+            return true;
+        }
+        false
+    }
+}
+
+impl maki_backing::BackingFile for LyingFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.allocate_range(offset, len)
+    }
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.punch_hole(offset, len)
+    }
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()?;
+        if self.injector.lie(&self.path) {
+            return Err(io::Error::other("audit: sync persisted but reported failure"));
+        }
+        Ok(())
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()?;
+        if self.injector.lie(&self.path) {
+            return Err(io::Error::other("audit: sync persisted but reported failure"));
+        }
+        Ok(())
+    }
+}
+
+impl Backing for Lying {
+    fn check_freshness(&self) -> io::Result<()> {
+        self.inner.check_freshness()
+    }
+    fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn maki_backing::BackingFile>> {
+        let inner = self.inner.open(path, create)?;
+        Ok(Arc::new(LyingFile {
+            inner,
+            path: path.to_string(),
+            injector: self.injector.clone(),
+        }))
+    }
+    fn exists(&self, path: &str) -> io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &str) -> io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.inner.list(dir)
+    }
+    fn sync_dir(&self, dir: &str) -> io::Result<()> {
+        self.inner.sync_dir(dir)?;
+        if self.injector.lie(&format!("dir {dir:?}")) {
+            return Err(io::Error::other("audit: dir sync persisted but reported failure"));
+        }
+        Ok(())
+    }
+    fn try_lock(&self, path: &str) -> io::Result<Box<dyn maki_backing::VolumeLock>> {
+        self.inner.try_lock(path)
+    }
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        self.inner.free_bytes()
+    }
 }
 
 /// One member of a concurrent request batch.
@@ -1009,6 +1199,11 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
     let injector = Injector::new(mode.clone(), seed, log.clone());
     backing.set_fault_hook(Some(injector.hook()));
     backing.set_partial_write_hook(Some(injector.partial_hook()));
+    let raw = backing.clone();
+    let backing: Arc<dyn Backing> = Arc::new(Lying {
+        inner: raw.clone(),
+        injector: injector.clone(),
+    });
 
     let unit = cfg.unit as u64;
     let block = cfg.block as u64;
@@ -1034,12 +1229,12 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
         let mut maybe: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
         let transient = mode.transient() && !death_armed;
         if death_armed {
-            backing.set_lenient_sync_failures(true);
+            raw.set_lenient_sync_failures(true);
             let at = rng.random_range(1..=workload_mutations.max(8));
             injector.arm(at);
             say(format!("-- cycle {cycle}: death armed after {at} mutations"));
         } else {
-            backing.set_lenient_sync_failures(false);
+            raw.set_lenient_sync_failures(false);
             injector.enabled.store(transient, Ordering::SeqCst);
             say(format!("-- cycle {cycle}"));
         }
@@ -1055,7 +1250,12 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                     let error: &CoreError = $error;
                     let images: &Vec<(u64, Vec<u8>)> = $images;
                     stats.bump(&format!("err-{}", error_class(error)));
-                    if !matches!(error, CoreError::Io(_) | CoreError::Durability(_)) {
+                    if !matches!(
+                        error,
+                        CoreError::Io(_)
+                            | CoreError::Durability(_)
+                            | CoreError::Format(maki_format::FormatError::Io(_))
+                    ) {
                         stats.note(format!(
                             "cfg {} mode {} seed {seed}: {} failed with class {}: {error}",
                             cfg.name,
@@ -1556,10 +1756,10 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
         engine.stop_checkpoint_worker().await;
         drop(engine);
         injector.revive();
-        backing.set_lenient_sync_failures(false);
+        raw.set_lenient_sync_failures(false);
 
         let mut kind = pick_crash(&mut rng);
-        apply_crash(kind, &backing, &mut rng);
+        apply_crash(kind, &raw, &mut rng);
         say(format!("== {kind:?}"));
         stats.bump("crashes");
         // A restart loses nothing; that only holds while no power loss
@@ -1569,7 +1769,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
         let mut attempts = 0;
         while attempts < 3 && rng.random_range(0..100) < mode.recovery_death_pct {
             attempts += 1;
-            backing.set_lenient_sync_failures(true);
+            raw.set_lenient_sync_failures(true);
             let at = rng.random_range(1..=recovery_mutations.max(6) + 4);
             injector.arm(at);
             say(format!("recovery with death armed after {at} mutations"));
@@ -1611,9 +1811,9 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 }
             }
             injector.revive();
-            backing.set_lenient_sync_failures(false);
+            raw.set_lenient_sync_failures(false);
             kind = pick_crash(&mut rng);
-            apply_crash(kind, &backing, &mut rng);
+            apply_crash(kind, &raw, &mut rng);
             say(format!("== {kind:?}"));
             strict &= kind == Crash::Restart;
         }
@@ -1625,7 +1825,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             && rng.random_range(0..100) < mode.recovery_fault_pct
         {
             attempts += 1;
-            backing.set_lenient_sync_failures(false);
+            raw.set_lenient_sync_failures(false);
             // One transient fault at a uniformly chosen mutation of the
             // recovery (it may land after recovery, in attach, or never).
             let at = rng.random_range(1..=recovery_mutations.max(6) + 2);
@@ -1665,7 +1865,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 }
             }
             kind = pick_crash(&mut rng);
-            apply_crash(kind, &backing, &mut rng);
+            apply_crash(kind, &raw, &mut rng);
             say(format!("== {kind:?}"));
             strict &= kind == Crash::Restart;
         }
@@ -1679,7 +1879,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 Err(e) => panic!("ATTACH-REFUSED: {e}\n{}", history()),
             }
             kind = pick_crash(&mut rng);
-            apply_crash(kind, &backing, &mut rng);
+            apply_crash(kind, &raw, &mut rng);
             say(format!("recovered, then == {kind:?} before any write"));
             strict &= kind == Crash::Restart;
             stats.bump("double-crashes");
@@ -1691,17 +1891,32 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             // Recovery may refuse; otherwise every unit must read as an
             // allowed value or fail with EIO, never foreign data or zeros
             // for a written unit. The seed ends here.
-            let candidates = damage_candidates(&backing);
+            let candidates = damage_candidates(&raw);
             for _ in 0..rng.random_range(1..=2usize) {
                 let path = candidates[rng.random_range(0..candidates.len())].clone();
-                say(format!("DAMAGE {}", damage_file(&backing, &path, &mut rng)));
+                say(format!("DAMAGE {}", damage_file(&raw, &path, &mut rng)));
             }
             stats.bump("damaged");
+            let report = match run_deep_check(&cfg, &raw, &injector) {
+                Ok(report) => report,
+                Err(text) => panic!("{text}\n{}", history()),
+            };
+            if let Some(report) = &report {
+                say(format!("deep check: errors {:?} warnings {:?}", report.errors, report.warnings));
+            }
+            let check_clean = report.as_ref().map(|r| r.errors.is_empty());
             let engine = match try_attach(&cfg, &backing).await {
                 Ok(engine) => engine,
                 Err(e) => {
                     say(format!("damaged volume refused: {e}"));
                     stats.bump("damage-refused");
+                    if check_clean == Some(true) {
+                        panic!(
+                            "CHECK-FALSE-NEGATIVE: deep check reported no error but attach was \
+                             refused: {e}\n{}",
+                            history()
+                        );
+                    }
                     return;
                 }
             };
@@ -1714,6 +1929,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 s.durable_sequence,
                 history()
             );
+            let mut eio_units = 0u64;
             for u in 0..cfg.device_units {
                 match engine.read(u * unit, unit as usize).await {
                     Ok(actual) => {
@@ -1727,8 +1943,16 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                             );
                         }
                     }
-                    Err(CoreError::Corrupt(_)) | Err(CoreError::Io(_)) => {
+                    Err(e @ (CoreError::Corrupt(_) | CoreError::Io(_))) => {
                         stats.bump("damage-eio-units");
+                        if check_clean == Some(true) {
+                            panic!(
+                                "CHECK-FALSE-NEGATIVE: deep check reported no error but unit {u} \
+                                 reads EIO after attach: {e}\n{}",
+                                history()
+                            );
+                        }
+                        eio_units += 1;
                     }
                     Err(e) => panic!(
                         "DAMAGE-ERROR-CLASS: unit {u}: unexpected error class {e}\n{}",
@@ -1736,8 +1960,36 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                     ),
                 }
             }
+            if check_clean == Some(false) && eio_units == 0 {
+                stats.bump("check-error-but-runtime-clean");
+                stats.note(format!(
+                    "cfg {} mode {} seed {seed}: deep check errors {:?} on a volume that attached \
+                     with every unit readable",
+                    cfg.name,
+                    mode.name,
+                    report.as_ref().map(|r| r.errors.clone()).unwrap_or_default()
+                ));
+            }
             stats.bump("damage-attached");
             return;
+        }
+
+        if rng.random_range(0..100) < 35 {
+            match run_deep_check(&cfg, &raw, &injector) {
+                Err(text) => panic!("{text}\n{}", history()),
+                Ok(None) => stats.bump("check-inconclusive"),
+                Ok(Some(report)) => {
+                    stats.bump("checks");
+                    if !report.errors.is_empty() {
+                        panic!(
+                            "CHECK-FALSE-POSITIVE: deep check reports errors {:?} on a \
+                             crash-consistent volume (no damage injected)\n{}",
+                            report.errors,
+                            history()
+                        );
+                    }
+                }
+            }
         }
 
         let before = injector.mutations();
@@ -2082,6 +2334,29 @@ async fn audit2_chaos_rfault() {
     cfgs.extend(["blk4k-v3", "u16k", "pend1-v3"]);
     sweep_owned(
         pairs_from_env(all_pairs(&cfgs, &["chaos-rfault"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audit2_lying() {
+    let mut cfgs: Vec<&str> = V2.to_vec();
+    cfgs.extend(V3);
+    cfgs.extend(NEWGEO);
+    sweep_owned(
+        pairs_from_env(all_pairs(&cfgs, &["lying", "chaos-lying", "rfault-lying"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit2_conc_lying() {
+    sweep_owned(
+        pairs_from_env(all_pairs(&CONC, &["lying", "chaos-lying"])),
         seeds(),
         4,
     )

@@ -152,3 +152,29 @@ async fn truncated_close_delimited_raw_ciphertext_is_accepted() {
         Err(e) => eprintln!("refused: {e}"),
     }
 }
+
+/// Same root cause without any framing problem: a well-framed 200 from a
+/// misrouted proxy (HTML maintenance page) is accepted as ciphertext, since
+/// raw encrypt results have no lower length bound and Content-Type is ignored.
+#[tokio::test]
+async fn short_html_200_is_accepted_as_raw_ciphertext() {
+    use maki_test_support::http_chaos::{ResponseSpec, TestServer};
+    let server = TestServer::start(Arc::new(|_| ResponseSpec {
+        status: 200,
+        body: b"<html><body>Service under maintenance</body></html>".to_vec(),
+        content_type: "text/html".into(),
+        delay: Duration::ZERO,
+        drop_after: None,
+        headers: vec![],
+    }))
+    .await;
+    let result = provider(&server.url())
+        .encrypt_batch(&context(), &unit())
+        .await;
+    if let Ok(out) = result {
+        panic!(
+            "AUDIT: a {}-byte text/html 200 was accepted as the ciphertext of a {UNIT}-byte unit",
+            out[0].data.len()
+        );
+    }
+}
