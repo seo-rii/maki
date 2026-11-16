@@ -542,48 +542,27 @@ root = "/tmp/unused"
 
 // ---------- absence of payload logging ----------
 
+/// Marks the child process that performs the logged round trip.
+const LOG_CHILD: &str = "MAKI_PHASE8_LOG_CHILD";
+const LOGGED_ROUND_TRIP: &str = "child_round_trips_a_payload_under_trace_logging";
+
+/// Runs only as the child of [`payloads_never_appear_in_logs`]: installs
+/// the daemon's process-wide sink (which also bridges the `log` crate) at
+/// the most verbose level, emits one sentinel from a runtime worker thread
+/// and one through `log`, then round-trips a payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn payloads_never_appear_in_logs() {
-    use tracing_subscriber::layer::SubscriberExt;
-
-    #[derive(Clone, Default)]
-    struct Capture(Arc<parking_lot::Mutex<String>>);
-    impl std::io::Write for Capture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().push_str(&String::from_utf8_lossy(buf));
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+async fn child_round_trips_a_payload_under_trace_logging() {
+    if std::env::var_os(LOG_CHILD).is_none() {
+        return;
     }
-
-    let capture = Capture::default();
-    let writer = capture.clone();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(move || writer.clone())
-            .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
+    assert!(
+        maki_core::logging::install_default_logging(),
+        "a log sink was already installed"
     );
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    // The absence assertions below prove something only if the capture
-    // sees every event the process emits: from runtime worker threads (where
-    // connection and server tasks run) and from the `log` crate (which the
-    // HTTP and TLS stacks use), not only tracing on this thread.
     tokio::spawn(async { tracing::error!("log capture sentinel: worker thread") })
         .await
         .unwrap();
     log::error!("log capture sentinel: log crate");
-    let seen = capture.0.lock().clone();
-    let missed: Vec<_> = ["worker thread", "log crate"]
-        .into_iter()
-        .filter(|sentinel| !seen.contains(&format!("log capture sentinel: {sentinel}")))
-        .collect();
-    assert!(
-        missed.is_empty(),
-        "the log capture missed events from: {missed:?}\n{seen}"
-    );
 
     let server = TestServer::start(xor_json_handler("data", "ciphertext")).await;
     let provider = HttpCryptoProvider::new(spec(
@@ -592,25 +571,62 @@ async fn payloads_never_appear_in_logs() {
         json_op("/decrypt", "data", "/ciphertext"),
     ))
     .unwrap();
-    let secret = vec![0xABu8; UNIT];
     let cts = provider
         .encrypt_batch(&ctx(), &[pt(7, 0xAB)])
         .await
         .unwrap();
-    let _ = provider.decrypt_batch(&ctx(), &cts).await.unwrap();
-
-    let logs = capture.0.lock().clone();
-    assert!(
-        !logs.contains(&b64(&secret)),
-        "plaintext base64 leaked into logs"
-    );
-    assert!(
-        !logs.contains(&b64(&cts[0].data)),
-        "ciphertext base64 leaked into logs"
-    );
+    let pts = provider.decrypt_batch(&ctx(), &cts).await.unwrap();
+    assert_eq!(pts[0].data.expose(), &[0xAB; UNIT][..]);
 }
 
-use tracing_subscriber::Layer as _;
+/// No payload byte reaches the logs, whichever thread or logging facade
+/// emits the event: the round trip runs in a child process whose global
+/// sink captures every event at `MAKI_LOG=trace`, and the sentinels prove
+/// the capture sees worker threads and the `log` crate.
+#[test]
+fn payloads_never_appear_in_logs() {
+    if std::env::var_os(LOG_CHILD).is_some() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            LOGGED_ROUND_TRIP,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LOG_CHILD, "1")
+        .env(maki_core::logging::LOG_ENV, "trace")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let logs = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(&format!("test {LOGGED_ROUND_TRIP} ... ok")),
+        "logged round trip failed:\n{stdout}\n{logs}"
+    );
+    let missed: Vec<_> = ["worker thread", "log crate"]
+        .into_iter()
+        .filter(|sentinel| !logs.contains(&format!("log capture sentinel: {sentinel}")))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "the log capture missed events from: {missed:?}\n{logs}"
+    );
+
+    let plaintext = vec![0xABu8; UNIT];
+    let ciphertext = xor(&plaintext);
+    for (what, bytes) in [("plaintext", &plaintext), ("ciphertext", &ciphertext)] {
+        let hex: String = bytes[..32].iter().map(|b| format!("{b:02x}")).collect();
+        let decimal = format!("{0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}", bytes[0]);
+        for (encoding, needle) in [("base64", b64(bytes)), ("hex", hex), ("decimal", decimal)] {
+            assert!(
+                !logs.contains(&needle) && !stdout.contains(&needle),
+                "{what} ({encoding}) leaked into the logs"
+            );
+        }
+    }
+}
 
 /// R5-005: an endpoint that does not serve the configured operation (a
 /// misrouted reverse proxy: 404, 405, 410) is at fault, not the request;
