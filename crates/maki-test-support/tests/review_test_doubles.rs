@@ -7,14 +7,16 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use maki_crypto::{
-    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
+    CiphertextUnit, Clock, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
     SecretBuffer,
 };
 use maki_test_support::sched::{yield_now, DeterministicScheduler};
-use maki_test_support::FakeCryptoProvider;
+use maki_test_support::{FakeCryptoProvider, ManualClock};
 
 const UNIT: u32 = 4096;
 
@@ -223,4 +225,47 @@ fn the_fake_refuses_a_decrypt_batch_whose_plaintext_exceeds_the_byte_limit() {
         block_on(provider.decrypt_batch(&context(), &ciphertexts)),
         "a 3-unit decrypt batch under a 2-unit byte limit",
     );
+}
+
+// ---------- ManualClock: reproducible wake order ----------
+
+/// Sleepers that reach their deadline in one `advance` are woken in
+/// (deadline, registration) order. Under tokio the wake order is the run
+/// order, so a wake order that varies between runs (a `HashMap`'s) makes
+/// the same test interleave the woken tasks differently each time.
+#[test]
+fn manual_clock_wakes_due_sleepers_in_deadline_then_registration_order() {
+    struct Recorder {
+        id: usize,
+        log: Arc<Mutex<Vec<usize>>>,
+    }
+    impl Wake for Recorder {
+        fn wake(self: Arc<Self>) {
+            self.log.lock().unwrap().push(self.id);
+        }
+    }
+
+    let seconds = [3u64, 1, 2, 1, 3, 2, 1, 2, 3, 1, 2, 3];
+    let mut expected: Vec<usize> = (0..seconds.len()).collect();
+    expected.sort_by_key(|id| (seconds[*id], *id));
+    for round in 0..8 {
+        let clock = ManualClock::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sleeps: Vec<_> = seconds
+            .iter()
+            .map(|s| clock.sleep(Duration::from_secs(*s)))
+            .collect();
+        for (id, sleep) in sleeps.iter_mut().enumerate() {
+            let waker = Waker::from(Arc::new(Recorder {
+                id,
+                log: log.clone(),
+            }));
+            assert!(sleep
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+        }
+        clock.advance(Duration::from_secs(3));
+        assert_eq!(*log.lock().unwrap(), expected, "round {round}");
+    }
 }
