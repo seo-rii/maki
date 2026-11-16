@@ -166,6 +166,21 @@ impl Server {
 }
 
 fn dispatcher(peers: &[(&str, Arc<WsCryptoProvider>)], retry_safe: bool) -> EndpointSet {
+    dispatcher_with_breaker(
+        peers,
+        retry_safe,
+        BreakerConfig {
+            failure_threshold: 3,
+            ..BreakerConfig::default()
+        },
+    )
+}
+
+fn dispatcher_with_breaker(
+    peers: &[(&str, Arc<WsCryptoProvider>)],
+    retry_safe: bool,
+    breaker: BreakerConfig,
+) -> EndpointSet {
     EndpointSet::new(
         peers
             .iter()
@@ -181,10 +196,7 @@ fn dispatcher(peers: &[(&str, Arc<WsCryptoProvider>)], retry_safe: bool) -> Endp
                 burst: 100,
                 min_probe_per_sec: 1.0,
             },
-            breaker: BreakerConfig {
-                failure_threshold: 3,
-                ..BreakerConfig::default()
-            },
+            breaker,
             global_max_inflight_batches: 2,
             global_max_inflight_bytes: 4096,
             per_endpoint_max_inflight: 2,
@@ -326,5 +338,87 @@ async fn f04_auth_upgrade_refusal_fails_over_without_repeating_bad_credentials()
             "HTTP {status} repeated rejected authentication"
         );
         assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// The upgrade is the same static GET on every connection and carries no
+/// crypto request, so a generic 4xx refusal (a proxy that cannot upgrade, a
+/// wrong route) is the endpoint's fault. It must fail over to a healthy peer
+/// and open the refusing peer's circuit, never fail the request as if the
+/// request itself were bad.
+#[tokio::test]
+async fn generic_4xx_upgrade_refusal_fails_over_and_opens_the_refusing_peer() {
+    // A long open window keeps the refusing peer out for the whole loop, so
+    // no half-open probe reaches it.
+    let breaker = BreakerConfig {
+        failure_threshold: 3,
+        open_initial: Duration::from_secs(600),
+        open_max: Duration::from_secs(600),
+        ..BreakerConfig::default()
+    };
+    for status in [400, 422, 426] {
+        // A retry-safe provider fails over within the same request.
+        let bad = Server::refuse_upgrade(status).await;
+        let good = Server::start().await;
+        let set = dispatcher_with_breaker(
+            &[("bad", bad.provider(true)), ("good", good.provider(true))],
+            true,
+            breaker.clone(),
+        );
+        for _ in 0..10 {
+            let output = set
+                .encrypt_batch(&context(), &input())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("HTTP {status} upgrade refusal failed a request: {error:?}")
+                });
+            assert_eq!(output[0].data, vec![0x42 ^ 0x5a; UNIT]);
+        }
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 1, "HTTP {status}");
+        assert_eq!(good.calls.load(Ordering::SeqCst), 10, "HTTP {status}");
+        assert_eq!(
+            set.endpoint_status()[0].circuit,
+            CircuitState::Open,
+            "HTTP {status}"
+        );
+
+        // A provider that is not retry-safe is never resent: the request
+        // that met the refusal fails, but it opens the circuit, so every
+        // later request goes to the healthy peer.
+        let bad = Server::refuse_upgrade(status).await;
+        let good = Server::start().await;
+        let set = dispatcher_with_breaker(
+            &[("bad", bad.provider(false)), ("good", good.provider(false))],
+            false,
+            breaker.clone(),
+        );
+        let mut failures = Vec::new();
+        for _ in 0..10 {
+            if let Err(error) = set.encrypt_batch(&context(), &input()).await {
+                failures.push(error);
+            }
+        }
+        assert!(
+            failures.len() <= 1,
+            "HTTP {status}: {} of 10 requests failed with a healthy peer available: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        assert!(
+            failures
+                .iter()
+                .all(|error| error.class() == maki_crypto::ErrorClass::EndpointFatal),
+            "HTTP {status}: {failures:?}"
+        );
+        assert_eq!(
+            bad.calls.load(Ordering::SeqCst),
+            failures.len(),
+            "HTTP {status}"
+        );
+        assert_eq!(
+            good.calls.load(Ordering::SeqCst),
+            10 - failures.len(),
+            "HTTP {status}"
+        );
     }
 }
