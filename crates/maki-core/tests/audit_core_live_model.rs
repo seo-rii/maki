@@ -23,7 +23,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 const UNIT: usize = 1024;
-const UNITS: usize = 64;
+const UNITS: usize = 60;
 const TASKS: usize = 4;
 const PER_TASK: usize = UNITS / TASKS;
 
@@ -198,7 +198,19 @@ async fn writer(engine: Engine, task: usize, seed: u64, ops: usize) -> Model {
                 let r = maybe_cancel(engine.write(offset as u64, &data, fua), cancel).await;
                 match r {
                     Some(Ok(())) => model.apply(offset, |_, d| d.fill(byte), len, false),
-                    Some(Err(e)) => panic!("{what}: write failed: {e}"),
+                    Some(Err(e)) => {
+                        let st = engine.stats().await;
+                        panic!(
+                            "{what}: write of {len} bytes failed: {e} (journal {} bytes, \
+                             segments {}, checkpoint {}, durable {}, appended {}, overlay {} units)",
+                            st.journal_total_bytes,
+                            st.journal_segments,
+                            st.checkpoint_sequence,
+                            st.durable_sequence,
+                            st.appended_sequence,
+                            st.overlay_units
+                        )
+                    }
                     None => model.apply(offset, |_, d| d.fill(byte), len, true),
                 }
             }
@@ -206,7 +218,19 @@ async fn writer(engine: Engine, task: usize, seed: u64, ops: usize) -> Model {
                 let r = maybe_cancel(engine.write_zeroes(offset as u64, len, fua), cancel).await;
                 match r {
                     Some(Ok(())) => model.apply(offset, |_, d| d.fill(0), len, false),
-                    Some(Err(e)) => panic!("{what}: write_zeroes failed: {e}"),
+                    Some(Err(e)) => {
+                        let st = engine.stats().await;
+                        panic!(
+                            "{what}: write_zeroes of {len} bytes failed: {e} (journal {} bytes, \
+                             segments {}, checkpoint {}, durable {}, appended {}, overlay {} units)",
+                            st.journal_total_bytes,
+                            st.journal_segments,
+                            st.checkpoint_sequence,
+                            st.durable_sequence,
+                            st.appended_sequence,
+                            st.overlay_units
+                        )
+                    }
                     None => model.apply(offset, |_, d| d.fill(0), len, true),
                 }
             }
@@ -242,8 +266,12 @@ async fn writer(engine: Engine, task: usize, seed: u64, ops: usize) -> Model {
 
 async fn read_all(engine: &Engine) -> Vec<u8> {
     let mut out = Vec::new();
-    for chunk in 0..(UNITS * UNIT) / 8192 {
-        out.extend(engine.read((chunk * 8192) as u64, 8192).await.unwrap());
+    let total = UNITS * UNIT;
+    let mut at = 0;
+    while at < total {
+        let len = (total - at).min(8192);
+        out.extend(engine.read(at as u64, len).await.unwrap());
+        at += len;
     }
     out
 }

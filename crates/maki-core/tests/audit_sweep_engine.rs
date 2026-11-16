@@ -1037,6 +1037,18 @@ fn damage_file(backing: &CrashableBacking, path: &str, rng: &mut StdRng) -> Stri
     format!("{path}: {what}")
 }
 
+/// Finding 1 of this audit (see `audit_sweep_regressions.rs`): a torn
+/// header of a never-completed segment refuses attach. Recognised so that a
+/// sweep keeps looking for other classes; counted as `known-torn-header`.
+fn known_torn_header(error: &str, log: &[String]) -> bool {
+    error.contains("invalid header")
+        && log.iter().any(|l| {
+            l.contains("short write")
+                && l.contains("journal/seg-")
+                && l.contains("offset: 0, len: 48")
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Coverage of rare engine paths: count WARN/ERROR tracing events by message
 // shape (digits folded), printed after every sweep.
@@ -1408,6 +1420,38 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
     let mut model = ReferenceBlockModel::new(cfg.unit as usize, cfg.device_units);
     let zeros = vec![0u8; cfg.unit as usize];
     let mut stamp: u32 = 0;
+    // The first attach of a pristine volume establishes the key canary and
+    // the first recovery metadata: interrupt it too (a death or a single
+    // Linux-model fault), then crash, before the real first attach.
+    if (mode.recovery_death_pct > 0 || mode.recovery_fault_pct > 0) && rng.random_bool(0.5) {
+        let at = rng.random_range(1..=40u64);
+        let death = mode.recovery_death_pct > 0 && rng.random_bool(0.5);
+        if death {
+            raw.set_lenient_sync_failures(true);
+            injector.arm(at);
+        } else {
+            injector.arm_single(at);
+        }
+        say(format!(
+            "first attach with {} after {at} mutations",
+            if death { "death" } else { "one fault" }
+        ));
+        match try_attach(&cfg, &backing).await {
+            Ok(engine) => {
+                engine.stop_checkpoint_worker().await;
+                drop(engine);
+                say("   first attach completed".to_string());
+            }
+            Err(e) => say(format!("   first attach failed: {e}")),
+        }
+        injector.revive();
+        injector.disarm_single();
+        raw.set_lenient_sync_failures(false);
+        let kind = pick_crash(&mut rng);
+        apply_crash(kind, &raw, &mut rng);
+        say(format!("== {kind:?}"));
+        stats.bump("first-attach-interrupted");
+    }
     let mut engine = match try_attach(&cfg, &backing).await {
         Ok(engine) => engine,
         Err(e) => panic!("ATTACH-FRESH: {e}\n{}", history()),
@@ -2009,6 +2053,10 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 }
                 Err(e) => {
                     say(format!("   recovery failed: {e}"));
+                    if !died && known_torn_header(&e.to_string(), &log.lock()) {
+                        stats.bump("known-torn-header");
+                        return;
+                    }
                     assert!(
                         died,
                         "ATTACH-REFUSED: recovery failed before the injected death: {e}\n{}",
@@ -2082,6 +2130,10 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 Ok(engine) => {
                     engine.stop_checkpoint_worker().await;
                     drop(engine);
+                }
+                Err(e) if known_torn_header(&e.to_string(), &log.lock()) => {
+                    stats.bump("known-torn-header");
+                    return;
                 }
                 Err(e) => panic!("ATTACH-REFUSED: {e}\n{}", history()),
             }
@@ -2187,6 +2239,12 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 Ok(None) => stats.bump("check-inconclusive"),
                 Ok(Some(report)) => {
                     stats.bump("checks");
+                    if report.errors.len() == 1
+                        && known_torn_header(&report.errors[0], &log.lock())
+                    {
+                        stats.bump("known-torn-header");
+                        return;
+                    }
                     if !report.errors.is_empty() {
                         panic!(
                             "CHECK-FALSE-POSITIVE: deep check reports errors {:?} on a \
@@ -2202,6 +2260,10 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
         let before = injector.mutations();
         engine = match try_attach(&cfg, &backing).await {
             Ok(engine) => engine,
+            Err(e) if known_torn_header(&e.to_string(), &log.lock()) => {
+                stats.bump("known-torn-header");
+                return;
+            }
             Err(e) => panic!("ATTACH-REFUSED: {e}\n{}", history()),
         };
         if !cfg.worker {
