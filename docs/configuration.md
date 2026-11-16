@@ -151,8 +151,9 @@ line and column when available. Their Display and Debug output omit the source
 text, values, unknown field names and the parser's free-form message; inspect
 the configuration locally at the reported location to diagnose the problem.
 Semantic validation errors can name a known field or endpoint. Endpoint URLs
-are shown as `scheme://host[:port]` without userinfo, path or query. Beyond
-schema, geometry, and secret-literal checks validation rejects:
+are shown as `scheme://host[:port]` without userinfo, path or query, and HTTP
+operation paths are never shown. Beyond schema, geometry, and secret-literal
+checks validation rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
   `[crypto.circuit_breaker]`, and `[crypto.retry_budget]` (except

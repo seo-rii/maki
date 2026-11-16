@@ -1560,10 +1560,11 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
             op.method
         )));
     }
+    // Never quote the path: like an endpoint URL it can carry path or
+    // query tokens, and validation errors reach stderr and the journal.
     if !op.path.starts_with('/') {
         return Err(invalid(format!(
-            "[crypto.http.{name}] path {:?} must start with a slash",
-            op.path
+            "[crypto.http.{name}] path must start with a slash"
         )));
     }
     for (header, value) in &op.headers {
