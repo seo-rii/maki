@@ -86,7 +86,11 @@ fn build(seed: u64, discard: bool) -> (Arc<CrashableBacking>, String) {
             Uuid::from_u128(UUID)
         };
         let mut bytes = SegmentHeader {
-            segment_index: if rng.random_bool(0.03) { index + 1 } else { index },
+            segment_index: if rng.random_bool(0.03) {
+                index + 1
+            } else {
+                index
+            },
             volume_uuid: header_uuid,
             base_sequence: base,
         }
@@ -158,7 +162,9 @@ fn build(seed: u64, discard: bool) -> (Arc<CrashableBacking>, String) {
         if rng.random_bool(0.5) {
             let names = backing.list(layout::JOURNAL_DIR).unwrap();
             if let Some(name) = names.iter().find(|n| n.starts_with("seg-")) {
-                backing.remove(&format!("{}/{name}", layout::JOURNAL_DIR)).unwrap();
+                backing
+                    .remove(&format!("{}/{name}", layout::JOURNAL_DIR))
+                    .unwrap();
                 desc.push(format!("removed {name}"));
             }
         }
@@ -205,9 +211,8 @@ fn one(seed: u64, discard: bool) -> Result<bool, String> {
     let image = snapshot(&first);
     let seq = first.journal_durable_sequence();
     drop(first);
-    let second = Volume::recover(backing.clone() as Arc<dyn Backing>, options()).map_err(|e| {
-        format!("seed {seed}: accepted once, refused on restart: {e}\n  {desc}")
-    })?;
+    let second = Volume::recover(backing.clone() as Arc<dyn Backing>, options())
+        .map_err(|e| format!("seed {seed}: accepted once, refused on restart: {e}\n  {desc}"))?;
     if snapshot(&second) != image || second.journal_durable_sequence() != seq {
         return Err(format!(
             "seed {seed}: second recovery shows different state\n  {desc}"
@@ -215,9 +220,10 @@ fn one(seed: u64, discard: bool) -> Result<bool, String> {
     }
     drop(second);
     backing.crash_all_lost();
-    let mut third = Volume::recover(backing.clone() as Arc<dyn Backing>, options()).map_err(|e| {
-        format!("seed {seed}: accepted, then refused after power loss: {e}\n  {desc}")
-    })?;
+    let mut third =
+        Volume::recover(backing.clone() as Arc<dyn Backing>, options()).map_err(|e| {
+            format!("seed {seed}: accepted, then refused after power loss: {e}\n  {desc}")
+        })?;
     if snapshot(&third) != image {
         return Err(format!(
             "seed {seed}: power loss after an accepting recovery changed the state\n  {desc}"

@@ -16,8 +16,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use maki_crypto::{
-    BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext,
-    CryptoProvider, PlaintextUnit, SecretBuffer,
+    BatchCapability, Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoProvider,
+    PlaintextUnit, SecretBuffer,
 };
 use maki_crypto_websocket::{WsCryptoProvider, WsProviderSpec};
 use serde_json::{json, Value};
@@ -141,9 +141,10 @@ fn maki_log_trace_must_not_write_plaintext_payloads() {
          {as_text}x as text and {as_hex}x hex-encoded",
         stderr.len()
     );
-    for line in stderr.lines().filter(|l| {
-        l.contains(encoded.as_str()) || l.contains(hex(encoded.as_bytes()).as_str())
-    }) {
+    for line in stderr
+        .lines()
+        .filter(|l| l.contains(encoded.as_str()) || l.contains(hex(encoded.as_bytes()).as_str()))
+    {
         let shown: String = line.chars().take(160).collect();
         eprintln!("  leaked: {shown}...");
     }

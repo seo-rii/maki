@@ -111,7 +111,10 @@ async fn idle_worker_retries_a_failed_repair_persist_after_reopen() {
     let st = engine.stats().await;
     eprintln!(
         "after reopen: appended {} durable {} checkpoint {} segments {} checkpoints {}",
-        st.appended_sequence, st.durable_sequence, st.checkpoint_sequence, st.journal_segments,
+        st.appended_sequence,
+        st.durable_sequence,
+        st.checkpoint_sequence,
+        st.journal_segments,
         st.checkpoints_total
     );
 
@@ -137,7 +140,10 @@ async fn idle_worker_retries_a_failed_repair_persist_after_reopen() {
         parked(&clock, before + 1).await;
     }
     let st = engine.stats().await;
-    eprintln!("after intervals: checkpoints {} failures {} segments {}", st.checkpoints_total, st.checkpoint_failures_total, st.journal_segments);
+    eprintln!(
+        "after intervals: checkpoints {} failures {} segments {}",
+        st.checkpoints_total, st.checkpoint_failures_total, st.journal_segments
+    );
     let state = engine.state();
     eprintln!("state after four idle worker intervals: {state:?}");
     // The worker retries (via the covered-segment trigger) and the volume

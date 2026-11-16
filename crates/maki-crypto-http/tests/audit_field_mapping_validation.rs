@@ -93,8 +93,7 @@ async fn encoding_on_a_non_payload_source_is_silently_ignored() {
             }],
         )
         .await;
-    let body: serde_json::Value =
-        serde_json::from_slice(&server.requests.lock()[0].body).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&server.requests.lock()[0].body).unwrap();
     assert_eq!(
         body["unit"],
         serde_json::json!("5"),

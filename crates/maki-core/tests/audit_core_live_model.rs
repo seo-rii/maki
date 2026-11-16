@@ -65,8 +65,15 @@ fn create(backing: &CrashableBacking) {
             provider_type: "fake".into(),
             crypto_compatibility_id: "test-profile-v1".into(),
             key_identity: "k".into(),
-            geometry: Geometry::compute(512, UNIT as u32, 512, UNIT as u32 + 8, (UNITS * UNIT) as u64, 8 * 1024)
-                .unwrap(),
+            geometry: Geometry::compute(
+                512,
+                UNIT as u32,
+                512,
+                UNIT as u32 + 8,
+                (UNITS * UNIT) as u64,
+                8 * 1024,
+            )
+            .unwrap(),
             format_version: 1,
             created_unix: 0,
         },

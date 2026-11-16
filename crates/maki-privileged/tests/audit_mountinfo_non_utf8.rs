@@ -40,7 +40,12 @@ fn mount(source: &str, target: &Path, fstype: &str, flags: libc::c_ulong, data: 
             data.as_ptr().cast(),
         )
     };
-    assert_eq!(rc, 0, "mount {target:?}: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "mount {target:?}: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn umount(target: &Path) {
@@ -67,8 +72,8 @@ fn write_record() {
 }
 
 fn plan() -> maki_privileged::plan::Plan {
-    let config = maki_privileged::config::parse(&format!("volume_uuid = \"{VOLUME_UUID}\"\n"))
-        .unwrap();
+    let config =
+        maki_privileged::config::parse(&format!("volume_uuid = \"{VOLUME_UUID}\"\n")).unwrap();
     let request = config
         .into_request(VOLUME, Default::default(), false)
         .unwrap();
@@ -98,7 +103,10 @@ fn child() {
     mount("tmpfs", hostile, "tmpfs", 0, "mode=0755");
 
     let observed = maki_privileged::exec::observe_mount("/run/audit-visible", "/dev/nbd250");
-    println!("with non-UTF-8 mount: observe_mount fstype = {:?}", observed.fstype);
+    println!(
+        "with non-UTF-8 mount: observe_mount fstype = {:?}",
+        observed.fstype
+    );
     let allocation = maki_privileged::exec::allocate_nbd_device();
     println!("with non-UTF-8 mount: allocate_nbd_device = {allocation:?}");
     let cleanup = maki_privileged::exec::cleanup(&plan());

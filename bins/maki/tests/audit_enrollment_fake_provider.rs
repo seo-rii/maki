@@ -229,7 +229,14 @@ client_key_file={key:?}
         String::from_utf8_lossy(&output.stdout).trim(),
         before.fence,
         after.fence,
-        if after.current.is_some() { "present" } else { "absent" }
+        if after.current.is_some() {
+            "present"
+        } else {
+            "absent"
+        }
     );
-    assert_eq!(after, before, "a refused enrollment must not change authority");
+    assert_eq!(
+        after, before,
+        "a refused enrollment must not change authority"
+    );
 }

@@ -31,8 +31,15 @@ fn superblock() -> Superblock {
         provider_type: "fake".into(),
         crypto_compatibility_id: "test-profile-v1".into(),
         key_identity: "k".into(),
-        geometry: Geometry::compute(UNIT, UNIT, 512, UNIT + 8, 64 * UNIT as u64, 16 * UNIT as u64)
-            .unwrap(),
+        geometry: Geometry::compute(
+            UNIT,
+            UNIT,
+            512,
+            UNIT + 8,
+            64 * UNIT as u64,
+            16 * UNIT as u64,
+        )
+        .unwrap(),
         format_version: 1,
         created_unix: 0,
     }

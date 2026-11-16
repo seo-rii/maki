@@ -51,7 +51,11 @@ fn deterministic_scheduler_reports_a_task_that_was_never_woken() {
     assert!(Pin::new(&mut future)
         .poll(&mut Context::from_waker(&waker))
         .is_pending());
-    assert_eq!(counter.0.load(Ordering::SeqCst), 0, "nobody will re-poll it");
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        0,
+        "nobody will re-poll it"
+    );
 
     let mut sched = DeterministicScheduler::new(7);
     sched.spawn(async {

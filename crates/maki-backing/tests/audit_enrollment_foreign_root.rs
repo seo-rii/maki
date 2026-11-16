@@ -46,7 +46,9 @@ struct Authority {
 impl Authority {
     fn new(identity: [u8; 16]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Mutex::new(StateStore::create(dir.path(), identity).unwrap()));
+        let store = Arc::new(Mutex::new(
+            StateStore::create(dir.path(), identity).unwrap(),
+        ));
         let make = |role| {
             Arc::new(LocalRpc {
                 store: store.clone(),

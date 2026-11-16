@@ -109,7 +109,9 @@ async fn a_slow_flush_blocks_an_unrelated_read() {
     assert_eq!(reading.await.unwrap().unwrap(), vec![0x11; 1024]);
     backing.set_fault_hook(None);
     engine.stop_checkpoint_worker().await;
-    eprintln!("volume lock busy during journal fdatasync: {busy_during_sync}; read blocked: {blocked}");
+    eprintln!(
+        "volume lock busy during journal fdatasync: {busy_during_sync}; read blocked: {blocked}"
+    );
     assert!(
         !busy_during_sync && !blocked,
         "a read of checkpointed data waited for the FLUSH's journal fdatasync: the barrier \

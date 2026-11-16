@@ -121,8 +121,7 @@ fn torn_header_of_a_never_created_segment_does_not_block_power_loss_recovery() {
     let mut refused = Vec::new();
     for seed in 0..64u64 {
         let backing = volume_backing();
-        let mut volume =
-            Volume::recover(backing.clone() as Arc<dyn Backing>, options()).unwrap();
+        let mut volume = Volume::recover(backing.clone() as Arc<dyn Backing>, options()).unwrap();
         volume.write_ct(0, &[0x41; CT], true).unwrap();
         arm_torn_header(&backing, false);
         assert!(volume.write_ct(1, &[0x42; CT], true).is_err());

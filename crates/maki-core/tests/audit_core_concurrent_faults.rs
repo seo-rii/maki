@@ -19,9 +19,9 @@ use maki_core::volume::VolumeOptions;
 use maki_format::{geometry::Geometry, init, superblock::Superblock};
 use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::{CrashableBacking, FakeCryptoProvider};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const UNIT: usize = 1024;
 const UNITS: usize = 64;
@@ -66,8 +66,15 @@ fn create(backing: &CrashableBacking) {
             provider_type: "fake".into(),
             crypto_compatibility_id: "test-profile-v1".into(),
             key_identity: "k".into(),
-            geometry: Geometry::compute(512, UNIT as u32, 512, UNIT as u32 + 8, (UNITS * UNIT) as u64, 8 * 1024)
-                .unwrap(),
+            geometry: Geometry::compute(
+                512,
+                UNIT as u32,
+                512,
+                UNIT as u32 + 8,
+                (UNITS * UNIT) as u64,
+                8 * 1024,
+            )
+            .unwrap(),
             format_version: 1,
             created_unix: 0,
         },
@@ -286,7 +293,11 @@ async fn run(seed: u64, verify_on_hit: bool, cache: bool) {
                 FaultOp::SyncData { path } if path.starts_with("journal/") => roll < 30,
                 FaultOp::SyncData { .. } => roll < 20,
                 FaultOp::SyncDir { .. } => roll < 20,
-                FaultOp::WriteAt { path, .. } if !path.ends_with(".dat") && !path.starts_with("journal/") => roll < 15,
+                FaultOp::WriteAt { path, .. }
+                    if !path.ends_with(".dat") && !path.starts_with("journal/") =>
+                {
+                    roll < 15
+                }
                 _ => false,
             };
             if hit {
@@ -337,7 +348,10 @@ async fn run(seed: u64, verify_on_hit: bool, cache: bool) {
     bg.await.unwrap();
     quiesce(&engine).await;
     faults_on.store(false, Ordering::SeqCst);
-    eprintln!("seed {seed}: injected {} faults", injected.load(Ordering::Relaxed));
+    eprintln!(
+        "seed {seed}: injected {} faults",
+        injected.load(Ordering::Relaxed)
+    );
 
     // Merge the disjoint per-task models.
     let mut model = Model::new();
@@ -350,8 +364,14 @@ async fn run(seed: u64, verify_on_hit: bool, cache: bool) {
     model.check(0, &final_view, &format!("seed {seed}: final read"));
     // A second read (cache path) must agree with the first.
     assert_eq!(read_all(&engine).await, final_view);
-    engine.flush().await.expect("FLUSH must heal once faults stop");
-    engine.checkpoint().await.expect("checkpoint must heal once faults stop");
+    engine
+        .flush()
+        .await
+        .expect("FLUSH must heal once faults stop");
+    engine
+        .checkpoint()
+        .await
+        .expect("checkpoint must heal once faults stop");
     assert_eq!(engine.state(), maki_core::engine::EngineState::Ready);
     let st = engine.stats().await;
     eprintln!(

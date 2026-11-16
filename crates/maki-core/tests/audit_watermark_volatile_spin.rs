@@ -89,7 +89,10 @@ async fn watermark_wakeups_run_useless_checkpoints_for_a_volatile_tail() {
     // Volatile writes (no FUA, no FLUSH) past the watermark.
     let mut unit = 0u64;
     while engine.stats().await.journal_total_bytes < 8 * 1024 {
-        engine.write(unit * 1024, &[0x33; 1024], false).await.unwrap();
+        engine
+            .write(unit * 1024, &[0x33; 1024], false)
+            .await
+            .unwrap();
         unit += 1;
     }
     let before = clock.sleeps.load(Ordering::SeqCst);
@@ -100,7 +103,10 @@ async fn watermark_wakeups_run_useless_checkpoints_for_a_volatile_tail() {
     const WRITES: u64 = 20;
     for _ in 0..WRITES {
         let sleeps = clock.sleeps.load(Ordering::SeqCst);
-        engine.write(unit * 1024, &[0x44; 1024], false).await.unwrap();
+        engine
+            .write(unit * 1024, &[0x44; 1024], false)
+            .await
+            .unwrap();
         unit += 1;
         parked(&clock, sleeps + 1).await;
     }

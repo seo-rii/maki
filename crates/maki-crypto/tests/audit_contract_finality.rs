@@ -72,10 +72,7 @@ fn contract() -> CryptoError {
 }
 
 /// Drive backoff/cooldown sleeps on the manual clock until the task ends.
-async fn drive<T: Send + 'static>(
-    clock: &ManualClock,
-    task: tokio::task::JoinHandle<T>,
-) -> T {
+async fn drive<T: Send + 'static>(clock: &ManualClock, task: tokio::task::JoinHandle<T>) -> T {
     for _ in 0..10_000 {
         if task.is_finished() {
             return task.await.unwrap();
@@ -154,7 +151,9 @@ async fn contract_then_cooling_circuit_fails_the_stalled_operation() {
     let broken = Arc::new(FakeCryptoProvider::new(UNIT as u32));
     let healthy = Arc::new(FakeCryptoProvider::new(UNIT as u32));
     broken.fail_next((0..100).map(|_| contract()));
-    healthy.fail_next([CryptoError::EndpointFatal("HTTP 401 from auth proxy".into())]);
+    healthy.fail_next([CryptoError::EndpointFatal(
+        "HTTP 401 from auth proxy".into(),
+    )]);
     let set = Arc::new(EndpointSet::new(
         vec![
             ("broken".into(), broken.clone() as Arc<dyn CryptoProvider>),

@@ -25,8 +25,15 @@ fn superblock(uuid: u128) -> Superblock {
         provider_type: "fake".into(),
         crypto_compatibility_id: "test-profile-v1".into(),
         key_identity: "k".into(),
-        geometry: Geometry::compute(UNIT, UNIT, 512, UNIT + 8, 64 * UNIT as u64, 16 * UNIT as u64)
-            .unwrap(),
+        geometry: Geometry::compute(
+            UNIT,
+            UNIT,
+            512,
+            UNIT + 8,
+            64 * UNIT as u64,
+            16 * UNIT as u64,
+        )
+        .unwrap(),
         format_version: 1,
         created_unix: 0,
     }
@@ -53,7 +60,10 @@ async fn a_root_with_an_earlier_volumes_canary_is_refused_at_create_not_at_attac
     let backing = Arc::new(MemBacking::new());
     init::create_volume(backing.as_ref(), superblock(1)).unwrap();
     let engine = attach(&backing).await.unwrap(); // establishes canary.a/b
-    engine.write(0, &vec![7; UNIT as usize], true).await.unwrap();
+    engine
+        .write(0, &vec![7; UNIT as usize], true)
+        .await
+        .unwrap();
     drop(engine);
     assert!(backing.exists(layout::KEY_CANARY_A).unwrap());
 
@@ -61,7 +71,11 @@ async fn a_root_with_an_earlier_volumes_canary_is_refused_at_create_not_at_attac
     // superblocks and every file of the three layout directories are gone.
     backing.remove(layout::SUPERBLOCK_A).unwrap();
     backing.remove(layout::SUPERBLOCK_B).unwrap();
-    for dir in [layout::DATA_DIR, layout::JOURNAL_DIR, layout::CHECKPOINT_DIR] {
+    for dir in [
+        layout::DATA_DIR,
+        layout::JOURNAL_DIR,
+        layout::CHECKPOINT_DIR,
+    ] {
         for name in backing.list(dir).unwrap() {
             backing.remove(&format!("{dir}/{name}")).unwrap();
         }

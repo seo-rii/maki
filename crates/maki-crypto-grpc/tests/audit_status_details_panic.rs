@@ -170,8 +170,14 @@ async fn daemon_wiring_a_panicking_peer_fails_requests_a_healthy_peer_could_serv
     let (good, good_calls) = healthy().await;
     let set = EndpointSet::new(
         vec![
-            ("bad".into(), Arc::new(provider(bad)) as Arc<dyn CryptoProvider>),
-            ("good".into(), Arc::new(provider(good)) as Arc<dyn CryptoProvider>),
+            (
+                "bad".into(),
+                Arc::new(provider(bad)) as Arc<dyn CryptoProvider>,
+            ),
+            (
+                "good".into(),
+                Arc::new(provider(good)) as Arc<dyn CryptoProvider>,
+            ),
         ],
         DispatchConfig {
             retry: RetryPolicy {

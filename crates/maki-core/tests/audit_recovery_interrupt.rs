@@ -358,9 +358,9 @@ fn sweep(seed: u64, cycles: usize, discard: bool, permille: u32) -> Result<(), S
                 Ok(v) => v.map(|(_, bytes)| bytes),
                 Err(e) => {
                     return Err(format!(
-                        "seed {seed} cycle {cycle}: unit {unit} unreadable after recovery: {e}\n  {}",
-                        report(&log)
-                    ))
+                    "seed {seed} cycle {cycle}: unit {unit} unreadable after recovery: {e}\n  {}",
+                    report(&log)
+                ))
                 }
             };
             if let Err(violation) = oracle.check_and_settle(unit, actual) {

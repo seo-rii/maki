@@ -133,16 +133,8 @@ impl Cfg {
                 },
                 journal_max_bytes: self.journal_max_bytes,
                 max_pending_bytes: self.max_pending_bytes,
-                emergency_reserve_bytes: if self.space {
-                    4 * self.unit as u64
-                } else {
-                    0
-                },
-                low_space_checkpoint_bytes: if self.space {
-                    3 * self.unit as u64
-                } else {
-                    0
-                },
+                emergency_reserve_bytes: if self.space { 4 * self.unit as u64 } else { 0 },
+                low_space_checkpoint_bytes: if self.space { 3 * self.unit as u64 } else { 0 },
                 interval: Duration::from_secs(3600),
             },
             ..EngineOptions::default()
@@ -961,7 +953,8 @@ fn run_deep_check(
     injector: &Injector,
 ) -> Result<Option<maki_format::checker::CheckReport>, String> {
     let before = injector.mutations();
-    let result = maki_core::check::deep_check(backing.clone() as Arc<dyn Backing>, cfg.segment_size);
+    let result =
+        maki_core::check::deep_check(backing.clone() as Arc<dyn Backing>, cfg.segment_size);
     let after = injector.mutations();
     if after != before {
         return Err(format!(
@@ -1071,7 +1064,11 @@ impl tracing::field::Visit for MessageVisitor {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TraceCounter {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let level = *event.metadata().level();
         if level != tracing::Level::WARN && level != tracing::Level::ERROR {
             return;
@@ -1101,8 +1098,7 @@ fn trace_counts() -> Arc<Mutex<BTreeMap<String, u64>>> {
         .get_or_init(|| {
             use tracing_subscriber::layer::SubscriberExt;
             let counts = Arc::new(Mutex::new(BTreeMap::new()));
-            let subscriber =
-                tracing_subscriber::registry().with(TraceCounter(counts.clone()));
+            let subscriber = tracing_subscriber::registry().with(TraceCounter(counts.clone()));
             let _ = tracing::subscriber::set_global_default(subscriber);
             counts
         })
@@ -1185,7 +1181,9 @@ struct LyingFile {
 impl Injector {
     fn lie(&self, what: &str) -> bool {
         if self.lie_next.swap(false, Ordering::SeqCst) {
-            self.log.lock().push(format!("      !! SINGLE lying sync of {what}"));
+            self.log
+                .lock()
+                .push(format!("      !! SINGLE lying sync of {what}"));
             return true;
         }
         if self.dead.load(Ordering::SeqCst)
@@ -1196,7 +1194,9 @@ impl Injector {
             return false;
         }
         if self.rng.lock().random_range(0..1000) < self.mode.lying_sync {
-            self.log.lock().push(format!("      ! lying sync of {what}"));
+            self.log
+                .lock()
+                .push(format!("      ! lying sync of {what}"));
             return true;
         }
         false
@@ -1225,14 +1225,18 @@ impl maki_backing::BackingFile for LyingFile {
     fn sync_data(&self) -> io::Result<()> {
         self.inner.sync_data()?;
         if self.injector.lie(&self.path) {
-            return Err(io::Error::other("audit: sync persisted but reported failure"));
+            return Err(io::Error::other(
+                "audit: sync persisted but reported failure",
+            ));
         }
         Ok(())
     }
     fn sync_all(&self) -> io::Result<()> {
         self.inner.sync_all()?;
         if self.injector.lie(&self.path) {
-            return Err(io::Error::other("audit: sync persisted but reported failure"));
+            return Err(io::Error::other(
+                "audit: sync persisted but reported failure",
+            ));
         }
         Ok(())
     }
@@ -1268,7 +1272,9 @@ impl Backing for Lying {
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
         self.inner.sync_dir(dir)?;
         if self.injector.lie(&format!("dir {dir:?}")) {
-            return Err(io::Error::other("audit: dir sync persisted but reported failure"));
+            return Err(io::Error::other(
+                "audit: dir sync persisted but reported failure",
+            ));
         }
         Ok(())
     }
@@ -1465,12 +1471,7 @@ fn apply_crash(kind: Crash, backing: &CrashableBacking, rng: &mut StdRng) {
 }
 
 /// The unit images a write of `data` (or zeros) at `offset` produces.
-fn images_after_write(
-    cfg: &Cfg,
-    model: &Tracked,
-    offset: u64,
-    data: &[u8],
-) -> Vec<(u64, Vec<u8>)> {
+fn images_after_write(cfg: &Cfg, model: &Tracked, offset: u64, data: &[u8]) -> Vec<(u64, Vec<u8>)> {
     let unit = cfg.unit as u64;
     let first = offset / unit;
     let last = (offset + data.len() as u64 - 1) / unit;
@@ -1612,7 +1613,9 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             raw.set_lenient_sync_failures(true);
             let at = rng.random_range(1..=workload_mutations.max(8));
             injector.arm(at);
-            say(format!("-- cycle {cycle}: death armed after {at} mutations"));
+            say(format!(
+                "-- cycle {cycle}: death armed after {at} mutations"
+            ));
         } else {
             raw.set_lenient_sync_failures(false);
             injector.enabled.store(transient, Ordering::SeqCst);
@@ -1711,7 +1714,11 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                     }
                 }
                 say(format!("heal: flush -> {attempts:?}"));
-                assert!(healed, "HEAL-FLUSH: FLUSH keeps failing after faults stopped\n{}", history());
+                assert!(
+                    healed,
+                    "HEAL-FLUSH: FLUSH keeps failing after faults stopped\n{}",
+                    history()
+                );
                 if attempts.len() > 1 {
                     stats.bump("heal-flush-needed-retry");
                     stats.note(format!(
@@ -1838,12 +1845,12 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 for op in &batch {
                     let engine = engine.clone();
                     handles.push(match op {
-                        BatchOp::Flush => tokio::spawn(async move {
-                            engine.flush().await.map(|_| None)
-                        }),
-                        BatchOp::Checkpoint => tokio::spawn(async move {
-                            engine.checkpoint().await.map(|_| None)
-                        }),
+                        BatchOp::Flush => {
+                            tokio::spawn(async move { engine.flush().await.map(|_| None) })
+                        }
+                        BatchOp::Checkpoint => {
+                            tokio::spawn(async move { engine.checkpoint().await.map(|_| None) })
+                        }
                         BatchOp::Read { offset, len, .. } => {
                             let (offset, len) = (*offset, *len);
                             tokio::spawn(async move { engine.read(offset, len).await.map(Some) })
@@ -2108,8 +2115,8 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                             while at < offset + len as u64 {
                                 let u = at / unit;
                                 let from = (at - u * unit) as usize;
-                                let to = ((offset + len as u64).min((u + 1) * unit) - u * unit)
-                                    as usize;
+                                let to =
+                                    ((offset + len as u64).min((u + 1) * unit) - u * unit) as usize;
                                 want.extend_from_slice(&model.read(u)[from..to]);
                                 at = (u + 1) * unit;
                             }
@@ -2225,14 +2232,18 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             // One transient fault at a uniformly chosen mutation of the
             // recovery (it may land after recovery, in attach, or never).
             let at = rng.random_range(1..=recovery_mutations.max(6) + 2);
-            say(format!("recovery with one transient fault after {at} mutations"));
+            say(format!(
+                "recovery with one transient fault after {at} mutations"
+            ));
             injector.arm_single(at);
             let result = try_attach(&cfg, &backing).await;
             let fired = injector.single.load(Ordering::SeqCst) < 0;
             injector.disarm_single();
             match result {
                 Ok(engine) => {
-                    say(format!("   faulty recovery completed (fault fired={fired})"));
+                    say(format!(
+                        "   faulty recovery completed (fault fired={fired})"
+                    ));
                     if fired {
                         stats.bump("faulty-recovery-ok-after-fault");
                         let fault = log
@@ -2302,7 +2313,10 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 Err(text) => panic!("{text}\n{}", history()),
             };
             if let Some(report) = &report {
-                say(format!("deep check: errors {:?} warnings {:?}", report.errors, report.warnings));
+                say(format!(
+                    "deep check: errors {:?} warnings {:?}",
+                    report.errors, report.warnings
+                ));
             }
             let check_clean = report.as_ref().map(|r| r.errors.is_empty());
             let engine = match try_attach(&cfg, &backing).await {
@@ -2367,7 +2381,10 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                      with every unit readable",
                     cfg.name,
                     mode.name,
-                    report.as_ref().map(|r| r.errors.clone()).unwrap_or_default()
+                    report
+                        .as_ref()
+                        .map(|r| r.errors.clone())
+                        .unwrap_or_default()
                 ));
             }
             stats.bump("damage-attached");
@@ -2380,8 +2397,7 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 Ok(None) => stats.bump("check-inconclusive"),
                 Ok(Some(report)) => {
                     stats.bump("checks");
-                    if report.errors.len() == 1
-                        && known_torn_header(&report.errors[0], &log.lock())
+                    if report.errors.len() == 1 && known_torn_header(&report.errors[0], &log.lock())
                     {
                         stats.bump("known-torn-header");
                         return;
@@ -2716,7 +2732,10 @@ fn pairs_from_env(default: Vec<(&'static str, &'static str)>) -> Vec<(String, St
 }
 
 async fn sweep_owned(pairs: Vec<(String, String)>, seeds: std::ops::Range<u64>, cycles: usize) {
-    let refs: Vec<(&str, &str)> = pairs.iter().map(|(c, m)| (c.as_str(), m.as_str())).collect();
+    let refs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(c, m)| (c.as_str(), m.as_str()))
+        .collect();
     sweep_all(&refs, seeds, cycles).await;
 }
 
@@ -2788,7 +2807,16 @@ async fn audit2_random_geometry() {
     sweep_owned(
         pairs_from_env(all_pairs(
             &["random-any"],
-            &["crash", "death", "sync", "chaos", "chaos-death", "lying", "rfault", "damage"],
+            &[
+                "crash",
+                "death",
+                "sync",
+                "chaos",
+                "chaos-death",
+                "lying",
+                "rfault",
+                "damage",
+            ],
         )),
         seeds(),
         4,
@@ -2826,7 +2854,10 @@ async fn audit2_damage() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit2_worker() {
     sweep_owned(
-        pairs_from_env(all_pairs(&WORKER, &["crash", "death", "chaos", "chaos-death"])),
+        pairs_from_env(all_pairs(
+            &WORKER,
+            &["crash", "death", "chaos", "chaos-death"],
+        )),
         seeds(),
         4,
     )

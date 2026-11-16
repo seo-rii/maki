@@ -12,8 +12,8 @@ use maki_crypto::{
     SecretBuffer,
 };
 use maki_crypto_http::{
-    BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding,
-    RespKind, RespSpec,
+    BodySpec, FieldSource, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding, RespKind,
+    RespSpec,
 };
 
 struct Counting;
@@ -24,7 +24,8 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
-            let now = LIVE.fetch_add(layout.size() as isize, Ordering::SeqCst) + layout.size() as isize;
+            let now =
+                LIVE.fetch_add(layout.size() as isize, Ordering::SeqCst) + layout.size() as isize;
             PEAK.fetch_max(now, Ordering::SeqCst);
         }
         p
@@ -47,7 +48,10 @@ fn provider(url: &str) -> HttpCryptoProvider {
         headers: vec![],
         query: vec![],
         body: BodySpec::Json {
-            fields: vec![("/data".into(), FieldSource::Payload(PayloadEncoding::Base64))],
+            fields: vec![(
+                "/data".into(),
+                FieldSource::Payload(PayloadEncoding::Base64),
+            )],
             items_path: None,
             item_fields: vec![],
         },

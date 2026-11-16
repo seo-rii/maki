@@ -114,12 +114,15 @@ fn audit_dropped_frame_bytes_remain_in_live_read_buffer() {
     let base = read_buf.as_ptr();
     let frame = read_buf.split_to(20).freeze();
     drop(frame); // consumer copied it into guarded storage and released it
-    // Next read on the same (pooled) connection reserves a little more space.
+                 // Next read on the same (pooled) connection reserves a little more space.
     read_buf.reserve(16);
     assert_eq!(read_buf.as_ptr(), unsafe { base.add(20) });
     // The allocation is still owned by read_buf and was fully initialised by
     // the writes above, so reading the discarded prefix is defined.
     let stale = unsafe { std::slice::from_raw_parts(base, 20) };
-    eprintln!("stale prefix after frame release: {:?}", String::from_utf8_lossy(stale));
+    eprintln!(
+        "stale prefix after frame release: {:?}",
+        String::from_utf8_lossy(stale)
+    );
     assert_eq!(stale, b"SECRET-RESPONSE-BODY");
 }

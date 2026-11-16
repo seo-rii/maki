@@ -110,7 +110,8 @@ fn small_frames_after(large: Option<usize>, count: usize) -> Duration {
     let config = WebSocketConfig::default()
         .max_message_size(Some(64 << 20))
         .max_frame_size(Some(64 << 20));
-    let mut socket = WebSocket::from_raw_socket(SegmentedPeer { segments }, Role::Client, Some(config));
+    let mut socket =
+        WebSocket::from_raw_socket(SegmentedPeer { segments }, Role::Client, Some(config));
     if let Some(len) = large {
         match socket.read().expect("large frame") {
             Message::Binary(payload) => assert_eq!(payload.len(), len),

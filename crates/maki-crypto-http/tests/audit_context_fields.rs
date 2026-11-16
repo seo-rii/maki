@@ -81,9 +81,7 @@ fn keyed_handler() -> maki_test_support::http_chaos::Handler {
             .enumerate()
             .map(|(i, b)| b ^ key ^ (i as u8) ^ 0xa5)
             .collect();
-        ResponseSpec::json(
-            &json!({"data": base64::engine::general_purpose::STANDARD.encode(out)}),
-        )
+        ResponseSpec::json(&json!({"data": base64::engine::general_purpose::STANDARD.encode(out)}))
     })
 }
 
@@ -144,15 +142,28 @@ items_path = "/items"
 "/unit" = { source = "unit_index" }
 "#;
     let mut config = config(&server.url(), body);
-    for op in [
-        config.crypto.http.as_mut().unwrap().encrypt.as_mut().unwrap(),
-    ] {
+    for op in [config
+        .crypto
+        .http
+        .as_mut()
+        .unwrap()
+        .encrypt
+        .as_mut()
+        .unwrap()]
+    {
         let r = op.response.as_mut().unwrap();
         r.items_path = Some("/items".into());
         r.item_index_path = Some("/unit".into());
     }
     {
-        let op = config.crypto.http.as_mut().unwrap().decrypt.as_mut().unwrap();
+        let op = config
+            .crypto
+            .http
+            .as_mut()
+            .unwrap()
+            .decrypt
+            .as_mut()
+            .unwrap();
         let r = op.response.as_mut().unwrap();
         r.items_path = Some("/items".into());
         r.item_index_path = Some("/unit".into());

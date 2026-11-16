@@ -58,7 +58,9 @@ fn run(fail: &'static (dyn Fn(&FaultOp<'_>) -> bool + Sync)) {
     assert!(init::create_volume(backing.as_ref(), superblock()).is_err());
     let mut volume = Volume::recover(backing.clone() as Arc<dyn Backing>, options())
         .expect("recovery accepts the cached superblock");
-    volume.write_ct(3, &[0x5A; 544], true).expect("FUA write acknowledged");
+    volume
+        .write_ct(3, &[0x5A; 544], true)
+        .expect("FUA write acknowledged");
     volume.flush().expect("FLUSH acknowledged");
     drop(volume);
 
