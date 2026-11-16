@@ -482,8 +482,9 @@ impl std::fmt::Debug for HttpCryptoProvider {
 /// blocking, so a FIFO cannot hang attach. A file that `may_hold_private_key`
 /// is a secret file like a `file` credential: it is opened once without
 /// following a symlink, and if it does hold a `PRIVATE KEY` block it must
-/// not be readable by group or others. Certificates and CA bundles may be
-/// symlinks (`/etc/ssl/certs`, certbot's `live/`).
+/// be owned by root or the process's user and not be readable by group or
+/// others. Certificates and CA bundles may be symlinks (`/etc/ssl/certs`,
+/// certbot's `live/`).
 pub fn read_tls_file(
     section: &str,
     what: &str,
@@ -538,6 +539,12 @@ pub fn read_tls_file(
     #[cfg(unix)]
     if may_hold_private_key && holds_key {
         use std::os::unix::fs::PermissionsExt;
+        if let Some(owner) = maki_crypto_local::keysource::untrusted_secret_owner(&meta) {
+            return Err(fail(format!(
+                "holds a private key and {owner}: its owner can read or replace it; give it \
+                 to root or the service user, or move the key to client_key (SPEC 9)"
+            )));
+        }
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(fail(format!(

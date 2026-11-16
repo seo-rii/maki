@@ -53,7 +53,10 @@ fn missing(name: &str) -> CryptoError {
 }
 
 /// Reads credentials from a directory of files: systemd `LoadCredential`
-/// (`$CREDENTIALS_DIRECTORY`) or a root-only secret directory.
+/// (`$CREDENTIALS_DIRECTORY`) or a root-only secret directory. On Unix every
+/// file must be a regular file owned by root or by the user this process
+/// runs as, and not accessible to others (see `new` and
+/// `credentials_directory` for the group rule).
 ///
 /// `load` uses file content raw, except when it is a pure even-length hex
 /// string (optionally newline-terminated), which is decoded; `load_text`
@@ -67,7 +70,8 @@ pub struct FileKeySource {
 }
 
 impl FileKeySource {
-    /// A root-only secret directory: files must be 0600 or 0400.
+    /// A root-only secret directory: files must be 0600 or 0400 and owned
+    /// by root or by the process's effective user.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -80,7 +84,9 @@ impl FileKeySource {
     /// `LoadCredential=` files with mode 0440 for the service's group. Group
     /// read is accepted when the file's group is the process's effective
     /// group or root; group write and any access by others are still
-    /// refused (R5-037).
+    /// refused (R5-037). The owner rule is the same as for `new`: the
+    /// service manager writes these files owned by root or by the service
+    /// user, so a file owned by anyone else is not one systemd put there.
     pub fn credentials_directory(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -144,6 +150,23 @@ fn read_guarded(mut file: std::fs::File, expected_len: u64) -> std::io::Result<S
     Ok(raw)
 }
 
+/// Why a secret file's owner cannot be trusted, or `None` when it is root
+/// or the effective user of this process. SPEC §9 asks for a *root-only*
+/// secret file, and a file's owner can read and rewrite it whatever its
+/// mode: a `0600` key owned by an unprivileged user is that user's to read
+/// or replace, so a root process must not load it. A process running as
+/// the service user may still load its own files.
+#[cfg(unix)]
+pub fn untrusted_secret_owner(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let owner = meta.uid();
+    (owner != 0 && owner != euid).then(|| {
+        format!("is owned by uid {owner}, not by root or this process's user (uid {euid})")
+    })
+}
+
 /// Open a credential file once and describe the opened descriptor, so the
 /// checks and the read concern the same file. On Unix the open neither
 /// follows a symlink (`O_NOFOLLOW`) nor blocks on a FIFO without a writer
@@ -184,14 +207,15 @@ impl FileKeySource {
             )));
         }
         let path = self.dir.join(name);
-        // SPEC §9: a file credential is a *root-only secret file*. Any group
-        // or other access, or anything but a regular file (a symlink to
+        // SPEC §9: a file credential is a *root-only secret file*. A file
+        // owned by anyone but root or this process's user, any group or
+        // other access, or anything but a regular file (a symlink to
         // somewhere else, a FIFO), is refused rather than loaded. The one
-        // exception is systemd's credentials directory: from systemd 257,
-        // LoadCredential files are 0440 for the service's group, so group
-        // read (never write) is accepted there when the file's group is the
-        // process's effective group or root (R5-037). The checks run on the
-        // opened descriptor (see `open_credential`).
+        // exception to the mode rule is systemd's credentials directory:
+        // from systemd 257, LoadCredential files are 0440 for the service's
+        // group, so group read (never write) is accepted there when the
+        // file's group is the process's effective group or root (R5-037).
+        // The checks run on the opened descriptor (see `open_credential`).
         let (file, meta) = match open_credential(&path) {
             Ok(opened) => opened,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -205,6 +229,13 @@ impl FileKeySource {
             if !meta.file_type().is_file() {
                 return Err(CryptoError::ProviderFatal(format!(
                     "credential {name:?} is not a regular file"
+                )));
+            }
+            if let Some(owner) = untrusted_secret_owner(&meta) {
+                return Err(CryptoError::ProviderFatal(format!(
+                    "credential file {name:?} {owner}: its owner can read or replace it \
+                     whatever its mode; a secret file must belong to root or to the service \
+                     user (SPEC 9)"
                 )));
             }
             use std::os::unix::fs::MetadataExt;

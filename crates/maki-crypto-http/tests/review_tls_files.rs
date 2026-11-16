@@ -2,9 +2,10 @@
 //! combined certificate/private-key PEM (`client_cert_file` without
 //! `client_key`, HTTP only) holds the mTLS private key, so it must pass the
 //! same checks as a `file` credential: opened once without following a
-//! symlink, a regular file, and not readable by group or others. Any TLS
-//! file must be a regular file, so a FIFO cannot hang attach. Certificates
-//! and CA bundles may still be symlinks (`/etc/ssl/certs`, certbot).
+//! symlink, a regular file owned by root or the process's user, and not
+//! readable by group or others. Any TLS file must be a regular file, so a
+//! FIFO cannot hang attach. Certificates and CA bundles may still be
+//! symlinks (`/etc/ssl/certs`, certbot).
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
