@@ -123,10 +123,15 @@ observed metadata against administrator-provided pins. It requires the complete
 duplicate, malformed, missing, additional or changed identity refuses attach
 before activation. Configuration order does not affect the PV set. The pins are
 part of the trusted attachment identity, so grow and detach reject a changed or
-newly omitted table before mutation, and recovery rechecks persisted pins
-against its fresh read-only report. Production configurations must provide this
-table. Omission remains a compatibility mode and does not independently
-authenticate the discovered LVM metadata.
+newly omitted table before mutation. Only attach reads the read-only LVM report;
+recovery does not run a new one. Recovery, and a detach that consumes a
+pre-activation intent, check the identity persisted from attach's report
+against the recorded pins, and the live NBD geometry and device-mapper names,
+UUIDs and dependencies against that identity. After activation, recovery checks
+the live mappings against the mapping proof recorded after the pinned
+activation. Production configurations must provide this table. Omission
+remains a compatibility mode and does not independently authenticate the
+discovered LVM metadata.
 
 Read-only LVM reporting is lockless and is not a promise that LVM leaves host
 hint files untouched. The attach lock does not coordinate other privileged

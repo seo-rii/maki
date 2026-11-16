@@ -447,10 +447,13 @@ nonempty VG system IDs, and cachevol layouts. This requires compatible LVM2
 report and scoped activation options.
 When `[lvm_identity]` is present, attach additionally requires the observed PV
 set and VG/target-LV UUIDs to equal the administrator pins before activation.
-Those pins become part of the trusted record; recovery rechecks them, and a
-grow or detach whose current configuration omits or changes them is refused
-before mutation. Omitting the table is supported only for compatibility and is
-outside the production profile. The checks do not coordinate host udev or other
+Those pins become part of the trusted record. Recovery does not read LVM
+metadata again: it checks the identity persisted from attach's report against
+the pins, and the live device-mapper mappings against that identity or the
+post-activation mapping proof. A grow or detach whose current configuration
+omits or changes them is refused before mutation. Omitting the table is
+supported only for compatibility and is outside the production profile. The
+checks do not coordinate host udev or other
 privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
 before using an existing partition layout or host activation policy.
 

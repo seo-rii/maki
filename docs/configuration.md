@@ -803,8 +803,11 @@ When `[lvm_identity]` is present, all three fields are required. `pv_uuids`
 must list the complete PV set without duplicates; its order is normalized.
 Attach refuses a missing, additional, malformed or changed PV, VG or configured
 target-LV UUID before activation. The pins are stored in the trusted attachment
-record and rechecked during recovery. Grow and detach also require the current
-configuration, including the pins, to match that record before any mutation.
+record. Recovery does not read LVM metadata again: it checks the identity
+attach persisted before activation against them, and the live mappings against
+that identity or the post-activation mapping proof. Grow and detach also
+require the current configuration, including the pins, to match that record
+before any mutation.
 
 Omitting the table remains accepted for old configurations and records, but
 does not authenticate the discovered LVM metadata against an administrator's
