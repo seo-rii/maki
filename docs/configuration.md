@@ -106,7 +106,10 @@ client_key = { source = "credential", name = "crypto-client-key" }
 ```
 
 For gRPC, use `crypto.grpc.endpoint`, an `https://` URL and `crypto.grpc.tls`
-with the same fields. WebSocket and gRPC require `client_cert_file` and
+with the same fields. A gRPC endpoint named by an IP literal
+(`https://192.0.2.10:7443`, `https://[2001:db8::10]:7443`) is verified against
+the certificate's IP-address SANs; a DNS SAN does not match it.
+WebSocket and gRPC require `client_cert_file` and
 `client_key` together; the private key is loaded through the existing credential
 router. Omit both for server-only TLS. HTTP also retains support for a combined
 certificate/private-key PEM in `client_cert_file`; such a file is a secret file

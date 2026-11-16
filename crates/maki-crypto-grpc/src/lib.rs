@@ -704,11 +704,15 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
+/// A URI host without the brackets that enclose an IPv6 literal.
+fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = unbracketed(host);
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
@@ -757,7 +761,20 @@ impl GrpcCryptoProvider {
                 // fails closed, as before).
                 let native_roots = tls.ca_certificate_pem.is_none()
                     || !rustls_native_certs::load_native_certs().certs.is_empty();
-                let mut config = ClientTlsConfig::new();
+                // Left unset, tonic takes the TLS server name from the URI
+                // host, which keeps an IPv6 literal's brackets ("[::1]"):
+                // neither a DNS name nor an IP address to rustls, so such an
+                // endpoint could never be built. Name the bare host instead.
+                // rustls verifies a literal as an IP-address server name
+                // against the certificate's IP SANs, exactly as it already
+                // did for IPv4; a DNS name is passed unchanged.
+                let server_name = endpoint
+                    .uri()
+                    .host()
+                    .map(unbracketed)
+                    .ok_or_else(|| fatal("gRPC endpoint URL has no host"))?
+                    .to_owned();
+                let mut config = ClientTlsConfig::new().domain_name(server_name);
                 if native_roots {
                     config = config.with_native_roots();
                 }
