@@ -1,6 +1,7 @@
-//! TEST-004: `CrashableBacking` must not offer crash outcomes a POSIX
-//! filesystem cannot produce, nor hide ones it can; durability tests
-//! are only as strong as this model.
+//! TEST-004: `CrashableBacking` must represent its documented namespace
+//! durability contract, including intermediate states; durability tests
+//! are only as strong as this model. Its indivisible-rename assumption is
+//! documented in `crash_backing`, not a universal filesystem guarantee.
 //!
 //! - A name and an inode are different things. A durable directory entry
 //!   whose data was never synced survives a power loss as an empty (or
@@ -83,7 +84,7 @@ fn a_recreated_file_never_shows_the_unlinked_inodes_bytes() {
 }
 
 #[test]
-fn a_lost_recreation_restores_the_unlinked_file() {
+fn unlink_and_recreate_can_keep_either_operation_or_lose_both() {
     let setup = || {
         let backing = CrashableBacking::new();
         write_synced(&backing, "f", b"OLD");
@@ -93,9 +94,13 @@ fn a_lost_recreation_restores_the_unlinked_file() {
         backing
     };
     let seen = outcomes(setup, "f");
-    for outcome in &seen {
-        let bytes = outcome.as_ref().expect("neither the old nor the new file");
+    // The unlink and subsequent create are separate operations. Keeping
+    // only the unlink legitimately leaves the path absent after a crash.
+    for bytes in seen.iter().flatten() {
         assert!(bytes == b"OLD" || bytes == b"NEW", "{bytes:?}");
+    }
+    for expected in [None, Some(b"OLD".to_vec()), Some(b"NEW".to_vec())] {
+        assert!(seen.contains(&expected), "missing outcome {expected:?}");
     }
     assert_eq!(
         seen.last().unwrap().as_deref(),

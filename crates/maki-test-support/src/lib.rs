@@ -4,8 +4,9 @@
 //! - [`model::ReferenceBlockModel`] — the durability oracle every phase is
 //!   verified against,
 //! - [`crash_backing::CrashableBacking`] — a `maki_backing::Backing` with
-//!   POSIX-faithful crash semantics (unsynced writes may be lost or torn,
-//!   unsynced dirents disappear, unsynced deletions resurrect),
+//!   explicit crash semantics (unsynced writes may be lost or torn,
+//!   namespace history is dependency ordered, unreachable subtrees disappear;
+//!   see the module's documented rename persistence assumption),
 //! - [`fake_provider::FakeCryptoProvider`] — deterministic, integrity-checking
 //!   crypto fake with fault/misbehavior injection,
 //! - [`clock::ManualClock`] — manually advanced `Clock`,

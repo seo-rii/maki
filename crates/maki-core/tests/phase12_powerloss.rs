@@ -3,10 +3,11 @@
 //! The SPEC's test hierarchy is WSL (development) → QEMU/KVM (hard VM power
 //! cut) → bare metal (final qualification). This file is the development
 //! tier: the *exact* SPEC §54 scenarios executed against the full engine
-//! over `CrashableBacking`, whose crash model (independent survival of every
-//! unsynced write, torn tails, orphaned dirents) is a superset of what a
-//! power cut can do to a POSIX filesystem. The QEMU/bare-metal runbook is
-//! in docs/testing.md.
+//! over `CrashableBacking`: unsynced writes may survive independently or
+//! tear, namespace operations retain their dependencies, and unpublished
+//! ancestors can hide their descendants. Its documented indivisible-rename
+//! assumption is not a universal filesystem power-loss guarantee. The
+//! QEMU/bare-metal runbook is in docs/testing.md.
 
 use std::sync::Arc;
 

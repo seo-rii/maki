@@ -1,4 +1,4 @@
-//! `CrashableBacking` — an in-memory `Backing` with POSIX-faithful crash
+//! `CrashableBacking` — an in-memory `Backing` with explicit crash
 //! semantics (SPEC §42 `CrashableBacking`).
 //!
 //! Durability rules simulated:
@@ -6,13 +6,22 @@
 //! - file creation/removal/rename is volatile until `sync_dir` on the parent;
 //!   names and inodes are separate, so a durable name can survive with its
 //!   unsynced data lost and a rename is kept or undone as a whole,
-//! - on crash, each volatile operation is independently kept or lost,
+//! - namespace operations are sampled independently, then their predecessor
+//!   dependencies are retained too; operations sharing a name stay ordered,
+//! - directory names are published by syncing their parent; a lost ancestor
+//!   makes its entire subtree unreachable,
 //! - optionally, any surviving write may be *torn* at sector boundaries of
 //!   a configurable granularity, aligned to the file (a prefix of sectors
 //!   kept, or one sector missing),
 //! - a removal that was never dir-synced may resurrect the file,
 //! - a creation that was never dir-synced may vanish even if its data was
 //!   fdatasync'd (orphan inode).
+//!
+//! Renames are indivisible in this model, including cross-directory renames:
+//! syncing either parent persists the whole operation and its predecessors.
+//! This is an explicit model assumption, not a general filesystem crash
+//! guarantee. Qualification of directory-local rename persistence needs an
+//! additional model or a real filesystem campaign.
 //!
 //! Fault injection: a hook may fail any operation (e.g. ENOSPC on append,
 //! EIO on fsync) — used by journal/checkpoint failpoint tests.
@@ -25,7 +34,7 @@
 //! - a `write_at` may persist a prefix and then fail (the partial-write
 //!   hook), leaving the file longer than the caller's logical end (F03).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
@@ -107,8 +116,8 @@ impl Inode {
 }
 
 /// A directory entry. Namespace changes are volatile until the parent
-/// directory is synced: a crash keeps each pending change or loses it, and
-/// the names one operation changed (both names of a rename) go together.
+/// directory is synced. `change` remains meaningful even when the durable
+/// and volatile values agree: a rename round trip has intermediate states.
 #[derive(Clone, Debug, Default)]
 struct Name {
     /// The inode the on-disk directory names.
@@ -119,10 +128,13 @@ struct Name {
     change: u64,
 }
 
-impl Name {
-    fn pending(&self) -> bool {
-        self.durable != self.volatile
-    }
+/// One indivisible operation and the prior operations on its affected names.
+/// Keep intermediate inode references until the history is settled, even if
+/// no current name or open handle still points at those inodes.
+#[derive(Clone, Debug)]
+struct NamespaceChange {
+    entries: Vec<(String, Option<InodeId>)>,
+    predecessors: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -133,6 +145,7 @@ struct Inner {
     handles: BTreeMap<InodeId, usize>,
     next_inode: InodeId,
     next_change: u64,
+    namespace_changes: BTreeMap<u64, NamespaceChange>,
     /// dir path -> dirent durable?
     dirs: BTreeMap<String, bool>,
     locks: std::collections::HashSet<String>,
@@ -163,11 +176,65 @@ impl Inner {
         self.names.get(path).and_then(|name| name.volatile)
     }
 
-    /// Point `path` at `inode` in the volatile namespace as part of `change`.
-    fn relink(&mut self, path: &str, inode: Option<InodeId>, change: u64) {
-        let name = self.names.entry(path.to_string()).or_default();
-        name.volatile = inode;
-        name.change = change;
+    /// Record all endpoints together, before another operation can replace
+    /// their last-change links. Unrelated names have no shared dependency.
+    fn relink(&mut self, entries: Vec<(String, Option<InodeId>)>) {
+        let predecessors = entries
+            .iter()
+            .filter_map(|(path, _)| self.names.get(path).map(|name| name.change))
+            .filter(|change| self.namespace_changes.contains_key(change))
+            .collect();
+        self.next_change += 1;
+        let change = self.next_change;
+        for (path, inode) in &entries {
+            let name = self.names.entry(path.clone()).or_default();
+            name.volatile = *inode;
+            name.change = change;
+        }
+        self.namespace_changes.insert(
+            change,
+            NamespaceChange {
+                entries,
+                predecessors,
+            },
+        );
+    }
+
+    fn require_dir(&self, dir: &str) -> io::Result<()> {
+        let mut prefix = String::new();
+        for part in dir.split('/').filter(|part| !part.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if self.volatile(&prefix).is_some() {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, prefix));
+            }
+            if !self.dirs.contains_key(&prefix) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, prefix));
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist only the selected operations and their dependency closure.
+    /// A predecessor already compacted by an earlier sync is satisfied.
+    fn persist_namespace(&mut self, selected: impl IntoIterator<Item = u64>) {
+        let mut pending: Vec<_> = selected.into_iter().collect();
+        let mut selected = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if let Some(change) = self.namespace_changes.get(&id) {
+                if selected.insert(id) {
+                    pending.extend(&change.predecessors);
+                }
+            }
+        }
+        for id in selected {
+            let change = self.namespace_changes.remove(&id).unwrap();
+            for (path, inode) in change.entries {
+                self.names.get_mut(&path).unwrap().durable = inode;
+            }
+        }
     }
 
     /// Drop inodes that no name (durable or volatile) and no handle reaches.
@@ -178,40 +245,41 @@ impl Inner {
             reached.extend(name.durable);
             reached.extend(name.volatile);
         }
+        for change in self.namespace_changes.values() {
+            reached.extend(change.entries.iter().filter_map(|(_, inode)| *inode));
+        }
         self.inodes.retain(|id, _| reached.contains(id));
     }
 
-    fn new_change(&mut self) -> u64 {
-        self.next_change += 1;
-        self.next_change
-    }
-
-    /// Settle the namespace after a crash: each pending change (`keep`
-    /// decides per change, so both names of a rename agree) either reached
-    /// the disk or did not. Returns the inodes still named afterwards.
-    fn settle_names(&mut self, mut keep: impl FnMut(&str, u64) -> bool) -> Vec<InodeId> {
-        let mut decided: BTreeMap<u64, bool> = BTreeMap::new();
-        let paths: Vec<String> = self.names.keys().cloned().collect();
-        for path in paths {
-            let name = self.names.get_mut(&path).unwrap();
-            if name.pending() {
-                let kept = *decided
-                    .entry(name.change)
-                    .or_insert_with(|| keep(&path, name.change));
-                let target = if kept { name.volatile } else { name.durable };
-                name.durable = target;
-                name.volatile = target;
-            }
-            if name.durable.is_none() {
-                self.names.remove(&path);
+    /// Settle selected namespace operations, then permanently drop names
+    /// below missing ancestors. Recreating a directory cannot expose them.
+    fn settle_names(&mut self, selected: impl IntoIterator<Item = u64>) -> Vec<InodeId> {
+        self.persist_namespace(selected);
+        self.namespace_changes.clear();
+        for name in self.names.values_mut() {
+            name.volatile = name.durable;
+        }
+        // Lexical order visits every parent before its descendants.
+        for (dir, durable) in std::mem::take(&mut self.dirs) {
+            if self.volatile(&dir).is_none() && self.require_dir(parent(&dir)).is_ok() {
+                self.dirs.insert(dir, durable);
             }
         }
+        let dirs = &self.dirs;
+        self.names.retain(|path, name| {
+            name.volatile = name.durable;
+            name.durable.is_some() && (parent(path).is_empty() || dirs.contains_key(parent(path)))
+        });
         let mut live: Vec<InodeId> = self.names.values().filter_map(|n| n.durable).collect();
         live.sort_unstable();
         live.dedup();
         self.inodes.retain(|id, _| live.binary_search(id).is_ok());
         live
     }
+}
+
+fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 /// The content a successful `sync_data` makes durable: the durable content
@@ -345,17 +413,17 @@ impl CrashableBacking {
         self.inner.lock().stats_read_bytes
     }
 
-    /// Simulate a crash: every pending namespace change and every dirty
-    /// write is independently kept or lost (a rename as one change); with
-    /// tearing enabled any kept write may persist partially. Afterwards,
-    /// everything that survived is durable.
+    /// Simulate a crash: sample pending namespace operations, keeping their
+    /// predecessor dependencies too (a rename as one change). Dirty writes
+    /// are independently kept or lost; with tearing enabled any kept write
+    /// may persist partially. Afterwards, everything that survived is durable.
     pub fn crash(&self, rng: &mut impl Rng) {
         let tearing = self.tearing;
         let mut inner = self.inner.lock();
         inner.stats_pending_writes = 0;
 
-        // Directories: unsynced dirs may vanish (only if empty of surviving
-        // files — for simplicity keep dirs whose creation survived the coin).
+        // Sample directory publication independently. settle_names removes
+        // every unreachable descendant after settling the file namespace.
         let dirs: Vec<String> = inner.dirs.keys().cloned().collect();
         for d in dirs {
             let durable = inner.dirs[&d];
@@ -368,7 +436,13 @@ impl CrashableBacking {
             }
         }
 
-        let live = inner.settle_names(|_, _| rng.random_bool(0.5));
+        let selected: Vec<_> = inner
+            .namespace_changes
+            .keys()
+            .copied()
+            .filter(|_| rng.random_bool(0.5))
+            .collect();
+        let live = inner.settle_names(selected);
         for id in live {
             let inode = inner.inodes.get_mut(&id).unwrap();
             let mut data = inode.durable.clone();
@@ -399,17 +473,18 @@ impl CrashableBacking {
     pub fn crash_all_lost(&self) {
         let mut inner = self.inner.lock();
         inner.stats_pending_writes = 0;
-        for id in inner.settle_names(|_, _| false) {
+        inner.dirs.retain(|_, durable| *durable);
+        for id in inner.settle_names([]) {
             let inode = inner.inodes.get_mut(&id).unwrap();
             *inode = Inode::from_content(std::mem::take(&mut inode.durable));
         }
-        inner.dirs.retain(|_, durable| *durable);
     }
 
     /// Deterministic torn-tail crash for journal tests: all pending ops of
     /// `path` are applied except the final write, which keeps only its first
-    /// `keep_bytes` bytes, and its directory entry survives. Everything else
-    /// crashes losing all volatile state.
+    /// `keep_bytes` bytes, and its directory entry survives. Its namespace
+    /// predecessors and ancestors survive too, so the selected path remains
+    /// reachable. All other volatile operations are lost.
     pub fn crash_keep_torn_prefix(&self, path: &str, keep_bytes: usize) {
         let mut inner = self.inner.lock();
         inner.stats_pending_writes = 0;
@@ -440,8 +515,22 @@ impl CrashableBacking {
             }
             apply(&mut data, p);
         }
-        let torn_change = inner.names[path].change;
-        for id in inner.settle_names(|name, change| name == path || change == torn_change) {
+        let mut selected = vec![inner.names[path].change];
+        let mut ancestor = parent(path);
+        while !ancestor.is_empty() {
+            *inner
+                .dirs
+                .get_mut(ancestor)
+                .expect("file parent must exist") = true;
+            // A directory may replace a removed durable file. Preserve that
+            // unlink too, or restoring the old file would hide the torn path.
+            if let Some(name) = inner.names.get(ancestor) {
+                selected.push(name.change);
+            }
+            ancestor = parent(ancestor);
+        }
+        inner.dirs.retain(|_, durable| *durable);
+        for id in inner.settle_names(selected) {
             let inode = inner.inodes.get_mut(&id).unwrap();
             let content = if id == torn {
                 data.clone()
@@ -450,7 +539,6 @@ impl CrashableBacking {
             };
             *inode = Inode::from_content(content);
         }
-        inner.dirs.retain(|_, durable| *durable);
     }
 }
 
@@ -622,6 +710,13 @@ impl Backing for CrashableBacking {
         validate(path, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Open { path, create })?;
+        inner.require_dir(parent(path))?;
+        if inner.dirs.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                path.to_string(),
+            ));
+        }
         let inode = match inner.volatile(path) {
             Some(inode) => inode,
             None if create => {
@@ -630,8 +725,7 @@ impl Backing for CrashableBacking {
                 inner.next_inode += 1;
                 let inode = inner.next_inode;
                 inner.inodes.insert(inode, Inode::default());
-                let change = inner.new_change();
-                inner.relink(path, Some(inode), change);
+                inner.relink(vec![(path.to_string(), Some(inode))]);
                 inode
             }
             None => return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string())),
@@ -647,6 +741,13 @@ impl Backing for CrashableBacking {
     fn exists(&self, path: &str) -> io::Result<bool> {
         validate(path, false)?;
         let inner = self.inner.lock();
+        if let Err(error) = inner.require_dir(parent(path)) {
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
         Ok(inner.volatile(path).is_some() || inner.dirs.contains_key(path))
     }
 
@@ -654,11 +755,11 @@ impl Backing for CrashableBacking {
         validate(path, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Remove { path })?;
+        inner.require_dir(parent(path))?;
         if inner.volatile(path).is_none() {
             return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string()));
         }
-        let change = inner.new_change();
-        inner.relink(path, None, change);
+        inner.relink(vec![(path.to_string(), None)]);
         Ok(())
     }
 
@@ -670,15 +771,21 @@ impl Backing for CrashableBacking {
         validate(to, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Rename { from, to })?;
+        inner.require_dir(parent(from))?;
+        inner.require_dir(parent(to))?;
+        if inner.dirs.contains_key(to) {
+            return Err(io::Error::new(io::ErrorKind::IsADirectory, to.to_string()));
+        }
         let inode = inner
             .volatile(from)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, from.to_string()))?;
         if from == to {
             return Ok(());
         }
-        let change = inner.new_change();
-        inner.relink(to, Some(inode), change);
-        inner.relink(from, None, change);
+        inner.relink(vec![
+            (from.to_string(), None),
+            (to.to_string(), Some(inode)),
+        ]);
         Ok(())
     }
 
@@ -691,6 +798,9 @@ impl Backing for CrashableBacking {
                 cur.push('/');
             }
             cur.push_str(comp);
+            if inner.volatile(&cur).is_some() {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, cur));
+            }
             inner.dirs.entry(cur.clone()).or_insert(false);
         }
         Ok(())
@@ -699,6 +809,7 @@ impl Backing for CrashableBacking {
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
         validate(dir, true)?;
         let inner = self.inner.lock();
+        inner.require_dir(dir)?;
         let prefix = if dir.is_empty() {
             String::new()
         } else {
@@ -731,25 +842,32 @@ impl Backing for CrashableBacking {
         validate(dir, true)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::SyncDir { dir })?;
-        // Commit namespace state for entries directly inside `dir`.
+        inner.require_dir(dir)?;
+        // Commit operations on entries directly inside `dir` and their
+        // predecessors. A rename persists as one operation, never half.
         let prefix = if dir.is_empty() {
             String::new()
         } else {
             format!("{dir}/")
         };
-        inner.names.retain(|name, entry| {
-            let direct = name
-                .strip_prefix(&prefix)
-                .is_some_and(|r| !r.is_empty() && !r.contains('/'));
-            if direct {
-                entry.durable = entry.volatile;
-            }
-            entry.durable.is_some() || entry.volatile.is_some()
+        let selected: Vec<_> = inner
+            .names
+            .iter()
+            .filter(|(name, _)| parent(name) == dir)
+            .map(|(_, entry)| entry.change)
+            .collect();
+        inner.persist_namespace(selected);
+        let Inner {
+            names,
+            namespace_changes,
+            ..
+        } = &mut *inner;
+        names.retain(|_, entry| {
+            entry.durable.is_some()
+                || entry.volatile.is_some()
+                || namespace_changes.contains_key(&entry.change)
         });
         inner.collect_garbage();
-        if !dir.is_empty() {
-            inner.dirs.insert(dir.to_string(), true);
-        }
         let dirnames: Vec<String> = inner.dirs.keys().cloned().collect();
         for name in dirnames {
             let direct = name
@@ -770,6 +888,7 @@ impl Backing for CrashableBacking {
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
         validate(path, false)?;
         let mut inner = self.inner.lock();
+        inner.require_dir(parent(path))?;
         if !inner.locks.insert(path.to_string()) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
