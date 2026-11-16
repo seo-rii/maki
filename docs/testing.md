@@ -217,7 +217,7 @@ The ignored long-running and external-service gates were not part of this run.
 | Component | Purpose |
 |---|---|
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
-| `CrashableBacking` | Independently keeps or loses unsynchronized operations and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
+| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
 | `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses |
 | `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing |
 | `DeterministicScheduler` | Reproducible seeded interleavings |
@@ -545,7 +545,14 @@ WRITE A with FUA succeeds; crash
 => A is new
 ```
 
-`CrashableBacking` models independent survival of pending operations. The main
+`CrashableBacking` samples pending operations and preserves the predecessor
+dependencies of surviving namespace changes. Chained renames can recover at
+intermediate names; independent names have no shared persistence order.
+Directory names are published by syncing their parent, and a lost ancestor
+makes all descendants unreachable. The model treats each rename as indivisible,
+including a cross-directory rename when either parent is synced. That is a
+model assumption, not a guarantee for every filesystem; directory-local rename
+persistence needs additional simulation or real-filesystem testing. The main
 power-loss gate (`phase12_powerloss.rs`) also enables tearing at 512-byte
 granularity, so an unsynced write can survive in part. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
