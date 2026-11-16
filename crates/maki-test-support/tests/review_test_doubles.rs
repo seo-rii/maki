@@ -12,8 +12,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use maki_crypto::{
-    CiphertextUnit, Clock, CryptoContext, CryptoError, CryptoProvider, ErrorClass, PlaintextUnit,
-    SecretBuffer,
+    Capability, CiphertextUnit, Clock, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
+    PlaintextUnit, SecretBuffer,
 };
 use maki_test_support::sched::{yield_now, DeterministicScheduler};
 use maki_test_support::{FakeCryptoProvider, ManualClock};
@@ -267,5 +267,78 @@ fn manual_clock_wakes_due_sleepers_in_deadline_then_registration_order() {
         }
         clock.advance(Duration::from_secs(3));
         assert_eq!(*log.lock().unwrap(), expected, "round {round}");
+    }
+}
+
+// ---------- FakeCryptoProvider: no framing check without integrity ----------
+
+fn damaged_ciphertexts(original: &CiphertextUnit) -> Vec<(&'static str, CiphertextUnit)> {
+    let size = original.data.len();
+    let with = |data: Vec<u8>| CiphertextUnit {
+        unit_index: original.unit_index,
+        data,
+    };
+    let mut header = original.data.clone();
+    header[0] ^= 0xFF;
+    let mut body = original.data.clone();
+    body[size / 2] ^= 0xFF;
+    vec![
+        ("zeroed", with(vec![0; size])),
+        ("overwritten", with(vec![0xA5; size])),
+        ("header-damaged", with(header)),
+        ("body-damaged", with(body)),
+    ]
+}
+
+/// With integrity off the fake stands in for an unauthenticated cipher
+/// (`local-aes-xts`): every ciphertext of the right length decrypts, a
+/// zeroed or overwritten unit to garbage, without an error. Refusing it on
+/// the fake's own framing would let a test of "damaged data is never
+/// served" pass for an unauthenticated profile even if the engine's slot
+/// checks were missing.
+#[test]
+fn an_unauthenticated_fake_decrypts_any_well_sized_ciphertext() {
+    let provider = FakeCryptoProvider::new(UNIT).with_integrity_check(false);
+    let caps = block_on(provider.capabilities()).unwrap();
+    assert_eq!(caps.integrity, Capability::Absent);
+    let original = block_on(provider.encrypt_batch(&context(), &plaintexts(1)))
+        .unwrap()
+        .remove(0);
+    assert_eq!(original.data.len(), caps.max_ciphertext_size as usize);
+    for (what, damaged) in damaged_ciphertexts(&original) {
+        let plaintext = block_on(provider.decrypt_batch(&context(), &[damaged]))
+            .unwrap_or_else(|error| panic!("{what} ciphertext was refused: {error}"));
+        assert_eq!(plaintext.len(), 1, "{what}");
+        assert_eq!(plaintext[0].data.len(), UNIT as usize, "{what}");
+    }
+    // Like XTS, a ciphertext that is not exactly one unit is still refused.
+    for len in [0, original.data.len() - 1, original.data.len() + 1] {
+        let wrong = CiphertextUnit {
+            unit_index: 0,
+            data: vec![0; len],
+        };
+        let result = block_on(provider.decrypt_batch(&context(), &[wrong]));
+        assert!(
+            matches!(result, Err(CryptoError::Integrity(_))),
+            "a {len}-byte ciphertext was not refused: {:?}",
+            result.map(|units| units.len())
+        );
+    }
+}
+
+/// The authenticated default refuses the same damage.
+#[test]
+fn an_authenticated_fake_refuses_damaged_ciphertext() {
+    let provider = FakeCryptoProvider::new(UNIT);
+    let original = block_on(provider.encrypt_batch(&context(), &plaintexts(1)))
+        .unwrap()
+        .remove(0);
+    for (what, damaged) in damaged_ciphertexts(&original) {
+        let result = block_on(provider.decrypt_batch(&context(), &[damaged]));
+        assert!(
+            matches!(result, Err(CryptoError::Integrity(_))),
+            "{what} ciphertext was not refused: {:?}",
+            result.map(|units| units.len())
+        );
     }
 }
