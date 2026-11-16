@@ -278,6 +278,10 @@ Environment=MAKI_LOG=info,maki_core::engine=debug
 Lines carry the level, the target module and structured fields such as the
 volume, operation and error class. Keys, plaintext, credentials and request
 payloads are never passed to a log macro; `SecretBuffer` redacts itself.
+Dependencies that would print payloads or credentials at trace level
+(`tungstenite`, `tokio_tungstenite`, `reqwest`) are capped at `debug`, even
+under `MAKI_LOG=trace` or a directive that names them
+([observability](observability.md#logs)).
 Read the journal with `journalctl -u maki@<volume>.service`.
 
 ## Rootless userspace smoke test

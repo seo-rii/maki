@@ -12,10 +12,18 @@
 //! Events carry operation names, error classes and identifiers only. Keys,
 //! plaintext and credentials are never passed to a tracing macro (SPEC §36);
 //! [`SecretBuffer`](maki_crypto::SecretBuffer) redacts itself in `Debug`.
+//!
+//! The sink also receives dependencies' `log` records (tracing-subscriber's
+//! `tracing-log` bridge). Some dependencies print payload or credential bytes
+//! at their most verbose levels, so those targets are capped whatever
+//! [`LOG_ENV`] says (see `CAPPED_TARGETS`).
 
 use std::io;
 
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{FilterExt, LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 /// Environment variable holding a `tracing_subscriber::EnvFilter` directive
 /// list, for example `warn`, `info,maki_core=debug`.
@@ -24,6 +32,29 @@ pub const LOG_ENV: &str = "MAKI_LOG";
 /// The level used when [`LOG_ENV`] is unset or unparsable.
 pub const DEFAULT_LEVEL: &str = "info";
 
+/// Dependency targets (and their submodules) whose more verbose levels print
+/// payload or credential bytes, with the most verbose level each may reach
+/// whatever [`LOG_ENV`] says:
+///
+/// - `tungstenite` logs every frame's payload (hex), every received text
+///   message and the client upgrade request (URL path, query and headers) at
+///   trace. WebSocket requests and responses carry the unit plaintext.
+/// - `tokio_tungstenite` is its async wrapper and shares the cap.
+/// - `reqwest` dumps the raw bytes it reads and writes above TLS at trace
+///   when a client enables `connection_verbose`. The HTTP provider does not;
+///   the cap keeps request bodies out of the log should that ever change.
+///
+/// Their debug output is connection lifecycle and error descriptions. The
+/// other libraries on the plaintext path print no payload or credential bytes
+/// at any level: hyper is built without logging, h2 leaves DATA payloads and
+/// header fields out of its frame formatting, rustls logs public handshake
+/// data only, and tonic, tower and hyper-util log connection state.
+const CAPPED_TARGETS: [(&str, LevelFilter); 3] = [
+    ("tungstenite", LevelFilter::DEBUG),
+    ("tokio_tungstenite", LevelFilter::DEBUG),
+    ("reqwest", LevelFilter::DEBUG),
+];
+
 /// Install the default stderr subscriber once per process.
 ///
 /// Returns `true` when this call installed it and `false` when a subscriber
@@ -31,11 +62,20 @@ pub const DEFAULT_LEVEL: &str = "info";
 /// process ends up with a working sink, so callers can ignore the result.
 pub fn install_default_logging() -> bool {
     let filter = EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LEVEL));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // An event must pass both filters. Adding cap directives to the operator's
+    // EnvFilter would not do: a more specific target directive
+    // (`tungstenite::protocol=trace`) or a span directive (`[name]=trace`)
+    // overrides them.
+    let cap = Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_targets(CAPPED_TARGETS);
+    let layer = fmt::layer()
         .with_writer(io::stderr)
         .with_ansi(false)
         .with_target(true)
+        .with_filter(filter.and(cap));
+    tracing_subscriber::registry()
+        .with(layer)
         .try_init()
         .is_ok()
 }
