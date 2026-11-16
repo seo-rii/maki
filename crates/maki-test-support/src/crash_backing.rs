@@ -47,6 +47,13 @@
 //!   counts as lost (a lost truncation stays possible after a bare retry);
 //! - a `write_at` may persist a prefix and then fail (the partial-write
 //!   hook), leaving the file longer than the caller's logical end (F03).
+//!
+//! A power loss (`crash*`) kills every process: it releases every lock, and
+//! every file or lock handle opened before it is dead. Each file operation
+//! through such a handle fails with an `ErrorKind::Other` I/O error (the
+//! model's EIO) without touching the recovered state, and dropping it
+//! releases nothing. A process restart (`drop` + reopen, page cache intact)
+//! is not a crash and invalidates nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -190,6 +197,8 @@ struct NamespaceChange {
 
 #[derive(Default)]
 struct Inner {
+    /// Number of power losses so far. Handles of an earlier epoch are dead.
+    epoch: u64,
     inodes: BTreeMap<InodeId, Inode>,
     names: BTreeMap<String, Name>,
     /// Open handles per inode: an unlinked inode stays usable while open.
@@ -214,6 +223,14 @@ struct Inner {
 }
 
 impl Inner {
+    /// Every process dies: its handles are dead and its locks released.
+    fn power_loss(&mut self) {
+        self.epoch += 1;
+        self.handles.clear();
+        self.locks.clear();
+        self.stats_pending_writes = 0;
+    }
+
     fn check(&self, op: &FaultOp<'_>) -> io::Result<()> {
         if let Some(hook) = &self.hook {
             if let Some(err) = hook(op) {
@@ -538,7 +555,7 @@ impl CrashableBacking {
     pub fn crash(&self, rng: &mut impl Rng) {
         let tearing = self.tearing;
         let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
+        inner.power_loss();
 
         // Sample directory publication independently. settle_names removes
         // every unreachable descendant after settling the file namespace.
@@ -590,7 +607,7 @@ impl CrashableBacking {
     /// deletions and renames are undone.
     pub fn crash_all_lost(&self) {
         let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
+        inner.power_loss();
         inner.dirs.retain(|_, durable| *durable);
         for id in inner.settle_names([]) {
             let inode = inner.inodes.get_mut(&id).unwrap();
@@ -606,7 +623,7 @@ impl CrashableBacking {
     /// uncertain operations, are lost.
     pub fn crash_keep_torn_prefix(&self, path: &str, keep_bytes: usize) {
         let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
+        inner.power_loss();
         let torn = inner.volatile(path).expect("file must exist");
         let inode = inner.inodes[&torn].clone();
         let mut data = inode.durable.clone();
@@ -666,11 +683,16 @@ pub struct CrashFile {
     /// The name the file was opened by (fault hooks and messages).
     path: String,
     inode: InodeId,
+    /// The power-loss epoch the handle was opened in.
+    epoch: u64,
 }
 
 impl Drop for CrashFile {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
+        if inner.epoch != self.epoch {
+            return;
+        }
         if let Some(count) = inner.handles.get_mut(&self.inode) {
             *count -= 1;
             if *count == 0 {
@@ -687,6 +709,12 @@ impl CrashFile {
         f: impl FnOnce(&mut Inner, &mut Inode) -> io::Result<R>,
     ) -> io::Result<R> {
         let mut inner = self.inner.lock();
+        if inner.epoch != self.epoch {
+            return Err(io::Error::other(format!(
+                "{}: handle opened before a power loss (EIO)",
+                self.path
+            )));
+        }
         let mut inode = inner.inodes.get(&self.inode).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -815,13 +843,18 @@ impl BackingFile for CrashFile {
 struct CrashLock {
     inner: Arc<Mutex<Inner>>,
     path: String,
+    /// The power-loss epoch the lock was taken in; a crash released it.
+    epoch: u64,
 }
 
 impl VolumeLock for CrashLock {}
 
 impl Drop for CrashLock {
     fn drop(&mut self) {
-        self.inner.lock().locks.remove(&self.path);
+        let mut inner = self.inner.lock();
+        if inner.epoch == self.epoch {
+            inner.locks.remove(&self.path);
+        }
     }
 }
 
@@ -855,6 +888,7 @@ impl Backing for CrashableBacking {
             inner: self.inner.clone(),
             path: path.to_string(),
             inode,
+            epoch: inner.epoch,
         }))
     }
 
@@ -1018,6 +1052,7 @@ impl Backing for CrashableBacking {
         Ok(Box::new(CrashLock {
             inner: self.inner.clone(),
             path: path.to_string(),
+            epoch: inner.epoch,
         }))
     }
 }

@@ -217,7 +217,7 @@ The ignored long-running and external-service gates were not part of this run.
 | Component | Purpose |
 |---|---|
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
-| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics follow Linux writeback: a failed `sync_data` marks its dirty operations clean with *unknown* persistence (the page cache keeps showing them, a retried sync writes nothing, a later power loss may keep any of them, whole or torn, and the worst-case crash loses them), a successful sync writes back every page a dirty write touched as a whole 4 KiB cached page, and the partial-write hook makes a `write_at` persist a prefix before failing |
+| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics follow Linux writeback: a failed `sync_data` marks its dirty operations clean with *unknown* persistence (the page cache keeps showing them, a retried sync writes nothing, a later power loss may keep any of them, whole or torn, and the worst-case crash loses them), a successful sync writes back every page a dirty write touched as a whole 4 KiB cached page, and the partial-write hook makes a `write_at` persist a prefix before failing. A power loss kills every process: file and lock handles opened before it are dead |
 | `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses |
 | `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing |
 | `DeterministicScheduler` | Reproducible seeded interleavings |
@@ -569,7 +569,15 @@ which makes the uncertain bytes in a re-dirtied page durable; bytes a
 successful sync rewrote or truncated never come back. A length change dirties
 no page. One whose sync failed may survive a crash until the next successful
 sync of the file, after which the model treats it as lost, so a bare retry
-cannot be relied on to persist a truncation. Simulation is useful
+cannot be relied on to persist a truncation.
+
+A power loss also kills every process. After `crash*` every lock is released,
+and each operation on a file handle opened before it fails with an
+`ErrorKind::Other` I/O error (the model's EIO) without changing the recovered
+state; dropping such a handle or lock releases nothing of the post-crash world.
+A test therefore cannot keep writing through, or syncing, a handle that a real
+power loss would have closed. A restart (`drop` + reopen, page cache intact)
+invalidates nothing. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 
