@@ -201,7 +201,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 self.assertEqual(report["passed_tests"], 0)
                 self.assertIn("preparation deadline", report["error"])
 
-    def test_each_started_campaign_uses_its_own_target_directory(self):
+    def test_each_started_campaign_uses_its_own_build_directories(self):
         def completed(command, **_kwargs):
             if command[:2] == ["git", "archive"]:
                 output = next(value for value in command if value.startswith("--output="))
@@ -233,12 +233,54 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(Path(first_config["target_dir"]), Path(first["run_dir"]) / "target")
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
+        self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
+        self.assertEqual(Path(second_config["build_dir"]), Path(second["run_dir"]) / "build")
+        self.assertNotEqual(first_config["build_dir"], second_config["build_dir"])
         self.assertEqual(first_config["profile"], "storage")
         self.assertEqual(first_config["suites"], list(self.runner.SUITES))
         self.assertEqual(second_config["profile"], "rollback")
         self.assertEqual(second_config["suites"], [
             "rollback_backing", "rollback_model", "rollback_protection", "rollback_process",
         ])
+
+    def test_prepare_isolates_all_packages_from_inherited_cargo_directories(self):
+        calls = []
+        inherited = {"CARGO_TARGET_DIR": str(self.root / "shared-target"),
+                     "CARGO_BUILD_BUILD_DIR": str(self.root / "shared-build")}
+        for profile in ("storage", "rollback"):
+            directory = self.root / profile
+            directory.mkdir()
+            config = {"source": str(directory), "target_dir": str(directory / "target"),
+                      "profile": profile}
+            groups = self.runner.suite_groups(config)
+
+            def child(command, _cwd, log, _stop, _timeout, env=None):
+                if command[0] == "cargo":
+                    calls.append((directory, dict(env)))
+                    package = command[command.index("-p") + 1]
+                    events = []
+                    for name in groups[package]:
+                        artifact = directory / (name + "-built")
+                        artifact.write_bytes(b"fixture binary")
+                        events.append(json.dumps({"reason": "compiler-artifact",
+                                                  "target": {"name": name},
+                                                  "executable": str(artifact)}))
+                    log.write_text("\n".join(events))
+                else:
+                    log.write_text("fixture: test\n")
+                return {"exit_code": 0, "reason": "exited"}
+
+            with mock.patch.dict(os.environ, inherited), \
+                    mock.patch.object(self.runner, "run_child", side_effect=child):
+                self.runner.prepare(directory, config, time.monotonic() + 30)
+                self.assertEqual(os.environ["CARGO_BUILD_BUILD_DIR"], inherited["CARGO_BUILD_BUILD_DIR"])
+
+        self.assertEqual(len(calls), 3, "storage and both rollback packages must be built")
+        for directory, environment in calls:
+            with self.subTest(campaign=directory.name):
+                self.assertEqual(environment["CARGO_TARGET_DIR"], str(directory / "target"))
+                self.assertEqual(environment["CARGO_BUILD_BUILD_DIR"], str(directory / "build"))
+                self.assertNotEqual(environment["CARGO_TARGET_DIR"], environment["CARGO_BUILD_BUILD_DIR"])
 
     def test_only_complete_nonempty_test_results_are_accepted(self):
         valid = "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.2s"
