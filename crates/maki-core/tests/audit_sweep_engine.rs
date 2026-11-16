@@ -949,6 +949,64 @@ fn damage_file(backing: &CrashableBacking, path: &str, rng: &mut StdRng) -> Stri
 }
 
 // ---------------------------------------------------------------------------
+// Coverage of rare engine paths: count WARN/ERROR tracing events by message
+// shape (digits folded), printed after every sweep.
+
+static TRACE_COUNTS: std::sync::OnceLock<Arc<Mutex<BTreeMap<String, u64>>>> =
+    std::sync::OnceLock::new();
+
+struct TraceCounter(Arc<Mutex<BTreeMap<String, u64>>>);
+
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TraceCounter {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let level = *event.metadata().level();
+        if level != tracing::Level::WARN && level != tracing::Level::ERROR {
+            return;
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        let mut key = String::new();
+        let mut in_digits = false;
+        for c in visitor.0.chars() {
+            if c.is_ascii_digit() {
+                if !in_digits {
+                    key.push('#');
+                }
+                in_digits = true;
+            } else {
+                in_digits = false;
+                key.push(c);
+            }
+        }
+        key.truncate(110);
+        *self.0.lock().entry(format!("{level} {key}")).or_default() += 1;
+    }
+}
+
+fn trace_counts() -> Arc<Mutex<BTreeMap<String, u64>>> {
+    TRACE_COUNTS
+        .get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let counts = Arc::new(Mutex::new(BTreeMap::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(TraceCounter(counts.clone()));
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            counts
+        })
+        .clone()
+}
+
+// ---------------------------------------------------------------------------
 // Statistics
 
 #[derive(Default)]
@@ -2122,6 +2180,8 @@ pub async fn sweep(
     budget: Duration,
 ) -> Outcome {
     let stats = Arc::new(Stats::default());
+    let traces = trace_counts();
+    traces.lock().clear();
     let started = Instant::now();
     let mut failures = Vec::new();
     let mut seeds_run = 0;
@@ -2166,6 +2226,9 @@ pub async fn sweep(
     );
     for note in stats.notes.lock().iter() {
         println!("AUDIT-NOTE {note}");
+    }
+    for (event, count) in traces.lock().iter() {
+        println!("AUDIT-TRACE cfg={cfg_name} mode={mode_name} {count:>6} {event}");
     }
     let mut classes: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for (seed, text) in &failures {
