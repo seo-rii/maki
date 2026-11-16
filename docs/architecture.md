@@ -136,7 +136,10 @@ fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
 larger than the writer can produce is rejected before it is read, and a
 complete-but-invalid final segment header is treated as damage rather than as
-a creation crash.
+a creation crash. That rule relies on the writer never extending a new segment
+before its header write: a header write that persists only a prefix leaves a
+file shorter than a header (or all zero), which recovery discards as a creation
+that never completed.
 
 The journal above the selected checkpoint must bridge through the proof's
 required sequence and exact record-end offset before recovery changes metadata.

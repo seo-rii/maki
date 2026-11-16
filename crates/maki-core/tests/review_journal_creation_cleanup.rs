@@ -14,6 +14,9 @@ use maki_test_support::{failpoints, CrashableBacking};
 #[derive(Default)]
 struct Faults {
     partial_header: AtomicBool,
+    /// With `partial_header`: the whole header, not a prefix, reaches the
+    /// disk before the write reports its error.
+    complete_header: AtomicBool,
     remove: AtomicBool,
     dirsync: AtomicBool,
 }
@@ -43,9 +46,15 @@ impl BackingFile for CreationFile {
             && self.faults.partial_header.swap(false, Ordering::SeqCst)
         {
             // Model permitted background writeback before pwrite returns EIO.
-            // The original backing operations persist an actual prefix and its
-            // created inode; no payload or operation result is forged.
-            self.inner.write_at(offset, &bytes[..20])?;
+            // The original backing operations persist an actual prefix (or the
+            // whole header) and its created inode; no payload or operation
+            // result is forged.
+            let persisted = if self.faults.complete_header.load(Ordering::SeqCst) {
+                bytes.len()
+            } else {
+                20
+            };
+            self.inner.write_at(offset, &bytes[..persisted])?;
             self.inner.sync_data()?;
             self.backing.sync_dir(layout::JOURNAL_DIR)?;
             return Err(io::Error::other("partial segment header write"));
@@ -337,13 +346,28 @@ fn cleanup_then_process_restart_does_not_need_to_recover_the_failed_creation() {
     }
 }
 
+/// A torn header prefix leaves a file shorter than a header, which recovery
+/// discards (`review_journal_torn_header.rs`). A *complete* header that fails
+/// its checksum is different: it reached the disk whole and was damaged
+/// there, which recovery cannot tell from damage to a segment that once held
+/// acknowledged records, so it must refuse it even though this creation
+/// failed and its cleanup never finished.
 #[test]
 fn an_unremoved_invalid_header_still_fails_closed_after_power_loss() {
     let _serial = failpoints::test_lock();
     for successor in [false, true] {
         let (backing, mut volume) = fixture(successor, false);
         backing.faults.remove.store(true, Ordering::SeqCst);
+        backing.faults.complete_header.store(true, Ordering::SeqCst);
         fail_creation(&backing, &mut volume, successor);
+        let file = backing.inner.open(&backing.target, false).unwrap();
+        let mut header = [0u8; maki_format::journal::SEGMENT_HEADER_SIZE];
+        file.read_at(0, &mut header).unwrap();
+        assert!(maki_format::journal::SegmentHeader::decode(&header).is_ok());
+        header[12] ^= 0x40; // media damage inside the persisted header
+        file.write_at(0, &header).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
         drop(volume);
         backing.faults.remove.store(false, Ordering::SeqCst);
         backing.inner.crash_all_lost();
