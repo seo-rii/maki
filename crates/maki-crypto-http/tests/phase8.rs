@@ -567,6 +567,24 @@ async fn payloads_never_appear_in_logs() {
     );
     let _guard = tracing::subscriber::set_default(subscriber);
 
+    // The absence assertions below prove something only if the capture
+    // sees every event the process emits: from runtime worker threads (where
+    // connection and server tasks run) and from the `log` crate (which the
+    // HTTP and TLS stacks use), not only tracing on this thread.
+    tokio::spawn(async { tracing::error!("log capture sentinel: worker thread") })
+        .await
+        .unwrap();
+    log::error!("log capture sentinel: log crate");
+    let seen = capture.0.lock().clone();
+    let missed: Vec<_> = ["worker thread", "log crate"]
+        .into_iter()
+        .filter(|sentinel| !seen.contains(&format!("log capture sentinel: {sentinel}")))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "the log capture missed events from: {missed:?}\n{seen}"
+    );
+
     let server = TestServer::start(xor_json_handler("data", "ciphertext")).await;
     let provider = HttpCryptoProvider::new(spec(
         &server.url(),
