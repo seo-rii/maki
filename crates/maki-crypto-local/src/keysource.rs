@@ -1,13 +1,15 @@
 //! Key-source abstraction (SPEC §9, §44).
 //!
-//! Missing or malformed credentials fail closed (`ProviderFatal`); key bytes
-//! travel in `SecretBuffer` and are never logged.
+//! Missing, blank or malformed credentials fail closed (`ProviderFatal`);
+//! key bytes travel in `SecretBuffer` and are never logged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use maki_crypto::{CryptoError, SecretBuffer};
 
+/// Every source here refuses a credential that is empty or holds only
+/// whitespace, for `load` and `load_text` alike (SPEC §44).
 pub trait KeySource: Send + Sync {
     /// Key material: a stored pure hex string is decoded (sources may keep
     /// binary keys as hex).
@@ -37,10 +39,9 @@ impl MapKeySource {
 
 impl KeySource for MapKeySource {
     fn load(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
-        self.map
-            .get(name)
-            .map(|b| SecretBuffer::from_slice(b))
-            .ok_or_else(|| missing(name))
+        let stored = self.map.get(name).ok_or_else(|| missing(name))?;
+        ensure_present(name, stored)?;
+        Ok(SecretBuffer::from_slice(stored))
     }
 
     fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
@@ -50,6 +51,22 @@ impl KeySource for MapKeySource {
 
 fn missing(name: &str) -> CryptoError {
     CryptoError::ProviderFatal(format!("credential {name:?} unavailable — failing closed"))
+}
+
+/// A blank credential is a missing one (SPEC §44): an empty file or
+/// variable, or one holding only whitespace (a token file truncated by a
+/// failed rotation), would otherwise be sent as `Authorization: Bearer `
+/// with no token. Whitespace is what `str::trim` removes, the trimming the
+/// header and metadata builders apply, so no value they would reduce to
+/// nothing is ever returned. `stored` is the credential as stored, before
+/// any hex decoding; the check borrows it and never copies it.
+fn ensure_present(name: &str, stored: &[u8]) -> Result<(), CryptoError> {
+    if std::str::from_utf8(stored).is_ok_and(|text| text.trim().is_empty()) {
+        return Err(CryptoError::ProviderFatal(format!(
+            "credential {name:?} is empty or only whitespace — failing closed"
+        )));
+    }
+    Ok(())
 }
 
 /// Reads credentials from a directory of files: systemd `LoadCredential`
@@ -267,7 +284,9 @@ impl FileKeySource {
                 "credential {name:?} is not a regular file"
             )));
         }
-        read_guarded(file, meta.len()).map_err(|_| missing(name))
+        let raw = read_guarded(file, meta.len()).map_err(|_| missing(name))?;
+        ensure_present(name, raw.expose())?;
+        Ok(raw)
     }
 }
 
@@ -310,17 +329,18 @@ impl KeySource for EnvKeySource {
         // only, SPEC §9); the key is copied into guarded memory and the
         // intermediate string is erased.
         let mut value = std::env::var(&var).map_err(|_| missing(name))?;
-        let key = key_from_bytes(value.as_bytes());
+        let key = ensure_present(name, value.as_bytes()).map(|()| key_from_bytes(value.as_bytes()));
         zeroize::Zeroize::zeroize(&mut value);
-        Ok(key)
+        key
     }
 
     fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
         let var = env_var_name(name);
         let mut value = std::env::var(&var).map_err(|_| missing(name))?;
-        let text = SecretBuffer::from_slice(value.as_bytes());
+        let text = ensure_present(name, value.as_bytes())
+            .map(|()| SecretBuffer::from_slice(value.as_bytes()));
         zeroize::Zeroize::zeroize(&mut value);
-        Ok(text)
+        text
     }
 }
 

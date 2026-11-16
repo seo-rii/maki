@@ -298,6 +298,10 @@ Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
 and metadata values, so a token generated with `openssl rand -hex 32` is sent
 as that hex text.
+A credential that is empty or holds only whitespace is refused like a missing
+one, whatever its source and use, so a token file truncated by a failed
+rotation stops attach instead of sending a header or metadata value without
+its token.
 Within one volume configuration, references may reuse a name only when they
 declare the same source. For example, `name = "token"` in both the encrypt and
 decrypt mappings is valid with `source = "credential"` on both. Combining that

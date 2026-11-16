@@ -1033,6 +1033,7 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
   (systemd `LoadCredential=`) has the same owner rule and may also be `0440`
   when its group is the daemon's own or root, as systemd 257 (Debian 13)
   writes them; group write and any access by others are refused (R5-037).
+  An empty or whitespace-only credential is refused like a missing one.
 - The control socket is `0660` with `control.group`; administrators reach it
   through the `root:maki-admin` `/run/maki-control` tree, while the NBD
   socket stays behind `/run/maki` (`root:maki` 0750), which only the daemon
