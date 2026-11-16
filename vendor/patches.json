@@ -128,7 +128,7 @@
         "src/lib.rs": "953e3d4faefd7a36ba665ade762b40bbaa47d52f606e2a665f4147847ca8ac83",
         "src/maki_buffer.rs": "29a7ea15f2fb97d336c21c2b2825e8cfb240ad375677345f36805faa5ed525c8",
         "src/protocol/frame/frame.rs": "b07b2f636bc1851790d534e22749e7868090f1753231a7677a098f0fc31c5edc",
-        "src/protocol/frame/mod.rs": "6b0421f5b6ceb0593775375bb3aa23f340f9753a2557a5bf9646dfaabf051700",
+        "src/protocol/frame/mod.rs": "b3d8b046d7570fd01682a1f076e3472426cdadb57b637667443f36da53b93534",
         "src/protocol/message.rs": "030da939106fc01d480139e86f78862b62e7b4ade7986ff1f0e4a398addbc1d0"
       }
     }

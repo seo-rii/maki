@@ -86,6 +86,10 @@ reusing storage erase discarded bytes. `tungstenite` guards its output queue,
 fragment collectors, masked formatting temporaries and handshake read/write
 storage before they can contain payload data. Their growth and error paths
 erase retired allocations. Public message/HTTP values remain caller-owned.
+Like hyper, tungstenite's frame reader reads into its buffer's spare capacity
+and keeps only the reported byte count. That capacity is zero-filled once per
+allocation instead of being zero-filled and wiped again on every read, which
+made each read rewrite whatever capacity a large frame left behind.
 
 Hyper's HTTP/1 body decoder also retains typed parse-error provenance for
 invalid chunk sizes, delimiters, extensions and trailers. These errors keep

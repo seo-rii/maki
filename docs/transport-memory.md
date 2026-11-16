@@ -385,7 +385,13 @@ collectors, masked-formatting temporaries and handshake read/write buffers.
 Guards exist before copying and survive growth, rejection, partial writes,
 cancellation and Drop. Incoming frame allocations use patched `BytesMut`;
 returned messages and shared frame views preserve caller ownership and wire
-contents.
+contents. The frame reader reads directly into that buffer's spare capacity,
+zero-filled once per allocation, and keeps only the byte count the stream
+reports, so a read no longer rewrites the capacity a large frame left behind.
+Maki's TCP and TLS streams write exactly the reported bytes. Anything a
+non-conforming stream writes beyond them stays in that library-owned spare
+capacity until a later read overwrites it or the allocation is erased on
+growth, compaction or release.
 
 These changes cover application-data byte allocations on Maki's active framing
 paths. Public HTTP header/URI values, arbitrary user-supplied body buffers,
