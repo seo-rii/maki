@@ -237,8 +237,8 @@ attach_config_path=""
 nbdkit_pid=""
 duplicate_pid=""
 sudo_keeper_pid=""
-nbd_connection_attempted=false
-nbd_connected=false
+nbd_connection_id=""
+helper_cleanup_needed=false
 mount_active=false
 vg_created=false
 pv_created=false
@@ -279,25 +279,52 @@ nbd_has_pid() {
     [[ "$value" =~ ^[1-9][0-9]*$ ]]
 }
 
-disconnect_test_nbd() {
-    if [[ "$nbd_connected" == true ]] ||
-        { [[ "$nbd_connection_attempted" == true ]] && nbd_has_pid; }; then
-        log "cleanup: disconnecting $device"
-        if sudo -n nbd-client -d "$nbd_target"; then
-            nbd_connected=false
-            return 0
-        fi
-        log "cleanup warning: could not disconnect $device"
-        return 1
+test_nbd_action() {
+    [[ -n "$nbd_connection_id" ]] || return 1
+    sudo -n python3 "$REPO_ROOT/scripts/privileged_validation_nbd.py" \
+        --device "$device" --identifier "$nbd_connection_id" "$@"
+}
+
+connect_test_nbd() {
+    # Record ownership before invoking nbd-client, including partial failures.
+    # A disconnected phase gets a fresh identity; a cleanup retry keeps its own.
+    if [[ -z "$nbd_connection_id" ]]; then
+        nbd_connection_id="maki-privval-$(python3 -c 'import uuid; print(uuid.uuid4())')" || return 1
     fi
+    test_nbd_action connect --socket "$socket_path"
+}
+
+disconnect_test_nbd() {
+    [[ -n "$nbd_connection_id" ]] || return 0
+    log "cleanup: disconnecting the owned backend on $device"
+    if test_nbd_action disconnect; then
+        nbd_connection_id=""
+        return 0
+    fi
+    log "cleanup warning: could not prove or disconnect our backend on $device"
+    return 1
 }
 
 cleanup() {
     local cleanup_rc=0
     set +e
 
-    if [[ "$mount_active" == true ]] ||
-        { [[ -n "$mountpoint" ]] && findmnt -rn -M "$mountpoint" >/dev/null 2>&1; }; then
+    # The helper's trusted record, not the raw connection identifier, owns this
+    # phase. Never hold our attach lock while calling the helper itself.
+    if [[ "$helper_cleanup_needed" == true ]]; then
+        if sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
+            --config "$attach_config_path" >"$run_dir/maki-cleanup-on-exit.txt" 2>&1; then
+            helper_cleanup_needed=false
+            mount_active=false
+        else
+            log "cleanup warning: helper cleanup failed; preserving its attachment and backing"
+            cleanup_safe=false
+            cleanup_rc=1
+        fi
+    fi
+
+    if [[ "$cleanup_safe" == true ]] && { [[ "$mount_active" == true ]] ||
+        { [[ -n "$mountpoint" ]] && findmnt -rn -M "$mountpoint" >/dev/null 2>&1; }; }; then
         log "cleanup: unmounting $mountpoint"
         if sudo -n umount "$mountpoint"; then
             mount_active=false
@@ -318,22 +345,20 @@ cleanup() {
     fi
 
     if [[ "$vg_created" == true || "$pv_created" == true ]]; then
-        if ! nbd_has_pid && [[ -n "$nbdkit_pid" ]] && kill -0 "$nbdkit_pid" 2>/dev/null; then
-            log "cleanup: reconnecting $device to remove disposable LVM metadata"
-            if sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096; then
-                nbd_connected=true
-            else
+        if ! test_nbd_action check >/dev/null 2>&1; then
+            log "cleanup: connecting our backend on $device to remove disposable LVM metadata"
+            if [[ -z "$nbdkit_pid" ]] || ! kill -0 "$nbdkit_pid" 2>/dev/null || ! connect_test_nbd; then
                 log "cleanup warning: could not reconnect $device for LVM cleanup"
                 cleanup_safe=false
                 cleanup_rc=1
             fi
         fi
 
-        if nbd_has_pid; then
+        if [[ "$cleanup_safe" == true ]]; then
             if [[ "$vg_created" == true ]]; then
-                sudo -n vgchange -ay "$vg_name" >/dev/null 2>&1 || true
-                sudo -n lvremove --yes --force "/dev/$vg_name/$lv_name" >/dev/null 2>&1 || true
-                if sudo -n vgremove --yes --force "$vg_name" >/dev/null 2>&1; then
+                test_nbd_action activate-vg --vg "$vg_name" >/dev/null 2>&1 || true
+                test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name" >/dev/null 2>&1 || true
+                if test_nbd_action remove-vg --vg "$vg_name" >/dev/null 2>&1; then
                     vg_created=false
                 else
                     log "cleanup warning: could not remove test VG $vg_name"
@@ -342,7 +367,7 @@ cleanup() {
                 fi
             fi
             if [[ "$pv_created" == true ]]; then
-                if sudo -n pvremove --yes --force "$device" >/dev/null 2>&1; then
+                if test_nbd_action remove-pv >/dev/null 2>&1; then
                     pv_created=false
                 else
                     log "cleanup warning: could not remove test PV on $device"
@@ -351,13 +376,25 @@ cleanup() {
                 fi
             fi
         else
-            log "cleanup warning: test LVM metadata remains but $device is disconnected"
+            log "cleanup warning: preserving test LVM metadata without a proven own connection"
             cleanup_safe=false
             cleanup_rc=1
         fi
     fi
 
-    disconnect_test_nbd || cleanup_rc=1
+    if ! disconnect_test_nbd; then
+        cleanup_safe=false
+        cleanup_rc=1
+    fi
+
+    if [[ "$cleanup_safe" == false ]]; then
+        if [[ -n "$sudo_keeper_pid" ]]; then
+            : >"$run_dir/stop-sudo-keeper"
+            kill -TERM "$sudo_keeper_pid" 2>/dev/null || true
+            wait "$sudo_keeper_pid" 2>/dev/null || true
+        fi
+        return "$cleanup_rc"
+    fi
 
     if stop_process_normally "$duplicate_pid" "duplicate nbdkit"; then
         duplicate_pid=""
@@ -780,9 +817,7 @@ existing_size="$(sudo -n blockdev --getsize64 "$device" 2>/dev/null || printf '0
 pass "$device exists and is unused"
 
 log "attaching the disposable export to $device"
-nbd_connection_attempted=true
-sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096
-nbd_connected=true
+connect_test_nbd
 for _ in $(seq 1 100); do
     attached_size="$(sudo -n blockdev --getsize64 "$device" 2>/dev/null || printf '0')"
     [[ "$attached_size" == "$VIRTUAL_SIZE_BYTES" ]] && break
@@ -793,7 +828,6 @@ done
 pass "kernel NBD attach and 512 MiB geometry"
 
 if nbd-client -d "$nbd_target" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
-    nbd_connected=false
     die "the unprivileged invoking user unexpectedly disconnected $device"
 fi
 pass "unprivileged NBD disconnect ioctl is denied"
@@ -828,8 +862,7 @@ done
 [[ "$fs_uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
     die "filesystem inventory returned an invalid UUID"
 sudo -n vgchange -an "$vg_name"
-sudo -n nbd-client -d "$nbd_target"
-nbd_connected=false
+disconnect_test_nbd
 pass "LVM physical/volume/logical volume and XFS creation"
 
 attach_config_dir_candidate="/run/maki-attach-validation-$volume_name"
@@ -860,13 +893,12 @@ sudo -n env PATH="$PATH" "$attach_bin" attach --volume "$volume_name" \
     >"$run_dir/maki-attach-plan.txt"
 
 log "running the real maki-attach helper"
-nbd_connection_attempted=true
+helper_cleanup_needed=true
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
 sudo -n env PATH="$PATH" "$attach_bin" attach --volume "$volume_name" \
     --config "$attach_config_path" \
     >"$run_dir/maki-attach.txt" 2>&1
-nbd_connected=true
 mount_active=true
 
 mounted_fstype="$(findmnt -n -o FSTYPE -M "$mountpoint")"
@@ -971,7 +1003,7 @@ sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
     --config "$attach_config_path" \
     >"$run_dir/maki-cleanup.txt" 2>&1
 mount_active=false
-nbd_connected=false
+helper_cleanup_needed=false
 pass "maki-attach cleanup unmounted XFS, deactivated LVM, and disconnected NBD"
 
 # A service stop and its recovery coordinator may both request cleanup. The
@@ -982,16 +1014,14 @@ sudo -n env PATH="$PATH" "$attach_bin" cleanup --volume "$volume_name" \
 pass "repeated maki-attach cleanup is idempotent"
 
 log "removing the disposable LVM metadata"
-sudo -n nbd-client -unix "$socket_path" "$nbd_target" -b 4096
-nbd_connected=true
-sudo -n vgchange -ay "$vg_name"
-sudo -n lvremove --yes --force "/dev/$vg_name/$lv_name"
-sudo -n vgremove --yes --force "$vg_name"
-sudo -n pvremove --yes --force "$device"
+connect_test_nbd
+test_nbd_action activate-vg --vg "$vg_name"
+test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name"
+test_nbd_action remove-vg --vg "$vg_name"
 vg_created=false
+test_nbd_action remove-pv
 pv_created=false
-sudo -n nbd-client -d "$nbd_target"
-nbd_connected=false
+disconnect_test_nbd
 pass "disposable LVM state removed"
 
 stop_process_normally "$nbdkit_pid" "nbdkit" || die "nbdkit did not stop cleanly"

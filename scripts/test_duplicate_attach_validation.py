@@ -207,6 +207,7 @@ mountpoint=""
 vg_created=false
 pv_created=false
 cleanup_safe=true
+helper_cleanup_needed=false
 duplicate_pid=duplicate
 nbdkit_pid=primary
 runtime_dir=""

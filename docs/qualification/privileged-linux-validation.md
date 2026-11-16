@@ -131,6 +131,22 @@ child directory, and delete only the `mktemp` work tree.
 It also removes the per-volume `/run/maki-control` directory and the temporary
 root-owned attach configuration created by the run.
 
+Every raw attachment phase supplies a fresh backend identifier to nbd-client.
+The runner records it before connecting, so even a command that fails after
+connecting can be cleaned up. Raw connect, disconnect, and LVM removal operations
+hold the helper's `/run/maki-attach/attach.lock`; each removal requires the live
+kernel backend to match the recorded identifier. A PID alone, a foreign backend,
+or an unreadable identity never authorizes a disconnect or LVM removal. Failure
+to prove ownership fails the run and preserves the daemon, backing, and remaining
+cleanup artifacts for inspection. The shared attach lock is retained.
+
+The `maki-attach` phase has its own identifier and trusted record. The exit trap
+uses the helper's cleanup command for that phase, including a failed attach,
+without holding the raw-operation lock. Only after helper cleanup succeeds may
+the runner reconnect with a fresh raw identifier to remove disposable metadata.
+This serializes cooperating helpers and runners; the dedicated NBD index must
+still be reserved against unrelated administrative commands that bypass the lock.
+
 If nbdkit does not exit after normal termination, the runner deliberately does
 not escalate to `SIGKILL`; it fails and preserves the backing tree so an
 operator can inspect the live process safely.
