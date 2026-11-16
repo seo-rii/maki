@@ -132,15 +132,19 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         Err(e) => report.errors.push(format!("key canary: {e}")),
     }
 
-    // Durable mark.
+    // Durable mark. It is advisory; without it the scan never classifies
+    // damage by what follows it (M-007, S-04).
     match load_durable_mark(&backing) {
         Ok(Some(mark)) => report.info.push(format!(
             "durable mark: segment {} durable to byte {}",
             mark.segment_index, mark.durable_size
         )),
-        Ok(None) => report
-            .info
-            .push("durable mark: absent (heuristic torn-tail classification)".to_string()),
+        Ok(None) => report.info.push(
+            "durable mark: absent (advisory; recovery proves the final segment as far as the \
+             durable proof names it, otherwise only its header, and treats a damaged record \
+             after that as a torn tail)"
+                .to_string(),
+        ),
         Err(RecoveryError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("durable mark: {e}")),
     }
