@@ -92,7 +92,7 @@ impl WorkloadSystem for LinuxSystem {
     fn mounted(&self, record: &BoundDeviceRecord) -> io::Result<recover::VerifiedMount> {
         recover::observe_complete(
             record,
-            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            &super::read_mountinfo()?,
             Path::new("/sys/class/block"),
         )
     }

@@ -16,22 +16,24 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// The mount table is bytes (paths need not be UTF-8); see `probe`.
 pub(super) fn allocate(sysfs: &Path, mountinfo: &Path) -> Result<String, ExecError> {
-    let mut mounts = String::new();
+    let mut mounts = Vec::new();
     std::fs::File::open(mountinfo)?
         .take(MAX_MOUNTINFO_BYTES as u64 + 1)
-        .read_to_string(&mut mounts)?;
+        .read_to_end(&mut mounts)?;
     choose(sysfs, &mounts)
 }
 
-fn choose(sysfs: &Path, mountinfo: &str) -> Result<String, ExecError> {
+fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
     if mountinfo.len() > MAX_MOUNTINFO_BYTES {
         return Err(invalid("mount inventory exceeds the allocation observation limit").into());
     }
     let mut mounted = BTreeSet::new();
-    for line in mountinfo.lines().filter(|line| !line.trim().is_empty()) {
-        let (left, right) = line
-            .split_once(" - ")
+    for line in
+        crate::probe::mountinfo_lines(mountinfo).filter(|line| !line.trim_ascii().is_empty())
+    {
+        let (left, right) = crate::probe::split_record(line)
             .ok_or_else(|| invalid("incomplete mount inventory during NBD allocation"))?;
         let mut fields = crate::probe::mountinfo_fields(left);
         let number = fields
@@ -41,7 +43,7 @@ fn choose(sysfs: &Path, mountinfo: &str) -> Result<String, ExecError> {
         {
             return Err(invalid("incomplete mount inventory during NBD allocation").into());
         }
-        mounted.insert(crate::detach::device_number(number)?);
+        mounted.insert(crate::detach::mount_device_number(number)?);
     }
 
     // Group root devices and their partitions in one bounded sysfs pass.

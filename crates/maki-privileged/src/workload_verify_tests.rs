@@ -23,7 +23,10 @@ impl workload_verify::WorkloadSystem for GateSystem {
         self.calls.borrow_mut().push("kernel");
         recover::observe_complete(
             record,
-            self.mounts.as_deref().unwrap_or(&self.inner.mounts(record)),
+            self.mounts
+                .as_deref()
+                .unwrap_or(&self.inner.mounts(record))
+                .as_bytes(),
             &self.inner.sysfs,
         )
     }
@@ -296,7 +299,7 @@ fn foreign_descendant_mounts_refuse_the_gate_before_filesystem_reads() {
             assert!(
                 recover::observe(
                     &record,
-                    system.mounts.as_deref().unwrap(),
+                    system.mounts.as_deref().unwrap().as_bytes(),
                     &system.inner.sysfs
                 )
                 .is_ok(),
@@ -333,9 +336,9 @@ fn root_mount_gate_treats_every_other_absolute_mount_as_a_descendant() {
     let mut record = state.read("pg").unwrap().unwrap();
     record.attachment.mountpoint = "/".into();
     let root = "40 25 253:0 / / rw,nosuid,nodev - xfs /dev/dm-0 rw\n";
-    assert!(recover::observe_complete(&record, root, &system.inner.sysfs).is_ok());
+    assert!(recover::observe_complete(&record, root.as_bytes(), &system.inner.sysfs).is_ok());
     let nested = format!("{root}41 40 0:9 / /proc rw - proc proc rw\n");
-    assert!(recover::observe_complete(&record, &nested, &system.inner.sysfs).is_err());
+    assert!(recover::observe_complete(&record, nested.as_bytes(), &system.inner.sysfs).is_err());
 }
 
 #[test]

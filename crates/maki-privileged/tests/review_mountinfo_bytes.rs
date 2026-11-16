@@ -115,7 +115,7 @@ fn child(parent_namespace: OsString) {
         "the kernel emits the non-UTF-8 path unescaped"
     );
 
-    let observed = observe_mount("/run/review-visible", "/dev/nbd250");
+    let observed = observe_mount("/run/review-visible", "/dev/nbd250").unwrap();
     assert_eq!(
         observed.fstype.as_deref(),
         Some("tmpfs"),

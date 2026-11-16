@@ -597,7 +597,7 @@ pub(super) fn prepare(record: &BoundDeviceRecord) -> Result<VerifiedLvm, ExecErr
 fn ensure_inactive(record: &BoundDeviceRecord) -> io::Result<()> {
     let observed = crate::detach::observe_kernel(
         record,
-        &std::fs::read_to_string("/proc/self/mountinfo")?,
+        &super::read_mountinfo()?,
         Path::new("/sys/class/block"),
     )?;
     if observed.mounted || observed.vg_active || observed.nbd_in_use {

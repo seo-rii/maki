@@ -46,7 +46,7 @@ impl Drop for Fixture {
 fn review_auto_allocation_skips_disconnected_root_holders() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("nbd2/holders/dm-0"), "").unwrap();
-    assert_eq!(choose(&fixture.0, "").unwrap(), "/dev/nbd3");
+    assert_eq!(choose(&fixture.0, b"").unwrap(), "/dev/nbd3");
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn review_auto_allocation_skips_disconnected_partition_holders() {
     let fixture = Fixture::new();
     fixture.partition();
     std::fs::write(fixture.0.join("nbd2p1/holders/dm-0"), "").unwrap();
-    assert_eq!(choose(&fixture.0, "").unwrap(), "/dev/nbd3");
+    assert_eq!(choose(&fixture.0, b"").unwrap(), "/dev/nbd3");
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn review_auto_allocation_skips_direct_and_partition_mounts() {
         let fixture = Fixture::new();
         fixture.partition();
         let mounts = format!("91 20 {number} / /srv/old rw - xfs /dev/old rw\n");
-        assert_eq!(choose(&fixture.0, &mounts).unwrap(), "/dev/nbd3");
+        assert_eq!(choose(&fixture.0, mounts.as_bytes()).unwrap(), "/dev/nbd3");
     }
 }
 
@@ -77,7 +77,7 @@ fn mountinfo_whitespace_in_paths_keeps_mounted_devices_occupied() {
         ] {
             let mounts =
                 format!("91 20 {number} / /srv/old{space}data rw - xfs /dev/old{space}device rw\n");
-            assert_eq!(choose(&fixture.0, &mounts).unwrap(), "/dev/nbd3");
+            assert_eq!(choose(&fixture.0, mounts.as_bytes()).unwrap(), "/dev/nbd3");
         }
     }
 }
@@ -86,7 +86,7 @@ fn mountinfo_whitespace_in_paths_keeps_mounted_devices_occupied() {
 fn review_auto_allocation_skips_backend_without_pid() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("nbd2/backend"), "old-connection\n").unwrap();
-    assert_eq!(choose(&fixture.0, "").unwrap(), "/dev/nbd3");
+    assert_eq!(choose(&fixture.0, b"").unwrap(), "/dev/nbd3");
 }
 
 #[test]
@@ -114,7 +114,10 @@ fn review_auto_allocation_refuses_unreadable_or_malformed_observations() {
         } else {
             ""
         };
-        assert!(choose(&fixture.0, mounts).is_err(), "accepted {case}");
+        assert!(
+            choose(&fixture.0, mounts.as_bytes()).is_err(),
+            "accepted {case}"
+        );
     }
 }
 
@@ -125,7 +128,7 @@ fn review_auto_allocation_reports_no_device_when_all_are_occupied() {
         std::fs::write(fixture.0.join(name).join("holders/dm-0"), "").unwrap();
     }
     assert!(matches!(
-        choose(&fixture.0, ""),
+        choose(&fixture.0, b""),
         Err(ExecError::NoFreeDevice)
     ));
 }
@@ -136,12 +139,12 @@ fn review_auto_allocation_uses_numeric_order_and_ignores_unrelated_mounts() {
     fixture.device("nbd10", "43:160");
     fixture.partition();
     assert_eq!(
-        choose(&fixture.0, "91 20 8:1 / /srv/old rw - xfs /dev/sda1 rw\n").unwrap(),
+        choose(&fixture.0, b"91 20 8:1 / /srv/old rw - xfs /dev/sda1 rw\n").unwrap(),
         "/dev/nbd2"
     );
     std::fs::write(fixture.0.join("nbd2/pid"), "123\n").unwrap();
     std::fs::write(fixture.0.join("nbd2/backend"), "old-connection\n").unwrap();
-    assert_eq!(choose(&fixture.0, "").unwrap(), "/dev/nbd3");
+    assert_eq!(choose(&fixture.0, b"").unwrap(), "/dev/nbd3");
 }
 
 #[test]
@@ -179,7 +182,7 @@ fn review_auto_allocation_reads_non_utf8_mount_paths_as_bytes() {
 fn review_auto_allocation_skips_pid_without_backend() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("nbd2/pid"), "123\n").unwrap();
-    assert_eq!(choose(&fixture.0, "").unwrap(), "/dev/nbd3");
+    assert_eq!(choose(&fixture.0, b"").unwrap(), "/dev/nbd3");
 }
 
 #[test]

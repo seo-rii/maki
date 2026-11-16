@@ -662,12 +662,12 @@ fn recovery_refuses_an_extra_mount_and_never_reads_the_sentinel() {
         "{}41 25 253:0 /subdir /container/data rw - xfs /dev/mapper/vg_maki_pg-data rw\n",
         system.mounts(&record)
     );
-    assert!(recover::observe(&record, &mounts, &system.sysfs).is_err());
+    assert!(recover::observe(&record, mounts.as_bytes(), &system.sysfs).is_err());
     let sentinel = Path::new(&record.attachment.mountpoint).join(SENTINEL_FILE);
     std::fs::remove_file(&sentinel).unwrap();
     std::fs::create_dir(&sentinel).unwrap();
     assert!(
-        recover::observe(&record, &system.mounts(&record), &system.sysfs)
+        recover::observe(&record, system.mounts(&record).as_bytes(), &system.sysfs)
             .unwrap()
             .mounted
     );
@@ -681,18 +681,69 @@ fn mountinfo_unicode_whitespace_preserves_recovery_and_complete_mount_identity()
         record.attachment.mountpoint = format!("/srv/audit{space}data");
         let mounts = system.mounts(&record);
         assert!(
-            recover::observe(&record, &mounts, &system.sysfs)
+            recover::observe(&record, mounts.as_bytes(), &system.sysfs)
                 .unwrap()
                 .mounted
         );
         assert_eq!(
-            recover::observe_complete(&record, &mounts, &system.sysfs)
+            recover::observe_complete(&record, mounts.as_bytes(), &system.sysfs)
                 .unwrap()
                 .device,
             (253, 0)
         );
 
         let extra = format!("{mounts}41 25 253:0 / /srv/other{space}data rw - xfs /dev/dm-0 rw\n");
-        assert!(recover::observe(&record, &extra, &system.sysfs).is_err());
+        assert!(recover::observe(&record, extra.as_bytes(), &system.sysfs).is_err());
     }
+}
+
+#[test]
+fn non_utf8_mount_records_keep_recovery_and_gate_checks_exact() {
+    let (_fixture, state, _req, system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    let mounts = system.mounts(&record);
+    let mountpoint = record.attachment.mountpoint.as_bytes();
+    let foreign = b"42 25 0:61 / /home/user/fuse-\xff rw,nosuid,nodev - fuse.\xfe \xfd rw\n";
+    let table = [mounts.as_bytes(), foreign].concat();
+    assert!(
+        recover::observe(&record, &table, &system.sysfs)
+            .unwrap()
+            .mounted
+    );
+    assert_eq!(
+        recover::observe_complete(&record, &table, &system.sysfs)
+            .unwrap()
+            .device,
+        (253, 0)
+    );
+
+    // A second mount of a recorded device is refused whatever its path.
+    let extra = b"43 25 253:0 / /container/\xff rw - xfs /dev/dm-0 rw\n";
+    let table = [mounts.as_bytes(), extra].concat();
+    assert!(recover::observe(&record, &table, &system.sysfs).is_err());
+
+    // The workload gate refuses a nested mount with a non-UTF-8 name.
+    let nested = [
+        b"44 40 0:62 / ".as_slice(),
+        mountpoint,
+        b"/\xff rw - tmpfs tmpfs rw\n",
+    ]
+    .concat();
+    let table = [mounts.as_bytes(), &nested].concat();
+    assert!(recover::observe_complete(&record, &table, &system.sysfs).is_err());
+
+    // The gate's snapshot is the exact record, so records that differ only
+    // in undecodable bytes are different snapshots.
+    let snapshot = |source: &[u8]| {
+        let line = [
+            b"40 25 253:0 / ".as_slice(),
+            mountpoint,
+            b" rw,nosuid,nodev - xfs ",
+            source,
+            b" rw\n",
+        ]
+        .concat();
+        recover::observe_complete(&record, &line, &system.sysfs).unwrap()
+    };
+    assert_ne!(snapshot(b"/dev/\xfe"), snapshot(b"/dev/\xff"));
 }

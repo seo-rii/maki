@@ -199,14 +199,23 @@ fn nbd_backend_at(sysfs: &Path, device: &str) -> io::Result<Option<String>> {
     }
 }
 
+/// The mount table of the helper's namespace.
+const MOUNTINFO: &str = "/proc/self/mountinfo";
+
+/// Read the mount table as bytes. Linux escapes only space, tab, newline
+/// and backslash in its fields and emits every other byte as is, so one
+/// mount anywhere in the namespace whose path or source is not UTF-8 (a
+/// user's FUSE mount, a Latin-1 CIFS or USB mount) is ordinary state, not a
+/// failed observation. The `probe` parsers compare the exact bytes.
+fn read_mountinfo() -> io::Result<Vec<u8>> {
+    std::fs::read(MOUNTINFO)
+}
+
 /// Lowest unused `/dev/nbdN` in sysfs and the current mount namespace.
 /// Connections, root/partition holders and direct mounts occupy a device.
 /// Call with the attach lock held; observation failures refuse allocation.
 pub fn allocate_nbd_device() -> Result<String, ExecError> {
-    allocation::allocate(
-        Path::new("/sys/class/block"),
-        Path::new("/proc/self/mountinfo"),
-    )
+    allocation::allocate(Path::new("/sys/class/block"), Path::new(MOUNTINFO))
 }
 
 fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
@@ -576,19 +585,18 @@ fn sysfs_leaf_devices(major_minor: &str) -> Vec<String> {
 
 /// Gather every fact the verifier needs about a mounted volume. Only the
 /// topology facts are collected when `touch` is false: nothing is written
-/// to a filesystem whose device has not been verified yet (F02).
-fn observe(mountpoint: &str, nbd_device: &str, touch: bool) -> MountObservation {
+/// to a filesystem whose device has not been verified yet (F02). A mount
+/// table that cannot be read is an error, never "nothing is mounted".
+fn observe(mountpoint: &str, nbd_device: &str, touch: bool) -> io::Result<MountObservation> {
     let mountpoint_exists = Path::new(mountpoint).is_dir();
-    let entry = std::fs::read_to_string("/proc/self/mountinfo")
-        .ok()
-        .and_then(|text| parse_mountinfo(&text, mountpoint));
+    let entry = parse_mountinfo(&read_mountinfo()?, mountpoint);
     let fstype = entry.as_ref().map(|e| e.fstype.clone());
     let fs_uuid = entry.as_ref().and_then(|e| blkid_uuid(&e.source));
     let backing_devices = entry
         .as_ref()
         .map(|e| sysfs_leaf_devices(&e.major_minor))
         .unwrap_or_default();
-    MountObservation {
+    Ok(MountObservation {
         mountpoint_exists,
         fstype,
         fs_uuid,
@@ -601,11 +609,11 @@ fn observe(mountpoint: &str, nbd_device: &str, touch: bool) -> MountObservation 
         rw_probe_ok: touch && entry.is_some() && rw_probe(mountpoint),
         mount_options: entry.map(|e| e.mount_options).unwrap_or_default(),
         backing_devices,
-    }
+    })
 }
 
 /// Gather every fact the verifier needs about a mounted volume.
-pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> MountObservation {
+pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> io::Result<MountObservation> {
     observe(mountpoint, nbd_device, true)
 }
 
@@ -681,7 +689,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             nbd_device,
         } => {
             tracing::info!("maki-attach: {step}");
-            let observed = observe(mountpoint, nbd_device, false);
+            let observed = observe(mountpoint, nbd_device, false)?;
             verify_mount_device(nbd_device, &observed)?;
             Ok(())
         }
@@ -696,7 +704,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             nbd_device,
         } => {
             tracing::info!("maki-attach: {step}");
-            let observed = observe_mount(mountpoint, nbd_device);
+            let observed = observe_mount(mountpoint, nbd_device)?;
             verify_mount_identity(
                 &MountExpectation {
                     fs_uuid: fs_uuid.clone(),
@@ -867,29 +875,16 @@ impl System for LinuxSystem {
         &self,
         record: &BoundDeviceRecord,
     ) -> io::Result<Option<recover::RecoveryProof>> {
-        recover::capture(
-            record,
-            &std::fs::read_to_string("/proc/self/mountinfo")?,
-            Path::new("/sys/class/block"),
-        )
-        .map(Some)
+        recover::capture(record, &read_mountinfo()?, Path::new("/sys/class/block")).map(Some)
     }
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        recover::observe(
-            record,
-            &std::fs::read_to_string("/proc/self/mountinfo")?,
-            Path::new("/sys/class/block"),
-        )
+        recover::observe(record, &read_mountinfo()?, Path::new("/sys/class/block"))
     }
     fn disconnected_recovery_observation(
         &self,
         record: &BoundDeviceRecord,
     ) -> io::Result<DetachObservation> {
-        recover::observe_disconnected(
-            record,
-            &std::fs::read_to_string("/proc/self/mountinfo")?,
-            Path::new("/sys/class/block"),
-        )
+        recover::observe_disconnected(record, &read_mountinfo()?, Path::new("/sys/class/block"))
     }
     fn lv_size(&self, vg: &str, lv: &str) -> Result<u64, ExecError> {
         let out = command::capture(
@@ -922,11 +917,7 @@ impl System for LinuxSystem {
     }
 
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        crate::detach::observe(
-            record,
-            &std::fs::read_to_string("/proc/self/mountinfo")?,
-            Path::new("/sys/class/block"),
-        )
+        crate::detach::observe(record, &read_mountinfo()?, Path::new("/sys/class/block"))
     }
 }
 
