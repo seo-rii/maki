@@ -190,13 +190,58 @@ def save_json(path, value):
 
 
 def bounded_run(command, timeout):
+    stdout, stderr = bytearray(), bytearray()
+    total = 0
+    leader_exited = False
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                                timeout=timeout, check=False)
+        until = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ, stdout)
+            selector.register(child.stderr, selectors.EVENT_READ, stderr)
+            while True:
+                if not leader_exited:
+                    # Do not reap (including via poll/communicate) before the
+                    # final group signal: the retained leader pins its PGID.
+                    status = os.waitid(os.P_PID, child.pid,
+                                       os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if status is not None:
+                        # Descendants may still hold either output pipe open.
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        leader_exited = True
+                if leader_exited and not selector.get_map():
+                    break
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout,
+                                                    output=bytes(stdout), stderr=bytes(stderr))
+                for key, _ in selector.select(min(.05, remaining)):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > (1 << 20):
+                        raise ValueError("gcloud output limit exceeded")
+                    key.data.extend(chunk)
     except subprocess.TimeoutExpired as error:
         raise TimeoutError(f"command deadline: {command[0]}") from error
-    if len(result.stdout) + len(result.stderr) > (1 << 20):
-        raise ValueError("gcloud output limit exceeded")
+    finally:
+        try:
+            if not leader_exited:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            child.wait(timeout=5)
+        finally:
+            child.stdout.close()
+            child.stderr.close()
+    result = subprocess.CompletedProcess(command, child.returncode, bytes(stdout), bytes(stderr))
     if result.returncode != 0:
         detail = result.stderr[-4096:].decode(errors="replace")
         raise RuntimeError(f"gcloud exited {result.returncode}: {detail}")

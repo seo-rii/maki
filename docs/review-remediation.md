@@ -2150,3 +2150,18 @@ foreign/corrupt bindings despite a valid current manifest and successful partial
 tombstone cleanup under a matching binding. The tests use private file-backed
 roots and test authorities; they do not qualify a deployed witness or a physical
 power-loss scenario.
+
+## GCP one-shot command cleanup (BUG-196, 2026-11-16)
+
+The final offline check uses `bounded_run()` rather than the guest session's
+`RemoteProcess`. Its timeout previously killed only the gcloud launcher, leaving
+an SSH child alive. One-shot commands now own a local process group and keep the
+leader waitable until group cleanup, including normal and failed leader exits.
+Output is collected within the existing combined 1 MiB limit; timeout, output
+errors and interruption also clean the owned group before reaping the leader.
+
+`scripts/test_gcp_command_cleanup_validation.py` covers descendants with closed
+or inherited pipes, successful/nonzero/signal exits, timeout, interruption, read
+errors and output limits, while preserving byte output and stderr diagnostics.
+These are owned local-process tests. They do not establish termination of remote
+guest commands or descendants that deliberately leave the local process group.
