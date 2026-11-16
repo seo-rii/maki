@@ -414,9 +414,14 @@ normal initial volume creation. Earlier claim candidates remain fenced out.
 A durable `remote.enrollment` binding fixes the approved identity and capacity
 before the claim. Explicit recovery can create a missing binding for a valid
 legacy marker-only attempt; a different or corrupt existing binding refuses
-rather than being silently replaced. Recognized quiescent lower-fence candidates may be retired by the subsequent
-GC pass; live handles and unknown artifacts are preserved. Quarantine damaged binding evidence for explicit
-operator investigation.
+rather than being silently replaced. Because older activated roots also lack
+a binding, recovery first refuses a root holding a GC tombstone or any
+namespace manifest other than this identity's empty initial candidate, so a
+`backing.root` that names another volume's data changes neither authority nor
+root. Only the quiescent lower-fence candidates that check examined may be
+retired by the subsequent GC pass; live handles and unknown artifacts are
+preserved. Quarantine damaged binding evidence for explicit operator
+investigation.
 
 If activation actually succeeded, use exact-current takeover and inspect the
 selected state. This command does not reset it or automatically finish inner

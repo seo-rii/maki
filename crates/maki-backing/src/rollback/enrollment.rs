@@ -1,6 +1,7 @@
 //! Immutable binding of an explicitly approved initial volume identity/capacity.
 //! Calls that create this binding must hold the root enrollment lock and must
-//! establish independently that the remote authority has never activated.
+//! establish independently that the remote authority has never activated and
+//! that the root holds no other volume's state (a legacy root has no binding).
 use super::*;
 
 const FILE: &str = "remote.enrollment";

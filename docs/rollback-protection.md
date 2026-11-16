@@ -142,8 +142,16 @@ New creation synchronizes `remote.enrollment`, a versioned identity/capacity
 binding, before claiming the authority. Resume validates an existing binding
 against the approved configuration. A valid marker-only backing created by an
 older binary can acquire the missing binding through this explicit operation
-only while its authority has never activated. Recognized quiescent lower-fence candidates may be retired by the subsequent
-GC pass; live handles and unknown artifacts are preserved. An existing corrupt or truncated binding is
+only while its authority has never activated. A missing binding does not show
+that the root is unused: activated roots written by older binaries have none.
+Before binding the root or claiming the authority, resume therefore refuses a
+root that holds anything a never-activated authority cannot have written: a
+GC tombstone, or a namespace other than the one its current claim names whose
+manifest slots hold anything but this identity's empty initial candidate (or a
+torn part of it). Another volume's data under a mistaken `backing.root` is
+refused this way, and neither authority nor root changes. The subsequent GC
+pass may retire only the quiescent lower-fence candidates that check examined;
+live handles and unknown artifacts are preserved. An existing corrupt or truncated binding is
 refused; preserve or quarantine it for explicit operator investigation rather
 than automatically overwriting it or changing capacity to force progress.
 
