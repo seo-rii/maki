@@ -454,7 +454,8 @@ pub struct CredentialRef {
     /// "credential" (systemd), "file", "keyring", "env" (dev only).
     pub source: String,
     pub name: String,
-    /// Optional template, e.g. `"Bearer {}"`.
+    /// Optional template for header and metadata values, e.g.
+    /// `"Bearer {}"`: exactly one `{}`, replaced by the credential.
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -952,6 +953,35 @@ impl VolumeConfig {
         for credential in credentials {
             validate_credential(credential)?;
         }
+        // Keys and TLS private keys are loaded as they are stored; only
+        // header and metadata values are formatted. A template there would
+        // be ignored without a word.
+        fn client_key(tls: Option<&TlsConfig>) -> Option<&CredentialRef> {
+            tls.and_then(|tls| tls.client_key.as_ref())
+        }
+        let crypto = &self.crypto;
+        for (field, credential) in [
+            ("crypto.key", crypto.key.as_ref()),
+            (
+                "crypto.http.tls.client_key",
+                client_key(crypto.http.as_ref().and_then(|s| s.tls.as_ref())),
+            ),
+            (
+                "crypto.websocket.tls.client_key",
+                client_key(crypto.websocket.as_ref().and_then(|s| s.tls.as_ref())),
+            ),
+            (
+                "crypto.grpc.tls.client_key",
+                client_key(crypto.grpc.as_ref().and_then(|s| s.tls.as_ref())),
+            ),
+        ] {
+            if credential.is_some_and(|c| c.format.is_some()) {
+                return Err(invalid(format!(
+                    "{field}: `format` applies only to HTTP header and gRPC metadata \
+                     credentials; remove it"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1283,6 +1313,19 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     // that validated it (BUG-122).
     if c.source == "file" && !is_absolute_path(&c.name) {
         return Err(invalid("file credential name must be an absolute path"));
+    }
+    // Consumers split the template on `{}` and insert the credential at
+    // each placeholder. Without one the value sent is the template alone: a
+    // literal secret written there would pass the SPEC §9 rule, and a typo
+    // ("Bearer {token}") would drop the credential. Two would send it twice.
+    if c.format
+        .as_ref()
+        .is_some_and(|template| template.matches("{}").count() != 1)
+    {
+        return Err(invalid(
+            "credential format must contain exactly one {} placeholder, which is \
+             replaced by the credential",
+        ));
     }
     Ok(())
 }

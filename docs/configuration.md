@@ -151,9 +151,9 @@ line and column when available. Their Display and Debug output omit the source
 text, values, unknown field names and the parser's free-form message; inspect
 the configuration locally at the reported location to diagnose the problem.
 Semantic validation errors can name a known field or endpoint. Endpoint URLs
-are shown as `scheme://host[:port]` without userinfo, path or query, and HTTP
-operation paths are never shown. Beyond schema, geometry, and secret-literal
-checks validation rejects:
+are shown as `scheme://host[:port]` without userinfo, path or query; HTTP
+operation paths, credential names and credential templates are never shown.
+Beyond schema, geometry, and secret-literal checks validation rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
   `[crypto.circuit_breaker]`, and `[crypto.retry_budget]` (except
@@ -228,8 +228,10 @@ checks validation rejects:
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
-- the `keyring` credential source, which this build does not implement, and
-  the same credential name declared with different sources.
+- the `keyring` credential source, which this build does not implement, the
+  same credential name declared with different sources, and a credential
+  `format` without exactly one `{}` placeholder or on a reference that is not
+  a header or metadata value (see [credentials](#credentials-and-secrets)).
 
 The providers additionally refuse unreadable or invalid TLS material at
 construction or handshake, and read `client_key` from its credential source to
@@ -291,6 +293,11 @@ Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
 and metadata values, so a token generated with `openssl rand -hex 32` is sent
 as that hex text.
+A header or metadata reference may add `format`, a template with exactly one
+`{}` placeholder that the credential replaces (`format = "Bearer {}"`). The
+rest of the template is sent literally, so never put a secret there.
+Validation refuses a template with no placeholder or with several, and refuses
+`format` on `crypto.key` and `tls.client_key`, which are loaded as stored.
 Within one volume configuration, references may reuse a name only when they
 declare the same source. For example, `name = "token"` in both the encrypt and
 decrypt mappings is valid with `source = "credential"` on both. Combining that

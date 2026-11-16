@@ -86,7 +86,17 @@ root = "/unused"
 "#
     ))
     .unwrap();
-    config.validate().unwrap();
+    // Validation refuses a template without exactly one placeholder. The
+    // constructor takes a configuration it does not validate, so its
+    // formatting must still handle such a template and erase what it copies.
+    let validated = config.validate();
+    match template {
+        Some(template) if template.matches("{}").count() != 1 => {
+            let error = validated.expect_err(template);
+            assert!(error.to_string().contains("placeholder"), "{error}");
+        }
+        _ => validated.unwrap(),
+    }
     config
 }
 
