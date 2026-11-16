@@ -138,6 +138,8 @@ impl FakeCryptoProvider {
         self
     }
 
+    /// Declare (and enforce, as a vendor endpoint would) the batch limits:
+    /// a larger batch is refused with `NonRetryableRequest`.
     pub fn with_max_batch(mut self, items: u32, bytes: u64) -> Self {
         self.max_batch_items = items;
         self.max_batch_bytes = bytes;
@@ -184,7 +186,16 @@ impl FakeCryptoProvider {
         out
     }
 
-    async fn common(&self, context: &CryptoContext, items: usize) -> Result<(), CryptoError> {
+    /// Checks every call makes before doing work. `plaintext_bytes` is what
+    /// the batch carries against `batch.max_bytes`: the plaintext sent for
+    /// an encrypt, one unit of plaintext per item for a decrypt (the
+    /// dispatcher sizes decrypt chunks the same way).
+    async fn common(
+        &self,
+        context: &CryptoContext,
+        items: usize,
+        plaintext_bytes: u64,
+    ) -> Result<(), CryptoError> {
         let latency = { self.latency.lock().clone() };
         if let Some((clock, d)) = latency {
             clock.sleep(d).await;
@@ -201,6 +212,12 @@ impl FakeCryptoProvider {
             return Err(CryptoError::NonRetryableRequest(format!(
                 "batch of {items} exceeds max_items {}",
                 self.max_batch_items
+            )));
+        }
+        if plaintext_bytes > self.max_batch_bytes {
+            return Err(CryptoError::NonRetryableRequest(format!(
+                "batch of {plaintext_bytes} plaintext bytes exceeds max_bytes {}",
+                self.max_batch_bytes
             )));
         }
         Ok(())
@@ -279,7 +296,10 @@ impl CryptoProvider for FakeCryptoProvider {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         let _guard = ConcurrencyGuard::enter(&self.current_calls, &self.max_concurrent);
         self.encrypt_calls.fetch_add(1, Ordering::SeqCst);
-        self.common(context, items.len()).await?;
+        let plaintext_bytes = items
+            .iter()
+            .fold(0u64, |sum, item| sum.saturating_add(item.data.len() as u64));
+        self.common(context, items.len(), plaintext_bytes).await?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let pt = item.data.expose();
@@ -310,7 +330,8 @@ impl CryptoProvider for FakeCryptoProvider {
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
         let _guard = ConcurrencyGuard::enter(&self.current_calls, &self.max_concurrent);
         self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
-        self.common(context, items.len()).await?;
+        let plaintext_bytes = (items.len() as u64).saturating_mul(u64::from(self.unit_size));
+        self.common(context, items.len(), plaintext_bytes).await?;
         let expected_len = (self.unit_size + self.overhead) as usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
