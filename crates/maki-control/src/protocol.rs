@@ -74,11 +74,41 @@ pub async fn send_command<W: AsyncWrite + Unpin>(
     wr: &mut W,
     request: &Request,
 ) -> Result<(), ProtocolError> {
-    let mut bytes = serde_json::to_vec(request)?;
+    // Reject an oversized request before publishing any of its frame. The
+    // connection can then still carry the caller's next valid command.
+    let mut bytes = serialize_line(request)?;
     bytes.push(b'\n');
     wr.write_all(&bytes).await?;
     wr.flush().await?;
     Ok(())
+}
+
+/// Serialize requests and responses with the same bound as `read_line`.
+/// Checking while encoding also bounds the temporary buffer when JSON escapes
+/// expand a string. The framing newline is not part of the payload limit.
+pub(crate) fn serialize_line(value: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
+    struct LineBuffer(Vec<u8>);
+
+    impl std::io::Write for LineBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_LINE - self.0.len() {
+                return Err(std::io::Error::other("control message exceeds line limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut buffer = LineBuffer(Vec::with_capacity(256));
+    match serde_json::to_writer(&mut buffer, value) {
+        Ok(()) => Ok(buffer.0),
+        Err(error) if error.is_io() => Err(ProtocolError::LineTooLong),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub async fn read_response<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Value, ProtocolError> {

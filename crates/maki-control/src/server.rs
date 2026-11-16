@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
-use crate::protocol::{read_line, ProtocolError, Request, MAX_LINE};
+use crate::protocol::{read_line, serialize_line, ProtocolError, Request};
 
 /// Bounds on control sessions. Fixed values: the control plane is local
 /// and single-purpose, so there is nothing to tune per deployment.
@@ -164,31 +164,14 @@ async fn handle(backend: &Arc<dyn ControlBackend>, request: Request) -> Value {
 /// Cap serialization as well as the bytes on the wire. In particular, an
 /// unusually long degradation/mutation error from any backend must return
 /// an explicit readable error, rather than breaking official client framing.
-struct ResponseBuffer(Vec<u8>);
-
-impl std::io::Write for ResponseBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_LINE - self.0.len() {
-            return Err(std::io::Error::other("control response exceeds line limit"));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn serialize_response(response: &Value) -> Result<Vec<u8>, ProtocolError> {
-    let mut buffer = ResponseBuffer(Vec::with_capacity(256));
-    match serde_json::to_writer(&mut buffer, response) {
-        Ok(()) => Ok(buffer.0),
-        Err(error) if error.is_io() => Ok(serde_json::to_vec(&json!({
+    match serialize_line(response) {
+        Ok(bytes) => Ok(bytes),
+        Err(ProtocolError::LineTooLong) => Ok(serde_json::to_vec(&json!({
             "ok": false,
             "error": "control response exceeds the 65536-byte line limit; response was not truncated",
         }))?),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
