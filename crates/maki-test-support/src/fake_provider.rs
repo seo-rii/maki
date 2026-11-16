@@ -4,6 +4,8 @@
 //! The keystream is seeded from the provider key and (when context binding is
 //! enabled) the volume UUID, compatibility ID and unit index — so ciphertext
 //! moved to another unit or volume fails integrity, like a real bound AEAD.
+//! With integrity disabled neither the magic nor the CRC is checked: like an
+//! unauthenticated cipher, any ciphertext of the right length decrypts.
 //!
 //! Injection points: queued errors, per-call latency via a `Clock`, and
 //! deliberate contract misbehavior (reorder / drop / duplicate / oversize)
@@ -125,9 +127,12 @@ impl FakeCryptoProvider {
         self
     }
 
-    /// Disable the decrypt-side CRC check: like an unauthenticated cipher
-    /// (XTS), a wrong key then yields garbage plaintext without an error,
-    /// and `integrity` is reported `Absent`.
+    /// Disable the decrypt-side checks (magic and CRC): like an
+    /// unauthenticated cipher (XTS), every ciphertext of the right length
+    /// decrypts, so a wrong key or a zeroed, overwritten or damaged unit
+    /// yields garbage plaintext without an error. Only a wrong length is
+    /// still refused (`Integrity`), as XTS does. `integrity` is reported
+    /// `Absent`.
     pub fn with_integrity_check(mut self, on: bool) -> Self {
         self.integrity_check = on;
         self
@@ -343,7 +348,7 @@ impl CryptoProvider for FakeCryptoProvider {
                     expected_len
                 )));
             }
-            if &ct[0..4] != MAGIC {
+            if self.integrity_check && &ct[0..4] != MAGIC {
                 return Err(CryptoError::Integrity("bad magic".to_string()));
             }
             let crc = u32::from_le_bytes(ct[4..8].try_into().unwrap());
