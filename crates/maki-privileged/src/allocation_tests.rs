@@ -154,6 +154,28 @@ fn review_auto_allocation_reads_mountinfo_before_choosing_a_device() {
 }
 
 #[test]
+fn review_auto_allocation_reads_non_utf8_mount_paths_as_bytes() {
+    let fixture = Fixture::new();
+    let mounts = fixture.0.join("mountinfo");
+    // Linux emits path and source bytes other than space, tab, newline and
+    // backslash unescaped, so an unrelated user's FUSE mount can put any
+    // byte sequence into the table.
+    std::fs::write(
+        &mounts,
+        b"92 20 0:61 / /home/user/fuse-\xff rw,nosuid,nodev - fuse.x \xfe rw\n",
+    )
+    .unwrap();
+    assert_eq!(allocate(&fixture.0, &mounts).unwrap(), "/dev/nbd2");
+    // A mount of the device itself still occupies it, whatever its path.
+    std::fs::write(
+        &mounts,
+        b"91 20 43:32 / /srv/old-\xff rw - xfs /dev/\xfe rw\n",
+    )
+    .unwrap();
+    assert_eq!(allocate(&fixture.0, &mounts).unwrap(), "/dev/nbd3");
+}
+
+#[test]
 fn review_auto_allocation_skips_pid_without_backend() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("nbd2/pid"), "123\n").unwrap();
