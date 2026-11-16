@@ -49,14 +49,13 @@ mod tests {
     /// Runs this test binary again with the child marker set, so the child
     /// installs the process-global subscriber without affecting the parent.
     fn child_stderr(filter: Option<&str>) -> String {
+        child_stderr_of("logging::tests::child_emits_events", filter)
+    }
+
+    fn child_stderr_of(child: &str, filter: Option<&str>) -> String {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args([
-                "--exact",
-                "logging::tests::child_emits_events",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", child, "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, "1")
             .env_remove(super::LOG_ENV);
         if let Some(filter) = filter {
@@ -114,5 +113,76 @@ mod tests {
         );
         let stderr = child_stderr(Some("debug"));
         assert!(stderr.contains("fixture debug is hidden"), "{stderr}");
+    }
+
+    /// Dependency targets whose trace output carries payload or credential
+    /// bytes (tungstenite frames and messages, reqwest's raw connection dump).
+    const CAPPED: [&str; 3] = [
+        "tungstenite::protocol::frame",
+        "tokio_tungstenite::compat",
+        "reqwest::connect",
+    ];
+
+    #[test]
+    fn child_emits_dependency_events() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        assert!(super::install_default_logging());
+        macro_rules! emit {
+            ($target:literal) => {
+                tracing::trace!(target: $target, "trace from {}", $target);
+                tracing::debug!(target: $target, "debug from {}", $target);
+            };
+        }
+        let span = tracing::info_span!("cap_probe");
+        let _entered = span.enter();
+        emit!("tungstenite::protocol::frame");
+        emit!("tokio_tungstenite::compat");
+        emit!("reqwest::connect");
+        emit!("maki_core::fixture");
+    }
+
+    #[test]
+    fn dependency_payload_targets_are_capped_at_debug_whatever_maki_log_says() {
+        for filter in [
+            "trace",
+            "warn,tungstenite=trace,tokio_tungstenite=trace,reqwest=trace",
+            // More specific than a crate-level directive.
+            "warn,tungstenite::protocol::frame=trace,tokio_tungstenite::compat=trace,\
+             reqwest::connect=trace",
+            // A span directive enables every target inside the span.
+            "warn,[cap_probe]=trace",
+        ] {
+            let stderr = child_stderr_of(
+                "logging::tests::child_emits_dependency_events",
+                Some(filter),
+            );
+            for target in CAPPED {
+                assert!(
+                    !stderr.contains(&format!("trace from {target}")),
+                    "MAKI_LOG={filter} let {target} log at trace:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains(&format!("debug from {target}")),
+                    "MAKI_LOG={filter} hid {target} debug diagnostics:\n{stderr}"
+                );
+            }
+        }
+        let stderr = child_stderr_of(
+            "logging::tests::child_emits_dependency_events",
+            Some("trace"),
+        );
+        assert!(
+            stderr.contains("trace from maki_core::fixture"),
+            "Maki's own targets keep the operator's threshold:\n{stderr}"
+        );
+        let stderr = child_stderr_of("logging::tests::child_emits_dependency_events", None);
+        for target in CAPPED {
+            assert!(
+                !stderr.contains(&format!("debug from {target}")),
+                "the default threshold stays info:\n{stderr}"
+            );
+        }
     }
 }
