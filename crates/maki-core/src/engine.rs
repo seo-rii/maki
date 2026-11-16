@@ -148,7 +148,8 @@ pub struct AttachIdentity {
 /// How the journal is kept bounded (SPEC §26, §30; review M-004).
 #[derive(Debug, Clone)]
 pub struct CheckpointPolicy {
-    /// Journal bytes on disk at which the background worker checkpoints.
+    /// Journal bytes on disk at which the background worker checkpoints,
+    /// syncing unsynced records first so they can be applied.
     pub journal_high_watermark_bytes: u64,
     /// Hard limit on journal bytes on disk. A write that would exceed it
     /// first syncs and checkpoints inline; if that cannot reclaim enough
@@ -163,7 +164,8 @@ pub struct CheckpointPolicy {
     pub emergency_reserve_bytes: u64,
     /// Backing free space preserved as checkpoint headroom after the next
     /// journal append when emergency-reserve admission is enabled. The worker
-    /// also checkpoints eagerly below this value (0 disables both behaviors).
+    /// also checkpoints eagerly below this value, syncing unsynced records
+    /// first (0 disables both behaviors).
     pub low_space_checkpoint_bytes: u64,
     /// The worker checkpoints at least this often while anything is
     /// pending; unsynced records are synced first so they can be applied.
@@ -2083,10 +2085,15 @@ impl EngineInner {
         {
             return;
         }
-        // A checkpoint applies only durable records: when the trigger is
-        // the elapsed interval, the overlay bound or a refused write, sync
-        // first so the pass actually shrinks what it was woken for.
-        if (by_time || by_overlay || by_refusal) && durable < appended {
+        // A checkpoint applies only durable records: when the trigger is the
+        // journal watermark, low free space, the elapsed interval, the
+        // overlay bound or a refused write, sync first so the pass actually
+        // shrinks what it was woken for. Without it a volatile tail above
+        // the watermark made every write wake the worker into a checkpoint
+        // that applied nothing. This is the FLUSH barrier (durable proof
+        // included); it only makes acknowledged records durable sooner.
+        // Cleanup and reclamation passes act on covered state and need none.
+        if (by_size || by_space || by_time || by_overlay || by_refusal) && durable < appended {
             let Ok(mut volume) = self.write_volume().await else {
                 return;
             };
