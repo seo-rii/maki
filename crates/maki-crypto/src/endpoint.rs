@@ -606,19 +606,6 @@ impl EndpointSet {
             .collect()
     }
 
-    /// Admissible endpoints, least-inflight first (SPEC §34): validated and
-    /// with a circuit that would admit a call.
-    fn candidates(&self) -> Vec<Arc<Endpoint>> {
-        let mut out: Vec<Arc<Endpoint>> = self
-            .endpoints
-            .iter()
-            .filter(|e| e.validated.load(Ordering::SeqCst) && e.breaker.would_allow())
-            .cloned()
-            .collect();
-        out.sort_by_key(|e| e.inflight.load(Ordering::SeqCst));
-        out
-    }
-
     /// Start validating quarantined endpoints (bounded by
     /// `validation_interval`, one run per endpoint at a time) against a
     /// validated, admitting reference. The validator makes real RPCs to an
@@ -960,18 +947,8 @@ impl EndpointSet {
             self.promote_quarantined(context);
 
             // One pass: try each admissible endpoint once, failing over
-            // between them.
-            let candidates = self.candidates();
-            if !candidates.is_empty()
-                && candidates
-                    .iter()
-                    .all(|e| contract_failed.iter().any(|f| Arc::ptr_eq(f, e)))
-            {
-                // Only endpoints that already broke the contract remain.
-                return Err(last_error.unwrap_or_else(|| {
-                    CryptoError::Contract("every admissible endpoint broke the contract".into())
-                }));
-            }
+            // between them. Endpoints that broke the contract for this
+            // operation stay excluded.
             let mut excluded = contract_failed.clone();
             while let Some(admission) = self
                 .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
@@ -1070,10 +1047,8 @@ impl EndpointSet {
                                 // (malformed body, wrong items, bad
                                 // encoding): the endpoint that sent it is at
                                 // fault. Charge its breaker so routing stops
-                                // preferring it, and fail over to an
-                                // endpoint this operation has not tried yet;
-                                // with none left the violation is reported
-                                // at once, never retried into (R5-005).
+                                // preferring it, and never send this
+                                // operation to it again (R5-005).
                                 probe.on_failure();
                                 if !retry_safe {
                                     self.metrics
@@ -1082,15 +1057,30 @@ impl EndpointSet {
                                     return Err(err);
                                 }
                                 contract_failed.push(endpoint.clone());
-                                let untried = self.endpoints.iter().any(|e| {
-                                    !tried.iter().any(|t| Arc::ptr_eq(t, e))
-                                        && e.validated.load(Ordering::SeqCst)
-                                        && e.breaker.would_allow()
+                                // Final only once every validated endpoint
+                                // has broken the contract for this operation
+                                // (a single endpoint included); quarantined
+                                // ones do not count. A peer that failed
+                                // transiently or whose circuit is cooling can
+                                // still serve, so the operation stays in the
+                                // backoff loop under the availability policy,
+                                // whatever order routing tried them in.
+                                // Endpoints are never unvalidated and only
+                                // this branch grows `contract_failed`, so no
+                                // later pass needs to check again.
+                                let peer_left = self.endpoints.iter().any(|e| {
+                                    e.validated.load(Ordering::SeqCst)
+                                        && !contract_failed.iter().any(|f| Arc::ptr_eq(f, e))
                                 });
-                                if !untried {
+                                if !peer_left {
                                     return Err(err);
                                 }
                                 last_error = Some(err);
+                                if let Some(dl) = deadline {
+                                    if self.clock.now() >= dl {
+                                        return Err(last_error.unwrap());
+                                    }
+                                }
                             }
                             ErrorClass::NonRetryableRequest | ErrorClass::ProviderFatal => {
                                 // Not the endpoint's fault (or fatal for the
