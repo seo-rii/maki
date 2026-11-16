@@ -70,6 +70,12 @@ pub struct Cfg {
     /// `Some(verify_on_hit)` enables a tiny plaintext cache.
     pub cache: Option<bool>,
     pub tear: usize,
+    /// Keep the background checkpoint worker running (with a low journal
+    /// watermark, so it wakes constantly) instead of stopping it.
+    pub worker: bool,
+    /// Above 1: some operations are issued as a batch of up to this many
+    /// concurrent requests on disjoint units (plus FLUSH/checkpoint).
+    pub concurrency: usize,
 }
 
 impl Cfg {
@@ -115,7 +121,11 @@ impl Cfg {
                 verify_on_hit,
             }),
             checkpoint: CheckpointPolicy {
-                journal_high_watermark_bytes: u64::MAX,
+                journal_high_watermark_bytes: if self.worker {
+                    self.segment_size.max(160)
+                } else {
+                    u64::MAX
+                },
                 journal_max_bytes: self.journal_max_bytes,
                 max_pending_bytes: self.max_pending_bytes,
                 emergency_reserve_bytes: 0,
@@ -145,9 +155,156 @@ pub fn cfg(name: &str) -> Cfg {
         discard: false,
         cache: None,
         tear: 128,
+        worker: false,
+        concurrency: 1,
     };
     let rec = |unit: u64| 32 + unit + 8;
     match name {
+        // ---- configurations added by the second auditor ----
+        // 4 KiB blocks and units (no RMW), two records per segment, v3.
+        "blk4k-v3" => Cfg {
+            name: "blk4k-v3",
+            block: 4096,
+            unit: 4096,
+            device_units: 24,
+            units_per_shard: 4,
+            segment_size: 48 + 2 * rec(4096),
+            journal_max_bytes: 5 * (48 + 2 * rec(4096)),
+            max_pending_bytes: rec(4096),
+            max_request_units: 4,
+            discard: true,
+            tear: 512,
+            ..base
+        },
+        // 16 KiB units over 4 KiB blocks (quarter-unit writes), 2 units per
+        // shard, 11 units (partial last shard), tiny overlay.
+        "u16k" => Cfg {
+            name: "u16k",
+            block: 4096,
+            unit: 16384,
+            device_units: 11,
+            units_per_shard: 2,
+            segment_size: 48 + 2 * rec(16384),
+            journal_max_bytes: 4 * (48 + 2 * rec(16384)),
+            max_pending_bytes: rec(16384),
+            max_overlay_entries: 4,
+            max_request_units: 3,
+            tear: 4096,
+            ..base
+        },
+        "u16k-v3" => Cfg {
+            name: "u16k-v3",
+            block: 4096,
+            unit: 16384,
+            device_units: 11,
+            units_per_shard: 2,
+            segment_size: 48 + 2 * rec(16384),
+            journal_max_bytes: 4 * (48 + 2 * rec(16384)),
+            max_pending_bytes: rec(16384),
+            max_overlay_entries: 4,
+            max_request_units: 3,
+            discard: true,
+            tear: 4096,
+            ..base
+        },
+        // The smallest legal pending bound (exactly one record: every
+        // second record of a request syncs inline), small hard limit, small
+        // overlay, verify-on-hit cache, v3.
+        "pend1-v3" => Cfg {
+            name: "pend1-v3",
+            segment_size: 48 + 5 * rec(512),
+            journal_max_bytes: 3 * (48 + 5 * rec(512)),
+            max_pending_bytes: rec(512),
+            max_overlay_entries: 6,
+            max_overlay_bytes: 10 * (512 + 8),
+            discard: true,
+            cache: Some(true),
+            ..base
+        },
+        // Background checkpoint worker left running (sequential requests).
+        "seg3-worker-v3" => Cfg {
+            name: "seg3-worker-v3",
+            segment_size: 48 + 3 * rec(512),
+            journal_max_bytes: 4 * (48 + 3 * rec(512)),
+            max_pending_bytes: 2 * rec(512),
+            max_overlay_entries: 8,
+            discard: true,
+            worker: true,
+            ..base
+        },
+        "rmw-worker" => Cfg {
+            name: "rmw-worker",
+            unit: 4096,
+            device_units: 22,
+            units_per_shard: 3,
+            segment_size: 48 + 2 * rec(4096),
+            max_overlay_entries: 5,
+            max_overlay_bytes: 12 * (4096 + 8),
+            max_request_units: 4,
+            tear: 512,
+            worker: true,
+            ..base
+        },
+        // Concurrent request batches on disjoint units, worker running.
+        "conc-v3" => Cfg {
+            name: "conc-v3",
+            segment_size: 48 + 3 * rec(512),
+            journal_max_bytes: 4 * (48 + 3 * rec(512)),
+            max_pending_bytes: 2 * rec(512),
+            max_overlay_entries: 10,
+            discard: true,
+            worker: true,
+            concurrency: 4,
+            ..base
+        },
+        "conc-v2" => Cfg {
+            name: "conc-v2",
+            segment_size: 48 + 3 * rec(512),
+            journal_max_bytes: 4 * (48 + 3 * rec(512)),
+            max_pending_bytes: 2 * rec(512),
+            max_overlay_entries: 10,
+            worker: true,
+            concurrency: 4,
+            ..base
+        },
+        "conc-rmw-v3" => Cfg {
+            name: "conc-rmw-v3",
+            unit: 4096,
+            device_units: 22,
+            units_per_shard: 3,
+            segment_size: 48 + 2 * rec(4096),
+            max_overlay_entries: 6,
+            max_overlay_bytes: 14 * (4096 + 8),
+            max_request_units: 4,
+            discard: true,
+            tear: 512,
+            worker: true,
+            concurrency: 3,
+            ..base
+        },
+        "conc-shard1-v3" => Cfg {
+            name: "conc-shard1-v3",
+            device_units: 13,
+            units_per_shard: 1,
+            segment_size: 48 + 2 * rec(512),
+            journal_max_bytes: 5 * (48 + 2 * rec(512)),
+            discard: true,
+            cache: Some(false),
+            worker: true,
+            concurrency: 4,
+            ..base
+        },
+        // Concurrency without the worker: only foreground races.
+        "conc-noworker-v3" => Cfg {
+            name: "conc-noworker-v3",
+            segment_size: 48 + 3 * rec(512),
+            journal_max_bytes: 4 * (48 + 3 * rec(512)),
+            max_pending_bytes: 2 * rec(512),
+            max_overlay_entries: 10,
+            discard: true,
+            concurrency: 4,
+            ..base
+        },
         // One record per segment: every append rolls.
         "seg1" => Cfg {
             name: "seg1",
@@ -308,10 +465,23 @@ pub struct Mode {
     /// Percent of operations replaced by a "faults stop: FLUSH and
     /// checkpoint must work again" check.
     pub heal_pct: u32,
+    /// Percent chance (per attempt, up to three) that recovery runs with
+    /// the transient faults above live, Linux failed-fsync model (a failed
+    /// recovery is followed by a restart or power loss and another try).
+    pub recovery_fault_pct: u32,
+    /// The transient faults apply to recovery only, never to the workload.
+    pub recovery_only: bool,
+    /// Percent chance per cycle of media damage to one or two non-journal
+    /// files after the crash; the seed ends after checking that cycle.
+    pub damage_pct: u32,
 }
 
 impl Mode {
     fn transient(&self) -> bool {
+        !self.recovery_only && self.any_faults()
+    }
+
+    fn any_faults(&self) -> bool {
         self.sync_data
             + self.sync_dir
             + self.write
@@ -379,6 +549,58 @@ pub fn mode(name: &str) -> Mode {
             midop_death_pct: 35,
             recovery_death_pct: 35,
             double_crash_pct: 10,
+            ..Mode::default()
+        },
+        // Clean workload; recovery itself sees transient faults with the
+        // Linux failed-fsync model, then restarts or loses power, and tries
+        // again (the death modes use lenient sync failures).
+        "rfault" => Mode {
+            name: "rfault",
+            strict_restart: true,
+            sync_data: 120,
+            sync_dir: 120,
+            write: 40,
+            partial: 40,
+            set_len: 40,
+            remove: 60,
+            rename: 40,
+            create: 40,
+            recovery_fault_pct: 70,
+            recovery_only: true,
+            double_crash_pct: 15,
+            ..Mode::default()
+        },
+        // Faulty workload and faulty recovery.
+        "chaos-rfault" => Mode {
+            name: "chaos-rfault",
+            strict_restart: true,
+            sync_data: 80,
+            sync_dir: 80,
+            write: 30,
+            partial: 30,
+            set_len: 30,
+            remove: 60,
+            rename: 30,
+            create: 30,
+            heal_pct: 4,
+            recovery_fault_pct: 60,
+            double_crash_pct: 10,
+            ..Mode::default()
+        },
+        // Crash-only workload, then media damage outside the journal.
+        "damage" => Mode {
+            name: "damage",
+            double_crash_pct: 10,
+            damage_pct: 30,
+            ..Mode::default()
+        },
+        "death-damage" => Mode {
+            name: "death-damage",
+            midop_death_pct: 50,
+            recovery_death_pct: 30,
+            double_crash_pct: 10,
+            damage_pct: 30,
+            ..Mode::default()
         },
         other => panic!("unknown mode {other}"),
     }
@@ -395,6 +617,10 @@ struct Injector {
     dead: AtomicBool,
     /// Mutations left before death; negative = not armed.
     countdown: AtomicI64,
+    /// Mutations left before one single transient fault; negative = off.
+    single: AtomicI64,
+    /// The single fault chose to be a short write of this `write_at`.
+    single_partial: AtomicBool,
     mutations: AtomicU64,
     rng: Mutex<StdRng>,
     log: Arc<Mutex<Vec<String>>>,
@@ -407,6 +633,8 @@ impl Injector {
             enabled: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             countdown: AtomicI64::new(-1),
+            single: AtomicI64::new(-1),
+            single_partial: AtomicBool::new(false),
             mutations: AtomicU64::new(0),
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0xFA17_FA17)),
             log,
@@ -430,6 +658,16 @@ impl Injector {
         self.mutations.load(Ordering::SeqCst)
     }
 
+    /// One transient fault after `mutations` more mutations (Linux model).
+    fn arm_single(&self, mutations: u64) {
+        self.single.store(mutations as i64, Ordering::SeqCst);
+    }
+
+    fn disarm_single(&self) {
+        self.single.store(-1, Ordering::SeqCst);
+        self.single_partial.store(false, Ordering::SeqCst);
+    }
+
     fn hook(self: &Arc<Self>) -> FaultHook {
         let me = self.clone();
         Arc::new(move |op| {
@@ -448,6 +686,22 @@ impl Injector {
                     return Some(io::Error::other("audit: backing died"));
                 }
                 me.countdown.store(left - 1, Ordering::SeqCst);
+                return None;
+            }
+            let single = me.single.load(Ordering::SeqCst);
+            if single >= 0 {
+                if single <= 1 {
+                    me.single.store(-1, Ordering::SeqCst);
+                    if let FaultOp::WriteAt { len, .. } = op {
+                        if *len > 1 && me.rng.lock().random_bool(0.5) {
+                            me.single_partial.store(true, Ordering::SeqCst);
+                            return None;
+                        }
+                    }
+                    me.log.lock().push(format!("      !! SINGLE fault {op:?}"));
+                    return Some(io::Error::other("audit: single injected failure"));
+                }
+                me.single.store(single - 1, Ordering::SeqCst);
                 return None;
             }
             if !me.enabled.load(Ordering::SeqCst) {
@@ -473,6 +727,15 @@ impl Injector {
     fn partial_hook(self: &Arc<Self>) -> PartialWriteHook {
         let me = self.clone();
         Arc::new(move |op| {
+            if me.single_partial.swap(false, Ordering::SeqCst) {
+                if let FaultOp::WriteAt { len, .. } = op {
+                    let keep = me.rng.lock().random_range(0..*len);
+                    me.log
+                        .lock()
+                        .push(format!("      !! SINGLE short write {keep} of {op:?}"));
+                    return Some((keep, io::Error::other("audit: single short write")));
+                }
+            }
             if me.dead.load(Ordering::SeqCst)
                 || me.countdown.load(Ordering::SeqCst) >= 0
                 || !me.enabled.load(Ordering::SeqCst)
@@ -494,6 +757,71 @@ impl Injector {
             None
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Media damage (outside the journal directory)
+
+fn damage_candidates(backing: &CrashableBacking) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in ["", "data", "checkpoint"] {
+        if let Ok(names) = backing.list(dir) {
+            for name in names {
+                let path = if dir.is_empty() {
+                    name
+                } else {
+                    format!("{dir}/{name}")
+                };
+                if path.starts_with("journal") || path == "volume.lock" {
+                    continue;
+                }
+                if backing.open(&path, false).is_ok() {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn damage_file(backing: &CrashableBacking, path: &str, rng: &mut StdRng) -> String {
+    let file = backing.open(path, false).unwrap();
+    let len = file.len().unwrap();
+    if len == 0 {
+        file.write_at(0, &[rng.random::<u8>() | 1]).unwrap();
+        file.sync_data().unwrap();
+        return format!("{path}: append one byte to empty file");
+    }
+    let what = match rng.random_range(0..3u32) {
+        0 => {
+            let n = rng.random_range(1..=8usize).min(len as usize);
+            let mut offsets = std::collections::BTreeSet::new();
+            while offsets.len() < n {
+                offsets.insert(rng.random_range(0..len));
+            }
+            for o in &offsets {
+                let mut b = [0u8; 1];
+                file.read_at(*o, &mut b).unwrap();
+                b[0] ^= 1 << rng.random_range(0..8);
+                file.write_at(*o, &b).unwrap();
+            }
+            format!("flip {n} bit(s) at {offsets:?}")
+        }
+        1 => {
+            let keep = rng.random_range(0..len);
+            file.set_len(keep).unwrap();
+            format!("truncate {len} -> {keep}")
+        }
+        _ => {
+            let start = rng.random_range(0..len);
+            let n = (len - start).min(64);
+            file.write_at(start, &vec![0u8; n as usize]).unwrap();
+            format!("zero {n} bytes at {start}")
+        }
+    };
+    file.sync_data().unwrap();
+    format!("{path}: {what}")
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +878,30 @@ async fn try_attach(cfg: &Cfg, backing: &Arc<CrashableBacking>) -> Result<Engine
         cfg.options(),
     )
     .await
+}
+
+/// One member of a concurrent request batch.
+enum BatchOp {
+    Flush,
+    Checkpoint,
+    Read {
+        offset: u64,
+        len: usize,
+        want: Vec<u8>,
+    },
+    Trim {
+        offset: u64,
+        len: usize,
+        fua: bool,
+        images: Vec<(u64, Vec<u8>)>,
+    },
+    Write {
+        offset: u64,
+        data: Vec<u8>,
+        fua: bool,
+        zero: bool,
+        images: Vec<(u64, Vec<u8>)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,7 +1021,9 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
         Ok(engine) => engine,
         Err(e) => panic!("ATTACH-FRESH: {e}\n{}", history()),
     };
-    engine.stop_checkpoint_worker().await;
+    if !cfg.worker {
+        engine.stop_checkpoint_worker().await;
+    }
     let mut workload_mutations: u64 = 80;
     let mut recovery_mutations: u64 = 30;
 
@@ -805,6 +1159,239 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
                 );
                 stats.bump("heals");
                 injector.enabled.store(true, Ordering::SeqCst);
+                continue;
+            }
+
+            if cfg.concurrency > 1 && rng.random_range(0..100) < 40 {
+                // A batch of concurrent requests on disjoint units, maybe
+                // with a FLUSH and/or a checkpoint racing them.
+                let mut used: std::collections::BTreeSet<u64> = Default::default();
+                let mut batch: Vec<BatchOp> = Vec::new();
+                let width = rng.random_range(2..=cfg.concurrency);
+                for _ in 0..width {
+                    let kind = rng.random_range(0..100);
+                    if kind < 12 {
+                        batch.push(BatchOp::Flush);
+                        continue;
+                    }
+                    if kind < 20 {
+                        batch.push(BatchOp::Checkpoint);
+                        continue;
+                    }
+                    // Pick a unit range not touched by another member.
+                    let mut picked = None;
+                    for _ in 0..8 {
+                        let count = rng.random_range(1..=cfg.max_request_units.min(3));
+                        let first = rng.random_range(0..=cfg.device_units - count);
+                        if (first..first + count).all(|u| !used.contains(&u)) {
+                            picked = Some((first, count));
+                            break;
+                        }
+                    }
+                    let Some((first, count)) = picked else {
+                        continue;
+                    };
+                    used.extend(first..first + count);
+                    // Block range inside the picked units (partial edges ok).
+                    let span = count * bpu;
+                    let (start, n) = if bpu > 1 && rng.random_bool(0.5) {
+                        let n = rng.random_range(1..=span);
+                        (first * bpu + rng.random_range(0..=span - n), n)
+                    } else {
+                        (first * bpu, span)
+                    };
+                    let (offset, len) = (start * block, (n * block) as usize);
+                    let fua = rng.random_bool(0.25);
+                    if kind < 40 {
+                        let mut want = Vec::with_capacity(len);
+                        let mut at = offset;
+                        while at < offset + len as u64 {
+                            let u = at / unit;
+                            let from = (at - u * unit) as usize;
+                            let to =
+                                ((offset + len as u64).min((u + 1) * unit) - u * unit) as usize;
+                            want.extend_from_slice(&model.read(u)[from..to]);
+                            at = (u + 1) * unit;
+                        }
+                        batch.push(BatchOp::Read { offset, len, want });
+                    } else if kind < 55 && cfg.discard {
+                        let first_whole = offset.div_ceil(unit);
+                        let end = (offset + len as u64) / unit;
+                        let images = (first_whole..end).map(|u| (u, zeros.clone())).collect();
+                        batch.push(BatchOp::Trim {
+                            offset,
+                            len,
+                            fua,
+                            images,
+                        });
+                    } else {
+                        let zero = rng.random_bool(0.1);
+                        stamp += 1;
+                        let data = if zero {
+                            vec![0u8; len]
+                        } else {
+                            pattern(stamp, offset, len)
+                        };
+                        let images = images_after_write(&cfg, &model, offset, &data);
+                        batch.push(BatchOp::Write {
+                            offset,
+                            data,
+                            fua,
+                            zero,
+                            images,
+                        });
+                    }
+                }
+                let mut handles = Vec::new();
+                for op in &batch {
+                    let engine = engine.clone();
+                    handles.push(match op {
+                        BatchOp::Flush => tokio::spawn(async move {
+                            engine.flush().await.map(|_| None)
+                        }),
+                        BatchOp::Checkpoint => tokio::spawn(async move {
+                            engine.checkpoint().await.map(|_| None)
+                        }),
+                        BatchOp::Read { offset, len, .. } => {
+                            let (offset, len) = (*offset, *len);
+                            tokio::spawn(async move { engine.read(offset, len).await.map(Some) })
+                        }
+                        BatchOp::Trim {
+                            offset, len, fua, ..
+                        } => {
+                            let (offset, len, fua) = (*offset, *len, *fua);
+                            tokio::spawn(async move {
+                                engine.trim(offset, len, fua).await.map(|_| None)
+                            })
+                        }
+                        BatchOp::Write {
+                            offset,
+                            data,
+                            fua,
+                            zero,
+                            ..
+                        } => {
+                            let (offset, data, fua, zero) = (*offset, data.clone(), *fua, *zero);
+                            tokio::spawn(async move {
+                                if zero {
+                                    engine.write_zeroes(offset, data.len(), fua).await
+                                } else {
+                                    engine.write(offset, &data, fua).await
+                                }
+                                .map(|_| None)
+                            })
+                        }
+                    });
+                }
+                let mut results = Vec::new();
+                for handle in handles {
+                    results.push(handle.await.expect("batch member panicked"));
+                }
+                // A FLUSH in the batch covers only what was acknowledged
+                // before the batch began.
+                let flushed = batch
+                    .iter()
+                    .zip(&results)
+                    .any(|(op, r)| matches!(op, BatchOp::Flush) && r.is_ok());
+                if flushed {
+                    model.flush();
+                }
+                let mut summary = Vec::new();
+                let mut failed: Vec<(String, CoreError, Vec<(u64, Vec<u8>)>)> = Vec::new();
+                for (op, result) in batch.into_iter().zip(results) {
+                    let verdict = match &result {
+                        Ok(_) => "ok".to_string(),
+                        Err(e) => format!("ERR {e}"),
+                    };
+                    match op {
+                        BatchOp::Flush => {
+                            summary.push(format!("flush -> {verdict}"));
+                            if let Err(e) = result {
+                                failed.push(("flush".into(), e, Vec::new()));
+                            }
+                        }
+                        BatchOp::Checkpoint => {
+                            summary.push(format!("checkpoint -> {verdict}"));
+                            if let Err(e) = result {
+                                failed.push(("checkpoint".into(), e, Vec::new()));
+                            }
+                        }
+                        BatchOp::Read { offset, len, want } => {
+                            summary.push(format!("read off {offset} len {len} -> {verdict}"));
+                            match result {
+                                Ok(Some(actual)) => assert!(
+                                    actual == want,
+                                    "LIVE-MISMATCH: batch read off {offset} len {len} differs \
+                                     from the acknowledged image\n{}",
+                                    history()
+                                ),
+                                Ok(None) => unreachable!(),
+                                Err(e) => assert!(
+                                    injector.is_dead(),
+                                    "LIVE-READ-FAILED: batch read off {offset} len {len}: {e}\n{}",
+                                    history()
+                                ),
+                            }
+                        }
+                        BatchOp::Trim {
+                            offset,
+                            len,
+                            fua,
+                            images,
+                        } => {
+                            summary.push(format!(
+                                "trim off {offset} len {len} fua={fua} -> {verdict}"
+                            ));
+                            match result {
+                                Ok(_) => {
+                                    for (u, image) in &images {
+                                        if fua {
+                                            model.write_fua(*u, image);
+                                        } else {
+                                            model.write(*u, image);
+                                        }
+                                    }
+                                }
+                                Err(e) => failed.push(("trim".into(), e, images)),
+                            }
+                        }
+                        BatchOp::Write {
+                            offset,
+                            data,
+                            fua,
+                            zero,
+                            images,
+                        } => {
+                            summary.push(format!(
+                                "{} off {offset} len {} (units {}..={}) fua={fua} -> {verdict}",
+                                if zero { "zero" } else { "write" },
+                                data.len(),
+                                images[0].0,
+                                images[images.len() - 1].0,
+                            ));
+                            match result {
+                                Ok(_) => {
+                                    for (u, image) in &images {
+                                        if fua {
+                                            model.write_fua(*u, image);
+                                        } else {
+                                            model.write(*u, image);
+                                        }
+                                    }
+                                }
+                                Err(e) => failed.push(("write".into(), e, images)),
+                            }
+                        }
+                    }
+                }
+                say(format!("batch [{}]", summary.join(" | ")));
+                stats.bump("batches");
+                for (what, error, images) in failed {
+                    resolve_failure!(what, &error, &images);
+                }
+                if injector.is_dead() {
+                    break;
+                }
                 continue;
             }
 
@@ -964,6 +1551,9 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
         if died {
             stats.bump("midop-deaths");
         }
+        // A running worker pass holds the volume (and its lock); the
+        // process "dies" once it has finished (the backing may be dead).
+        engine.stop_checkpoint_worker().await;
         drop(engine);
         injector.revive();
         backing.set_lenient_sync_failures(false);
@@ -988,6 +1578,24 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             match result {
                 Ok(engine) => {
                     say(format!("   recovery completed (died={died})"));
+                    if died {
+                        // Some mutation failed and attach still succeeded:
+                        // which step tolerates a failure?
+                        let death = log
+                            .lock()
+                            .iter()
+                            .rev()
+                            .find(|l| l.contains("DEATH"))
+                            .cloned()
+                            .unwrap_or_default();
+                        stats.bump("recovery-ok-despite-death");
+                        stats.note(format!(
+                            "cfg {} mode {} seed {seed}: attach succeeded after death: {}",
+                            cfg.name,
+                            mode.name,
+                            death.trim()
+                        ));
+                    }
                     engine.stop_checkpoint_worker().await;
                     drop(engine);
                     stats.bump("recovery-then-crash");
@@ -1010,6 +1618,58 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             strict &= kind == Crash::Restart;
         }
 
+        // Recovery under transient faults (Linux failed-fsync model).
+        let mut attempts = 0;
+        while mode.any_faults()
+            && attempts < 3
+            && rng.random_range(0..100) < mode.recovery_fault_pct
+        {
+            attempts += 1;
+            backing.set_lenient_sync_failures(false);
+            // One transient fault at a uniformly chosen mutation of the
+            // recovery (it may land after recovery, in attach, or never).
+            let at = rng.random_range(1..=recovery_mutations.max(6) + 2);
+            say(format!("recovery with one transient fault after {at} mutations"));
+            injector.arm_single(at);
+            let result = try_attach(&cfg, &backing).await;
+            let fired = injector.single.load(Ordering::SeqCst) < 0;
+            injector.disarm_single();
+            match result {
+                Ok(engine) => {
+                    say(format!("   faulty recovery completed (fault fired={fired})"));
+                    if fired {
+                        stats.bump("faulty-recovery-ok-after-fault");
+                        let fault = log
+                            .lock()
+                            .iter()
+                            .rev()
+                            .find(|l| l.contains("SINGLE"))
+                            .cloned()
+                            .unwrap_or_default();
+                        stats.note(format!(
+                            "cfg {} mode {} seed {seed}: attach succeeded after a fault: {}",
+                            cfg.name,
+                            mode.name,
+                            fault.trim()
+                        ));
+                    }
+                    stats.bump("faulty-recovery-ok");
+                    engine.stop_checkpoint_worker().await;
+                    // Sometimes write a little through the faulty-recovered
+                    // engine before crashing: it must be as good as any.
+                    drop(engine);
+                }
+                Err(e) => {
+                    say(format!("   faulty recovery failed: {e}"));
+                    stats.bump("faulty-recovery-failed");
+                }
+            }
+            kind = pick_crash(&mut rng);
+            apply_crash(kind, &backing, &mut rng);
+            say(format!("== {kind:?}"));
+            strict &= kind == Crash::Restart;
+        }
+
         if rng.random_range(0..100) < mode.double_crash_pct {
             match try_attach(&cfg, &backing).await {
                 Ok(engine) => {
@@ -1025,12 +1685,69 @@ pub async fn run_seed(run: Run, stats: Arc<Stats>) {
             stats.bump("double-crashes");
         }
 
+        if rng.random_range(0..100) < mode.damage_pct {
+            // Media damage to one or two non-journal files after the crash
+            // (journal damage can legitimately revert a FLUSHed write, S-04).
+            // Recovery may refuse; otherwise every unit must read as an
+            // allowed value or fail with EIO, never foreign data or zeros
+            // for a written unit. The seed ends here.
+            let candidates = damage_candidates(&backing);
+            for _ in 0..rng.random_range(1..=2usize) {
+                let path = candidates[rng.random_range(0..candidates.len())].clone();
+                say(format!("DAMAGE {}", damage_file(&backing, &path, &mut rng)));
+            }
+            stats.bump("damaged");
+            let engine = match try_attach(&cfg, &backing).await {
+                Ok(engine) => engine,
+                Err(e) => {
+                    say(format!("damaged volume refused: {e}"));
+                    stats.bump("damage-refused");
+                    return;
+                }
+            };
+            engine.stop_checkpoint_worker().await;
+            let s = engine.stats().await;
+            assert!(
+                s.checkpoint_sequence <= s.durable_sequence,
+                "CHECKPOINT-AHEAD (damaged): checkpoint {} > durable {}\n{}",
+                s.checkpoint_sequence,
+                s.durable_sequence,
+                history()
+            );
+            for u in 0..cfg.device_units {
+                match engine.read(u * unit, unit as usize).await {
+                    Ok(actual) => {
+                        let in_flight = maybe.get(&u).is_some_and(|set| set.contains(&actual));
+                        if let Err(violation) = model.crash_adopt(u, &actual) {
+                            assert!(
+                                in_flight,
+                                "DAMAGE-ORACLE: {violation} (wanted one of the allowed \
+                                 values or EIO)\n{}",
+                                history()
+                            );
+                        }
+                    }
+                    Err(CoreError::Corrupt(_)) | Err(CoreError::Io(_)) => {
+                        stats.bump("damage-eio-units");
+                    }
+                    Err(e) => panic!(
+                        "DAMAGE-ERROR-CLASS: unit {u}: unexpected error class {e}\n{}",
+                        history()
+                    ),
+                }
+            }
+            stats.bump("damage-attached");
+            return;
+        }
+
         let before = injector.mutations();
         engine = match try_attach(&cfg, &backing).await {
             Ok(engine) => engine,
             Err(e) => panic!("ATTACH-REFUSED: {e}\n{}", history()),
         };
-        engine.stop_checkpoint_worker().await;
+        if !cfg.worker {
+            engine.stop_checkpoint_worker().await;
+        }
         recovery_mutations = (injector.mutations() - before).max(6);
         say("recovered".to_string());
 
@@ -1105,9 +1822,9 @@ pub async fn sweep(
             cfg: cfg(cfg_name),
             mode: mode(mode_name),
             seed,
-            cycles,
-            ops_lo: 6,
-            ops_hi: 40,
+            cycles: env_or("AUDIT_CYCLES", cycles as u64) as usize,
+            ops_lo: env_or("AUDIT_OPS_LO", 6) as usize,
+            ops_hi: env_or("AUDIT_OPS_HI", 40) as usize,
             verbose: false,
         };
         let task = tokio::spawn(run_seed(run, stats.clone()));
@@ -1124,10 +1841,13 @@ pub async fn sweep(
         }
     }
     println!(
-        "AUDIT-SWEEP cfg={cfg_name} mode={mode_name} seeds={}..{} run={seeds_run} cycles={cycles} \
+        "AUDIT-SWEEP cfg={cfg_name} mode={mode_name} seeds={}..{} run={seeds_run} cycles={} ops={}..{} \
          failures={} elapsed={:.0}s | {}",
         seeds.start,
         seeds.start + seeds_run,
+        env_or("AUDIT_CYCLES", cycles as u64),
+        env_or("AUDIT_OPS_LO", 6),
+        env_or("AUDIT_OPS_HI", 40),
         failures.len(),
         started.elapsed().as_secs_f64(),
         stats.render()
@@ -1187,6 +1907,13 @@ pub async fn sweep_all(pairs: &[(&str, &str)], seeds: std::ops::Range<u64>, cycl
                 .join("\n\n")
         );
     }
+}
+
+fn env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn seeds() -> std::ops::Range<u64> {
@@ -1279,6 +2006,132 @@ async fn audit_chaos_death_v3() {
     sweep_all(&pairs(&V3, "chaos-death"), seeds(), 4).await;
 }
 
+// ---- second auditor: new geometries, worker, concurrency, faulty recovery
+
+const NEWGEO: [&str; 4] = ["blk4k-v3", "u16k", "u16k-v3", "pend1-v3"];
+const WORKER: [&str; 2] = ["seg3-worker-v3", "rmw-worker"];
+const CONC: [&str; 5] = [
+    "conc-v3",
+    "conc-v2",
+    "conc-rmw-v3",
+    "conc-shard1-v3",
+    "conc-noworker-v3",
+];
+
+fn all_pairs<'a>(cfgs: &[&'a str], modes: &[&'a str]) -> Vec<(&'a str, &'a str)> {
+    modes
+        .iter()
+        .flat_map(|m| cfgs.iter().map(move |c| (*c, *m)))
+        .collect()
+}
+
+fn pairs_from_env(default: Vec<(&'static str, &'static str)>) -> Vec<(String, String)> {
+    match std::env::var("AUDIT_PAIRS") {
+        // "cfg:mode,cfg:mode"
+        Ok(spec) => spec
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (c, m) = p.split_once(':').expect("cfg:mode");
+                (c.to_string(), m.to_string())
+            })
+            .collect(),
+        Err(_) => default
+            .into_iter()
+            .map(|(c, m)| (c.to_string(), m.to_string()))
+            .collect(),
+    }
+}
+
+async fn sweep_owned(pairs: Vec<(String, String)>, seeds: std::ops::Range<u64>, cycles: usize) {
+    let refs: Vec<(&str, &str)> = pairs.iter().map(|(c, m)| (c.as_str(), m.as_str())).collect();
+    sweep_all(&refs, seeds, cycles).await;
+}
+
+#[tokio::test]
+async fn audit2_newgeo_crash_death() {
+    sweep_owned(
+        pairs_from_env(all_pairs(&NEWGEO, &["crash", "death"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audit2_newgeo_faults() {
+    sweep_owned(
+        pairs_from_env(all_pairs(&NEWGEO, &["chaos", "chaos-death"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audit2_rfault() {
+    let mut cfgs: Vec<&str> = V2.to_vec();
+    cfgs.extend(V3);
+    cfgs.extend(NEWGEO);
+    sweep_owned(pairs_from_env(all_pairs(&cfgs, &["rfault"])), seeds(), 4).await;
+}
+
+#[tokio::test]
+async fn audit2_chaos_rfault() {
+    let mut cfgs: Vec<&str> = V3.to_vec();
+    cfgs.extend(["blk4k-v3", "u16k", "pend1-v3"]);
+    sweep_owned(
+        pairs_from_env(all_pairs(&cfgs, &["chaos-rfault"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audit2_damage() {
+    let mut cfgs: Vec<&str> = V2.to_vec();
+    cfgs.extend(V3);
+    cfgs.extend(NEWGEO);
+    cfgs.extend(["seg3-cache-v3", "rmw-cache", "plain", "plain-v3"]);
+    sweep_owned(
+        pairs_from_env(all_pairs(&cfgs, &["damage", "death-damage"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit2_worker() {
+    sweep_owned(
+        pairs_from_env(all_pairs(&WORKER, &["crash", "death", "chaos", "chaos-death"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit2_conc_clean() {
+    sweep_owned(
+        pairs_from_env(all_pairs(&CONC, &["crash", "death"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit2_conc_faults() {
+    sweep_owned(
+        pairs_from_env(all_pairs(&CONC, &["sync", "chaos", "chaos-death"])),
+        seeds(),
+        4,
+    )
+    .await;
+}
+
 /// One seed, chosen by environment, with its full history printed:
 /// `AUDIT_CFG=odd-v3 AUDIT_MODE=death AUDIT_SEED=17 [AUDIT_CYCLES=4]`.
 #[tokio::test]
@@ -1300,8 +2153,8 @@ async fn audit_one() {
         mode: mode(&mode_name),
         seed,
         cycles,
-        ops_lo: 6,
-        ops_hi: 40,
+        ops_lo: env_or("AUDIT_OPS_LO", 6) as usize,
+        ops_hi: env_or("AUDIT_OPS_HI", 40) as usize,
         verbose: true,
     };
     run_seed(run, Arc::new(Stats::default())).await;
