@@ -219,7 +219,7 @@ The ignored long-running and external-service gates were not part of this run.
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
 | `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
 | `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses. Refuses a batch over its declared `max_items` or `max_bytes` (plaintext bytes; one unit per decrypt item) with `NonRetryableRequest`, as a vendor endpoint would |
-| `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing |
+| `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing. Sleepers due in one `advance` are woken by deadline, then in creation order |
 | `DeterministicScheduler` | Reproducible seeded interleavings. A task is polled again only after its waker fires, so a lost wakeup stalls (`run` panics, `run_bounded` returns `false`) as it would hang under tokio |
 | Failpoints | Named failures at journal, shard, and checkpoint persistence boundaries |
 
