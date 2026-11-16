@@ -254,6 +254,20 @@ fn recovery_refuses_bytes_that_changed_after_the_validated_scan() {
         recovered.is_err(),
         "recovery must not persist a different image than it validated"
     );
+    drop(recovered);
+
+    // The refusal must come before anything vouches for the changed bytes:
+    // the proof still ends at the acknowledged record, so the next attach
+    // drops the changed, never-acknowledged record as a torn tail. Replay
+    // rescans the segment and would refuse it too, but only after a durable
+    // mark and the proof had been published over it.
+    let volume = Volume::recover(backing, options())
+        .expect("a refused recovery must not publish a horizon over changed bytes");
+    assert_eq!(
+        volume.read_ct(0).unwrap().unwrap().1,
+        vec![1; CIPHERTEXT_SIZE]
+    );
+    assert_eq!(volume.read_ct(1).unwrap(), None);
 }
 
 #[test]
