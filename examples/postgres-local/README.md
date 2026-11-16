@@ -11,9 +11,12 @@ volume named `postgres`, encrypted with the local AES-256-GCM-SIV provider.
 | [`postgresql.service.d/10-maki.conf`](postgresql.service.d/10-maki.conf) | `/etc/systemd/system/postgresql@15-main.service.d/10-maki.conf` | `root:root 0644` |
 | [`checklist.md`](checklist.md) | — | Tick before go-live |
 
-The credential is not a file in this bundle: generate it on the host
-(`head -c 32 /dev/urandom > /etc/maki/secrets/postgres.token`, mode `0400`)
-and keep a copy in the deployment's secret store.
+The credential is not a file in this bundle. Create
+`/etc/maki/secrets/postgres.token` using the complete
+[credential procedure](../../docs/deployment/postgres.md#3-credential), which
+publishes the key with mode `0400` and refuses to replace existing files or
+symlinks. Continue only on success; preserve an existing key instead of
+deleting it to retry. Keep a copy in the deployment's secret store.
 
 The order in which to use these files, the decisions each `decide` marker
 asks for, and the planned-stop and recovery runbooks are in the

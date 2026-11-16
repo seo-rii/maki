@@ -63,11 +63,13 @@ No prebuilt packages are published yet.
 ## Quick start
 
 The [quick start](docs/getting-started/quickstart.md) runs one local-key volume
-through the packaged systemd lifecycle and a full stop/start round trip. In
-outline:
+through the packaged systemd lifecycle and a full stop/start round trip.
+First run its complete [key-creation procedure](docs/getting-started/quickstart.md#1-create-the-key)
+and continue only if it succeeds. It refuses to replace an existing file or
+symlink; preserve an existing key instead of deleting it to retry. The
+remaining steps, in outline:
 
 ```bash
-head -c 32 /dev/urandom > /etc/maki/secrets/demo.token            # key
 install -m 0640 -o root -g maki demo.toml /etc/maki/volumes/demo.toml
 install -d -o maki -g maki -m 0700 /var/lib/maki/demo
 sudo -u maki maki volume create /etc/maki/volumes/demo.toml
