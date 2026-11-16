@@ -103,7 +103,10 @@ fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
         "control_socket_path=\"$control_runtime_dir/control.sock\"",
         "rmdir \"$control_runtime_dir\"",
         "nbd_target=\"$(basename \"$device\")\"",
-        "nbd-client -unix \"$socket_path\" \"$nbd_target\"",
+        "sudo -n python3 \"$REPO_ROOT/scripts/privileged_validation_nbd.py\"",
+        "--device \"$device\" --identifier \"$nbd_connection_id\" \"$@\"",
+        "test_nbd_action connect --socket \"$socket_path\"",
+        "test_nbd_action disconnect",
         "nbd-client -d \"$nbd_target\"",
     ] {
         assert!(
