@@ -250,6 +250,17 @@ fn response_status(
     }
 }
 
+/// Remote status text and details are ignored (SPEC §18), but tonic parses
+/// both when it reads a status from these headers: it panics on details that
+/// are not base64, and it replaces the code with `Unknown` when the message
+/// does not percent-decode to UTF-8. Either would let peer bytes crash the
+/// call or change its class. Remove both first, so the class follows only the
+/// validated `grpc-status` value and the allowlisted metadata.
+fn discard_remote_status_text(headers: &mut tonic::codegen::http::HeaderMap) {
+    headers.remove("grpc-message");
+    headers.remove("grpc-status-details-bin");
+}
+
 impl http_body::Body for BoundedResponseBody {
     type Data = tonic::codegen::Bytes;
     type Error = tonic::Status;
@@ -261,15 +272,16 @@ impl http_body::Body for BoundedResponseBody {
         if self.finished {
             return Poll::Ready(None);
         }
-        let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        let mut frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
         // A response that ends inside a message, or reports success without
         // one, broke the receive contract; tonic would surface either as a
         // local `Internal` status, which maps to Retryable (BUG-121).
-        let violation = match &frame {
+        let violation = match &mut frame {
             Some(Ok(frame)) => {
                 if let Some(bytes) = frame.data_ref() {
                     self.framing.observe(bytes).err()
-                } else if let Some(trailers) = frame.trailers_ref() {
+                } else if let Some(trailers) = frame.trailers_mut() {
+                    discard_remote_status_text(trailers);
                     self.finished = true;
                     if self.framing.inside_message() {
                         Some("grpc response ended inside a message")
@@ -358,7 +370,9 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
         let response = tonic::codegen::Service::call(&mut self.inner, request);
         let limit = self.limit;
         Box::pin(async move {
-            let response = response.await?;
+            let mut response = response.await?;
+            // Tonic reads a trailers-only status from these headers.
+            discard_remote_status_text(response.headers_mut());
             // A successful unary response needs a message followed by OK
             // trailers. Initial status belongs to a trailers-only error.
             // Tonic treats initial OK as an empty response and skips later

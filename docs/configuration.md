@@ -415,7 +415,11 @@ The message-size limit bounds each received gRPC frame before decoding.
 Locally rejected oversized frames and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may
 move to another peer. An actual remote `OutOfRange` status remains a request
-error, regardless of its message text.
+error, regardless of its message text. Remote status text (`grpc-message`) and
+details (`grpc-status-details-bin`) are discarded before the status is read:
+an error's class follows only its `grpc-status` code and `maki-crypto-error`
+metadata, and text or details that do not decode neither change that class nor
+turn an OK status into an error.
 
 ## Backing directory identity
 
