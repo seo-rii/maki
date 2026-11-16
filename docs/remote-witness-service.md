@@ -199,7 +199,14 @@ operator-controlled cutover after destination verification.
 Configuration files are bounded to 64 KiB and reject unknown fields. On Unix,
 they must not be symlinks or writable by group/others. Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
-accessible to group/others (`0600` is appropriate). The key loader accepts one
+accessible to group/others (`0600` is appropriate), and must be owned by root
+or by the user the loading process runs as. A key owned by any other user is
+refused whatever its mode, because its owner can read or replace it; a process
+run as root therefore refuses a key owned by the service or daemon user. Run
+the server as its service account, and run `maki volume witness` with the
+daemon's writer configuration as the daemon user (`sudo -u maki`), or use the
+administrator configuration as root. Certificates and CA bundles may have any
+owner. The key loader accepts one
 unencrypted PKCS#8, PKCS#1 RSA or SEC1 EC PEM block. Encrypted keys, bag
 attributes, extra blocks and trailing non-whitespace text are refused.
 Private-key PEM, base64 scratch and decoded DER are erased on drop; the pinned

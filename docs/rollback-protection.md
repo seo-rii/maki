@@ -63,7 +63,9 @@ client_key_file = "/etc/maki/witness/writer.key"
 
 Provision the independently managed authority and its writer/admin certificate
 allowlist as described in [remote witness operations](remote-witness-service.md).
-Private key files must be owner-only regular files. Requests use TLS 1.3 mutual
+Private key files must be owner-only regular files owned by root or by the user
+the loading process runs as (the daemon user for the writer key); a key owned
+by anyone else is refused whatever its mode. Requests use TLS 1.3 mutual
 authentication, bounded frames and deadlines. There is no offline fallback.
 The metadata service can use a local state directory with an exclusive lock or
 a replicated etcd quorum shared by stateless frontends. Identity-pinned endpoint

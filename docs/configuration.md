@@ -64,6 +64,14 @@ the outer witness identity, distinct from the inner superblock UUID. All
 frontends use the same verified `server_name`, approved identity and shared
 etcd key. Independently copied local witness directories cannot provide HA.
 
+`client_key_file` is a secret file: it is opened without following a symlink,
+must be a regular file owned by root or by the user the loading process runs
+as (the daemon user for the packaged service), and must not be accessible to
+group or others (0600 or 0400). A key owned by any other user is refused
+whatever its mode, because its owner can read or replace it. `ca_file` and
+`client_cert_file` are public and may have any owner, but must not contain a
+private key.
+
 One deadline of `timeout_ms` (1–60000 ms) covers the entire endpoint attempt
 sequence. A stalled frontend receives a bounded share, leaving time for later
 frontends. Transport failures retry the identical operation ID and predecessor;
