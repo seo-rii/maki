@@ -23,9 +23,10 @@ guarded storage, then erase the source owner. Shared chunks preserve surviving
 aliases and copy into guarded storage; their library backing is erased on its
 final release. An empty response allocates no aggregate buffer.
 After a per-item or batch JSON response has been parsed into its owned guarded
-tree, the original guarded HTTP body is dropped before payload decoding starts.
-This shortens the overlap between the wire representation and decoded outputs;
-the tree still holds its encoded strings until extraction finishes.
+tree of selected values, the original guarded HTTP body is dropped before
+payload decoding starts. This shortens the overlap between the wire
+representation and decoded outputs; the tree still holds its encoded strings
+until extraction finishes.
 
 Focused allocation regressions observe the selected output immediately before
 deallocation and show that malformed Base64 and hex inputs no longer release a
@@ -75,15 +76,24 @@ copying, then erases and releases the old owner. `Bytes::from_owner` retains the
 request-body guard until the last HTTP body clone is released. Raw decryption
 responses transfer their owner directly to the caller.
 
-Response JSON is deserialized directly into a guarded tree. Every completed
-string and object key is copied into a `SecretBuffer` allocated before its
-first byte is written, with page locking when enabled and successful. Both
-per-item and batched responses use that tree. Dropping an incomplete object or
-array after a syntax error erases its completed strings and keys; duplicate
-values and discarded duplicate keys are erased as they are replaced. The tree
-also owns cleanup after success, response-contract errors and unwinding, rather
-than relying on a wipe after parsing completes. JSON pointer lookup, duplicate
-last-value-wins behavior, number validation and recursion limits are unchanged.
+Response JSON is deserialized directly into a guarded tree that keeps only
+what the response mapping reads: the payload string and echoed unit index at
+their configured pointers, the objects and arrays on the way to them, and for
+a batch at most as many elements as were requested (later elements are only
+counted). Every kept string and object key is copied into a `SecretBuffer`
+allocated before its first byte is written, with page locking when enabled and
+successful. Both per-item and batched responses use that tree. Every other
+string, key, number and container is validated exactly like a kept one
+(syntax, UTF-8, number range and the recursion limit) but never copied out of
+the guarded wire body. A body of many small values therefore cannot multiply
+its size in memory: kept strings never exceed the body, and the structure adds
+a fixed amount per configured pointer and requested batch element. Dropping an
+incomplete object or array after a syntax error erases its completed kept
+strings and keys; duplicate values and discarded duplicate keys are erased as
+they are replaced. The tree also owns cleanup after success, response-contract
+errors and unwinding, rather than relying on a wipe after parsing completes.
+JSON pointer lookup along the configured pointers, duplicate last-value-wins
+behavior, number validation and recursion limits are unchanged.
 
 Request mapping keys, credential-value strings and combined identity PEMs still
 have zeroizing ownership without per-allocation page locks. Plain source
@@ -99,8 +109,15 @@ The 2026-10-07 response-tree regressions first observed unzeroized deallocation
 of completed strings in malformed JSON and of duplicate keys and values through
 the real per-item response parser. They now require those allocations to be
 erased, together with successful response trees and a batch's earlier decoded
-payloads when a later item fails. Focused checks cover response key/value page
-locks, JSON pointer compatibility, malformed UTF-8 and recursion limits.
+payloads when a later item fails. Since the parser keeps only selected values,
+they place the sensitive strings and keys on configured pointers and also
+require unselected ones never to be copied. Focused checks cover response
+key/value page locks, JSON pointer compatibility with the complete document,
+malformed UTF-8 and recursion limits inside skipped values.
+`maki-crypto-http/tests/review_response_memory.rs` bounds the peak heap of one
+response within the default cap to three times its body size, which covers
+the guarded body and its growth while chunks arrive; a body of empty arrays
+previously held 43 times its size as tree nodes.
 
 The 2026-09-20 follow-up passed the complete `maki-crypto` and
 `maki-crypto-http` suites (175 passing invocations, two ignored) and strict

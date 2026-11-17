@@ -356,6 +356,36 @@ pub struct RespSpec {
     pub item_index_path: Option<String>,
 }
 
+impl RespSpec {
+    /// What a single-item response is read for: its payload and echo.
+    fn single_selection(&self) -> response::Selection {
+        let mut selection = response::Selection::default();
+        if let Some(path) = &self.data_path {
+            selection.string(path);
+        }
+        if let Some(path) = &self.item_index_path {
+            selection.number(path);
+        }
+        selection
+    }
+
+    /// What a batch response is read for: up to `count` elements at
+    /// `items_path`, each with its payload (the element itself without a
+    /// `data_path`) and echo. Further elements are only counted.
+    fn batch_selection(&self, count: usize) -> response::Selection {
+        let mut element = response::Selection::default();
+        element.string(self.data_path.as_deref().unwrap_or(""));
+        if let Some(path) = &self.item_index_path {
+            element.number(path);
+        }
+        let mut selection = response::Selection::default();
+        if let Some(path) = &self.items_path {
+            selection.elements(path, count, element);
+        }
+        selection
+    }
+}
+
 #[derive(Clone)]
 pub struct OpSpec {
     pub method: String,
@@ -460,6 +490,12 @@ impl std::fmt::Debug for HttpProviderSpec {
 }
 
 // ---------------------------------------------------------------- provider
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Encrypt,
+    Decrypt,
+}
 
 pub struct HttpCryptoProvider {
     client: reqwest::Client,
@@ -693,6 +729,32 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
     CryptoError::Retryable(format!("transport error: {e}"))
 }
 
+/// Whether an HTTP/1.x response body ends only when the connection closes
+/// (RFC 9112 §6.3). hyper reports an exact size for a Content-Length body and
+/// for a status or method without a body. Otherwise it decodes chunks when
+/// `chunked` is the final transfer coding (taking precedence over any
+/// Content-Length) and reads to EOF in every other case. Later protocol
+/// versions end each stream explicitly.
+fn close_delimited(response: &reqwest::Response) -> bool {
+    use reqwest::Version;
+    if !matches!(
+        response.version(),
+        Version::HTTP_09 | Version::HTTP_10 | Version::HTTP_11
+    ) || response.content_length().is_some()
+    {
+        return false;
+    }
+    let chunked = response
+        .headers()
+        .get_all(reqwest::header::TRANSFER_ENCODING)
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+    !chunked
+}
+
 fn classify_status(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
@@ -858,6 +920,16 @@ impl HttpCryptoProvider {
         if let Some(err) = classify_status(response.status(), response.headers()) {
             return Err(err);
         }
+        // A body that only the connection close ends cannot prove that it is
+        // complete: an endpoint dying mid-body sends the same FIN. Accepting
+        // it would turn a truncated ciphertext into an acknowledged write.
+        if close_delimited(&response) {
+            return Err(CryptoError::Contract(
+                "HTTP response has neither Content-Length nor chunked framing; \
+                 a connection close cannot prove its body complete"
+                    .into(),
+            ));
+        }
         if let Some(len) = response.content_length() {
             let len = usize::try_from(len)
                 .map_err(|_| CryptoError::Contract("response size overflow".into()))?;
@@ -881,10 +953,10 @@ impl HttpCryptoProvider {
         match op.response.kind {
             RespKind::Raw => Ok(body),
             RespKind::Json => {
-                let value = response::parse(body.expose())
+                let value = response::parse(body.expose(), &op.response.single_selection())
                     .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
-                // The tree owns its strings; release the duplicate wire body
-                // before allocating the decoded payload.
+                // The tree owns the strings it kept; release the duplicate
+                // wire body before allocating the decoded payload.
                 drop(body);
                 if let Some(index_path) = &op.response.item_index_path {
                     let echoed = value.pointer(index_path).and_then(|v| v.as_u64());
@@ -958,6 +1030,7 @@ impl HttpCryptoProvider {
     async fn run_per_item(
         &self,
         op: &OpSpec,
+        direction: Direction,
         context: &CryptoContext,
         items: &[(u64, SecretBuffer)],
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
@@ -977,6 +1050,22 @@ impl HttpCryptoProvider {
                 }
             };
             let response = self.send(op, body, json).await?;
+            // The whole raw body becomes the unit's ciphertext, and nothing
+            // else in it distinguishes ciphertext from, say, a proxy's error
+            // page, so it must be at least as long as its plaintext. This
+            // belongs to the raw mapping, not to CheckedProvider: compact
+            // provider encodings are valid in general (BUG-049, BUG-053).
+            if direction == Direction::Encrypt
+                && op.response.kind == RespKind::Raw
+                && response.len() < payload.len()
+            {
+                return Err(CryptoError::Contract(format!(
+                    "raw encrypt response for unit {unit_index} is {} bytes, shorter than its \
+                     {}-byte plaintext",
+                    response.len(),
+                    payload.len()
+                )));
+            }
             out.push(self.parse_single(op, response, *unit_index)?);
         }
         Ok(out)
@@ -994,7 +1083,8 @@ impl HttpCryptoProvider {
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let encoded = request::encode_batch(fields, items_path, item_fields, context, items)?;
         let response = self.send(op, body_from(encoded), true).await?;
-        let value = response::parse(response.expose())
+        let selection = op.response.batch_selection(items.len());
+        let value = response::parse(response.expose(), &selection)
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;
         drop(response);
         Self::extract_batch(op, &value, items)
@@ -1011,21 +1101,22 @@ impl HttpCryptoProvider {
             .items_path
             .as_deref()
             .ok_or_else(|| fatal("response items_path missing for batch layout"))?;
-        let elements = value
+        let (length, elements) = value
             .pointer(resp_items_path)
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
                 CryptoError::Contract(format!("response missing array at {resp_items_path:?}"))
             })?;
-        if elements.len() != items.len() {
+        // The batch selection keeps each element up to the requested count,
+        // so an array of exactly that length was kept whole, in order.
+        if length != items.len() || elements.len() != length {
             return Err(CryptoError::Contract(format!(
-                "batch response has {} element(s) for {} item(s)",
-                elements.len(),
+                "batch response has {length} element(s) for {} item(s)",
                 items.len()
             )));
         }
         let mut out = Vec::with_capacity(items.len());
-        for (i, element) in elements.iter().enumerate() {
+        for (i, (_, element)) in elements.iter().enumerate() {
             if let Some(index_path) = &op.response.item_index_path {
                 let echoed = element.pointer(index_path).and_then(|v| v.as_u64());
                 if echoed != Some(items[i].0) {
@@ -1049,10 +1140,14 @@ impl HttpCryptoProvider {
 
     async fn run_op(
         &self,
-        op: &OpSpec,
+        direction: Direction,
         context: &CryptoContext,
         items: &[(u64, SecretBuffer)],
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
+        let op = match direction {
+            Direction::Encrypt => &self.spec.encrypt,
+            Direction::Decrypt => &self.spec.decrypt,
+        };
         match &op.body {
             BodySpec::Json {
                 fields,
@@ -1062,7 +1157,7 @@ impl HttpCryptoProvider {
                 self.run_batched(op, context, items, items_path, fields, item_fields)
                     .await
             }
-            _ => self.run_per_item(op, context, items).await,
+            _ => self.run_per_item(op, direction, context, items).await,
         }
     }
 
@@ -1324,7 +1419,7 @@ impl CryptoProvider for HttpCryptoProvider {
             .iter()
             .map(|i| (i.unit_index, i.data.duplicate()))
             .collect();
-        let results = self.run_op(&self.spec.encrypt, context, &payloads).await?;
+        let results = self.run_op(Direction::Encrypt, context, &payloads).await?;
         Ok(results
             .into_iter()
             .zip(items.iter())
@@ -1344,7 +1439,7 @@ impl CryptoProvider for HttpCryptoProvider {
             .iter()
             .map(|i| (i.unit_index, SecretBuffer::from_slice(&i.data)))
             .collect();
-        let results = self.run_op(&self.spec.decrypt, context, &payloads).await?;
+        let results = self.run_op(Direction::Decrypt, context, &payloads).await?;
         Ok(results
             .into_iter()
             .zip(items.iter())
