@@ -249,9 +249,12 @@ symptom.
 
 Checkpoints are not only a shutdown step. A background worker checkpoints when
 the journal crosses a size watermark, when backing free space drops below the
-checkpoint reserve, and on a time interval (syncing unsynced records first). The
+checkpoint reserve, and on a time interval, syncing unsynced records first so
+each pass applies them. The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims
-inline at the hard journal limit, and refuses writes with ENOSPC unless fresh
+inline at the hard journal limit (other writes queue behind an inline reclaim,
+so the space it frees goes to the write that ran it), and refuses writes with
+ENOSPC unless fresh
 backing space covers the emergency reserve, configured checkpoint headroom,
 projected record bytes, and all segment headers created by that write, or when
 the journal cannot be

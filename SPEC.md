@@ -1277,8 +1277,8 @@ fsync journal directory
 Checkpoints MUST run automatically, not only at detach. Triggers:
 
 ```text
-journal bytes on disk >= journal_max_bytes / 2       (background worker)
-backing free space   <  checkpoint_reserve_bytes     (background worker)
+journal bytes on disk >= journal_max_bytes / 2       (background worker, syncs first)
+backing free space   <  checkpoint_reserve_bytes     (background worker, syncs first)
 interval elapsed with unapplied records              (background worker, syncs first)
 write would exceed journal_max_bytes                 (inline, before the append)
 ```
@@ -1290,7 +1290,10 @@ projected journal footprint of that write, MUST fail with ENOSPC; reads
 continue. This admission check is enabled when
 `journal_emergency_reserve_bytes` is nonzero. An unavailable or failed
 free-space query
-MUST fail write admission while that reserve is enabled. A failed checkpoint
+MUST fail write admission while that reserve is enabled. Space an inline
+checkpoint frees MUST remain available to the write that ran it: other writes
+wait behind that write instead of appending into it, so concurrent writers
+cannot turn a reclaimable bound into ENOSPC. A failed checkpoint
 MUST be visible as a degraded volume state until a later checkpoint succeeds.
 
 ---

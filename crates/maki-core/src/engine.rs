@@ -19,9 +19,11 @@
 //!   journal sync when unsynced bytes exceed their limit, checkpoints inline
 //!   at the hard journal limit, and refuses writes (ENOSPC) when the backing
 //!   cannot preserve its emergency reserve and configured checkpoint headroom
-//!   after the exact next append or the journal cannot be reclaimed. A
-//!   failed reclaim puts the engine in a `Degraded` state that the next
-//!   successful checkpoint clears.
+//!   after the exact next append or the journal cannot be reclaimed. A write
+//!   that reclaims inline holds a FIFO reclaim gate until it has appended and
+//!   other writes queue behind it, so the space its checkpoint frees is its
+//!   own. A failed reclaim puts the engine in a `Degraded` state that the
+//!   next successful checkpoint clears.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -146,7 +148,8 @@ pub struct AttachIdentity {
 /// How the journal is kept bounded (SPEC §26, §30; review M-004).
 #[derive(Debug, Clone)]
 pub struct CheckpointPolicy {
-    /// Journal bytes on disk at which the background worker checkpoints.
+    /// Journal bytes on disk at which the background worker checkpoints,
+    /// syncing unsynced records first so they can be applied.
     pub journal_high_watermark_bytes: u64,
     /// Hard limit on journal bytes on disk. A write that would exceed it
     /// first syncs and checkpoints inline; if that cannot reclaim enough
@@ -161,7 +164,8 @@ pub struct CheckpointPolicy {
     pub emergency_reserve_bytes: u64,
     /// Backing free space preserved as checkpoint headroom after the next
     /// journal append when emergency-reserve admission is enabled. The worker
-    /// also checkpoints eagerly below this value (0 disables both behaviors).
+    /// also checkpoints eagerly below this value, syncing unsynced records
+    /// first (0 disables both behaviors).
     pub low_space_checkpoint_bytes: u64,
     /// The worker checkpoints at least this often while anything is
     /// pending; unsynced records are synced first so they can be applied.
@@ -289,9 +293,10 @@ mod unit_lock_tests {
 /// always asks the backing again while holding the exclusive volume lock.
 const FREE_SPACE_CACHE_TTL: Duration = Duration::from_secs(1);
 
-/// Inline reclaim rounds one write may take before ENOSPC. Each round syncs
-/// the journal and checkpoints; more than one is needed only when other
-/// writers append volatile records while a round runs.
+/// Inline reclaims one write may run before ENOSPC. A write reclaims only
+/// while it holds the reclaim gate, so no other write appends between its
+/// journal sync and its retry, and one checkpoint covers every appended
+/// record; the bound only guarantees that the retry loop terminates.
 const MAX_RECLAIM_ROUNDS: usize = 4;
 
 struct EngineInner {
@@ -324,6 +329,16 @@ struct EngineInner {
     checkpoint_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Serializes snapshots through publication, including inline reclaim.
     checkpoint_gate: Arc<AsyncMutex<()>>,
+    /// Inline-reclaim fairness (SPEC §26): a write over the journal or
+    /// overlay bound holds this gate from its refusal until it has appended,
+    /// and every other write queues behind it (FIFO) instead of appending, so
+    /// the space its checkpoint frees is its own. Only admitted requests wait
+    /// here, so the queue is bounded by `max_active_callbacks`.
+    reclaim_gate: Arc<AsyncMutex<()>>,
+    /// Writes holding or queued for `reclaim_gate` (live [`ReclaimTicket`]s).
+    /// Incremented only under the volume write lock, where admission reads
+    /// it: zero there proves that no write is reclaiming or waiting to.
+    reclaim_queue: AtomicUsize,
     state: parking_lot::Mutex<EngineState>,
     checkpoints_total: AtomicU64,
     checkpoint_failures_total: AtomicU64,
@@ -488,6 +503,69 @@ fn enospc(msg: impl Into<String>) -> CoreError {
 /// its append-footprint accounting must agree on this, so both go through here.
 fn record_len(ct: &CiphertextUnit) -> u64 {
     maki_format::journal::RECORD_HEADER_SIZE as u64 + ct.data.len() as u64
+}
+
+/// One journal-admission pass of a request, under the volume write lock.
+enum Admission {
+    /// The request fits; [`Engine::journal_request`] returns it once the
+    /// records are appended.
+    Admit,
+    /// Another write holds or awaits the reclaim gate: release the volume
+    /// lock, wait for the gate ([`ReclaimTicket::wait`]), then retry.
+    Queue,
+    /// Over the journal or overlay bound while holding the reclaim gate, and
+    /// the journal is synced: release the volume lock, checkpoint, retry.
+    Reclaim,
+}
+
+/// A write's place in the inline-reclaim queue
+/// ([`EngineInner::reclaim_gate`]). It joins the queue under the volume write
+/// lock, so every later admission sees it. Dropping it (the write appended,
+/// failed, or its task was dropped) releases the gate and then leaves the
+/// queue, so an empty queue also proves the gate free.
+struct ReclaimTicket {
+    inner: Arc<EngineInner>,
+    gate: Option<OwnedMutexGuard<()>>,
+}
+
+impl ReclaimTicket {
+    /// Join the queue; the caller holds the volume write lock.
+    fn join(inner: &Arc<EngineInner>) -> Self {
+        inner.reclaim_queue.fetch_add(1, Ordering::SeqCst);
+        Self {
+            inner: inner.clone(),
+            gate: None,
+        }
+    }
+
+    fn holds_gate(&self) -> bool {
+        self.gate.is_some()
+    }
+
+    /// Take the gate if it is free, without waiting. A free gate is never
+    /// taken past a queued waiter: the async mutex hands a released gate to
+    /// its oldest waiter directly.
+    fn try_enter(&mut self) -> bool {
+        if self.gate.is_none() {
+            self.gate = self.inner.reclaim_gate.clone().try_lock_owned().ok();
+        }
+        self.holds_gate()
+    }
+
+    /// Wait for the gate in FIFO order. Never called with the volume lock
+    /// held: the holder needs it to reclaim and append.
+    async fn wait(&mut self) {
+        if self.gate.is_none() {
+            self.gate = Some(self.inner.reclaim_gate.clone().lock_owned().await);
+        }
+    }
+}
+
+impl Drop for ReclaimTicket {
+    fn drop(&mut self) {
+        drop(self.gate.take());
+        self.inner.reclaim_queue.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The volume write lock, held by a request, the checkpoint or the worker.
@@ -688,6 +766,8 @@ impl Engine {
             checkpoint_stop: AtomicBool::new(false),
             checkpoint_worker: AsyncMutex::new(None),
             checkpoint_gate: Arc::new(AsyncMutex::new(())),
+            reclaim_gate: Arc::new(AsyncMutex::new(())),
+            reclaim_queue: AtomicUsize::new(0),
             state: parking_lot::Mutex::new(EngineState::Ready),
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
@@ -1288,24 +1368,32 @@ impl Engine {
         // Own the orchestration as well as each storage operation. Inline
         // reclaim releases the volume lock while applying checkpoint data;
         // cancelling the caller must not release its write/admission guards.
+        // The orchestration also owns the request's reclaim ticket: it leaves
+        // the queue when the task ends, however the caller is cancelled.
         let engine = self.clone();
         tokio::spawn(async move {
             let cts = Arc::new(cts);
             let (_admission, _guards) = (admission, guards);
-            for round in 0..=MAX_RECLAIM_ROUNDS {
-                let reclaimed = round > 0;
-                let last_round = round == MAX_RECLAIM_ROUNDS;
+            let mut ticket: Option<ReclaimTicket> = None;
+            let mut reclaims = 0;
+            loop {
                 let mut volume = engine.inner.write_volume().await?;
                 let io_engine = engine.clone();
                 let io_cts = cts.clone();
                 let io_admission = _admission.clone();
                 let io_guards = _guards.clone();
-                let written = storage_task(move || {
+                let mut io_ticket = ticket.take();
+                let (outcome, io_ticket) = storage_task(move || {
                     let (_admission, _guards) = (io_admission, io_guards);
-                    let outcome =
-                        io_engine.journal_request(&mut volume, &io_cts, fua, reclaimed, last_round);
+                    let outcome = io_engine.journal_request(
+                        &mut volume,
+                        &io_cts,
+                        fua,
+                        &mut io_ticket,
+                        reclaims,
+                    );
                     io_engine.inner.note_journal(&volume);
-                    if matches!(outcome, Ok(true))
+                    if matches!(outcome, Ok(Admission::Admit))
                         && (volume.journal_total_bytes()
                             >= io_engine.inner.policy.journal_high_watermark_bytes
                             || io_engine.inner.overlay_above_watermark(&volume)
@@ -1313,31 +1401,42 @@ impl Engine {
                     {
                         io_engine.inner.checkpoint_notify.notify_one();
                     }
-                    outcome
+                    (outcome, io_ticket)
                 })
-                .await??;
-                if written {
-                    return Ok(());
+                .await?;
+                ticket = io_ticket;
+                match outcome? {
+                    Admission::Admit => return Ok(()),
+                    Admission::Queue => {
+                        // A queued pass always leaves a ticket behind.
+                        if let Some(ticket) = ticket.as_mut() {
+                            ticket.wait().await;
+                        }
+                    }
+                    Admission::Reclaim => {
+                        // Never wait for the checkpoint gate while holding
+                        // volume.
+                        engine.inner.checkpoint().await?;
+                        reclaims += 1;
+                    }
                 }
-                // Never wait for the checkpoint gate while holding volume.
-                engine.inner.checkpoint().await?;
             }
-            unreachable!("the last unsuccessful admission round returns ENOSPC")
         })
         .await
         .map_err(|error| std::io::Error::other(format!("journal task failed: {error}")))?
     }
 
     /// Admit, append and publish one request's records; with `fua`, sync
-    /// them (SPEC §24) and account the FUA latency.
+    /// them (SPEC §24) and account the FUA latency. Returns
+    /// [`Admission::Admit`] once appended; otherwise nothing was appended.
     fn journal_request(
         &self,
         volume: &mut Volume,
         cts: &[CiphertextUnit],
         fua: bool,
-        reclaimed: bool,
-        last_round: bool,
-    ) -> Result<bool, CoreError> {
+        ticket: &mut Option<ReclaimTicket>,
+        reclaims: usize,
+    ) -> Result<Admission, CoreError> {
         // Already-zero trim hints must not reserve storage or consume journal
         // capacity. All records in a request are either writes or tombstones.
         // Only a header that proves the unit unwritten skips it: the payload
@@ -1357,8 +1456,11 @@ impl Engine {
         } else {
             cts
         };
-        if !cts.is_empty() && !self.admit_journal(volume, cts, reclaimed, last_round)? {
-            return Ok(false);
+        if !cts.is_empty() {
+            match self.admit_journal(volume, cts, ticket, reclaims)? {
+                Admission::Admit => {}
+                refused => return Ok(refused),
+            }
         }
         for ct in cts {
             if volume
@@ -1387,7 +1489,7 @@ impl Engine {
                 .fua_latency
                 .record(self.inner.clock.now().saturating_sub(started));
         }
-        Ok(true)
+        Ok(Admission::Admit)
     }
 
     /// Journal admission for one request (SPEC §30 "journal queue"; review
@@ -1402,26 +1504,35 @@ impl Engine {
     /// exact append footprint (records + any new segment headers), recomputed
     /// after reclaim because reclaim can change the active segment (R08).
     ///
-    /// A request that still does not fit after a reclaim is refused only
-    /// when nothing more can be reclaimed, i.e. a checkpoint already covers
-    /// every appended record. A checkpoint retires records up to the horizon
-    /// it captured, so records another writer appended while the reclaim ran
-    /// are still held, whether they are volatile (they are synced first) or
-    /// already durable through FUA/FLUSH (`durable == appended` proves
-    /// nothing, BUG-089); a further round is taken, up to
-    /// [`MAX_RECLAIM_ROUNDS`] (`last_round`).
+    /// A request over the journal or overlay bound reclaims only while it
+    /// holds the reclaim gate, and every other write queues behind the gate
+    /// while anyone holds or awaits it ([`Admission::Queue`]). Without the
+    /// gate, writers that took the volume lock between a reclaim and its
+    /// retry appended into the space it freed, and a write could exhaust its
+    /// rounds with ENOSPC although the bound was reclaimable throughout. With
+    /// it, nothing is appended between the holder's journal sync and its
+    /// retry, so the checkpoint in between covers every appended record.
+    ///
+    /// A request that still does not fit after its own reclaim is refused
+    /// only when nothing more can be reclaimed, i.e. a checkpoint covers
+    /// every appended record (`durable == appended` proves nothing, BUG-089).
+    /// Should a reclaim ever leave newer records, a further round is taken,
+    /// up to [`MAX_RECLAIM_ROUNDS`].
     fn admit_journal(
         &self,
         volume: &mut Volume,
         cts: &[CiphertextUnit],
-        reclaimed: bool,
-        last_round: bool,
-    ) -> Result<bool, CoreError> {
-        let exhausted = |volume: &Volume| {
-            reclaimed
-                && (last_round
-                    || volume.checkpoint_sequence() >= volume.journal_appended_sequence())
-        };
+        ticket: &mut Option<ReclaimTicket>,
+        reclaims: usize,
+    ) -> Result<Admission, CoreError> {
+        // Appending while another write reclaims (or waits to) would take the
+        // space its checkpoint frees: queue behind it instead.
+        if !ticket.as_ref().is_some_and(ReclaimTicket::holds_gate)
+            && self.inner.reclaim_queue.load(Ordering::SeqCst) > 0
+            && !self.enter_reclaim_gate(ticket)
+        {
+            return Ok(Admission::Queue);
+        }
         let policy = &self.inner.policy;
         let footprint =
             |volume: &Volume| volume.journal_append_footprint(cts.iter().map(record_len));
@@ -1488,38 +1599,52 @@ impl Engine {
         let over_entries = self.inner.max_overlay_entries > 0
             && (volume.overlay_len() as u64).saturating_add(cts.len() as u64)
                 > self.inner.max_overlay_entries;
-        if over_bytes || over_entries {
-            if exhausted(volume) {
-                return Err(enospc(format!(
+        let over_overlay = over_bytes || over_entries;
+        let over_journal = volume
+            .journal_total_bytes()
+            .saturating_add(footprint(volume))
+            > policy.journal_max_bytes;
+        if !over_overlay && !over_journal {
+            return Ok(Admission::Admit);
+        }
+        if !self.enter_reclaim_gate(ticket) {
+            return Ok(Admission::Queue);
+        }
+        let exhausted = reclaims > 0
+            && (reclaims >= MAX_RECLAIM_ROUNDS
+                || volume.checkpoint_sequence() >= volume.journal_appended_sequence());
+        if exhausted {
+            return Err(if over_overlay {
+                enospc(format!(
                     "overlay at its limit ({} bytes / {} units held, limits {} bytes / {} \
                      units) and cannot be reclaimed",
                     volume.overlay_bytes(),
                     volume.overlay_len(),
                     self.inner.max_overlay_bytes,
                     self.inner.max_overlay_entries
-                )));
-            }
-            self.inner.sync_journal(volume)?;
-            return Ok(false);
-        }
-        if volume
-            .journal_total_bytes()
-            .saturating_add(footprint(volume))
-            > policy.journal_max_bytes
-        {
-            if exhausted(volume) {
-                return Err(enospc(format!(
+                ))
+            } else {
+                enospc(format!(
                     "journal at hard limit {} bytes and cannot be reclaimed",
                     policy.journal_max_bytes
-                )));
-            }
-            // Everything sealed becomes reclaimable once it is durable.
-            // The caller drops volume before acquiring the checkpoint gate,
-            // then repeats admission against current space and footprint.
-            self.inner.sync_journal(volume)?;
-            return Ok(false);
+                ))
+            });
         }
-        Ok(true)
+        // Everything sealed becomes reclaimable once it is durable, and the
+        // overlay retires what a checkpoint applies. The caller drops volume
+        // before acquiring the checkpoint gate, then repeats admission
+        // against current space and footprint.
+        self.inner.sync_journal(volume)?;
+        Ok(Admission::Reclaim)
+    }
+
+    /// Join the reclaim queue (once) and take its gate if that is possible
+    /// without waiting; the caller holds the volume write lock. `false`:
+    /// another write holds or awaits the gate, so this one must queue.
+    fn enter_reclaim_gate(&self, ticket: &mut Option<ReclaimTicket>) -> bool {
+        ticket
+            .get_or_insert_with(|| ReclaimTicket::join(&self.inner))
+            .try_enter()
     }
 
     /// Backing free space (`None` = unknown), allowing samples younger than
@@ -1960,10 +2085,16 @@ impl EngineInner {
         {
             return;
         }
-        // A checkpoint applies only durable records: when the trigger is
-        // the elapsed interval, the overlay bound or a refused write, sync
-        // first so the pass actually shrinks what it was woken for.
-        if (by_time || by_overlay || by_refusal) && durable < appended {
+        // A checkpoint applies only durable records: when the trigger is the
+        // journal watermark, low free space, the elapsed interval, the
+        // overlay bound or a refused write, sync first so the pass actually
+        // shrinks what it was woken for. Without it a volatile tail above
+        // the watermark made every write wake the worker into a checkpoint
+        // that applied nothing. This is the FLUSH barrier (durable proof
+        // included); it only makes acknowledged records durable sooner.
+        // Cleanup and reclamation passes act on covered state and need none.
+        let mut sync_failed = false;
+        if (by_size || by_space || by_time || by_overlay || by_refusal) && durable < appended {
             let Ok(mut volume) = self.write_volume().await else {
                 return;
             };
@@ -1974,8 +2105,19 @@ impl EngineInner {
             let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
             if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
+                // The sync is retried only after an interval (BUG-101). A
+                // failed sync does not advance the durable mark, so a
+                // checkpoint still applies only records that were durable
+                // before it. The watermark and low-space triggers exist to
+                // give journal and backing space back, and deleting covered
+                // sealed segments needs no sync: they still checkpoint what
+                // is durable, as they did before they synced first, so a
+                // journal whose syncs keep failing does not also stop that.
                 self.defer_checkpoint_retry();
-                return;
+                if !(by_size || by_space) {
+                    return;
+                }
+                sync_failed = true;
             }
         }
         if !self.checkpoint_stop.load(Ordering::SeqCst) {
@@ -1985,12 +2127,16 @@ impl EngineInner {
                     self.defer_checkpoint_retry();
                 }
                 Ok(_) => {
-                    *self.checkpoint_retry_at.lock() = None;
+                    // A checkpoint after a failed sync keeps that sync's
+                    // deferral: the next pass waits out the interval.
+                    if !sync_failed {
+                        *self.checkpoint_retry_at.lock() = None;
+                    }
                     let volume = self.volume.read().await;
                     *self.reclamation_retry_at.lock() = volume
                         .has_deferred_reclamation()
                         .then(|| self.clock.now() + self.policy.interval);
-                    if volume.has_pending_reclamation() {
+                    if !sync_failed && volume.has_pending_reclamation() {
                         // Continue this bounded sweep past failed ranges;
                         // retry those only after finishing the sweep and
                         // waiting out its independent interval.

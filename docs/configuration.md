@@ -620,12 +620,23 @@ times; it does not refresh them.
 | Setting | Enforced as |
 |---|---|
 | `backing.journal_segment_size` | Size at which the journal writer starts a new segment (4096 bytes to 1 GiB). It may be changed between attaches, lowered included: recovery accepts segments of any size up to that maximum |
-| `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
+| `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC only if that cannot make room (see the inline reclaim paragraph below) |
 | `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
 | `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; checked before every record, including inside one request. Must hold a maximum ciphertext plus its 32-byte record header |
-| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when a reclaim round can make no more room (up to four rounds: records other writers append during a round are synced and reclaimed in the next); the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
+| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when that reclaim cannot make room; the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
 | `limits.max_overlay_entries` (default 262144) | Units the overlay may hold, whatever their payload (a v3 discard tombstone has none but still costs an entry). Same inline-checkpoint and ENOSPC behaviour; must hold the largest request in crypto units, or be `0` to disable |
+
+An inline reclaim keeps what it frees for the write that ran it. From the
+moment a write is refused for the journal or overlay bound until it has
+appended, it holds a reclaim gate, and every other write or discard queues
+behind it in arrival order instead of appending; reads, FLUSH and the
+background worker do not wait. Only admitted requests queue, so
+`limits.max_active_callbacks` bounds the queue. Nothing is appended between
+the reclaiming write's journal sync and its retry, so its checkpoint covers
+every appended record, and ENOSPC means that the request does not fit even
+then. The validated minimums of both bounds are therefore sized for one
+maximal request, not one per concurrent callback.
 
 The hard journal limit also has a configuration-dependent minimum for forward
 progress after reclaim. It includes the largest request, the retained active
@@ -643,7 +654,11 @@ checkpoint applies durable records; a successful call that advances no sequence
 does not postpone the worker's periodic sync of pending writes. After a failed
 pass the worker waits one interval before it tries again, however many writes
 cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
-checkpoints inline, and a success clears the wait.
+checkpoints inline, and a success clears the wait. Each pass syncs unsynced
+records before it checkpoints; a failed sync counts as a failed pass, but a pass
+started by the watermark or by low free space still checkpoints the records
+that were durable before it (deleting the sealed segments they cover) and then
+waits, so a journal whose syncs keep failing still gives that space back.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
