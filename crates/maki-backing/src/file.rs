@@ -1,5 +1,6 @@
 //! Real-filesystem backing rooted at a volume directory.
 
+use std::ffi::{OsStr, OsString};
 #[cfg(any(not(target_os = "linux"), test))]
 use std::fs;
 use std::fs::File;
@@ -84,7 +85,9 @@ impl FileBacking {
     /// GC uses bounded, sorted pages after an exclusive name cursor and a
     /// pinned-directory retirement operation;
     /// neither operation is available on pathname-only development backends.
-    pub(crate) fn gc_entries(&self, after: Option<&str>) -> io::Result<Vec<String>> {
+    /// Pages hold exact entry names in byte order; anyone who can write the
+    /// root can add a name that is not UTF-8.
+    pub(crate) fn gc_entries(&self, after: Option<&OsStr>) -> io::Result<Vec<OsString>> {
         #[cfg(target_os = "linux")]
         {
             self.directory.gc_entries(after)
