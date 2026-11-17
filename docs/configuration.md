@@ -267,7 +267,8 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   in the endpoint URL);
 - the `keyring` credential source, which this build does not implement, the
   same credential name declared with different sources, a credential name the
-  loaders cannot read, and a credential `format` without exactly one `{}`
+  loaders cannot read or an `env` name no environment variable can have, and
+  a credential `format` without exactly one `{}`
   placeholder or on a reference that is not a header or metadata value (see
   [credentials](#credentials-and-secrets)).
 
@@ -337,6 +338,11 @@ A `credential` name, and the file name that ends a `file` path, may contain
 only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
 the loaders refuse any other name, so validation refuses it before a volume is
 created (a key's name is stored as the volume's immutable key identity).
+An `env` name is upper-cased, with `-` and `.` replaced by `_`, to form the
+variable name. It must not contain `=` or a NUL character, which no
+environment variable name can hold (a lookup of `A=B` would even return part
+of variable `A`); any other name is accepted, since the source is meant for
+development only.
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header

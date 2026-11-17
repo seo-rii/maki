@@ -1351,6 +1351,18 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
                  '.', '_' and '-' that does not start with '.'",
             ));
         }
+        // The development source reads `MAKI_CREDENTIAL_<NAME>`. No
+        // environment variable name holds '=' (it ends the name of every
+        // `NAME=value` entry) or NUL (it ends the entry), so such a name can
+        // never be set, and looking it up reads part of another variable:
+        // getenv("A=B") returns the rest of `A` after a leading "B=".
+        // Anything else an environment can hold stays valid.
+        "env" if c.name.contains(['=', '\0']) => {
+            return Err(invalid(
+                "env credential name must not contain '=' or NUL: no environment variable \
+                 name can hold them",
+            ));
+        }
         _ => {}
     }
     // Consumers split the template on `{}` and insert the credential at
