@@ -46,6 +46,9 @@ const TAIL_SEGMENT: u64 = 128 * UNIT;
 /// Three records per segment: the fourth write rolls, which seals and syncs
 /// the full segment.
 const SMALL_SEGMENT: u64 = 4096;
+/// Every record gets its own segment: each write rolls, which seals and syncs
+/// the record before it, so only the newest record is volatile.
+const ONE_RECORD_SEGMENT: u64 = UNIT;
 
 /// A manual clock that counts sleeps: the worker creates one at the top of
 /// every loop iteration, so a new sleep means its previous pass finished.
@@ -217,7 +220,10 @@ fn applied(stats: &EngineStats) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watermark_checkpoint_applies_a_volatile_tail() {
-    const WATERMARK: u64 = 8 * UNIT;
+    // Two one-record segments reach the watermark: from the second write on,
+    // every write seals a segment, crosses the watermark and wakes the
+    // worker. The clock never moves, so only the watermark triggers it.
+    const WATERMARK: u64 = 2 * UNIT;
     let backing = Arc::new(CrashableBacking::new());
     let clock = clock();
     let engine = engine(
@@ -231,32 +237,22 @@ async fn watermark_checkpoint_applies_a_volatile_tail() {
             low_space_checkpoint_bytes: 0,
             interval: INTERVAL,
         },
-        TAIL_SEGMENT,
+        ONE_RECORD_SEGMENT,
     )
     .await;
 
-    // Volatile writes up to the watermark; the clock never moves, so only
-    // the watermark can trigger the worker, first after the crossing write.
-    let mut unit = 0u64;
-    loop {
-        let sleeps = clock.sleeps.load(Ordering::SeqCst);
-        engine
-            .write(unit * UNIT, &[0x33; UNIT as usize], false)
-            .await
-            .unwrap();
-        unit += 1;
-        if engine.stats().await.journal_total_bytes >= WATERMARK {
-            clock.parked(sleeps + 1).await;
-            break;
-        }
-    }
+    // The first volatile write stays below the watermark.
+    engine
+        .write(0, &[0x33; UNIT as usize], false)
+        .await
+        .unwrap();
     let start = engine.stats().await;
-    assert!(
-        applied(&start),
-        "the watermark pass ran without applying the volatile tail: {start:?}"
-    );
+    assert!(start.journal_total_bytes < WATERMARK, "{start:?}");
+    assert_eq!(start.checkpoints_total, 0, "{start:?}");
 
-    // Each further volatile write wakes the worker; each pass must apply it.
+    // Each further volatile write wakes the worker; each pass must apply
+    // the newest record, which only the pass's own sync makes durable.
+    let mut unit = 1u64;
     for write in 0..20u64 {
         let sleeps = clock.sleeps.load(Ordering::SeqCst);
         engine
@@ -274,7 +270,7 @@ async fn watermark_checkpoint_applies_a_volatile_tail() {
         );
     }
     for written in 0..unit {
-        let expected = if written < unit - 20 { 0x33 } else { 0x44 };
+        let expected = if written == 0 { 0x33 } else { 0x44 };
         assert_eq!(
             engine.read(written * UNIT, UNIT as usize).await.unwrap(),
             vec![expected; UNIT as usize]
