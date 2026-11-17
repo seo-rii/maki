@@ -170,7 +170,10 @@ have been pruned; checkpointing does not lower the horizon. The reverse cannot
 happen: a checkpoint only consumes records both copies attest, so a checkpoint
 state above the proof's horizon is refused as damage by recovery and by the
 deep check, before any repair. Accepting it would treat the acknowledged
-records between the two as already applied.
+records between the two as already applied. A covered proof is not matched
+against the journal, but when newer records survive, the record end recovery
+publishes for them must lie after the proof's stored location; a proof naming
+a later segment or record end is refused the same way.
 
 Unproven final-tail bytes may be discarded after a crash. Intact later records
 do not prove that earlier damaged bytes were durable: unsynced sectors may

@@ -1370,7 +1370,10 @@ above the proof's horizon is damage, not a crash state. Recovery and the deep
 check MUST refuse it before any recovery write. They MUST likewise refuse a
 recovered durable sequence or highest segment index (of a surviving segment,
 the proof or the advisory mark) that leaves the resumed writer no sequence for
-one more record or no index for one more segment.
+one more record or no index for one more segment. When records above a covered
+proof survive, the record end recovery publishes for them MUST follow the
+proof's stored location; a covered proof naming a later segment or record end
+is damage and MUST be refused the same way.
 
 The first scan streams segment data and retains no replay payloads. After all
 durability checks and repairs succeed, a second scan replays accepted records

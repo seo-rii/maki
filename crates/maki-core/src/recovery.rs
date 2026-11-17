@@ -328,9 +328,7 @@ fn recover_with_replay(
     // checkpoint already covers the old proof's segment, retain its location;
     // it is valid for that segment to have been pruned.
     if scan.durable_sequence > durable_proof.durable_sequence {
-        if let Some(last) = scan.segments.iter().rev().find(|segment| {
-            segment.record_count > 0 && segment.last_sequence() == scan.durable_sequence
-        }) {
+        if let Some(last) = horizon_end(&scan.segments, scan.durable_sequence) {
             durable_proof.durable_sequence = scan.durable_sequence;
             durable_proof.segment_index = last.index;
             durable_proof.durable_size = last.size;
@@ -997,6 +995,29 @@ fn scan_journal_with_proof(
         }
     }
 
+    // Recovery publishes the accepted horizon as the new proof, whose record
+    // end must follow the stored one (`DurableProof::follows`). A proof the
+    // checkpoint covers is not matched against the journal above it, so
+    // refuse here, read-only, a stored location at or beyond the end of the
+    // newer records: segment indexes only grow and a proof names its own
+    // record end, so no writer leaves one, and the deep check must refuse
+    // what recovery refuses.
+    if let Some(proof) = proof.filter(|proof| durable_sequence > proof.durable_sequence) {
+        if let Some(end) = horizon_end(&segments, durable_sequence) {
+            if (end.index, end.size) <= (proof.segment_index, proof.durable_size) {
+                return Err(RecoveryError::Corrupt(format!(
+                    "durable proof for sequence {} names segment {} byte {}, at or beyond \
+                     the end of the newer journal records (segment {} byte {})",
+                    proof.durable_sequence,
+                    proof.segment_index,
+                    proof.durable_size,
+                    end.index,
+                    end.size
+                )));
+            }
+        }
+    }
+
     let (replay, replay_units) = replay.into_parts();
     Ok(JournalScan {
         durable_sequence,
@@ -1029,4 +1050,13 @@ pub fn load_durable_mark(backing: &Arc<dyn Backing>) -> Result<Option<DurableMar
         Err(e) => return Err(RecoveryError::Io(e)),
     }
     Ok(DurableMark::decode(&buf).ok())
+}
+
+/// The surviving segment whose records end at `sequence`: the record end
+/// recovery publishes in the durable proof when it adopts that horizon.
+fn horizon_end(segments: &[SegmentInfo], sequence: u64) -> Option<&SegmentInfo> {
+    segments
+        .iter()
+        .rev()
+        .find(|segment| segment.record_count > 0 && segment.last_sequence() == sequence)
 }
