@@ -35,7 +35,8 @@
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
-use maki_format::ab::AbStore;
+use maki_format::ab::{AbRecord, AbStore};
+use maki_format::canary::KeyCanary;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
@@ -44,8 +45,8 @@ use maki_format::journal::{
 };
 use maki_format::layout;
 use maki_format::superblock::{
-    load_volume_superblock, persist_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2,
-    SUPERBLOCK_VERSION_V3,
+    load_volume_superblock, persist_volume_superblock, Superblock, VolumeSuperblock,
+    SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
 };
 use maki_format::FormatError;
 
@@ -241,6 +242,9 @@ fn recover_with_replay(
         replay,
         progress,
     )?;
+    // This recovery, the attach after it and later checkpoints store A/B
+    // metadata; refuse a generation that leaves no room before any write.
+    check_metadata_generations(backing, &store)?;
     // The superblock is the volume's commit point; every repair below, and
     // the resumed writer, depends on it. A failed or interrupted creation, or
     // a restart, can hand recovery a copy that exists only in the page cache
@@ -1059,4 +1063,73 @@ fn horizon_end(segments: &[SegmentInfo], sequence: u64) -> Option<&SegmentInfo> 
         .iter()
         .rev()
         .find(|segment| segment.record_count > 0 && segment.last_sequence() == sequence)
+}
+
+/// The highest A/B metadata generation recovery accepts: the top quarter of
+/// the generation space is refused. Every store advances a record's
+/// generation by one from zero, so no writer comes near it, and a larger
+/// CRC-valid generation is damage. The bound sits `2^62` stores below the
+/// store's own exhaustion check, so no attach, replay or later checkpoint
+/// can reach that check, however many stores the journal makes it perform:
+/// the read-only deep check can then refuse exactly what recovery refuses,
+/// without predicting how often each record is stored. It also sits `2^62`
+/// above `i64::MAX`, so a damaged generation at that common boundary value
+/// keeps working instead of crossing the bound after a few stores.
+const MAX_METADATA_GENERATION: u64 = u64::MAX - (1 << 62);
+
+/// Refuse, read-only, A/B metadata whose raw generation (as a store ranks
+/// it) is above [`MAX_METADATA_GENERATION`]: the superblock, checkpoint
+/// state, durable proof, key canary, shard catalog and each loaded shard's
+/// allocation and discard maps. Recovery runs this before its first write;
+/// the deep check reports the same refusal.
+pub(crate) fn check_metadata_generations(
+    backing: &Arc<dyn Backing>,
+    store: &SlotStore,
+) -> Result<(), RecoveryError> {
+    fn highest<T: AbRecord>(
+        backing: &Arc<dyn Backing>,
+        a: &str,
+        b: &str,
+    ) -> Result<Option<u64>, RecoveryError> {
+        let (a, b) = AbStore::new(a, b).raw_generations::<T>(backing.as_ref())?;
+        Ok(a.max(b))
+    }
+    let mut pairs = Vec::new();
+    for (what, generation) in [
+        (
+            "superblock",
+            highest::<VolumeSuperblock>(backing, layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)?,
+        ),
+        (
+            "checkpoint state",
+            highest::<CheckpointState>(backing, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B)?,
+        ),
+        (
+            "durable proof",
+            highest::<DurableProof>(
+                backing,
+                maki_format::durable_proof::DURABLE_PROOF_A,
+                maki_format::durable_proof::DURABLE_PROOF_B,
+            )?,
+        ),
+        (
+            "key canary",
+            highest::<KeyCanary>(backing, layout::KEY_CANARY_A, layout::KEY_CANARY_B)?,
+        ),
+    ] {
+        if let Some(generation) = generation {
+            pairs.push((what.to_string(), generation));
+        }
+    }
+    pairs.extend(store.metadata_generations()?);
+    if let Some((what, generation)) = pairs
+        .into_iter()
+        .find(|(_, generation)| *generation > MAX_METADATA_GENERATION)
+    {
+        return Err(RecoveryError::Corrupt(format!(
+            "{what}: A/B generation {generation} is above {MAX_METADATA_GENERATION}; every store \
+             advances it by one, so no writer produces it, and later stores could exhaust it"
+        )));
+    }
+    Ok(())
 }

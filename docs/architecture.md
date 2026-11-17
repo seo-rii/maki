@@ -97,7 +97,12 @@ Before touching it, the store rewrites the preserved, typed-valid copy's exact
 bytes without truncation, synchronizes that file, and synchronizes its parent
 directory. Only then does it advance the generation, write the replacement,
 and synchronize the new contents. The caller must synchronize the replacement's
-directory entry when it creates a file.
+directory entry when it creates a file. Each store advances the generation by
+one, and recovery and the deep check refuse a volume whose A/B metadata carries
+a CRC-valid generation in the top quarter of the generation space (above
+`u64::MAX - 2^62`) before any recovery write: no writer produces one, and
+`2^62` stores below the store's own exhaustion check no attach, replay or later
+checkpoint can exhaust a generation.
 
 This preservation step also runs after a failed store or a process restart:
 readable, CRC-valid bytes may still be volatile, and writeback errors can clear

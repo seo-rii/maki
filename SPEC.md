@@ -1944,9 +1944,12 @@ panicking. Geometry uses checked arithmetic. Superblocks, allocation maps,
 shard catalogs, slots, journal records, and checkpoint state use versioned,
 CRC-protected encodings with frozen golden vectors.
 
-A/B metadata MUST fall back to the highest valid generation. Torn final journal
-tails may be truncated; corruption before a valid successor record MUST refuse
-recovery.
+A/B metadata MUST fall back to the highest valid generation. Each store advances
+a generation by one; recovery and the deep check MUST refuse, before any
+recovery write, A/B metadata (superblock, shard catalog, allocation and discard
+maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
+is above `u64::MAX - 2^62`. Torn final journal tails may be truncated;
+corruption before a valid successor record MUST refuse recovery.
 
 ---
 

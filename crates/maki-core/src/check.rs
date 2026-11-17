@@ -25,8 +25,8 @@ use maki_format::FormatError;
 use crate::error::CoreError;
 use crate::journal::effective_segment_size;
 use crate::recovery::{
-    acquire_lock, load_checkpoint_state, load_durable_mark, load_superblock, summarize_journal,
-    JournalRepair, RecoveryError,
+    acquire_lock, check_metadata_generations, load_checkpoint_state, load_durable_mark,
+    load_superblock, summarize_journal, JournalRepair, RecoveryError,
 };
 use crate::store::SlotStore;
 
@@ -199,6 +199,14 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     let mut unrecoverable = 0u64;
     match SlotStore::open(backing.clone(), superblock.geometry.clone()) {
         Ok(store) => {
+            // The A/B generations recovery checks before its first write.
+            match check_metadata_generations(&backing, &store) {
+                Ok(()) => {}
+                Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
+                    return Err(CoreError::Io(e))
+                }
+                Err(e) => report.errors.push(e.to_string()),
+            }
             let mut checked = 0u64;
             let mut probed = 0u64;
             let listed = store.allocated_units().map(|unit| (unit, true));
