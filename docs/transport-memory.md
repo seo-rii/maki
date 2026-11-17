@@ -253,6 +253,19 @@ to the caller. Private Debug output redacts bytes. Public `CryptoItem`,
 wire encoding; external callers using those public structs are responsible
 for their own allocation lifetime.
 
+The response decoder knows how many items the request carried and refuses the
+first item beyond that count before decoding it, as a receive-contract error
+charged to the endpoint; items already decoded are erased with the rejected
+response. An empty item is two bytes on the wire but a whole guarded item in
+memory, so collecting every item a message within `max_message_bytes` can
+carry before the count check held up to 49 times the message in heap.
+Unknown fields were, and still are, skipped without allocating. A response
+with fewer items, or an item echoing the wrong unit, still fails the existing
+checks after decoding.
+`maki-crypto-grpc/tests/review_response_memory.rs` bounds the peak heap of one
+response within the default message cap to three times the message; it now
+measures about 1.3 times, which is tonic's message buffer and its growth.
+
 The private item is page-lock-capable before its first decoded byte is written,
 and retains that owner through rejection, cancellation and successful transfer.
 Tonic's encoded/decoded buffers and HTTP framing buffers remain separate
