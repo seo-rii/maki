@@ -116,6 +116,10 @@ pub struct JournalScan {
     /// Units with at least one such record, when the scan was asked to
     /// collect units instead of payloads (`summarize_journal`).
     pub replay_units: std::collections::BTreeSet<u64>,
+    /// The subset of `replay_units` whose newest such record carries
+    /// ciphertext (not a v3 discard tombstone): after replay their slots
+    /// hold data.
+    pub replay_written: std::collections::BTreeSet<u64>,
     pub repairs: Vec<JournalRepair>,
     /// Whether a durable mark was found for the final segment.
     pub mark: Option<DurableMark>,
@@ -139,8 +143,12 @@ enum ReplayRecords {
     Discard,
     /// Only the units that have an uncovered replay record: what the deep
     /// checker needs to tell recoverable slot damage from unrecoverable
-    /// damage (R4-004). One `u64` per distinct unit, no payloads.
-    Units(std::collections::BTreeSet<u64>),
+    /// damage (R4-004), and which of them hold ciphertext after replay (the
+    /// key-canary verdict). At most two `u64` per distinct unit, no payloads.
+    Units {
+        units: std::collections::BTreeSet<u64>,
+        written: std::collections::BTreeSet<u64>,
+    },
 }
 
 impl ReplayRecords {
@@ -148,20 +156,33 @@ impl ReplayRecords {
         match self {
             Self::All(records) => records.push(record),
             Self::Discard => {}
-            Self::Units(units) => {
+            Self::Units { units, written } => {
                 units.insert(record.unit_index);
+                // Records arrive in sequence order: the newest one decides.
+                if record.payload.is_empty() {
+                    written.remove(&record.unit_index);
+                } else {
+                    written.insert(record.unit_index);
+                }
             }
         }
         Ok(())
     }
 
-    /// (retained records, units with an uncovered record). Only the mode
-    /// that was asked for is populated; the other side is empty.
-    fn into_parts(self) -> (Vec<JournalRecord>, std::collections::BTreeSet<u64>) {
+    /// (retained records, units with an uncovered record, those of them
+    /// whose newest record carries ciphertext). Only the mode that was
+    /// asked for is populated; the other parts are empty.
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<JournalRecord>,
+        std::collections::BTreeSet<u64>,
+        std::collections::BTreeSet<u64>,
+    ) {
         match self {
-            Self::All(records) => (records, Default::default()),
+            Self::All(records) => (records, Default::default(), Default::default()),
             Self::Discard => Default::default(),
-            Self::Units(units) => (Vec::new(), units),
+            Self::Units { units, written } => (Vec::new(), units, written),
         }
     }
 }
@@ -586,6 +607,8 @@ pub(crate) struct JournalSummary {
     /// Units recovery would rewrite (or discard) from a validated record:
     /// damage to their slots is recoverable (R4-004).
     pub replay_units: std::collections::BTreeSet<u64>,
+    /// Those of them whose newest record carries ciphertext.
+    pub replay_written: std::collections::BTreeSet<u64>,
 }
 
 pub(crate) fn summarize_journal(
@@ -606,7 +629,10 @@ pub(crate) fn summarize_journal(
         checkpoint_sequence,
         segment_size,
         proof.as_ref(),
-        ReplayRecords::Units(Default::default()),
+        ReplayRecords::Units {
+            units: Default::default(),
+            written: Default::default(),
+        },
         &|| {},
     )?;
     let uncovered_records = scan
@@ -624,6 +650,7 @@ pub(crate) fn summarize_journal(
         durable_sequence: scan.durable_sequence,
         repairs: scan.repairs,
         replay_units: scan.replay_units,
+        replay_written: scan.replay_written,
     })
 }
 
@@ -1022,13 +1049,14 @@ fn scan_journal_with_proof(
         }
     }
 
-    let (replay, replay_units) = replay.into_parts();
+    let (replay, replay_units, replay_written) = replay.into_parts();
     Ok(JournalScan {
         durable_sequence,
         next_segment_index,
         segments,
         replay,
         replay_units,
+        replay_written,
         repairs,
         mark: final_mark,
         verified_prefixes,

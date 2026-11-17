@@ -28,7 +28,7 @@ use crate::recovery::{
     acquire_lock, check_metadata_generations, load_checkpoint_state, load_durable_mark,
     load_superblock, summarize_journal, JournalRepair, RecoveryError,
 };
-use crate::store::SlotStore;
+use crate::store::{SlotRead, SlotStore};
 
 /// Cap on individually reported slot errors (the count is always exact).
 const MAX_SLOT_ERRORS: usize = 64;
@@ -114,8 +114,11 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         }
     };
 
-    // Key canary: informational (bound on first attach).
+    // Key canary. Attach binds a missing one when it can, so whether its
+    // loss stops the next attach depends on what the volume holds; that is
+    // decided once the journal and the slots have been read.
     let canary_ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let mut missing_canary = None;
     match canary_ab.load::<KeyCanary>(backing.as_ref()) {
         Ok(Some(canary)) if canary.volume_uuid == superblock.volume_uuid => {
             report.info.push("key canary: present".to_string());
@@ -123,11 +126,16 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         Ok(Some(_)) => report
             .errors
             .push("key canary belongs to a different volume".to_string()),
-        Ok(None) => report.warnings.push(
-            "key canary: absent (bound on the next attach; a volume with data needs an \
-             integrity-capable provider for that)"
-                .to_string(),
-        ),
+        // A copy that fails validation loads exactly like a missing one.
+        Ok(None) => {
+            let damaged =
+                backing.exists(layout::KEY_CANARY_A)? || backing.exists(layout::KEY_CANARY_B)?;
+            missing_canary = Some(if damaged {
+                "key canary: copies exist but no copy validates"
+            } else {
+                "key canary: absent"
+            });
+        }
         Err(FormatError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => report.errors.push(format!("key canary: {e}")),
     }
@@ -153,6 +161,8 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // replay payloads: this report needs counts, repair decisions and the
     // set of units a replay would rewrite.
     let mut replay_units = std::collections::BTreeSet::new();
+    let mut replay_written = std::collections::BTreeSet::new();
+    let mut journal_durable = None;
     let mut journal_ok = false;
     match summarize_journal(
         &backing,
@@ -178,6 +188,8 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                 }
             }
             replay_units = scan.replay_units;
+            replay_written = scan.replay_written;
+            journal_durable = Some(scan.durable_sequence);
             journal_ok = true;
         }
         Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
@@ -197,8 +209,13 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // does not decode there is damage (EIO), never a hole.
     let mut recoverable = 0u64;
     let mut unrecoverable = 0u64;
+    // What attach would find to probe for a missing key canary: a stored
+    // unit that replay neither rewrites nor discards first.
+    let mut stored_ciphertext = false;
+    let mut shard_count = None;
     match SlotStore::open(backing.clone(), superblock.geometry.clone()) {
         Ok(store) => {
+            shard_count = Some(store.shard_count());
             // The A/B generations recovery checks before its first write.
             match check_metadata_generations(&backing, &store) {
                 Ok(()) => {}
@@ -217,7 +234,14 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                 } else {
                     probed += 1;
                 }
-                if let Err(e) = store.read_slot(unit) {
+                let read = store.read_slot(unit);
+                if allocated
+                    && !replay_units.contains(&unit)
+                    && matches!(read, Ok(SlotRead::Ciphertext { .. }))
+                {
+                    stored_ciphertext = true;
+                }
+                if let Err(e) = read {
                     // An unavailable read did not validate the slot's bytes.
                     // Keep this check inconclusive, even with a replay source;
                     // only proven slot damage contributes to either verdict.
@@ -285,6 +309,35 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             return Err(CoreError::Io(e))
         }
         Err(e) => report.errors.push(format!("slot store: {e}")),
+    }
+
+    // A missing or invalid canary: a pristine volume binds a new one at the
+    // next attach. A volume with history first needs an integrity-capable
+    // provider to decrypt existing ciphertext, and with no ciphertext left
+    // to probe every attach refuses, whatever the provider (`MissingCanary`):
+    // that is the only case certain to refuse, so the only error. The
+    // offline check does not know the provider's integrity capability.
+    if let Some(what) = missing_canary {
+        let history = journal_durable
+            .zip(shard_count)
+            .map(|(durable, shards)| checkpoint_sequence > 0 || durable > 0 || shards > 0);
+        let ciphertext = stored_ciphertext || !replay_written.is_empty();
+        match history {
+            Some(false) => report.warnings.push(format!(
+                "{what} (the volume holds no data; the next attach binds a new canary)"
+            )),
+            Some(true) if ciphertext => report.warnings.push(format!(
+                "{what}; the volume holds data, so attach binds a new canary only after an \
+                 integrity-capable provider decrypts existing ciphertext, and refuses without one"
+            )),
+            Some(true) => report.errors.push(format!(
+                "{what}; the volume has history but no ciphertext left to probe, so every \
+                 attach refuses, whatever the provider"
+            )),
+            None => report.warnings.push(format!(
+                "{what} (whether attach can bind a new canary is undetermined; see the errors)"
+            )),
+        }
     }
 
     // One word for the operator: what the next attach will do with this

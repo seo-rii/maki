@@ -247,6 +247,7 @@ fn last_accepted_horizon_remains_readable_with_exact_record_count() {
 #[test]
 fn empty_segment_at_the_last_accepted_base_preserves_the_horizon() {
     let fixture = Fixture::new(u64::MAX - 2);
+    bind_key_canary(fixture.backing.as_ref(), fixture.superblock.volume_uuid);
     fixture.segment(1, u64::MAX - 1, &[]);
     let mutations = fixture.observe_mutations();
     let backing: Arc<dyn Backing> = fixture.backing.clone();
@@ -400,4 +401,20 @@ fn durable_proof_index_leaving_no_index_for_a_roll_is_refused() {
                 .unwrap();
         }
     });
+}
+
+/// What an engine's first attach stores before any write: a key canary bound
+/// to the volume. Without one, a volume with history but no ciphertext is
+/// refused by every attach, and the deep check reports that; this fixture is
+/// about the journal, not the canary.
+fn bind_key_canary(backing: &dyn Backing, volume_uuid: uuid::Uuid) {
+    let ab = maki_format::ab::AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let mut canary = maki_format::canary::KeyCanary {
+        generation: 0,
+        volume_uuid,
+        unit_index: maki_format::canary::CANARY_UNIT_INDEX,
+        ciphertext: vec![0x5a; 64],
+    };
+    ab.store(backing, &mut canary).unwrap();
+    ab.store(backing, &mut canary).unwrap();
 }
