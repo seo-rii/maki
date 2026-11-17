@@ -572,6 +572,108 @@ async fn followup_inconclusive_negative_probe_preserves_retry_class() {
     );
 }
 
+/// Builds the error a probe fails with (`CryptoError::Retryable`, ...).
+type ProbeError = fn(String) -> CryptoError;
+
+/// A provider that fails only the tamper probe, with `error`: it records the
+/// ciphertexts it issued, and a decrypt request carrying any other bytes
+/// (the self-test's flipped ciphertext) never reaches the fake. Every other
+/// request, each context-binding probe included (issued bytes under another
+/// unit index or context), goes to the fake, which rejects a probe with a
+/// definitive `Integrity` error.
+struct TamperProbeFails {
+    inner: FakeCryptoProvider,
+    error: ProbeError,
+    issued: std::sync::Mutex<Vec<Vec<u8>>>,
+    tamper_probes: std::sync::atomic::AtomicUsize,
+}
+
+impl TamperProbeFails {
+    fn new(error: ProbeError) -> Self {
+        Self {
+            inner: FakeCryptoProvider::new(UNIT as u32),
+            error,
+            issued: Default::default(),
+            tamper_probes: Default::default(),
+        }
+    }
+
+    fn tamper_probes(&self) -> usize {
+        self.tamper_probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl CryptoProvider for TamperProbeFails {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.inner.capabilities().await
+    }
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        let cts = self.inner.encrypt_batch(context, items).await?;
+        let mut issued = self.issued.lock().unwrap();
+        issued.extend(cts.iter().map(|ct| ct.data.clone()));
+        Ok(cts)
+    }
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        let tampered = {
+            let issued = self.issued.lock().unwrap();
+            items.iter().any(|ct| !issued.contains(&ct.data))
+        };
+        if tampered {
+            self.tamper_probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err((self.error)("tamper probe: connection reset".into()));
+        }
+        self.inner.decrypt_batch(context, items).await
+    }
+}
+
+/// MAKI-011: only a definitive rejection of the tampered ciphertext proves an
+/// integrity claim. A transport error on the tamper probe leaves it
+/// unproven even after every context-binding probe got a definitive
+/// rejection, so the self-test fails, and with that error's own class
+/// (inconclusive: the dispatcher quarantines and retries this endpoint,
+/// FUP-008) rather than as a provider fault. The same provider passes once
+/// the tamper probe gets an `Integrity` rejection.
+#[tokio::test]
+async fn a_transport_error_on_the_tamper_probe_alone_leaves_integrity_unproven() {
+    use maki_crypto::ErrorClass;
+    let transport_errors: [(ProbeError, ErrorClass); 3] = [
+        (CryptoError::Retryable, ErrorClass::Retryable),
+        (CryptoError::Throttled, ErrorClass::Throttled),
+        (CryptoError::EndpointFatal, ErrorClass::EndpointFatal),
+    ];
+    for (error, class) in transport_errors {
+        let provider = TamperProbeFails::new(error);
+        let result = provider_self_test(&provider, &ctx(), UNIT, "test-profile-v1").await;
+        assert_eq!(
+            provider.tamper_probes(),
+            1,
+            "{class:?}: the self-test must reach the tamper probe, after every other check"
+        );
+        let error = result.expect_err("a transport error cannot prove integrity");
+        assert_eq!(
+            error.class(),
+            class,
+            "an inconclusive tamper probe keeps its class: {error}"
+        );
+    }
+
+    let provider = TamperProbeFails::new(CryptoError::Integrity);
+    provider_self_test(&provider, &ctx(), UNIT, "test-profile-v1")
+        .await
+        .expect("an integrity rejection of the tampered ciphertext proves the claim");
+    assert_eq!(provider.tamper_probes(), 1);
+}
+
 /// A provider that returns an empty success for the moved-ciphertext probe.
 struct FollowupEmptyMovedReply(Arc<FakeCryptoProvider>);
 
