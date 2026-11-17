@@ -19,15 +19,34 @@ deployment or an external qualification campaign.
 
 Build the binary with `cargo build --release --locked -p maki-witness-cli`.
 Initialize one authority directory with a fresh, nonzero storage-identity UUID.
-This identity differs from the inner volume superblock UUID:
+This identity differs from the inner volume superblock UUID. Run it as the
+service account that will serve the authority (`maki-witness` here), below a
+directory that account owns:
 
 ```sh
-maki-witness init /var/lib/maki-witness/volume 01234567-89ab-cdef-0123-456789abcdef
+install -d -o maki-witness -g maki-witness -m 0700 /var/lib/maki-witness
+sudo -u maki-witness maki-witness init /var/lib/maki-witness/volume 01234567-89ab-cdef-0123-456789abcdef
 ```
 
 Initialization refuses existing state. Local `serve` holds the authority's
 exclusive process lock until exit. Copied local directories are separate
 histories; they cannot be used as failover replicas.
+
+Whoever can write the state directory or its `remote.*` files can put an older
+record back and roll the authority back. On Unix, `init` and `serve` therefore
+require the directory (checked on the opened directory, without following a
+symlink) and those files to be owned by root or by the user the command runs
+as, and not writable by group or others; a sticky bit does not make shared
+write access safe. Anything else is refused before state is written or the
+listener is bound, with an error naming the owner. `init` creates missing
+directories owner-only (`0700`) as the user that runs it, so an authority
+initialized as root must be handed over with `chown -R` before the service
+account serves it, and a `serve` run as root refuses a directory owned by the
+service account. Group and other read access is allowed: the files hold the
+public record that any authenticated client can inspect and SHA-256 digests of
+the last request and of the current random 256-bit session capability, which do
+not reveal the capability. The check covers the state directory, not its
+ancestors; keep those writable only by root or the service account.
 
 Provision a server certificate with the intended DNS name or IP address in its
 subject alternative names, plus separate writer and administrator client
@@ -197,7 +216,14 @@ operator-controlled cutover after destination verification.
 ## Credential and configuration files
 
 Configuration files are bounded to 64 KiB and reject unknown fields. On Unix,
-they must not be symlinks or writable by group/others. Credential files are
+they must not be symlinks or writable by group/others, and must be owned by
+root or by the user that runs the command (`serve`, `init-etcd` or `inspect`).
+A configuration owned by any other user is refused whatever its mode, because
+its owner can rewrite the administrator allow-list, the key path or the
+authority it names. A root-owned `0644` file suits both the service account
+and root; a command run as root refuses a configuration owned by the service
+account. Configurations hold no secrets, so group and other read access is
+allowed. Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
 accessible to group/others (`0600` is appropriate), and must be owned by root
 or by the user the loading process runs as. A key owned by any other user is

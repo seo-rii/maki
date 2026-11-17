@@ -163,6 +163,17 @@ impl Directory {
         Ok(Self(root))
     }
 
+    pub(super) fn root_metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.0.metadata()
+    }
+
+    pub(super) fn entry_metadata(&self, path: &str) -> io::Result<std::fs::Metadata> {
+        let (parent, child) = self.parent(path)?;
+        // O_PATH with O_NOFOLLOW describes a final symlink itself and does
+        // not block on a FIFO.
+        open_at(&parent, &child, libc::O_PATH)?.metadata()
+    }
+
     fn directory(&self, path: &str, create: bool) -> io::Result<File> {
         validate(path, true)?;
         // Opening '.' creates an independent directory stream offset. dup()
