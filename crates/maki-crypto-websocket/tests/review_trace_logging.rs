@@ -27,6 +27,7 @@ const CHILD: &str = "MAKI_REVIEW_TRACE_LOGGING_CHILD";
 const UNIT: usize = 48;
 const PLAINTEXT: &[u8; UNIT] = b"SECRET-PLAINTEXT-UNIT-MARKER-0000000000000000000";
 const QUERY_SECRET: &str = "query-credential-marker";
+const CLOSE_SECRET: &str = "SECRET-CLOSE-REASON-PLAINTEXT-MARKER";
 const CHILD_TRACE_MARKER: &str = "review child trace marker";
 
 fn provider(url: String) -> WsCryptoProvider {
@@ -120,13 +121,12 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn child_stderr(filter: &str) -> String {
+    child_stderr_of("child_performs_websocket_crypto_under_maki_log", filter)
+}
+
+fn child_stderr_of(child: &str, filter: &str) -> String {
     let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "child_performs_websocket_crypto_under_maki_log",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(["--exact", child, "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
         .env("MAKI_LOG", filter)
         .output()
@@ -138,6 +138,75 @@ fn child_stderr(filter: &str) -> String {
         output.status
     );
     stderr
+}
+
+#[tokio::test]
+async fn child_receives_websocket_close_reason_under_maki_log() {
+    use tokio_tungstenite::tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message,
+    };
+
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    assert!(maki_core::logging::install_default_logging());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+        // Providers may reflect request contents in diagnostic close reasons.
+        // They must stay out of the daemon sink just like remote error text.
+        ws.send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: CLOSE_SECRET.into(),
+        })))
+        .await
+        .unwrap();
+    });
+    let context = CryptoContext {
+        volume_uuid: uuid::Uuid::from_u128(7),
+        format_version: 1,
+        crypto_compatibility_id: "review-trace-v1".into(),
+    };
+    let error = provider(url)
+        .encrypt_batch(
+            &context,
+            &[PlaintextUnit {
+                unit_index: 0,
+                data: SecretBuffer::from_slice(PLAINTEXT),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, maki_crypto::CryptoError::Retryable(_)));
+    server.await.unwrap();
+}
+
+#[test]
+fn raised_maki_log_never_writes_websocket_close_reason() {
+    if std::env::var_os(CHILD).is_some() {
+        return;
+    }
+    for filter in [
+        "debug",
+        "trace",
+        "warn,tungstenite::protocol=debug",
+        "warn,tungstenite::protocol=trace",
+    ] {
+        let stderr = child_stderr_of(
+            "child_receives_websocket_close_reason_under_maki_log",
+            filter,
+        );
+        for needle in [CLOSE_SECRET.to_string(), hex(CLOSE_SECRET.as_bytes())] {
+            assert!(
+                !stderr.contains(&needle),
+                "MAKI_LOG={filter} wrote the remote close reason to the log"
+            );
+        }
+    }
 }
 
 #[test]
