@@ -180,8 +180,14 @@ systemd-analyze verify maki@demo.service maki-attach@demo.service \
   maki-recover@demo.service maki-workload@demo.target
 ```
 
-(`maki-attach@demo.service` reports a missing `/etc/maki/attach/demo.toml`
-assertion until a volume exists; that is expected.)
+`verify` checks the unit files and the programs they run; it does not evaluate
+`Assert*=` settings, so it reports nothing about the
+`/etc/maki/attach/demo.toml` that `maki-attach@demo.service` asserts. That
+file exists only once [provisioning](first-volume.md) writes it, and until then
+the unit cannot start; that is expected.
+`systemd-analyze condition --unit=maki-attach@demo.service` evaluates the
+assertion without starting anything: it prints `Asserts failed.` and exits 1
+while the file is missing.
 
 Grant an administrator account access to control sockets by adding it to the
 `maki-admin` group. Root does not need it. The volume configuration is
