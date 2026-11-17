@@ -194,15 +194,28 @@ envelope validation and payload decoding therefore retain the tree without
 also retaining the provider's source frame. A shared library source keeps its
 own lifetime; releasing the provider copy does not modify surviving aliases.
 
-The private response tree stores every owned JSON string and object key in
-`SecretBuffer`, including base64 data, error text and unknown nested fields.
-Borrowed strings copy directly into guarded storage; owned strings transfer
-their allocation. Dropping malformed partial trees, overwritten duplicate
-values, stale responses or responses to cancelled receivers erases these
-owners. Debug output is redacted. Ordinary object lookups still select the
-last duplicate value. Negative self-test errors retain their stricter known
-field uniqueness and type checks without a second parse or remote strings
-in type-error messages. JSON syntax, recursion and frame limits are unchanged.
+The private response tree keeps only what the response handling reads: the
+numeric `id`, the `error` object's `class` and `reason` strings, and the
+`unit` and `data` of each response item. Items are kept up to the largest item
+count among the requests registered on that connection generation when the
+frame arrives; later items are only counted. A request registers before it is
+sent, so no response that could be delivered loses an item, and a longer array
+still fails the existing count check. Every other string, key, number and
+container, including error message text and unknown fields, is validated like
+a kept one (syntax, UTF-8, number range and the recursion limit) but never
+copied out of the guarded frame. A frame of many small values therefore cannot
+multiply its size in memory: kept strings never exceed the frame, and the
+structure adds a fixed amount per kept item.
+
+Every kept string and object key is stored in `SecretBuffer`. Borrowed strings
+copy directly into guarded storage; owned strings transfer their allocation,
+and an owned string nothing reads is adopted and erased at once. Dropping
+malformed partial trees, overwritten duplicate values, stale responses or
+responses to cancelled receivers erases these owners. Debug output is
+redacted. Ordinary object lookups still select the last duplicate value.
+Negative self-test errors retain their stricter known field uniqueness and
+type checks without a second parse or remote strings in type-error messages.
+JSON syntax, recursion and frame limits are unchanged.
 
 Allocation tests inspect initialized bytes immediately before deallocation,
 including unique sliced payloads whose original prefix and suffix become
@@ -211,12 +224,17 @@ locking covers the entire allocation, including pages of spare capacity.
 Shared source owners and tungstenite read/framing buffers retain
 library-controlled lifetimes, with backing erasure described below. The pinned
 parser patch separately erases its
-private escape-decoding scratch. The response
-tree's container/number storage and many small values also remain outside any
-total resident-memory bound. These changes do not close MAKI-015 or MAKI-032.
+private escape-decoding scratch. These changes do not close MAKI-015 or
+MAKI-032.
 
 The incoming-response unit adds 14 focused regressions. The complete
 WebSocket package passed 49 tests and all-targets strict Clippy on 2026-09-12.
+Since the parser keeps only what is read, the erasure regressions place their
+sensitive strings on read fields (item data, error reason) and also require
+unread strings and keys never to be copied.
+`maki-crypto-websocket/tests/review_response_memory.rs` bounds the peak heap of
+one response within the default frame cap to three times the frame; a frame of
+small values previously held 43 times its size as tree nodes.
 
 ## gRPC provider-owned messages
 
@@ -234,6 +252,19 @@ to the caller. Private Debug output redacts bytes. Public `CryptoItem`,
 `CryptoBatchRequest`, and `CryptoBatchResponse` retain their existing API and
 wire encoding; external callers using those public structs are responsible
 for their own allocation lifetime.
+
+The response decoder knows how many items the request carried and refuses the
+first item beyond that count before decoding it, as a receive-contract error
+charged to the endpoint; items already decoded are erased with the rejected
+response. An empty item is two bytes on the wire but a whole guarded item in
+memory, so collecting every item a message within `max_message_bytes` can
+carry before the count check held up to 49 times the message in heap.
+Unknown fields were, and still are, skipped without allocating. A response
+with fewer items, or an item echoing the wrong unit, still fails the existing
+checks after decoding.
+`maki-crypto-grpc/tests/review_response_memory.rs` bounds the peak heap of one
+response within the default message cap to three times the message; it now
+measures about 1.3 times, which is tonic's message buffer and its growth.
 
 The private item is page-lock-capable before its first decoded byte is written,
 and retains that owner through rejection, cancellation and successful transfer.

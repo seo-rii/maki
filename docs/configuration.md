@@ -452,6 +452,11 @@ ignored, and a close frame ends the connection. Pending requests are scoped to a
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
+A response frame is parsed against this protocol: only its `id`, the error's
+`class` and `reason`, and the `unit` and `data` of at most as many items as the
+largest request awaiting a response on that connection are kept. Other values
+are validated but not kept, so the frame-size limit also bounds the memory a
+response takes, not only its wire bytes.
 Once a request has registered on an established connection, cancelling it or
 expiring its overall attempt deadline or response-wait timeout removes that
 request and stops new requests from joining its connection generation.
@@ -517,8 +522,10 @@ default `/maki.CryptoService/EncryptBatch` and `/maki.CryptoService/DecryptBatch
 a gateway prefix or a query is sent unchanged), but request and response
 messages must match that contract and responses must preserve unit identity
 and order.
-The message-size limit bounds each received gRPC frame before decoding.
-Locally rejected oversized frames and invalid protobuf results are endpoint
+The message-size limit bounds each received gRPC frame before decoding, and
+decoding refuses the first item beyond the number the request carried, so the
+limit also bounds the memory a response's items take. Locally rejected
+oversized frames, extra items and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may
 move to another peer. An actual remote `OutOfRange` status remains a request
 error, regardless of its message text. Remote status text (`grpc-message`) and

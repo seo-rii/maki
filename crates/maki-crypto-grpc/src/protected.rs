@@ -116,3 +116,39 @@ pub(super) struct WireResponse {
     #[prost(message, repeated, tag = "1")]
     pub(super) items: Vec<WireItem>,
 }
+
+/// Why a response message was refused while decoding.
+#[derive(Debug, PartialEq)]
+pub(super) enum ResponseDecodeError {
+    /// It carries an item beyond the number the request had.
+    ExtraItem,
+    /// It is not a valid `CryptoBatchResponse`.
+    Malformed,
+}
+
+impl WireResponse {
+    /// Decode the response to a request of `requested` items, refusing the
+    /// first item beyond that count before decoding it. A two-byte empty item
+    /// becomes a whole guarded item in memory, so collecting every item a
+    /// message within the size limit can carry, then comparing the count,
+    /// held many times the message in heap. Otherwise this is
+    /// `Message::decode`; items already decoded are erased on refusal.
+    pub(super) fn decode_bounded(
+        mut buf: impl Buf,
+        requested: usize,
+    ) -> Result<Self, ResponseDecodeError> {
+        let mut response = Self::default();
+        let ctx = DecodeContext::default();
+        while buf.has_remaining() {
+            let (tag, wire_type) =
+                encoding::decode_key(&mut buf).map_err(|_| ResponseDecodeError::Malformed)?;
+            if tag == 1 && response.items.len() == requested {
+                return Err(ResponseDecodeError::ExtraItem);
+            }
+            response
+                .merge_field(tag, wire_type, &mut buf, ctx.clone())
+                .map_err(|_| ResponseDecodeError::Malformed)?;
+        }
+        Ok(response)
+    }
+}

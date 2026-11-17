@@ -33,7 +33,7 @@ use maki_format::config::check_grpc_method_path;
 mod connection;
 mod protected;
 use connection::ConnectionCache;
-use protected::{WireItem, WireRequest, WireResponse};
+use protected::{ResponseDecodeError, WireItem, WireRequest, WireResponse};
 
 #[cfg(test)]
 mod protected_tests;
@@ -409,12 +409,16 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
     }
 }
 
-#[derive(Default)]
-struct ResponseCodec(tonic::codec::ProstCodec<WireRequest, WireResponse>);
+struct ResponseCodec {
+    inner: tonic::codec::ProstCodec<WireRequest, WireResponse>,
+    /// Items in the request; a response with more is refused while decoding.
+    requested: usize,
+}
 
-struct ResponseDecoder(
-    <tonic::codec::ProstCodec<WireRequest, WireResponse> as tonic::codec::Codec>::Decoder,
-);
+struct ResponseDecoder {
+    inner: <tonic::codec::ProstCodec<WireRequest, WireResponse> as tonic::codec::Codec>::Decoder,
+    requested: usize,
+}
 
 impl tonic::codec::Codec for ResponseCodec {
     type Encode = WireRequest;
@@ -424,11 +428,14 @@ impl tonic::codec::Codec for ResponseCodec {
     type Decoder = ResponseDecoder;
 
     fn encoder(&mut self) -> Self::Encoder {
-        self.0.encoder()
+        self.inner.encoder()
     }
 
     fn decoder(&mut self) -> Self::Decoder {
-        ResponseDecoder(self.0.decoder())
+        ResponseDecoder {
+            inner: self.inner.decoder(),
+            requested: self.requested,
+        }
     }
 }
 
@@ -440,13 +447,20 @@ impl tonic::codec::Decoder for ResponseDecoder {
         &mut self,
         source: &mut tonic::codec::DecodeBuf<'_>,
     ) -> Result<Option<Self::Item>, Self::Error> {
-        self.0
-            .decode(source)
-            .map_err(|_| receive_contract_status("grpc response protobuf decoding failed"))
+        WireResponse::decode_bounded(source, self.requested)
+            .map(Some)
+            .map_err(|error| {
+                receive_contract_status(match error {
+                    ResponseDecodeError::ExtraItem => {
+                        "grpc response has more items than the request"
+                    }
+                    ResponseDecodeError::Malformed => "grpc response protobuf decoding failed",
+                })
+            })
     }
 
     fn buffer_settings(&self) -> tonic::codec::BufferSettings {
-        self.0.buffer_settings()
+        self.inner.buffer_settings()
     }
 }
 
@@ -906,7 +920,10 @@ impl GrpcCryptoProvider {
             request.metadata_mut().insert(key, value);
         }
 
-        let codec = ResponseCodec::default();
+        let codec = ResponseCodec {
+            inner: Default::default(),
+            requested: expected.len(),
+        };
 
         // `Channel::timeout` bounds the connection, not the whole exchange:
         // a server that stalls after the response headers, or between the
@@ -949,6 +966,7 @@ impl GrpcCryptoProvider {
             }
         };
 
+        // The decoder already refused any item beyond the request's count.
         if response.items.len() != expected.len() {
             return Err(CryptoError::Contract(format!(
                 "grpc response has {} item(s), expected {}",
