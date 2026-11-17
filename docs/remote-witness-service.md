@@ -95,6 +95,19 @@ The line includes the actual listening address. Service-manager integration,
 network policy and independently managed persistent storage are operator
 provisioning steps.
 
+A local authority answers a change only after writing and syncing
+`remote.next`, renaming it over `remote.state` and syncing the directory. A
+failure before the rename (EMFILE, ENOSPC or EIO while opening, writing or
+syncing `remote.next`) leaves `remote.state` unchanged: that request is
+answered as unavailable and later requests are served normally. After a
+failed rename or directory sync either state may be the published one, so
+`serve` answers every request as unavailable until it is restarted; it keeps
+running and does not exit by itself. The restart serves and re-publishes the
+state it reads, and clients resolve their pending request against it. A
+`remote.state` that changes, disappears or stops decoding while `serve` holds
+its lock also makes it answer unavailable until a restart, which then serves
+whatever valid state the file holds: find out what changed it first.
+
 ## Initialize a replicated authority
 
 Provision an independently managed, persistent etcd cluster with at least three

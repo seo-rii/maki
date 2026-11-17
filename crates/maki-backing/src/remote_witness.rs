@@ -473,9 +473,12 @@ impl CanonicalState {
 
 /// A separately persisted freshness authority for exactly one volume.
 ///
-/// Its stable lock covers every request and must outlive the server. Errors
-/// during persistence poison the handle: reopen and resolve the exact request
-/// before proceeding. The authority directory must never follow data restores.
+/// Its stable lock covers every request and must outlive the server. A
+/// persistence error once the rename over `remote.state` has been attempted
+/// poisons the handle: reopen and resolve the exact request before
+/// proceeding. An error before it leaves the published state unchanged and
+/// fails only its request. The authority directory must never follow data
+/// restores.
 pub struct StateStore {
     backing: Arc<dyn Backing>,
     stored: Stored,
@@ -590,7 +593,12 @@ impl StateStore {
         if stored == self.stored {
             return Ok(self.stored.record.clone());
         }
-        if let Err(error) = publish(self.backing.as_ref(), &stored) {
+        // A failure before the rename (EMFILE, a transient ENOSPC or EIO)
+        // leaves `remote.state` exactly as published and `stored` still
+        // describes it, so only this request fails. Once the rename has
+        // been attempted either state may be the published one.
+        stage(self.backing.as_ref(), &stored)?;
+        if let Err(error) = commit(self.backing.as_ref()) {
             self.poisoned = true;
             return Err(error);
         }
@@ -834,12 +842,28 @@ fn read(backing: &dyn Backing) -> io::Result<Stored> {
 }
 
 fn publish(backing: &dyn Backing, stored: &Stored) -> io::Result<()> {
+    stage(backing, stored)?;
+    commit(backing)
+}
+
+/// Write and sync the next state as `remote.next`, touching nothing else.
+/// Nothing reads `remote.next` as state, and every stage truncates it and
+/// rewrites all of it through a new descriptor, so what a failed stage left
+/// behind (a prefix, bytes whose sync failed) is never synced as is.
+fn stage(backing: &dyn Backing, stored: &Stored) -> io::Result<()> {
     let bytes = encode(stored)?;
     let file = backing.open(TEMP_FILE, true)?;
     file.set_len(0)?;
     file.write_at(0, &bytes)?;
     file.set_len(bytes.len() as u64)?;
-    file.sync_data()?;
+    file.sync_data()
+}
+
+/// Replace `remote.state` with the staged state and make that durable. A
+/// failed rename may still have happened, and after a failed directory sync
+/// the new state is visible but may not survive a power loss: after any
+/// error here only a reopen, which re-publishes what it reads, settles it.
+fn commit(backing: &dyn Backing) -> io::Result<()> {
     backing.rename(TEMP_FILE, STATE_FILE)?;
     backing.sync_dir("")
 }
