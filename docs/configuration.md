@@ -660,7 +660,12 @@ pass still checkpoints the records that were durable before it, whatever started
 it (applying them, deleting the sealed segments they cover and shrinking the
 overlay), and then waits, so a journal whose syncs keep failing still gives that
 space and memory back. With nothing durable left to apply or reclaim, a pass
-whose sync fails runs no checkpoint.
+whose sync fails runs no checkpoint. The watermark counts only journal a
+checkpoint can delete: the active segment is never deleted, so the worker
+checkpoints for size only once a sealed segment exists. Half of
+`journal_max_bytes` is always above one segment, so this only matters to an
+engine embedded with a lower watermark, which then checkpoints once per sealed
+segment instead of on every write.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole

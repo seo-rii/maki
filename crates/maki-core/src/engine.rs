@@ -149,7 +149,10 @@ pub struct AttachIdentity {
 #[derive(Debug, Clone)]
 pub struct CheckpointPolicy {
     /// Journal bytes on disk at which the background worker checkpoints,
-    /// syncing unsynced records first so they can be applied.
+    /// syncing unsynced records first so they can be applied. Only a journal
+    /// with a sealed segment counts: a checkpoint never deletes the active
+    /// segment, so a watermark at or below one segment does not make every
+    /// write a sync and a checkpoint (the pass comes at the roll instead).
     pub journal_high_watermark_bytes: u64,
     /// Hard limit on journal bytes on disk. A write that would exceed it
     /// first syncs and checkpoints inline; if that cannot reclaim enough
@@ -1394,8 +1397,7 @@ impl Engine {
                     );
                     io_engine.inner.note_journal(&volume);
                     if matches!(outcome, Ok(Admission::Admit))
-                        && (volume.journal_total_bytes()
-                            >= io_engine.inner.policy.journal_high_watermark_bytes
+                        && (io_engine.inner.journal_above_watermark(&volume)
                             || io_engine.inner.overlay_above_watermark(&volume)
                             || volume.has_pending_reclamation())
                     {
@@ -1981,6 +1983,16 @@ impl EngineInner {
         .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))?
     }
 
+    /// The journal has reached its watermark and a checkpoint could delete
+    /// some of it (SPEC §26). A checkpoint deletes covered sealed segments,
+    /// never the active one: counting a journal that is only its active
+    /// segment let a watermark at or below the segment size wake the worker
+    /// into a sync and a checkpoint on every write, reclaiming nothing.
+    fn journal_above_watermark(&self, volume: &Volume) -> bool {
+        volume.journal_total_bytes() >= self.policy.journal_high_watermark_bytes
+            && volume.journal_sealed_segment_count() > 0
+    }
+
     /// The overlay has crossed half of a configured bound (R4-005): the
     /// worker should checkpoint before write admission has to do it inline.
     fn overlay_above_watermark(&self, volume: &Volume) -> bool {
@@ -2001,7 +2013,7 @@ impl EngineInner {
     /// are already durable are still checkpointed).
     async fn worker_pass(self: &Arc<Self>) {
         let (
-            total,
+            by_size,
             appended,
             checkpointed,
             durable,
@@ -2013,7 +2025,7 @@ impl EngineInner {
         ) = {
             let v = self.volume.read().await;
             (
-                v.journal_total_bytes(),
+                self.journal_above_watermark(&v),
                 v.journal_appended_sequence(),
                 v.checkpoint_sequence(),
                 v.journal_durable_sequence(),
@@ -2053,7 +2065,6 @@ impl EngineInner {
         {
             return;
         }
-        let by_size = total >= self.policy.journal_high_watermark_bytes;
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
             let backing = self.backing.clone();
             storage_task(move || backing.free_bytes())
