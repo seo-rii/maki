@@ -13,9 +13,10 @@
 //!   them into "corruption" for the next recovery. The writer must
 //!   normalize the file to its logical end before it appends or seals.
 //!
-//! `CrashableBacking` models both failure modes (writeback loss is its
-//! default for a failed sync; partial writes come from the partial-write
-//! hook).
+//! `CrashableBacking` models both failure modes (by default a failed sync
+//! leaves its writes uncertain: a retry writes nothing and the worst-case
+//! crash loses them, while a successful sync writes back every re-dirtied
+//! page whole; partial writes come from the partial-write hook).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -135,23 +136,43 @@ fn flush_after_a_failed_sync_rewrites_lost_records_before_acknowledging() {
 }
 
 /// Same with FUA: the failing write is not acknowledged; the next FUA write
-/// is, and it must cover the earlier record too (it was pending as well).
+/// is, and it must cover the earlier records too (they were pending as
+/// well). The kernel writes back whole pages, so a later record sharing the
+/// failed records' page would persist them even without a rewrite: the
+/// pending records fill the first page of a two-page segment, and the next
+/// FUA record lies entirely in the second.
 #[test]
 fn fua_after_a_failed_sync_covers_every_pending_record() {
     let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());
-    let mut vol = new_volume(&backing);
+    let options = VolumeOptions {
+        journal_segment_size: 2 * SEGMENT,
+    };
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
+    let mut vol = Volume::recover(backing.clone() as Arc<dyn Backing>, options.clone()).unwrap();
     // Open the segment first: a sync failure during segment creation is a
     // failed roll, which appends nothing (correct, but not this scenario).
-    vol.write_ct(5, &ct(5), false).unwrap();
+    let filler = 5..5 + RECORDS_PER_SEGMENT;
+    for unit in filler.clone() {
+        vol.write_ct(unit, &ct(unit as u8), false).unwrap();
+    }
+    // The next record straddles the page boundary; the one after it starts
+    // beyond it.
+    const _: () = assert!(48 + RECORDS_PER_SEGMENT * RECORD < SEGMENT);
+    const _: () = assert!(48 + (RECORDS_PER_SEGMENT + 1) * RECORD > SEGMENT);
     fail_segment_syncs(&backing, 1);
     assert!(vol.write_ct(0, &ct(1), true).is_err());
     vol.write_ct(1, &ct(2), true).unwrap();
     drop(vol);
 
     backing.crash_all_lost();
-    let vol = recover(&backing).unwrap();
-    assert_eq!(vol.read_ct(5).unwrap().map(|(_, d)| d), Some(ct(5)));
+    let vol = Volume::recover(backing.clone() as Arc<dyn Backing>, options).unwrap();
+    for unit in filler {
+        assert_eq!(
+            vol.read_ct(unit).unwrap().map(|(_, d)| d),
+            Some(ct(unit as u8))
+        );
+    }
     assert_eq!(vol.read_ct(1).unwrap().map(|(_, d)| d), Some(ct(2)));
     assert_eq!(
         vol.read_ct(0).unwrap().map(|(_, d)| d),

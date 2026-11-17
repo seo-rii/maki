@@ -26,13 +26,34 @@
 //! Fault injection: a hook may fail any operation (e.g. ENOSPC on append,
 //! EIO on fsync) — used by journal/checkpoint failpoint tests.
 //!
-//! Failure semantics are Linux-faithful, not "the syscall never happened":
-//! - a failed `sync_data` marks every dirty write *clean without persisting
-//!   it* (the page cache keeps showing the bytes, a later `sync_data` has
-//!   nothing left to write, a crash drops them) — the writeback-error
-//!   behaviour PostgreSQL's `data_sync_retry` documents (F01);
+//! Failure semantics follow Linux writeback, not "the syscall never
+//! happened":
+//! - a failed `sync_data` marks every dirty operation *clean with unknown
+//!   persistence* — the writeback-error behaviour PostgreSQL's
+//!   `data_sync_retry` documents (F01). The page cache keeps showing the
+//!   bytes and a retried `sync_data` has nothing left to write, so they never
+//!   become certain on their own; but the flusher, or the failing sync before
+//!   the page that failed, may already have written them, so a later crash
+//!   keeps each of them independently (and tears it, with tearing enabled),
+//!   exactly like an unsynced operation. `crash_all_lost` and
+//!   `crash_keep_torn_prefix` drop them;
+//! - writeback is page granular ([`PAGE_SIZE`]): a successful `sync_data`
+//!   writes every page a dirty write touched *whole*, as the page cache holds
+//!   it (zero past end-of-file), so a later write anywhere in a page makes the
+//!   bytes of an earlier failed sync in that page durable. Bytes a successful
+//!   sync rewrote or truncated are never brought back by an older failed
+//!   writeback. A length change dirties no page; one whose sync failed may
+//!   survive a crash until the next successful `sync_data`, after which it
+//!   counts as lost (a lost truncation stays possible after a bare retry);
 //! - a `write_at` may persist a prefix and then fail (the partial-write
 //!   hook), leaving the file longer than the caller's logical end (F03).
+//!
+//! A power loss (`crash*`) kills every process: it releases every lock, and
+//! every file or lock handle opened before it is dead. Each file operation
+//! through such a handle fails with an `ErrorKind::Other` I/O error (the
+//! model's EIO) without touching the recovered state, and dropping it
+//! releases nothing. A process restart (`drop` + reopen, page cache intact)
+//! is not a crash and invalidates nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -91,6 +112,10 @@ enum Pend {
 
 type InodeId = u64;
 
+/// Page size of the simulated page cache: a successful `sync_data` writes
+/// back every page a dirty write touched as a whole.
+pub const PAGE_SIZE: usize = 4096;
+
 /// File content, independent of any name (TEST-004): an open handle keeps
 /// its inode across `remove` and `rename`, a re-created name is a new inode,
 /// and a name can survive a crash while its inode's data does not.
@@ -98,10 +123,16 @@ type InodeId = u64;
 struct Inode {
     /// Content known durable (data-synced). A new inode is empty on disk.
     durable: Vec<u8>,
+    /// Operations of failed syncs, oldest first: clean in the page cache,
+    /// possibly on disk. Each is newer than the `durable` bytes it covers
+    /// (successful syncs cut out what they rewrote or truncated) and older
+    /// than every `pending` operation. A crash may keep any of them; no sync
+    /// replays them.
+    uncertain: Vec<Pend>,
     /// Dirty operations: what the next successful `sync_data` persists.
     pending: Vec<Pend>,
     /// The page-cache view: every operation ever applied, including writes
-    /// a failed `sync_data` marked clean without persisting.
+    /// a failed `sync_data` marked clean.
     image: Vec<u8>,
 }
 
@@ -110,8 +141,35 @@ impl Inode {
         Self {
             image: content.clone(),
             durable: content,
+            uncertain: Vec::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// A successful `sync_data`: persist the dirty operations, then every
+    /// page they wrote as the page cache holds it. Uncertain bytes inside
+    /// those pages or beyond a persisted truncation are settled; uncertain
+    /// length changes count as lost.
+    fn sync(&mut self) {
+        let pages = dirty_pages(&self.pending);
+        let mut durable = durable_after_sync(self);
+        for &page in &pages {
+            write_back_page(&mut durable, &self.image, page);
+        }
+        let cut = self
+            .pending
+            .iter()
+            .filter_map(|op| match op {
+                Pend::SetLen(len) => Some(*len),
+                Pend::Write { .. } => None,
+            })
+            .min();
+        self.uncertain = std::mem::take(&mut self.uncertain)
+            .into_iter()
+            .flat_map(|op| unsettled(op, &pages, cut))
+            .collect();
+        self.durable = durable;
+        self.pending.clear();
     }
 }
 
@@ -139,6 +197,8 @@ struct NamespaceChange {
 
 #[derive(Default)]
 struct Inner {
+    /// Number of power losses so far. Handles of an earlier epoch are dead.
+    epoch: u64,
     inodes: BTreeMap<InodeId, Inode>,
     names: BTreeMap<String, Name>,
     /// Open handles per inode: an unlinked inode stays usable while open.
@@ -153,7 +213,7 @@ struct Inner {
     partial_hook: Option<PartialWriteHook>,
     /// When set, a failed `sync_data` leaves its dirty writes dirty (the
     /// "syscall never happened" model). The default is the Linux model:
-    /// the writes are marked clean and lost.
+    /// the writes are marked clean, possibly but not certainly persisted.
     lenient_sync_failures: bool,
     stats_pending_writes: usize,
     /// Bytes returned by `read_at` since creation (cache-efficiency tests).
@@ -163,6 +223,14 @@ struct Inner {
 }
 
 impl Inner {
+    /// Every process dies: its handles are dead and its locks released.
+    fn power_loss(&mut self) {
+        self.epoch += 1;
+        self.handles.clear();
+        self.locks.clear();
+        self.stats_pending_writes = 0;
+    }
+
     fn check(&self, op: &FaultOp<'_>) -> io::Result<()> {
         if let Some(hook) = &self.hook {
             if let Some(err) = hook(op) {
@@ -282,15 +350,80 @@ fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-/// The content a successful `sync_data` makes durable: the durable content
-/// plus every *dirty* operation, in order. Writes an earlier failed sync
-/// marked clean are not part of it.
+/// The durable content plus every *dirty* operation, in order. Writes an
+/// earlier failed sync marked clean are not part of it; [`Inode::sync`]
+/// adds those in the pages it writes back.
 fn durable_after_sync(inode: &Inode) -> Vec<u8> {
     let mut data = inode.durable.clone();
     for p in &inode.pending {
         apply(&mut data, p);
     }
     data
+}
+
+/// Pages a dirty write touched.
+fn dirty_pages(pending: &[Pend]) -> BTreeSet<u64> {
+    let page = PAGE_SIZE as u64;
+    let mut pages = BTreeSet::new();
+    for op in pending {
+        if let Pend::Write { offset, data } = op {
+            if !data.is_empty() {
+                pages.extend(offset / page..=(offset + data.len() as u64 - 1) / page);
+            }
+        }
+    }
+    pages
+}
+
+/// Write back one cached page whole: its bytes up to end-of-file, then the
+/// zeros the kernel writes past end-of-file. A page truncated out of the
+/// cache since it was dirtied is not written.
+fn write_back_page(durable: &mut Vec<u8>, image: &[u8], page: u64) {
+    let start = page as usize * PAGE_SIZE;
+    if start >= image.len() {
+        return;
+    }
+    let cached = (start + PAGE_SIZE).min(image.len());
+    if durable.len() < cached {
+        durable.resize(cached, 0);
+    }
+    durable[start..cached].copy_from_slice(&image[start..cached]);
+    let page_end = (start + PAGE_SIZE).min(durable.len());
+    if cached < page_end {
+        durable[cached..page_end].fill(0);
+    }
+}
+
+/// What remains uncertain of an operation of a failed sync after a later
+/// successful one: the bytes outside the pages it wrote back and below its
+/// shortest persisted length. An uncertain length change is dropped.
+fn unsettled(op: Pend, pages: &BTreeSet<u64>, cut: Option<u64>) -> Vec<Pend> {
+    let Pend::Write { offset, data } = op else {
+        return Vec::new();
+    };
+    let page = PAGE_SIZE as u64;
+    let end = cut.map_or(offset + data.len() as u64, |cut| {
+        cut.min(offset + data.len() as u64)
+    });
+    let mut kept = Vec::new();
+    let mut start = offset;
+    while start < end {
+        let next_page = ((start / page + 1) * page).min(end);
+        if pages.contains(&(start / page)) {
+            start = next_page;
+            continue;
+        }
+        let mut stop = next_page;
+        while stop < end && !pages.contains(&(stop / page)) {
+            stop = ((stop / page + 1) * page).min(end);
+        }
+        kept.push(Pend::Write {
+            offset: start,
+            data: data[(start - offset) as usize..(stop - offset) as usize].to_vec(),
+        });
+        start = stop;
+    }
+    kept
 }
 
 fn apply(data: &mut Vec<u8>, p: &Pend) {
@@ -392,8 +525,9 @@ impl CrashableBacking {
 
     /// Choose what a failed `sync_data` does to the dirty writes it could
     /// not persist. `false` (the default) is the Linux model: they are
-    /// marked clean and lost, a retry of the sync has nothing to write.
-    /// `true` keeps them dirty, as if the syscall had never run.
+    /// marked clean with unknown persistence (a crash may or may not keep
+    /// them) and a retry of the sync has nothing to write. `true` keeps them
+    /// dirty, as if the syscall had never run.
     pub fn set_lenient_sync_failures(&self, lenient: bool) {
         self.inner.lock().lenient_sync_failures = lenient;
     }
@@ -414,13 +548,14 @@ impl CrashableBacking {
     }
 
     /// Simulate a crash: sample pending namespace operations, keeping their
-    /// predecessor dependencies too (a rename as one change). Dirty writes
-    /// are independently kept or lost; with tearing enabled any kept write
-    /// may persist partially. Afterwards, everything that survived is durable.
+    /// predecessor dependencies too (a rename as one change). Dirty and
+    /// uncertain (failed-sync) operations are independently kept or lost, in
+    /// order; with tearing enabled any kept write may persist partially.
+    /// Afterwards, everything that survived is durable.
     pub fn crash(&self, rng: &mut impl Rng) {
         let tearing = self.tearing;
         let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
+        inner.power_loss();
 
         // Sample directory publication independently. settle_names removes
         // every unreachable descendant after settling the file namespace.
@@ -451,7 +586,7 @@ impl CrashableBacking {
             // only the last one: sectors of unsynced writes reach the platter
             // in any order, so an earlier record can be torn while a later
             // one is intact (SPEC §27 torn-tail classification).
-            for p in &inode.pending {
+            for p in inode.uncertain.iter().chain(&inode.pending) {
                 if !rng.random_bool(0.5) {
                     continue;
                 }
@@ -467,12 +602,12 @@ impl CrashableBacking {
         }
     }
 
-    /// Crash losing *every* volatile operation (worst case): unsynced writes
-    /// dropped, unsynced creations vanish, unsynced deletions and renames
-    /// are undone.
+    /// Crash losing *every* volatile operation (worst case): unsynced and
+    /// failed-sync writes dropped, unsynced creations vanish, unsynced
+    /// deletions and renames are undone.
     pub fn crash_all_lost(&self) {
         let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
+        inner.power_loss();
         inner.dirs.retain(|_, durable| *durable);
         for id in inner.settle_names([]) {
             let inode = inner.inodes.get_mut(&id).unwrap();
@@ -484,10 +619,11 @@ impl CrashableBacking {
     /// `path` are applied except the final write, which keeps only its first
     /// `keep_bytes` bytes, and its directory entry survives. Its namespace
     /// predecessors and ancestors survive too, so the selected path remains
-    /// reachable. All other volatile operations are lost.
+    /// reachable. All other volatile operations, and every failed sync's
+    /// uncertain operations, are lost.
     pub fn crash_keep_torn_prefix(&self, path: &str, keep_bytes: usize) {
         let mut inner = self.inner.lock();
-        inner.stats_pending_writes = 0;
+        inner.power_loss();
         let torn = inner.volatile(path).expect("file must exist");
         let inode = inner.inodes[&torn].clone();
         let mut data = inode.durable.clone();
@@ -547,11 +683,16 @@ pub struct CrashFile {
     /// The name the file was opened by (fault hooks and messages).
     path: String,
     inode: InodeId,
+    /// The power-loss epoch the handle was opened in.
+    epoch: u64,
 }
 
 impl Drop for CrashFile {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
+        if inner.epoch != self.epoch {
+            return;
+        }
         if let Some(count) = inner.handles.get_mut(&self.inode) {
             *count -= 1;
             if *count == 0 {
@@ -568,6 +709,12 @@ impl CrashFile {
         f: impl FnOnce(&mut Inner, &mut Inode) -> io::Result<R>,
     ) -> io::Result<R> {
         let mut inner = self.inner.lock();
+        if inner.epoch != self.epoch {
+            return Err(io::Error::other(format!(
+                "{}: handle opened before a power loss (EIO)",
+                self.path
+            )));
+        }
         let mut inode = inner.inodes.get(&self.inode).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -678,15 +825,16 @@ impl BackingFile for CrashFile {
             if let Err(e) = inner.check(&FaultOp::SyncData { path: &self.path }) {
                 if !inner.lenient_sync_failures {
                     // Writeback failed: the kernel marks the pages clean and
-                    // keeps their (unpersisted) content in the page cache. A
-                    // retry of fsync has nothing dirty to write and succeeds
-                    // without touching the disk.
-                    inode.pending.clear();
+                    // keeps their content in the page cache. A retry of fsync
+                    // has nothing dirty to write and succeeds without
+                    // touching the disk, but some of the pages may already
+                    // have reached it.
+                    let failed = std::mem::take(&mut inode.pending);
+                    inode.uncertain.extend(failed);
                 }
                 return Err(e);
             }
-            inode.durable = durable_after_sync(inode);
-            inode.pending.clear();
+            inode.sync();
             Ok(())
         })
     }
@@ -695,13 +843,18 @@ impl BackingFile for CrashFile {
 struct CrashLock {
     inner: Arc<Mutex<Inner>>,
     path: String,
+    /// The power-loss epoch the lock was taken in; a crash released it.
+    epoch: u64,
 }
 
 impl VolumeLock for CrashLock {}
 
 impl Drop for CrashLock {
     fn drop(&mut self) {
-        self.inner.lock().locks.remove(&self.path);
+        let mut inner = self.inner.lock();
+        if inner.epoch == self.epoch {
+            inner.locks.remove(&self.path);
+        }
     }
 }
 
@@ -735,6 +888,7 @@ impl Backing for CrashableBacking {
             inner: self.inner.clone(),
             path: path.to_string(),
             inode,
+            epoch: inner.epoch,
         }))
     }
 
@@ -898,6 +1052,7 @@ impl Backing for CrashableBacking {
         Ok(Box::new(CrashLock {
             inner: self.inner.clone(),
             path: path.to_string(),
+            epoch: inner.epoch,
         }))
     }
 }
@@ -911,8 +1066,9 @@ mod tests {
     }
 
     /// The Linux writeback-error model: a failed fsync leaves the bytes
-    /// visible but unpersisted, a retried fsync succeeds without writing
-    /// them, and only a rewrite makes them durable.
+    /// visible but not durable, a retried fsync succeeds without writing
+    /// them (the worst-case crash still loses them), and only a rewrite
+    /// makes them durable.
     #[test]
     fn failed_sync_marks_dirty_writes_clean_and_lost() {
         let backing = CrashableBacking::new();
@@ -937,7 +1093,7 @@ mod tests {
         assert_eq!(
             file.len().unwrap(),
             0,
-            "lost writeback must not survive a crash"
+            "a retried sync must not make failed writeback durable"
         );
 
         // Rewriting the same bytes dirties them again; the next sync persists them.

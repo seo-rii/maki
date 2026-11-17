@@ -220,7 +220,7 @@ The ignored long-running and external-service gates were not part of this run.
 | Component | Purpose |
 |---|---|
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
-| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
+| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics follow Linux writeback: a failed `sync_data` marks its dirty operations clean with *unknown* persistence (the page cache keeps showing them, a retried sync writes nothing, a later power loss may keep any of them, whole or torn, and the worst-case crash loses them), a successful sync writes back every page a dirty write touched as a whole 4 KiB cached page, and the partial-write hook makes a `write_at` persist a prefix before failing. A power loss kills every process: file and lock handles opened before it are dead |
 | `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses. Refuses a batch over its declared `max_items` or `max_bytes` (plaintext bytes; one unit per decrypt item) with `NonRetryableRequest`, as a vendor endpoint would. With integrity off it behaves like an unauthenticated cipher: any ciphertext of the right length decrypts (to garbage when damaged) and only a wrong length is refused |
 | `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing. Sleepers due in one `advance` are woken by deadline, then in creation order |
 | `DeterministicScheduler` | Reproducible seeded interleavings. A task is polled again only after its waker fires, so a lost wakeup stalls (`run` panics, `run_bounded` returns `false`) as it would hang under tokio |
@@ -559,7 +559,30 @@ including a cross-directory rename when either parent is synced. That is a
 model assumption, not a guarantee for every filesystem; directory-local rename
 persistence needs additional simulation or real-filesystem testing. The main
 power-loss gate (`phase12_powerloss.rs`) also enables tearing at 512-byte
-granularity, so an unsynced write can survive in part. Simulation is useful
+granularity, so an unsynced write can survive in part.
+
+A failed `sync_data` only reports that some writeback failed: the flusher, or
+the failing sync before the page that failed, may already have written the
+rest. The model therefore keeps a failed sync's operations as *uncertain*: a
+later crash keeps each one independently, exactly like an unsynced operation
+(torn too, with tearing enabled), while `crash_all_lost` and
+`crash_keep_torn_prefix` drop them. A retried sync has nothing dirty to write
+and makes none of them certain, so the rewrite-before-retry protocols remain
+required (F01). Writeback is page granular: a successful sync persists every
+page a dirty write touched as the page cache holds it (zero past end-of-file),
+which makes the uncertain bytes in a re-dirtied page durable; bytes a
+successful sync rewrote or truncated never come back. A length change dirties
+no page. One whose sync failed may survive a crash until the next successful
+sync of the file, after which the model treats it as lost, so a bare retry
+cannot be relied on to persist a truncation.
+
+A power loss also kills every process. After `crash*` every lock is released,
+and each operation on a file handle opened before it fails with an
+`ErrorKind::Other` I/O error (the model's EIO) without changing the recovered
+state; dropping such a handle or lock releases nothing of the post-crash world.
+A test therefore cannot keep writing through, or syncing, a handle that a real
+power loss would have closed. A restart (`drop` + reopen, page cache intact)
+invalidates nothing. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 
