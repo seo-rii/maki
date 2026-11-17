@@ -5,7 +5,8 @@
 //! limits on every call; a violation is `CryptoError::Contract`
 //! (ProviderFatal). It is never retried against the endpoint that sent it; in
 //! an `EndpointSet` it charges that endpoint's breaker, and a retry-safe
-//! request fails over to an endpoint it has not tried yet (R5-005).
+//! request fails over to the other validated endpoints, failing only once
+//! every one of them has broken the contract for it (R5-005).
 
 use std::sync::Arc;
 

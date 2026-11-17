@@ -309,10 +309,17 @@ request-fatal, or provider-fatal. Only eligible failures enter bounded full-
 jitter retry. A response that breaks the provider contract (malformed body,
 wrong item count, bad encoding) and an HTTP 404/405/410 are charged to the
 endpoint that sent them: its breaker counts the failure and a retry-safe
-request fails over to an endpoint it has not tried yet, so a misrouted
-endpoint cannot absorb most traffic. A contract violation with no untried
-endpoint left is reported at once. Retry budgets, circuit breakers, endpoint limits, and global byte
-and request semaphores prevent a failing provider from causing unbounded work.
+request fails over to another endpoint, so a misrouted endpoint cannot absorb
+most traffic. An operation is never sent again to an endpoint that broke the
+contract for it. The violation is reported at once only when every validated
+endpoint has broken the contract for that operation (a single endpoint
+included; quarantined endpoints do not count). While another validated
+endpoint remains, even one that failed transiently or whose circuit is
+cooling, the operation stays in the normal backoff loop whatever order the
+endpoints were tried in: under `stall` it stays pending, and under
+`bounded-error` it ends at `max_operation_time`. Retry budgets, circuit
+breakers, endpoint limits, and global byte and request semaphores prevent a
+failing provider from causing unbounded work.
 
 ## Cache and growth
 
