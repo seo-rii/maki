@@ -6,30 +6,84 @@
 //! installed. Without this sink an operator saw a failed exit status and
 //! none of the reasons. This mirrors `maki_core::logging` (R4-001) without
 //! depending on it: `maki-core` pulls in crypto crates, which the helper
-//! must never link (PRIV-010).
+//! must never link (PRIV-010). It accepts the same `MAKI_LOG` values, so
+//! the small value check is duplicated rather than shared.
 
+use std::ffi::OsStr;
 use std::io;
 
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 /// Environment variable holding a `tracing_subscriber::EnvFilter` directive
-/// list, shared with the daemon (`maki_core::logging::LOG_ENV`).
+/// list, shared with the daemon (`maki_core::logging::LOG_ENV`). Every
+/// directive names its level (see `parse_filter`).
 pub const LOG_ENV: &str = "MAKI_LOG";
 
-/// The level used when [`LOG_ENV`] is unset or unparsable.
+/// The level used when [`LOG_ENV`] is unset, empty or invalid.
 pub const DEFAULT_LEVEL: &str = "info";
 
 /// Install the default stderr subscriber once per process. Returns `false`
-/// when a subscriber was already present.
+/// when a subscriber was already present. An invalid [`LOG_ENV`] value is
+/// reported once, by the call that installs the sink.
 pub fn install_default_logging() -> bool {
-    let filter = EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LEVEL));
-    tracing_subscriber::fmt()
+    let value = std::env::var_os(LOG_ENV);
+    let (filter, refused) = match value.as_deref().map(parse_filter) {
+        Some(Ok(Some(filter))) => (filter, None),
+        Some(Err(reason)) => (EnvFilter::new(DEFAULT_LEVEL), Some(reason)),
+        Some(Ok(None)) | None => (EnvFilter::new(DEFAULT_LEVEL), None),
+    };
+    let installed = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(io::stderr)
         .with_ansi(false)
         .with_target(false)
         .try_init()
-        .is_ok()
+        .is_ok();
+    if let (true, Some(reason)) = (installed, refused) {
+        tracing::warn!(
+            value = ?value.unwrap_or_default(),
+            %reason,
+            "MAKI_LOG is not a valid filter; logging at {DEFAULT_LEVEL}"
+        );
+    }
+    installed
+}
+
+/// Parse a [`LOG_ENV`] value: `Ok(None)` when it holds no directive (empty),
+/// which means the default like an unset variable.
+///
+/// EnvFilter reads a directive without a level as a target, or a span,
+/// enabled at trace, and turns every target no directive names off. A
+/// misspelt level (`warning`, `err`) would then hide every halted rollback,
+/// so each directive must be a level or end in `=<level>`, as for the daemon
+/// (`maki_core::logging`).
+fn parse_filter(value: &OsStr) -> Result<Option<EnvFilter>, String> {
+    let value = value.to_str().ok_or("the value is not UTF-8")?;
+    // EnvFilter splits the same way and skips empty directives.
+    let directives: Vec<&str> = value.split(',').filter(|d| !d.is_empty()).collect();
+    if directives.is_empty() {
+        return Ok(None);
+    }
+    if let Some(directive) = directives.iter().find(|d| !names_level(d)) {
+        return Err(format!(
+            "directive {directive:?} does not name a level; use off, error, warn, info, \
+             debug or trace, alone or as <target>=<level>"
+        ));
+    }
+    EnvFilter::try_new(value)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Whether `directive` is a level or ends in `=<level>`. Whatever precedes
+/// the `=` is left to EnvFilter's parser.
+fn names_level(directive: &str) -> bool {
+    let level = directive
+        .rsplit_once('=')
+        .map_or(directive, |(_, level)| level);
+    // `LevelFilter` parses "" as ERROR, but EnvFilter reads `target=` as trace.
+    !level.is_empty() && level.parse::<LevelFilter>().is_ok()
 }
 
 #[cfg(test)]
