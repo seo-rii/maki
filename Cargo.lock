@@ -1019,6 +1019,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "libc",
+ "log",
  "maki-backing",
  "maki-core",
  "maki-crypto",
@@ -1037,7 +1038,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "zeroize",
 ]

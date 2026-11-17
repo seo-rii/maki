@@ -142,7 +142,51 @@ fn spare_capacity_lock_case() {
     );
 }
 
+/// Linux capability sets (`capget(2)`), version 3: two 32-bit words.
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Clears `capability` from the calling thread's effective set. This child
+/// process exits after its case, so nothing is restored; an unprivileged
+/// user has nothing to clear.
+fn drop_effective_capability(capability: u32) -> std::io::Result<()> {
+    const VERSION_3: u32 = 0x2008_0522;
+    // pid 0 names the calling thread.
+    let mut header = CapabilityHeader {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapabilityData::default(); 2];
+    // SAFETY: both pointers reference live, correctly laid out structures
+    // for the duration of each call; capget writes two data words.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    data[(capability / 32) as usize].effective &= !(1 << (capability % 32));
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn locking_failure_case() {
+    // RLIMIT_MEMLOCK does not bind a process with CAP_IPC_LOCK (root).
+    const CAP_IPC_LOCK: u32 = 14;
+    if let Err(error) = drop_effective_capability(CAP_IPC_LOCK) {
+        eprintln!("skipping the locking failure case: cannot drop CAP_IPC_LOCK ({error})");
+        return;
+    }
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

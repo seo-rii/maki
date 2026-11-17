@@ -1,6 +1,6 @@
 //! Manually advanced clock (SPEC §42 `ManualClock`).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,11 +15,16 @@ use maki_crypto::clock::{Clock, SleepFuture};
 struct Inner {
     now: Duration,
     next_id: u64,
-    sleepers: HashMap<u64, (Duration, Option<Waker>)>,
+    /// Keyed by (deadline, registration id), so due sleepers are woken in
+    /// one reproducible order.
+    sleepers: BTreeMap<(Duration, u64), Option<Waker>>,
 }
 
 /// A `Clock` whose time only moves when `advance`/`set` is called.
-/// Sleep futures complete exactly when their deadline is reached.
+/// Sleep futures complete exactly when their deadline is reached. Sleepers
+/// that become due in one `advance` are woken by deadline, then in the
+/// order they were created, so the run order of the woken tasks is the same
+/// on every run.
 #[derive(Clone, Default)]
 pub struct ManualClock {
     inner: Arc<Mutex<Inner>>,
@@ -37,9 +42,8 @@ impl ManualClock {
             let now = inner.now;
             inner
                 .sleepers
-                .values_mut()
-                .filter(|(deadline, _)| *deadline <= now)
-                .filter_map(|(_, w)| w.take())
+                .range_mut(..=(now, u64::MAX))
+                .filter_map(|(_, waker)| waker.take())
                 .collect()
         };
         for w in wakers {
@@ -70,7 +74,7 @@ impl Clock for ManualClock {
         let id = inner.next_id;
         inner.next_id += 1;
         let deadline = inner.now + duration;
-        inner.sleepers.insert(id, (deadline, None));
+        inner.sleepers.insert((deadline, id), None);
         drop(inner);
         Box::pin(ManualSleep {
             inner: self.inner.clone(),
@@ -91,12 +95,13 @@ impl Future for ManualSleep {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.lock();
+        let key = (self.deadline, self.id);
         if inner.now >= self.deadline {
-            inner.sleepers.remove(&self.id);
+            inner.sleepers.remove(&key);
             Poll::Ready(())
         } else {
-            if let Some(entry) = inner.sleepers.get_mut(&self.id) {
-                entry.1 = Some(cx.waker().clone());
+            if let Some(waker) = inner.sleepers.get_mut(&key) {
+                *waker = Some(cx.waker().clone());
             }
             Poll::Pending
         }
@@ -105,6 +110,6 @@ impl Future for ManualSleep {
 
 impl Drop for ManualSleep {
     fn drop(&mut self) {
-        self.inner.lock().sleepers.remove(&self.id);
+        self.inner.lock().sleepers.remove(&(self.deadline, self.id));
     }
 }
