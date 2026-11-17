@@ -327,9 +327,11 @@ fn declared_context_binding_requires_a_per_item_unit_index() {
         &["unit_index", "context_binding"],
         "batch without unit_index",
     );
+    // A top-level unit index of a batch is refused whatever the binding:
+    // it is sent as 0 (review_http_item_sources.rs).
     assert_refused(
         &batch("contractual", &format!("{CONTEXT}{UNIT}"), PAYLOAD),
-        &["unit_index", "context_binding"],
+        &["unit_index", "item_fields"],
         "batch with unit_index only at the top level",
     );
     assert_refused(

@@ -224,6 +224,11 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   and no top-level field may sit at, under or above the batch `items_path`;
   each batch element's `item_fields` are checked as their own object.
   `/vol` and `/volume`, or `/a~1b` (the key `a/b`) and `/a/b`, are distinct;
+- HTTP JSON body fields that no request carries: a `payload`, `unit_index`
+  or `batch_index` source among the top-level `fields` of a batch (they are
+  evaluated once per request, with no item, and would be sent as an empty
+  payload or zero; map them in `item_fields`), and a non-empty
+  `item_fields` table on a per-item body, which sends only `fields`;
 - a gRPC `encrypt_path` or `decrypt_path` that the provider would not send
   as written (validation and the provider apply one rule): it must start
   with `/`, be at most 65534 bytes long, and contain only RFC 3986 path and
@@ -234,10 +239,9 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
 - a declared `capabilities.context_binding` whose context does not reach
   the provider: each of `volume_id`, `compatibility_id` and `format_version`
   must be a source in the JSON `fields`, or in `item_fields` of a batch
-  layout (a raw body sends no fields, and a per-item body never sends
-  `item_fields`), and the attach self-test's unit-index probe needs a
-  per-item `unit_index`: in `fields` of a per-item body, in `item_fields` of
-  a batch (top-level batch fields belong to no item);
+  layout (a raw body sends no fields), and the attach self-test's
+  unit-index probe needs a per-item `unit_index`: in `fields` of a per-item
+  body, in `item_fields` of a batch;
 - a transport limit that cannot carry one full crypto batch, including the
   declared maximum ciphertext size. The maximum batch is bounded by both
   `crypto.batch.max_items` and the number of provider plaintext units that fit
@@ -383,9 +387,11 @@ sources:
 | `batch_index` | the item's position in its request, an unsigned JSON integer |
 
 Only `payload` takes an `encoding`. A per-item body sends `fields` once per
-item. A batch body sends `fields` once per request (a `payload`, `unit_index`
-or `batch_index` there carries no item: an empty payload and zero) and the
-array of `item_fields` objects at `items_path`.
+item and takes no `item_fields`. A batch body sends `fields` once per request,
+so they may carry only `volume_id`, `compatibility_id` and `format_version`
+(validation refuses a `payload`, `unit_index` or `batch_index` there, which
+would describe no item), and the array of `item_fields` objects at
+`items_path`.
 
 JSON requests default to `Content-Type: application/json`. An explicitly
 configured `Content-Type` overrides that default, including vendor media types;

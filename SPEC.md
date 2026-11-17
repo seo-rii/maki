@@ -837,7 +837,12 @@ not start with `/`, and request pointers that would replace one another on
 the wire. Pointers are applied in order and replace what they address, so two
 pointers of one JSON object conflict when, after RFC 6901 decoding, one
 equals the other or addresses a field inside it; a batch `items_path` also
-conflicts with any top-level field at, under or above it.
+conflicts with any top-level field at, under or above it. Validation MUST
+also reject fields no request carries: a batch evaluates its top-level
+`fields` once per request, with no item, so a `payload`, `unit_index` or
+`batch_index` source there (which would be sent as an empty payload or 0)
+belongs in `item_fields`; and a per-item body sends only `fields`, so it
+takes no `item_fields`.
 
 Batch result identity: every batch element a remote provider returns MUST
 carry the unit index of the request item it answers, in request order. Maki
