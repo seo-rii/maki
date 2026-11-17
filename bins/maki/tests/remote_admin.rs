@@ -608,6 +608,100 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
     }
 }
 
+/// Whether this `maki` binary has the test-only `fake` provider compiled in.
+/// `cargo test --workspace` unifies the nbdkit crate's own dev-dependency
+/// features into every binary; `cargo test -p maki` builds the feature set a
+/// release has, where a plain `volume create` refuses the provider (M-008).
+fn fake_provider_compiled(dir: &std::path::Path) -> bool {
+    let config = dir.join("fake-probe.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "config_schema_version=1\n[volume]\nname=\"fake-probe\"\nmax_virtual_size=\"1MiB\"\n\
+             shard_logical_size=\"64KiB\"\n[crypto]\nprovider=\"fake\"\n\
+             crypto_compatibility_id=\"test-profile-v1\"\n[crypto.capabilities]\n\
+             supported_plaintext_sizes=[4096]\nmax_ciphertext_size=4104\n[backing]\nroot={:?}\n\
+             journal_segment_size=\"64KiB\"\njournal_max_bytes=\"2MiB\"\n\
+             checkpoint_reserve_bytes=\"0B\"\njournal_emergency_reserve_bytes=\"0B\"\n",
+            dir.join("fake-probe").to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = run(&["volume", "create", config.to_str().unwrap()]);
+    let error = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        return true;
+    }
+    assert!(
+        error.contains("not compiled"),
+        "unexpected probe failure: {error}"
+    );
+    false
+}
+
+#[test]
+fn resume_enrollment_refuses_a_provider_this_build_cannot_construct() {
+    let f = Fixture::new();
+    if fake_provider_compiled(f.dir.path()) {
+        eprintln!(
+            "skipped: this maki binary includes the fake provider (feature unification); \
+             run `cargo test -p maki` to exercise the release feature set"
+        );
+        return;
+    }
+    assert!(RollbackBacking::create_remote(
+        &f.root,
+        Arc::new(LoseClaims(f.writer.clone())),
+        64 * 1024
+    )
+    .is_err());
+    let before = inspect(f.writer.as_ref());
+    let identity = uuid::Uuid::from_bytes(before.identity).to_string();
+    let fence = before.fence.to_string();
+    let entries = || {
+        let mut names: Vec<_> = std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let root_before = entries();
+    let real = std::fs::read_to_string(&f.admin_config).unwrap();
+    let fake = real
+        .replace(
+            "provider=\"local-aes-gcm-siv\"\ncrypto_compatibility_id=\"local-aes-gcm-siv-v1\"\n\
+             key={source=\"env\",name=\"unused-admin-key\"}\n",
+            "provider=\"fake\"\ncrypto_compatibility_id=\"test-profile-v1\"\n",
+        )
+        .replace("max_ciphertext_size=4384", "max_ciphertext_size=4104");
+    assert!(fake.contains("provider=\"fake\""));
+    std::fs::write(&f.admin_config, fake).unwrap();
+    // Initialization would record provider "fake" in a superblock that no
+    // build without the provider can attach, and consume the enrollment.
+    failure(
+        &[
+            "volume",
+            "resume-enrollment",
+            f.path(true),
+            &fence,
+            &identity,
+        ],
+        "not compiled",
+    );
+    assert_eq!(inspect(f.writer.as_ref()), before, "authority changed");
+    assert_eq!(entries(), root_before, "backing root changed");
+    // The same approval still completes with a provider this build has.
+    std::fs::write(&f.admin_config, real).unwrap();
+    success(&[
+        "volume",
+        "resume-enrollment",
+        f.path(true),
+        &fence,
+        &identity,
+    ]);
+}
+
 #[test]
 fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness() {
     let f = Fixture::new();
