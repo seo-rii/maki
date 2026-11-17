@@ -365,7 +365,8 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 - The plugin advertises configured NBD block sizes and validates request
   length, range, and alignment before copying write plaintext into Maki or
   submitting work to the engine.
-- The control socket exposes status, metrics, checkpoint, and reload only.
+- The control socket exposes status, metrics, checkpoint, drain, and reload
+  only.
 - Socket creation keeps the process umask unchanged. A private staging
   directory hides the socket until its group and mode are set; rename then
   publishes the ready socket at its configured path.

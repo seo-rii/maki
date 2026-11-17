@@ -245,8 +245,9 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   base64/base64url/hex encoding, JSON pointer wrappers and echoed indices; raw
   and single-item responses are checked too. JSON bounds cover compact documents
   containing the declared fields, including the required null-filled
-  array prefixes selected by numeric JSON-pointer tokens. Only RFC 6901 `~0`
-  and `~1` pointer escapes are accepted. Optional provider metadata, non-null
+  array prefixes selected by numeric JSON-pointer tokens. Response pointers
+  accept only the RFC 6901 `~0` and `~1` escapes (a request pointer keeps any
+  other `~` literally, as in `/x~2` above). Optional provider metadata, non-null
   data in unmapped array siblings, whitespace and redundant escaping need
   additional response capacity. Remote responses still obey the hard
   runtime cap. A zero limit is rejected;
@@ -308,7 +309,8 @@ systemd 257 and later write those files `0440` for the service's group, which
 Maki accepts in the credentials directory only (R5-037). The
 privileged attach helper has no crypto dependency and no credential directive.
 
-A `file` credential must be a regular file with mode `0600` or `0400`, and
+A `file` credential must be a regular file with no group or other permission
+bits (for example `0600` or `0400`), and
 every credential file, in the credentials directory too, must be owned by root
 or by the user the loading process runs as (the daemon user for the packaged
 service). A file owned by any other user is refused whatever its mode, because
@@ -771,7 +773,7 @@ attached, fails closed on Linux, and is reported under `security` in
 | `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
 | `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` registered `SecretBuffer` allocations (including plaintext, keys and cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported. Local providers produce plaintext in place inside such buffers; their expanded AES key schedules are page-locked in a `SecretBox` and zeroized on drop (see [local providers and key material](transport-memory.md#local-providers-and-key-material)). Separate transport allocations are described in [buffer lifetime limits](transport-memory.md) |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
-| `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
+| `memory_lock_mode = "off"` | No locking. `cache.lock_memory` defaults to `true` (also with the cache off), which validation refuses with this mode, so set `cache.lock_memory = false` too |
 | `require_secure_swap_policy` (default false) | Requires readable, parseable `/proc/swaps` and accepts only RAM-only zram or dm-crypt with proven independent physical backing, including zram writeback. NBD ancestors, cycles, and unknown backing are refused. Device identity determines classification; keep the topology fixed while attached. See [swap dependency checks](operations.md#swap-dependency-checks). The shipped production example enables this policy |
 
 Buffers are zeroized before their page-lock ownership is released. Exporting a

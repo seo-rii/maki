@@ -78,7 +78,9 @@ locks and atomic rename.
 | Snapshot- or restore-managed filesystems | See limitation | Restoring an older backing image is not detected by default formats ([rollback protection](../rollback-protection.md)) |
 
 The backing directory and its ancestors must be real directories (no
-symlinks) on Linux, owned by the daemon user, mode `0700`.
+symlinks) on Linux. The backing directory itself must be owned by the daemon
+user, mode `0700`; its ancestors need not be (the packaged `/var/lib/maki` is
+`root:maki` `0750`).
 Backing files, including volume locks, must be regular files with exactly one
 hard link. Linux checks this on open and refuses existing hardlink aliases,
 including hardlink-based backing copies. The check cannot prevent later link

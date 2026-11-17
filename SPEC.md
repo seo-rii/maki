@@ -675,7 +675,9 @@ Geometry creation MUST reject more than 2^24 possible shards, matching the
 supported shard-catalog limit, any capacity calculation that overflows an
 unsigned 64-bit byte count, and a unit count that reaches the reserved
 key-canary unit index (§27), which attach refuses. `maki volume inspect`
-reports these five maximum-layout values. They exclude journal and checkpoint
+reports the five maximum-layout values above (all but `units_per_shard`) and
+a sixth, the discard-map A/B bytes, which equal `allocation_map_ab_bytes` for
+a v3 volume and are zero for v2. They exclude journal and checkpoint
 headroom, filesystem metadata and copy-on-write overhead, and application
 temporary space; they are not a full-volume physical reservation. Before
 accepting a journal record, a Linux backing MUST physically allocate the exact
