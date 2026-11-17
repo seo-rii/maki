@@ -177,8 +177,10 @@ fn main() -> ExitCode {
             match created {
                 Ok(sb) => {
                     // The superblock does not record the volume name.
-                    let name = maki_format::config::parse_config(&raw)
-                        .map(|cfg| cfg.volume.name)
+                    let cfg = maki_format::config::parse_config(&raw).ok();
+                    let name = cfg
+                        .as_ref()
+                        .map(|cfg| cfg.volume.name.as_str())
                         .unwrap_or_default();
                     println!(
                         "created volume {name} (provider {}, uuid {}, {} bytes virtual, slot size {})",
@@ -187,7 +189,7 @@ fn main() -> ExitCode {
                         sb.geometry.max_virtual_size,
                         sb.geometry.slot_size
                     );
-                    if let Some(hint) = ownership_hint(running_as_root()) {
+                    if let Some(hint) = ownership_hint(running_as_root(), cfg.as_ref()) {
                         eprintln!("warning: {hint}");
                     }
                     ExitCode::SUCCESS
@@ -366,13 +368,34 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
 }
 
 /// The backing tree is created owner-only; a root-created volume is
-/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`).
-fn ownership_hint(as_root: bool) -> Option<&'static str> {
-    as_root.then_some(
-        "the volume tree was created owner-only by root; the daemon runs as the maki user \
-         and cannot open it. Run `maki volume create` as that user (sudo -u maki ...) or \
-         chown the tree to maki:maki before starting the service",
-    )
+/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). A local
+/// rollback witness is created the same way, so name both paths.
+fn ownership_hint(
+    as_root: bool,
+    cfg: Option<&maki_format::config::VolumeConfig>,
+) -> Option<String> {
+    if !as_root {
+        return None;
+    }
+    let local_witness = cfg.and_then(|cfg| {
+        cfg.backing
+            .rollback_protection
+            .as_ref()
+            .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
+            .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()))
+    });
+    Some(match local_witness {
+        Some((root, witness)) => format!(
+            "the volume tree {root} and the rollback witness in {witness} were created \
+             owner-only by root; the daemon runs as the maki user and cannot open them. Run \
+             `maki volume create` as that user (sudo -u maki ...) or \
+             `chown -R maki:maki {root} {witness}` before starting the service"
+        ),
+        None => "the volume tree was created owner-only by root; the daemon runs as the maki \
+                 user and cannot open it. Run `maki volume create` as that user \
+                 (sudo -u maki ...) or chown the tree to maki:maki before starting the service"
+            .to_string(),
+    })
 }
 
 #[cfg(unix)]
