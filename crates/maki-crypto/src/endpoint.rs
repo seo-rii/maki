@@ -950,10 +950,18 @@ impl EndpointSet {
             // between them. Endpoints that broke the contract for this
             // operation stay excluded.
             let mut excluded = contract_failed.clone();
-            while let Some(admission) = self
-                .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
-                .await?
-            {
+            loop {
+                let admission = match self
+                    .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
+                    .await
+                {
+                    Ok(Some(admission)) => admission,
+                    Ok(None) => break,
+                    // The deadline expired while waiting for admission.
+                    // Report the last endpoint failure, as the other
+                    // deadline exits do; with none, the deadline itself.
+                    Err(deadline_exceeded) => return Err(last_error.unwrap_or(deadline_exceeded)),
+                };
                 let endpoint = admission.endpoint.clone();
                 let Some(probe) = endpoint.breaker.acquire() else {
                     // Readiness can change on another worker after admission.
