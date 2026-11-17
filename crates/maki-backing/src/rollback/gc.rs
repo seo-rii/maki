@@ -168,6 +168,16 @@ impl<'a> OperationGuard<'a> {
             // error stops collection, and the next pass starts at the root.
             after = page.last().cloned();
             for entry in page {
+                // Namespaces, tombstones and root files are ASCII. A name
+                // that is not UTF-8 is unknown like any other: keep it.
+                let entry = match entry.into_string() {
+                    Ok(entry) => entry,
+                    Err(entry) => {
+                        let name = entry.to_string_lossy().into_owned();
+                        report.record(Disposition::Unrecognized, name);
+                        continue;
+                    }
+                };
                 if [
                     "rollback.format",
                     "remote.enroll.lock",

@@ -452,6 +452,9 @@ and `retained` namespace arrays. Each array retains at most the first 4,096
 names in that category. The corresponding fields in `counts` give the total
 numbers processed, including any omitted details; `details_truncated` is true
 if any array omitted names. Use `counts`, not array lengths, for totals.
+An entry whose name is not valid UTF-8 is never a namespace: GC keeps it,
+lists it under `skipped_unrecognized` with U+FFFD in place of each invalid
+byte sequence, and goes on.
 
 GC walks the root in sorted pages of at most 4,096 names and continues past
 pages containing only retained, live or unrecognized entries. Each page scans

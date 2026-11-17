@@ -311,6 +311,11 @@ fn unactivated_candidates(
         }
         after = page.last().cloned();
         for entry in page {
+            // Names Maki writes are ASCII, so one that is not UTF-8 is
+            // neither a namespace nor a tombstone of any volume.
+            let Ok(entry) = entry.into_string() else {
+                continue;
+            };
             if entry
                 .strip_prefix(TOMBSTONE)
                 .is_some_and(|original| namespace_fence(original).is_some())

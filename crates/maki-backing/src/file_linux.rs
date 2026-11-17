@@ -2,7 +2,7 @@
 //! previously checked absolute pathname. A renamed root stays the same volume.
 
 use std::collections::BinaryHeap;
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -249,7 +249,11 @@ impl Drop for DirectoryStream {
     }
 }
 
-fn visit_names(directory: &File, mut visit: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+/// Visit each entry's exact name bytes; a name need not be UTF-8.
+fn visit_names(
+    directory: &File,
+    mut visit: impl FnMut(&OsStr) -> io::Result<()>,
+) -> io::Result<()> {
     // A fresh open file description gives each scan its own directory offset.
     let fd = open_at(directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?.into_raw_fd();
     // SAFETY: fdopendir takes ownership on success; on failure we close fd.
@@ -275,17 +279,19 @@ fn visit_names(directory: &File, mut visit: impl FnMut(&str) -> io::Result<()>) 
         if name == c"." || name == c".." {
             continue;
         }
-        let name = name.to_str().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 GC directory entry")
-        })?;
-        visit(name)?;
+        visit(OsStr::from_bytes(name.to_bytes()))?;
     }
     Ok(())
 }
 
+/// A namespace's entries for retirement, which must account for each one:
+/// a name that is not UTF-8 fails the scan, so the namespace is kept.
 fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     visit_names(directory, |name| {
+        let name = name.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 GC directory entry")
+        })?;
         if names.len() == maximum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -299,9 +305,15 @@ fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-fn names_after(directory: &File, after: Option<&str>, maximum: usize) -> io::Result<Vec<String>> {
+/// The smallest `maximum` names above `after`, ordered by their bytes, so a
+/// name that is not UTF-8 is listed exactly once like any other.
+fn names_after(
+    directory: &File,
+    after: Option<&OsStr>,
+    maximum: usize,
+) -> io::Result<Vec<OsString>> {
     assert!(maximum > 0);
-    let mut page = BinaryHeap::<String>::new();
+    let mut page = BinaryHeap::<OsString>::new();
     visit_names(directory, |name| {
         if after.is_some_and(|after| name <= after) {
             return Ok(());
@@ -309,7 +321,7 @@ fn names_after(directory: &File, after: Option<&str>, maximum: usize) -> io::Res
         if page.len() < maximum {
             page.push(name.to_owned());
         } else if let Some(mut largest) = page.peek_mut() {
-            if name < largest.as_str() {
+            if name < largest.as_os_str() {
                 *largest = name.to_owned();
             }
         }
@@ -376,7 +388,7 @@ fn unexpected(error: &io::Error) -> bool {
 }
 
 impl Directory {
-    pub(super) fn gc_entries(&self, after: Option<&str>) -> io::Result<Vec<String>> {
+    pub(super) fn gc_entries(&self, after: Option<&OsStr>) -> io::Result<Vec<OsString>> {
         names_after(&self.0, after, 4096)
     }
 
