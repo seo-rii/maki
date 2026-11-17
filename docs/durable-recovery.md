@@ -159,9 +159,11 @@ Failed proof publication does not make new records checkpoint-eligible.
 
 ## Recovery, corruption and checkpoint pruning
 
-Recovery loads the required proof before applying repairs. Above the selected
-checkpoint, the journal must bridge through the required sequence and match
-its exact segment/record-end boundary. A missing final segment or a file
+Recovery loads the required proof before applying repairs; its first write
+makes the selected superblock durable in both copies, since an interrupted
+creation or a restart can hand it a copy that exists only in the page cache.
+Above the selected checkpoint, the journal must bridge through the required
+sequence and match its exact segment/record-end boundary. A missing final segment or a file
 truncated exactly at an earlier complete record therefore fails explicitly.
 If the checkpoint already covers the horizon, its old segment may legitimately
 have been pruned; checkpointing does not lower the horizon.
