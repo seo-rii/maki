@@ -195,10 +195,15 @@ fn a_segment_crossing_into_maximum_sequence_is_refused_without_sequence_wrap() {
     });
 }
 
+/// The highest horizon recovery accepts keeps its exact record count. On a
+/// v2 volume that is the last one a resumed writer can still extend by one
+/// record in one more segment; the preserved v1 read-only inspection keeps
+/// its historical bound, the last representable sequence and index.
 #[test]
-fn last_representable_horizon_remains_readable_with_exact_record_count() {
+fn last_accepted_horizon_remains_readable_with_exact_record_count() {
     for legacy in [false, true] {
-        let fixture = Fixture::new(u64::MAX - 2);
+        let last = if legacy { u64::MAX - 1 } else { u64::MAX - 2 };
+        let fixture = Fixture::new(last - 1);
         if legacy {
             // Exercise the preserved v1 read-only path with real frozen v1
             // envelopes, not a policy bypass or an in-place product migration.
@@ -211,7 +216,7 @@ fn last_representable_horizon_remains_readable_with_exact_record_count() {
                     .unwrap();
             }
         }
-        fixture.segment(u64::MAX - 1, u64::MAX - 1, &[u64::MAX - 1]);
+        fixture.segment(last, last, &[last]);
         let mutations = fixture.observe_mutations();
         let backing: Arc<dyn Backing> = fixture.backing.clone();
         let scan = scan_journal(
@@ -221,28 +226,28 @@ fn last_representable_horizon_remains_readable_with_exact_record_count() {
             SEGMENT_SIZE,
         )
         .unwrap();
-        assert_eq!(scan.durable_sequence, u64::MAX - 1);
-        assert_eq!(scan.next_segment_index, u64::MAX);
+        assert_eq!(scan.durable_sequence, last);
+        assert_eq!(scan.next_segment_index, last + 1);
         assert_eq!(scan.replay.len(), 1);
-        assert_eq!(scan.replay[0].sequence, u64::MAX - 1);
+        assert_eq!(scan.replay[0].sequence, last);
         let report = deep_check(backing, SEGMENT_SIZE).unwrap();
         assert!(
             report.errors.is_empty(),
             "legacy={legacy}: {:?}",
             report.errors
         );
-        assert!(report.info.iter().any(|line| line.contains(
-            "journal: 1 segment(s), 1 record(s) newer than the checkpoint, durable sequence 18446744073709551614"
-        )));
+        assert!(report.info.iter().any(|line| line.contains(&format!(
+            "journal: 1 segment(s), 1 record(s) newer than the checkpoint, durable sequence {last}"
+        ))));
         fixture.backing.set_fault_hook(None);
         assert!(mutations.lock().unwrap().is_empty());
     }
 }
 
 #[test]
-fn empty_segment_at_maximum_base_preserves_the_representable_horizon() {
-    let fixture = Fixture::new(u64::MAX - 1);
-    fixture.segment(1, u64::MAX, &[]);
+fn empty_segment_at_the_last_accepted_base_preserves_the_horizon() {
+    let fixture = Fixture::new(u64::MAX - 2);
+    fixture.segment(1, u64::MAX - 1, &[]);
     let mutations = fixture.observe_mutations();
     let backing: Arc<dyn Backing> = fixture.backing.clone();
     let scan = scan_journal(
@@ -252,18 +257,18 @@ fn empty_segment_at_maximum_base_preserves_the_representable_horizon() {
         SEGMENT_SIZE,
     )
     .unwrap();
-    assert_eq!(scan.durable_sequence, u64::MAX - 1);
+    assert_eq!(scan.durable_sequence, u64::MAX - 2);
     assert!(scan.replay.is_empty());
     assert!(scan.repairs.is_empty());
     let report = deep_check(backing, SEGMENT_SIZE).unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(report.info.iter().any(|line| line.contains(
-        "journal: 1 segment(s), 0 record(s) newer than the checkpoint, durable sequence 18446744073709551614"
+        "journal: 1 segment(s), 0 record(s) newer than the checkpoint, durable sequence 18446744073709551613"
     )));
     fixture.backing.set_fault_hook(None);
     assert!(mutations.lock().unwrap().is_empty());
     let volume = Volume::recover(fixture.backing.clone(), VolumeOptions::default()).unwrap();
-    assert_eq!(volume.journal_durable_sequence(), u64::MAX - 1);
+    assert_eq!(volume.journal_durable_sequence(), u64::MAX - 2);
 }
 
 #[test]

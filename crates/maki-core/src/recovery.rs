@@ -970,6 +970,32 @@ fn scan_journal_with_proof(
         })?,
         None => 0,
     };
+    // A resumed writer opens a new segment for its first append and refuses
+    // `u64::MAX` as a record sequence or a segment index
+    // (`JournalWriter::check_append`). A horizon or index that leaves no
+    // value for one more record and one more segment would make every write
+    // fail forever, on a volume the deep check called clean. Each value is
+    // consumed one record or one segment at a time, so in practice only
+    // damage gets there: refuse it rather than attach a volume nothing can
+    // write. The advisory mark counts like a segment (S-03: numbering never
+    // falls back below it). Read-only legacy inspection keeps its historical
+    // classification.
+    if proof.is_some() {
+        if durable_sequence.checked_add(2).is_none() {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal sequence space exhausted: durable sequence {durable_sequence} leaves no \
+                 sequence for another record"
+            )));
+        }
+        if next_segment_index == u64::MAX {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment index space exhausted: segment index {} (of a surviving \
+                 segment, the durable proof or the durable mark) leaves no index for another \
+                 segment",
+                u64::MAX - 1
+            )));
+        }
+    }
 
     let (replay, replay_units) = replay.into_parts();
     Ok(JournalScan {

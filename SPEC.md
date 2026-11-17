@@ -1367,7 +1367,10 @@ lower the horizon to make a damaged volume attach.
 Checkpointing consumes only records both proof copies attest, and recovery
 publishes the proof before it advances the checkpoint, so a selected checkpoint
 above the proof's horizon is damage, not a crash state. Recovery and the deep
-check MUST refuse it before any recovery write.
+check MUST refuse it before any recovery write. They MUST likewise refuse a
+recovered durable sequence or highest segment index (of a surviving segment,
+the proof or the advisory mark) that leaves the resumed writer no sequence for
+one more record or no index for one more segment.
 
 The first scan streams segment data and retains no replay payloads. After all
 durability checks and repairs succeed, a second scan replays accepted records
