@@ -289,5 +289,189 @@ class DocumentationAnchors(unittest.TestCase):
         ])
 
 
+class DocumentationReferenceLinks(unittest.TestCase):
+    """Reference definitions (`[label]: target "title"`) are links too.
+
+    GitHub renders `[text][label]`, `[label][]` and `[label]` through the
+    document's own definitions (CommonMark): labels match case-insensitively
+    with whitespace collapsed, and a full or collapsed reference whose label
+    has no definition is shown as literal bracketed text.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
+        self.write("docs/target.md", "# Present\n")
+
+    def write(self, name, content):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8"))
+        subprocess.run(["git", "-C", str(self.root), "add", "--", name], check=True)
+        return path
+
+    def test_definition_targets_must_exist(self):
+        self.write("README.md", "See [present][ok] and [gone][].\n\n"
+                                "[ok]: docs/target.md\n"
+                                "[gone]: docs/missing.md\n"
+                                "[dir]: docs/\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: docs/missing.md"])
+
+    def test_definition_anchors_must_name_a_heading(self):
+        self.write("README.md", "# Title\n\n[a] [b] [c] [d]\n\n"
+                                "[a]: docs/target.md#present\n"
+                                "[b]: docs/target.md#absent\n"
+                                "[c]: #title\n"
+                                "[d]: #nope\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:6: docs/target.md#absent (missing anchor)",
+            "README.md:8: #nope (missing anchor)",
+        ])
+
+    def test_definition_syntax_variants_are_recognized(self):
+        self.write("README.md", "\n".join([
+            "[angle]: <docs/missing-angle.md>",
+            '[double]: docs/missing-double.md "Title"',
+            "[single]: docs/missing-single.md 'Title'",
+            "[paren]: docs/missing-paren.md (Title)",
+            "   [indented]: docs/missing-indented.md",
+            "[next-line]:",
+            "  docs/missing-next-line.md",
+            '  "title on its own line"',
+            "[escaped]: docs/missing\\_escaped.md",
+            "",
+            "> [quoted]: docs/missing-quoted.md",
+            "",
+            "- [listed]: docs/missing-listed.md",
+            "",
+        ]))
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: docs/missing-angle.md",
+            "README.md:2: docs/missing-double.md",
+            "README.md:3: docs/missing-single.md",
+            "README.md:4: docs/missing-paren.md",
+            "README.md:5: docs/missing-indented.md",
+            "README.md:7: docs/missing-next-line.md",
+            "README.md:9: docs/missing_escaped.md",
+            "README.md:11: docs/missing-quoted.md",
+            "README.md:13: docs/missing-listed.md",
+        ])
+
+    def test_lines_github_does_not_treat_as_definitions_are_not_checked(self):
+        self.write("README.md", "\n".join([
+            "```text",
+            "[fenced]: missing-fenced.md",
+            "```",
+            "[note]: see the next section",
+            "",
+            '[bad-title]: missing-bad-title.md "unterminated',
+            "",
+            '[trailing]: missing-trailing.md "Title" text',
+            "",
+            "A paragraph line",
+            "[continuation]: missing-continuation.md",
+            "",
+            "[empty]: <>",
+            "[web]: https://example.invalid/missing.md",
+            "[mail]: mailto:test@example.invalid",
+            "[^footnote]: missing-footnote.md is footnote text",
+            "",
+        ]))
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_undefined_full_and_collapsed_references_are_reported(self):
+        self.write("README.md", "\n".join([
+            "[Text][defined] and [Defined][] resolve.",
+            "[Text][missing] does not.",
+            "Neither does [missing][].",
+            "Nor ![an image][missing-image].",
+            "An undefined shortcut [like this] is ordinary text.",
+            "- [x] a task item and [an inline link](docs/target.md).",
+            "`[code][span]` and \\[escaped][] are not references.",
+            "[inline][label](docs/target.md) has an inline link after it.",
+            "Footnotes[^1] are not links.",
+            "[![badge][missing-badge]][defined] nests an undefined image.",
+            "[A link](https://example.invalid/?q[0][1]) has brackets in its URL.",
+            "[foo][bar][defined]: `[bar][defined]` is the link, `[foo]` text.",
+            "",
+            "[defined]: docs/target.md",
+            "[^1]: The footnote.",
+            "",
+        ]))
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: [Text][missing] (undefined reference)",
+            "README.md:3: [missing][] (undefined reference)",
+            "README.md:4: [an image][missing-image] (undefined reference)",
+            "README.md:10: [badge][missing-badge] (undefined reference)",
+        ])
+
+    def test_labels_match_case_insensitively_with_whitespace_collapsed(self):
+        self.write("README.md", "\n".join([
+            "[a][FOO BAR] [b][ foo   bar ] [Foo Bar][] [c][ẞ] [d][other]",
+            "",
+            "[Foo  Bar]: docs/target.md",
+            "[SS]: docs/target.md",
+            "",
+        ]))
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: [d][other] (undefined reference)",
+        ])
+
+    def test_definitions_are_scoped_to_their_document(self):
+        self.write("docs/other.md", "[elsewhere]: target.md\n")
+        self.write("README.md", "[text][elsewhere]\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: [text][elsewhere] (undefined reference)",
+        ])
+
+    def test_every_definition_is_checked_even_a_duplicate_label(self):
+        self.write("README.md", "[text][dup]\n\n"
+                                "[dup]: docs/target.md\n"
+                                "[DUP]: docs/missing.md\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: docs/missing.md"])
+
+    def test_reference_links_in_headings_contribute_their_text_to_the_slug(self):
+        self.write("docs/target.md", "\n".join([
+            "## See [the guide][g] first",
+            "## Use [Shortcut] now",
+            "## Read [Collapsed][] too",
+            "## Literal [undefined][nothing] text",
+            "",
+            "[g]: https://example.invalid/guide",
+            "[shortcut]: https://example.invalid/shortcut",
+            "[collapsed]: https://example.invalid/collapsed",
+            "",
+        ]))
+        self.write("README.md", "\n".join([
+            "[a](docs/target.md#see-the-guide-first)",
+            "[b](docs/target.md#use-shortcut-now)",
+            "[c](docs/target.md#read-collapsed-too)",
+            "[d](docs/target.md#literal-undefinednothing-text)",
+            "",
+        ]))
+        self.assertEqual(broken_links(self.root), [
+            "docs/target.md:4: [undefined][nothing] (undefined reference)",
+        ])
+
+    def test_unchanged_archive_definitions_keep_the_omission_exception(self):
+        self.write("vendor/hyper/guide.md", "# Guide\n")
+        path = self.write("vendor/hyper/README.md", "[examples] [guide] [bad]\n\n"
+                                                    "[examples]: examples/\n"
+                                                    "[guide]: guide.md#guide\n"
+                                                    "[bad]: guide.md#nope\n")
+        self.write("vendor/upstream.json", json.dumps({
+            "schema": 1,
+            "packages": {"hyper": {"upstream_files": {
+                "README.md": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "guide.md": hashlib.sha256(b"# Guide\n").hexdigest(),
+            }}},
+        }))
+        self.assertEqual(broken_links(self.root), [
+            "vendor/hyper/README.md:5: guide.md#nope (missing anchor)",
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()
