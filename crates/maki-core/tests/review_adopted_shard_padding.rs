@@ -15,7 +15,9 @@ use uuid::Uuid;
 use maki_backing::Backing;
 use maki_core::check::deep_check;
 use maki_core::volume::{Volume, VolumeOptions};
+use maki_format::ab::AbStore;
 use maki_format::allocation::AllocationMap;
+use maki_format::canary::{KeyCanary, CANARY_UNIT_INDEX};
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
@@ -42,8 +44,22 @@ fn superblock() -> Superblock {
 fn volume_with_short_orphan(bitmap: u8) -> Arc<CrashableBacking> {
     let block = superblock();
     assert_eq!(block.geometry.units_per_shard(), UNITS_PER_SHARD);
+    let volume_uuid = block.volume_uuid;
     let backing = Arc::new(CrashableBacking::new());
     init::create_volume(backing.as_ref(), block).unwrap();
+
+    // An engine binds its key canary before it can create a shard. Without
+    // one, even an unwritten shard makes the volume non-pristine, with no
+    // ciphertext available to prove the key: a separate attach refusal.
+    let canary_ab = AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let mut canary = KeyCanary {
+        generation: 0,
+        volume_uuid,
+        unit_index: CANARY_UNIT_INDEX,
+        ciphertext: vec![0x5a; 64],
+    };
+    canary_ab.store(backing.as_ref(), &mut canary).unwrap();
+    canary_ab.store(backing.as_ref(), &mut canary).unwrap();
 
     let mut image = AllocationMap::new(UNITS_PER_SHARD).encode();
     let n = image.len();

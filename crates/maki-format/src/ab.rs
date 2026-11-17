@@ -187,6 +187,17 @@ impl AbStore {
         Ok((a, b))
     }
 
+    /// Raw generation of each side as `store` ranks it before choosing the
+    /// next one: any CRC-valid record within this store's length bound
+    /// counts, whatever its type or version (`None` = absent, empty,
+    /// over-long or CRC-invalid). Read-only; hard I/O errors are reported.
+    pub fn raw_generations<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+    ) -> Result<(Option<u64>, Option<u64>), FormatError> {
+        self.generations::<T>(backing)
+    }
+
     /// The side the *next* store will overwrite: a side that does not hold
     /// a valid record *of type `T`* first (whatever its raw generation says),
     /// otherwise the older one. Choosing by raw generation alone would let a
