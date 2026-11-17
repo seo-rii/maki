@@ -204,11 +204,23 @@ schema, geometry, and secret-literal checks validation rejects:
   index so reordered, dropped, or duplicated results are detected. Only a
   `type = "json"` body with `items_path` is a batch; a raw body is sent one
   item per request;
-- a declared `capabilities.context_binding` whose context fields do not reach
+- HTTP JSON body mappings the provider cannot build or send as written
+  (validation and the provider use one parser): an unknown field `source` or
+  payload `encoding`, an `encoding` on a source other than `payload`, a
+  request pointer or `items_path` that does not start with `/`, and request
+  pointers that would replace one another on the wire. After RFC 6901
+  decoding, no pointer of one JSON object may equal another or address a
+  field inside it (`/volume` with `/volume/profile`, or `/x~2` with `/x~02`),
+  and no top-level field may sit at, under or above the batch `items_path`;
+  each batch element's `item_fields` are checked as their own object.
+  `/vol` and `/volume`, or `/a~1b` (the key `a/b`) and `/a/b`, are distinct;
+- a declared `capabilities.context_binding` whose context does not reach
   the provider: each of `volume_id`, `compatibility_id` and `format_version`
   must be a source in the JSON `fields`, or in `item_fields` of a batch
   layout (a raw body sends no fields, and a per-item body never sends
-  `item_fields`);
+  `item_fields`), and the attach self-test's unit-index probe needs a
+  per-item `unit_index`: in `fields` of a per-item body, in `item_fields` of
+  a batch (top-level batch fields belong to no item);
 - a transport limit that cannot carry one full crypto batch, including the
   declared maximum ciphertext size. The maximum batch is bounded by both
   `crypto.batch.max_items` and the number of provider plaintext units that fit
@@ -329,8 +341,22 @@ if a backend's runtime data produces a larger response.
 
 The HTTP provider maps logical fields into a vendor request without interpreting
 the vendor cipher. Supported mappings include raw single-item payloads and JSON
-objects containing payload, unit index, volume ID, compatibility ID, or batch
-index. Binary data may use base64, base64url, or hexadecimal encoding.
+objects whose fields (JSON pointer = `{ source, encoding }`) carry one of these
+sources:
+
+| `source` | Sent as |
+|---|---|
+| `payload` | the item's plaintext or ciphertext, as a string in its `encoding`: `base64` (default, padded), `base64url` (unpadded), `hex-lower` (alias `hex`) or `hex-upper` |
+| `unit_index` | the item's unit index, an unsigned JSON integer |
+| `volume_id` | the volume UUID, a lowercase hyphenated string |
+| `compatibility_id` | the crypto compatibility ID, a string |
+| `format_version` | the on-disk format version, an unsigned JSON integer |
+| `batch_index` | the item's position in its request, an unsigned JSON integer |
+
+Only `payload` takes an `encoding`. A per-item body sends `fields` once per
+item. A batch body sends `fields` once per request (a `payload`, `unit_index`
+or `batch_index` there carries no item: an empty payload and zero) and the
+array of `item_fields` objects at `items_path`.
 
 JSON requests default to `Content-Type: application/json`. An explicitly
 configured `Content-Type` overrides that default, including vendor media types;
