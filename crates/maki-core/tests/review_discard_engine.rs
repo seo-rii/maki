@@ -10,7 +10,7 @@ use rand::SeedableRng;
 
 async fn attach(backing: &Arc<CrashableBacking>) -> Engine {
     Engine::attach(
-        backing.clone(),
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(1024)),
         EngineOptions {
             checkpoint: CheckpointPolicy {

@@ -60,7 +60,7 @@ async fn try_attach(backing: &Arc<CrashableBacking>) -> Result<Engine, AttachErr
         init::create_volume_with_discard(backing.as_ref(), superblock()).unwrap();
     }
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             checkpoint: CheckpointPolicy {

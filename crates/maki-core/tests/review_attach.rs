@@ -13,7 +13,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use maki_backing::Backing;
 use maki_core::engine::{AttachError, AttachIdentity, CheckpointPolicy, Engine, EngineOptions};
 use maki_core::volume::{Volume, VolumeOptions};
 use maki_crypto::{
@@ -89,7 +88,7 @@ async fn attach(
     backing: &Arc<CrashableBacking>,
     provider: Arc<dyn CryptoProvider>,
 ) -> Result<Engine, AttachError> {
-    Engine::attach(backing.clone() as Arc<dyn Backing>, provider, options(None)).await
+    Engine::attach(backing.process(), provider, options(None)).await
 }
 
 async fn attach_as(
@@ -99,7 +98,7 @@ async fn attach_as(
     key_identity: &str,
 ) -> Result<Engine, AttachError> {
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         provider,
         options(Some(AttachIdentity {
             provider_type: provider_type.into(),
@@ -224,7 +223,7 @@ async fn write_legacy_unit(backing: &Arc<CrashableBacking>, provider: &dyn Crypt
         .await
         .unwrap();
     let mut vol = Volume::recover(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         VolumeOptions {
             journal_segment_size: 1 << 20,
         },

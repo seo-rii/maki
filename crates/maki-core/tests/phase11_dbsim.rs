@@ -74,7 +74,7 @@ async fn attach(backing: &Arc<CrashableBacking>) -> Engine {
         init::create_volume(backing.as_ref(), superblock()).unwrap();
     }
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             checkpoint: CheckpointPolicy {
@@ -418,7 +418,7 @@ async fn provider_outage_aborts_transaction_without_corruption() {
         init::create_volume(backing.as_ref(), superblock()).unwrap();
     }
     let engine = Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         provider.clone(),
         EngineOptions {
             checkpoint: CheckpointPolicy {

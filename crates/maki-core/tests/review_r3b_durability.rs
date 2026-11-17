@@ -94,7 +94,7 @@ async fn try_attach_with(
         init::create_volume(backing.as_ref(), superblock()).unwrap();
     }
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(UNIT)),
         cache_options(UNIT, cache),
     )
@@ -773,7 +773,7 @@ async fn attach_big(backing: &Arc<CrashableBacking>, cache: bool) -> Arc<Engine>
     }
     Arc::new(
         Engine::attach(
-            backing.clone() as Arc<dyn Backing>,
+            backing.process(),
             Arc::new(FakeCryptoProvider::new(BIG_UNIT)),
             cache_options(BIG_UNIT, cache),
         )

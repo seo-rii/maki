@@ -29,7 +29,6 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use uuid::Uuid;
 
-use maki_backing::Backing;
 use maki_core::engine::{CheckpointPolicy, Engine, EngineCacheConfig, EngineOptions, EngineState};
 use maki_core::error::CoreError;
 use maki_core::volume::VolumeOptions;
@@ -101,7 +100,7 @@ fn fresh() -> Arc<CrashableBacking> {
 
 async fn attach(backing: &Arc<CrashableBacking>, provider: Arc<dyn CryptoProvider>) -> Arc<Engine> {
     Arc::new(
-        Engine::attach(backing.clone() as Arc<dyn Backing>, provider, options())
+        Engine::attach(backing.process(), provider, options())
             .await
             .expect("attach"),
     )
