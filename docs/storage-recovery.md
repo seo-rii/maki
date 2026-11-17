@@ -211,8 +211,11 @@ sentinel read uses held descriptors, refuses links and non-regular files, and
 checks the mounted device. It opens with `O_NOATIME` and drops only that flag
 when the kernel refuses it (a workload-owned file in a unit without
 CAP_FOWNER); the attach mount's `noatime` option keeps access times unchanged
-then too. Backend and mapping identity are checked again after both
-potentially blocking reads.
+then too. A refused permission (EACCES) is never retried: in a unit whose
+bounding set drops both CAP_DAC_READ_SEARCH and CAP_DAC_OVERRIDE, the mode
+bits must let root read and search the volume root and read the sentinel
+([unit requirements](operations.md#privileged-helper)). Backend and mapping
+identity are checked again after both potentially blocking reads.
 
 Verification does not initialize a sentinel, run a write probe, repair storage,
 change the attach record, or start a database. A configured first-attach

@@ -8,6 +8,17 @@ reference package-internal paths omitted from the published archive. Missing
 published files/directories and links in edited or project documents still fail.
 External URLs and mail links are not checked.
 
+Reference-style links are checked too. Every link reference definition
+(`[label]: path#anchor "title"`) that GitHub recognizes (CommonMark: it starts
+a paragraph, inside a block quote or list item too, and is not a `[^footnote]`
+definition) must name an existing target and anchor, like an inline link, even
+when its label is unused or repeated. A full or collapsed reference
+(`[text][label]`, `[label][]`) whose label no definition of the same document
+matches (case-insensitively, whitespace collapsed) is reported: GitHub renders
+it as literal bracketed text. An undefined shortcut (`[label]`) is ordinary
+text and is not reported. Multi-line titles and link texts are not parsed, and
+indented code blocks are not distinguished from list-item content.
+
 A fragment, in-page (`#anchor`) or on another Markdown file (`other.md#anchor`),
 must name exactly a heading slug as GitHub computes it, or an explicit
 `<a id="...">`/`<a name="...">` anchor of that document. Fragments on other
@@ -44,6 +55,13 @@ HTML_TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
 AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
 BACKTICKS = re.compile(r"`+")
 ASCII_PUNCTUATION = frozenset(string.punctuation)
+# A link label: at most 999 characters, no unescaped brackets.
+LINK_LABEL = re.compile(r"\[((?:[^\\\[\]]|\\.){0,999})\]")
+# Block-quote markers, then at most one list-item marker, before a block.
+CONTAINER_PREFIX = re.compile(
+    r"^((?: {0,3}>[ \t]?)*)( {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$))?"
+)
+THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
 def candidate_markdown(root):
@@ -101,11 +119,267 @@ def closing_parenthesis(text, start):
     return -1
 
 
-def inline_text(raw):
+def label_key(label):
+    """A link label as CommonMark matches it: trimmed, internal whitespace
+    collapsed to one space, Unicode case-folded."""
+    return re.sub(r"[ \t\r\n]+", " ", label.strip(" \t\r\n")).casefold()
+
+
+def valid_label(label):
+    return bool(label.strip(" \t\r\n"))
+
+
+def unescape(raw):
+    """Resolve backslash escapes of ASCII punctuation and entity references."""
+    parts = []
+    plain = []
+    index = 0
+    while index < len(raw):
+        if raw[index] == "\\" and raw[index + 1:index + 2] in ASCII_PUNCTUATION:
+            parts.append(html.unescape("".join(plain)))
+            plain = []
+            parts.append(raw[index + 1])
+            index += 2
+            continue
+        plain.append(raw[index])
+        index += 1
+    parts.append(html.unescape("".join(plain)))
+    return "".join(parts)
+
+
+def link_destination(text, start):
+    """The raw link destination at `text[start:]` and its end, or None."""
+    if text.startswith("<", start):
+        index = start + 1
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == ">":
+                return text[start + 1:index], index + 1
+            if text[index] == "<":
+                return None
+            index += 1
+        return None
+    depth = 0
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and text[index + 1:index + 2] in ASCII_PUNCTUATION:
+            index += 2
+            continue
+        if char in " \t" or ord(char) < 0x20 or char == "\x7f":
+            break
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        index += 1
+    if index == start or depth:
+        return None
+    return text[start:index], index
+
+
+def link_title_end(text, start):
+    """The end of a complete link title at `text[start:]`, or -1."""
+    closer = {'"': '"', "'": "'", "(": ")"}.get(text[start:start + 1])
+    if closer is None:
+        return -1
+    index = start + 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == closer:
+            return index + 1
+        if closer == ")" and text[index] == "(":
+            return -1
+        index += 1
+    return -1
+
+
+def title_only(text):
+    """Whether `text` is one complete link title and nothing else."""
+    stripped = text.strip(" \t")
+    return bool(stripped) and link_title_end(stripped, 0) == len(stripped)
+
+
+def continuation(lines, index, number):
+    """Line `index` without block-quote markers if it directly follows line
+    `number`, else None."""
+    if index >= len(lines) or lines[index][0] != number + 1:
+        return None
+    line = lines[index][1]
+    return line[CONTAINER_PREFIX.match(line).end(1):]
+
+
+def parse_definition(content, lines, index):
+    """Parse a link reference definition that starts `content` (line `index`).
+
+    Returns (lines consumed, destination line, label key, destination) or None.
+    """
+    match = re.match(r"[ \t]*" + LINK_LABEL.pattern + ":", content)
+    if not match or not valid_label(match.group(1)) or match.group(1).startswith("^"):
+        return None
+    number = lines[index][0]
+    rest = content[match.end():]
+    consumed = 1
+    if not rest.strip(" \t"):
+        rest = continuation(lines, index + 1, number)
+        if rest is None or not rest.strip(" \t"):
+            return None
+        consumed = 2
+    destination_line = lines[index + consumed - 1][0]
+    parsed = link_destination(rest, len(rest) - len(rest.lstrip(" \t")))
+    if parsed is None:
+        return None
+    destination, end = parsed
+    after = rest[end:]
+    if after.strip(" \t"):
+        # A title must be separated by whitespace and end the line.
+        if after[:1] not in (" ", "\t") or not title_only(after):
+            return None
+    else:
+        title = continuation(lines, index + consumed, destination_line)
+        if title is not None and title_only(title):
+            consumed += 1
+    return consumed, destination_line, label_key(match.group(1)), unescape(destination)
+
+
+def reference_definitions(text):
+    """Link reference definitions GitHub recognizes, outside code fences.
+
+    Returns (first line, last line, destination line, label key, destination)
+    tuples in document order. A definition starts a paragraph: it follows a
+    blank line, a heading, a thematic break, a fence or another definition,
+    or opens a block quote or list item. A line continuing a paragraph is
+    text. The destination may be on the next line, and a title on the line
+    after it; a title must end on the line it starts on. `[^label]:` starts
+    a footnote, not a link.
+    """
+    lines = list(unfenced_lines(text))
+    definitions = []
+    in_paragraph = False
+    previous_number = None
+    previous_quoted = False
+    index = 0
+    while index < len(lines):
+        number, line = lines[index]
+        if previous_number != number - 1:
+            in_paragraph = False  # a fenced block ended the paragraph
+        prefix = CONTAINER_PREFIX.match(line)
+        quoted = bool(prefix.group(1))
+        opens_container = bool(prefix.group(2)) or (quoted and not previous_quoted)
+        block = line[prefix.end(1):]
+        content = line[prefix.end():]
+        previous_number, previous_quoted = number, quoted
+        definition = None
+        if not in_paragraph or opens_container:
+            definition = parse_definition(content, lines, index)
+        if definition is not None:
+            consumed, destination_line, label, destination = definition
+            last = lines[index + consumed - 1][0]
+            definitions.append((number, last, destination_line, label, destination))
+            previous_number = last
+            in_paragraph = False
+            index += consumed
+            continue
+        in_paragraph = not (
+            not content.strip()
+            or ATX_HEADING.match(block)
+            or THEMATIC_BREAK.match(block)
+            or (in_paragraph and SETEXT_UNDERLINE.match(block))
+        )
+        index += 1
+    return definitions
+
+
+def mask_code_spans(line):
+    """`line` with each code span replaced by spaces of the same length."""
+    out = []
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == "\\":
+            out.append(line[index:index + 2])
+            index += 2
+            continue
+        if char == "`":
+            opening = BACKTICKS.match(line, index).group(0)
+            closing = next(
+                (run for run in BACKTICKS.finditer(line, index + len(opening))
+                 if run.group(0) == opening),
+                None,
+            )
+            if closing is None:
+                out.append(opening)
+                index += len(opening)
+            else:
+                out.append(" " * (closing.end() - index))
+                index = closing.end()
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def undefined_references(line, labels):
+    """Full (`[text][label]`) and collapsed (`[label][]`) references on
+    `line` whose label `labels` does not define, as written.
+
+    Link text is scanned too, so an undefined reference nested in another
+    one (an image inside a link) is found; a label and an inline link's
+    destination are not link text. A label that is followed by another
+    label or an inline destination may be the text of the next construct
+    (CommonMark retries from there), so it is not reported on its own.
+    """
+    masked = mask_code_spans(line)
+    found = []
+    skip = {}  # start of a label or destination -> its end
+    index = 0
+    while index < len(masked):
+        if index in skip:
+            index = skip[index]
+            continue
+        if masked[index] == "\\":
+            index += 2
+            continue
+        close = closing_bracket(masked, index) if masked[index] == "[" else -1
+        index += 1
+        if close == -1:
+            continue
+        if masked[close + 1:close + 2] == "(":
+            end = closing_parenthesis(masked, close + 1)
+            if end != -1:
+                skip[close + 1] = end + 1
+            continue
+        reference = LINK_LABEL.match(masked, close + 1)
+        if reference is None:
+            continue
+        if reference.group(1):
+            label = line[reference.start(1):reference.end(1)]
+        elif LINK_LABEL.fullmatch(masked, index - 1, close + 1):
+            label = line[index:close]
+        else:
+            continue
+        if not valid_label(label) or label.startswith("^"):
+            continue
+        if label_key(label) not in labels:
+            if masked[reference.end():reference.end() + 1] in ("[", "("):
+                continue
+            found.append(line[index - 1:reference.end()])
+        skip[close + 1] = reference.end()
+    return found
+
+
+def inline_text(raw, labels=frozenset()):
     """Reduce inline Markdown to its rendered text as (character, literal) pairs.
 
     Code span contents and backslash-escaped characters are literal: they are
-    never emphasis delimiters or entity references.
+    never emphasis delimiters or entity references. `labels` holds the
+    document's defined reference labels: a reference to one renders as a link.
     """
     out = []
     index = 0
@@ -141,8 +415,22 @@ def inline_text(raw):
                     # A link contributes its text; an image's alt text is an
                     # attribute, not part of the heading's text.
                     if char == "[":
-                        out.extend(inline_text(raw[opening + 1:close]))
+                        out.extend(inline_text(raw[opening + 1:close], labels))
                     index = end + 1
+                    continue
+            if close != -1 and labels:
+                # A full reference uses its own label; a collapsed (`[]`)
+                # or shortcut reference uses its text. An undefined full
+                # label leaves the brackets literal (CommonMark).
+                reference = LINK_LABEL.match(raw, close + 1)
+                if reference and reference.group(1):
+                    label = reference.group(1)
+                else:
+                    label = raw[opening + 1:close]
+                if label_key(label) in labels:
+                    if char == "[":
+                        out.extend(inline_text(raw[opening + 1:close], labels))
+                    index = reference.end() if reference else close + 1
                     continue
         if char == "<":
             autolink = AUTOLINK.match(raw, index)
@@ -159,9 +447,9 @@ def inline_text(raw):
     return out
 
 
-def heading_text(raw):
+def heading_text(raw, labels=frozenset()):
     """The text GitHub renders for a heading's inline content."""
-    pairs = inline_text(raw)
+    pairs = inline_text(raw, labels)
     kept = []
     index = 0
     while index < len(pairs):
@@ -209,9 +497,18 @@ def github_slug(text):
 
 def document_anchors(text):
     """Every anchor GitHub defines for a Markdown document."""
+    definitions = reference_definitions(text)
+    labels = frozenset(definition[3] for definition in definitions)
+    # A definition is not paragraph text, so it never becomes a setext heading.
+    definition_lines = {
+        number for first, last, _, _, _ in definitions for number in range(first, last + 1)
+    }
     headings = []
     paragraph = []
     for number, line in unfenced_lines(text):
+        if number in definition_lines:
+            paragraph = []
+            continue
         atx = ATX_HEADING.match(line)
         if atx:
             headings.append(ATX_CLOSING.sub("", atx.group(2) or ""))
@@ -231,7 +528,7 @@ def document_anchors(text):
     anchors = set()
     occurrences = {}
     for heading in headings:
-        base = github_slug(heading_text(heading))
+        base = github_slug(heading_text(heading, labels))
         slug = base
         while slug in occurrences:
             occurrences[base] += 1
@@ -283,32 +580,51 @@ def broken_links(root):
             anchor_cache[key] = document_anchors(key.read_bytes().decode("utf-8"))
         return anchor_cache[key]
 
+    def target_problem(path, content, target):
+        """Why `target`, linked from `path`, is broken, or None."""
+        if not target or target.startswith(SKIP_PREFIXES):
+            return None
+        file_part, _, fragment = target.partition("#")
+        target_path = path.parent / file_part if file_part else path
+        if not target_path.exists():
+            if omitted_archive_reference(root, path, content, target_path, packages):
+                return None
+            return target
+        fragment = urllib.parse.unquote(fragment)
+        if (
+            fragment
+            and target_path.is_file()
+            and target_path.suffix.lower() == ".md"
+            and fragment not in anchors_of(target_path)
+        ):
+            return f"{target} (missing anchor)"
+        return None
+
     broken = []
     for path in candidate_markdown(root):
         content = path.read_bytes()
         text = content.decode("utf-8")
         relative = path.relative_to(root).as_posix()
+        definitions = reference_definitions(text)
+        labels = frozenset(definition[3] for definition in definitions)
+        problems = [
+            (number, target_problem(path, content, destination))
+            for _, _, number, _, destination in definitions
+        ]
         for number, line in unfenced_lines(text):
-            for match in LINK.finditer(line):
-                target = match.group(1)
-                if target.startswith(SKIP_PREFIXES):
-                    continue
-                file_part, _, fragment = target.partition("#")
-                target_path = path.parent / file_part if file_part else path
-                if not target_path.exists():
-                    if not omitted_archive_reference(
-                        root, path, content, target_path, packages
-                    ):
-                        broken.append(f"{relative}:{number}: {target}")
-                    continue
-                fragment = urllib.parse.unquote(fragment)
-                if (
-                    fragment
-                    and target_path.is_file()
-                    and target_path.suffix.lower() == ".md"
-                    and fragment not in anchors_of(target_path)
-                ):
-                    broken.append(f"{relative}:{number}: {target} (missing anchor)")
+            problems.extend(
+                (number, target_problem(path, content, match.group(1)))
+                for match in LINK.finditer(line)
+            )
+            problems.extend(
+                (number, f"{reference} (undefined reference)")
+                for reference in undefined_references(line, labels)
+            )
+        broken.extend(
+            f"{relative}:{number}: {problem}"
+            for number, problem in sorted(problems, key=lambda entry: entry[0])
+            if problem is not None
+        )
     return broken
 
 

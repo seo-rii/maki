@@ -695,9 +695,12 @@ each write additionally uses `posix_fallocate` for its exact journal range and
 the complete destination slot before the journal accepts the record. A new
 shard also has both allocation-map copies and its catalog entry created and
 synced first. An unrelated filesystem consumer therefore cannot take the
-already allocated journal or slot blocks before checkpoint completes. A
-reservation failure returns ENOSPC without consuming a journal sequence and is
-retryable.
+already allocated journal or slot blocks before checkpoint completes. That
+holds only where the backing filesystem overwrites allocated blocks in place:
+not for extents shared with a reflink copy, and not on a copy-on-write
+filesystem ([backing store](deployment/support-matrix.md#backing-store-below-maki)).
+A reservation failure returns ENOSPC without consuming a journal sequence and
+is retryable.
 
 Untouched slots remain sparse and unreserved. Filesystem directory metadata,
 copy-on-write amplification, snapshots, journal/checkpoint headroom beyond the
