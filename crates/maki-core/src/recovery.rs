@@ -15,7 +15,11 @@
 //!   fdatasync'd before their successor was created), and only *after* the
 //!   prefix proved by the required v2 evidence (and advisory durable mark);
 //! - a final segment shorter than a header, or entirely zero-filled, is a
-//!   creation crash and is discarded; a *complete* but invalid header is
+//!   creation crash and is discarded, and so is a final segment exactly one
+//!   header long whose header fails its checksum at an index above every
+//!   segment the durable proof and mark name (the torn header writers that
+//!   preallocated it left; damage there cannot be told from that tear, and
+//!   such a file holds nothing acknowledged); any other invalid header is
 //!   durable damage;
 //! - the surviving journal must bridge from `checkpoint_sequence + 1` and
 //!   be contiguous — a missing segment is never silently skipped;
@@ -35,6 +39,7 @@ use std::sync::Arc;
 use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::codec::strip_verify_crc;
 use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
     max_segment_file_size, DurableMark, JournalRecord, ScanOutcome, SegmentHeader,
@@ -739,15 +744,28 @@ fn scan_journal_with_proof(
         let header = match SegmentHeader::decode(&header_bytes) {
             Ok(h) => h,
             Err(e) => {
-                // A never-written (zero-filled) final segment is a creation
-                // crash; anything else with a full-sized header is damage.
-                if is_last
-                    && marked_durable.is_none()
-                    && range_is_zero(file.as_ref(), 0..len, progress)?
-                {
-                    repairs.push(JournalRepair::Discard { path });
-                    continue;
+                if is_last && marked_durable.is_none() {
+                    // A never-written (zero-filled) final segment is a
+                    // creation crash.
+                    let unwritten = range_is_zero(file.as_ref(), 0..len, progress)?;
+                    // So is a final segment exactly one header long whose
+                    // header is torn (fails its checksum) above everything
+                    // the durable evidence names: writers that extended a
+                    // new segment to a full header before writing it left
+                    // this when the write tore and the failed creation's
+                    // cleanup never finished. It holds no record byte, and
+                    // no acknowledged record can live at its index.
+                    let torn_creation = len == SEGMENT_HEADER_SIZE as u64
+                        && strip_verify_crc(&header_bytes, "journal segment header").is_err()
+                        && above_durable_evidence(index, proof, mark);
+                    if unwritten || torn_creation {
+                        repairs.push(JournalRepair::Discard { path });
+                        continue;
+                    }
                 }
+                // Anything else with a full-sized header is damage,
+                // including an intact (checksum-valid) one that does not
+                // decode.
                 return Err(RecoveryError::Corrupt(format!(
                     "journal segment {name}: invalid header ({e})"
                 )));
@@ -943,6 +961,25 @@ fn scan_journal_with_proof(
         mark: final_mark,
         verified_prefixes,
     })
+}
+
+/// Whether segment `index` lies above every segment the durable evidence
+/// names. The required proof is published to both copies before every
+/// acknowledgement and names the segment holding its horizon, so every
+/// acknowledged record lies in that segment or an earlier one; an empty proof
+/// (sequence 0) has acknowledged nothing. The advisory mark names a segment
+/// only once its creation completed. Without a proof (read-only legacy
+/// inspection) nothing vouches for any index.
+fn above_durable_evidence(
+    index: u64,
+    proof: Option<&DurableProof>,
+    mark: Option<DurableMark>,
+) -> bool {
+    let Some(proof) = proof else {
+        return false;
+    };
+    (proof.durable_sequence == 0 || index > proof.segment_index)
+        && mark.is_none_or(|mark| index > mark.segment_index)
 }
 
 /// The durable mark, if present and intact. Absent, empty, short, or
