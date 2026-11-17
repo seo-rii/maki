@@ -51,7 +51,7 @@ async fn new_engine(backing: &Arc<CrashableBacking>) -> Engine {
 
 async fn attach(backing: &Arc<CrashableBacking>) -> Result<Engine, AttachError> {
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         provider(),
         EngineOptions {
             volume: VolumeOptions {
@@ -308,12 +308,7 @@ async fn attach_refuses_crypto_profile_mismatch() {
     let backing = Arc::new(CrashableBacking::new());
     init::create_volume(backing.as_ref(), superblock()).unwrap();
     let wrong = Arc::new(FakeCryptoProvider::new(UNIT).with_compat_id("other-profile"));
-    let err = Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
-        wrong,
-        EngineOptions::default(),
-    )
-    .await;
+    let err = Engine::attach(backing.process(), wrong, EngineOptions::default()).await;
     assert!(matches!(err, Err(AttachError::Crypto(_))), "{err:?}");
 }
 
@@ -322,13 +317,11 @@ async fn attach_refuses_wrong_unit_size_provider() {
     let backing = Arc::new(CrashableBacking::new());
     init::create_volume(backing.as_ref(), superblock()).unwrap();
     let wrong = Arc::new(FakeCryptoProvider::new(4096));
-    assert!(Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
-        wrong,
-        EngineOptions::default(),
-    )
-    .await
-    .is_err());
+    assert!(
+        Engine::attach(backing.process(), wrong, EngineOptions::default())
+            .await
+            .is_err()
+    );
 }
 
 // ---------- corrupted ciphertext is EIO, never plaintext ----------

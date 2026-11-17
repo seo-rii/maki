@@ -67,7 +67,7 @@ fn adapter_with_provider(
         .unwrap();
     let engine = runtime
         .block_on(Engine::attach(
-            backing.clone() as Arc<dyn Backing>,
+            backing.process(),
             provider,
             simulated_engine_options(),
         ))
