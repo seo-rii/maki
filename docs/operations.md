@@ -121,6 +121,13 @@ install -d -o maki -g maki -m 0700 /var/lib/maki/example
 sudo -u maki maki volume create /etc/maki/volumes/example.toml
 ```
 
+The backing filesystem must overwrite allocated blocks in place, or the
+space reservation does not hold. A copy-on-write backing (btrfs with its
+default copy-on-write data, ZFS) is unsupported. On btrfs, running
+`chattr +C /var/lib/maki/example` between the two commands makes every backing
+file created afterwards NOCOW; that configuration is not qualified
+([copy-on-write filesystems](deployment/support-matrix.md#copy-on-write-filesystems)).
+
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
 instance `example`:
@@ -653,6 +660,22 @@ service's other restrictions, including its filesystem view. The gate must
 still be able to read the trusted configuration/state and probe the verified LV
 under those restrictions: it opens `/dev/<vg>/<lv>`, so the unit must not use
 `PrivateDevices=yes`, and any `DevicePolicy=` must allow reading that node.
+It also opens the mounted volume's root directory and reads `.maki-sentinel`
+in it. The gate runs as root, but only with the capabilities the unit's
+`CapabilityBoundingSet=` keeps. If that drops both CAP_DAC_READ_SEARCH and
+CAP_DAC_OVERRIDE, the kernel checks the gate's opens against the mode bits as
+for any process with user and group root: it needs read and search
+permission on the volume root and read permission on the sentinel. A volume
+root owned by the workload user with mode `0700` (or `0750` with the
+workload's group) then fails the gate with EACCES (`Permission denied`), and
+so does a sentinel the workload replaced with one root cannot read (attach
+creates it root-owned, mode `0600`). For such a unit, keep CAP_DAC_READ_SEARCH
+(sufficient on its own) or CAP_DAC_OVERRIDE in the bounding set, or leave the
+volume root readable and searchable by others (for example `0755`) with the
+workload's private directory below it, as the
+[PostgreSQL guide](deployment/postgres.md) does. The gate retries an open only
+without `O_NOATIME`, when the kernel refuses that flag (it needs CAP_FOWNER
+for an inode root does not own), never after EACCES.
 Keep the configuration root-controlled; this is not a generic sudo grant. A
 failed check prevents that start. Qualify the service's actual mount namespace
 and sandbox on the target host. A host check cannot establish which

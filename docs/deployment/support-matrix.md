@@ -60,13 +60,16 @@ the recovery unit's `OnSuccess=`. Details are in the
 
 The backing is an ordinary directory (`backing.root`). Maki relies on the
 filesystem honouring `fdatasync`, directory `fsync`, `posix_fallocate`, file
-locks and atomic rename.
+locks and atomic rename, and on it overwriting allocated blocks in place
+([copy-on-write](#copy-on-write-filesystems)).
 
 | Backing | Status | Notes |
 |---|---|---|
 | GCE balanced/standard Persistent Disk, ext4 | **Campaign passed** | Physical reservation, whole-instance reset, database and package campaigns |
 | Single local NVMe/SATA SSD or HDD, ext4 | Expected | Same code path; write-cache and power-loss behaviour of the device are not qualified |
 | Single local disk, XFS as the *backing* filesystem | Expected | Not exercised externally. Backing files must not share extents with reflink copies (below) |
+| btrfs with its default copy-on-write data, ZFS | Unsupported | Every overwrite of written data needs new space, which `posix_fallocate` does not reserve ([copy-on-write](#copy-on-write-filesystems)) |
+| btrfs with NOCOW backing files (`chattr +C` on the backing directory before volume creation) | Not qualified | Unshared NOCOW extents are overwritten in place; snapshots and reflinks still share them. Not exercised, and Maki does not check the attribute ([copy-on-write](#copy-on-write-filesystems)) |
 | Software RAID (`mdadm`) below the backing filesystem | Not qualified | Correctness depends on the array honouring FLUSH/FUA to all members; see [RAID](raid.md) |
 | Hardware RAID controller below the backing filesystem | Not qualified | Depends on controller cache policy (battery-backed write cache or write-through) |
 | LVM (plain, thin, cache) below the backing filesystem | Not qualified | The daemon does not inspect what is under its filesystem |
@@ -100,6 +103,34 @@ so it is an availability failure, not data loss. Make backing copies with
 `cp --reflink=never` (or a tool that copies data rather than cloning extents),
 and do not run a volume while its files still share extents with another copy.
 Maki does not detect shared extents.
+
+### Copy-on-write filesystems
+
+A copy-on-write filesystem voids the reservation without any copy. btrfs
+writes file data copy-on-write by default: `posix_fallocate` allocates the
+range, but once data has been written there, every overwrite goes to newly
+allocated space. Maki rewrites data in place routinely: a checkpoint rewrites
+a unit's slot, each barrier (FLUSH or FUA) that makes new journal records
+durable and each checkpoint rewrite A/B metadata copies, and recovery rewrites
+journal records. On a full filesystem those writes fail with ENOSPC; a barrier
+is then refused rather than acknowledged, and a failed checkpoint degrades the
+volume as above. ZFS always writes changed blocks to new space, so no setting
+avoids this there. Such a backing is unsupported.
+
+btrfs overwrites the data of a NOCOW file in place unless it falls back to
+copy-on-write, which it does at least for an extent that a snapshot of the
+subvolume or a reflink copy shares; the shared-extent rule above therefore
+still applies. Set the attribute on the backing directory before
+`maki volume create` writes any file into it
+(`chattr +C /var/lib/maki/<volume>`): files and directories created in it
+afterwards inherit it. `chattr +C` on a file that already holds data has no
+defined effect (chattr(1)), so an existing volume's files are not converted in
+place, and the `nodatacow` mount option applies only to files created while it
+is in effect. `lsattr` shows `C` on a NOCOW file. NOCOW also turns off btrfs
+data checksums and compression for those files. This configuration is not
+qualified: Maki checks neither the filesystem nor the attribute, and whether
+btrfs can still refuse these overwrites for lack of metadata space has not
+been examined.
 
 ## Exported stack (above Maki)
 

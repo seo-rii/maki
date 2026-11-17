@@ -101,6 +101,14 @@ punctuation removed and each space turned into a hyphen, so
 `-1`, `-2` and so on. Fragments on source files and directories are not
 checked.
 
+Reference-style links get the same checks. Every definition
+(`[label]: path#anchor "title"`) must name an existing target and anchor, even
+when its label is unused. A full or collapsed reference (`[text][label]`,
+`[label][]`) needs a definition in the same document, matched without regard
+to case or repeated whitespace: without one, GitHub shows the brackets as
+literal text. An undefined shortcut (`[label]`) is ordinary text and is not
+reported.
+
 ## Commits and pull requests
 
 - Use the conventional prefixes already in the history: `feat`, `fix`,
