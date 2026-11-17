@@ -376,6 +376,14 @@ malformed frames are contract errors as described above. A provider with
 individual request cancellation does not make its live siblings fail or
 require them to be resent.
 
+The HTTP upgrade that opens a connection is the same request every time and
+carries no crypto request, so its refusal is never blamed on a request: HTTP
+408 and 5xx are retryable, 429 is throttling, and every other status (a
+redirect, an authentication refusal, or a generic 4xx such as 400 or 426 from
+a proxy that cannot upgrade) is an endpoint failure. The dispatcher opens that
+endpoint's circuit, so later requests go to a peer (a retry-safe request also
+fails over at once), and attach quarantines it like an unreachable endpoint.
+
 A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
 `timeout`, so a slow handshake still serves the next request; a peer that never

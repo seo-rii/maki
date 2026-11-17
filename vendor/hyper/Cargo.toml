@@ -204,7 +204,10 @@ version = "0.1"
 version = "0.2.4"
 
 [dev-dependencies.pretty_env_logger]
-version = "0.5"
+# Keep upstream test call sites: they only use the compatible `try_init` API.
+# pretty_env_logger 0.5 depends on unmaintained humantime (RUSTSEC-2026-0542).
+package = "env_logger"
+version = "0.11.11"
 
 [dev-dependencies.serde]
 version = "1.0"
