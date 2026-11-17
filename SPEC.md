@@ -866,7 +866,16 @@ the `unit_index` field of `CryptoItem`.
 
 Retry safety: a provider whose capabilities do not declare `retry_safe` is
 sent each request at most once. No retry, failover, or transport-level resend
-happens after the request has been sent.
+happens after the request may have been sent. A request that the transport
+proves was never sent has not been sent: its TCP connection, TLS handshake or
+WebSocket upgrade failed, or the attempt failed or timed out before the
+request was handed to an established connection. Such a request MAY fail over
+to another endpoint, and the availability policy MAY retry it, as for any
+request not yet sent. A transport MUST mark only failures it can prove
+happened before the first request byte was written; every other failure,
+including a timeout or reset after the request was handed over, counts as
+sent. Once any attempt, or an earlier part of the same provider call, may have
+been sent, the call's error no longer carries the mark.
 
 Context on the wire: every request carries the whole crypto context — the
 volume UUID, the crypto compatibility ID and the format version. For HTTP
@@ -1570,6 +1579,11 @@ EndpointFatal
 ProviderFatal
 ```
 
+A `Retryable`, `Throttled` or `EndpointFatal` error may additionally be marked
+*not sent* when the transport proves that no byte of the request left Maki
+(§18). The mark keeps the class and its circuit-breaker charge; it only lets a
+request to a provider that is not retry-safe fail over or be retried.
+
 Retry backoff uses:
 
 ```text
@@ -1666,6 +1680,10 @@ Supported policies:
 stall
 bounded-error
 ```
+
+Under either policy, a request to a provider that is not retry-safe ends with
+an error as soon as an attempt that may have sent it fails (§18); attempts
+proven unsent do not count.
 
 ## `stall`
 

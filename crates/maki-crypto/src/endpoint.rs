@@ -17,8 +17,10 @@
 //!   `bounded-error`: it bounds backoff *and* cancels an in-flight RPC
 //!   (review M-010);
 //! - a provider that is not `retry_safe` is never sent the same request
-//!   twice: after an RPC has been sent, no retry and no failover happens
-//!   (review M-010);
+//!   twice: after an RPC may have been sent, no retry and no failover
+//!   happens (review M-010). An attempt whose error the transport marked
+//!   [`CryptoError::not_sent`] (connect, TLS or upgrade failure before any
+//!   request byte was written) does not count as sent;
 //! - endpoints whose cross-endpoint validation could not run at attach are
 //!   quarantined: they never serve until the validator (run against a
 //!   validated endpoint, with the real volume context) succeeds (review
@@ -59,7 +61,9 @@ pub struct DispatchConfig {
     /// is abandoned when it expires. `None` = no deadline.
     pub max_operation_time: Option<Duration>,
     /// The provider's declared `retry_safe` capability. When false, a
-    /// request is sent at most once: no retry, no failover.
+    /// request is sent at most once: no retry, no failover once an attempt
+    /// may have sent it. Attempts that failed with a
+    /// [`CryptoError::not_sent`] error did not send it.
     pub retry_safe: bool,
     /// Minimum spacing between validation attempts of a quarantined
     /// endpoint.
@@ -903,6 +907,26 @@ impl EndpointSet {
         retry_safe: bool,
         caps: &CryptoCapabilities,
     ) -> Result<Response, CryptoError> {
+        let mut sent = false;
+        let result = self
+            .dispatch_attempts(context, request, deadline, retry_safe, caps, &mut sent)
+            .await;
+        // The not-sent mark describes the whole operation: once any attempt
+        // may have reached a provider, its error no longer proves that.
+        result.map_err(|error| if sent { error.maybe_sent() } else { error })
+    }
+
+    /// `sent` becomes true once an attempt may have reached a provider:
+    /// every attempt except one whose error the transport marked not sent.
+    async fn dispatch_attempts(
+        &self,
+        context: &CryptoContext,
+        request: Request<'_>,
+        deadline: Option<Duration>,
+        retry_safe: bool,
+        caps: &CryptoCapabilities,
+        sent: &mut bool,
+    ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
         if self.global.max_items() == 0
             || self.endpoints[0].semaphore.max_items() == 0
@@ -950,10 +974,18 @@ impl EndpointSet {
             // between them. Endpoints that broke the contract for this
             // operation stay excluded.
             let mut excluded = contract_failed.clone();
-            while let Some(admission) = self
-                .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
-                .await?
-            {
+            loop {
+                let admission = match self
+                    .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
+                    .await
+                {
+                    Ok(Some(admission)) => admission,
+                    Ok(None) => break,
+                    // The deadline expired while waiting for admission.
+                    // Report the last endpoint failure, as the other
+                    // deadline exits do; with none, the deadline itself.
+                    Err(deadline_exceeded) => return Err(last_error.unwrap_or(deadline_exceeded)),
+                };
                 let endpoint = admission.endpoint.clone();
                 let Some(probe) = endpoint.breaker.acquire() else {
                     // Readiness can change on another worker after admission.
@@ -962,8 +994,10 @@ impl EndpointSet {
                 };
                 excluded.push(endpoint.clone());
                 if calls_made > 0 {
-                    // A re-send of a request that already reached a provider.
-                    if !retry_safe {
+                    // Another attempt. A request that may already have
+                    // reached a provider is never re-sent unless retry-safe;
+                    // one every earlier attempt proved unsent may go out.
+                    if !retry_safe && *sent {
                         self.metrics
                             .retries_refused_unsafe
                             .fetch_add(1, Ordering::SeqCst);
@@ -1004,6 +1038,9 @@ impl EndpointSet {
                         return Ok(response);
                     }
                     Err(err) => {
+                        // Only a transport's proof keeps the request unsent.
+                        let unsent = err.is_not_sent();
+                        *sent |= !unsent;
                         if is_deadline_error(&err) {
                             // The operation's budget ran out mid-RPC: not
                             // an endpoint failure, so no breaker or budget
@@ -1030,9 +1067,10 @@ impl EndpointSet {
                                         return Err(last_error.unwrap());
                                     }
                                 }
-                                if !retry_safe {
+                                if !retry_safe && !unsent {
                                     // The request may have reached the
-                                    // provider: never send it again.
+                                    // provider: never send it again. An
+                                    // unsent one fails over like any other.
                                     self.metrics
                                         .retries_refused_unsafe
                                         .fetch_add(1, Ordering::SeqCst);
@@ -1165,7 +1203,7 @@ impl CryptoProvider for EndpointSet {
                 end += 1;
             }
             let chunk = &items[start..end];
-            match self
+            let result = self
                 .dispatch(
                     context,
                     Request::Encrypt(chunk),
@@ -1173,8 +1211,9 @@ impl CryptoProvider for EndpointSet {
                     self.config.retry_safe && caps.retry_safe,
                     caps,
                 )
-                .await?
-            {
+                .await;
+            // Earlier chunks of this call were sent.
+            match result.map_err(|error| if start > 0 { error.maybe_sent() } else { error })? {
                 Response::Encrypted(mut result) => {
                     out.append(&mut result);
                 }
@@ -1222,8 +1261,8 @@ impl CryptoProvider for EndpointSet {
             ));
         }
         let mut out = Vec::with_capacity(items.len());
-        for chunk in items.chunks(chunk_size) {
-            match self
+        for (index, chunk) in items.chunks(chunk_size).enumerate() {
+            let result = self
                 .dispatch(
                     context,
                     Request::Decrypt(chunk),
@@ -1231,8 +1270,9 @@ impl CryptoProvider for EndpointSet {
                     self.config.retry_safe && caps.retry_safe,
                     caps,
                 )
-                .await?
-            {
+                .await;
+            // Earlier chunks of this call were sent.
+            match result.map_err(|error| if index > 0 { error.maybe_sent() } else { error })? {
                 Response::Decrypted(mut result) => {
                     out.append(&mut result);
                 }

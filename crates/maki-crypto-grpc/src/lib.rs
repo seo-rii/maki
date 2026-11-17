@@ -11,6 +11,7 @@
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -932,6 +933,13 @@ impl GrpcCryptoProvider {
         // failover (BUG-017). Bound readiness plus the unary call together
         // by the configured operation timeout. The `bounded-error` policy's
         // outer deadline (BUG-013) is separate and still applies.
+        //
+        // Until `handed_over` is set, the request is still owned here: the
+        // connection is established without an RPC body, and readiness only
+        // reserves capacity. A failure (or the timeout) before that point
+        // proves that no byte of the request was sent; it is marked so the
+        // dispatcher may send the request to a peer (SPEC §18).
+        let handed_over = AtomicBool::new(false);
         let exchange = async {
             let channel = connection.channel().await?;
             let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
@@ -943,11 +951,20 @@ impl GrpcCryptoProvider {
             grpc.ready()
                 .await
                 .map_err(|e| CryptoError::Retryable(format!("grpc endpoint not ready: {e}")))?;
+            handed_over.store(true, Ordering::SeqCst);
             grpc.unary(request, path, codec)
                 .await
                 .map_err(|status| map_status(&status))
         };
-        let response = match tokio::time::timeout(self.spec.timeout, exchange).await {
+        let result = tokio::time::timeout(self.spec.timeout, exchange).await;
+        let unsent = |error: CryptoError| {
+            if handed_over.load(Ordering::SeqCst) {
+                error
+            } else {
+                error.not_sent()
+            }
+        };
+        let response = match result {
             Ok(Ok(response)) => {
                 connection.succeeded();
                 response.into_inner()
@@ -956,13 +973,13 @@ impl GrpcCryptoProvider {
                 if error.class() != ErrorClass::Retryable {
                     connection.preserve();
                 }
-                return Err(error);
+                return Err(unsent(error));
             }
             Err(_) => {
-                return Err(CryptoError::Retryable(format!(
+                return Err(unsent(CryptoError::Retryable(format!(
                     "grpc operation exceeded the {:?} transport timeout",
                     self.spec.timeout
-                )));
+                ))));
             }
         };
 

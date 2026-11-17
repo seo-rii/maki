@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_crypto::{
-    BatchCapability, Capability, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
+    BatchCapability, Capability, CryptoCapabilities, CryptoContext, CryptoProvider, ErrorClass,
     PlaintextUnit, SecretBuffer,
 };
 use maki_crypto_grpc::{GrpcCryptoProvider, GrpcProviderSpec, GrpcTlsConfig};
@@ -93,8 +93,11 @@ async fn a_peer_that_never_answers_tls_does_not_pin_the_channel() {
         let result = provider
             .encrypt_batch(&context, std::slice::from_ref(&item))
             .await;
+        // The RPC timed out before its request was handed to a connection,
+        // so the error is also marked as not sent.
         assert!(
-            matches!(result, Err(CryptoError::Retryable(_))),
+            matches!(&result, Err(error)
+                if error.class() == ErrorClass::Retryable && error.is_not_sent()),
             "a silent peer must fail the RPC as a transport error: {result:?}"
         );
         assert!(

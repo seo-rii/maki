@@ -16,11 +16,13 @@
 //! arrive out of order; responses with unknown ids (stale, from an earlier
 //! connection generation) are dropped. On connection failure, pending
 //! requests fail `Retryable` and the next call reconnects transparently.
+//! A failure before a request frame reached the connection (TCP, TLS, the
+//! upgrade) is marked as not sent, so the dispatcher may fail it over.
 //! Frame sizes are bounded in both directions. Invalid receive framing is
 //! an endpoint contract failure, so that operation is never resent to it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -658,11 +660,15 @@ impl WsCryptoProvider {
         })
     }
 
+    /// `handed_over` becomes true in the same poll that hands the request
+    /// frame to the connection's writer. Until then no byte of the request
+    /// can have been written: TCP, TLS and the upgrade carry none of it.
     async fn request_once(
         &self,
         id: u64,
         items: usize,
         encoded: SecretBuffer,
+        handed_over: &AtomicBool,
     ) -> Result<Value, CryptoError> {
         let queued = Arc::new(parking_lot::Mutex::new(Some(request::into_message(
             encoded,
@@ -715,7 +721,9 @@ impl WsCryptoProvider {
                 completed: false,
             };
             let sent = tokio::time::timeout(self.spec.timeout, conn.sender.send(queued)).await;
-            if !matches!(sent, Ok(Ok(()))) {
+            if matches!(sent, Ok(Ok(()))) {
+                handed_over.store(true, Ordering::SeqCst);
+            } else {
                 // Writer gone or wedged: drop this connection if it's still
                 // the registered one.
                 if guard.as_ref().map(|c| c.generation) == Some(generation) {
@@ -746,7 +754,10 @@ impl WsCryptoProvider {
     /// One logical request with a single transparent reconnect attempt on
     /// transport failure. A provider that is not `retry_safe` is never sent
     /// the same request twice (review M-010): the transport failure is
-    /// surfaced as-is.
+    /// surfaced as-is. A failure before any attempt handed its frame to a
+    /// connection (connect, TLS, upgrade, send queue, or the attempt timeout
+    /// expiring first) is marked [`CryptoError::not_sent`], so the
+    /// dispatcher may send the request to a peer.
     async fn request(
         &self,
         op: &str,
@@ -754,6 +765,8 @@ impl WsCryptoProvider {
         items: &[(u64, &[u8])],
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let mut last_err = None;
+        // Whether any attempt of this call may have written its frame.
+        let mut may_have_sent = false;
         let attempts = if self.spec.capabilities.retry_safe {
             2
         } else {
@@ -769,12 +782,21 @@ impl WsCryptoProvider {
             // handshake before starting their own full timeout. Dropping the
             // attempt keeps PendingRequest's generation-scoped cleanup and
             // live-sibling ownership unchanged.
+            let handed_over = AtomicBool::new(false);
             let result = tokio::time::timeout(
                 self.spec.timeout,
-                self.request_once(id, items.len(), encoded),
+                self.request_once(id, items.len(), encoded, &handed_over),
             )
             .await
             .unwrap_or_else(|_| Err(retryable("websocket request timeout")));
+            may_have_sent |= handed_over.load(Ordering::SeqCst);
+            let result = result.map_err(|error| {
+                if may_have_sent {
+                    error
+                } else {
+                    error.not_sent()
+                }
+            });
             match result {
                 Ok(response) => return self.parse_response(&response, items),
                 Err(e) if e.is_retryable() => last_err = Some(e),

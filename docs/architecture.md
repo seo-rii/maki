@@ -347,6 +347,22 @@ endpoints were tried in: under `stall` it stays pending, and under
 breakers, endpoint limits, and global byte and request semaphores prevent a
 failing provider from causing unbounded work.
 
+A provider that is not retry-safe is sent each request at most once: after an
+attempt that may have reached the endpoint fails, the dispatcher neither
+retries nor fails over, under either availability policy. An attempt that
+provably never left Maki does not count. Transports mark such an error as not
+sent (`CryptoError::not_sent`, which keeps its class and breaker charge) only
+where they can prove that no request byte was written: HTTP for reqwest
+connect errors (TCP connect or TLS handshake), gRPC for failures and timeouts
+before the request is handed to tonic on an established connection, and
+WebSocket for failures before the request frame reaches an upgraded
+connection (TCP, TLS, the upgrade, the send queue or the attempt timeout).
+The dispatcher fails such a request over and, under the availability policy,
+retries it like a request not yet sent. The mark describes the whole call: it
+is dropped once any attempt, an earlier chunk of the dispatch, an earlier
+per-item HTTP request, or an earlier transparent WebSocket reconnect attempt
+may have sent the request.
+
 ## Cache and growth
 
 The optional cache stores plaintext under `(unit_index, write_sequence)`. A

@@ -19,7 +19,7 @@ pub mod selftest;
 pub mod types;
 
 pub use clock::{Clock, SystemClock};
-pub use error::{ContextField, CryptoError, ErrorClass};
+pub use error::{ContextField, CryptoError, ErrorClass, NotSentError};
 pub use provider::CryptoProvider;
 pub use random_prefix::RandomPrefixProvider;
 pub use secret::{SecretBox, SecretBuffer};
