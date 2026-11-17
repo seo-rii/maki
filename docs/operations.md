@@ -1083,7 +1083,9 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
 - `maki status`, `metrics`, `checkpoint`, `drain` and `reload` give up when the
   daemon does not answer within 60 s (600 s for `checkpoint` and `drain`); pass
   `--timeout <seconds>` to wait longer. A timeout means the daemon is stalled
-  or busy, not that the command was rejected.
+  or busy, not that the command was rejected. Commands without a control
+  round trip (`volume`, `check`) refuse `--timeout` with the usage and exit
+  status 2.
 - While the journal cannot be synced (see the writeback item above) `maki
   status` reports `state: degraded` with the reason, and `maki_volume_state`
   is 2, until a barrier succeeds; a successful checkpoint alone does not clear
