@@ -400,7 +400,12 @@ pub(super) fn load_generation(
             let mut header = [0; 8];
             file.read_at(0, &mut header)?;
             let len = u64::from_le_bytes(header);
-            if len == 0 || len > manifest_bound(MAX_CAPACITY) - 8 {
+            // The length is unauthenticated. A canonical manifest fits its
+            // slot, so refuse one the file cannot hold before allocating.
+            if len == 0
+                || len > manifest_bound(MAX_CAPACITY) - 8
+                || len > file.len()?.saturating_sub(8)
+            {
                 return Err(invalid("invalid remote manifest length"));
             }
             let mut bytes = vec![0; len as usize];
