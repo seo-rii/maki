@@ -495,7 +495,20 @@ fn refusal(tls: &mut ClientStream, error: io::Error) -> io::Error {
         // A connection that already failed returns its stored error,
         // including an alert received on the normal path.
         match tls.conn.process_new_packets() {
-            Err(rustls::Error::AlertReceived(alert)) => return alert_error(alert),
+            Err(rustls::Error::AlertReceived(alert)) => {
+                // rustls clears `is_handshaking` after queuing the client's
+                // final flight. Some of it may still be queued when a write
+                // fails, so `wants_write` cannot rule out a refusal.
+                let finished_full_handshake = !tls.conn.is_handshaking()
+                    && matches!(
+                        tls.conn.handshake_kind(),
+                        Some(
+                            rustls::HandshakeKind::Full
+                                | rustls::HandshakeKind::FullWithHelloRetryRequest
+                        )
+                    );
+                return alert_error(alert, finished_full_handshake);
+            }
             Err(_) => return error,
             Ok(_) if !drain || reads == MAX_ALERT_READS => return error,
             Ok(_) => reads += 1,
@@ -506,12 +519,12 @@ fn refusal(tls: &mut ClientStream, error: io::Error) -> io::Error {
     }
 }
 
-/// A server sends these alerts when it does not accept the client's
-/// certificate chain or signature: the witness refusing this client, as
-/// final as its `permission_denied` answer. rustls reports a certificate
-/// signed by another key of a CA with the same name as `decrypt_error`.
-/// Other alerts stay TLS failures. Only the alert's name is reported.
-fn alert_error(alert: rustls::AlertDescription) -> io::Error {
+/// Classify certificate-related alerts as denials only after the client
+/// reaches its final flight in a full handshake. Earlier alerts can be
+/// negotiation failures, and resumed handshakes send no client certificate.
+/// `DecryptError` here includes a certificate signed by another key of a CA
+/// with the same name. The generic `HandshakeFailure` always stays a TLS error.
+fn alert_error(alert: rustls::AlertDescription, finished_full_handshake: bool) -> io::Error {
     use rustls::AlertDescription as Alert;
     match alert {
         Alert::BadCertificate
@@ -523,12 +536,13 @@ fn alert_error(alert: rustls::AlertDescription) -> io::Error {
         | Alert::AccessDenied
         | Alert::CertificateRequired
         | Alert::DecryptError
-        | Alert::HandshakeFailure => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "witness refused the client's TLS authentication: received fatal alert {alert:?}"
-            ),
-        ),
+            if finished_full_handshake =>
+        {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("witness TLS client authentication failed: received fatal alert {alert:?}"),
+            )
+        }
         _ => io::Error::new(
             io::ErrorKind::InvalidData,
             rustls::Error::AlertReceived(alert),
