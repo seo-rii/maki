@@ -521,6 +521,12 @@ impl CrashableBacking {
         Self::default()
     }
 
+    /// The backing as one process of the code under test sees it: a view
+    /// that shares this backing's state.
+    pub fn process(&self) -> Arc<Self> {
+        Arc::new(self.clone())
+    }
+
     /// Enable random torn-write simulation at `granularity` bytes.
     pub fn with_tearing(mut self, granularity: usize) -> Self {
         assert!(granularity > 0);
