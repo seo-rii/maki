@@ -656,7 +656,7 @@ fn review_f07_tls_rpc_timeout_erases_owned_payload_before_return() {
         tokio::time::advance(provider.spec.timeout).await;
         assert!(matches!(
             call.await.unwrap(),
-            Err(CryptoError::Retryable(_))
+            Err(error) if error.class() == maki_crypto::ErrorClass::Retryable && error.is_not_sent()
         ));
         assert_zeroized();
     });

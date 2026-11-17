@@ -11,7 +11,7 @@ use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
 use maki_crypto::{
     BatchCapability, Capability, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
-    PlaintextUnit, SecretBuffer,
+    ErrorClass, PlaintextUnit, SecretBuffer,
 };
 use maki_crypto_http::{
     BodySpec, HttpCryptoProvider, HttpProviderSpec, OpSpec, PayloadEncoding, RespKind, RespSpec,
@@ -369,6 +369,8 @@ async fn tcp_connection_refusal_remains_retryable() {
         .encrypt_batch(&context(), &plaintext())
         .await
         .unwrap_err();
-    assert!(matches!(error, CryptoError::Retryable(_)), "{error}");
+    assert_eq!(error.class(), ErrorClass::Retryable, "{error}");
+    // Nothing was written, so the request may go to a peer.
+    assert!(error.is_not_sent(), "{error:?}");
     drop(reservation);
 }

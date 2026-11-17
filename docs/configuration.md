@@ -479,8 +479,9 @@ carries no crypto request, so its refusal is never blamed on a request: HTTP
 408 and 5xx are retryable, 429 is throttling, and every other status (a
 redirect, an authentication refusal, or a generic 4xx such as 400 or 426 from
 a proxy that cannot upgrade) is an endpoint failure. The dispatcher opens that
-endpoint's circuit, so later requests go to a peer (a retry-safe request also
-fails over at once), and attach quarantines it like an unreachable endpoint.
+endpoint's circuit, so later requests go to a peer, and attach quarantines it
+like an unreachable endpoint. The refused request itself fails over at once,
+even with `retry_safe = false`: no byte of it was sent (see below).
 
 A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
@@ -488,8 +489,19 @@ A gRPC request gives up after `timeout`, but the connection attempt behind it
 completes the handshake is abandoned then and the next request reconnects.
 
 Providers that do not declare `retry_safe` are sent every request at most
-once: the dispatcher performs no retry or failover after a request has been
-sent, and the WebSocket transport does not resend over a fresh connection. With
+once: the dispatcher performs no retry or failover after a request may have
+been sent, and the WebSocket transport does not resend over a fresh connection.
+A request that provably never left Maki has not been sent, so it fails over to
+another endpoint and is retried under the availability policy like any request
+not yet sent. The transports claim this only where they can prove it: HTTP
+when reqwest reports a connect error (the TCP connection or the TLS handshake
+failed), gRPC when the connection, TLS handshake or channel readiness fails,
+or the request timeout expires, before the request is handed to the
+established connection, and WebSocket when the TCP connection, TLS, the
+upgrade or the send queue fails, or the request timeout expires, before the
+request frame reaches the connection. A timeout, reset or error status after
+that point counts as sent, as does a later unit of an HTTP per-item mapping
+once an earlier unit was sent. With
 `availability_policy = "bounded-error"`, `max_operation_time` is an absolute
 wall-clock deadline: backoff never sleeps past it and an expired caller receives
 an error. A shared RPC remains active while it still has a live caller.
