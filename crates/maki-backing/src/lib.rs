@@ -142,6 +142,31 @@ pub trait BackingFile: Send + Sync {
     fn sync_all(&self) -> io::Result<()> {
         self.sync_data()
     }
+
+    /// The file's owner where the backing has Unix ownership; `None` where
+    /// it has none (in-memory and non-Unix backings).
+    fn owner(&self) -> io::Result<Option<FileOwner>> {
+        Ok(None)
+    }
+
+    /// Give the open file to `owner` (`fchown` on the descriptor, no
+    /// pathname lookup). Only a privileged process can give a file to
+    /// another user, so callers decide when to ask. Like other inode
+    /// metadata, the change is volatile until `sync_all` succeeds.
+    fn set_owner(&self, owner: FileOwner) -> io::Result<()> {
+        let _ = owner;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file ownership is not supported by this backing",
+        ))
+    }
+}
+
+/// A Unix file owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileOwner {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// Held while a volume is attached; dropping releases the lock.

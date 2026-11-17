@@ -283,6 +283,21 @@ impl BackingFile for RealFile {
     fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
+
+    #[cfg(unix)]
+    fn owner(&self) -> io::Result<Option<crate::FileOwner>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.file.metadata()?;
+        Ok(Some(crate::FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn set_owner(&self, owner: crate::FileOwner) -> io::Result<()> {
+        std::os::unix::fs::fchown(&self.file, Some(owner.uid), Some(owner.gid))
+    }
 }
 
 #[cfg(unix)]
