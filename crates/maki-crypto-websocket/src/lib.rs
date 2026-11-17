@@ -117,11 +117,13 @@ impl std::fmt::Debug for WsProviderSpec {
     }
 }
 
-/// id → (connection generation the request was sent on, responder).
-/// The generation lets a dying connection's sweep fail only *its own*
-/// requests — never ones already in flight on a successor connection.
-type Pending =
-    Arc<parking_lot::Mutex<HashMap<u64, (u64, oneshot::Sender<Result<Value, CryptoError>>)>>>;
+/// id → (connection generation the request was sent on, its item count,
+/// responder). The generation lets a dying connection's sweep fail only *its
+/// own* requests — never ones already in flight on a successor connection.
+/// The item counts bound how many response items the reader keeps.
+type Pending = Arc<
+    parking_lot::Mutex<HashMap<u64, (u64, usize, oneshot::Sender<Result<Value, CryptoError>>)>>,
+>;
 
 struct Connection {
     sender: mpsc::Sender<QueuedMessage>,
@@ -428,11 +430,11 @@ impl WsCryptoProvider {
         dead_generation.fetch_max(generation, Ordering::SeqCst);
         let ids: Vec<u64> = map
             .iter()
-            .filter(|(_, (g, _))| *g == generation)
+            .filter(|(_, (g, _, _))| *g == generation)
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            if let Some((_, tx)) = map.remove(&id) {
+            if let Some((_, _, tx)) = map.remove(&id) {
                 let _ = tx.send(Err(failure.duplicate()));
             }
         }
@@ -542,7 +544,21 @@ impl WsCryptoProvider {
                         let Some(frame) = frame.filter(|_| text) else {
                             return violation("a non-text frame");
                         };
-                        let Ok(value) = frame.parse() else {
+                        // A request registers before it is sent, so a frame
+                        // answering it can only reach a request registered on
+                        // this generation already: keeping as many items as
+                        // the largest of those loses none it could deliver.
+                        // Later items are only counted, so a frame of many
+                        // small items costs no more than the items it may
+                        // carry (`max_frame_bytes` bounds only wire bytes).
+                        let items = reader_pending
+                            .lock()
+                            .values()
+                            .filter(|(g, _, _)| *g == generation)
+                            .map(|(_, items, _)| *items)
+                            .max()
+                            .unwrap_or(0);
+                        let Ok(value) = frame.parse(items) else {
                             return violation("a text frame that is not a JSON response");
                         };
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
@@ -565,14 +581,14 @@ impl WsCryptoProvider {
                         };
                         let response = {
                             let mut pending = reader_pending.lock();
-                            if pending.get(&id).is_some_and(|(g, _)| *g == generation) {
+                            if pending.get(&id).is_some_and(|(g, _, _)| *g == generation) {
                                 pending.remove(&id)
                             } else {
                                 None
                             }
                         };
                         match response {
-                            Some((_, tx)) => {
+                            Some((_, _, tx)) => {
                                 let _ = tx.send(frame);
                             }
                             None => {
@@ -642,7 +658,12 @@ impl WsCryptoProvider {
         })
     }
 
-    async fn request_once(&self, id: u64, encoded: SecretBuffer) -> Result<Value, CryptoError> {
+    async fn request_once(
+        &self,
+        id: u64,
+        items: usize,
+        encoded: SecretBuffer,
+    ) -> Result<Value, CryptoError> {
         let queued = Arc::new(parking_lot::Mutex::new(Some(request::into_message(
             encoded,
         )?)));
@@ -663,7 +684,7 @@ impl WsCryptoProvider {
                 let registered = {
                     let mut pending = self.pending.lock();
                     if conn.cancellation.register() {
-                        pending.insert(id, (conn.generation, reply.take().unwrap()));
+                        pending.insert(id, (conn.generation, items, reply.take().unwrap()));
                         true
                     } else {
                         false
@@ -748,9 +769,12 @@ impl WsCryptoProvider {
             // handshake before starting their own full timeout. Dropping the
             // attempt keeps PendingRequest's generation-scoped cleanup and
             // live-sibling ownership unchanged.
-            let result = tokio::time::timeout(self.spec.timeout, self.request_once(id, encoded))
-                .await
-                .unwrap_or_else(|_| Err(retryable("websocket request timeout")));
+            let result = tokio::time::timeout(
+                self.spec.timeout,
+                self.request_once(id, items.len(), encoded),
+            )
+            .await
+            .unwrap_or_else(|_| Err(retryable("websocket request timeout")));
             match result {
                 Ok(response) => return self.parse_response(&response, items),
                 Err(e) if e.is_retryable() => last_err = Some(e),
@@ -812,15 +836,22 @@ impl WsCryptoProvider {
                 ),
             });
         }
-        let items = response
+        let (length, items) = response
             .get("items")
             .and_then(|i| i.as_array())
             .ok_or_else(|| CryptoError::Contract("response missing items array".to_string()))?;
-        if items.len() != expected {
+        if length != expected {
             return Err(CryptoError::Contract(format!(
-                "response has {} item(s), expected {expected}",
-                items.len()
+                "response has {length} item(s), expected {expected}"
             )));
+        }
+        // The reader keeps as many items as the largest request registered
+        // when the frame arrived. Fewer than this request's own count means
+        // the frame arrived before the request was sent.
+        if items.len() != length {
+            return Err(CryptoError::Contract(
+                "response arrived before its request was sent".into(),
+            ));
         }
         items
             .iter()

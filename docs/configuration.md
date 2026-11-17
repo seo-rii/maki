@@ -431,6 +431,11 @@ ignored, and a close frame ends the connection. Pending requests are scoped to a
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
+A response frame is parsed against this protocol: only its `id`, the error's
+`class` and `reason`, and the `unit` and `data` of at most as many items as the
+largest request awaiting a response on that connection are kept. Other values
+are validated but not kept, so the frame-size limit also bounds the memory a
+response takes, not only its wire bytes.
 Once a request has registered on an established connection, cancelling it or
 expiring its overall attempt deadline or response-wait timeout removes that
 request and stops new requests from joining its connection generation.
