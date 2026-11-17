@@ -216,10 +216,18 @@ impl GuardedString {
     }
 }
 
+// Unit tests bound how often one operation validates a whole guarded string.
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    pub(crate) static VALIDATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 impl Deref for GuardedString {
     type Target = str;
 
     fn deref(&self) -> &str {
+        #[cfg(all(test, feature = "std"))]
+        VALIDATIONS.with(|count| count.set(count.get() + 1));
         // Every write originates from a valid &str and truncation preserves a
         // character boundary. Check the invariant before exposing a string.
         str::from_utf8(&self.0).expect("guarded error messages are UTF-8")

@@ -481,6 +481,25 @@ impl<'de> Visitor<'de> for ReferenceFromString {
     {
         Ok(RawValue::from_borrowed(s))
     }
+
+    /// Text that does not borrow from the input gets serde's default rejection.
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(de::Error::invalid_type(Unexpected::Str(s), &self))
+    }
+
+    /// Owned raw text cannot be borrowed either. Adopt it before rejecting it,
+    /// so the raw JSON is erased instead of freed as an ordinary String.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let s = GuardedString::from_string(s);
+        Err(de::Error::invalid_type(Unexpected::Str(&s), &self))
+    }
 }
 
 pub struct BoxedFromString;

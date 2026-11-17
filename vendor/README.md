@@ -9,7 +9,9 @@ buffer ownership, not the TLS wire protocol or JSON syntax.
 
 `serde_json` erases its private string/number scratch before reuse and its full
 allocation before growth or release. Integer128 scanning and error-message
-formatting use the same ownership. Parsed values, borrowed input and messages
+formatting use the same ownership. Reading a message's trailing line and
+column validates the guarded text once, so building an error stays linear in
+the message length. Parsed values, borrowed input and messages
 formatted by callers remain caller-owned. A caller-retained `Deserializer`
 keeps its latest scratch until reuse or Drop; a visitor may still borrow it.
 The optional `raw_value` path also guards reader accumulation, owned map/seed
@@ -19,6 +21,7 @@ UTF-8, serializer and seed errors and normal unwinding. Borrowed raw input and
 public `Box<RawValue>` outputs keep their upstream ownership. Passing an owned
 String to an arbitrary visitor transfers cleanup responsibility at
 `visit_string`; the library's own visitors immediately adopt it again.
+The borrowed `&RawValue` seed also adopts owned text before rejecting it.
 The `arbitrary_precision` path guards scanned number text, owned number-map
 and seed storage, internal number-visitor handoffs and float display
 temporaries. Consuming a `Number` as a deserializer adopts its owned string
@@ -147,8 +150,9 @@ features and new allocation/clear/consume/shrink paths; an unchanged public API
 does not prove the same internal lifetimes. Update the upstream inventory and
 patch manifest together. The dependency contract
 (`scripts/check_vendor_erasure.py`) also compares each patched package's
-resolved Cargo features with its reviewed feature list; enabling any other
-feature, directly or through a dependency, fails until that feature's paths are
+Cargo features, resolved with every workspace feature enabled, with its reviewed
+feature list; enabling any other feature, directly, through a dependency or
+through an optional workspace feature, fails until that feature's paths are
 reviewed and added. CI runs the dependency contract and the explicit vendor
 tests because these packages are excluded from workspace membership.
 
