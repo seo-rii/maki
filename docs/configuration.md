@@ -164,8 +164,9 @@ line and column when available. Their Display and Debug output omit the source
 text, values, unknown field names and the parser's free-form message; inspect
 the configuration locally at the reported location to diagnose the problem.
 Semantic validation errors can name a known field or endpoint. Endpoint URLs
-are shown as `scheme://host[:port]` without userinfo, path or query. Beyond
-schema, geometry, and secret-literal checks validation rejects:
+are shown as `scheme://host[:port]` without userinfo, path or query; HTTP
+operation paths, credential names and credential templates are never shown.
+Beyond schema, geometry, and secret-literal checks validation rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
   `[crypto.circuit_breaker]`, and `[crypto.retry_budget]` (except
@@ -187,14 +188,15 @@ schema, geometry, and secret-literal checks validation rejects:
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
   `nbd.device_block_size` that differs from the volume's, a `minimum_io`
-  above 64 KiB, an export size that is not a multiple of `minimum_io`, a
-  `maximum_io` that does not fit in the NBD 32-bit wire
-  field, or a `limits.max_plaintext_bytes` too small for every crypto unit
-  touched by one permitted NBD request. The charge rounds to whole crypto
-  units, including partial units at both ends, and accounts for `minimum_io`
-  alignment and the export size. For example, 1 KiB requests with 512-byte
-  alignment and 4 KiB crypto units can touch two units and need 8 KiB, not
-  5 KiB;
+  above 64 KiB, a configured or defaulted `preferred_io` above 32 MiB (nbdkit
+  refuses a larger preferred block size, failing every client handshake), an
+  export size that is not a multiple of `minimum_io`, a `maximum_io` that does
+  not fit in the NBD 32-bit wire field, or a `limits.max_plaintext_bytes` too
+  small for every crypto unit touched by one permitted NBD request. The charge
+  rounds to whole crypto units, including partial units at both ends, and
+  accounts for `minimum_io` alignment and the export size. For example, 1 KiB
+  requests with 512-byte alignment and 4 KiB crypto units can touch two units
+  and need 8 KiB, not 5 KiB;
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at
@@ -252,8 +254,11 @@ schema, geometry, and secret-literal checks validation rejects:
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
-- the `keyring` credential source, which this build does not implement, and
-  the same credential name declared with different sources.
+- the `keyring` credential source, which this build does not implement, the
+  same credential name declared with different sources, a credential name the
+  loaders cannot read, and a credential `format` without exactly one `{}`
+  placeholder or on a reference that is not a header or metadata value (see
+  [credentials](#credentials-and-secrets)).
 
 The providers additionally refuse unreadable or invalid TLS material at
 construction or handshake, and read `client_key` from its credential source to
@@ -317,6 +322,10 @@ one would resolve against whichever process's working directory reads it), `env`
 reads `MAKI_CREDENTIAL_<NAME>`. TLS `ca_file` and `client_cert_file` paths must
 be absolute for the same reason. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
+A `credential` name, and the file name that ends a `file` path, may contain
+only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
+the loaders refuse any other name, so validation refuses it before a volume is
+created (a key's name is stored as the volume's immutable key identity).
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
@@ -326,6 +335,11 @@ A credential that is empty or holds only whitespace is refused like a missing
 one, whatever its source and use, so a token file truncated by a failed
 rotation stops attach instead of sending a header or metadata value without
 its token.
+A header or metadata reference may add `format`, a template with exactly one
+`{}` placeholder that the credential replaces (`format = "Bearer {}"`). The
+rest of the template is sent literally, so never put a secret there.
+Validation refuses a template with no placeholder or with several, and refuses
+`format` on `crypto.key` and `tls.client_key`, which are loaded as stored.
 Within one volume configuration, references may reuse a name only when they
 declare the same source. For example, `name = "token"` in both the encrypt and
 decrypt mappings is valid with `source = "credential"` on both. Combining that

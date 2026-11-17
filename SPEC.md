@@ -604,8 +604,9 @@ Block-related concepts are separated.
 | `slot_size`           | physical slot size            |        calculated |
 
 The plugin MUST advertise the configured minimum, preferred, and maximum NBD
-I/O sizes. The minimum MUST be at most 64 KiB and the maximum MUST fit in the
-32-bit NBD field. Both configured and stored export sizes MUST be multiples
+I/O sizes. The minimum MUST be at most 64 KiB, the preferred size at most
+32 MiB (the largest nbdkit accepts), and the maximum MUST fit in the 32-bit NBD
+field. Both configured and stored export sizes MUST be multiples
 of the effective minimum I/O size; validation MUST refuse an inaccessible
 tail before creation or export. Read and write callbacks MUST reject zero-length,
 out-of-range, or minimum-misaligned requests before copying write plaintext or
@@ -661,16 +662,17 @@ catalog_ab_bytes        = 2 * (28 + 8 * num_shards)
 ```
 
 Geometry creation MUST reject more than 2^24 possible shards, matching the
-supported shard-catalog limit, and any capacity calculation that overflows an
-unsigned 64-bit byte count. `maki volume inspect` reports these five
-maximum-layout values. They exclude journal and checkpoint headroom,
-filesystem metadata and copy-on-write overhead, and application temporary
-space; they are not a full-volume physical reservation. Before accepting a
-journal record, a Linux backing MUST physically allocate the exact journal
-range and the record's complete checkpoint slot. Both allocation-map copies
-and the catalog entry of a newly touched shard MUST already be durable. A
-failed reservation MUST NOT consume a sequence or append the record. Untouched
-slots MAY remain sparse.
+supported shard-catalog limit, any capacity calculation that overflows an
+unsigned 64-bit byte count, and a unit count that reaches the reserved
+key-canary unit index (§27), which attach refuses. `maki volume inspect`
+reports these five maximum-layout values. They exclude journal and checkpoint
+headroom, filesystem metadata and copy-on-write overhead, and application
+temporary space; they are not a full-volume physical reservation. Before
+accepting a journal record, a Linux backing MUST physically allocate the exact
+journal range and the record's complete checkpoint slot. Both allocation-map
+copies and the catalog entry of a newly touched shard MUST already be durable.
+A failed reservation MUST NOT consume a sequence or append the record.
+Untouched slots MAY remain sparse.
 
 ---
 

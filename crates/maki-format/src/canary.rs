@@ -26,8 +26,9 @@ pub const CANARY_VERSION: u32 = 1;
 pub const MAX_CANARY_CIPHERTEXT: u32 = 16 << 20;
 
 /// Reserved unit index the canary is encrypted at. Above any unit a volume
-/// can address in practice (attach refuses geometries that reach it), yet
-/// below 2^53 so JSON-based remote providers represent it exactly.
+/// can address in practice (geometry creation and superblock decode refuse
+/// geometries that reach it, and attach checks again), yet below 2^53 so
+/// JSON-based remote providers represent it exactly.
 pub const CANARY_UNIT_INDEX: u64 = 0x0010_0000_4D41_4B49;
 
 /// The fixed plaintext of a volume's canary: an ASCII tag followed by a
