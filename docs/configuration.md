@@ -804,9 +804,11 @@ the recovered engine. A smaller ancestor ceiling is rejected because it changes
 the configured envelope. Missing, malformed, unreadable or unlimited leaf
 limits fail attach. Ancestors may be unlimited; the real hierarchy root has no
 `memory.max`. Paths come from `/proc/self/cgroup` and `/proc/self/mountinfo`,
-including mountinfo escaping. Ambiguous mounts, subtree mounts hiding ancestors,
-root membership, nested mounts shadowing controller files and escaping paths
-are refused. Run under the host cgroup
+including mountinfo escaping. Other mounts are compared with the cgroup-v2 mount
+by their exact path bytes, so one elsewhere whose path is not UTF-8, contains a
+newline or is deeply nested does not affect admission. Ambiguous mounts, subtree
+mounts hiding ancestors, root membership, nested mounts shadowing controller
+files and escaping paths are refused. Run under the host cgroup
 namespace with the complete hierarchy visible; a container can hide further
 ancestors, and visibility is not a proof of their headroom.
 
