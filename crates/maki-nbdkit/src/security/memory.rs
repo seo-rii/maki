@@ -41,8 +41,10 @@ pub fn verify(config: &VolumeConfig) -> Result<Option<MemoryBudgetPosture>, Daem
 mod linux {
     use super::*;
     use maki_format::config::MemoryBudgetSection;
+    use std::ffi::OsString;
     use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Component, Path};
 
@@ -67,8 +69,11 @@ mod linux {
         Ok(PathBuf::from(text))
     }
 
-    fn unescape_mount(text: &str) -> Result<String, String> {
-        let bytes = text.as_bytes();
+    /// Decode the escapes Linux writes into mountinfo paths (`\040` space,
+    /// `\011` tab, `\012` newline, `\134` backslash) into the path's exact
+    /// bytes. The kernel escapes nothing else in these fields, so any other
+    /// backslash sequence is a malformed table.
+    fn unescape_mount(bytes: &[u8]) -> Result<Vec<u8>, String> {
         let mut result = Vec::with_capacity(bytes.len());
         let mut i = 0;
         while i < bytes.len() {
@@ -89,10 +94,60 @@ mod linux {
                 i += 1;
             }
         }
-        String::from_utf8(result).map_err(|_| "non-UTF8 mountinfo path".into())
+        Ok(result)
     }
 
-    pub(super) fn layout(membership: &str, mountinfo: &str) -> Result<Layout, String> {
+    /// A path of the cgroup-v2 mount record, which admission resolves and
+    /// reads: it must decode to UTF-8 and pass `absolute_path`.
+    fn cgroup_mount_path(field: &[u8]) -> Result<PathBuf, String> {
+        let text =
+            String::from_utf8(unescape_mount(field)?).map_err(|_| "non-UTF8 mountinfo path")?;
+        absolute_path(&text)
+    }
+
+    /// The mountpoint of any other mount, kept as its exact bytes: it is
+    /// only compared, component by component, with the cgroup-v2 mount.
+    /// Every name the kernel can emit is accepted (bytes that are not
+    /// UTF-8, an escaped newline, any depth), so a mount elsewhere in the
+    /// namespace cannot refuse admission. A path the kernel never emits
+    /// (relative, or with a NUL or an empty, `.` or `..` component) is a
+    /// malformed table that could hide a nested mount, and refuses.
+    fn other_mount_path(field: &[u8]) -> Result<PathBuf, String> {
+        let path = unescape_mount(field)?;
+        if path.first() != Some(&b'/')
+            || path.contains(&0)
+            || (path != b"/"
+                && path[1..]
+                    .split(|&byte| byte == b'/')
+                    .any(|s| s.is_empty() || s == b"." || s == b".."))
+        {
+            return Err("invalid mountinfo mountpoint".into());
+        }
+        Ok(PathBuf::from(OsString::from_vec(path)))
+    }
+
+    /// Records of the mount table, split as `str::lines` splits text.
+    fn mountinfo_records(table: &[u8]) -> impl Iterator<Item = &[u8]> {
+        table
+            .split_inclusive(|&byte| byte == b'\n')
+            .map(|line| match line.strip_suffix(b"\n") {
+                Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+                None => line,
+            })
+    }
+
+    fn mountinfo_fields(part: &[u8]) -> Vec<&[u8]> {
+        part.split(|&byte| byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect()
+    }
+
+    /// The mount table is bytes, not text: only the cgroup-v2 records are
+    /// decoded and validated as paths admission uses.
+    pub(super) fn layout(
+        membership: &str,
+        mountinfo: &(impl AsRef<[u8]> + ?Sized),
+    ) -> Result<Layout, String> {
         let mut group = None;
         // procfs terminates records with LF; a preceding CR belongs to the path.
         for line in membership.split_terminator('\n') {
@@ -122,30 +177,28 @@ mod linux {
         let group = absolute_path(group)?;
         let mut mounts = Vec::new();
         let mut other_mounts = Vec::new();
-        for line in mountinfo.lines() {
-            let Some((before, after)) = line.split_once(" - ") else {
+        for line in mountinfo_records(mountinfo.as_ref()) {
+            let Some(at) = line.windows(3).position(|window| window == b" - ") else {
                 return Err("malformed mountinfo".into());
             };
             // Linux separates fields with ASCII spaces and escapes spaces,
-            // tabs, newlines and backslashes within paths. Other whitespace,
-            // including Unicode, carriage return and form-feed, is path data.
-            let fields: Vec<_> = before
-                .split(' ')
-                .filter(|field| !field.is_empty())
-                .collect();
-            let fs: Vec<_> = after.split(' ').filter(|field| !field.is_empty()).collect();
+            // tabs, newlines and backslashes within paths. Other bytes,
+            // including Unicode whitespace, carriage return, form-feed and
+            // sequences that are not UTF-8, are path data.
+            let fields = mountinfo_fields(&line[..at]);
+            let fs = mountinfo_fields(&line[at + 3..]);
             if fields.len() < 6 || fs.len() < 3 {
                 return Err("malformed mountinfo fields".into());
             }
-            if fs[0] != "cgroup2" {
-                other_mounts.push(absolute_path(&unescape_mount(fields[4])?)?);
+            if fs[0] != b"cgroup2" {
+                other_mounts.push(other_mount_path(fields[4])?);
                 continue;
             }
-            let root = absolute_path(&unescape_mount(fields[3])?)?;
+            let root = cgroup_mount_path(fields[3])?;
             if root != Path::new("/") {
                 return Err("subtree cgroup mount hides ancestor limits".into());
             }
-            mounts.push(absolute_path(&unescape_mount(fields[4])?)?);
+            mounts.push(cgroup_mount_path(fields[4])?);
         }
         if mounts.len() != 1 {
             return Err("missing or ambiguous cgroup-v2 mount".into());
@@ -158,20 +211,29 @@ mod linux {
         Ok(Layout { mount, leaf })
     }
 
-    fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
+    fn read_bounded_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let mut result = String::new();
+        let mut result = Vec::new();
         file.take(max + 1)
-            .read_to_string(&mut result)
+            .read_to_end(&mut result)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         if result.len() as u64 > max {
             return Err(format!("oversized kernel field {}", path.display()));
         }
         Ok(result)
+    }
+
+    fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
+        String::from_utf8(read_bounded_bytes(path, max)?).map_err(|_| {
+            format!(
+                "cannot read {}: stream did not contain valid UTF-8",
+                path.display()
+            )
+        })
     }
 
     fn number(value: &str) -> Result<u64, String> {
@@ -294,7 +356,8 @@ mod linux {
             return Err("RLIMIT_MEMLOCK is below required_memlock_bytes".into());
         }
         let membership = read_bounded(Path::new("/proc/self/cgroup"), 1 << 20)?;
-        let mounts = read_bounded(Path::new("/proc/self/mountinfo"), 1 << 20)?;
+        // Linux emits mount path bytes as is: the table is never decoded.
+        let mounts = read_bounded_bytes(Path::new("/proc/self/mountinfo"), 1 << 20)?;
         let layout = layout(&membership, &mounts)?;
         let file = std::fs::File::open(&layout.mount)
             .map_err(|e| format!("cannot open cgroup mount: {e}"))?;
@@ -309,7 +372,7 @@ mod linux {
         }
         let posture = assess(budget, &layout, memlock)?;
         if read_bounded(Path::new("/proc/self/cgroup"), 1 << 20)? != membership
-            || read_bounded(Path::new("/proc/self/mountinfo"), 1 << 20)? != mounts
+            || read_bounded_bytes(Path::new("/proc/self/mountinfo"), 1 << 20)? != mounts
             || memlock_limit()? != memlock
         {
             return Err("kernel memory policy changed during admission".into());
@@ -524,6 +587,156 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_mount_path_bytes_do_not_refuse_admission() {
+        // Linux escapes only space, tab, newline and backslash in mountinfo
+        // paths and emits every other byte as is. A user's FUSE mount, a
+        // Latin-1 USB label or a deep directory elsewhere in the namespace
+        // is ordinary state, not a malformed cgroup hierarchy.
+        let cgroup = mountinfo("/", "/sys/fs/cgroup").into_bytes();
+        let tmpfs =
+            |path: &[u8]| [b"44 31 0:55 / ".as_slice(), path, b" rw - tmpfs tmpfs rw\n"].concat();
+        let deep = [b"/srv".as_slice(), &b"/d".repeat(300)].concat();
+        let foreign = [
+            (
+                "path, FUSE subtype and source not UTF-8",
+                b"52 31 0:61 / /home/user/fuse-\xff rw,nosuid,nodev - fuse.\xfe \xfd rw\n".to_vec(),
+            ),
+            ("escaped newline", tmpfs(b"/media/usb\\012stick")),
+            ("301 components", tmpfs(&deep)),
+            ("non-UTF-8 sibling", tmpfs(b"/sys/fs/cgroup\xff")),
+            ("escaped newline sibling", tmpfs(b"/sys/fs/cgroup\\012")),
+        ];
+        let expected = Layout {
+            mount: "/sys/fs/cgroup".into(),
+            leaf: "/sys/fs/cgroup/slice/daemon".into(),
+        };
+        let all: Vec<u8> = foreign
+            .iter()
+            .flat_map(|(_, record)| record.clone())
+            .collect();
+        let mut refused = Vec::new();
+        for (case, record) in foreign.iter().chain([&("all of them", all)]) {
+            for (order, table) in [
+                ("after", [cgroup.as_slice(), record].concat()),
+                ("before", [record.as_slice(), &cgroup].concat()),
+            ] {
+                let result = layout("0::/slice/daemon\n", &table);
+                if result.as_ref() != Ok(&expected) {
+                    refused.push(format!("{case}, {order} the cgroup2 mount: {result:?}"));
+                }
+            }
+        }
+        assert!(refused.is_empty(), "{refused:#?}");
+    }
+
+    #[test]
+    fn mounts_at_or_below_the_cgroup_mount_shadow_policy_whatever_their_bytes() {
+        let cgroup = mountinfo("/", "/sys/fs/cgroup").into_bytes();
+        let record = |fstype: &[u8], path: &[u8]| {
+            let parts = [b"44 31 0:55 / ".as_slice(), path, b" rw - ", fstype];
+            [cgroup.as_slice(), &parts.concat(), b" none rw\n"].concat()
+        };
+        // The root filesystem is a sibling of every hierarchy, not a parent.
+        assert!(layout("0::/slice/daemon\n", &record(b"ext4", b"/")).is_ok());
+        let deep = [b"/sys/fs/cgroup".as_slice(), &b"/d".repeat(300)].concat();
+        for (fstype, path) in [
+            (b"tmpfs".as_slice(), b"/sys/fs/cgroup".as_slice()),
+            (b"tmpfs", b"/sys/fs/cgroup/slice/\xff"),
+            (b"tmpfs", b"/sys/fs/cgroup/\xff/daemon"),
+            (b"fuse.\xfe", b"/sys/fs/cgroup/slice/daemon"),
+            (b"tmpfs", b"/sys/fs/cgroup/slice\\012daemon"),
+            (b"tmpfs", &deep),
+        ] {
+            assert_eq!(
+                layout("0::/slice/daemon\n", &record(fstype, path)).unwrap_err(),
+                "nested mount can shadow cgroup memory policy",
+                "{}",
+                String::from_utf8_lossy(&path[..path.len().min(48)])
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup2_records_and_undecodable_mountpoints_still_refuse() {
+        let cgroup = mountinfo("/", "/sys/fs/cgroup").into_bytes();
+        let cgroup2 = |root: &[u8], mount: &[u8]| {
+            [
+                b"31 22 0:26 ".as_slice(),
+                root,
+                b" ",
+                mount,
+                b" rw - cgroup2 cgroup2 rw\n",
+            ]
+            .concat()
+        };
+        let tmpfs = |path: &[u8]| {
+            [
+                cgroup.as_slice(),
+                b"44 31 0:55 / ",
+                path,
+                b" rw - tmpfs tmpfs rw\n",
+            ]
+            .concat()
+        };
+        let deep = [b"/sys/fs/cgroup".as_slice(), &b"/d".repeat(300)].concat();
+        for (table, error) in [
+            // The hierarchy's own record is still a UTF-8 cgroup path.
+            (
+                cgroup2(b"/", b"/sys/fs/cgroup-\xff"),
+                "non-UTF8 mountinfo path",
+            ),
+            (
+                cgroup2(b"/\xff", b"/sys/fs/cgroup"),
+                "non-UTF8 mountinfo path",
+            ),
+            (
+                cgroup2(b"/", b"/sys/fs/cgroup\\012"),
+                "invalid or escaping cgroup path",
+            ),
+            (cgroup2(b"/", &deep), "invalid or escaping cgroup path"),
+            (cgroup2(b"/", b"/sys/fs/\\777"), "invalid mountinfo escape"),
+            // A second hierarchy is never skipped, whatever its path.
+            (
+                [cgroup.as_slice(), &cgroup2(b"/", b"/mnt/\xff")].concat(),
+                "non-UTF8 mountinfo path",
+            ),
+            (
+                [cgroup.as_slice(), &cgroup2(b"/", b"/mnt/second")].concat(),
+                "missing or ambiguous cgroup-v2 mount",
+            ),
+            // Mountpoints the kernel never emits cannot be compared, so they
+            // refuse rather than possibly hide a nested mount.
+            (tmpfs(b"relative"), "invalid mountinfo mountpoint"),
+            (tmpfs(b"/srv//x"), "invalid mountinfo mountpoint"),
+            (tmpfs(b"/srv/./x"), "invalid mountinfo mountpoint"),
+            (
+                tmpfs(b"/srv/../sys/fs/cgroup/slice"),
+                "invalid mountinfo mountpoint",
+            ),
+            (tmpfs(b"/srv/"), "invalid mountinfo mountpoint"),
+            (tmpfs(b"/srv\0x"), "invalid mountinfo mountpoint"),
+            (tmpfs(b"/srv\\777"), "invalid mountinfo escape"),
+            (tmpfs(b"/srv\\000"), "invalid mountinfo escape"),
+            (tmpfs(b"/srv\\04"), "truncated mountinfo escape"),
+            (
+                [cgroup.as_slice(), b"44 31 0:55 / /srv\xff rw tmpfs\n"].concat(),
+                "malformed mountinfo",
+            ),
+            (
+                [cgroup.as_slice(), b"44 31 0:55 / /srv\xff - tmpfs\n"].concat(),
+                "malformed mountinfo fields",
+            ),
+        ] {
+            assert_eq!(
+                layout("0::/slice/daemon\n", &table).unwrap_err(),
+                error,
+                "{}",
+                String::from_utf8_lossy(&table[..table.len().min(160)])
+            );
+        }
+    }
+
+    #[test]
     fn admission_uses_leaf_limit_and_all_visible_ancestor_headroom() {
         let f = Fixture::new();
         let result = assess(&budget(), &f.layout, 2048).unwrap();
@@ -636,7 +849,7 @@ mod tests {
     #[test]
     fn actual_kernel_membership_and_unlimited_limit_are_not_substituted() {
         let membership = std::fs::read_to_string("/proc/self/cgroup").unwrap();
-        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let mounts = std::fs::read("/proc/self/mountinfo").unwrap();
         let result = layout(&membership, &mounts);
         let Ok(view) = result else {
             // Restricted container views are a deliberate fail-closed result.
