@@ -1047,10 +1047,12 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
 - Volume directories are created `0700` and their files `0600`; a `file`
-  credential must be a regular file with mode `0600` or `0400`, or attach is
-  refused. A `credential` (systemd `LoadCredential=`) may also be `0440` when
-  its group is the daemon's own or root, as systemd 257 (Debian 13) writes
-  them; group write and any access by others are refused (R5-037).
+  credential must be a regular file with mode `0600` or `0400`, owned by root
+  or by the user the daemon runs as, or attach is refused. A `credential`
+  (systemd `LoadCredential=`) has the same owner rule and may also be `0440`
+  when its group is the daemon's own or root, as systemd 257 (Debian 13)
+  writes them; group write and any access by others are refused (R5-037).
+  An empty or whitespace-only credential is refused like a missing one.
 - The control socket is `0660` with `control.group`; administrators reach it
   through the `root:maki-admin` `/run/maki-control` tree, while the NBD
   socket stays behind `/run/maki` (`root:maki` 0750), which only the daemon
