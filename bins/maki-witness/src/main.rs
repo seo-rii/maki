@@ -43,9 +43,26 @@ fn read_config<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
             "configuration must be a regular file at most 64 KiB",
         ));
     }
+    // A server configuration names the administrators, the server key and
+    // the authority; a client configuration names the trusted server and CA.
+    // Its owner can rewrite it whatever its mode, so it must belong to root
+    // or to the user this process runs as. Both checks describe the opened
+    // descriptor, which was opened without following a symlink.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let owner = metadata.uid();
+        if owner != 0 && owner != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "configuration is owned by uid {owner}, not by root or this process's user \
+                     (uid {euid}): its owner can rewrite it whatever its mode"
+                ),
+            ));
+        }
         if metadata.permissions().mode() & 0o022 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

@@ -197,7 +197,14 @@ operator-controlled cutover after destination verification.
 ## Credential and configuration files
 
 Configuration files are bounded to 64 KiB and reject unknown fields. On Unix,
-they must not be symlinks or writable by group/others. Credential files are
+they must not be symlinks or writable by group/others, and must be owned by
+root or by the user that runs the command (`serve`, `init-etcd` or `inspect`).
+A configuration owned by any other user is refused whatever its mode, because
+its owner can rewrite the administrator allow-list, the key path or the
+authority it names. A root-owned `0644` file suits both the service account
+and root; a command run as root refuses a configuration owned by the service
+account. Configurations hold no secrets, so group and other read access is
+allowed. Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
 accessible to group/others (`0600` is appropriate), and must be owned by root
 or by the user the loading process runs as. A key owned by any other user is
