@@ -1422,7 +1422,7 @@ impl System for ReviewForeignMountSystem {
     }
 
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        crate::detach::observe(record, &self.mountinfo, &self.sysfs)
+        crate::detach::observe(record, self.mountinfo.as_bytes(), &self.sysfs)
     }
 }
 
@@ -1598,16 +1598,17 @@ impl System for ObservedSystem {
         &self,
         record: &BoundDeviceRecord,
     ) -> io::Result<Option<recover::RecoveryProof>> {
-        recover::capture(record, &self.mounts(record), &self.sysfs).map(Some)
+        recover::capture(record, self.mounts(record).as_bytes(), &self.sysfs).map(Some)
     }
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        recover::observe(record, &self.mounts(record), &self.sysfs)
+        recover::observe(record, self.mounts(record).as_bytes(), &self.sysfs)
     }
     fn disconnected_recovery_observation(
         &self,
         record: &BoundDeviceRecord,
     ) -> io::Result<DetachObservation> {
-        let observed = recover::observe_disconnected(record, &self.mounts(record), &self.sysfs)?;
+        let observed =
+            recover::observe_disconnected(record, self.mounts(record).as_bytes(), &self.sysfs)?;
         let count = self.fake.recovery_observations.get() + 1;
         self.fake.recovery_observations.set(count);
         if self.fake.holder_after_recovery_observation && count == 1 {
@@ -1660,7 +1661,7 @@ impl System for ObservedSystem {
         } else {
             String::new()
         };
-        crate::detach::observe(record, &mounts, &self.sysfs)
+        crate::detach::observe(record, mounts.as_bytes(), &self.sysfs)
     }
 }
 

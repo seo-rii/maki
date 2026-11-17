@@ -11,10 +11,11 @@ use maki_privileged::probe::{
 };
 
 fuzz_target!(|data: &[u8]| {
+    // The kernel's mount table is bytes: paths need not be UTF-8.
+    let _ = parse_mountinfo(data, "/mnt/target");
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
-    let _ = parse_mountinfo(text, "/mnt/target");
     let _ = parse_mountinfo(text, text);
     for line in text.lines() {
         let _ = nbd_device_of(line);

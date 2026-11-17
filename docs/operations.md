@@ -459,10 +459,13 @@ nonempty VG system IDs, and cachevol layouts. This requires compatible LVM2
 report and scoped activation options.
 When `[lvm_identity]` is present, attach additionally requires the observed PV
 set and VG/target-LV UUIDs to equal the administrator pins before activation.
-Those pins become part of the trusted record; recovery rechecks them, and a
-grow or detach whose current configuration omits or changes them is refused
-before mutation. Omitting the table is supported only for compatibility and is
-outside the production profile. The checks do not coordinate host udev or other
+Those pins become part of the trusted record. Recovery does not read LVM
+metadata again: it checks the identity persisted from attach's report against
+the pins, and the live device-mapper mappings against that identity or the
+post-activation mapping proof. A grow or detach whose current configuration
+omits or changes them is refused before mutation. Omitting the table is
+supported only for compatibility and is outside the production profile. The
+checks do not coordinate host udev or other
 privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
 before using an existing partition layout or host activation policy.
 
@@ -641,9 +644,11 @@ RequiredBy=maki-workload@pg.target
 The `!` keeps the helper's root user/group credentials while retaining the
 service's other restrictions, including its filesystem view. The gate must
 still be able to read the trusted configuration/state and probe the verified LV
-under those restrictions. Keep the configuration root-controlled; this is not
-a generic sudo grant. A failed check prevents that start. Qualify the service's
-actual mount namespace and sandbox on the target host. A host check cannot establish which
+under those restrictions: it opens `/dev/<vg>/<lv>`, so the unit must not use
+`PrivateDevices=yes`, and any `DevicePolicy=` must allow reading that node.
+Keep the configuration root-controlled; this is not a generic sudo grant. A
+failed check prevents that start. Qualify the service's actual mount namespace
+and sandbox on the target host. A host check cannot establish which
 filesystem an existing container's bind mount exposes; stop and recreate those
 bindings through the workload recovery procedure. See the
 [gate's checks and limits](storage-recovery.md#checking-storage-before-each-workload-start).

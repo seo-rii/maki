@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use super::{
     command, identity_error, lvm_preflight, verify_connection, ExecError, LinuxSystem, System,
 };
-use crate::detach::{device_number, is_nbd_partition, mapped_volume_group, DetachObservation};
+use crate::detach::{
+    device_number, is_nbd_partition, mapped_volume_group, mount_device_number, mounted_below,
+    DetachObservation,
+};
 use crate::plan::{Plan, PlannedStep, AUTO_NBD_DEVICE};
 use crate::state::{BoundDeviceRecord, TrustedState};
 
@@ -173,20 +176,19 @@ fn inventory(record: &BoundDeviceRecord, sysfs: &Path) -> io::Result<Vec<BlockId
 
 fn check_mounts(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     nodes: &[BlockIdentity],
 ) -> io::Result<()> {
-    for line in mounts.lines().filter(|line| !line.trim().is_empty()) {
-        let (left, _) = line
-            .split_once(" - ")
-            .ok_or_else(|| invalid("incomplete mountinfo"))?;
+    for line in crate::probe::mountinfo_lines(mounts).filter(|line| !line.trim_ascii().is_empty()) {
+        let (left, _) =
+            crate::probe::split_record(line).ok_or_else(|| invalid("incomplete mountinfo"))?;
         let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
         if fields.len() < 6 {
             return Err(invalid("incomplete mountinfo"));
         }
-        let device = device_number(fields[2])?;
+        let device = mount_device_number(fields[2])?;
         if nodes.iter().any(|node| node.device == device)
-            && crate::probe::unescape(fields[4]) != record.attachment.mountpoint
+            && crate::probe::unescape(fields[4]) != record.attachment.mountpoint.as_bytes()
         {
             return Err(invalid(
                 "recorded block device has another mount; stop all workload mounts before recovery",
@@ -219,7 +221,7 @@ fn single_deactivation_mapping<'a>(
 
 fn force_deactivation_target_at(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     sysfs: &Path,
 ) -> io::Result<Option<BlockIdentity>> {
     let proof = record
@@ -319,7 +321,7 @@ fn verify_removal_info(expected: &BlockIdentity, output: &Output) -> io::Result<
 
 pub(super) fn deactivate_connected_from_proof(record: &BoundDeviceRecord) -> Result<(), ExecError> {
     verify_connection(record, &LinuxSystem)?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mounts = super::read_mountinfo()?;
     let Some(mapping) =
         force_deactivation_target_at(record, &mounts, Path::new("/sys/class/block"))?
     else {
@@ -335,7 +337,7 @@ pub(super) fn deactivate_connected_from_proof(record: &BoundDeviceRecord) -> Res
     // Recheck both independent authorities immediately before mutation: the
     // netlink connection nonce and the exact root-owned recovery proof.
     verify_connection(record, &LinuxSystem)?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mounts = super::read_mountinfo()?;
     if force_deactivation_target_at(record, &mounts, Path::new("/sys/class/block"))?
         != Some(mapping.clone())
     {
@@ -353,7 +355,7 @@ pub(super) fn deactivate_connected_from_proof(record: &BoundDeviceRecord) -> Res
     }
 
     verify_connection(record, &LinuxSystem)?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mounts = super::read_mountinfo()?;
     if force_deactivation_target_at(record, &mounts, Path::new("/sys/class/block"))?.is_some() {
         return Err(identity_error(
             "device-mapper target remained after direct deactivation",
@@ -366,7 +368,7 @@ pub(super) fn deactivate_connected_from_proof(record: &BoundDeviceRecord) -> Res
 /// brackets this observation and its atomic publication with nonce checks.
 pub(super) fn capture(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     sysfs: &Path,
 ) -> io::Result<RecoveryProof> {
     let observed = crate::detach::observe_kernel(record, mounts, sysfs)?;
@@ -398,7 +400,7 @@ pub(super) fn capture(
 /// nodes must match exactly, and new mappings or holders are never adopted.
 pub(super) fn observe(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
     observe_with_empty_reset(record, mounts, sysfs, false)
@@ -409,7 +411,7 @@ pub(super) fn observe(
 /// with absent-backend checks and reobserves before retiring the record.
 pub(super) fn observe_disconnected(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
     observe_with_empty_reset(record, mounts, sysfs, true)
@@ -417,7 +419,7 @@ pub(super) fn observe_disconnected(
 
 fn observe_with_empty_reset(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     sysfs: &Path,
     permit_empty_reset: bool,
 ) -> io::Result<DetachObservation> {
@@ -475,12 +477,13 @@ fn observe_with_empty_reset(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VerifiedMount {
     pub device: (u32, u32),
-    mountinfo: String,
+    /// The exact mountinfo record bytes.
+    mountinfo: Vec<u8>,
 }
 
 pub(super) fn observe_complete(
     record: &BoundDeviceRecord,
-    mounts: &str,
+    mounts: &[u8],
     sysfs: &Path,
 ) -> io::Result<VerifiedMount> {
     let proof = record
@@ -495,30 +498,30 @@ pub(super) fn observe_complete(
         return Err(invalid("persisted mapping proof is incomplete or changed"));
     }
     let mut verified_mount = None;
-    for line in mounts.lines() {
-        let (left, right) = line
-            .split_once(" - ")
-            .ok_or_else(|| invalid("incomplete mountinfo"))?;
+    for line in crate::probe::mountinfo_lines(mounts) {
+        let (left, right) =
+            crate::probe::split_record(line).ok_or_else(|| invalid("incomplete mountinfo"))?;
         let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
         let filesystem: Vec<_> = crate::probe::mountinfo_fields(right).collect();
         if fields.len() < 6 || filesystem.len() < 3 {
             return Err(invalid("incomplete mountinfo"));
         }
         let mounted_path = crate::probe::unescape(fields[4]);
-        if mounted_path != record.attachment.mountpoint {
+        if mounted_path != record.attachment.mountpoint.as_bytes() {
             // A foreign filesystem below the dedicated volume can hide data
             // paths even while its root and sentinel are correct. Compare
             // decoded path components, including when the configured root is
             // '/', rather than rejecting unrelated names with the same prefix.
-            if Path::new(&mounted_path).starts_with(&record.attachment.mountpoint) {
+            if mounted_below(&mounted_path, &record.attachment.mountpoint) {
                 return Err(invalid("workload volume contains a nested mount"));
             }
             continue;
         }
+        let options = || crate::probe::mount_options(fields[5]);
         // Kernel-only evidence of rw mounting, not a claim that writes or
         // database recovery would succeed; the gate performs no write probe.
-        if !fields[5].split(',').any(|option| option == "rw")
-            || !filesystem[2].split(',').any(|option| option == "rw")
+        if !options().any(|option| option == b"rw")
+            || !crate::probe::mount_options(filesystem[2]).any(|option| option == b"rw")
         {
             return Err(invalid("workload mount is read-only"));
         }
@@ -526,17 +529,17 @@ pub(super) fn observe_complete(
         // provider: a mount honouring their setuid bits or device nodes (one
         // made before R5-002, or remounted) is not opened to the workload.
         // Reattach the volume to remount it `nosuid,nodev`.
-        if !["nosuid", "nodev"]
+        if ![b"nosuid".as_slice(), b"nodev"]
             .iter()
-            .all(|required| fields[5].split(',').any(|option| option == *required))
+            .all(|required| options().any(|option| option == *required))
         {
             return Err(invalid(
                 "workload mount is not nosuid,nodev; reattach the volume",
             ));
         }
         verified_mount = Some(VerifiedMount {
-            device: device_number(fields[2])?,
-            mountinfo: line.into(),
+            device: mount_device_number(fields[2])?,
+            mountinfo: line.to_vec(),
         });
     }
     verified_mount.ok_or_else(|| invalid("workload mount is missing"))

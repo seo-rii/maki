@@ -1734,9 +1734,12 @@ NBD candidates and the discovered VG UUID. For the production profile, the
 root-owned attachment configuration MUST also provide the complete PV UUID set,
 VG UUID and configured target-LV UUID in `[lvm_identity]`; any mismatch MUST
 refuse activation. These administrator pins are part of the trusted attachment
-identity and MUST be rechecked during recovery. Grow and detach MUST refuse a
-configuration that removes or changes them. Omitting the table remains a
-compatibility mode and does not satisfy this production requirement. The helper
+identity. Recovery does not read LVM metadata again: it MUST refuse a persisted
+pre-activation identity that does not match the pins, and MUST hold the live
+mappings to that identity or to the post-activation mapping proof, as described
+below. Grow and detach MUST refuse a configuration that removes or changes them.
+Omitting the table remains a compatibility mode and does not satisfy this
+production requirement. The helper
 durably records the verified live identity before activation and replaces it
 with the complete mapping proof after activation. If activation outlives the
 helper, ordinary detach may
