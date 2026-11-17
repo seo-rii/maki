@@ -1,0 +1,247 @@
+//! Recovery rewrites every journal prefix it accepts before it syncs the
+//! segment and publishes a horizon covering it (SPEC §27; K-01 and
+//! F01 / BUG-021 in the remediation log).
+//!
+//! A failed `fdatasync` marks the segment's dirty pages clean without
+//! persisting them. A process restart then hands recovery those page-cache
+//! records, and recovery accepts them. Its own fdatasync has nothing dirty
+//! to write, so only the rewrite makes the records durable. Recovery then
+//! syncs a durable mark and both proof copies naming the new segment end,
+//! and only afterwards replays the records into slots, advances the
+//! checkpoint state and prunes the segments. Until that pruning is durable,
+//! the next recovery validates the surviving segment against the mark and
+//! the proof, and until the checkpoint advances the segment is the only copy
+//! it can replay: a power loss in that window must find the records in the
+//! segment on disk.
+//!
+//! Tests that let recovery finish do not see this window: replay has made
+//! the records durable through the slots before attach returns. This suite
+//! stops recovery after every backing operation instead, loses power, and
+//! requires the next attach to succeed with every acknowledged write and
+//! nothing foreign.
+//!
+//! It needs the Linux failed-sync model (`CrashableBacking`'s default): if a
+//! failed sync left its writes dirty, recovery's plain sync would persist
+//! them without the rewrite. The first premise check guards that. Tearing is
+//! not needed to see a missing rewrite (the all-lost power loss shows it);
+//! the sampled, torn power losses widen what recovery must survive.
+
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use uuid::Uuid;
+
+use maki_backing::Backing;
+use maki_core::recovery::RecoveryError;
+use maki_core::volume::{Volume, VolumeOptions};
+use maki_format::geometry::Geometry;
+use maki_format::superblock::Superblock;
+use maki_format::{init, layout};
+use maki_test_support::crash_backing::FaultOp;
+use maki_test_support::{failpoints, CrashableBacking, ReferenceBlockModel};
+
+const UNIT: u32 = 512;
+const CT_LEN: usize = 540;
+const SEGMENT: u64 = 4096;
+const RECORD: u64 = 32 + CT_LEN as u64;
+const RECORDS_PER_SEGMENT: u64 = (SEGMENT - 48) / RECORD; // 7
+const DEVICE_UNITS: u64 = 64;
+/// Written only by the records whose writeback fails.
+const LOST_ONLY_UNIT: u64 = 40;
+
+fn geometry() -> Geometry {
+    // 16 units per shard: the workload spans two shards.
+    Geometry::compute(512, UNIT, 512, 544, UNIT as u64 * DEVICE_UNITS, 512 * 16).unwrap()
+}
+
+fn superblock() -> Superblock {
+    Superblock {
+        generation: 0,
+        volume_uuid: Uuid::from_u128(0x5EC0_27FE),
+        provider_type: "fake".into(),
+        crypto_compatibility_id: "test-profile-v1".into(),
+        key_identity: "k".into(),
+        geometry: geometry(),
+        format_version: 1,
+        created_unix: 0,
+    }
+}
+
+fn options() -> VolumeOptions {
+    VolumeOptions {
+        journal_segment_size: SEGMENT,
+    }
+}
+
+fn recover(backing: &Arc<CrashableBacking>) -> Result<Volume, RecoveryError> {
+    Volume::recover(backing.clone() as Arc<dyn Backing>, options())
+}
+
+fn ct(stamp: u8) -> Vec<u8> {
+    vec![stamp; CT_LEN]
+}
+
+fn is_segment(path: &str) -> bool {
+    path.strip_prefix(&format!("{}/", layout::JOURNAL_DIR))
+        .and_then(layout::parse_journal_segment)
+        .is_some()
+}
+
+/// Write through the volume and record what the call acknowledged.
+fn write(volume: &mut Volume, model: &mut ReferenceBlockModel, unit: u64, stamp: u8, fua: bool) {
+    volume.write_ct(unit, &ct(stamp), fua).unwrap();
+    if fua {
+        model.write_fua(unit, &ct(stamp));
+    } else {
+        model.write(unit, &ct(stamp));
+    }
+}
+
+/// A unit's content as the oracle sees it (unwritten = zeros).
+fn observe(volume: &Volume, unit: u64) -> Vec<u8> {
+    volume
+        .read_ct(unit)
+        .unwrap_or_else(|e| panic!("unit {unit} unreadable: {e}"))
+        .map_or_else(|| vec![0; CT_LEN], |(_, ct)| ct)
+}
+
+/// Two journal segments: a sealed one, synced in full by its roll, and a
+/// final one whose last three records reached the page cache but were lost
+/// by a failed FLUSH writeback. The FLUSH reported the failure, so they
+/// were never acknowledged. Then the process restarts with the cache intact.
+fn restarted_after_lost_writeback() -> (Arc<CrashableBacking>, ReferenceBlockModel) {
+    let backing = Arc::new(CrashableBacking::new().with_tearing(512));
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
+    let mut volume = recover(&backing).unwrap();
+    let mut model = ReferenceBlockModel::new(CT_LEN, DEVICE_UNITS);
+
+    write(&mut volume, &mut model, 0, 0x10, true);
+    for i in 1..=RECORDS_PER_SEGMENT {
+        write(&mut volume, &mut model, 1 + i % 3, 0x20 + i as u8, false);
+    }
+    volume.flush().unwrap();
+    model.flush();
+    assert_eq!(volume.journal_segment_count(), 2);
+
+    write(&mut volume, &mut model, 0, 0x30, false);
+    write(&mut volume, &mut model, 1, 0x31, false);
+    write(&mut volume, &mut model, LOST_ONLY_UNIT, 0x32, false);
+    let durable = volume.journal_durable_sequence();
+    backing.set_fault_hook(Some(Arc::new(|op| match op {
+        FaultOp::SyncData { path } if is_segment(path) => {
+            Some(io::Error::other("writeback EIO: dirty pages marked clean"))
+        }
+        _ => None,
+    })));
+    assert!(volume.flush().is_err(), "the failed writeback is reported");
+    backing.set_fault_hook(None);
+    assert_eq!(volume.journal_durable_sequence(), durable);
+    drop(volume); // a process restart: the page cache keeps the records
+    (backing, model)
+}
+
+/// Let `stop` hooked backing operations through, then fail every later one:
+/// the recovering process stops there and changes nothing afterwards.
+/// Returns the number of operations attempted.
+fn stop_after(backing: &CrashableBacking, stop: usize) -> Arc<AtomicUsize> {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = seen.clone();
+    backing.set_fault_hook(Some(Arc::new(move |_| {
+        (counter.fetch_add(1, Ordering::SeqCst) >= stop)
+            .then(|| io::Error::other("power lost during recovery"))
+    })));
+    seen
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PowerLoss {
+    /// Every unsynced operation is lost: the deterministic worst case.
+    AllLost,
+    /// A seeded sample of unsynced operations survives, possibly torn.
+    Sampled(u64),
+}
+
+const POWER_LOSSES: [PowerLoss; 4] = [
+    PowerLoss::AllLost,
+    PowerLoss::Sampled(1),
+    PowerLoss::Sampled(2),
+    PowerLoss::Sampled(3),
+];
+
+fn lose_power(backing: &CrashableBacking, loss: PowerLoss) {
+    backing.set_fault_hook(None);
+    match loss {
+        PowerLoss::AllLost => backing.crash_all_lost(),
+        PowerLoss::Sampled(seed) => backing.crash(&mut StdRng::seed_from_u64(seed)),
+    }
+}
+
+#[test]
+fn power_loss_anywhere_in_a_recovery_that_adopted_lost_writeback_keeps_the_volume() {
+    let _guard = failpoints::test_lock();
+
+    // Premise: the lost records exist only in the page cache, a plain
+    // fdatasync (all recovery would do without the rewrite) does not persist
+    // them, and an uninterrupted recovery adopts them.
+    {
+        let (backing, _) = restarted_after_lost_writeback();
+        for name in backing.list(layout::JOURNAL_DIR).unwrap() {
+            let path = format!("{}/{name}", layout::JOURNAL_DIR);
+            if is_segment(&path) {
+                backing.open(&path, false).unwrap().sync_data().unwrap();
+            }
+        }
+        lose_power(&backing, PowerLoss::AllLost);
+        let volume = recover(&backing).unwrap();
+        assert_eq!(
+            observe(&volume, LOST_ONLY_UNIT),
+            vec![0; CT_LEN],
+            "a plain sync persisted the lost writeback, so the sweep below \
+             could not tell a missing rewrite"
+        );
+    }
+    let total = {
+        let (backing, _) = restarted_after_lost_writeback();
+        let seen = stop_after(&backing, usize::MAX);
+        let volume = recover(&backing).unwrap();
+        assert_eq!(observe(&volume, LOST_ONLY_UNIT), ct(0x32));
+        seen.load(Ordering::SeqCst)
+    };
+
+    for stop in 0..=total {
+        for loss in POWER_LOSSES {
+            let what = format!("stopped after {stop} of {total} operations, {loss:?}");
+            let (backing, mut model) = restarted_after_lost_writeback();
+            let seen = stop_after(&backing, stop);
+            match recover(&backing) {
+                Ok(mut volume) => {
+                    assert_eq!(stop, total, "{what}: recovery ignored a failed operation");
+                    backing.set_fault_hook(None);
+                    // READY shows every adopted record; a FLUSH now
+                    // acknowledges all of them.
+                    for unit in 0..DEVICE_UNITS {
+                        assert_eq!(observe(&volume, unit), model.read(unit), "{what}: {unit}");
+                    }
+                    volume.flush().unwrap();
+                    model.flush();
+                }
+                Err(e) => assert!(
+                    seen.load(Ordering::SeqCst) > stop,
+                    "{what}: recovery failed before the stop: {e}"
+                ),
+            }
+            lose_power(&backing, loss);
+
+            let volume = recover(&backing)
+                .unwrap_or_else(|e| panic!("{what}: the volume must attach again: {e}"));
+            for unit in 0..DEVICE_UNITS {
+                if let Err(violation) = model.crash_adopt(unit, &observe(&volume, unit)) {
+                    panic!("{what}: {violation}");
+                }
+            }
+        }
+    }
+}
