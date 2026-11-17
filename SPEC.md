@@ -428,14 +428,24 @@ Example systemd configuration:
 LoadCredential=crypto-token:/secure/path/token
 ```
 
-Supported credential sources:
+Supported credential sources, named by a reference's `source`:
 
 ```text
-systemd credentials
-root-only secret file
-kernel keyring
-explicit secret-provider abstraction
+credential   systemd credentials ($CREDENTIALS_DIRECTORY/<name>)
+file         secret file at an absolute path
+env          environment variable MAKI_CREDENTIAL_<NAME> (development)
 ```
+
+Each reference is loaded from exactly the source it declares, through one
+key-source abstraction, with no fallback between sources. A secret file MUST
+be a regular file, opened without following a symlink, owned by root or by
+the user the loading process runs as, with no group or other access (for
+example `0600` or `0400`): its owner can read or replace it whatever its
+mode. A systemd credential follows the same rule, except that it MAY also
+grant read, and only read, to its group when that group is the process's own
+or root, as systemd 257 writes `LoadCredential=` files (`0440`). The kernel
+keyring is not implemented; configuration validation rejects a `keyring`
+source.
 
 Environment variables MAY be used in development environments but SHOULD NOT be the primary production secret source.
 
@@ -665,7 +675,9 @@ Geometry creation MUST reject more than 2^24 possible shards, matching the
 supported shard-catalog limit, any capacity calculation that overflows an
 unsigned 64-bit byte count, and a unit count that reaches the reserved
 key-canary unit index (§27), which attach refuses. `maki volume inspect`
-reports these five maximum-layout values. They exclude journal and checkpoint
+reports the five maximum-layout values above (all but `units_per_shard`) and
+a sixth, the discard-map A/B bytes, which equal `allocation_map_ab_bytes` for
+a v3 volume and are zero for v2. They exclude journal and checkpoint
 headroom, filesystem metadata and copy-on-write overhead, and application
 temporary space; they are not a full-volume physical reservation. Before
 accepting a journal record, a Linux backing MUST physically allocate the exact
@@ -1303,8 +1315,11 @@ Checkpoints MUST run automatically, not only at detach. Triggers:
 journal bytes on disk >= journal_max_bytes / 2
   and at least one sealed segment on disk            (background worker, syncs first)
 backing free space   <  checkpoint_reserve_bytes     (background worker, syncs first)
+overlay >= max_overlay_{bytes,entries} / 2           (background worker, syncs first)
+write refused for backing free space                 (background worker, syncs first)
 interval elapsed with unapplied records              (background worker, syncs first)
 write would exceed journal_max_bytes                 (inline, before the append)
+write would exceed max_overlay_{bytes,entries}       (inline, before the append)
 ```
 
 A checkpoint deletes covered sealed segments and never the active one, so the

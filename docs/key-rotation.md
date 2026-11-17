@@ -96,11 +96,23 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    drain. Successful drain closes I/O admission for that attachment; only a
    new attachment can resume I/O.
 
-4. After the acknowledgement, stop the lifecycle target:
+4. After the acknowledgement, block automatic recovery for the rest of this
+   procedure, then stop the lifecycle target:
 
    ```sh
+   sudo systemctl mask --runtime maki-recover@example.service
    sudo systemctl stop maki-workload@example.target
    ```
+
+   The packaged daemon unit starts the recovery coordinator through
+   `OnFailure=`, and a failed attach start requests it too. With nothing
+   attached its cleanup succeeds, and its `OnSuccess=` starts
+   `maki-workload@example.target`, registered workloads included. Unmasked, a
+   failed start in step 5 or 6 would make systemd retry the whole lifecycle
+   until it succeeds or reaches the start limits, without the checks those
+   steps require. The runtime mask makes those requests fail until step 6
+   removes it; a reboot also removes it
+   ([maintenance mask](operations.md#systemd-deployment)).
 
    Wait for every registered workload, `maki-attach@example.service` and
    `maki@example.service` to report `ActiveState=inactive`, using the bounded
@@ -163,9 +175,17 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    Verify the trusted attachment and mount identity. Recreate container bind
    mounts when necessary; a host remount does not establish that an existing
    container sees the new mount. Complete the deployment's database recovery
-   and read verification before enabling application writes. Retire the old
-   authentication credential only after this evidence is accepted. Preserve
-   access to the encryption key for retained backups and the existing volume.
+   and read verification before enabling application writes. Once this
+   evidence is accepted, re-enable automatic recovery before the workloads
+   return to normal service:
+
+   ```sh
+   sudo systemctl unmask --runtime maki-recover@example.service
+   ```
+
+   Retire the old authentication credential only after this evidence is
+   accepted. Preserve access to the encryption key for retained backups and
+   the existing volume.
 
 ## Rotate server certificates and a private server CA
 
@@ -177,8 +197,9 @@ If providers are shared, distribute overlapping trust to every affected client
 before replacing a server certificate and coordinate their maintenance windows.
 
 Use the stopped sequence above for each stage: quiesce writers, unmount,
-acknowledge drain, stop the target and wait for every unit, change inputs, and
-restart with full peer, mount, and database verification. This implementation
+acknowledge drain, mask recovery, stop the target and wait for every unit,
+change inputs, and restart with full peer, mount, and database verification
+before unmasking recovery. This implementation
 reads the CA file at construction;
 changing it does not reload a running connection pool.
 
@@ -222,15 +243,17 @@ stopped; test independent failover and full-provider loss separately.
 
 ## Roll back a credential change
 
-Keep writers stopped if the new credential or any peer fails validation. If a
-new daemon attached, repeat the unmount, acknowledged drain, and target-stop
-sequence before changing its inputs again. If attach itself failed, confirm
+Keep writers stopped and `maki-recover@example.service` masked (step 4) if the
+new credential or any peer fails validation. If a new daemon attached, repeat
+the unmount, acknowledged drain, and target-stop sequence before changing its
+inputs again. If attach itself failed, confirm
 that the process exited and the volume lock is released; no successful drain
 can be inferred from that failure.
 
 Restore the previous root-controlled credential/configuration only when the
 old credential is valid and still resolves to the original encryption key.
-Repeat all attach, peer, canary, mount, and database checks before resuming.
+Repeat all attach, peer, canary, mount, and database checks before unmasking
+recovery and resuming.
 If the old key is unavailable or the old credential was revoked, restoring a
 file or an endpoint name cannot recover access. Preserve the original volume
 and escalate through the key custodian and tested restore procedure. Do not
