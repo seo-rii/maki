@@ -43,8 +43,16 @@ pub fn parse_and_validate(raw: &str) -> Result<VolumeConfig, ConfigError> {
             "backing rollback protection is supported only on Linux".to_string(),
         ));
     }
-    check_provider_available(&config, cfg!(feature = "fake-provider"))?;
+    check_provider_compiled(&config)?;
     Ok(config)
+}
+
+/// [`check_provider_available`] for the providers compiled into this build.
+/// Every entry point that initializes a volume records the configured
+/// provider in its superblock, so it calls this before changing the backing
+/// or the remote authority.
+pub fn check_provider_compiled(config: &VolumeConfig) -> Result<(), ConfigError> {
+    check_provider_available(config, cfg!(feature = "fake-provider"))
 }
 
 /// Providers a build can actually construct. The non-cryptographic `fake`
@@ -1218,7 +1226,26 @@ pub fn resume_enrollment_from_config(
     expected: &maki_backing::remote_witness::Record,
     discard: bool,
 ) -> Result<Superblock, DaemonError> {
+    resume_enrollment(
+        config,
+        rpc,
+        expected,
+        discard,
+        cfg!(feature = "fake-provider"),
+    )
+}
+
+fn resume_enrollment(
+    config: &VolumeConfig,
+    rpc: Arc<dyn maki_backing::remote_witness::Rpc>,
+    expected: &maki_backing::remote_witness::Record,
+    discard: bool,
+    fake_enabled: bool,
+) -> Result<Superblock, DaemonError> {
     config.validate()?;
+    // Recovery consumes the enrollment and initialization records the
+    // provider: refuse one this build cannot construct before either (M-008).
+    check_provider_available(config, fake_enabled)?;
     let rollback = config
         .backing
         .rollback_protection
@@ -1277,6 +1304,123 @@ pub fn control_socket_path(config: &VolumeConfig) -> String {
         .socket
         .clone()
         .unwrap_or_else(|| format!("/run/maki-control/{}/control.sock", config.volume.name))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod resume_enrollment_provider_tests {
+    use super::*;
+    use maki_backing::remote_witness::{Action, Record, Request, Role, Rpc, StateStore};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct Authority {
+        store: Arc<std::sync::Mutex<StateStore>>,
+        role: Role,
+        lose_claims: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl Rpc for Authority {
+        fn call(&self, request: &Request) -> std::io::Result<Record> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let record = self.store.lock().unwrap().handle(self.role, request)?;
+            if request.action == Action::Claim && self.lose_claims.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "lost claim reply",
+                ));
+            }
+            Ok(record)
+        }
+    }
+
+    fn inspect(rpc: &dyn Rpc) -> Record {
+        rpc.call(&Request {
+            authorization: None,
+            operation_id: *uuid::Uuid::new_v4().as_bytes(),
+            expected: None,
+            action: Action::Inspect,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn resume_enrollment_refuses_an_unavailable_provider_before_any_witness_call() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(std::sync::Mutex::new(
+            StateStore::create_backing(Arc::new(maki_backing::MemBacking::new()), [1; 16]).unwrap(),
+        ));
+        let authority = |role, lose_claims| {
+            Arc::new(Authority {
+                store: store.clone(),
+                role,
+                lose_claims: AtomicBool::new(lose_claims),
+                calls: AtomicUsize::new(0),
+            })
+        };
+        let writer = authority(Role::Writer, true);
+        assert!(RollbackBacking::create_remote(root.path(), writer.clone(), 64 * 1024).is_err());
+        let admin = authority(Role::Admin, false);
+        let expected = inspect(admin.as_ref());
+        assert!(expected.current.is_none());
+        let config = parse_config(&format!(
+            r#"config_schema_version=1
+[volume]
+name="fake-enroll"
+max_virtual_size="1MiB"
+shard_logical_size="64KiB"
+[crypto]
+provider="fake"
+crypto_compatibility_id="test-profile-v1"
+[crypto.capabilities]
+supported_plaintext_sizes=[4096]
+max_ciphertext_size=4104
+[backing]
+root={:?}
+journal_segment_size="64KiB"
+journal_max_bytes="2MiB"
+checkpoint_reserve_bytes="0B"
+journal_emergency_reserve_bytes="0B"
+[backing.rollback_protection]
+capacity="64KiB"
+[backing.rollback_protection.remote]
+address="127.0.0.1:9"
+server_name="localhost"
+timeout_ms=2000
+ca_file="/unused/ca.pem"
+client_cert_file="/unused/admin.pem"
+client_key_file="/unused/admin.key"
+"#,
+            root.path().to_str().unwrap()
+        ))
+        .unwrap();
+        let entries = || {
+            let mut names: Vec<_> = std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = entries();
+        let calls = admin.calls.load(Ordering::SeqCst);
+        let error = resume_enrollment(&config, admin.clone(), &expected, false, false).unwrap_err();
+        assert!(
+            matches!(&error, DaemonError::Config(ConfigError::Invalid(message)) if message.contains("not compiled")),
+            "{error}"
+        );
+        assert_eq!(
+            admin.calls.load(Ordering::SeqCst),
+            calls,
+            "witness was called"
+        );
+        assert_eq!(inspect(admin.as_ref()), expected);
+        assert_eq!(entries(), before);
+        // The availability check is the only difference: a build that has
+        // the provider completes the same approved recovery.
+        let created = resume_enrollment(&config, admin.clone(), &expected, false, true).unwrap();
+        assert_eq!(created.provider_type, "fake");
+        assert!(inspect(admin.as_ref()).current.is_some());
+    }
 }
 
 #[cfg(test)]

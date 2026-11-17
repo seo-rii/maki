@@ -3,6 +3,7 @@
 //! ```text
 //! acquire volume lock → select valid superblock → validate shard catalog
 //! → validate allocation metadata → load checkpoint state → scan journal
+//! → make the superblock and checkpoint state durable
 //! → discard/truncate partial tail → bounded replay checkpoint → READY
 //! ```
 //! (The provider self-test, crypto-compatibility verification and the key
@@ -41,7 +42,8 @@ use maki_format::journal::{
 };
 use maki_format::layout;
 use maki_format::superblock::{
-    load_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
+    load_volume_superblock, persist_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2,
+    SUPERBLOCK_VERSION_V3,
 };
 use maki_format::FormatError;
 
@@ -212,7 +214,7 @@ fn recover_with_replay(
             "legacy v1 volume requires an explicit migration; writable recovery refuses it without changing recovery metadata".into(),
         )));
     }
-    let superblock = envelope.superblock;
+    let superblock = envelope.superblock.clone();
     // Missing evidence must fail even on an empty-looking volume, before
     // checkpoint metadata or any recovery repair is written.
     let mut durable_proof = DurableProofStore::load(backing.as_ref(), superblock.volume_uuid)?;
@@ -236,6 +238,16 @@ fn recover_with_replay(
         replay,
         progress,
     )?;
+    // The superblock is the volume's commit point; every repair below, and
+    // the resumed writer, depends on it. A failed or interrupted creation, or
+    // a restart, can hand recovery a copy that exists only in the page cache
+    // (K-01): accepting it as is lets FUA/FLUSH succeed on a volume the next
+    // power loss turns into "no valid superblock". Rewrite and sync both
+    // copies first, the selected one before the other, completing a copy an
+    // interrupted creation never wrote. The scan above is read-only, so the
+    // required-horizon checks still precede every recovery write.
+    let superblock = persist_volume_superblock(backing.as_ref(), &envelope)?.superblock;
+    progress();
     // The selected checkpoint state gates which journal segments a later
     // checkpoint may reclaim (`allow_covered_holes_below`, `delete_covered`).
     // A restart hands recovery page-cache bytes that were never fdatasync'd,

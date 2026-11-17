@@ -762,6 +762,11 @@ pass "nbdkit runs unprivileged with no-new-privileges and empty effective capabi
 if sudo -n -u nobody nbdinfo "$nbd_uri" >"$run_dir/unrelated-user-socket.txt" 2>&1; then
     die "unrelated user unexpectedly opened the protected NBD socket"
 fi
+# libnbd reports a failed connect(2) as "<call>: connect: <strerror>". Only
+# EACCES is the boundary: a sudo policy or password refusal, a missing
+# command, or a refused, absent or reset socket proves nothing about it.
+grep -Eq '(^|[[:space:]])connect: Permission denied' "$run_dir/unrelated-user-socket.txt" ||
+    die "unrelated user was not refused with EACCES on the NBD socket: $(cat "$run_dir/unrelated-user-socket.txt")"
 pass "unrelated user is denied by the runtime-directory boundary"
 
 duplicate_socket="$work_dir/duplicate.sock"
@@ -830,6 +835,16 @@ pass "kernel NBD attach and 512 MiB geometry"
 if nbd-client -d "$nbd_target" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
     die "the unprivileged invoking user unexpectedly disconnected $device"
 fi
+# Without CAP_SYS_ADMIN the kernel refuses the ioctl with EPERM, and opening a
+# device node the user cannot write fails with EACCES. A netlink client
+# reports the kernel's EPERM only as "Failed to disconnect device", so every
+# refusal must also leave this run's backend connected. A usage, target,
+# module or executable error is not a denial.
+grep -Eq 'Operation not permitted|Cannot open NBD: Permission denied|Failed to disconnect device' \
+    "$run_dir/unprivileged-nbd-ioctl.txt" ||
+    die "unprivileged NBD disconnect failed without a permission denial: $(cat "$run_dir/unprivileged-nbd-ioctl.txt")"
+test_nbd_action check ||
+    die "our backend on $device did not survive the unprivileged disconnect attempt"
 pass "unprivileged NBD disconnect ioctl is denied"
 
 log "running CRC32C raw-device fio with periodic fsync"

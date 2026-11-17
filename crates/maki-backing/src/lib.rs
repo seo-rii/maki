@@ -87,17 +87,31 @@ pub trait BackingFile: Send + Sync {
 
     /// Reserve physical storage for a byte range before the caller publishes
     /// work that will later depend on writing it. Real Linux files override
-    /// this with `posix_fallocate`, whose successful return guarantees that
-    /// later writes to the range do not fail for lack of filesystem space.
+    /// this with `posix_fallocate`. A successful return allocates every hole
+    /// in the range, which keeps later writes there from failing for lack
+    /// of filesystem space only where the filesystem overwrites allocated
+    /// extents in place. It does not unshare extents the file shares with
+    /// another file, so it does not cover them: on XFS with reflink (the
+    /// `mkfs.xfs` default since xfsprogs 5.1), a `cp --reflink` copy (GNU
+    /// coreutils 9 `cp` defaults to `--reflink=auto`) shares every extent,
+    /// `posix_fallocate` still returns success, and an in-place overwrite is
+    /// copy-on-write and can fail with ENOSPC. Copy-on-write filesystems are
+    /// not covered either. Backing files must not share extents with copies.
     /// Allocation metadata may remain volatile after this call even when
     /// the file length is already durable. Call `sync_all` before publishing
     /// a journal record that depends on crash-surviving completion space.
     /// In-memory backings may model allocation by extending the file;
     /// extent-aware tests must track unwritten reservations separately.
+    /// A zero-length range reserves nothing: every backing returns success
+    /// without changing the file (Linux `fallocate(2)` itself would refuse
+    /// it with EINVAL).
     fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        if len == 0 {
+            return Ok(());
+        }
         if self.len()? < end {
             self.set_len(end)?;
         }

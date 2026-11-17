@@ -34,8 +34,19 @@ class CargoTestRunnerTests(unittest.TestCase):
         event.update(overrides)
         return event
 
+    def compiled_test(self, manifest=None, kind="test", **overrides):
+        event = {"reason": "compiler-artifact", "target": {
+            "name": "review_native_plugin_path", "kind": [kind], "crate_types": ["bin"],
+            "src_path": str(runner.MANIFEST.parent / "tests/review_native_plugin_path.rs")},
+            "profile": {"test": True}, "manifest_path": str(manifest or runner.MANIFEST),
+            "executable": str(self.root / "test-binary"), "filenames": []}
+        event.update(overrides)
+        return event
+
     def invoke(self, events, arguments=None, compile_status=0, test_status=0,
-               platform="linux"):
+               platform="linux", native_tests=True):
+        if native_tests:
+            events = [self.compiled_test(), *events]
         compiler = mock.MagicMock()
         compiler.__enter__.return_value = compiler
         compiler.stdout = io.StringIO("\n".join(json.dumps(event) for event in events))
@@ -60,6 +71,46 @@ class CargoTestRunnerTests(unittest.TestCase):
         self.assertFalse(runner.PLUGIN_ENV in build.call_args.kwargs["env"])
         self.assertEqual(tests.call_args.kwargs["env"][runner.PLUGIN_ENV], str(self.plugin))
         self.assertEqual(build.call_args.kwargs["cwd"], runner.ROOT)
+
+    def test_selections_without_native_integration_tests_run_without_plugin(self):
+        core_manifest = runner.ROOT / "crates/maki-core/Cargo.toml"
+        for arguments, event in [
+            (["-p", "maki-core", "--locked"], self.compiled_test(manifest=core_manifest)),
+            (["--workspace", "--exclude", "maki-nbdkit"], self.compiled_test(manifest=core_manifest)),
+            (["--workspace", "--lib"], self.compiled_test(kind="lib")),
+        ]:
+            with self.subTest(arguments=arguments), mock.patch.dict(
+                    os.environ, {runner.PLUGIN_ENV: "/stale/plugin.so"}):
+                status, build, tests = self.invoke(
+                    [event], arguments, test_status=7, native_tests=False)
+                self.assertEqual(status, 7)
+                self.assertEqual(tests.call_args.args[0][1:], ["test", *arguments])
+                self.assertNotIn(runner.PLUGIN_ENV, build.call_args.kwargs["env"])
+                self.assertNotIn(runner.PLUGIN_ENV, tests.call_args.kwargs["env"])
+
+    def test_native_integration_selection_still_requires_plugin(self):
+        status, _, tests = self.invoke([], ["-p", "maki-nbdkit", "--test", "review_native_plugin_path"])
+        self.assertEqual(status, 1)
+        tests.assert_not_called()
+
+    def test_older_native_test_artifact_without_manifest_still_requires_plugin(self):
+        event = self.compiled_test()
+        del event["manifest_path"]
+        status, _, tests = self.invoke([event], native_tests=False)
+        self.assertEqual(status, 1)
+        tests.assert_not_called()
+
+    def test_present_unusable_or_ambiguous_plugin_is_not_ignored_without_native_tests(self):
+        other = self.root / "other/libmaki_nbdkit.so"
+        other.parent.mkdir()
+        other.write_bytes(b"other")
+        for events in [[self.artifact(self.root / "missing/libmaki_nbdkit.so")],
+                       [self.artifact(filenames=[str(self.root / "wrong-name.so")])],
+                       [self.artifact(), self.artifact(other)]]:
+            with self.subTest(events=events):
+                status, _, tests = self.invoke(events, native_tests=False)
+                self.assertEqual(status, 1)
+                tests.assert_not_called()
 
     def test_compile_failure_never_runs_tests_even_with_an_artifact(self):
         status, _, tests = self.invoke([self.artifact()], compile_status=17)
@@ -115,6 +166,30 @@ class CargoTestRunnerTests(unittest.TestCase):
                 build.assert_not_called()
                 self.assertEqual(tests.call_args.args[0][1:], ["test", *arguments])
 
+    def test_doc_test_selection_is_forwarded_without_a_compile_phase(self):
+        # Cargo refuses every `--doc --no-run` compile phase ("can't skip
+        # running doc tests with --no-run", exit 101). Doc tests never load
+        # the native plugin, so the selection is forwarded verbatim.
+        for arguments in (["--doc", "-p", "maki-core", "--locked"],
+                          ["--workspace", "--doc", "--", "--nocapture"]):
+            with self.subTest(arguments=arguments), mock.patch.dict(
+                    os.environ, {runner.PLUGIN_ENV: "/stale/plugin.so"}):
+                status, build, tests = self.invoke(
+                    [], arguments, compile_status=101, test_status=7, native_tests=False)
+                self.assertEqual(status, 7)
+                build.assert_not_called()
+                self.assertEqual(tests.call_args.args[0][1:], ["test", *arguments])
+                self.assertEqual(tests.call_args.kwargs["cwd"], runner.ROOT)
+                self.assertNotIn(runner.PLUGIN_ENV, tests.call_args.kwargs["env"])
+
+    def test_doc_after_the_harness_separator_is_not_a_cargo_selection(self):
+        arguments = ["-p", "maki-nbdkit", "--", "--doc"]
+        status, build, tests = self.invoke([self.artifact()], arguments)
+        self.assertEqual(status, 0)
+        self.assertEqual(build.call_args.args[0][2:], ["-p", "maki-nbdkit", "--no-run",
+                                                       "--message-format=json"])
+        self.assertEqual(tests.call_args.kwargs["env"][runner.PLUGIN_ENV], str(self.plugin))
+
     def test_wrapper_rejects_options_that_would_override_its_compile_contract(self):
         for argument in ["--no-run", "--message-format=json", "--message-format"]:
             status, build, tests = self.invoke([], [argument])
@@ -126,7 +201,7 @@ class CargoTestRunnerTests(unittest.TestCase):
         rendered = "error: fixture compile failure\n"
         stream = [json.dumps({"reason": "compiler-message", "message": {"rendered": rendered}})]
         with contextlib.redirect_stderr(io.StringIO()) as output:
-            self.assertEqual(runner.compiler_artifacts(stream), set())
+            self.assertEqual(runner.compiler_artifacts(stream), (set(), False))
         self.assertEqual(output.getvalue(), rendered)
 
 

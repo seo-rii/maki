@@ -71,7 +71,8 @@ nanosecond buckets have at most 3.125% relative width; this is a bounded-memory
 estimate, not an exact sorted sample percentile. `mean_us` and `max_us` use
 the actual observed durations.
 
-This is a single-caller engine measurement. It does not run nbdkit, kernel NBD,
+This is an in-process engine measurement: one caller by default, up to 256
+concurrent I/O jobs with `--concurrency`. It does not run nbdkit, kernel NBD,
 LVM, XFS, systemd hardening or a database. Immediate reads may hit the configured
 plaintext cache and the backing's OS cache. Record cache mode and working-set
 size; use separate cold-start and warm-cache profiles when that distinction

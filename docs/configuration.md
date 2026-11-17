@@ -64,6 +64,14 @@ the outer witness identity, distinct from the inner superblock UUID. All
 frontends use the same verified `server_name`, approved identity and shared
 etcd key. Independently copied local witness directories cannot provide HA.
 
+`client_key_file` is a secret file: it is opened without following a symlink,
+must be a regular file owned by root or by the user the loading process runs
+as (the daemon user for the packaged service), and must not be accessible to
+group or others (0600 or 0400). A key owned by any other user is refused
+whatever its mode, because its owner can read or replace it. `ca_file` and
+`client_cert_file` are public and may have any owner, but must not contain a
+private key.
+
 One deadline of `timeout_ms` (1–60000 ms) covers the entire endpoint attempt
 sequence. A stalled frontend receives a bounded share, leaving time for later
 frontends. Transport failures retry the identical operation ID and predecessor;
@@ -83,9 +91,10 @@ configuration; this configuration creates no infrastructure.
 | `remote-grpc` | gRPC | Declared by provider contract | HTTPS, custom CA, and mTLS supported |
 | `fake` | In-process test provider | Test-only | Refused unless built with `--features fake-provider` |
 
-The `fake` provider is not compiled into a default build; `maki volume create`
-and attach reject it at validation time. Enable the `fake-provider` feature of
-`maki-nbdkit` only for development and benchmark builds.
+The `fake` provider is not compiled into a default build; `maki volume create`,
+`maki volume resume-enrollment` and attach reject it at validation time,
+before the backing or a remote witness changes. Enable the `fake-provider`
+feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
 endpoint URL. The TLS section is optional when system/default trust is enough.
@@ -106,12 +115,16 @@ client_key = { source = "credential", name = "crypto-client-key" }
 ```
 
 For gRPC, use `crypto.grpc.endpoint`, an `https://` URL and `crypto.grpc.tls`
-with the same fields. WebSocket and gRPC require `client_cert_file` and
+with the same fields. A gRPC endpoint named by an IP literal
+(`https://192.0.2.10:7443`, `https://[2001:db8::10]:7443`) is verified against
+the certificate's IP-address SANs; a DNS SAN does not match it.
+WebSocket and gRPC require `client_cert_file` and
 `client_key` together; the private key is loaded through the existing credential
 router. Omit both for server-only TLS. HTTP also retains support for a combined
 certificate/private-key PEM in `client_cert_file`; such a file is a secret file
 like a `file` credential: it is opened without following a symlink and, when it
-holds a private key, must not be readable by group or others (0600 or 0400).
+holds a private key, must be owned by root or by the user the process runs as
+and must not be readable by group or others (0600 or 0400).
 Every TLS file must be a regular file of at most 1 MiB; CA bundles and
 certificates paired with `client_key` may be symlinks. A CA bundle, or a
 WebSocket/gRPC `client_cert_file`, that contains a private key is refused at
@@ -151,8 +164,9 @@ line and column when available. Their Display and Debug output omit the source
 text, values, unknown field names and the parser's free-form message; inspect
 the configuration locally at the reported location to diagnose the problem.
 Semantic validation errors can name a known field or endpoint. Endpoint URLs
-are shown as `scheme://host[:port]` without userinfo, path or query. Beyond
-schema, geometry, and secret-literal checks validation rejects:
+are shown as `scheme://host[:port]` without userinfo, path or query; HTTP
+operation paths, credential names and credential templates are never shown.
+Beyond schema, geometry, and secret-literal checks validation rejects:
 
 - any zero count or byte limit under `[limits]`, `[crypto.batch]`,
   `[crypto.circuit_breaker]`, and `[crypto.retry_budget]` (except
@@ -174,14 +188,15 @@ schema, geometry, and secret-literal checks validation rejects:
   `device_block_size <= minimum_io <= preferred_io <= maximum_io` (an unset
   `nbd.preferred_io` is the crypto unit size, raised to `minimum_io`), an
   `nbd.device_block_size` that differs from the volume's, a `minimum_io`
-  above 64 KiB, an export size that is not a multiple of `minimum_io`, a
-  `maximum_io` that does not fit in the NBD 32-bit wire
-  field, or a `limits.max_plaintext_bytes` too small for every crypto unit
-  touched by one permitted NBD request. The charge rounds to whole crypto
-  units, including partial units at both ends, and accounts for `minimum_io`
-  alignment and the export size. For example, 1 KiB requests with 512-byte
-  alignment and 4 KiB crypto units can touch two units and need 8 KiB, not
-  5 KiB;
+  above 64 KiB, a configured or defaulted `preferred_io` above 32 MiB (nbdkit
+  refuses a larger preferred block size, failing every client handshake), an
+  export size that is not a multiple of `minimum_io`, a `maximum_io` that does
+  not fit in the NBD 32-bit wire field, or a `limits.max_plaintext_bytes` too
+  small for every crypto unit touched by one permitted NBD request. The charge
+  rounds to whole crypto units, including partial units at both ends, and
+  accounts for `minimum_io` alignment and the export size. For example, 1 KiB
+  requests with 512-byte alignment and 4 KiB crypto units can touch two units
+  and need 8 KiB, not 5 KiB;
 - a `cache.mode = "read"` with a zero size or TTL, and empty `control` values;
 - missing or foreign provider sections: local providers need `[crypto].key` and
   must not carry transport sections; `remote-http` needs `[crypto.http]` with at
@@ -199,11 +214,23 @@ schema, geometry, and secret-literal checks validation rejects:
   index so reordered, dropped, or duplicated results are detected. Only a
   `type = "json"` body with `items_path` is a batch; a raw body is sent one
   item per request;
-- a declared `capabilities.context_binding` whose context fields do not reach
+- HTTP JSON body mappings the provider cannot build or send as written
+  (validation and the provider use one parser): an unknown field `source` or
+  payload `encoding`, an `encoding` on a source other than `payload`, a
+  request pointer or `items_path` that does not start with `/`, and request
+  pointers that would replace one another on the wire. After RFC 6901
+  decoding, no pointer of one JSON object may equal another or address a
+  field inside it (`/volume` with `/volume/profile`, or `/x~2` with `/x~02`),
+  and no top-level field may sit at, under or above the batch `items_path`;
+  each batch element's `item_fields` are checked as their own object.
+  `/vol` and `/volume`, or `/a~1b` (the key `a/b`) and `/a/b`, are distinct;
+- a declared `capabilities.context_binding` whose context does not reach
   the provider: each of `volume_id`, `compatibility_id` and `format_version`
   must be a source in the JSON `fields`, or in `item_fields` of a batch
   layout (a raw body sends no fields, and a per-item body never sends
-  `item_fields`);
+  `item_fields`), and the attach self-test's unit-index probe needs a
+  per-item `unit_index`: in `fields` of a per-item body, in `item_fields` of
+  a batch (top-level batch fields belong to no item);
 - a transport limit that cannot carry one full crypto batch, including the
   declared maximum ciphertext size. The maximum batch is bounded by both
   `crypto.batch.max_items` and the number of provider plaintext units that fit
@@ -227,8 +254,11 @@ schema, geometry, and secret-literal checks validation rejects:
 - TLS material that does not exist or cannot be read, `client_key` without
   `client_cert_file`, and `server_name` (unsupported: put the certificate's name
   in the endpoint URL);
-- the `keyring` credential source, which this build does not implement, and
-  the same credential name declared with different sources.
+- the `keyring` credential source, which this build does not implement, the
+  same credential name declared with different sources, a credential name the
+  loaders cannot read, and a credential `format` without exactly one `{}`
+  placeholder or on a reference that is not a header or metadata value (see
+  [credentials](#credentials-and-secrets)).
 
 The providers additionally refuse unreadable or invalid TLS material at
 construction or handshake, and read `client_key` from its credential source to
@@ -278,6 +308,13 @@ systemd 257 and later write those files `0440` for the service's group, which
 Maki accepts in the credentials directory only (R5-037). The
 privileged attach helper has no crypto dependency and no credential directive.
 
+A `file` credential must be a regular file with mode `0600` or `0400`, and
+every credential file, in the credentials directory too, must be owned by root
+or by the user the loading process runs as (the daemon user for the packaged
+service). A file owned by any other user is refused whatever its mode, because
+its owner can read or replace it; a process run as root therefore refuses a
+key owned by the daemon user, so run it as that user instead.
+
 Every credential reference is loaded from exactly the `source` it declares:
 `credential` reads `$CREDENTIALS_DIRECTORY/<name>` and fails closed when the
 directory is unset, `file` reads the named file (an absolute path: a relative
@@ -285,11 +322,24 @@ one would resolve against whichever process's working directory reads it), `env`
 reads `MAKI_CREDENTIAL_<NAME>`. TLS `ca_file` and `client_cert_file` paths must
 be absolute for the same reason. There is no fallback between sources, so a production
 daemon cannot attach on a stray environment variable.
+A `credential` name, and the file name that ends a `file` path, may contain
+only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
+the loaders refuse any other name, so validation refuses it before a volume is
+created (a key's name is stored as the volume's immutable key identity).
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
 and metadata values, so a token generated with `openssl rand -hex 32` is sent
 as that hex text.
+A credential that is empty or holds only whitespace is refused like a missing
+one, whatever its source and use, so a token file truncated by a failed
+rotation stops attach instead of sending a header or metadata value without
+its token.
+A header or metadata reference may add `format`, a template with exactly one
+`{}` placeholder that the credential replaces (`format = "Bearer {}"`). The
+rest of the template is sent literally, so never put a secret there.
+Validation refuses a template with no placeholder or with several, and refuses
+`format` on `crypto.key` and `tls.client_key`, which are loaded as stored.
 Within one volume configuration, references may reuse a name only when they
 declare the same source. For example, `name = "token"` in both the encrypt and
 decrypt mappings is valid with `source = "credential"` on both. Combining that
@@ -313,8 +363,22 @@ if a backend's runtime data produces a larger response.
 
 The HTTP provider maps logical fields into a vendor request without interpreting
 the vendor cipher. Supported mappings include raw single-item payloads and JSON
-objects containing payload, unit index, volume ID, compatibility ID, or batch
-index. Binary data may use base64, base64url, or hexadecimal encoding.
+objects whose fields (JSON pointer = `{ source, encoding }`) carry one of these
+sources:
+
+| `source` | Sent as |
+|---|---|
+| `payload` | the item's plaintext or ciphertext, as a string in its `encoding`: `base64` (default, padded), `base64url` (unpadded), `hex-lower` (alias `hex`) or `hex-upper` |
+| `unit_index` | the item's unit index, an unsigned JSON integer |
+| `volume_id` | the volume UUID, a lowercase hyphenated string |
+| `compatibility_id` | the crypto compatibility ID, a string |
+| `format_version` | the on-disk format version, an unsigned JSON integer |
+| `batch_index` | the item's position in its request, an unsigned JSON integer |
+
+Only `payload` takes an `encoding`. A per-item body sends `fields` once per
+item. A batch body sends `fields` once per request (a `payload`, `unit_index`
+or `batch_index` there carries no item: an empty payload and zero) and the
+array of `item_fields` objects at `items_path`.
 
 JSON requests default to `Content-Type: application/json`. An explicitly
 configured `Content-Type` overrides that default, including vendor media types;
@@ -337,6 +401,16 @@ may omit this setting; batch mappings require it. Raw responses remain unchanged
 The response-size limit includes the configured echo and JSON wrappers. Missing,
 duplicate, reordered, oversized, or partial batch responses are provider contract
 errors. Response bodies are read under a hard size limit.
+A successful response must frame its body with `Content-Length` or chunked
+transfer coding. A body that only the connection close ends is a provider
+contract error, because it cannot be told apart from an endpoint that died
+mid-response. A raw encrypt response shorter than its plaintext is a contract
+error too: the whole body becomes the unit's ciphertext, and nothing else in it
+distinguishes ciphertext from, for example, a proxy's error page. Contract
+errors charge the endpoint that answered, and a retry-safe request fails over.
+JSON responses are parsed against the response mapping: values that no
+configured pointer reaches are validated but not kept, so the size limit also
+bounds the memory a response takes, not only its wire bytes.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
 
@@ -375,6 +449,14 @@ malformed frames are contract errors as described above. A provider with
 `retry_safe = false` returns errors without resending those requests. An
 individual request cancellation does not make its live siblings fail or
 require them to be resent.
+
+The HTTP upgrade that opens a connection is the same request every time and
+carries no crypto request, so its refusal is never blamed on a request: HTTP
+408 and 5xx are retryable, 429 is throttling, and every other status (a
+redirect, an authentication refusal, or a generic 4xx such as 400 or 426 from
+a proxy that cannot upgrade) is an endpoint failure. The dispatcher opens that
+endpoint's circuit, so later requests go to a peer (a retry-safe request also
+fails over at once), and attach quarantines it like an unreachable endpoint.
 
 A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
@@ -415,7 +497,11 @@ The message-size limit bounds each received gRPC frame before decoding.
 Locally rejected oversized frames and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may
 move to another peer. An actual remote `OutOfRange` status remains a request
-error, regardless of its message text.
+error, regardless of its message text. Remote status text (`grpc-message`) and
+details (`grpc-status-details-bin`) are discarded before the status is read:
+an error's class follows only its `grpc-status` code and `maki-crypto-error`
+metadata, and text or details that do not decode neither change that class nor
+turn an OK status into an error.
 
 ## Backing directory identity
 
@@ -534,12 +620,23 @@ times; it does not refresh them.
 | Setting | Enforced as |
 |---|---|
 | `backing.journal_segment_size` | Size at which the journal writer starts a new segment (4096 bytes to 1 GiB). It may be changed between attaches, lowered included: recovery accepts segments of any size up to that maximum |
-| `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC if space cannot be reclaimed |
+| `backing.journal_max_bytes` | Hard limit on journal bytes on disk (at least twice the segment size). The worker checkpoints at half of it; a write that would exceed it checkpoints inline and fails with ENOSPC only if that cannot make room (see the inline reclaim paragraph below) |
 | `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
 | `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; checked before every record, including inside one request. Must hold a maximum ciphertext plus its 32-byte record header |
-| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when a reclaim round can make no more room (up to four rounds: records other writers append during a round are synced and reclaimed in the next); the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
+| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when that reclaim cannot make room; the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
 | `limits.max_overlay_entries` (default 262144) | Units the overlay may hold, whatever their payload (a v3 discard tombstone has none but still costs an entry). Same inline-checkpoint and ENOSPC behaviour; must hold the largest request in crypto units, or be `0` to disable |
+
+An inline reclaim keeps what it frees for the write that ran it. From the
+moment a write is refused for the journal or overlay bound until it has
+appended, it holds a reclaim gate, and every other write or discard queues
+behind it in arrival order instead of appending; reads, FLUSH and the
+background worker do not wait. Only admitted requests queue, so
+`limits.max_active_callbacks` bounds the queue. Nothing is appended between
+the reclaiming write's journal sync and its retry, so its checkpoint covers
+every appended record, and ENOSPC means that the request does not fit even
+then. The validated minimums of both bounds are therefore sized for one
+maximal request, not one per concurrent callback.
 
 The hard journal limit also has a configuration-dependent minimum for forward
 progress after reclaim. It includes the largest request, the retained active
@@ -557,7 +654,11 @@ checkpoint applies durable records; a successful call that advances no sequence
 does not postpone the worker's periodic sync of pending writes. After a failed
 pass the worker waits one interval before it tries again, however many writes
 cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
-checkpoints inline, and a success clears the wait.
+checkpoints inline, and a success clears the wait. Each pass syncs unsynced
+records before it checkpoints; a failed sync counts as a failed pass, but a pass
+started by the watermark or by low free space still checkpoints the records
+that were durable before it (deleting the sealed segments they cover) and then
+waits, so a journal whose syncs keep failing still gives that space back.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
@@ -803,8 +904,11 @@ When `[lvm_identity]` is present, all three fields are required. `pv_uuids`
 must list the complete PV set without duplicates; its order is normalized.
 Attach refuses a missing, additional, malformed or changed PV, VG or configured
 target-LV UUID before activation. The pins are stored in the trusted attachment
-record and rechecked during recovery. Grow and detach also require the current
-configuration, including the pins, to match that record before any mutation.
+record. Recovery does not read LVM metadata again: it checks the identity
+attach persisted before activation against them, and the live mappings against
+that identity or the post-activation mapping proof. Grow and detach also
+require the current configuration, including the pins, to match that record
+before any mutation.
 
 Omitting the table remains accepted for old configurations and records, but
 does not authenticate the discovered LVM metadata against an administrator's

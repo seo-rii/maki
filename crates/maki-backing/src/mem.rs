@@ -1,6 +1,11 @@
 //! Simple in-memory backing (always-durable; no crash semantics).
 //! For unit tests and benchmarks. Crash simulation lives in
 //! `maki-test-support::CrashableBacking`.
+//!
+//! The namespace follows POSIX path rules like the real backings: every
+//! ancestor of a path must be an existing directory (`NotFound`, or
+//! `NotADirectory` when one is a file), and a directory name cannot be
+//! opened, locked or renamed over as a file (`IsADirectory`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -16,6 +21,43 @@ struct Namespace {
     files: BTreeMap<String, Arc<Mutex<Vec<u8>>>>,
     dirs: HashSet<String>,
     locks: HashSet<String>,
+}
+
+impl Namespace {
+    /// `dir` ("" = root) and each of its ancestors must be a directory,
+    /// as for a path lookup on a filesystem.
+    fn require_dir(&self, dir: &str) -> io::Result<()> {
+        let mut prefix = String::new();
+        for part in dir.split('/').filter(|part| !part.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if self.files.contains_key(&prefix) {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, prefix));
+            }
+            if !self.dirs.contains(&prefix) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, prefix));
+            }
+        }
+        Ok(())
+    }
+
+    /// The parent of `path` exists and `path` itself is not a directory.
+    fn require_file_name(&self, path: &str) -> io::Result<()> {
+        self.require_dir(parent(path))?;
+        if self.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                path.to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 /// In-memory `Backing`. All operations are immediately "durable".
@@ -118,6 +160,7 @@ impl Backing for MemBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         validate(path, false)?;
         let mut ns = self.ns.lock();
+        ns.require_file_name(path)?;
         if let Some(data) = ns.files.get(path) {
             return Ok(Arc::new(MemFile { data: data.clone() }));
         }
@@ -135,12 +178,17 @@ impl Backing for MemBacking {
     fn exists(&self, path: &str) -> io::Result<bool> {
         validate(path, false)?;
         let ns = self.ns.lock();
+        match ns.require_dir(parent(path)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            result => result?,
+        }
         Ok(ns.files.contains_key(path) || ns.dirs.contains(path))
     }
 
     fn remove(&self, path: &str) -> io::Result<()> {
         validate(path, false)?;
         let mut ns = self.ns.lock();
+        ns.require_dir(parent(path))?;
         ns.files
             .remove(path)
             .map(|_| ())
@@ -151,6 +199,8 @@ impl Backing for MemBacking {
         validate(from, false)?;
         validate(to, false)?;
         let mut ns = self.ns.lock();
+        ns.require_dir(parent(from))?;
+        ns.require_file_name(to)?;
         let data = ns
             .files
             .remove(from)
@@ -168,6 +218,9 @@ impl Backing for MemBacking {
                 cur.push('/');
             }
             cur.push_str(comp);
+            if ns.files.contains_key(&cur) {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, cur));
+            }
             ns.dirs.insert(cur.clone());
         }
         Ok(())
@@ -176,6 +229,7 @@ impl Backing for MemBacking {
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
         validate(dir, true)?;
         let ns = self.ns.lock();
+        ns.require_dir(dir)?;
         let prefix = if dir.is_empty() {
             String::new()
         } else {
@@ -196,12 +250,13 @@ impl Backing for MemBacking {
 
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
         validate(dir, true)?;
-        Ok(())
+        self.ns.lock().require_dir(dir)
     }
 
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
         validate(path, false)?;
         let mut ns = self.ns.lock();
+        ns.require_file_name(path)?;
         if !ns.locks.insert(path.to_string()) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,

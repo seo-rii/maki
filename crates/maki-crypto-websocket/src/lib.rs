@@ -264,6 +264,12 @@ fn retryable(msg: impl std::fmt::Display) -> CryptoError {
 /// HTTP upgrade authentication and TLS identity errors are endpoint failures,
 /// just as in HTTP/gRPC. Only transient transport failures may reconnect with
 /// the same credentials. Never format a remote body/header or credentialed URL.
+///
+/// Unlike an HTTP provider's 4xx, an upgrade refusal never answers a crypto
+/// request: the upgrade is the same static GET on every connection. Any 4xx
+/// other than 408/429 is therefore the endpoint's fault (a proxy that cannot
+/// upgrade, a wrong route), never `NonRetryableRequest`, which would stop the
+/// dispatcher from failing over and attach from quarantining the endpoint.
 fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError {
     use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
 
@@ -271,14 +277,9 @@ fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError
         Error::Http(response) => {
             let code = response.status().as_u16();
             match code {
-                300..=399 | 401 | 403 | 404 | 405 | 407 | 410 => {
-                    CryptoError::EndpointFatal(format!("websocket upgrade HTTP {code}"))
-                }
                 429 => CryptoError::Throttled(format!("websocket upgrade HTTP {code}")),
                 408 => retryable(format!("websocket upgrade HTTP {code}")),
-                400..=499 => {
-                    CryptoError::NonRetryableRequest(format!("websocket upgrade HTTP {code}"))
-                }
+                300..=499 => CryptoError::EndpointFatal(format!("websocket upgrade HTTP {code}")),
                 500..=599 => retryable(format!("websocket upgrade HTTP {code}")),
                 _ => CryptoError::EndpointFatal(format!("invalid websocket upgrade HTTP {code}")),
             }

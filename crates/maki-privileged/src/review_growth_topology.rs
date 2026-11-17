@@ -88,10 +88,10 @@ impl System for GrowthSystem {
         Ok(Some(self.connection.clone()))
     }
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        crate::detach::observe(record, &self.mounts(), &self.root)
+        crate::detach::observe(record, self.mounts().as_bytes(), &self.root)
     }
     fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
-        recover::observe(record, &self.mounts(), &self.root)
+        recover::observe(record, self.mounts().as_bytes(), &self.root)
     }
     fn lv_size(&self, _: &str, _: &str) -> Result<u64, ExecError> {
         Ok(self.size)
@@ -151,7 +151,7 @@ fn setup(partitioned: bool) -> (Fixture, TrustedState, Plan, BoundDeviceRecord, 
         recovery: None,
         recovery_intent: None,
     };
-    record.recovery = Some(recover::capture(&record, "", &root).unwrap());
+    record.recovery = Some(recover::capture(&record, b"", &root).unwrap());
     state.write(&record).unwrap();
     let plan = crate::plan::plan_grow(&crate::plan::GrowRequest {
         volume: request.volume,
@@ -178,7 +178,7 @@ fn setup(partitioned: bool) -> (Fixture, TrustedState, Plan, BoundDeviceRecord, 
 #[test]
 fn partition_pv_growth_is_refused_before_lv_or_filesystem_mutation() {
     let (_fixture, state, plan, record, mut system) = setup(true);
-    recover::observe_complete(&record, &system.mounts(), &system.root).unwrap();
+    recover::observe_complete(&record, system.mounts().as_bytes(), &system.root).unwrap();
     let result = execute_with(&plan, Some(&state), &mut system);
     assert!(
         result.is_err(),
@@ -191,7 +191,7 @@ fn partition_pv_growth_is_refused_before_lv_or_filesystem_mutation() {
     );
     assert_eq!(system.size, 1 << 30);
     assert_eq!(state.read(&record.volume).unwrap(), Some(record.clone()));
-    recover::observe_complete(&record, &system.mounts(), &system.root).unwrap();
+    recover::observe_complete(&record, system.mounts().as_bytes(), &system.root).unwrap();
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn partition_growth_retry_preserves_the_original_live_attachment() {
             system.steps.is_empty(),
             "unsupported retry changed the mapping"
         );
-        recover::observe_complete(&record, &system.mounts(), &system.root).unwrap();
+        recover::observe_complete(&record, system.mounts().as_bytes(), &system.root).unwrap();
     }
 }
 
@@ -225,7 +225,7 @@ fn whole_device_pv_growth_reaches_xfs_and_preserves_the_proof() {
     assert_eq!(system.steps, ["lvextend", "xfs-growfs"]);
     assert_eq!(system.size, 2 << 30);
     assert_eq!(state.read(&record.volume).unwrap(), Some(record.clone()));
-    recover::observe_complete(&record, &system.mounts(), &system.root).unwrap();
+    recover::observe_complete(&record, system.mounts().as_bytes(), &system.root).unwrap();
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn whole_device_retry_after_completed_lvextend_only_grows_xfs() {
     system.steps.clear();
     execute_with(&plan, Some(&state), &mut system).unwrap();
     assert_eq!(system.steps, ["xfs-growfs"]);
-    recover::observe_complete(&record, &system.mounts(), &system.root).unwrap();
+    recover::observe_complete(&record, system.mounts().as_bytes(), &system.root).unwrap();
 }
 
 #[test]

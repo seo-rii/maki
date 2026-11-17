@@ -8,7 +8,7 @@ use crate::remote_witness::{
 use crate::witness::Anchor;
 
 use super::enrollment::Enrollment;
-use super::gc::{GcReport, OperationGuard};
+use super::gc::{namespace_fence, GcReport, OperationGuard, TOMBSTONE};
 
 const REMOTE_MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
 
@@ -39,8 +39,9 @@ impl Witness {
     /// records proven anchor changes and uncertain publications itself; a
     /// transient read failure only refuses this operation. A remote Inspect
     /// changes nothing, so a witness
-    /// that could not be asked (timeout, refused or reset connection, an
-    /// unavailable quorum) only refuses this operation; the next check
+    /// that could not be asked (timeout, refused or reset connection, a
+    /// local socket error, an unavailable quorum) only refuses this
+    /// operation; the next check
     /// either matches again or observes the change (BUG-103). A mismatch,
     /// an invalid or denied answer stops the session for good. The kinds
     /// match the ones the failover client treats as final.
@@ -251,10 +252,98 @@ fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
     disk.sync_dir("")
 }
 
-fn collect_after_activation(guard: &OperationGuard<'_>, rpc: &dyn Rpc) {
+fn collect_after_activation(
+    guard: &OperationGuard<'_>,
+    rpc: &dyn Rpc,
+    only: Option<&BTreeSet<String>>,
+) {
     // An accepted root is already durable. GC failure postpones reclamation;
     // it must not turn a successful activation into an ambiguous writer loss.
-    let _ = guard.collect(rpc);
+    let _ = guard.collect_within(rpc, only);
+}
+
+/// The only manifest a never-activated authority's session can have written:
+/// the empty generation-0 candidate of its initial activation.
+fn empty_manifest(identity: [u8; 16], capacity: u64) -> Manifest {
+    Manifest {
+        format: 1,
+        identity,
+        generation: 0,
+        capacity,
+        next_id: 1,
+        entries: BTreeMap::new(),
+        files: BTreeMap::new(),
+    }
+}
+
+/// Show that a root resumed for a never-activated authority holds nothing
+/// another volume can own, before the root is bound or the authority is
+/// claimed. A missing binding proves nothing: activated roots written before
+/// the binding existed have none (the restore form of this is BUG-187). Such
+/// an authority never accepted a descriptor, so it never advanced, restored
+/// or ran GC. Each namespace in its root is the candidate its current claim
+/// names, or an abandoned initial candidate whose manifest slots hold the
+/// empty generation-0 manifest for this identity and capacity, a torn part
+/// of it (a byte is either that byte or a reserved zero), or nothing. A
+/// tombstone or any other manifest belongs to another volume's history:
+/// refuse, and let automatic GC retire only the namespaces examined here.
+fn unactivated_candidates(
+    disk: &FileBacking,
+    expected: &Record,
+    capacity: u64,
+) -> io::Result<BTreeSet<String>> {
+    let bytes = empty_manifest(expected.identity, capacity).encode()?;
+    let mut image = (bytes.len() as u64).to_le_bytes().to_vec();
+    image.extend_from_slice(&bytes);
+    let pending = namespace(expected.fence, expected.session);
+    let foreign = |name: &str| {
+        invalid(format!(
+            "this backing root holds remote state that a never-activated authority \
+             cannot have written ({name}); check backing.root before retrying"
+        ))
+    };
+    let mut candidates = BTreeSet::new();
+    let mut after = None;
+    loop {
+        let page = disk.gc_entries(after.as_deref())?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().cloned();
+        for entry in page {
+            if entry
+                .strip_prefix(TOMBSTONE)
+                .is_some_and(|original| namespace_fence(original).is_some())
+            {
+                return Err(foreign(&entry));
+            }
+            if namespace_fence(&entry).is_none() {
+                // GC never reclaims an unrecognized entry.
+                continue;
+            }
+            if entry != pending {
+                let candidate = disk.gc_scope(&entry)?;
+                for slot in MANIFESTS {
+                    let file = match candidate.open(slot, false) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    };
+                    let mut prefix = vec![0; file.len()?.min(image.len() as u64) as usize];
+                    file.read_at(0, &mut prefix)?;
+                    if prefix
+                        .iter()
+                        .zip(&image)
+                        .any(|(byte, expected)| *byte != 0 && byte != expected)
+                    {
+                        return Err(foreign(&entry));
+                    }
+                }
+            }
+            candidates.insert(entry);
+        }
+    }
+    Ok(candidates)
 }
 
 pub(super) fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Backing>> {
@@ -408,6 +497,11 @@ impl RollbackBacking {
         if inspect(rpc.as_ref())? != *expected {
             return Err(invalid("enrollment approval is stale"));
         }
+        // The approval proves the authority, not this directory. Refuse a
+        // different binding or another volume's state before the root or the
+        // authority changes.
+        Enrollment::verify_if_present(disk.as_ref(), expected.identity, capacity)?;
+        let candidates = unactivated_candidates(&disk, expected, capacity)?;
         // Re-publish the validated marker before the independent authority
         // can accept enrollment. A readable legacy marker may be cache-only.
         let marker = disk.open(MARKER, false)?;
@@ -424,7 +518,7 @@ impl RollbackBacking {
         )?;
         let result =
             Self::activate_empty(disk.clone(), capacity, claim, rpc.clone(), authorization)?;
-        collect_after_activation(&guard, rpc.as_ref());
+        collect_after_activation(&guard, rpc.as_ref(), Some(&candidates));
         Ok(result)
     }
 
@@ -448,7 +542,7 @@ impl RollbackBacking {
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
         let result =
             Self::activate_empty(disk.clone(), capacity, claim, rpc.clone(), authorization)?;
-        collect_after_activation(&guard, rpc.as_ref());
+        collect_after_activation(&guard, rpc.as_ref(), None);
         Ok(result)
     }
 
@@ -459,15 +553,7 @@ impl RollbackBacking {
         rpc: Arc<dyn Rpc>,
         authorization: SessionAuthorization,
     ) -> io::Result<Self> {
-        let manifest = Manifest {
-            format: 1,
-            identity: claim.identity,
-            generation: 0,
-            capacity,
-            next_id: 1,
-            entries: BTreeMap::new(),
-            files: BTreeMap::new(),
-        };
+        let manifest = empty_manifest(claim.identity, capacity);
         Self::activate_fork(disk, None, manifest, 0, claim, rpc, authorization)
     }
 
@@ -479,7 +565,7 @@ impl RollbackBacking {
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
-        collect_after_activation(&guard, rpc.as_ref());
+        collect_after_activation(&guard, rpc.as_ref(), None);
         Ok(result)
     }
 
@@ -490,7 +576,7 @@ impl RollbackBacking {
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), expected, &authorization, Action::Takeover)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
-        collect_after_activation(&guard, rpc.as_ref());
+        collect_after_activation(&guard, rpc.as_ref(), None);
         Ok(result)
     }
 
@@ -649,7 +735,7 @@ impl RollbackBacking {
             rpc.clone(),
             authorization,
         )?;
-        collect_after_activation(&guard, rpc.as_ref());
+        collect_after_activation(&guard, rpc.as_ref(), None);
         Ok(result)
     }
 

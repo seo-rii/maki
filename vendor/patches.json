@@ -14,8 +14,8 @@
     },
     "hyper": {
       "files": {
-        "Cargo.lock": "4cbf3872850360d8a623138475f40d6b0bfbaf9578d38697155d4b1b8275f5b4",
-        "Cargo.toml": "bbb0fdb53bf741687878c824773a5489fea829ccb7089e05200f85155e857b8c",
+        "Cargo.lock": "4fa9f162666a019904933fd25081d971ad0082d95be10b30e3ea97644fb1f944",
+        "Cargo.toml": "73627d7b1a061fcefe1df7c90c913af60a747fae379bac3d991c5556fbfdb3ac",
         "src/common/date.rs": "a0f90ed9115d766b450322ea57594610afc5411871d41cba8acc411ed4555c07",
         "src/error.rs": "1f8ffa4998ee431840fc623c8ad43925aa8f21346e427ef8eb9dd59950675480",
         "src/proto/h1/decode.rs": "bdaf1232922da6197f35a53de2dc48161551fa41bc7efbdace45326d26f7ca6e",
@@ -119,7 +119,7 @@
     },
     "tungstenite": {
       "files": {
-        "Cargo.lock": "5891ea51070592aaa65557ffa51f01f5f4a1ac0d10844e7bb045f33f3ed51c1a",
+        "Cargo.lock": "948cc8a9d65a72bfbf2dd9992d065feb16ef771328f2b1a799a7f538a7c6a87e",
         "Cargo.toml": "dbf154a766d01bfc2f27054c6e6ed922d4a8368ad9cb2636f47cddac56c6d4c6",
         "src/buffer.rs": "67102a9adde8421ce61e12da72d87ce4d920cf3de4ba4c8d7bb45d5e6eae506f",
         "src/handshake/client.rs": "909326c12e65ca520c31a8291f643b4b1e1213046b8d3784212abe26ed4b57af",
@@ -128,7 +128,7 @@
         "src/lib.rs": "953e3d4faefd7a36ba665ade762b40bbaa47d52f606e2a665f4147847ca8ac83",
         "src/maki_buffer.rs": "29a7ea15f2fb97d336c21c2b2825e8cfb240ad375677345f36805faa5ed525c8",
         "src/protocol/frame/frame.rs": "b07b2f636bc1851790d534e22749e7868090f1753231a7677a098f0fc31c5edc",
-        "src/protocol/frame/mod.rs": "6b0421f5b6ceb0593775375bb3aa23f340f9753a2557a5bf9646dfaabf051700",
+        "src/protocol/frame/mod.rs": "b3d8b046d7570fd01682a1f076e3472426cdadb57b637667443f36da53b93534",
         "src/protocol/message.rs": "030da939106fc01d480139e86f78862b62e7b4ade7986ff1f0e4a398addbc1d0"
       }
     }

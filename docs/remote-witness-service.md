@@ -199,7 +199,14 @@ operator-controlled cutover after destination verification.
 Configuration files are bounded to 64 KiB and reject unknown fields. On Unix,
 they must not be symlinks or writable by group/others. Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
-accessible to group/others (`0600` is appropriate). The key loader accepts one
+accessible to group/others (`0600` is appropriate), and must be owned by root
+or by the user the loading process runs as. A key owned by any other user is
+refused whatever its mode, because its owner can read or replace it; a process
+run as root therefore refuses a key owned by the service or daemon user. Run
+the server as its service account, and run `maki volume witness` with the
+daemon's writer configuration as the daemon user (`sudo -u maki`), or use the
+administrator configuration as root. Certificates and CA bundles may have any
+owner. The key loader accepts one
 unencrypted PKCS#8, PKCS#1 RSA or SEC1 EC PEM block. Encrypted keys, bag
 attributes, extra blocks and trailing non-whitespace text are refused.
 Private-key PEM, base64 scratch and decoded DER are erased on drop; the pinned
@@ -305,7 +312,9 @@ If the preferred frontend fails, the remaining frontends share the original
 overall deadline and a successful alternate becomes the next preferred address.
 Authentication failures, malformed records and predecessor conflicts remain
 terminal. A stalled former first address therefore consumes time once during
-failover rather than on every later successful call.
+failover rather than on every later successful call. A local socket error, such
+as the EPERM Linux returns from `connect()` when a firewall drops the
+connection, is a transport failure like a refused connection, not a denial.
 
 Inspect through the configured client without claiming a session:
 
@@ -414,9 +423,14 @@ normal initial volume creation. Earlier claim candidates remain fenced out.
 A durable `remote.enrollment` binding fixes the approved identity and capacity
 before the claim. Explicit recovery can create a missing binding for a valid
 legacy marker-only attempt; a different or corrupt existing binding refuses
-rather than being silently replaced. Recognized quiescent lower-fence candidates may be retired by the subsequent
-GC pass; live handles and unknown artifacts are preserved. Quarantine damaged binding evidence for explicit
-operator investigation.
+rather than being silently replaced. Because older activated roots also lack
+a binding, recovery first refuses a root holding a GC tombstone or any
+namespace manifest other than this identity's empty initial candidate, so a
+`backing.root` that names another volume's data changes neither authority nor
+root. Only the quiescent lower-fence candidates that check examined may be
+retired by the subsequent GC pass; live handles and unknown artifacts are
+preserved. Quarantine damaged binding evidence for explicit operator
+investigation.
 
 If activation actually succeeded, use exact-current takeover and inspect the
 selected state. This command does not reset it or automatically finish inner

@@ -7,11 +7,11 @@ use crate::file::GcRemoval;
 use crate::remote_witness::{namespace, Action, Record, Request, Rpc};
 use crate::{Backing, FileBacking, VolumeLock};
 
-const TOMBSTONE: &str = ".remote-gc-";
+pub(super) const TOMBSTONE: &str = ".remote-gc-";
 const MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
 const REPORT_DETAIL_LIMIT: usize = 4096;
 
-fn namespace_fence(name: &str) -> Option<u64> {
+pub(super) fn namespace_fence(name: &str) -> Option<u64> {
     let bytes = name.as_bytes();
     if bytes.len() != 56
         || !bytes.starts_with(b"remote-")
@@ -105,6 +105,17 @@ impl<'a> OperationGuard<'a> {
     /// held. The caller's root guard excludes every concurrent physical fork.
     /// Authority outages or changes stop reclamation before the next candidate.
     pub fn collect(&self, rpc: &dyn Rpc) -> io::Result<GcReport> {
+        self.collect_within(rpc, None)
+    }
+
+    /// [`Self::collect`], retiring only the named namespaces when `only` is
+    /// set; every other entry is retained. Enrollment recovery reclaims
+    /// nothing it has not itself shown to belong to its authority.
+    pub(super) fn collect_within(
+        &self,
+        rpc: &dyn Rpc,
+        only: Option<&BTreeSet<String>>,
+    ) -> io::Result<GcReport> {
         let marker = self.disk.open("rollback.format", false)?;
         let mut bytes = [0; MAGIC.len()];
         if marker.len()? != bytes.len() as u64 {
@@ -175,7 +186,10 @@ impl<'a> OperationGuard<'a> {
                     report.record(Disposition::Unrecognized, entry);
                     continue;
                 };
-                if fence >= record.fence || retained.contains(original) {
+                if fence >= record.fence
+                    || retained.contains(original)
+                    || only.is_some_and(|names| !names.contains(original))
+                {
                     report.record(Disposition::Retained, entry);
                     continue;
                 }

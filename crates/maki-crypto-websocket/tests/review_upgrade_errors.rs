@@ -1,4 +1,11 @@
 //! F04: HTTP upgrade failures retain their HTTP error class and retry policy.
+//!
+//! The upgrade is the same static GET on every connection and carries no
+//! crypto request, so a refusal is never the request's fault. A generic 4xx
+//! (400, 422, 426, ...) is the endpoint's fault, like an authentication or
+//! routing refusal: it must be `EndpointFatal`, which the dispatcher fails
+//! over on and which quarantines the endpoint at attach. Only 408 and 429
+//! keep their transient meaning.
 use maki_crypto::{
     BatchCapability, Capability, CryptoCapabilities, CryptoContext, CryptoProvider, ErrorClass,
     PlaintextUnit, SecretBuffer,
@@ -17,13 +24,14 @@ async fn f04_upgrade_status_controls_class_and_retry_count() {
         (403, ErrorClass::EndpointFatal),
         (401, ErrorClass::EndpointFatal),
         (301, ErrorClass::EndpointFatal),
-        (400, ErrorClass::NonRetryableRequest),
+        (400, ErrorClass::EndpointFatal),
         (404, ErrorClass::EndpointFatal),
         (405, ErrorClass::EndpointFatal),
         (407, ErrorClass::EndpointFatal),
         (408, ErrorClass::Retryable),
         (410, ErrorClass::EndpointFatal),
-        (422, ErrorClass::NonRetryableRequest),
+        (422, ErrorClass::EndpointFatal),
+        (426, ErrorClass::EndpointFatal),
         (429, ErrorClass::Throttled),
         (500, ErrorClass::Retryable),
         (503, ErrorClass::Retryable),

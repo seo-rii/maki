@@ -136,7 +136,10 @@ fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
 larger than the writer can produce is rejected before it is read, and a
 complete-but-invalid final segment header is treated as damage rather than as
-a creation crash.
+a creation crash. That rule relies on the writer never extending a new segment
+before its header write: a header write that persists only a prefix leaves a
+file shorter than a header (or all zero), which recovery discards as a creation
+that never completed.
 
 The journal above the selected checkpoint must bridge through the proof's
 required sequence and exact record-end offset before recovery changes metadata.
@@ -144,6 +147,17 @@ A missing final segment, a shortened complete-record prefix, or corruption
 inside that required prefix fails explicitly. A proof may name a pruned segment
 only when the checkpoint already covers its horizon. Both proof copies absent
 or invalid is an error even for an empty-looking v2 volume.
+
+The first recovery write makes the selected superblock durable. A creation that
+failed or was killed after writing superblock A (a failed fdatasync, or a kill
+before it) leaves a readable copy that may exist only in the page cache, and a
+retried creation refuses that root, so recovery is where the copy becomes
+durable. It rewrites each valid copy from its exact validated bytes and syncs
+it and the root directory, selected copy first, then completes a missing or
+invalid copy (creation stopped after A) through the A/B store, one generation
+above the existing copies, as creation would have. Valid copies are never
+re-encoded, so repeated recoveries leave both files unchanged. Read-only
+inspection, including the deep check, never writes them.
 
 Unproven final-tail bytes may be truncated after a crash. Intact later records
 do not prove the durability of earlier damaged bytes, because unsynced sectors
@@ -235,9 +249,12 @@ symptom.
 
 Checkpoints are not only a shutdown step. A background worker checkpoints when
 the journal crosses a size watermark, when backing free space drops below the
-checkpoint reserve, and on a time interval (syncing unsynced records first). The
+checkpoint reserve, and on a time interval, syncing unsynced records first so
+each pass applies them. The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims
-inline at the hard journal limit, and refuses writes with ENOSPC unless fresh
+inline at the hard journal limit (other writes queue behind an inline reclaim,
+so the space it frees goes to the write that ran it), and refuses writes with
+ENOSPC unless fresh
 backing space covers the emergency reserve, configured checkpoint headroom,
 projected record bytes, and all segment headers created by that write, or when
 the journal cannot be
@@ -309,10 +326,17 @@ request-fatal, or provider-fatal. Only eligible failures enter bounded full-
 jitter retry. A response that breaks the provider contract (malformed body,
 wrong item count, bad encoding) and an HTTP 404/405/410 are charged to the
 endpoint that sent them: its breaker counts the failure and a retry-safe
-request fails over to an endpoint it has not tried yet, so a misrouted
-endpoint cannot absorb most traffic. A contract violation with no untried
-endpoint left is reported at once. Retry budgets, circuit breakers, endpoint limits, and global byte
-and request semaphores prevent a failing provider from causing unbounded work.
+request fails over to another endpoint, so a misrouted endpoint cannot absorb
+most traffic. An operation is never sent again to an endpoint that broke the
+contract for it. The violation is reported at once only when every validated
+endpoint has broken the contract for that operation (a single endpoint
+included; quarantined endpoints do not count). While another validated
+endpoint remains, even one that failed transiently or whose circuit is
+cooling, the operation stays in the normal backoff loop whatever order the
+endpoints were tried in: under `stall` it stays pending, and under
+`bounded-error` it ends at `max_operation_time`. Retry budgets, circuit
+breakers, endpoint limits, and global byte and request semaphores prevent a
+failing provider from causing unbounded work.
 
 ## Cache and growth
 

@@ -97,6 +97,17 @@ impl Geometry {
                 "max_virtual_size {max_virtual_size} exceeds the signed NBD export size limit"
             )));
         }
+        // The key canary is encrypted at a reserved unit index that no data
+        // unit may reach. Attach refuses such a volume, so refuse it at
+        // creation and superblock decode, as for the size limit above.
+        let num_units = max_virtual_size / crypto_unit_size as u64;
+        if num_units > crate::canary::CANARY_UNIT_INDEX {
+            return Err(FormatError::Invalid(format!(
+                "max_virtual_size {max_virtual_size} addresses {num_units} units of \
+                 {crypto_unit_size} bytes, which reaches the reserved key-canary unit index {}",
+                crate::canary::CANARY_UNIT_INDEX
+            )));
+        }
         if shard_logical_size == 0 || !shard_logical_size.is_multiple_of(crypto_unit_size as u64) {
             return Err(FormatError::Invalid(format!(
                 "shard_logical_size {shard_logical_size} must be a positive multiple of crypto_unit_size"

@@ -29,8 +29,10 @@ path into the test run. Cargo 1.100 puts integration tests and libraries in
 separate unit directories, so native fixtures cannot infer the plugin path
 from the test executable or loader search path. The wrapper uses the same
 Cargo options, features and profile for both phases; it does not search old
-build outputs. On other platforms it invokes Cargo directly. Use `CARGO` to
-select a Cargo executable, or `RUSTUP_TOOLCHAIN=1.94.0` for the baseline.
+build outputs. On other platforms it invokes Cargo directly, and so does a
+`--doc` selection on Linux: Cargo cannot compile doc tests with `--no-run`,
+and they never load the plugin. Use `CARGO` to select a Cargo executable, or
+`RUSTUP_TOOLCHAIN=1.94.0` for the baseline.
 
 The ignored release-mode suite is substantially more expensive than the default
 workspace suite. It uses simulated backing stores and does not perform real
@@ -62,7 +64,8 @@ compatibility checks.
 The baseline workspace suite includes unit tests, parser mutation smokes,
 golden format vectors, provider conformance, transport chaos, failpoints,
 manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
-power-loss simulations, and real-process tests for all four binaries.
+power-loss simulations, and real-process tests for all five binaries (`maki`,
+`maki-attach`, `maki-check`, `maki-benchmark` and `maki-witness`).
 The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
 before the workspace tests and checks their executables. This runs the native
 startup, negotiation, drain, process-crash, and ABI regressions instead of relying on optional
@@ -217,10 +220,10 @@ The ignored long-running and external-service gates were not part of this run.
 | Component | Purpose |
 |---|---|
 | `ReferenceBlockModel` | Oracle for acknowledged, durable, and crash-possible data |
-| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics are Linux-faithful: a failed `sync_data` marks its dirty writes clean and *lost* (a retried sync writes nothing; only a rewrite persists them), and the partial-write hook makes a `write_at` persist a prefix before failing |
-| `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses |
-| `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing |
-| `DeterministicScheduler` | Reproducible seeded interleavings |
+| `CrashableBacking` | Samples unsynchronized operations, retains namespace dependencies, and can model tearing. Failure semantics follow Linux writeback: a failed `sync_data` marks its dirty operations clean with *unknown* persistence (the page cache keeps showing them, a retried sync writes nothing, a later power loss may keep any of them, whole or torn, and the worst-case crash loses them), a successful sync writes back every page a dirty write touched as a whole 4 KiB cached page, and the partial-write hook makes a `write_at` persist a prefix before failing. A power loss kills every process: file and lock handles opened before it are dead |
+| `FakeCryptoProvider` | Deterministic crypto, latency, errors, and malformed provider responses. Refuses a batch over its declared `max_items` or `max_bytes` (plaintext bytes; one unit per decrypt item) with `NonRetryableRequest`, as a vendor endpoint would. With integrity off it behaves like an unauthenticated cipher: any ciphertext of the right length decrypts (to garbage when damaged) and only a wrong length is refused |
+| `ManualClock` | Deterministic retry, timeout, cache TTL, and breaker timing. Sleepers due in one `advance` are woken by deadline, then in creation order |
+| `DeterministicScheduler` | Reproducible seeded interleavings. A task is polled again only after its waker fires, so a lost wakeup stalls (`run` panics, `run_bounded` returns `false`) as it would hang under tokio |
 | Failpoints | Named failures at journal, shard, and checkpoint persistence boundaries |
 
 Golden vectors freeze the on-disk format. Self-checksummed images are hashed
@@ -273,7 +276,7 @@ packaged configuration without installing services or creating users.
 | Queue deadlines (BUG-013) | `maki-crypto/tests/review_queued_deadline.rs`: ManualClock deadlines cover admission, coalescing, slot wait, and RPC under one caller budget; a live peer retains its own budget and stall mode remains unbounded |
 | Concurrent socket permissions (BUG-014) | `maki-control/tests/review_uds_umask.rs`: bind concurrently with private directory creation and verify mode 0700 is preserved; `review_uds.rs` also checks prepared socket mode/group, preservation on failed group lookup, cleanup on failed publication, and actual Linux connection at the maximum public path length |
 | Partial journal writes (BUG-020) | `maki-core/tests/review_journal_retry.rs`: a BackingFile that writes a prefix then returns EIO, shorter retries, roll/FLUSH without retry, cleanup failure, and recovery after sealing the segment |
-| Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO, retry and process recovery followed by power loss, changes after the scan, valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer |
+| Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO, retry and process recovery followed by power loss, changes after the scan (refused before any proof covers them), valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer; `review_recovery_prefix_rewrite.rs`: power loss after every backing operation of a recovery that adopted such bytes after a restart, including the window in which the synced mark and proof already cover records that only the journal segment holds |
 | gRPC authentication evidence (TEST-002) | `maki-nbdkit/tests/phase9_daemon.rs`: attach without metadata must fail after the server actually rejects it with Unauthenticated; valid metadata roundtrips with no authentication rejection, independently of which deadline's error text wins |
 | Convergent privileged cleanup (R3-007) | `maki-privileged/src/exec_tests.rs`, `recover.rs`, and `maki-attach/tests/e2e.rs`: no record succeeds without probing, an owned connected backend selects detach, an absent backend selects recovery, and a foreign or unreadable backend preserves the record. The proof-scoped fallback runs only after an exited `vgchange` returns nonzero, accepts one exact closed target mapping, rechecks the backend, and rejects changed identity, multi-mapping topology, open count, or force/deferred/retry removal |
 | Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
@@ -283,6 +286,8 @@ packaged configuration without installing services or creating users.
 | Package removal and inputs (R4-003, R4-007) | `scripts/test_debian_package.py`: `prerm` refuses removal under an attachment record or an active `maki@`/`maki-attach@`/`maki-workload@` unit or when `systemctl` cannot be queried but never blocks upgrades, no maintainer script starts/stops/restarts a service, ELF stubs of the wrong machine, class, type or a non-ELF file are refused, unknown architectures are refused, the dependency scan is on by default and fails closed on unanalysable artifacts or a missing `dpkg-shlibdeps`, `--no-shlibdeps` warns and keeps only the static `Depends` |
 | Deep-check verdict (R4-004) | `maki-core/tests/review_r4_check_verdict.rs`: recoverable slot damage passes with a warning and is repaired by recovery, damage without a journal source fails, mixed damage reports both classes, a healthy volume is `clean`, a damaged header on an unlisted slot is `unrecoverable` |
 | Overlay memory bound (R4-005) | `maki-core/tests/review_r4_overlay_bound.rs`, `maki-format/tests/review_r4_overlay_limits.rs`, `maki-nbdkit/tests/review_r4_overlay_options.rs`: bytes and entries stay under their limits without journal pressure, the worker checkpoints on the overlay watermark with a manual clock, a failed reclaim refuses the write and degrades, a concurrent volatile write during an inline reclaim does not cause ENOSPC (multi-thread, `checkpoint.slot_write` hook), defaults/zero/minimum validation, and the daemon mapping |
+| Inline reclaim fairness | `maki-core/tests/review_reclaim_fairness.rs`: eight concurrent writers of maximal, misaligned requests against a journal limit or an overlay limit at its validated minimum, with no injected fault, never get ENOSPC, keep the bound and read back their last data (multi-thread) |
+| Worker sync before checkpoints | `maki-core/tests/review_watermark_volatile_tail.rs`: with only volatile records in the active segment, a pass woken by the journal watermark or started by low backing free space syncs first and applies them; with every journal sync failing (fault hook), such a pass still applies the durable records and deletes their sealed segments, and the failed sync is retried only after an interval (ManualClock that counts the worker's sleeps) |
 | Cache-first reads (R4-006) | `maki-core/tests/review_r4_cache_reads.rs`: a hit reads at most the 64-byte header and makes no provider call, an overlay hit reads nothing, newer versions miss, header damage is EIO despite a cached entry, payload damage is served until eviction then EIO, uncached reads still verify, `cache.verify_on_hit` re-reads the payload on a hit (damage is EIO at once) without a provider call; `maki-nbdkit/tests/review_r4_cache_verify_options.rs` maps the setting |
 
 The native NBD negotiation case requires Linux, `nbdkit`, and `nbdinfo` from
@@ -554,7 +559,30 @@ including a cross-directory rename when either parent is synced. That is a
 model assumption, not a guarantee for every filesystem; directory-local rename
 persistence needs additional simulation or real-filesystem testing. The main
 power-loss gate (`phase12_powerloss.rs`) also enables tearing at 512-byte
-granularity, so an unsynced write can survive in part. Simulation is useful
+granularity, so an unsynced write can survive in part.
+
+A failed `sync_data` only reports that some writeback failed: the flusher, or
+the failing sync before the page that failed, may already have written the
+rest. The model therefore keeps a failed sync's operations as *uncertain*: a
+later crash keeps each one independently, exactly like an unsynced operation
+(torn too, with tearing enabled), while `crash_all_lost` and
+`crash_keep_torn_prefix` drop them. A retried sync has nothing dirty to write
+and makes none of them certain, so the rewrite-before-retry protocols remain
+required (F01). Writeback is page granular: a successful sync persists every
+page a dirty write touched as the page cache holds it (zero past end-of-file),
+which makes the uncertain bytes in a re-dirtied page durable; bytes a
+successful sync rewrote or truncated never come back. A length change dirties
+no page. One whose sync failed may survive a crash until the next successful
+sync of the file, after which the model treats it as lost, so a bare retry
+cannot be relied on to persist a truncation.
+
+A power loss also kills every process. After `crash*` every lock is released,
+and each operation on a file handle opened before it fails with an
+`ErrorKind::Other` I/O error (the model's EIO) without changing the recovered
+state; dropping such a handle or lock releases nothing of the post-crash world.
+A test therefore cannot keep writing through, or syncing, a handle that a real
+power loss would have closed. A restart (`drop` + reopen, page cache intact)
+invalidates nothing. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 

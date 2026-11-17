@@ -77,7 +77,7 @@ max_ciphertext_size = 4124
 name = "one"
 url = "{url}"
 [crypto.grpc.metadata]
-authorization = {{ source = "file", name = "{}", format = "Bearer {{}} repeat={{}} repeat={{}}" }}
+authorization = {{ source = "file", name = "{}", format = "Bearer {{}} suffix=appended-after-the-credential" }}
 {later_metadata}[backing]
 root = "{}"
 "#,

@@ -259,8 +259,9 @@ documentation contract/link tests and the complete link check passed. This is
 procedure consistency, not new dirty-XFS qualification evidence.
 
 The automatic review's suspected unbuffered TLS KeyUpdate ordering failure on
-#63 was not reproduced. Existing `check_required_size` includes queued TLS
-records and `write_fragments` copies them before encrypting application data.
+#63 was not reproduced. Existing `check_required_size` (vendored rustls,
+`vendor/rustls/src/common_state.rs`) includes queued TLS records and
+`write_fragments` copies them before encrypting application data.
 [#72](https://github.com/seo-rii/maki/pull/72), commit `4a3712d`, adds real-peer
 low-record-limit regressions for direct output and exact-size retry after an
 insufficient buffer. Both ring and AWS-LC library suites passed (265 and 266

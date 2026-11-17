@@ -37,9 +37,13 @@ a multi-page write may leave an already completed prefix in the working view;
 retrying the write can complete it. A failed arena write or commit still requires
 reopening against the witness.
 A remote witness that cannot be reached (a timeout, a refused or reset
-connection, an unavailable quorum) refuses each operation with no fallback, but
-does not stop the session: the next check either matches the claimed record
-again or observes the change and stops it.
+connection, a local socket error such as the EPERM Linux returns from
+`connect()` when a firewall or a full conntrack table drops the connection, an
+unavailable quorum) refuses each operation with no fallback, but does not stop
+the session: the next check either matches the claimed record again or
+observes the change and stops it. Besides an observed change, only the
+witness's own denial, a predecessor conflict, an invalid answer or a TLS failure
+stops the session.
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.
@@ -63,7 +67,9 @@ client_key_file = "/etc/maki/witness/writer.key"
 
 Provision the independently managed authority and its writer/admin certificate
 allowlist as described in [remote witness operations](remote-witness-service.md).
-Private key files must be owner-only regular files. Requests use TLS 1.3 mutual
+Private key files must be owner-only regular files owned by root or by the user
+the loading process runs as (the daemon user for the writer key); a key owned
+by anyone else is refused whatever its mode. Requests use TLS 1.3 mutual
 authentication, bounded frames and deadlines. There is no offline fallback.
 The metadata service can use a local state directory with an exclusive lock or
 a replicated etcd quorum shared by stateless frontends. Identity-pinned endpoint
@@ -142,8 +148,16 @@ New creation synchronizes `remote.enrollment`, a versioned identity/capacity
 binding, before claiming the authority. Resume validates an existing binding
 against the approved configuration. A valid marker-only backing created by an
 older binary can acquire the missing binding through this explicit operation
-only while its authority has never activated. Recognized quiescent lower-fence candidates may be retired by the subsequent
-GC pass; live handles and unknown artifacts are preserved. An existing corrupt or truncated binding is
+only while its authority has never activated. A missing binding does not show
+that the root is unused: activated roots written by older binaries have none.
+Before binding the root or claiming the authority, resume therefore refuses a
+root that holds anything a never-activated authority cannot have written: a
+GC tombstone, or a namespace other than the one its current claim names whose
+manifest slots hold anything but this identity's empty initial candidate (or a
+torn part of it). Another volume's data under a mistaken `backing.root` is
+refused this way, and neither authority nor root changes. The subsequent GC
+pass may retire only the quiescent lower-fence candidates that check examined;
+live handles and unknown artifacts are preserved. An existing corrupt or truncated binding is
 refused; preserve or quarantine it for explicit operator investigation rather
 than automatically overwriting it or changing capacity to force progress.
 

@@ -23,7 +23,7 @@ pub struct SequenceConfig {
 pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), OracleViolation> {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
     let backing = CrashableBacking::new();
-    let file = backing.open("data", true).expect("open");
+    let mut file = backing.open("data", true).expect("open");
     let total = cfg.num_units * cfg.unit_size as u64;
     file.set_len(total).expect("set_len");
     file.sync_data().expect("sync");
@@ -70,10 +70,11 @@ pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), Oracle
                 file.sync_data().expect("sync");
                 model.flush();
             }
-            // crash + oracle check on every unit
+            // crash + oracle check on every unit; the crash killed the
+            // process, so the rest of the sequence uses a new handle
             _ => {
                 backing.crash(&mut rng);
-                let file = backing.open("data", false).expect("reopen");
+                file = backing.open("data", false).expect("reopen");
                 for unit in 0..cfg.num_units {
                     let actual = read_unit(file.as_ref(), unit);
                     model.crash_adopt(unit, &actual)?;

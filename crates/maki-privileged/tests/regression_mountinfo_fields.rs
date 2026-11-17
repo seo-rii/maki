@@ -77,3 +77,45 @@ fn mountinfo_preserves_unescaped_whitespace_in_path_and_source_fields() {
         assert_eq!(observed.mount_options, ["rw", "noatime"]);
     }
 }
+
+/// Linux emits path, source and type bytes other than space, tab, newline
+/// and backslash unescaped, so a foreign mount's fields need not be UTF-8.
+#[test]
+fn non_utf8_records_neither_fail_nor_hide_the_configured_mount() {
+    let path = configured_mountpoint("/srv/audit");
+    let foreign = b"36 27 0:61 / /home/user/fuse-\xff rw,nosuid - fuse.\xfe \xfd rw\n";
+    let table = [
+        foreign.as_slice(),
+        mountinfo(&path, "/dev/dm-0").as_bytes(),
+        foreign,
+    ]
+    .concat();
+    let observed = parse_mountinfo(&table, &path).expect("the volume stays visible");
+    assert_eq!(observed.fstype, "xfs");
+    assert_eq!(observed.major_minor, "253:0");
+    assert_eq!(observed.source, "/dev/dm-0");
+
+    // The mount at the path is still found when only its source is not
+    // UTF-8; the source is a probe hint, decoded lossily.
+    let table = [
+        format!("35 27 253:0 / {path} rw,noatime - xfs ").as_bytes(),
+        b"/dev/\xff rw\n",
+    ]
+    .concat();
+    let observed = parse_mountinfo(&table, &path).unwrap();
+    assert_eq!(observed.source, "/dev/\u{fffd}");
+    assert_eq!(observed.mount_options, ["rw", "noatime"]);
+}
+
+#[test]
+fn non_utf8_paths_match_only_their_exact_bytes() {
+    // A replacement character in a configured path is not the byte it
+    // would replace, raw or escaped: nothing decodes a path lossily.
+    let replacement = "/srv/audit\u{fffd}";
+    for raw in [b"/srv/audit\xff".as_slice(), b"/srv/audit\\377"] {
+        let table = [b"35 27 253:0 / ", raw, b" rw - xfs /dev/dm-0 rw\n"].concat();
+        assert!(parse_mountinfo(&table, replacement).is_none(), "{raw:?}");
+        assert!(parse_mountinfo(&table, "/srv/audit").is_none(), "{raw:?}");
+    }
+    assert!(parse_mountinfo(&mountinfo(replacement, "/dev/dm-0"), replacement).is_some());
+}

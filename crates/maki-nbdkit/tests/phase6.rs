@@ -250,8 +250,15 @@ fn clean_detach_flushes_checkpoints_and_releases_lock() {
     adapter.pwrite(&vec![0x77; 4096], 0, false).unwrap();
     adapter.shutdown().unwrap(); // flush + checkpoint + release
 
-    // Lock released: immediate re-attach succeeds; data durable even
-    // through a lose-everything crash (shutdown checkpointed).
+    // Lock released while the adapter still exists. Check it before the
+    // crash: a power loss releases every lock anyway.
+    drop(
+        backing
+            .try_lock(maki_format::layout::VOLUME_LOCK)
+            .expect("a clean detach must release the volume lock"),
+    );
+    // Immediate re-attach succeeds; data durable even through a
+    // lose-everything crash (shutdown checkpointed).
     backing.crash_all_lost();
     let adapter = adapter_over(&backing);
     let mut buf = vec![0u8; 4096];

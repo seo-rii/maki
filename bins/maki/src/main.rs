@@ -547,6 +547,10 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
             if identity.is_nil() {
                 return Err("approved storage identity must be nonzero".into());
             }
+            // Initialization records the provider in the new superblock.
+            // Refuse one this build cannot construct before asking the
+            // authority anything (M-008).
+            maki_nbdkit::daemon::check_provider_compiled(&cfg).map_err(|e| e.to_string())?;
             let before = witness_record(rpc.as_ref())?;
             if before.identity != *identity.as_bytes()
                 || before.fence != fence

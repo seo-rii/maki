@@ -75,7 +75,7 @@ impl Fixture {
     }
 
     fn observe(&self, mounts: &str) -> io::Result<DetachObservation> {
-        observe(&self.record, mounts, &self.root.join("sys"))
+        observe(&self.record, mounts.as_bytes(), &self.root.join("sys"))
     }
 
     fn partition(&self) {
@@ -243,4 +243,66 @@ fn mountinfo_unicode_whitespace_preserves_detach_mount_and_nested_identity() {
         let observed = fixture.observe(&nested).unwrap();
         assert!(observed.mounted && observed.nested);
     }
+}
+
+#[test]
+fn non_utf8_mount_records_are_compared_as_exact_bytes() {
+    let mut fixture = Fixture::new();
+    fixture.mapping("vg--maki-data--lv", "nbd3");
+    let sys = fixture.root.join("sys");
+    let record = |device: &str, path: &[u8], source: &[u8]| -> Vec<u8> {
+        [
+            format!("41 25 {device} / ").as_bytes(),
+            path,
+            b" rw - xfs ",
+            source,
+            b" rw\n",
+        ]
+        .concat()
+    };
+    let mountpoint = fixture.record.attachment.mountpoint.clone();
+    let mountpoint = mountpoint.as_bytes();
+    let volume = record("253:0", mountpoint, b"/dev/mapper/vg--maki-data--lv");
+
+    // An unrelated mount whose path, source and type are not UTF-8 neither
+    // fails the observation nor hides the volume.
+    let foreign = b"42 25 0:61 / /home/user/fuse-\xff rw,nosuid,nodev - fuse.\xfe \xfd rw\n";
+    let observed = observe(
+        &fixture.record,
+        &[foreign, volume.as_slice()].concat(),
+        &sys,
+    )
+    .unwrap();
+    assert!(observed.mounted && !observed.nested && observed.nbd_in_use);
+    // The volume is identified by device number, not by its source text.
+    assert!(
+        observe(
+            &fixture.record,
+            &record("253:0", mountpoint, b"/dev/\xff"),
+            &sys
+        )
+        .unwrap()
+        .mounted
+    );
+    // A direct mount of the NBD device at a non-UTF-8 path occupies it.
+    std::fs::remove_dir_all(fixture.root.join("sys/dm-0")).unwrap();
+    std::fs::remove_file(fixture.root.join("sys/nbd3/holders/dm-0")).unwrap();
+    let direct = record("43:3", b"/srv/\xff", b"/dev/nbd3");
+    assert!(observe(&fixture.record, &direct, &sys).unwrap().nbd_in_use);
+
+    // A non-UTF-8 name below the mountpoint is nested; one that only shares
+    // its text prefix is a sibling.
+    let below = record("0:62", &[mountpoint, b"/\xff"].concat(), b"tmpfs");
+    assert!(observe(&fixture.record, &below, &sys).unwrap().nested);
+    let sibling = record("0:62", &[mountpoint, b"\xff"].concat(), b"tmpfs");
+    let observed = observe(&fixture.record, &sibling, &sys).unwrap();
+    assert!(!observed.nested && !observed.mounted);
+
+    // A replacement character in the configured path never stands for an
+    // undecodable byte in the table.
+    let configured = format!("{}\u{fffd}", fixture.record.attachment.mountpoint);
+    fixture.record.attachment.mountpoint = configured;
+    let lookalike = record("0:62", &[mountpoint, b"\xff"].concat(), b"tmpfs");
+    let observed = observe(&fixture.record, &lookalike, &sys).unwrap();
+    assert!(!observed.mounted && !observed.nested);
 }

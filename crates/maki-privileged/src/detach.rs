@@ -36,6 +36,20 @@ pub(crate) fn device_number(value: &str) -> io::Result<(u32, u32)> {
     ))
 }
 
+/// A mountinfo `major:minor` field. The field is kernel-formatted digits;
+/// anything else fails the observation.
+pub(crate) fn mount_device_number(field: &[u8]) -> io::Result<(u32, u32)> {
+    device_number(std::str::from_utf8(field).map_err(|_| invalid("invalid kernel device number"))?)
+}
+
+/// Whether an unescaped mountinfo path lies strictly below `root`, compared
+/// by path component on the exact bytes (`/srv/pg-old` is not below
+/// `/srv/pg`; every other absolute path is below `/`).
+pub(crate) fn mounted_below(path: &[u8], root: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path != root.as_bytes() && Path::new(std::ffi::OsStr::from_bytes(path)).starts_with(root)
+}
+
 pub(crate) fn mapped_volume_group(name: &str) -> Option<String> {
     let mut group = String::new();
     let mut chars = name.chars().peekable();
@@ -111,7 +125,7 @@ fn depends_only_on(
 /// be able to block cleanup (R5-006); attach and `verify` still check it.
 pub(crate) fn observe(
     record: &BoundDeviceRecord,
-    mountinfo: &str,
+    mountinfo: &[u8],
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
     observe_kernel(record, mountinfo, sysfs)
@@ -120,7 +134,7 @@ pub(crate) fn observe(
 /// Kernel-only observation, shared by detach, rollback and recovery.
 pub(crate) fn observe_kernel(
     record: &BoundDeviceRecord,
-    mountinfo: &str,
+    mountinfo: &[u8],
     sysfs: &Path,
 ) -> io::Result<DetachObservation> {
     let nbd_index = crate::probe::nbd_index(&record.device)
@@ -176,29 +190,29 @@ pub(crate) fn observe_kernel(
 
     let mut mounted_device = None;
     let mut nested = false;
-    for line in mountinfo.lines().filter(|line| !line.trim().is_empty()) {
-        let (left, right) = line
-            .split_once(" - ")
+    for line in
+        crate::probe::mountinfo_lines(mountinfo).filter(|line| !line.trim_ascii().is_empty())
+    {
+        let (left, right) = crate::probe::split_record(line)
             .ok_or_else(|| invalid("incomplete mountinfo observation"))?;
         let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
         let filesystem: Vec<_> = crate::probe::mountinfo_fields(right).collect();
         if fields.len() < 6 || filesystem.len() < 3 {
             return Err(invalid("incomplete mountinfo observation"));
         }
-        let device = device_number(fields[2])?;
+        let device = mount_device_number(fields[2])?;
         // Partitions have their own holders directories, and direct
         // filesystem mounts are represented in mountinfo rather than in
         // holders. Neither may be mistaken for an entirely unused NBD.
         nbd_in_use |= nbd_devices.contains(&device);
         let mounted_path = crate::probe::unescape(fields[4]);
-        nested |= mounted_path != record.attachment.mountpoint
-            && Path::new(&mounted_path).starts_with(&record.attachment.mountpoint);
-        if mounted_path == record.attachment.mountpoint {
+        nested |= mounted_below(&mounted_path, &record.attachment.mountpoint);
+        if mounted_path == record.attachment.mountpoint.as_bytes() {
             // Every entry at the target must belong to the same complete
             // filesystem. A stacked or bind-subtree mount is not safe to
             // unmount as part of this recorded attachment.
-            if crate::probe::unescape(fields[3]) != "/"
-                || filesystem[0] != "xfs"
+            if crate::probe::unescape(fields[3]) != b"/"
+                || filesystem[0] != b"xfs"
                 || expected_lv_device != Some(device)
                 || mounted_device.is_some()
             {

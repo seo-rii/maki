@@ -287,7 +287,7 @@ documents.
   intervals are rejected without library panics. Admission waits without holding
   global capacity and reselects available peers. Rust 1.99 warnings are fixed;
   reproducible Rust 1.94 and latest-stable Linux/Windows jobs run independently.
-  See [regressions](docs/review-remediation.md#correctness-and-recovery-review-2026-10-12).
+  See [regressions](docs/review-remediation.md#correctness-and-recovery-review--2026-10-12).
 - **Bounded recovery slot-write amplification**: every historical record stays
   validated, while only each unit's latest sequence within the existing batch
   writes slot data; a last discard skips superseded writes. Allocation evidence,

@@ -39,6 +39,18 @@ pub mod layout {
     /// The journal writer's fdatasync high-water mark (see `journal::DurableMark`).
     pub const JOURNAL_DURABLE_MARK: &str = "journal/durable-mark";
 
+    /// Every volume metadata file at the root of the backing except
+    /// [`VOLUME_LOCK`]. Volume creation refuses a root that holds any of
+    /// them, so a new root-level file must be listed here.
+    pub const ROOT_METADATA: [&str; 6] = [
+        SUPERBLOCK_A,
+        SUPERBLOCK_B,
+        SHARD_CATALOG_A,
+        SHARD_CATALOG_B,
+        KEY_CANARY_A,
+        KEY_CANARY_B,
+    ];
+
     pub fn shard_data(shard: u64) -> String {
         format!("{DATA_DIR}/shard-{shard:08x}.dat")
     }

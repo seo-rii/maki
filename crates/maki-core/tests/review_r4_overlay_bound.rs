@@ -277,23 +277,25 @@ async fn a_zero_limit_keeps_the_overlay_unbounded_for_library_callers() {
     assert_eq!(stats.overlay_units, 48);
 }
 
-/// A write that another writer's volatile records keep out after its inline
-/// reclaim must sync and reclaim again, not fail with ENOSPC: a checkpoint
-/// retires only records up to the durable mark, so a non-FUA write that
-/// lands while the reclaim runs (the volume lock is released while slot data
-/// is written) is still in the overlay when the first writer retries. The
-/// minimum `max_overlay_bytes` promises that one maximal request always fits
-/// after a reclaim; it held only when no other writer ran concurrently.
+/// A write that arrives while another one reclaims inline must not make it
+/// fail with ENOSPC, nor fail itself: a checkpoint retires only records up to
+/// the horizon it captured, so a non-FUA write that appended while the
+/// reclaim ran (the volume lock is released while slot data is written) was
+/// still in the overlay when the first writer retried. The minimum
+/// `max_overlay_bytes` promises that one maximal request always fits after a
+/// reclaim; it held only when no other writer ran concurrently. The arriving
+/// write now queues behind the reclaiming one rather than appending into the
+/// space its checkpoint frees, so it is spawned here, not awaited inside the
+/// reclaim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_volatile_write_during_inline_reclaim_does_not_cause_enospc() {
     concurrent_write_during_inline_reclaim(false).await;
 }
 
-/// BUG-089: the same with a FUA (or flushed) concurrent write. Its records
-/// are durable but newer than the horizon the running checkpoint captured,
-/// so after the reclaim `durable == appended` and the overlay still holds
-/// them. That does not prove nothing more can be reclaimed: one more round
-/// retires them. Only a checkpoint covering every appended record does.
+/// BUG-089: the same with a FUA (or flushed) concurrent write. Records that
+/// are durable but newer than the horizon a running checkpoint captured mean
+/// `durable == appended` does not prove that nothing more can be reclaimed;
+/// only a checkpoint covering every appended record does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_fua_write_during_inline_reclaim_does_not_cause_enospc() {
     concurrent_write_during_inline_reclaim(true).await;
@@ -321,20 +323,23 @@ async fn concurrent_write_during_inline_reclaim(fua: bool) {
     engine.write(off(0), &data(1), false).await.unwrap();
     engine.write(off(1), &data(2), false).await.unwrap();
 
-    // While that reclaim writes slot data, a second writer adds two volatile
-    // units (it fits: 4 + 4 CT), which the reclaim cannot retire.
+    // While that reclaim writes slot data, a second writer arrives with two
+    // units (it would fit: 4 + 4 CT), which the reclaim could not retire.
     let injected = Arc::new(AtomicBool::new(false));
+    let concurrent = Arc::new(parking_lot::Mutex::new(None));
     let runtime = tokio::runtime::Handle::current();
     let other = engine.clone();
     let once = injected.clone();
+    let spawned = concurrent.clone();
     let _hook = failpoints::set(
         "checkpoint.slot_write",
         failpoints::FailpointAction::Callback(Arc::new(move || {
             if !once.swap(true, Ordering::SeqCst) {
-                let payload = vec![0xA5; 2 * UNIT as usize];
-                runtime
-                    .block_on(other.write(off(40), &payload, fua))
-                    .expect("the concurrent small write is admitted");
+                let other = other.clone();
+                *spawned.lock() = Some(runtime.spawn(async move {
+                    let payload = vec![0xA5; 2 * UNIT as usize];
+                    other.write(off(40), &payload, fua).await
+                }));
             }
             None
         })),
@@ -349,6 +354,11 @@ async fn concurrent_write_during_inline_reclaim(fua: bool) {
         injected.load(Ordering::SeqCst),
         "the reclaim ran and the hook fired"
     );
+    let concurrent = concurrent.lock().take().expect("the hook spawned a write");
+    concurrent
+        .await
+        .unwrap()
+        .expect("the concurrent small write is admitted");
     drop(_hook);
 
     let stats = engine.stats().await;

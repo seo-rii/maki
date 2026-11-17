@@ -20,8 +20,11 @@ Read [durable recovery and migration](durable-recovery.md) before replacing an
 existing installation. There is no automatic in-place format upgrade. Preserve
 an untouched source, old software and provider/key material, then use an
 isolated recovery copy and verified logical/DB-native transfer to a fresh v2
-volume. Do not remove proofs or change format bytes to bypass a refusal. The
-crypto context's `format_version` is unchanged by the envelope version.
+volume. Copy backing files with `cp --reflink=never`: a reflink copy shares
+extents with the source, which voids Maki's space reservation for both
+([backing store](deployment/support-matrix.md#backing-store-below-maki)). Do
+not remove proofs or change format bytes to bypass a refusal. The crypto
+context's `format_version` is unchanged by the envelope version.
 
 ## Prerequisites
 
@@ -78,11 +81,18 @@ maki check /etc/maki/volumes/example.toml
 
 `volume create` needs an empty backing root: it refuses a root whose `data/`,
 `journal/` or `checkpoint/` directory still holds a file, because an earlier
-volume's shards would otherwise be adopted and served by the new one.
-The superblock copies are written last, once everything else is durable, so a
-creation interrupted by a crash leaves no superblock: the root is not a volume.
-`volume create` refuses any files the interrupted run left in the layout
-directories until the root is emptied.
+volume's shards would otherwise be adopted and served by the new one, and a
+root that still holds an earlier volume's `superblock.*`, `shard-catalog.*` or
+`canary.*` (a stale key canary would otherwise fail the first attach as a key
+mismatch). A leftover `volume.lock` is accepted.
+The superblock copies are written last, once everything else is durable: a
+creation interrupted before it writes a superblock copy leaves a root that is
+not a volume, and `volume create` refuses any files the interrupted run left in
+the layout directories until the root is emptied. Once a copy is readable, a
+retried `volume create` reports `volume superblock already present`: the root
+is a complete volume, except that a failed or killed creation may have left
+that copy only in the page cache. The first attach makes both superblock copies
+durable before it accepts writes; empty the root instead to start over.
 
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing
@@ -147,10 +157,13 @@ stored structure and volume identity; actual key verification happens at
 attach. Combine these checks with provider authentication and application
 recovery/backup verification before accepting recovered data.
 
-`--deep` takes the volume lock and refuses to run while a daemon is attached;
-when checking a backing
-root directly, pass `--journal-segment-size` if the volume uses a non-default
-size.
+`--deep` takes the volume lock and refuses to run while a daemon is attached.
+When checking a backing root directly, `maki-check` needs no segment size:
+like recovery, it bounds each journal segment file by the largest file a
+writer can produce under any valid `journal_segment_size` (at most 1 GiB), so
+segments written before the setting was lowered stay readable. Its
+`--journal-segment-size` flag is still accepted, but no value within that
+limit changes the verdict.
 
 The deep report states one of three verdicts as an `info: deep check verdict:`
 line, printed before any `warning:` and `ERROR:` lines; the report ends with
@@ -278,6 +291,12 @@ Environment=MAKI_LOG=info,maki_core::engine=debug
 Lines carry the level, the target module and structured fields such as the
 volume, operation and error class. Keys, plaintext, credentials and request
 payloads are never passed to a log macro; `SecretBuffer` redacts itself.
+Dependencies that would print payloads or credentials at trace level
+(`tungstenite`, `tokio_tungstenite`, `reqwest`) are capped at `debug`, even
+under `MAKI_LOG=trace` or a directive that names them
+([observability](observability.md#logs)). The `tungstenite::protocol` subtree
+is capped at `info` because its debug output also includes the peer's close
+reason and reply frame. WebSocket handshake debug diagnostics remain available.
 Read the journal with `journalctl -u maki@<volume>.service`.
 
 ## Rootless userspace smoke test
@@ -447,10 +466,13 @@ nonempty VG system IDs, and cachevol layouts. This requires compatible LVM2
 report and scoped activation options.
 When `[lvm_identity]` is present, attach additionally requires the observed PV
 set and VG/target-LV UUIDs to equal the administrator pins before activation.
-Those pins become part of the trusted record; recovery rechecks them, and a
-grow or detach whose current configuration omits or changes them is refused
-before mutation. Omitting the table is supported only for compatibility and is
-outside the production profile. The checks do not coordinate host udev or other
+Those pins become part of the trusted record. Recovery does not read LVM
+metadata again: it checks the identity persisted from attach's report against
+the pins, and the live device-mapper mappings against that identity or the
+post-activation mapping proof. A grow or detach whose current configuration
+omits or changes them is refused before mutation. Omitting the table is
+supported only for compatibility and is outside the production profile. The
+checks do not coordinate host udev or other
 privileged processes. See [the support limits](storage-recovery.md#checking-lvm-before-activation)
 before using an existing partition layout or host activation policy.
 
@@ -629,9 +651,11 @@ RequiredBy=maki-workload@pg.target
 The `!` keeps the helper's root user/group credentials while retaining the
 service's other restrictions, including its filesystem view. The gate must
 still be able to read the trusted configuration/state and probe the verified LV
-under those restrictions. Keep the configuration root-controlled; this is not
-a generic sudo grant. A failed check prevents that start. Qualify the service's
-actual mount namespace and sandbox on the target host. A host check cannot establish which
+under those restrictions: it opens `/dev/<vg>/<lv>`, so the unit must not use
+`PrivateDevices=yes`, and any `DevicePolicy=` must allow reading that node.
+Keep the configuration root-controlled; this is not a generic sudo grant. A
+failed check prevents that start. Qualify the service's actual mount namespace
+and sandbox on the target host. A host check cannot establish which
 filesystem an existing container's bind mount exposes; stop and recreate those
 bindings through the workload recovery procedure. See the
 [gate's checks and limits](storage-recovery.md#checking-storage-before-each-workload-start).
@@ -856,6 +880,8 @@ the separate process in [durable recovery](durable-recovery.md).
    `maki-workload@<volume>.target` and wait until the workload, attach and daemon
    units are inactive. Run `maki check` before capture.
 2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
+   A same-host capture must copy data, not clone extents (`cp --reflink=never`;
+   see [backing store](deployment/support-matrix.md#backing-store-below-maki)).
    Capture the credential through the deployment's secret-backup mechanism,
    separately from ordinary logs and backups. Record hashes, Maki revision,
    volume UUID, provider identity, filesystem and LVM identities, tool versions,
@@ -1028,10 +1054,12 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
 - Volume directories are created `0700` and their files `0600`; a `file`
-  credential must be a regular file with mode `0600` or `0400`, or attach is
-  refused. A `credential` (systemd `LoadCredential=`) may also be `0440` when
-  its group is the daemon's own or root, as systemd 257 (Debian 13) writes
-  them; group write and any access by others are refused (R5-037).
+  credential must be a regular file with mode `0600` or `0400`, owned by root
+  or by the user the daemon runs as, or attach is refused. A `credential`
+  (systemd `LoadCredential=`) has the same owner rule and may also be `0440`
+  when its group is the daemon's own or root, as systemd 257 (Debian 13)
+  writes them; group write and any access by others are refused (R5-037).
+  An empty or whitespace-only credential is refused like a missing one.
 - The control socket is `0660` with `control.group`; administrators reach it
   through the `root:maki-admin` `/run/maki-control` tree, while the NBD
   socket stays behind `/run/maki` (`root:maki` 0750), which only the daemon

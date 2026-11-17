@@ -4,6 +4,8 @@
 //! The keystream is seeded from the provider key and (when context binding is
 //! enabled) the volume UUID, compatibility ID and unit index — so ciphertext
 //! moved to another unit or volume fails integrity, like a real bound AEAD.
+//! With integrity disabled neither the magic nor the CRC is checked: like an
+//! unauthenticated cipher, any ciphertext of the right length decrypts.
 //!
 //! Injection points: queued errors, per-call latency via a `Clock`, and
 //! deliberate contract misbehavior (reorder / drop / duplicate / oversize)
@@ -125,9 +127,12 @@ impl FakeCryptoProvider {
         self
     }
 
-    /// Disable the decrypt-side CRC check: like an unauthenticated cipher
-    /// (XTS), a wrong key then yields garbage plaintext without an error,
-    /// and `integrity` is reported `Absent`.
+    /// Disable the decrypt-side checks (magic and CRC): like an
+    /// unauthenticated cipher (XTS), every ciphertext of the right length
+    /// decrypts, so a wrong key or a zeroed, overwritten or damaged unit
+    /// yields garbage plaintext without an error. Only a wrong length is
+    /// still refused (`Integrity`), as XTS does. `integrity` is reported
+    /// `Absent`.
     pub fn with_integrity_check(mut self, on: bool) -> Self {
         self.integrity_check = on;
         self
@@ -138,6 +143,8 @@ impl FakeCryptoProvider {
         self
     }
 
+    /// Declare (and enforce, as a vendor endpoint would) the batch limits:
+    /// a larger batch is refused with `NonRetryableRequest`.
     pub fn with_max_batch(mut self, items: u32, bytes: u64) -> Self {
         self.max_batch_items = items;
         self.max_batch_bytes = bytes;
@@ -184,7 +191,16 @@ impl FakeCryptoProvider {
         out
     }
 
-    async fn common(&self, context: &CryptoContext, items: usize) -> Result<(), CryptoError> {
+    /// Checks every call makes before doing work. `plaintext_bytes` is what
+    /// the batch carries against `batch.max_bytes`: the plaintext sent for
+    /// an encrypt, one unit of plaintext per item for a decrypt (the
+    /// dispatcher sizes decrypt chunks the same way).
+    async fn common(
+        &self,
+        context: &CryptoContext,
+        items: usize,
+        plaintext_bytes: u64,
+    ) -> Result<(), CryptoError> {
         let latency = { self.latency.lock().clone() };
         if let Some((clock, d)) = latency {
             clock.sleep(d).await;
@@ -201,6 +217,12 @@ impl FakeCryptoProvider {
             return Err(CryptoError::NonRetryableRequest(format!(
                 "batch of {items} exceeds max_items {}",
                 self.max_batch_items
+            )));
+        }
+        if plaintext_bytes > self.max_batch_bytes {
+            return Err(CryptoError::NonRetryableRequest(format!(
+                "batch of {plaintext_bytes} plaintext bytes exceeds max_bytes {}",
+                self.max_batch_bytes
             )));
         }
         Ok(())
@@ -279,7 +301,10 @@ impl CryptoProvider for FakeCryptoProvider {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         let _guard = ConcurrencyGuard::enter(&self.current_calls, &self.max_concurrent);
         self.encrypt_calls.fetch_add(1, Ordering::SeqCst);
-        self.common(context, items.len()).await?;
+        let plaintext_bytes = items
+            .iter()
+            .fold(0u64, |sum, item| sum.saturating_add(item.data.len() as u64));
+        self.common(context, items.len(), plaintext_bytes).await?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let pt = item.data.expose();
@@ -310,7 +335,8 @@ impl CryptoProvider for FakeCryptoProvider {
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
         let _guard = ConcurrencyGuard::enter(&self.current_calls, &self.max_concurrent);
         self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
-        self.common(context, items.len()).await?;
+        let plaintext_bytes = (items.len() as u64).saturating_mul(u64::from(self.unit_size));
+        self.common(context, items.len(), plaintext_bytes).await?;
         let expected_len = (self.unit_size + self.overhead) as usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -322,7 +348,7 @@ impl CryptoProvider for FakeCryptoProvider {
                     expected_len
                 )));
             }
-            if &ct[0..4] != MAGIC {
+            if self.integrity_check && &ct[0..4] != MAGIC {
                 return Err(CryptoError::Integrity("bad magic".to_string()));
             }
             let crc = u32::from_le_bytes(ct[4..8].try_into().unwrap());

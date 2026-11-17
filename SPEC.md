@@ -604,8 +604,9 @@ Block-related concepts are separated.
 | `slot_size`           | physical slot size            |        calculated |
 
 The plugin MUST advertise the configured minimum, preferred, and maximum NBD
-I/O sizes. The minimum MUST be at most 64 KiB and the maximum MUST fit in the
-32-bit NBD field. Both configured and stored export sizes MUST be multiples
+I/O sizes. The minimum MUST be at most 64 KiB, the preferred size at most
+32 MiB (the largest nbdkit accepts), and the maximum MUST fit in the 32-bit NBD
+field. Both configured and stored export sizes MUST be multiples
 of the effective minimum I/O size; validation MUST refuse an inaccessible
 tail before creation or export. Read and write callbacks MUST reject zero-length,
 out-of-range, or minimum-misaligned requests before copying write plaintext or
@@ -661,16 +662,17 @@ catalog_ab_bytes        = 2 * (28 + 8 * num_shards)
 ```
 
 Geometry creation MUST reject more than 2^24 possible shards, matching the
-supported shard-catalog limit, and any capacity calculation that overflows an
-unsigned 64-bit byte count. `maki volume inspect` reports these five
-maximum-layout values. They exclude journal and checkpoint headroom,
-filesystem metadata and copy-on-write overhead, and application temporary
-space; they are not a full-volume physical reservation. Before accepting a
-journal record, a Linux backing MUST physically allocate the exact journal
-range and the record's complete checkpoint slot. Both allocation-map copies
-and the catalog entry of a newly touched shard MUST already be durable. A
-failed reservation MUST NOT consume a sequence or append the record. Untouched
-slots MAY remain sparse.
+supported shard-catalog limit, any capacity calculation that overflows an
+unsigned 64-bit byte count, and a unit count that reaches the reserved
+key-canary unit index (§27), which attach refuses. `maki volume inspect`
+reports these five maximum-layout values. They exclude journal and checkpoint
+headroom, filesystem metadata and copy-on-write overhead, and application
+temporary space; they are not a full-volume physical reservation. Before
+accepting a journal record, a Linux backing MUST physically allocate the exact
+journal range and the record's complete checkpoint slot. Both allocation-map
+copies and the catalog entry of a newly touched shard MUST already be durable.
+A failed reservation MUST NOT consume a sequence or append the record.
+Untouched slots MAY remain sparse.
 
 ---
 
@@ -804,18 +806,30 @@ batch layout
 timeouts
 ```
 
-Supported encodings:
+Supported payload encodings:
 
 ```text
-raw
-base64
-base64url
-hex-lower
+raw         (HTTP body or response type = "raw": the bytes themselves)
+base64      (RFC 4648 §4, padded; the default)
+base64url   (RFC 4648 §5, unpadded)
+hex-lower   (alias hex)
 hex-upper
-utf8
-integer
-uuid
 ```
+
+Only the payload is encoded. Every other HTTP field source has one fixed JSON
+representation and takes no `encoding`: `unit_index`, `format_version` and
+`batch_index` are unsigned JSON integers, `volume_id` is the lowercase
+hyphenated UUID string, and `compatibility_id` is a JSON string. WebSocket
+and gRPC use the fixed request schemas of their reference contracts.
+
+HTTP request mappings are validated exactly as the provider builds them:
+configuration validation MUST reject an unknown field source or payload
+encoding, an `encoding` on a non-payload source, a request pointer that does
+not start with `/`, and request pointers that would replace one another on
+the wire. Pointers are applied in order and replace what they address, so two
+pointers of one JSON object conflict when, after RFC 6901 decoding, one
+equals the other or addresses a field inside it; a batch `items_path` also
+conflicts with any top-level field at, under or above it.
 
 Batch result identity: every batch element a remote provider returns MUST
 carry the unit index of the request item it answers, in request order. Maki
@@ -837,12 +851,17 @@ for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
 `CryptoBatchRequest`. A provider that declares context binding MUST tie
 ciphertext to all of them. Maki's attach self-test probes each field
 separately (plus the unit index) and refuses attach when a foreign value
-decrypts to the original plaintext. A schema-level refusal is accepted only as
-`CryptoError::UnsupportedContext` for the exact field that probe changed:
-`FormatVersion` or `CompatibilityId`. A generic bad request, provider failure,
-or a refusal of another field does not prove context binding. Definitive
-`CryptoError::Integrity` or a valid changed plaintext also satisfies a context
-probe; an unavailable endpoint remains inconclusive.
+decrypts to the original plaintext. WebSocket and gRPC always send each
+item's unit index; an HTTP mapping that declares context binding MUST also
+map a per-item `unit_index` field (in `fields` of a per-item body, in
+`item_fields` of a batch, whose top-level fields belong to no item), and
+configuration validation rejects one that omits any of these fields. A
+schema-level refusal is accepted only as `CryptoError::UnsupportedContext` for
+the exact field that probe changed: `FormatVersion` or `CompatibilityId`. A
+generic bad request, provider failure, or a refusal of another field does not
+prove context binding. Definitive `CryptoError::Integrity` or a valid changed
+plaintext also satisfies a context probe; an unavailable endpoint remains
+inconclusive.
 
 Explicit schema refusals use HTTP status `422` or gRPC status
 `FailedPrecondition` with exactly one `maki-crypto-error` header/metadata value:
@@ -870,22 +889,11 @@ path = "/encrypt"
 type = "json"
 
 [crypto.http.encrypt.body.fields]
-"/data" = {
-    source = "payload",
-    encoding = "base64"
-}
-
-"/volume" = {
-    source = "volume_id"
-}
-
-"/profile" = {
-    source = "compatibility_id"
-}
-
-"/format" = {
-    source = "format_version"
-}
+"/data" = { source = "payload", encoding = "base64" }
+"/unit" = { source = "unit_index" }
+"/volume" = { source = "volume_id" }
+"/profile" = { source = "compatibility_id" }
+"/format" = { source = "format_version" }
 
 [crypto.http.encrypt.response]
 type = "json"
@@ -926,9 +934,11 @@ semaphore limits
 batch sizing
 ```
 
-The current runtime reload supports only `cache.max_bytes`, while
-`cache.mode = "read"`. It requires an integer byte count and refuses the change
-when the cache is disabled. Endpoint, credential, timeout, retry,
+The current runtime reload supports only `cache.max_bytes` and `cache.ttl`,
+while `cache.mode = "read"`. It requires an integer byte count, accepts an
+optional positive TTL (omitting it keeps the current TTL), validates both
+before applying either, and refuses the change when the cache is disabled or
+the payload has any other field. Endpoint, credential, timeout, retry,
 circuit-breaker, semaphore, and batch reload requests explicitly report that
 the change was not applied; use the restart and self-test procedure above.
 
@@ -1159,6 +1169,13 @@ A failed append MAY leave a partial physical tail, but subsequent appends and
 barriers MUST remove bytes beyond the last accepted record. Cleanup MUST stay
 pending until truncation and synchronization succeed, including before a roll.
 
+Segment creation MUST NOT extend a new segment file before its header is
+written. A header write that persists only a prefix then leaves a file shorter
+than a header, a creation crash that recovery discards, whereas a complete
+header that fails validation is durable damage. The header's storage is
+allocated by its write and made durable by the creation's data sync, before any
+record of the segment is reserved or accepted.
+
 Tracked state includes:
 
 ```text
@@ -1260,8 +1277,8 @@ fsync journal directory
 Checkpoints MUST run automatically, not only at detach. Triggers:
 
 ```text
-journal bytes on disk >= journal_max_bytes / 2       (background worker)
-backing free space   <  checkpoint_reserve_bytes     (background worker)
+journal bytes on disk >= journal_max_bytes / 2       (background worker, syncs first)
+backing free space   <  checkpoint_reserve_bytes     (background worker, syncs first)
 interval elapsed with unapplied records              (background worker, syncs first)
 write would exceed journal_max_bytes                 (inline, before the append)
 ```
@@ -1273,7 +1290,10 @@ projected journal footprint of that write, MUST fail with ENOSPC; reads
 continue. This admission check is enabled when
 `journal_emergency_reserve_bytes` is nonzero. An unavailable or failed
 free-space query
-MUST fail write admission while that reserve is enabled. A failed checkpoint
+MUST fail write admission while that reserve is enabled. Space an inline
+checkpoint frees MUST remain available to the write that ran it: other writes
+wait behind that write instead of appending into it, so concurrent writers
+cannot turn a reclaimable bound into ENOSPC. A failed checkpoint
 MUST be visible as a degraded volume state until a later checkpoint succeeds.
 
 ---
@@ -1294,6 +1314,10 @@ read shard catalog and allocation metadata
 load selected checkpoint state
  ↓
 scan journal and validate the required sequence and exact record-end boundary
+ ↓
+make the selected superblock durable in both copies: rewrite each valid copy
+from its exact validated bytes and sync it and the root directory, selected
+copy first, then complete a missing or invalid copy through the A/B store
  ↓
 persist selected checkpoint state and apply approved metadata repairs
  ↓
@@ -1325,6 +1349,14 @@ required horizon. Missing its entire segment or truncating it at an earlier
 complete-record boundary MUST fail. A proof's segment may have been pruned only
 when the checkpoint covers its horizon. Required-horizon validation MUST precede
 recovery metadata changes and tail repairs.
+
+The superblock is the volume's commit point, yet a creation that failed or was
+killed after writing a copy, or a process restart, can leave a CRC-valid copy
+only in the page cache. Writable recovery MUST make the selected superblock
+durable in both copies before any other recovery write and before READY. It
+MUST NOT re-encode a valid copy and MUST make the selected copy durable before
+touching the other, so an interruption at any point never destroys a copy that
+was already durable. Read-only checks and inspection MUST NOT write it.
 
 Damage beyond the required final-tail boundary MAY be treated as torn unsynced
 data. An intact later record MUST NOT be used to infer earlier durability:
@@ -1543,6 +1575,7 @@ CLOSED / OPEN
 Default:
 
 ```toml
+[crypto.circuit_breaker]
 failure_threshold = 8
 open_initial = "1s"
 open_max = "30s"
@@ -1731,9 +1764,12 @@ NBD candidates and the discovered VG UUID. For the production profile, the
 root-owned attachment configuration MUST also provide the complete PV UUID set,
 VG UUID and configured target-LV UUID in `[lvm_identity]`; any mismatch MUST
 refuse activation. These administrator pins are part of the trusted attachment
-identity and MUST be rechecked during recovery. Grow and detach MUST refuse a
-configuration that removes or changes them. Omitting the table remains a
-compatibility mode and does not satisfy this production requirement. The helper
+identity. Recovery does not read LVM metadata again: it MUST refuse a persisted
+pre-activation identity that does not match the pins, and MUST hold the live
+mappings to that identity or to the post-activation mapping proof, as described
+below. Grow and detach MUST refuse a configuration that removes or changes them.
+Omitting the table remains a compatibility mode and does not satisfy this
+production requirement. The helper
 durably records the verified live identity before activation and replaces it
 with the complete mapping proof after activation. If activation outlives the
 helper, ordinary detach may

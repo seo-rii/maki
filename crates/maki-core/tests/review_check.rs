@@ -266,6 +266,32 @@ fn deep_check_tolerates_a_torn_tail_and_reports_the_repair() {
     .unwrap();
 }
 
+/// The durable mark is advisory and often lost in the crash it describes.
+/// Without it, recovery proves the final segment only as far as the durable
+/// proof names it, otherwise only its header, and never classifies damage by
+/// what follows it (M-007, S-04). The deep check must report that rule, not
+/// a heuristic recovery no longer uses.
+#[test]
+fn deep_check_reports_the_rule_recovery_uses_without_a_durable_mark() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    vol.write_ct(0, &ct(1), true).unwrap();
+    drop(vol);
+    backing.remove(layout::JOURNAL_DURABLE_MARK).unwrap();
+
+    let report = deep(&backing);
+    assert!(report.ok(), "{}", errors(&report));
+    let mark = report
+        .info
+        .iter()
+        .find(|i| i.starts_with("durable mark:"))
+        .unwrap_or_else(|| panic!("no durable-mark line in {:?}", report.info));
+    assert!(!mark.contains("heuristic"), "{mark}");
+    assert!(mark.contains("durable proof"), "{mark}");
+    assert!(mark.contains("only its header"), "{mark}");
+}
+
 #[test]
 fn deep_check_refuses_to_race_an_attached_volume() {
     let _guard = failpoints::test_lock();
