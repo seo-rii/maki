@@ -28,10 +28,12 @@ create a shard, reserve a slot, or append another journal record. "Already
 zero" is decided from the slot header alone, so a discard never reads the
 payload; a unit whose payload or header is damaged is retired by its tombstone
 instead of failing the discard with EIO (R5-012). Discard admission needs only
-the emergency reserve, not the checkpoint headroom (R5-011). That lets a trim
-return space the filesystem freed before the backing ran low; it is not a way
-out of low space, because freeing more (deleting files) needs writes, which
-are refused inside the headroom.
+the emergency reserve, not the checkpoint headroom (R5-011), so a raw discard
+of the exported device is still admitted inside the headroom. A filesystem on
+the volume cannot use that: deleting a file needs writes, and XFS `fstrim`
+forces a log write before it discards, so both are refused there
+([known limitations](status.md#known-limitations)); free space on the backing
+filesystem instead.
 
 NBD WRITE_ZEROES is not a hint: every byte in its range reads as zero
 afterwards, on every volume. The plugin handles it natively in requests of at
