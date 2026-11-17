@@ -1,13 +1,15 @@
 //! Key-source abstraction (SPEC §9, §44).
 //!
-//! Missing or malformed credentials fail closed (`ProviderFatal`); key bytes
-//! travel in `SecretBuffer` and are never logged.
+//! Missing, blank or malformed credentials fail closed (`ProviderFatal`);
+//! key bytes travel in `SecretBuffer` and are never logged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use maki_crypto::{CryptoError, SecretBuffer};
 
+/// Every source here refuses a credential that is empty or holds only
+/// whitespace, for `load` and `load_text` alike (SPEC §44).
 pub trait KeySource: Send + Sync {
     /// Key material: a stored pure hex string is decoded (sources may keep
     /// binary keys as hex).
@@ -37,10 +39,9 @@ impl MapKeySource {
 
 impl KeySource for MapKeySource {
     fn load(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
-        self.map
-            .get(name)
-            .map(|b| SecretBuffer::from_slice(b))
-            .ok_or_else(|| missing(name))
+        let stored = self.map.get(name).ok_or_else(|| missing(name))?;
+        ensure_present(name, stored)?;
+        Ok(SecretBuffer::from_slice(stored))
     }
 
     fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
@@ -52,8 +53,27 @@ fn missing(name: &str) -> CryptoError {
     CryptoError::ProviderFatal(format!("credential {name:?} unavailable — failing closed"))
 }
 
+/// A blank credential is a missing one (SPEC §44): an empty file or
+/// variable, or one holding only whitespace (a token file truncated by a
+/// failed rotation), would otherwise be sent as `Authorization: Bearer `
+/// with no token. Whitespace is what `str::trim` removes, the trimming the
+/// header and metadata builders apply, so no value they would reduce to
+/// nothing is ever returned. `stored` is the credential as stored, before
+/// any hex decoding; the check borrows it and never copies it.
+fn ensure_present(name: &str, stored: &[u8]) -> Result<(), CryptoError> {
+    if std::str::from_utf8(stored).is_ok_and(|text| text.trim().is_empty()) {
+        return Err(CryptoError::ProviderFatal(format!(
+            "credential {name:?} is empty or only whitespace — failing closed"
+        )));
+    }
+    Ok(())
+}
+
 /// Reads credentials from a directory of files: systemd `LoadCredential`
-/// (`$CREDENTIALS_DIRECTORY`) or a root-only secret directory.
+/// (`$CREDENTIALS_DIRECTORY`) or a root-only secret directory. On Unix every
+/// file must be a regular file owned by root or by the user this process
+/// runs as, and not accessible to others (see `new` and
+/// `credentials_directory` for the group rule).
 ///
 /// `load` uses file content raw, except when it is a pure even-length hex
 /// string (optionally newline-terminated), which is decoded; `load_text`
@@ -67,7 +87,8 @@ pub struct FileKeySource {
 }
 
 impl FileKeySource {
-    /// A root-only secret directory: files must be 0600 or 0400.
+    /// A root-only secret directory: files must be 0600 or 0400 and owned
+    /// by root or by the process's effective user.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -80,7 +101,9 @@ impl FileKeySource {
     /// `LoadCredential=` files with mode 0440 for the service's group. Group
     /// read is accepted when the file's group is the process's effective
     /// group or root; group write and any access by others are still
-    /// refused (R5-037).
+    /// refused (R5-037). The owner rule is the same as for `new`: the
+    /// service manager writes these files owned by root or by the service
+    /// user, so a file owned by anyone else is not one systemd put there.
     pub fn credentials_directory(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -148,6 +171,23 @@ fn read_guarded(mut file: std::fs::File, expected_len: u64) -> std::io::Result<S
     Ok(raw)
 }
 
+/// Why a secret file's owner cannot be trusted, or `None` when it is root
+/// or the effective user of this process. SPEC §9 asks for a *root-only*
+/// secret file, and a file's owner can read and rewrite it whatever its
+/// mode: a `0600` key owned by an unprivileged user is that user's to read
+/// or replace, so a root process must not load it. A process running as
+/// the service user may still load its own files.
+#[cfg(unix)]
+pub fn untrusted_secret_owner(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let owner = meta.uid();
+    (owner != 0 && owner != euid).then(|| {
+        format!("is owned by uid {owner}, not by root or this process's user (uid {euid})")
+    })
+}
+
 /// Open a credential file once and describe the opened descriptor, so the
 /// checks and the read concern the same file. On Unix the open neither
 /// follows a symlink (`O_NOFOLLOW`) nor blocks on a FIFO without a writer
@@ -188,14 +228,15 @@ impl FileKeySource {
             )));
         }
         let path = self.dir.join(name);
-        // SPEC §9: a file credential is a *root-only secret file*. Any group
-        // or other access, or anything but a regular file (a symlink to
+        // SPEC §9: a file credential is a *root-only secret file*. A file
+        // owned by anyone but root or this process's user, any group or
+        // other access, or anything but a regular file (a symlink to
         // somewhere else, a FIFO), is refused rather than loaded. The one
-        // exception is systemd's credentials directory: from systemd 257,
-        // LoadCredential files are 0440 for the service's group, so group
-        // read (never write) is accepted there when the file's group is the
-        // process's effective group or root (R5-037). The checks run on the
-        // opened descriptor (see `open_credential`).
+        // exception to the mode rule is systemd's credentials directory:
+        // from systemd 257, LoadCredential files are 0440 for the service's
+        // group, so group read (never write) is accepted there when the
+        // file's group is the process's effective group or root (R5-037).
+        // The checks run on the opened descriptor (see `open_credential`).
         let (file, meta) = match open_credential(&path) {
             Ok(opened) => opened,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -209,6 +250,13 @@ impl FileKeySource {
             if !meta.file_type().is_file() {
                 return Err(CryptoError::ProviderFatal(format!(
                     "credential {name:?} is not a regular file"
+                )));
+            }
+            if let Some(owner) = untrusted_secret_owner(&meta) {
+                return Err(CryptoError::ProviderFatal(format!(
+                    "credential file {name:?} {owner}: its owner can read or replace it \
+                     whatever its mode; a secret file must belong to root or to the service \
+                     user (SPEC 9)"
                 )));
             }
             use std::os::unix::fs::MetadataExt;
@@ -240,7 +288,9 @@ impl FileKeySource {
                 "credential {name:?} is not a regular file"
             )));
         }
-        read_guarded(file, meta.len()).map_err(|_| missing(name))
+        let raw = read_guarded(file, meta.len()).map_err(|_| missing(name))?;
+        ensure_present(name, raw.expose())?;
+        Ok(raw)
     }
 }
 
@@ -283,17 +333,18 @@ impl KeySource for EnvKeySource {
         // only, SPEC §9); the key is copied into guarded memory and the
         // intermediate string is erased.
         let mut value = std::env::var(&var).map_err(|_| missing(name))?;
-        let key = key_from_bytes(value.as_bytes());
+        let key = ensure_present(name, value.as_bytes()).map(|()| key_from_bytes(value.as_bytes()));
         zeroize::Zeroize::zeroize(&mut value);
-        Ok(key)
+        key
     }
 
     fn load_text(&self, name: &str) -> Result<SecretBuffer, CryptoError> {
         let var = env_var_name(name);
         let mut value = std::env::var(&var).map_err(|_| missing(name))?;
-        let text = SecretBuffer::from_slice(value.as_bytes());
+        let text = ensure_present(name, value.as_bytes())
+            .map(|()| SecretBuffer::from_slice(value.as_bytes()));
         zeroize::Zeroize::zeroize(&mut value);
-        Ok(text)
+        text
     }
 }
 

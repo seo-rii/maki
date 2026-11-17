@@ -111,7 +111,8 @@ with the same fields. WebSocket and gRPC require `client_cert_file` and
 router. Omit both for server-only TLS. HTTP also retains support for a combined
 certificate/private-key PEM in `client_cert_file`; such a file is a secret file
 like a `file` credential: it is opened without following a symlink and, when it
-holds a private key, must not be readable by group or others (0600 or 0400).
+holds a private key, must be owned by root or by the user the process runs as
+and must not be readable by group or others (0600 or 0400).
 Every TLS file must be a regular file of at most 1 MiB; CA bundles and
 certificates paired with `client_key` may be symlinks. A CA bundle, or a
 WebSocket/gRPC `client_cert_file`, that contains a private key is refused at
@@ -283,6 +284,13 @@ systemd 257 and later write those files `0440` for the service's group, which
 Maki accepts in the credentials directory only (R5-037). The
 privileged attach helper has no crypto dependency and no credential directive.
 
+A `file` credential must be a regular file with mode `0600` or `0400`, and
+every credential file, in the credentials directory too, must be owned by root
+or by the user the loading process runs as (the daemon user for the packaged
+service). A file owned by any other user is refused whatever its mode, because
+its owner can read or replace it; a process run as root therefore refuses a
+key owned by the daemon user, so run it as that user instead.
+
 Every credential reference is loaded from exactly the `source` it declares:
 `credential` reads `$CREDENTIALS_DIRECTORY/<name>` and fails closed when the
 directory is unset, `file` reads the named file (an absolute path: a relative
@@ -299,6 +307,10 @@ Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
 and metadata values, so a token generated with `openssl rand -hex 32` is sent
 as that hex text.
+A credential that is empty or holds only whitespace is refused like a missing
+one, whatever its source and use, so a token file truncated by a failed
+rotation stops attach instead of sending a header or metadata value without
+its token.
 A header or metadata reference may add `format`, a template with exactly one
 `{}` placeholder that the credential replaces (`format = "Bearer {}"`). The
 rest of the template is sent literally, so never put a secret there.

@@ -2,9 +2,10 @@
 //! combined certificate/private-key PEM (`client_cert_file` without
 //! `client_key`, HTTP only) holds the mTLS private key, so it must pass the
 //! same checks as a `file` credential: opened once without following a
-//! symlink, a regular file, and not readable by group or others. Any TLS
-//! file must be a regular file, so a FIFO cannot hang attach. Certificates
-//! and CA bundles may still be symlinks (`/etc/ssl/certs`, certbot).
+//! symlink, a regular file owned by root or the process's user, and not
+//! readable by group or others. Any TLS file must be a regular file, so a
+//! FIFO cannot hang attach. Certificates and CA bundles may still be
+//! symlinks (`/etc/ssl/certs`, certbot).
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -106,4 +107,31 @@ fn a_private_key_in_a_certificate_only_file_is_refused() {
             "{section} {what}: {error}"
         );
     }
+}
+
+/// SPEC §9: a secret file is root-only. The owner of a file can read and
+/// rewrite it whatever its mode, so a `0600` combined identity PEM owned by
+/// an unprivileged user is no secret file when root loads it: that user can
+/// read the mTLS private key or swap in their own identity. The owner must
+/// be root or the process's own user, as for a `file` credential.
+#[test]
+fn a_combined_identity_pem_owned_by_another_user_is_refused() {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("needs root to chown the fixture to uid 65534; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("id.pem");
+    write(&path, &identity_pem(), 0o600);
+    std::os::unix::fs::chown(&path, Some(65534), Some(65534)).unwrap();
+    // Never print the bytes on failure: they hold a private key.
+    let Err(error) = read_tls_file("http", "client_cert_file", path.to_str().unwrap(), true) else {
+        panic!("a combined identity PEM owned by uid 65534 was accepted");
+    };
+    assert!(error.to_string().contains("owned by uid 65534"), "{error}");
+    // A certificate-only file in the combined slot is not a secret.
+    let identity = rcgen::generate_simple_self_signed(vec!["maki-client".into()]).unwrap();
+    write(&path, identity.cert.pem().as_bytes(), 0o644);
+    read_tls_file("http", "client_cert_file", path.to_str().unwrap(), true).unwrap();
 }
