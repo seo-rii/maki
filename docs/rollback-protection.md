@@ -136,6 +136,17 @@ to create an inner v3 volume; the default initializes an inner v2 volume.
 This command completes normal initial volume creation after recovering the
 outer backing's enrollment.
 
+Run both commands as root: the administrator key must stay unreadable to the
+daemon user. `resume-enrollment` creates the new writer namespace owner-only
+(`0700` directories, `0600` files) as root, so the daemon cannot open it until
+the backing is handed back, as after takeover or restore
+([remote witness operations](remote-witness-service.md#snapshot-takeover-and-restore)).
+Do that before the next start:
+
+```sh
+chown -R maki:maki /var/lib/maki/protected
+```
+
 The authority must have `current = null`; successful first activation makes
 that condition permanently unavailable. Recovery compares the full inspected
 record, requires administrator credentials and selects a higher fence with a
@@ -475,10 +486,12 @@ later cleanup; the lock is removed last. The current directory and independent
 external snapshot directories are never cleanup targets. See
 [durable recovery](durable-recovery.md) for the persistence boundary.
 
-To retry cleanup after old handles close, without claiming a writer:
+To retry cleanup after old handles close, without claiming a writer, run GC
+with the writer configuration as the daemon user (a process run as root
+refuses the daemon-owned writer key):
 
 ```sh
-maki volume gc /etc/maki/protected-writer.toml
+sudo -u maki maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and

@@ -203,10 +203,15 @@ accessible to group/others (`0600` is appropriate), and must be owned by root
 or by the user the loading process runs as. A key owned by any other user is
 refused whatever its mode, because its owner can read or replace it; a process
 run as root therefore refuses a key owned by the service or daemon user. Run
-the server as its service account, and run `maki volume witness` with the
-daemon's writer configuration as the daemon user (`sudo -u maki`), or use the
-administrator configuration as root. Certificates and CA bundles may have any
-owner. The key loader accepts one
+the server as its service account. The remote `maki volume` commands load
+their configuration's client key before they contact the authority, so run
+`witness`, `snapshot` and `gc` with the daemon's writer configuration as the
+daemon user (`sudo -u maki`); a snapshot also needs a backup directory that
+user can create. `witness` may instead use the administrator configuration as
+root. `takeover`, `restore` and `resume-enrollment` need the administrator
+configuration: run them as root and then hand the new writer namespace back
+([below](#snapshot-takeover-and-restore)). Certificates and CA bundles may have
+any owner. The key loader accepts one
 unencrypted PKCS#8, PKCS#1 RSA or SEC1 EC PEM block. Encrypted keys, bag
 attributes, extra blocks and trailing non-whitespace text are refused.
 Private-key PEM, base64 scratch and decoded DER are erased on drop; the pinned
@@ -319,16 +324,19 @@ connection, is a transport failure like a refused connection, not a denial.
 Inspect through the configured client without claiming a session:
 
 ```sh
-maki volume witness /etc/maki/volume-writer.toml
+sudo -u maki maki volume witness /etc/maki/volume-writer.toml
 ```
 
 ## Snapshot, takeover and restore
 
 Stop the volume daemon before an ordinary snapshot while keeping the authority
-online. Snapshot refuses a live writer and an occupied backup directory:
+online. Snapshot refuses a live writer and an occupied backup directory. Run it
+as the daemon user, who owns the writer key (a process run as root refuses
+that key), into a location that user can create:
 
 ```sh
-maki volume snapshot /etc/maki/volume-writer.toml /backup/maki/snapshot-001
+install -d -o maki -g maki -m 0700 /backup/maki
+sudo -u maki maki volume snapshot /etc/maki/volume-writer.toml /backup/maki/snapshot-001
 ```
 
 The command copies authenticated committed data, durably writes the bounded
@@ -441,10 +449,11 @@ for the compatibility and initialization limits.
 ## Retire old writer namespaces
 
 A GC pass runs automatically after successful remote activation. To collect
-again after old processes have exited, run:
+again after old processes have exited, run it with the writer configuration as
+the daemon user (a process run as root refuses the daemon-owned writer key):
 
 ```sh
-maki volume gc /etc/maki/volume-writer.toml
+sudo -u maki maki volume gc /etc/maki/volume-writer.toml
 ```
 
 The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
