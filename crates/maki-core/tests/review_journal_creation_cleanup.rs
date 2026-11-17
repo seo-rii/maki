@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use maki_backing::{Backing, BackingFile, VolumeLock};
 use maki_core::volume::{Volume, VolumeOptions};
+use maki_format::journal::{DurableMark, SegmentHeader, SEGMENT_HEADER_SIZE};
 use maki_format::{geometry::Geometry, init, layout, superblock::Superblock};
 use maki_test_support::{failpoints, CrashableBacking};
 
@@ -346,35 +347,83 @@ fn cleanup_then_process_restart_does_not_need_to_recover_the_failed_creation() {
     }
 }
 
-/// A torn header prefix leaves a file shorter than a header, which recovery
-/// discards (`review_journal_torn_header.rs`). A *complete* header that fails
-/// its checksum is different: it reached the disk whole and was damaged
-/// there, which recovery cannot tell from damage to a segment that once held
-/// acknowledged records, so it must refuse it even though this creation
-/// failed and its cleanup never finished.
+/// Fail a creation whose whole header reached the disk before the write
+/// reported its error, leave its cleanup unfinished (the unlink fails), and
+/// damage the persisted header in place. Returns the left-over file.
+fn leave_damaged_creation(
+    backing: &CreationBacking,
+    volume: &mut Volume,
+    successor: bool,
+) -> Arc<dyn BackingFile> {
+    backing.faults.remove.store(true, Ordering::SeqCst);
+    backing.faults.complete_header.store(true, Ordering::SeqCst);
+    fail_creation(backing, volume, successor);
+    let file = backing.inner.open(&backing.target, false).unwrap();
+    let mut header = [0u8; SEGMENT_HEADER_SIZE];
+    file.read_at(0, &mut header).unwrap();
+    assert!(SegmentHeader::decode(&header).is_ok());
+    header[12] ^= 0x40; // media damage inside the persisted header
+    file.write_at(0, &header).unwrap();
+    file.sync_data().unwrap();
+    backing.faults.remove.store(false, Ordering::SeqCst);
+    file
+}
+
+/// A file exactly one header long, at the index the failed creation was
+/// writing, holds no record byte, and that index lies above every segment
+/// the durable proof and mark name: nothing acknowledged can live there.
+/// Recovery discards it whether its header is a torn prefix (as writers that
+/// preallocated the header left it, `review_journal_legacy_torn_header.rs`)
+/// or whole and damaged, which its bytes cannot tell apart.
+#[test]
+fn an_unremoved_damaged_header_only_creation_is_discarded_after_power_loss() {
+    let _serial = failpoints::test_lock();
+    for successor in [false, true] {
+        let (backing, mut volume) = fixture(successor, false);
+        drop(leave_damaged_creation(&backing, &mut volume, successor));
+        let volume = crash_recover(&backing, volume, successor);
+        assert!(!backing.exists(&backing.target).unwrap());
+        let failed = if successor { 3 } else { 0 };
+        assert!(volume.read_ct(failed).unwrap().is_none());
+    }
+}
+
+/// An invalid header recovery cannot prove empty and unnamed is durable
+/// damage, even though this creation failed and its cleanup never finished:
+/// one followed by bytes that could be a record, or one at an index the
+/// durable mark names (as after a creation that completed).
 #[test]
 fn an_unremoved_invalid_header_still_fails_closed_after_power_loss() {
     let _serial = failpoints::test_lock();
     for successor in [false, true] {
-        let (backing, mut volume) = fixture(successor, false);
-        backing.faults.remove.store(true, Ordering::SeqCst);
-        backing.faults.complete_header.store(true, Ordering::SeqCst);
-        fail_creation(&backing, &mut volume, successor);
-        let file = backing.inner.open(&backing.target, false).unwrap();
-        let mut header = [0u8; maki_format::journal::SEGMENT_HEADER_SIZE];
-        file.read_at(0, &mut header).unwrap();
-        assert!(maki_format::journal::SegmentHeader::decode(&header).is_ok());
-        header[12] ^= 0x40; // media damage inside the persisted header
-        file.write_at(0, &header).unwrap();
-        file.sync_data().unwrap();
-        drop(file);
-        drop(volume);
-        backing.faults.remove.store(false, Ordering::SeqCst);
-        backing.inner.crash_all_lost();
-        let error = Volume::recover(backing.clone(), options())
-            .err()
-            .expect("invalid nonzero segment headers must not be discarded as crash artifacts");
-        assert!(error.to_string().contains("invalid header"));
+        for marked in [false, true] {
+            let (backing, mut volume) = fixture(successor, false);
+            let file = leave_damaged_creation(&backing, &mut volume, successor);
+            if marked {
+                let mark = backing
+                    .inner
+                    .open(layout::JOURNAL_DURABLE_MARK, true)
+                    .unwrap();
+                let named = DurableMark {
+                    segment_index: u64::from(successor),
+                    durable_size: SEGMENT_HEADER_SIZE as u64,
+                };
+                mark.write_at(0, &named.encode()).unwrap();
+                mark.sync_data().unwrap();
+                backing.inner.sync_dir(layout::JOURNAL_DIR).unwrap();
+            } else {
+                file.write_at(SEGMENT_HEADER_SIZE as u64, &[0x5a]).unwrap();
+                file.sync_data().unwrap();
+            }
+            drop(file);
+            drop(volume);
+            backing.inner.crash_all_lost();
+            let error = Volume::recover(backing.clone(), options()).err().expect(
+                "an invalid header recovery cannot prove empty and unnamed must not be \
+                 discarded as a crash artifact",
+            );
+            assert!(error.to_string().contains("invalid header"), "{error}");
+        }
     }
 }
 

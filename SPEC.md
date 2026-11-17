@@ -1185,9 +1185,10 @@ pending until truncation and synchronization succeed, including before a roll.
 Segment creation MUST NOT extend a new segment file before its header is
 written. A header write that persists only a prefix then leaves a file shorter
 than a header, a creation crash that recovery discards, whereas a complete
-header that fails validation is durable damage. The header's storage is
-allocated by its write and made durable by the creation's data sync, before any
-record of the segment is reserved or accepted.
+header that fails validation is durable damage outside the one header-only
+case §27 discards (which writers that extended the file first could leave).
+The header's storage is allocated by its write and made durable by the
+creation's data sync, before any record of the segment is reserved or accepted.
 
 Tracked state includes:
 
@@ -1369,6 +1370,17 @@ required horizon. Missing its entire segment or truncating it at an earlier
 complete-record boundary MUST fail. A proof's segment may have been pruned only
 when the checkpoint covers its horizon. Required-horizon validation MUST precede
 recovery metadata changes and tail repairs.
+
+A final segment that holds no record and that no durable evidence names is an
+unfinished creation: one shorter than a header or entirely zero that neither
+the proof nor the durable mark names, or one exactly one header long whose
+header fails its checksum at an index above the segments the proof and the
+mark name. Recovery MUST discard it, removing it and syncing the journal
+directory before the writer resumes. Every acknowledged record lies at or
+below the proof's horizon, in the segment the proof names or an earlier one,
+and the mark names a segment only once its creation completed, so no
+acknowledged record is lost. Any other invalid segment header, including a
+checksum-valid one that does not decode, MUST fail recovery.
 
 The superblock is the volume's commit point, yet a creation that failed or was
 killed after writing a copy, or a process restart, can leave a CRC-valid copy
