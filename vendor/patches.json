@@ -113,7 +113,7 @@
         "tests/maki_allocator.rs": "4ed253579b7836110e2b3c9859d9c1376be040a5d615fae6153f8cb2dcd1def7",
         "tests/maki_float.rs": "483283fd449a3cf16086ee5c807459b62c9a211c10055bd6bca621e8344544e8",
         "tests/maki_number.rs": "5ea38c10030d35caf532a8b694cef180c6210e7fac9edfd9037b10ca90ca6014",
-        "tests/maki_raw.rs": "588924ab8e0806d9e6f2b1568de8f3642e62c7b57aa85c9807d234a155f02319",
+        "tests/maki_raw.rs": "8fa0f62c3c7461b04f4ab3020628b6a62498e3ffc030d9432d0fb097f07d4de9",
         "tests/maki_scratch.rs": "4c9c561b904112c7173216f1e9f917d9feddf8e59eaf8eb9328653b27a1f51a4"
       }
     },
