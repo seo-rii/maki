@@ -149,7 +149,10 @@ pub struct AttachIdentity {
 #[derive(Debug, Clone)]
 pub struct CheckpointPolicy {
     /// Journal bytes on disk at which the background worker checkpoints,
-    /// syncing unsynced records first so they can be applied.
+    /// syncing unsynced records first so they can be applied. Only a journal
+    /// with a sealed segment counts: a checkpoint never deletes the active
+    /// segment, so a watermark at or below one segment does not make every
+    /// write a sync and a checkpoint (the pass comes at the roll instead).
     pub journal_high_watermark_bytes: u64,
     /// Hard limit on journal bytes on disk. A write that would exceed it
     /// first syncs and checkpoints inline; if that cannot reclaim enough
@@ -1394,8 +1397,7 @@ impl Engine {
                     );
                     io_engine.inner.note_journal(&volume);
                     if matches!(outcome, Ok(Admission::Admit))
-                        && (volume.journal_total_bytes()
-                            >= io_engine.inner.policy.journal_high_watermark_bytes
+                        && (io_engine.inner.journal_above_watermark(&volume)
                             || io_engine.inner.overlay_above_watermark(&volume)
                             || volume.has_pending_reclamation())
                     {
@@ -1981,6 +1983,16 @@ impl EngineInner {
         .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))?
     }
 
+    /// The journal has reached its watermark and a checkpoint could delete
+    /// some of it (SPEC §26). A checkpoint deletes covered sealed segments,
+    /// never the active one: counting a journal that is only its active
+    /// segment let a watermark at or below the segment size wake the worker
+    /// into a sync and a checkpoint on every write, reclaiming nothing.
+    fn journal_above_watermark(&self, volume: &Volume) -> bool {
+        volume.journal_total_bytes() >= self.policy.journal_high_watermark_bytes
+            && volume.journal_sealed_segment_count() > 0
+    }
+
     /// The overlay has crossed half of a configured bound (R4-005): the
     /// worker should checkpoint before write admission has to do it inline.
     fn overlay_above_watermark(&self, volume: &Volume) -> bool {
@@ -1997,10 +2009,11 @@ impl EngineInner {
     /// One worker pass: checkpoint if the journal crossed its watermark,
     /// the overlay crossed half its bound, the backing is low on space, or
     /// the interval elapsed with work pending (unsynced records are synced
-    /// first so they can be applied).
+    /// first so they can be applied; when that sync fails, the records that
+    /// are already durable are still checkpointed).
     async fn worker_pass(self: &Arc<Self>) {
         let (
-            total,
+            by_size,
             appended,
             checkpointed,
             durable,
@@ -2012,7 +2025,7 @@ impl EngineInner {
         ) = {
             let v = self.volume.read().await;
             (
-                v.journal_total_bytes(),
+                self.journal_above_watermark(&v),
                 v.journal_appended_sequence(),
                 v.checkpoint_sequence(),
                 v.journal_durable_sequence(),
@@ -2052,7 +2065,6 @@ impl EngineInner {
         {
             return;
         }
-        let by_size = total >= self.policy.journal_high_watermark_bytes;
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
             let backing = self.backing.clone();
             storage_task(move || backing.free_bytes())
@@ -2102,19 +2114,34 @@ impl EngineInner {
                 return;
             }
             let inner = self.clone();
-            let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
-            if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
+            let flushed = storage_task(move || {
+                inner.sync_journal(&mut volume).map_err(|error| {
+                    // What a checkpoint can still do without the records
+                    // this sync was for, read under the same lock.
+                    let durable_work = volume.journal_durable_sequence()
+                        > volume.checkpoint_sequence()
+                        || volume.journal_covered_segment_count() > 0
+                        || volume.has_pending_checkpoint_cleanup()
+                        || volume.has_pending_reclamation();
+                    (error.to_string(), durable_work)
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err((error.to_string(), false)));
+            if let Err((e, durable_work)) = flushed {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
                 // The sync is retried only after an interval (BUG-101). A
                 // failed sync does not advance the durable mark, so a
                 // checkpoint still applies only records that were durable
-                // before it. The watermark and low-space triggers exist to
-                // give journal and backing space back, and deleting covered
-                // sealed segments needs no sync: they still checkpoint what
-                // is durable, as they did before they synced first, so a
-                // journal whose syncs keep failing does not also stop that.
+                // before it, and deleting the sealed segments they cover
+                // needs no sync. Whatever started the pass, it still
+                // checkpoints what is durable: that applies those records,
+                // shrinks the overlay and gives journal and backing space
+                // back, so a journal whose syncs keep failing does not also
+                // stop every checkpoint. With nothing durable to apply or
+                // reclaim there is nothing to checkpoint until the retry.
                 self.defer_checkpoint_retry();
-                if !(by_size || by_space) {
+                if !(durable_work || retry_reclaim) {
                     return;
                 }
                 sync_failed = true;

@@ -85,12 +85,14 @@ async fn a_failing_checkpoint_is_not_retried_on_every_write() {
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             volume: VolumeOptions {
-                journal_segment_size: 8192,
+                // Every record gets its own segment, so from the second
+                // write on each write seals one.
+                journal_segment_size: 1024,
             },
             checkpoint: CheckpointPolicy {
-                // Every journaled write is above the watermark and wakes
-                // the worker; the hard bound is far away, so no write ever
-                // needs an inline checkpoint.
+                // Every write that seals a segment is above the watermark
+                // and wakes the worker; the hard bound is far away, so no
+                // write ever needs an inline checkpoint.
                 journal_high_watermark_bytes: 1024,
                 journal_max_bytes: 1 << 20,
                 max_pending_bytes: 64 * 1024,
@@ -122,7 +124,10 @@ async fn a_failing_checkpoint_is_not_retried_on_every_write() {
             .write(unit * UNIT as u64, &[unit as u8 + 1; UNIT as usize], true)
             .await
             .unwrap();
-        parked(&clock, before + 1).await;
+        // The first write seals nothing: the journal has only its segment.
+        if unit > 0 {
+            parked(&clock, before + 1).await;
+        }
     }
     assert_eq!(
         attempts.load(Ordering::SeqCst),

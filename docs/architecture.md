@@ -248,7 +248,8 @@ every mutation (`check_invariants`), so the randomized suites described in
 symptom.
 
 Checkpoints are not only a shutdown step. A background worker checkpoints when
-the journal crosses a size watermark, when backing free space drops below the
+the journal crosses a size watermark with a sealed segment to delete (the
+active segment never is), when backing free space drops below the
 checkpoint reserve, and on a time interval, syncing unsynced records first so
 each pass applies them. The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims

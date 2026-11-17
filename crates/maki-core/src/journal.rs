@@ -205,6 +205,12 @@ impl JournalWriter {
         self.sealed.len() + usize::from(self.active.is_some())
     }
 
+    /// Sealed segments on disk. Every one is durable (a seal syncs it), so
+    /// a checkpoint can cover and delete it; the active segment never is.
+    pub fn sealed_segment_count(&self) -> usize {
+        self.sealed.len()
+    }
+
     pub fn active_segment_index(&self) -> Option<u64> {
         self.active.as_ref().map(|a| a.info.index)
     }
