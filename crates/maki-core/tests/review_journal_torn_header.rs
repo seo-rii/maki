@@ -8,8 +8,9 @@
 //! sync fails before a power loss, recovery finds the file as the final
 //! segment. It never held a record and nothing durable names it, so it must
 //! read as a creation crash (a file shorter than a header), never as a
-//! complete-length header with a bad checksum, which recovery rightly treats
-//! as durable damage.
+//! complete-length header with a bad checksum, which recovery treats as
+//! durable damage unless the durable proof and mark rule out a record there
+//! (`review_journal_legacy_torn_header.rs`).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};

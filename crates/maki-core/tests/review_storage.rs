@@ -287,8 +287,9 @@ fn recovery_accepts_resurrected_covered_segments() {
     assert_eq!(vol.read_ct(0).unwrap().unwrap().1, ct(0xAA));
 }
 
-/// A final segment with a complete but invalid header is durable damage,
-/// not a creation crash: it must not be silently deleted.
+/// A final segment holding an acknowledged record, with a complete but
+/// invalid header, is durable damage, not a creation crash: it must not be
+/// silently deleted.
 #[test]
 fn recovery_rejects_full_final_segment_bad_header() {
     let _guard = failpoints::test_lock();

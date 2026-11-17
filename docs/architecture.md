@@ -135,11 +135,16 @@ and rebuilds the in-memory overlay from records newer than the checkpoint. It
 fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
 larger than the writer can produce is rejected before it is read, and a
-complete-but-invalid final segment header is treated as damage rather than as
-a creation crash. That rule relies on the writer never extending a new segment
-before its header write: a header write that persists only a prefix leaves a
-file shorter than a header (or all zero), which recovery discards as a creation
-that never completed.
+complete-but-invalid segment header is treated as damage rather than as a
+creation crash. The writer never extends a new segment before its header
+write, so a header write that persists only a prefix leaves a final file
+shorter than a header (or all zero), which recovery discards as a creation that
+never completed. Writers that preallocated the header could instead leave a
+final segment exactly one header long whose header fails its checksum; recovery
+discards that too, but only at an index above every segment the durable proof
+and mark name. The proof names the segment of the newest acknowledged record
+and the mark names a segment only once its creation completed, so such a file
+holds nothing acknowledged. Every other invalid header still fails closed.
 
 The journal above the selected checkpoint must bridge through the proof's
 required sequence and exact record-end offset before recovery changes metadata.
