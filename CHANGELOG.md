@@ -11,6 +11,45 @@ documents.
 
 ### Breaking changes
 
+- **Credential and witness key files must be owned by root or by the user that
+  loads them** (AUD-029, AUD-031, 2026-11-16;
+  [#158](https://github.com/seo-rii/maki/pull/158),
+  [#162](https://github.com/seo-rii/maki/pull/162)). This applies to `file`
+  credentials, files in the systemd credentials directory, an HTTP combined
+  certificate and private-key PEM, and witness TLS private keys, whatever their
+  mode. A process run as root therefore refuses a key owned by the daemon user:
+  run `maki-benchmark`, a daemon started by hand or `maki volume witness` with
+  the daemon's writer configuration as that user (`sudo -u maki`). See
+  [credentials](docs/configuration.md#credentials-and-secrets) and the [witness
+  service](docs/remote-witness-service.md#credential-and-configuration-files).
+- **An empty or whitespace-only credential is refused like a missing one**
+  (AUD-030, [#158](https://github.com/seo-rii/maki/pull/158)), so a token file
+  truncated by a failed rotation stops attach instead of sending
+  `Authorization: Bearer ` without its token.
+- **Credential references must be loadable as written** (AUD-032, AUD-036,
+  [#159](https://github.com/seo-rii/maki/pull/159)). A header or metadata
+  `format` needs exactly one `{}` placeholder, and `format` on `crypto.key` or
+  a `tls.client_key` is refused. A `credential` name, and the file name of a
+  `file` path, may contain only ASCII letters, digits, `.`, `_` and `-` and
+  must not start with `.`, as the loaders require; `volume create` used to
+  store another key name as the volume's immutable key identity, after which
+  every attach failed.
+- **`nbd.preferred_io` above 32 MiB and geometries that reach the key-canary
+  unit index are refused** (AUD-034, AUD-035,
+  [#159](https://github.com/seo-rii/maki/pull/159)). nbdkit failed every client
+  handshake for the first, and attach refused the second; a stored superblock
+  with such a geometry now loads as an invalid copy. See [validation
+  rules](docs/configuration.md#validation-rules).
+- **`remote-http` request mappings are validated as the provider builds them**
+  (AUD-026, [#161](https://github.com/seo-rii/maki/pull/161)). Unknown field
+  sources or payload encodings, an encoding on a source other than `payload`, a
+  request pointer or `items_path` without a leading slash, pointers of one
+  object that overlap (including a field at, under or above `items_path`), and
+  a declared context binding without a per-item `unit_index` fail validation
+  instead of failing attach or every request. SPEC §18 no longer lists the
+  `utf8`, `integer` and `uuid` encodings, which the provider never implemented
+  ([HTTP mapping](docs/configuration.md#remote-http-mapping)).
+
 - **Remote transport limits must hold a full ciphertext batch** (BUG-092,
   2026-10-14). gRPC `max_message_bytes`, WebSocket `max_frame_bytes` and, for
   a batched HTTP mapping, `max_response_bytes` are checked against the larger
@@ -187,7 +226,8 @@ documents.
   `07fed8b`); the package owns nothing under `/etc/maki` and never starts a
   volume.
 - **`[lvm_identity]` pins** (complete PV set, VG and target LV UUIDs) in the
-  attach configuration, rechecked by recovery, grow and detach.
+  attach configuration. Grow and detach refuse a configuration that changes
+  them, and recovery checks the identity attach recorded against them.
 - **Native readiness**: the data-plane unit is `Type=notify` and reports
   `READY=1` only after recovery, provider checks and control binding
   (`2a3f023`).
@@ -207,6 +247,79 @@ documents.
   checker in CI (2026-09-23).
 
 ### Fixed
+
+- **2026-11-16 audit: durability and recovery** (AUD-001 to AUD-007). Recovery
+  rewrites both superblock copies from their exact bytes and completes a
+  missing one before any other repair, so a failed or killed `volume create`
+  can no longer leave a volume whose only superblock copy is in the page cache;
+  every attach now does a few extra 4 KiB superblock writes and syncs
+  ([#164](https://github.com/seo-rii/maki/pull/164)). `maki volume create` also
+  refuses a root that still holds an earlier volume's `superblock.*`,
+  `shard-catalog.*` or `canary.*`
+  ([#164](https://github.com/seo-rii/maki/pull/164)). A torn journal segment
+  header left by a failed segment roll no longer blocks attach
+  ([#166](https://github.com/seo-rii/maki/pull/166)). Concurrent writers can no
+  longer take the space an inline reclaim frees for the write that ran it,
+  which turned a reclaimable journal or overlay bound into ENOSPC; this
+  replaces the four-round retry of the R4-005 follow-up. Watermark and
+  low-space checkpoints sync the journal first instead of applying nothing, and
+  still checkpoint durable records when that sync fails
+  ([#168](https://github.com/seo-rii/maki/pull/168)). Recovery's rewrite of the
+  journal it adopts is covered by a power-loss sweep
+  ([#167](https://github.com/seo-rii/maki/pull/167)). See the [remediation
+  log](docs/review-remediation.md#internal-audit-2026-11-16-aud-001aud-051).
+- **2026-11-16 audit: remote providers** (AUD-019 to AUD-025). A gRPC peer can
+  no longer panic a call with malformed `grpc-status-details-bin` or change its
+  error class with undecodable `grpc-message` text, and IPv6-literal gRPC TLS
+  endpoints can be built ([#150](https://github.com/seo-rii/maki/pull/150)).
+  Under `stall`, a contract violation ends an operation only once every
+  validated endpoint has broken the contract for it; until then the request
+  waits for the remaining peers, including one whose circuit is cooling
+  ([#154](https://github.com/seo-rii/maki/pull/154)). A WebSocket upgrade
+  refused with any 3xx or 4xx other than 408 and 429 opens that endpoint's
+  circuit, a retry-safe request fails over, and attach quarantines the endpoint
+  instead of refusing ([#155](https://github.com/seo-rii/maki/pull/155)). HTTP
+  refuses a close-delimited success response and a raw encrypt response shorter
+  than its plaintext as contract errors, which previously stored a truncated
+  body as the unit's ciphertext, and a JSON response no longer takes about 43
+  times its size in memory ([#157](https://github.com/seo-rii/maki/pull/157)).
+  WebSocket reads no longer rewrite the whole retained read buffer
+  ([#160](https://github.com/seo-rii/maki/pull/160)).
+- **2026-11-16 audit: logging, witness and privileged helper** (AUD-027,
+  AUD-028, AUD-033, AUD-037 to AUD-041). `tungstenite`, `tokio_tungstenite` and
+  `reqwest` are capped at `debug`, and `tungstenite::protocol` at `info`,
+  whatever `MAKI_LOG` says, so `MAKI_LOG=trace` no longer writes WebSocket
+  payloads, upgrade query credentials or close reasons to the journal; their
+  trace output is no longer available
+  ([#155](https://github.com/seo-rii/maki/pull/155);
+  [logging](docs/operations.md#logging)). Validation errors no longer quote an
+  HTTP operation path ([#159](https://github.com/seo-rii/maki/pull/159)).
+  Enrollment recovery refuses a root that holds another volume's data,
+  `maki volume resume-enrollment` refuses a provider the build cannot
+  construct, and a local socket denial (netfilter EPERM) is a transport
+  failure, so witness failover continues and the rollback backing refuses only
+  that operation ([#156](https://github.com/seo-rii/maki/pull/156)). The
+  privileged helper reads the mount table as bytes, so one non-UTF-8 mount path
+  anywhere no longer fails attach, detach, recovery and NBD allocation for
+  every volume, and the workload verify gate runs in a unit without
+  `CAP_FOWNER` ([#153](https://github.com/seo-rii/maki/pull/153)).
+- **2026-11-16 audit: tooling and tests** (AUD-008 to AUD-018, AUD-042 to
+  AUD-046). The privileged validation runner requires the expected permission
+  denial instead of any failure, the nightly plugin and fake-provider gates
+  require the exact symbol and refusal, and `scripts/run_cargo_tests.py` runs
+  `--doc` selections ([#151](https://github.com/seo-rii/maki/pull/151)). The
+  vendor erasure check compares resolved features with a reviewed list
+  ([#160](https://github.com/seo-rii/maki/pull/160)); the standalone vendor
+  test loggers no longer depend on unmaintained `humantime` (RUSTSEC-2026-0542,
+  [#155](https://github.com/seo-rii/maki/pull/155)). `CrashableBacking` keeps a
+  failed sync's writes uncertain instead of lost, writes back whole 4 KiB
+  pages, and ends every handle and lock at a simulated power loss
+  ([#165](https://github.com/seo-rii/maki/pull/165)). `MemBacking` applies
+  POSIX path rules, a zero-length `allocate_range` is a no-op on every backing
+  including `FileBacking`, and the fake provider, `ManualClock` and
+  `DeterministicScheduler` follow the contracts they stand in for; two tests
+  that failed only as root now inject their faults for root too
+  ([#163](https://github.com/seo-rii/maki/pull/163)).
 
 - **Mixed benchmark write verification** (BUG-134, 2026-10-20): check the
   latest expected value at every initialized slot after measurement, including
@@ -232,8 +345,8 @@ documents.
   [remediation log](docs/review-remediation.md#project-review-2026-10-14).
 - **2026-10-14 second review pass**: binding the control socket refuses any
   file at the address other than a dead socket (BUG-099). Volume creation
-  writes the superblock last, so an interrupted creation is not a volume
-  (BUG-100). The checkpoint worker waits one interval after a failed pass
+  writes the superblock last, so a creation interrupted before it writes a
+  superblock copy is not a volume (BUG-100). The checkpoint worker waits one interval after a failed pass
   (BUG-101), and a write refused for free space wakes it (BUG-106). A
   coalesced provider call never carries one unit twice (BUG-102). A remote
   witness that cannot be reached refuses each operation without stopping the
@@ -477,6 +590,25 @@ observable behaviour:
   per-RPC deadlines cover gRPC readiness plus the call (BUG-017).
 
 ### Documentation
+
+- **2026-11-16 audit** (AUD-047 to AUD-051): the link checker verifies in-page
+  and cross-file anchors against GitHub heading slugs
+  ([CONTRIBUTING](CONTRIBUTING.md#documentation)), and the deep check no longer
+  names a torn-tail heuristic recovery stopped using
+  ([#152](https://github.com/seo-rii/maki/pull/152)). Backing files must not
+  share extents with reflink copies: a `cp --reflink` copy (coreutils 9's
+  default on XFS and btrfs) can make an in-place write fail with ENOSPC despite
+  the space reservation; copy with `cp --reflink=never`
+  ([status](docs/status.md#known-limitations),
+  [#152](https://github.com/seo-rii/maki/pull/152)). Stale statements in
+  CLAUDE.md, SPEC, the operations, performance and testing guides and the
+  remediation log's citations were corrected
+  ([#152](https://github.com/seo-rii/maki/pull/152)). The guides now say that
+  recovery checks the identity attach recorded against the `[lvm_identity]`
+  pins rather than reading LVM metadata again
+  ([#153](https://github.com/seo-rii/maki/pull/153)), and the privileged
+  validation runbook names the results its earlier lenient denial checks cover
+  ([#151](https://github.com/seo-rii/maki/pull/151)).
 
 - **2026-10-14 project review**: docs that contradicted `status.md` or the code
   were corrected (remote witness status, power-loss tearing, nightly gate
