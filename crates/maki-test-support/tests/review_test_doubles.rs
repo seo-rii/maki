@@ -358,3 +358,16 @@ fn zero_length_allocation_does_not_change_a_crashable_file() {
         assert_eq!(file.len().unwrap(), 0, "allocate_range({offset}, 0)");
     }
 }
+
+// ---------- CrashableBacking: POSIX namespace rules ----------
+
+#[path = "../../maki-backing/tests/common/namespace_parity.rs"]
+mod namespace_parity;
+
+/// The crash simulator runs the namespace table `MemBacking` and Linux
+/// `FileBacking` run (maki-backing `review_mem_backing_parity.rs`): a
+/// directory name is neither a lock file nor unlinked as a file (EISDIR).
+#[test]
+fn crashable_backing_namespace_follows_posix_path_rules() {
+    namespace_parity::check("CrashableBacking", || Box::new(CrashableBacking::new()));
+}
