@@ -166,7 +166,11 @@ Above the selected checkpoint, the journal must bridge through the required
 sequence and match its exact segment/record-end boundary. A missing final segment or a file
 truncated exactly at an earlier complete record therefore fails explicitly.
 If the checkpoint already covers the horizon, its old segment may legitimately
-have been pruned; checkpointing does not lower the horizon.
+have been pruned; checkpointing does not lower the horizon. The reverse cannot
+happen: a checkpoint only consumes records both copies attest, so a checkpoint
+state above the proof's horizon is refused as damage by recovery and by the
+deep check, before any repair. Accepting it would treat the acknowledged
+records between the two as already applied.
 
 Unproven final-tail bytes may be discarded after a crash. Intact later records
 do not prove that earlier damaged bytes were durable: unsynced sectors may

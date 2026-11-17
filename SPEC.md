@@ -1364,6 +1364,11 @@ unsynced sectors may persist out of order. Recovery MUST rewrite, verify and
 sync accepted prefixes, then publish both proofs before READY. It MUST NOT
 lower the horizon to make a damaged volume attach.
 
+Checkpointing consumes only records both proof copies attest, and recovery
+publishes the proof before it advances the checkpoint, so a selected checkpoint
+above the proof's horizon is damage, not a crash state. Recovery and the deep
+check MUST refuse it before any recovery write.
+
 The first scan streams segment data and retains no replay payloads. After all
 durability checks and repairs succeed, a second scan replays accepted records
 through a ciphertext batch with a 1 MiB grouping target and advances the

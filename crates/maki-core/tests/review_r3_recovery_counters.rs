@@ -10,8 +10,12 @@ use maki_core::volume::{Volume, VolumeOptions};
 use maki_core::CoreError;
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::durable_proof::DurableProofStore;
 use maki_format::geometry::Geometry;
-use maki_format::journal::{encode_record, DurableMark, JournalRecord, SegmentHeader};
+use maki_format::journal::{
+    encode_record, DurableMark, JournalRecord, SegmentHeader, RECORD_HEADER_SIZE,
+    SEGMENT_HEADER_SIZE,
+};
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
 use maki_test_support::{crash_backing::FaultOp, CrashableBacking};
@@ -44,6 +48,18 @@ impl Fixture {
         let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
         store.store(backing.as_ref(), &mut state).unwrap();
         store.store(backing.as_ref(), &mut state).unwrap();
+        if checkpoint > 0 {
+            // A checkpoint only consumes records both proof copies attest:
+            // publish the proof such a checkpoint implies. Its segment 0 has
+            // since been pruned, so tests place later segments above it.
+            // Recovery refuses a checkpoint above the proof.
+            let mut proof =
+                DurableProofStore::load(backing.as_ref(), superblock.volume_uuid).unwrap();
+            proof.durable_sequence = checkpoint.min(u64::MAX - 1);
+            proof.segment_index = 0;
+            proof.durable_size = (SEGMENT_HEADER_SIZE + RECORD_HEADER_SIZE + 540) as u64;
+            DurableProofStore::advance(backing.as_ref(), &mut proof).unwrap();
+        }
         Self {
             backing,
             superblock,
@@ -168,14 +184,14 @@ fn maximum_advisory_mark_index_is_refused_even_after_its_segment_was_pruned() {
 #[test]
 fn record_at_maximum_base_sequence_is_refused_without_sequence_wrap() {
     assert_public_apis_refuse(u64::MAX - 1, |fixture| {
-        fixture.segment(0, u64::MAX, &[u64::MAX]);
+        fixture.segment(1, u64::MAX, &[u64::MAX]);
     });
 }
 
 #[test]
 fn a_segment_crossing_into_maximum_sequence_is_refused_without_sequence_wrap() {
     assert_public_apis_refuse(u64::MAX - 2, |fixture| {
-        fixture.segment(0, u64::MAX - 1, &[u64::MAX - 1, u64::MAX]);
+        fixture.segment(1, u64::MAX - 1, &[u64::MAX - 1, u64::MAX]);
     });
 }
 
@@ -226,7 +242,7 @@ fn last_representable_horizon_remains_readable_with_exact_record_count() {
 #[test]
 fn empty_segment_at_maximum_base_preserves_the_representable_horizon() {
     let fixture = Fixture::new(u64::MAX - 1);
-    fixture.segment(0, u64::MAX, &[]);
+    fixture.segment(1, u64::MAX, &[]);
     let mutations = fixture.observe_mutations();
     let backing: Arc<dyn Backing> = fixture.backing.clone();
     let scan = scan_journal(

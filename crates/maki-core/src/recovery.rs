@@ -21,6 +21,8 @@
 //!   be contiguous — a missing segment is never silently skipped;
 //! - a segment larger than the writer can ever produce is rejected before
 //!   it is read into memory;
+//! - the selected checkpoint never lies above the required proof's horizon
+//!   (checkpoints only consume records the proof attests);
 //! - metadata read errors other than "not found" are I/O errors, never
 //!   "invalid copy" (an initialized volume must have checkpoint state).
 //!
@@ -226,6 +228,7 @@ fn recover_with_replay(
 
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
+    check_checkpoint_horizon(checkpoint_state.checkpoint_sequence, &durable_proof)?;
     progress();
 
     // 5./6. scan journal, then apply the repairs the scan decided on
@@ -589,12 +592,20 @@ pub(crate) fn summarize_journal(
     checkpoint_sequence: u64,
     segment_size: u64,
 ) -> Result<JournalSummary, RecoveryError> {
-    let scan = scan_journal_with_replay(
+    // The deep check scans against the volume's stored checkpoint state, so
+    // it applies the rule recovery applies to that state.
+    let proof = load_required_proof(backing, superblock)?;
+    if let Some(proof) = &proof {
+        check_checkpoint_horizon(checkpoint_sequence, proof)?;
+    }
+    let scan = scan_journal_with_proof(
         backing,
         superblock,
         checkpoint_sequence,
         segment_size,
+        proof.as_ref(),
         ReplayRecords::Units(Default::default()),
+        &|| {},
     )?;
     let uncovered_records = scan
         .segments
@@ -621,23 +632,7 @@ fn scan_journal_with_replay(
     segment_size: u64,
     replay: ReplayRecords,
 ) -> Result<JournalScan, RecoveryError> {
-    let envelope = load_volume_superblock(backing.as_ref())?;
-    if envelope.superblock.volume_uuid != superblock.volume_uuid {
-        return Err(RecoveryError::Corrupt(
-            "journal scan superblock identity mismatch".into(),
-        ));
-    }
-    let proof = if matches!(
-        envelope.metadata_version,
-        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
-    ) {
-        Some(DurableProofStore::load(
-            backing.as_ref(),
-            superblock.volume_uuid,
-        )?)
-    } else {
-        None // read-only legacy inspection retains its historical classification
-    };
+    let proof = load_required_proof(backing, superblock)?;
     scan_journal_with_proof(
         backing,
         superblock,
@@ -647,6 +642,50 @@ fn scan_journal_with_replay(
         replay,
         &|| {},
     )
+}
+
+/// The required durable proof of a v2/v3 volume; `None` for a legacy v1
+/// volume, whose read-only inspection retains its historical classification.
+fn load_required_proof(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+) -> Result<Option<DurableProof>, RecoveryError> {
+    let envelope = load_volume_superblock(backing.as_ref())?;
+    if envelope.superblock.volume_uuid != superblock.volume_uuid {
+        return Err(RecoveryError::Corrupt(
+            "journal scan superblock identity mismatch".into(),
+        ));
+    }
+    if !matches!(
+        envelope.metadata_version,
+        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(DurableProofStore::load(
+        backing.as_ref(),
+        superblock.volume_uuid,
+    )?))
+}
+
+/// A record becomes checkpoint-eligible only once both proof copies attest
+/// it, and recovery publishes the proof before it advances the checkpoint,
+/// so no crash or restart leaves the stored checkpoint above the proof.
+/// Accepting one would treat the acknowledged records between the two as
+/// applied, and let a later checkpoint prune them, although no slot holds
+/// them. Recovery and the deep check refuse it before any recovery write.
+fn check_checkpoint_horizon(
+    checkpoint_sequence: u64,
+    proof: &DurableProof,
+) -> Result<(), RecoveryError> {
+    if checkpoint_sequence > proof.durable_sequence {
+        return Err(RecoveryError::Corrupt(format!(
+            "checkpoint sequence {checkpoint_sequence} is above the required durable proof's \
+             horizon {}; checkpoints only consume records the proof attests",
+            proof.durable_sequence
+        )));
+    }
+    Ok(())
 }
 
 fn scan_journal_with_proof(
