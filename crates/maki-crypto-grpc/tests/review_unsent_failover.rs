@@ -62,6 +62,7 @@ struct CryptoServer {
 }
 
 impl CryptoServer {
+    #[allow(clippy::result_large_err)] // tonic::Status is the natural error type for a gRPC handler
     async fn handle(
         self,
         request: Request<CryptoBatchRequest>,
