@@ -114,6 +114,9 @@ and intentionally restore an approved older snapshot under the same identity.
 Restore requires administrator credentials, an exact current fence/root and a
 separately approved snapshot hash. It increases generation and epoch; it never
 lowers the authority. See the service guide for copy-pasteable commands.
+The automatic GC pass after a restore deletes the replaced newer state from
+the backing root; snapshot it first if it may be needed again
+([restore procedure](remote-witness-service.md#snapshot-takeover-and-restore)).
 An administrator can resume initial enrollment while the authority has never
 activated a descriptor, using the procedure below. An initialized descriptor
 cannot be reset through enrollment recovery, including when its activation
