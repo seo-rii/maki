@@ -10,8 +10,12 @@ use maki_core::volume::{Volume, VolumeOptions};
 use maki_core::CoreError;
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::durable_proof::{DurableProofStore, DURABLE_PROOF_A, DURABLE_PROOF_B};
 use maki_format::geometry::Geometry;
-use maki_format::journal::{encode_record, DurableMark, JournalRecord, SegmentHeader};
+use maki_format::journal::{
+    encode_record, DurableMark, JournalRecord, SegmentHeader, RECORD_HEADER_SIZE,
+    SEGMENT_HEADER_SIZE,
+};
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
 use maki_test_support::{crash_backing::FaultOp, CrashableBacking};
@@ -44,6 +48,18 @@ impl Fixture {
         let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
         store.store(backing.as_ref(), &mut state).unwrap();
         store.store(backing.as_ref(), &mut state).unwrap();
+        if checkpoint > 0 {
+            // A checkpoint only consumes records both proof copies attest:
+            // publish the proof such a checkpoint implies. Its segment 0 has
+            // since been pruned, so tests place later segments above it.
+            // Recovery refuses a checkpoint above the proof.
+            let mut proof =
+                DurableProofStore::load(backing.as_ref(), superblock.volume_uuid).unwrap();
+            proof.durable_sequence = checkpoint.min(u64::MAX - 1);
+            proof.segment_index = 0;
+            proof.durable_size = (SEGMENT_HEADER_SIZE + RECORD_HEADER_SIZE + 540) as u64;
+            DurableProofStore::advance(backing.as_ref(), &mut proof).unwrap();
+        }
         Self {
             backing,
             superblock,
@@ -168,21 +184,26 @@ fn maximum_advisory_mark_index_is_refused_even_after_its_segment_was_pruned() {
 #[test]
 fn record_at_maximum_base_sequence_is_refused_without_sequence_wrap() {
     assert_public_apis_refuse(u64::MAX - 1, |fixture| {
-        fixture.segment(0, u64::MAX, &[u64::MAX]);
+        fixture.segment(1, u64::MAX, &[u64::MAX]);
     });
 }
 
 #[test]
 fn a_segment_crossing_into_maximum_sequence_is_refused_without_sequence_wrap() {
     assert_public_apis_refuse(u64::MAX - 2, |fixture| {
-        fixture.segment(0, u64::MAX - 1, &[u64::MAX - 1, u64::MAX]);
+        fixture.segment(1, u64::MAX - 1, &[u64::MAX - 1, u64::MAX]);
     });
 }
 
+/// The highest horizon recovery accepts keeps its exact record count. On a
+/// v2 volume that is the last one a resumed writer can still extend by one
+/// record in one more segment; the preserved v1 read-only inspection keeps
+/// its historical bound, the last representable sequence and index.
 #[test]
-fn last_representable_horizon_remains_readable_with_exact_record_count() {
+fn last_accepted_horizon_remains_readable_with_exact_record_count() {
     for legacy in [false, true] {
-        let fixture = Fixture::new(u64::MAX - 2);
+        let last = if legacy { u64::MAX - 1 } else { u64::MAX - 2 };
+        let fixture = Fixture::new(last - 1);
         if legacy {
             // Exercise the preserved v1 read-only path with real frozen v1
             // envelopes, not a policy bypass or an in-place product migration.
@@ -195,7 +216,7 @@ fn last_representable_horizon_remains_readable_with_exact_record_count() {
                     .unwrap();
             }
         }
-        fixture.segment(u64::MAX - 1, u64::MAX - 1, &[u64::MAX - 1]);
+        fixture.segment(last, last, &[last]);
         let mutations = fixture.observe_mutations();
         let backing: Arc<dyn Backing> = fixture.backing.clone();
         let scan = scan_journal(
@@ -205,28 +226,29 @@ fn last_representable_horizon_remains_readable_with_exact_record_count() {
             SEGMENT_SIZE,
         )
         .unwrap();
-        assert_eq!(scan.durable_sequence, u64::MAX - 1);
-        assert_eq!(scan.next_segment_index, u64::MAX);
+        assert_eq!(scan.durable_sequence, last);
+        assert_eq!(scan.next_segment_index, last + 1);
         assert_eq!(scan.replay.len(), 1);
-        assert_eq!(scan.replay[0].sequence, u64::MAX - 1);
+        assert_eq!(scan.replay[0].sequence, last);
         let report = deep_check(backing, SEGMENT_SIZE).unwrap();
         assert!(
             report.errors.is_empty(),
             "legacy={legacy}: {:?}",
             report.errors
         );
-        assert!(report.info.iter().any(|line| line.contains(
-            "journal: 1 segment(s), 1 record(s) newer than the checkpoint, durable sequence 18446744073709551614"
-        )));
+        assert!(report.info.iter().any(|line| line.contains(&format!(
+            "journal: 1 segment(s), 1 record(s) newer than the checkpoint, durable sequence {last}"
+        ))));
         fixture.backing.set_fault_hook(None);
         assert!(mutations.lock().unwrap().is_empty());
     }
 }
 
 #[test]
-fn empty_segment_at_maximum_base_preserves_the_representable_horizon() {
-    let fixture = Fixture::new(u64::MAX - 1);
-    fixture.segment(0, u64::MAX, &[]);
+fn empty_segment_at_the_last_accepted_base_preserves_the_horizon() {
+    let fixture = Fixture::new(u64::MAX - 2);
+    bind_key_canary(fixture.backing.as_ref(), fixture.superblock.volume_uuid);
+    fixture.segment(1, u64::MAX - 1, &[]);
     let mutations = fixture.observe_mutations();
     let backing: Arc<dyn Backing> = fixture.backing.clone();
     let scan = scan_journal(
@@ -236,18 +258,18 @@ fn empty_segment_at_maximum_base_preserves_the_representable_horizon() {
         SEGMENT_SIZE,
     )
     .unwrap();
-    assert_eq!(scan.durable_sequence, u64::MAX - 1);
+    assert_eq!(scan.durable_sequence, u64::MAX - 2);
     assert!(scan.replay.is_empty());
     assert!(scan.repairs.is_empty());
     let report = deep_check(backing, SEGMENT_SIZE).unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(report.info.iter().any(|line| line.contains(
-        "journal: 1 segment(s), 0 record(s) newer than the checkpoint, durable sequence 18446744073709551614"
+        "journal: 1 segment(s), 0 record(s) newer than the checkpoint, durable sequence 18446744073709551613"
     )));
     fixture.backing.set_fault_hook(None);
     assert!(mutations.lock().unwrap().is_empty());
     let volume = Volume::recover(fixture.backing.clone(), VolumeOptions::default()).unwrap();
-    assert_eq!(volume.journal_durable_sequence(), u64::MAX - 1);
+    assert_eq!(volume.journal_durable_sequence(), u64::MAX - 2);
 }
 
 #[test]
@@ -314,4 +336,85 @@ fn roll_refuses_exhausted_index_before_sealing_or_creating_a_segment() {
     assert_eq!(volume.read_ct(1).unwrap(), None);
     volume.flush().unwrap();
     assert_eq!(volume.journal_durable_sequence(), 1);
+}
+
+// A resumed writer starts with no active segment: its first append needs a
+// sequence for the record and an index for the segment it opens, and the
+// writer refuses `u64::MAX` as either. A recovered horizon or index that
+// leaves neither makes every write fail forever on a volume the deep check
+// called clean; recovery and the check refuse it instead.
+
+#[test]
+fn durable_horizon_leaving_no_sequence_for_a_record_is_refused() {
+    assert_public_apis_refuse(u64::MAX - 1, |_| {});
+    assert_public_apis_refuse(u64::MAX - 1, |fixture| {
+        fixture.segment(1, u64::MAX, &[]);
+    });
+}
+
+#[test]
+fn record_at_the_last_sequence_leaving_no_successor_is_refused() {
+    assert_public_apis_refuse(u64::MAX - 2, |fixture| {
+        fixture.segment(1, u64::MAX - 1, &[u64::MAX - 1]);
+    });
+}
+
+#[test]
+fn segment_index_leaving_no_index_for_a_roll_is_refused() {
+    assert_public_apis_refuse(0, |fixture| fixture.segment(u64::MAX - 1, 1, &[]));
+}
+
+#[test]
+fn advisory_mark_index_leaving_no_index_for_a_roll_is_refused() {
+    assert_public_apis_refuse(0, |fixture| {
+        fixture
+            .backing
+            .open(layout::JOURNAL_DURABLE_MARK, true)
+            .unwrap()
+            .write_at(
+                0,
+                &DurableMark {
+                    segment_index: u64::MAX - 1,
+                    durable_size: 48,
+                }
+                .encode(),
+            )
+            .unwrap();
+    });
+}
+
+#[test]
+fn durable_proof_index_leaving_no_index_for_a_roll_is_refused() {
+    assert_public_apis_refuse(5, |fixture| {
+        // Both copies, identical: neither the A/B selection nor `follows`
+        // objects, and the checkpoint covers the proof's horizon.
+        let mut proof =
+            DurableProofStore::load(fixture.backing.as_ref(), fixture.superblock.volume_uuid)
+                .unwrap();
+        proof.segment_index = u64::MAX - 1;
+        for path in [DURABLE_PROOF_A, DURABLE_PROOF_B] {
+            fixture
+                .backing
+                .open(path, false)
+                .unwrap()
+                .write_at(0, &proof.encode())
+                .unwrap();
+        }
+    });
+}
+
+/// What an engine's first attach stores before any write: a key canary bound
+/// to the volume. Without one, a volume with history but no ciphertext is
+/// refused by every attach, and the deep check reports that; this fixture is
+/// about the journal, not the canary.
+fn bind_key_canary(backing: &dyn Backing, volume_uuid: uuid::Uuid) {
+    let ab = maki_format::ab::AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let mut canary = maki_format::canary::KeyCanary {
+        generation: 0,
+        volume_uuid,
+        unit_index: maki_format::canary::CANARY_UNIT_INDEX,
+        ciphertext: vec![0x5a; 64],
+    };
+    ab.store(backing, &mut canary).unwrap();
+    ab.store(backing, &mut canary).unwrap();
 }

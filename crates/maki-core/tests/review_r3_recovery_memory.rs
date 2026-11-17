@@ -397,6 +397,7 @@ fn deep_check_preserves_checkpoint_counts_tail_repairs_and_read_only_state() {
 
     for checkpoint in [0, 5, 12] {
         let fixture = overwrite_fixture(12);
+        bind_key_canary(fixture.backing.as_ref(), fixture.superblock.volume_uuid);
         let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
         let mut state = store
             .load::<CheckpointState>(fixture.backing.as_ref())
@@ -772,4 +773,20 @@ fn review_f06_large_ciphertexts_do_not_overlap_in_replay_or_slot_encoding() {
             );
         }
     }
+}
+
+/// What an engine's first attach stores before any write: a key canary bound
+/// to the volume. Without one, a volume with history but no ciphertext is
+/// refused by every attach, and the deep check reports that; this fixture is
+/// about the journal, not the canary.
+fn bind_key_canary(backing: &dyn Backing, volume_uuid: uuid::Uuid) {
+    let ab = maki_format::ab::AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let mut canary = maki_format::canary::KeyCanary {
+        generation: 0,
+        volume_uuid,
+        unit_index: maki_format::canary::CANARY_UNIT_INDEX,
+        ciphertext: vec![0x5a; 64],
+    };
+    ab.store(backing, &mut canary).unwrap();
+    ab.store(backing, &mut canary).unwrap();
 }

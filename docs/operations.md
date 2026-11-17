@@ -180,7 +180,17 @@ line, printed before any `warning:` and `ERROR:` lines; the report ends with
 |---|---|---|
 | `clean` | Every allocated slot reads back and no unlisted slot holds a damaged header; ordinary replay of the journal is all the next attach does | None |
 | `recoverable` | Some slot payloads are damaged, but each such unit has a validated journal record newer than the checkpoint, so recovery rewrites (or discards) the slot before the volume is exposed. The report lists them as `warning: slot: recoverable: …` and `check passed` | Attach normally; re-run the deep check afterwards and expect `clean` |
-| `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
+| `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation in a way attach refuses. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
+
+A key canary with no valid copy is reported as `key canary: absent` or, when
+canary files exist but none validates, `key canary: copies exist but no copy
+validates`. Attach binds a new canary on a volume that holds no data, and on a
+volume with data only after an integrity-capable provider decrypts existing
+ciphertext; without such a provider, or with no ciphertext left (every unit
+trimmed), it refuses. The offline check does not know the provider, so it
+reports a lost canary as an `ERROR:` only when the volume has history but no
+ciphertext to probe, which every attach refuses; otherwise it is a `warning:`
+that says what attach needs.
 
 The check reads every slot the map lists and probes the header of every
 slot it does not list in an existing shard, exactly like the read path: a

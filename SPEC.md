@@ -1420,6 +1420,17 @@ unsynced sectors may persist out of order. Recovery MUST rewrite, verify and
 sync accepted prefixes, then publish both proofs before READY. It MUST NOT
 lower the horizon to make a damaged volume attach.
 
+Checkpointing consumes only records both proof copies attest, and recovery
+publishes the proof before it advances the checkpoint, so a selected checkpoint
+above the proof's horizon is damage, not a crash state. Recovery and the deep
+check MUST refuse it before any recovery write. They MUST likewise refuse a
+recovered durable sequence or highest segment index (of a surviving segment,
+the proof or the advisory mark) that leaves the resumed writer no sequence for
+one more record or no index for one more segment. When records above a covered
+proof survive, the record end recovery publishes for them MUST follow the
+proof's stored location; a covered proof naming a later segment or record end
+is damage and MUST be refused the same way.
+
 The first scan streams segment data and retains no replay payloads. After all
 durability checks and repairs succeed, a second scan replays accepted records
 through a ciphertext batch with a 1 MiB grouping target and advances the
@@ -1998,9 +2009,12 @@ panicking. Geometry uses checked arithmetic. Superblocks, allocation maps,
 shard catalogs, slots, journal records, and checkpoint state use versioned,
 CRC-protected encodings with frozen golden vectors.
 
-A/B metadata MUST fall back to the highest valid generation. Torn final journal
-tails may be truncated; corruption before a valid successor record MUST refuse
-recovery.
+A/B metadata MUST fall back to the highest valid generation. Each store advances
+a generation by one; recovery and the deep check MUST refuse, before any
+recovery write, A/B metadata (superblock, shard catalog, allocation and discard
+maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
+is above `u64::MAX - 2^62`. Torn final journal tails may be truncated;
+corruption before a valid successor record MUST refuse recovery.
 
 ---
 
