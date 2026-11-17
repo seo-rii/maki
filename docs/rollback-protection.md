@@ -43,7 +43,9 @@ unavailable quorum) refuses each operation with no fallback, but does not stop
 the session: the next check either matches the claimed record again or
 observes the change and stops it. Besides an observed change, only the
 witness's own denial, a predecessor conflict, an invalid answer or a TLS failure
-stops the session.
+stops the session. A frontend whose allow-list no longer names the writer
+certificate denies it, which stops the session too; correcting the allow-list
+does not resume it.
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.

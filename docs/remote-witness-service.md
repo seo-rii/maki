@@ -337,10 +337,14 @@ all mutation retries preserve their exact operation and session authorization.
 If the preferred frontend fails, the remaining frontends share the original
 overall deadline and a successful alternate becomes the next preferred address.
 Authentication failures, malformed records and predecessor conflicts remain
-terminal. A stalled former first address therefore consumes time once during
+terminal: the client returns them without trying another frontend. A
+stalled former first address therefore consumes time once during
 failover rather than on every later successful call. A local socket error, such
 as the EPERM Linux returns from `connect()` when a firewall drops the
-connection, is a transport failure like a refused connection, not a denial.
+connection, is a transport failure like a refused connection, not a denial. A
+trusted client certificate that a frontend's allow-list does not name is a
+denial: the frontend answers it, so an allow-list mistake is reported as
+`PermissionDenied`, not as an unavailable witness.
 
 Inspect through the configured client without claiming a session:
 
@@ -525,7 +529,10 @@ there is no stale replica or offline fallback.
 
 The server admits 1–256 connection workers and requires 1–256 distinct
 allow-listed certificate identities. A connection takes a worker only after
-TLS has authenticated an allow-listed certificate. Until it acquires a worker,
+TLS has authenticated an allow-listed certificate. A trusted certificate that
+the allow-list does not name never takes one: the server reads its single
+request while it holds a pending slot and answers it with a denial bound to that
+request, never calling the authority. Until it acquires a worker,
 it occupies one of four pending slots per worker, including while waiting after
 authentication. If these slots fill, a new arrival evicts the oldest pending
 connection and closes its socket. An authenticated waiter can therefore be
