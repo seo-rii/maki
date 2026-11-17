@@ -144,9 +144,25 @@ fn read_pem(path: &Path, private: bool) -> io::Result<SecretBuffer> {
             "TLS credentials must be regular files at most 1 MiB",
         ));
     }
+    // A private key is a secret file. Its owner can read and rewrite it
+    // whatever its mode, so it must belong to root or to the user this
+    // process runs as. Both checks describe the opened descriptor.
+    // Certificates and CA bundles are public and may have any owner.
     #[cfg(unix)]
     if private {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let owner = metadata.uid();
+        if owner != 0 && owner != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "TLS key is owned by uid {owner}, not by root or this process's user \
+                     (uid {euid}): its owner can read or replace it whatever its mode"
+                ),
+            ));
+        }
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
