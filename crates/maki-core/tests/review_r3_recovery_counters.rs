@@ -10,7 +10,7 @@ use maki_core::volume::{Volume, VolumeOptions};
 use maki_core::CoreError;
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
-use maki_format::durable_proof::DurableProofStore;
+use maki_format::durable_proof::{DurableProofStore, DURABLE_PROOF_A, DURABLE_PROOF_B};
 use maki_format::geometry::Geometry;
 use maki_format::journal::{
     encode_record, DurableMark, JournalRecord, SegmentHeader, RECORD_HEADER_SIZE,
@@ -330,4 +330,69 @@ fn roll_refuses_exhausted_index_before_sealing_or_creating_a_segment() {
     assert_eq!(volume.read_ct(1).unwrap(), None);
     volume.flush().unwrap();
     assert_eq!(volume.journal_durable_sequence(), 1);
+}
+
+// A resumed writer starts with no active segment: its first append needs a
+// sequence for the record and an index for the segment it opens, and the
+// writer refuses `u64::MAX` as either. A recovered horizon or index that
+// leaves neither makes every write fail forever on a volume the deep check
+// called clean; recovery and the check refuse it instead.
+
+#[test]
+fn durable_horizon_leaving_no_sequence_for_a_record_is_refused() {
+    assert_public_apis_refuse(u64::MAX - 1, |_| {});
+    assert_public_apis_refuse(u64::MAX - 1, |fixture| {
+        fixture.segment(1, u64::MAX, &[]);
+    });
+}
+
+#[test]
+fn record_at_the_last_sequence_leaving_no_successor_is_refused() {
+    assert_public_apis_refuse(u64::MAX - 2, |fixture| {
+        fixture.segment(1, u64::MAX - 1, &[u64::MAX - 1]);
+    });
+}
+
+#[test]
+fn segment_index_leaving_no_index_for_a_roll_is_refused() {
+    assert_public_apis_refuse(0, |fixture| fixture.segment(u64::MAX - 1, 1, &[]));
+}
+
+#[test]
+fn advisory_mark_index_leaving_no_index_for_a_roll_is_refused() {
+    assert_public_apis_refuse(0, |fixture| {
+        fixture
+            .backing
+            .open(layout::JOURNAL_DURABLE_MARK, true)
+            .unwrap()
+            .write_at(
+                0,
+                &DurableMark {
+                    segment_index: u64::MAX - 1,
+                    durable_size: 48,
+                }
+                .encode(),
+            )
+            .unwrap();
+    });
+}
+
+#[test]
+fn durable_proof_index_leaving_no_index_for_a_roll_is_refused() {
+    assert_public_apis_refuse(5, |fixture| {
+        // Both copies, identical: neither the A/B selection nor `follows`
+        // objects, and the checkpoint covers the proof's horizon.
+        let mut proof =
+            DurableProofStore::load(fixture.backing.as_ref(), fixture.superblock.volume_uuid)
+                .unwrap();
+        proof.segment_index = u64::MAX - 1;
+        for path in [DURABLE_PROOF_A, DURABLE_PROOF_B] {
+            fixture
+                .backing
+                .open(path, false)
+                .unwrap()
+                .write_at(0, &proof.encode())
+                .unwrap();
+        }
+    });
 }
