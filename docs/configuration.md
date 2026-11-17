@@ -677,12 +677,13 @@ space while holding the volume write lock. It requires enough space for the
 configured emergency reserve and checkpoint headroom after all record bytes and
 segment headers created by that request. A discard (v3) needs only the
 emergency reserve: its tombstones carry no payload and their checkpoint writes
-no slot data, so `fstrim` still returns space the filesystem had *already*
-freed when free space is inside the checkpoint headroom. It cannot free more:
-deleting a file is itself a write, which is refused there, and a filesystem on
-the volume sees those refusals as I/O errors (XFS reported EIO in the
-2026-10-03 pressure run). Keep backing free space above the reserve plus the
-headroom, and recover from that state by freeing space on the backing
+no slot data, so a raw discard of the exported device is still admitted when
+free space is inside the checkpoint headroom. A filesystem on the volume
+cannot use that: deleting a file is itself a write, and XFS `fstrim` forces a
+log write before it discards, so both are refused there and the filesystem
+sees I/O errors ([known limitations](status.md#known-limitations)). Keep
+backing free space above the reserve plus the headroom, and recover from that
+state by freeing space on the backing
 filesystem, not inside the volume. Checked arithmetic fails closed on an
 overflow. It does not reuse the statistics cache, so space lost or restored
 between consecutive writes is observed even within the same second. Setting
