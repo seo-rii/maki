@@ -265,3 +265,22 @@ async fn plaintext_endpoints_are_limited_to_loopback() {
         );
     }
 }
+
+#[test]
+fn an_ip_literal_host_is_verified_as_an_ip_address_server_name() {
+    use rustls::pki_types::ServerName;
+    for (host, ip_address) in [
+        ("[::1]", true),
+        ("[2001:db8::10]", true),
+        ("127.0.0.1", true),
+        ("localhost", false),
+        ("crypto.example", false),
+    ] {
+        let name = ServerName::try_from(super::unbracketed(host)).unwrap();
+        if ip_address {
+            assert!(matches!(name, ServerName::IpAddress(_)), "{host}: {name:?}");
+        } else {
+            assert!(matches!(name, ServerName::DnsName(_)), "{host}: {name:?}");
+        }
+    }
+}

@@ -106,7 +106,10 @@ client_key = { source = "credential", name = "crypto-client-key" }
 ```
 
 For gRPC, use `crypto.grpc.endpoint`, an `https://` URL and `crypto.grpc.tls`
-with the same fields. WebSocket and gRPC require `client_cert_file` and
+with the same fields. A gRPC endpoint named by an IP literal
+(`https://192.0.2.10:7443`, `https://[2001:db8::10]:7443`) is verified against
+the certificate's IP-address SANs; a DNS SAN does not match it.
+WebSocket and gRPC require `client_cert_file` and
 `client_key` together; the private key is loaded through the existing credential
 router. Omit both for server-only TLS. HTTP also retains support for a combined
 certificate/private-key PEM in `client_cert_file`; such a file is a secret file
@@ -423,7 +426,11 @@ The message-size limit bounds each received gRPC frame before decoding.
 Locally rejected oversized frames and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may
 move to another peer. An actual remote `OutOfRange` status remains a request
-error, regardless of its message text.
+error, regardless of its message text. Remote status text (`grpc-message`) and
+details (`grpc-status-details-bin`) are discarded before the status is read:
+an error's class follows only its `grpc-status` code and `maki-crypto-error`
+metadata, and text or details that do not decode neither change that class nor
+turn an OK status into an error.
 
 ## Backing directory identity
 

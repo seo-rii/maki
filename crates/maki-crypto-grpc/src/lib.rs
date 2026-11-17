@@ -250,6 +250,17 @@ fn response_status(
     }
 }
 
+/// Remote status text and details are ignored (SPEC §18), but tonic parses
+/// both when it reads a status from these headers: it panics on details that
+/// are not base64, and it replaces the code with `Unknown` when the message
+/// does not percent-decode to UTF-8. Either would let peer bytes crash the
+/// call or change its class. Remove both first, so the class follows only the
+/// validated `grpc-status` value and the allowlisted metadata.
+fn discard_remote_status_text(headers: &mut tonic::codegen::http::HeaderMap) {
+    headers.remove("grpc-message");
+    headers.remove("grpc-status-details-bin");
+}
+
 impl http_body::Body for BoundedResponseBody {
     type Data = tonic::codegen::Bytes;
     type Error = tonic::Status;
@@ -261,15 +272,16 @@ impl http_body::Body for BoundedResponseBody {
         if self.finished {
             return Poll::Ready(None);
         }
-        let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        let mut frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
         // A response that ends inside a message, or reports success without
         // one, broke the receive contract; tonic would surface either as a
         // local `Internal` status, which maps to Retryable (BUG-121).
-        let violation = match &frame {
+        let violation = match &mut frame {
             Some(Ok(frame)) => {
                 if let Some(bytes) = frame.data_ref() {
                     self.framing.observe(bytes).err()
-                } else if let Some(trailers) = frame.trailers_ref() {
+                } else if let Some(trailers) = frame.trailers_mut() {
+                    discard_remote_status_text(trailers);
                     self.finished = true;
                     if self.framing.inside_message() {
                         Some("grpc response ended inside a message")
@@ -358,7 +370,9 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
         let response = tonic::codegen::Service::call(&mut self.inner, request);
         let limit = self.limit;
         Box::pin(async move {
-            let response = response.await?;
+            let mut response = response.await?;
+            // Tonic reads a trailers-only status from these headers.
+            discard_remote_status_text(response.headers_mut());
             // A successful unary response needs a message followed by OK
             // trailers. Initial status belongs to a trailers-only error.
             // Tonic treats initial OK as an empty response and skips later
@@ -690,11 +704,15 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
+/// A URI host without the brackets that enclose an IPv6 literal.
+fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = unbracketed(host);
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
@@ -743,7 +761,20 @@ impl GrpcCryptoProvider {
                 // fails closed, as before).
                 let native_roots = tls.ca_certificate_pem.is_none()
                     || !rustls_native_certs::load_native_certs().certs.is_empty();
-                let mut config = ClientTlsConfig::new();
+                // Left unset, tonic takes the TLS server name from the URI
+                // host, which keeps an IPv6 literal's brackets ("[::1]"):
+                // neither a DNS name nor an IP address to rustls, so such an
+                // endpoint could never be built. Name the bare host instead.
+                // rustls verifies a literal as an IP-address server name
+                // against the certificate's IP SANs, exactly as it already
+                // did for IPv4; a DNS name is passed unchanged.
+                let server_name = endpoint
+                    .uri()
+                    .host()
+                    .map(unbracketed)
+                    .ok_or_else(|| fatal("gRPC endpoint URL has no host"))?
+                    .to_owned();
+                let mut config = ClientTlsConfig::new().domain_name(server_name);
                 if native_roots {
                     config = config.with_native_roots();
                 }
