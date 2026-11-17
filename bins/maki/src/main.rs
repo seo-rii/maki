@@ -25,7 +25,8 @@ const USAGE: &str = "usage:
   maki reload <config.toml> cache --max-bytes <bytes> [--ttl <duration>]
   maki reload <config.toml> <section>  hot config reload (control socket)
     control commands take --socket <path> in place of <config.toml>, e.g.
-    --socket /run/maki-control/<volume>/control.sock for maki-admin members
+    --socket /run/maki-control/<volume>/control.sock for maki-admin members,
+    and --timeout <seconds> (default 60; 600 for checkpoint and drain)
   maki attach|detach|grow ...          delegated to maki-attach (privileged)
   maki --help | --version";
 
@@ -65,6 +66,33 @@ fn take_timeout(args: &mut Vec<String>) -> Result<Option<Duration>, String> {
         .ok_or_else(|| format!("--timeout: {value:?} is not a positive number of seconds"))?;
     args.drain(i..i + 2);
     Ok(Some(Duration::from_secs(secs)))
+}
+
+/// The commands that take `--timeout`: the control commands, which bound
+/// their round trip with it, and the helper verbs, whose delegation route
+/// keeps a leading `--timeout` out of the printed `maki-attach` command.
+const TIMEOUT_COMMANDS: [&str; 8] = [
+    "status",
+    "metrics",
+    "checkpoint",
+    "drain",
+    "reload",
+    "attach",
+    "detach",
+    "grow",
+];
+
+/// The command word: the first argument that is neither `--timeout` nor
+/// `--socket` nor the value after one of them.
+fn command_word(args: &[String]) -> Option<&str> {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if !matches!(arg, "--timeout" | "--socket") {
+            return Some(arg);
+        }
+        args.next();
+    }
+    None
 }
 
 /// Remove `--socket <path>` from the arguments, if present.
@@ -133,6 +161,13 @@ fn main() -> ExitCode {
         Some("attach" | "detach" | "grow")
     ) {
         return privileged_helper(&args);
+    }
+    // A command outside `TIMEOUT_COMMANDS` refuses `--timeout` as misuse,
+    // whatever its value, rather than ignoring it.
+    if args.iter().any(|arg| arg == "--timeout")
+        && !command_word(&args).is_some_and(|command| TIMEOUT_COMMANDS.contains(&command))
+    {
+        return usage();
     }
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,

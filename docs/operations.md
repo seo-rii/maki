@@ -295,10 +295,22 @@ Events that matter operationally:
 | `INFO` | default threshold; lifecycle milestones |
 | `DEBUG` | free-space query failures, control session lifecycle |
 
-`MAKI_LOG` selects the threshold with `tracing_subscriber::EnvFilter`
-directives, for example `MAKI_LOG=warn` or `MAKI_LOG=info,maki_core=debug`;
-unset or invalid values mean `info`. Set it through a drop-in on the packaged
-unit:
+`MAKI_LOG` selects the threshold with comma-separated
+`tracing_subscriber::EnvFilter` directives, for example `MAKI_LOG=warn` or
+`MAKI_LOG=info,maki_core=debug`. Each directive names its level: either a
+level alone (`off`, `error`, `warn`, `info`, `debug` or `trace`, in any case)
+or a target or span selector followed by `=<level>` (`maki_core::engine=debug`,
+`[name]=trace`). EnvFilter itself would read a word without a level, such as
+the misspelt `warning` or `err` or a bare `maki_core`, as a target enabled at
+`trace` and turn every other target off, ERROR included, so Maki refuses it.
+Unset or empty values mean `info`; so do invalid ones, and the process then
+logs one `WARN` line, `MAKI_LOG is not a valid filter`, with a fixed reason
+and the 1-based directive index when available. Selector values and detailed
+parser errors are omitted because they can contain user data. A list without
+a level alone logs only the targets it names:
+`MAKI_LOG=maki_core=debug` hides the plugin's own `maki_nbdkit` errors, so
+give the rest a threshold too, as in `info,maki_core=debug`. Set it through a
+drop-in on the packaged unit:
 
 ```ini
 [Service]
@@ -1075,7 +1087,9 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
 - `maki status`, `metrics`, `checkpoint`, `drain` and `reload` give up when the
   daemon does not answer within 60 s (600 s for `checkpoint` and `drain`); pass
   `--timeout <seconds>` to wait longer. A timeout means the daemon is stalled
-  or busy, not that the command was rejected.
+  or busy, not that the command was rejected. Commands without a control
+  round trip (`volume`, `check`) refuse `--timeout` with the usage and exit
+  status 2.
 - While the journal cannot be synced (see the writeback item above) `maki
   status` reports `state: degraded` with the reason, and `maki_volume_state`
   is 2, until a barrier succeeds; a successful checkpoint alone does not clear
