@@ -208,7 +208,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo build --release --locked -p maki-nbdkit
-          nm -D target/release/libmaki_nbdkit.so | grep -q plugin_init
+          # A defined text symbol named exactly plugin_init, not an import.
+          nm -D --defined-only target/release/libmaki_nbdkit.so |
+            grep -Eq '[[:space:]]T[[:space:]]plugin_init$'
       # Third review F08: the hand-mirrored nbdkit_plugin struct and the
       # NBDKIT_* constants are checked against the distribution's header by
       # a C probe (tests/review_abi.rs), not by comments.
@@ -240,9 +242,15 @@ jobs:
           [backing]
           root = "/tmp/fakevol"
           EOF
-          if target/release/maki volume create /tmp/fake.toml; then
+          if target/release/maki volume create /tmp/fake.toml 2>/tmp/fake-create.err; then
+            cat /tmp/fake-create.err >&2
             echo "release build accepted provider = fake" >&2; exit 1
           fi
+          cat /tmp/fake-create.err >&2
+          # Any other failure (a config drifted out of schema) never reaches
+          # the provider check, so it is no evidence the provider is absent.
+          grep -Fq 'provider "fake" is not compiled into this build' /tmp/fake-create.err ||
+            { echo "volume create failed without refusing provider = fake" >&2; exit 1; }
           test ! -e /tmp/fakevol/superblock.a
 
   etcd-qualification:

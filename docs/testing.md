@@ -29,8 +29,10 @@ path into the test run. Cargo 1.100 puts integration tests and libraries in
 separate unit directories, so native fixtures cannot infer the plugin path
 from the test executable or loader search path. The wrapper uses the same
 Cargo options, features and profile for both phases; it does not search old
-build outputs. On other platforms it invokes Cargo directly. Use `CARGO` to
-select a Cargo executable, or `RUSTUP_TOOLCHAIN=1.94.0` for the baseline.
+build outputs. On other platforms it invokes Cargo directly, and so does a
+`--doc` selection on Linux: Cargo cannot compile doc tests with `--no-run`,
+and they never load the plugin. Use `CARGO` to select a Cargo executable, or
+`RUSTUP_TOOLCHAIN=1.94.0` for the baseline.
 
 The ignored release-mode suite is substantially more expensive than the default
 workspace suite. It uses simulated backing stores and does not perform real

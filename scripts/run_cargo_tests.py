@@ -5,7 +5,9 @@ Forward cargo-test options and optional harness arguments verbatim. On Linux,
 first compile the identical test selection with --no-run and parse Cargo's
 compiler-artifact messages. This preserves the toolchain, profile, target and
 unified dependency features without depending on Cargo's internal cache layout.
-Non-Linux runs need no native Linux plugin and invoke cargo test directly.
+Non-Linux runs need no native Linux plugin and invoke cargo test directly, as
+do doc-test (--doc) selections, which Cargo cannot compile with --no-run and
+which never load the plugin.
 """
 
 import json
@@ -80,10 +82,14 @@ def run(arguments, platform=None):
         return 2
     if any(arg in ("-h", "--help") for arg in cargo_arguments):
         return subprocess.call(command, cwd=ROOT)
-    compile_command = [command[0], "test", *cargo_arguments,
-                       "--no-run", "--message-format=json"]
     environment = os.environ.copy()
     environment.pop(PLUGIN_ENV, None)
+    if "--doc" in cargo_arguments:
+        # Cargo cannot compile doc tests with --no-run, and they never load
+        # the native plugin: run the selection as given.
+        return subprocess.call(command, cwd=ROOT, env=environment)
+    compile_command = [command[0], "test", *cargo_arguments,
+                       "--no-run", "--message-format=json"]
     with subprocess.Popen(compile_command, cwd=ROOT, env=environment,
                           stdout=subprocess.PIPE, text=True,
                           encoding="utf-8", errors="replace") as compiler:
