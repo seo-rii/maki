@@ -150,8 +150,9 @@ features and new allocation/clear/consume/shrink paths; an unchanged public API
 does not prove the same internal lifetimes. Update the upstream inventory and
 patch manifest together. The dependency contract
 (`scripts/check_vendor_erasure.py`) also compares each patched package's
-resolved Cargo features with its reviewed feature list; enabling any other
-feature, directly or through a dependency, fails until that feature's paths are
+Cargo features, resolved with every workspace feature enabled, with its reviewed
+feature list; enabling any other feature, directly, through a dependency or
+through an optional workspace feature, fails until that feature's paths are
 reviewed and added. CI runs the dependency contract and the explicit vendor
 tests because these packages are excluded from workspace membership.
 

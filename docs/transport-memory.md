@@ -295,9 +295,10 @@ rustls-based HTTP, WebSocket and gRPC TLS connections resolve to these patched
 sources. The [vendor guide](../vendor/README.md) records the covered owners and
 upgrade procedure. Published archive checksums record the original sources;
 source inventories, patch hashes, resolved dependency paths and each patched
-library's resolved Cargo features are checked in CI. Silently replacing a
-patch, resolving a second library version or enabling a feature outside the
-reviewed list fails the contract.
+library's Cargo features, resolved with every workspace feature enabled, are
+checked in CI. Silently replacing a patch, resolving a second library version
+or enabling a feature outside the reviewed list, even only through an optional
+workspace feature, fails the contract.
 
 The JSON parser's escaped-string scratch, reader scratch, integer128 scanning
 and formatted error-message heap buffers erase removed bytes before reuse.
