@@ -6,7 +6,8 @@ layer exposed through nbdkit. `SPEC.md` is normative. Start with
 `docs/testing.md` for maintained project documentation. `docs/status.md` is
 the only page that states current support; dated campaign reports live under
 `docs/qualification/` and never claim current state. Run
-`python3 -B scripts/check_docs_links.py` after moving or renaming a document.
+`python3 -B scripts/check_docs_links.py` after moving or renaming a document
+or a heading (it also verifies anchors).
 
 ## Ground rules
 
@@ -68,7 +69,7 @@ Failpoint-using tests must hold `failpoints::test_lock()` (failpoints are proces
 - `mlock`/`munlock` work on whole pages with no reference count: `SecretBuffer` counts owners per page under one lock, and only the last owner unlocks, after zeroization (F04 / BUG-006).
 - The rewrite rule applies to A/B records too: before the stale side is overwritten, the preserved (typed-valid) side's exact bytes are rewritten and synced (file and directory), so the durable copy is safe before the target is touched. A failed sync of the target is *not* emptied — the preserve step already protected the durable copy, and a readable newer generation is kept for a later store to preserve in turn. This BUG-001 preserve-first rule subsumes the earlier N-09 empty-on-failure approach; do not re-add the emptying (it discards a newer generation and the two designs' tests contradict each other).
 - A circuit-breaker probe must return its half-open slot on every exit, verdict or not: the dispatcher holds a `BreakerPermit` whose drop releases the slot, so a deadline or a cancelled future never wedges the circuit (N-10 / BUG-004).
-- Recovery must make the checkpoint state it selects durable *before* the writer resumes: a restart can hand it a page-cache-only newer checkpoint, and reclaiming journal against it then losing power leaves an older checkpoint whose covering segment is gone ("does not bridge"). `recover` re-stores the selected state; a failed A/B store also empties its unsynced side (BUG-022).
+- Recovery must make the checkpoint state it selects durable *before* the writer resumes: a restart can hand it a page-cache-only newer checkpoint, and reclaiming journal against it then losing power leaves an older checkpoint whose covering segment is gone ("does not bridge"). `recover` re-stores the selected state and fails closed if that store fails; the store's preserve-first step (BUG-001, above) keeps the other valid copy durable, and a failed target sync is not emptied (BUG-022).
 - `grow` is not exempt from attach identity: it takes the attach lock and must match the trusted record (targets and live NBD backend identity) before any `lvextend`/`xfs_growfs`, exactly like detach — its plan carries the `AttachmentIdentity` (BUG-018).
 - A clean `shutdown` must drain live control sessions, not just stop accepting: sessions run in a `JoinSet` that `serve_with_shutdown` aborts *and awaits*, or a lingering session keeps an `Engine` clone and the volume lock past a "successful" detach (BUG-015).
 - A remote transport needs an overall per-RPC timeout, not only a connection timeout: a server that stalls after headers or before trailers otherwise pins its inflight slot forever. The gRPC provider wraps readiness + the unary call in one `tokio::time::timeout` (BUG-017).

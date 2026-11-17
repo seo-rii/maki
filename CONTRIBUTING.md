@@ -92,6 +92,15 @@ published archive only when its raw-byte SHA-256 matches `vendor/upstream.json`.
 Edited vendor documents and project documentation keep the normal link checks;
 missing files or directories included in the archive remain errors.
 
+A fragment on a Markdown link, in-page (`#anchor`) or cross-file
+(`other.md#anchor`), must name a heading of that document as GitHub slugs it,
+or an explicit `<a id>`/`<a name>` anchor there. The slug is the heading's
+text (inline code and links reduced to their text) in lower case, with
+punctuation removed and each space turned into a hyphen, so
+`Review — 2026-10-12` becomes `review--2026-10-12`; a repeated heading gets
+`-1`, `-2` and so on. Fragments on source files and directories are not
+checked.
+
 ## Commits and pull requests
 
 - Use the conventional prefixes already in the history: `feat`, `fix`,

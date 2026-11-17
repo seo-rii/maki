@@ -926,9 +926,11 @@ semaphore limits
 batch sizing
 ```
 
-The current runtime reload supports only `cache.max_bytes`, while
-`cache.mode = "read"`. It requires an integer byte count and refuses the change
-when the cache is disabled. Endpoint, credential, timeout, retry,
+The current runtime reload supports only `cache.max_bytes` and `cache.ttl`,
+while `cache.mode = "read"`. It requires an integer byte count, accepts an
+optional positive TTL (omitting it keeps the current TTL), validates both
+before applying either, and refuses the change when the cache is disabled or
+the payload has any other field. Endpoint, credential, timeout, retry,
 circuit-breaker, semaphore, and batch reload requests explicitly report that
 the change was not applied; use the restart and self-test procedure above.
 
@@ -1543,6 +1545,7 @@ CLOSED / OPEN
 Default:
 
 ```toml
+[crypto.circuit_breaker]
 failure_threshold = 8
 open_initial = "1s"
 open_max = "30s"
