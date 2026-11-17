@@ -28,7 +28,9 @@ Drop, including outputs discarded after a later trailing-input error.
 The `float_roundtrip` lexical path guards 32-bit and 64-bit limb arrays,
 including growth, removed limbs, clones, multiplication/Karatsuba temporaries,
 result replacement and final full-capacity release. Float rounding behavior is
-preserved. Maki's production parser enables none of these optional modes.
+preserved. Maki's resolved configuration enables `raw_value`, which the witness
+protocol uses to borrow its request payload; `arbitrary_precision` and
+`float_roundtrip` stay disabled.
 
 `rustls` erases consumed plaintext queues and deframer regions, including
 obsolete compaction tails. Replacing or releasing these buffers erases their
@@ -96,6 +98,10 @@ reusing storage erase discarded bytes. `tungstenite` guards its output queue,
 fragment collectors, masked formatting temporaries and handshake read/write
 storage before they can contain payload data. Their growth and error paths
 erase retired allocations. Public message/HTTP values remain caller-owned.
+Like hyper, tungstenite's frame reader reads into its buffer's spare capacity
+and keeps only the reported byte count. That capacity is zero-filled once per
+allocation instead of being zero-filled and wiped again on every read, which
+made each read rewrite whatever capacity a large frame left behind.
 
 Hyper's HTTP/1 body decoder also retains typed parse-error provenance for
 invalid chunk sizes, delimiters, extensions and trailers. These errors keep
@@ -139,7 +145,11 @@ checksum, reapply and review each ownership change, and rerun the erasure
 regressions and protocol tests before changing the pinned version. Inspect new
 features and new allocation/clear/consume/shrink paths; an unchanged public API
 does not prove the same internal lifetimes. Update the upstream inventory and
-patch manifest together. CI runs the dependency contract and the explicit vendor
+patch manifest together. The dependency contract
+(`scripts/check_vendor_erasure.py`) also compares each patched package's
+resolved Cargo features with its reviewed feature list; enabling any other
+feature, directly or through a dependency, fails until that feature's paths are
+reviewed and added. CI runs the dependency contract and the explicit vendor
 tests because these packages are excluded from workspace membership.
 
 Project documentation links are checked separately from preserved archive

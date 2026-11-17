@@ -43,6 +43,9 @@ class VendorErasureContract(unittest.TestCase):
         self.metadata["resolve"] = {"nodes": [
             {"id": "serde_json", "features": ["default", "std"]},
             {"id": "rustls", "features": ["ring", "std", "tls12"]},
+            {"id": "bytes", "features": ["default", "std"]},
+            {"id": "hyper", "features": ["client", "http1", "http2"]},
+            {"id": "tungstenite", "features": ["handshake", "__rustls-tls"]},
         ]}
         (self.root / "Cargo.toml").write_text(manifest)
         (self.root / "Cargo.lock").write_text(lock)
@@ -50,7 +53,62 @@ class VendorErasureContract(unittest.TestCase):
         (self.root / "vendor/patches.json").write_text(json.dumps(patches))
         (self.root / "vendor/test-ca-provenance.json").write_text(json.dumps({"files": {}}))
 
+    def features(self, name):
+        return next(node for node in self.metadata["resolve"]["nodes"]
+                    if node["id"] == name)["features"]
+
     def test_known_local_dependencies_pass(self):
+        self.assertEqual(check(self.root, self.metadata), [])
+
+    def test_current_workspace_features_are_reviewed(self):
+        for name, features in (
+            ("bytes", ["default", "std"]),
+            ("hyper", ["client", "default", "http1", "http2", "server"]),
+            ("rustls", ["aws-lc-rs", "aws_lc_rs", "log", "logging", "ring", "std", "tls12"]),
+            ("serde_json", ["default", "raw_value", "std"]),
+            ("tungstenite", ["__rustls-tls", "data-encoding", "handshake", "http",
+                             "httparse", "rustls", "rustls-pki-types", "sha1"]),
+        ):
+            self.features(name)[:] = features
+        self.assertEqual(check(self.root, self.metadata), [])
+
+    def test_unreviewed_feature_is_rejected(self):
+        for name, feature in (
+            ("serde_json", "preserve_order"), ("serde_json", "unbounded_depth"),
+            ("rustls", "brotli"), ("bytes", "serde"), ("hyper", "ffi"),
+            ("tungstenite", "native-tls"), ("tungstenite", "rustls-tls-webpki-roots"),
+        ):
+            with self.subTest(name=name, feature=feature):
+                features = self.features(name)
+                features.append(feature)
+                errors = check(self.root, self.metadata)
+                features.remove(feature)
+                self.assertTrue(any(name in error and feature in error for error in errors),
+                                errors)
+
+    def test_missing_resolve_section_is_rejected(self):
+        for resolve in (None, {}, {"nodes": []}):
+            with self.subTest(resolve=resolve):
+                self.metadata["resolve"] = resolve
+                self.assertTrue(check(self.root, self.metadata))
+        del self.metadata["resolve"]
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_patched_package_missing_from_resolve_is_rejected(self):
+        nodes = self.metadata["resolve"]["nodes"]
+        nodes[:] = [node for node in nodes if node["id"] != "tungstenite"]
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_nested_target_directory_is_inventoried(self):
+        path = self.root / "vendor/rustls/src/target"
+        path.mkdir(parents=True)
+        (path / "unrecorded.rs").write_text("// unreviewed source\n")
+        self.assertTrue(check(self.root, self.metadata))
+
+    def test_top_level_build_directory_is_ignored(self):
+        path = self.root / "vendor/rustls/target/debug"
+        path.mkdir(parents=True)
+        (path / "build-output").write_text("local build artifact\n")
         self.assertEqual(check(self.root, self.metadata), [])
 
     def test_unrecorded_source_edit_is_rejected(self):
@@ -81,18 +139,18 @@ class VendorErasureContract(unittest.TestCase):
                          ["std", "arbitrary_precision", "float_roundtrip"],
                          ["std", "raw_value", "arbitrary_precision", "float_roundtrip"]):
             with self.subTest(features=features):
-                self.metadata["resolve"]["nodes"][0]["features"] = features
+                self.features("serde_json")[:] = features
                 self.assertEqual(check(self.root, self.metadata), [])
 
     def test_reviewed_raw_value_feature_is_allowed(self):
-        self.metadata["resolve"]["nodes"][0]["features"].append("raw_value")
+        self.features("serde_json").append("raw_value")
         self.assertEqual(check(self.root, self.metadata), [])
 
     def test_reviewed_arbitrary_precision_feature_is_allowed(self):
         for features in (["std", "arbitrary_precision"],
                          ["std", "raw_value", "arbitrary_precision"]):
             with self.subTest(features=features):
-                self.metadata["resolve"]["nodes"][0]["features"] = features
+                self.features("serde_json")[:] = features
                 self.assertEqual(check(self.root, self.metadata), [])
 
     def test_dependency_patch_removal_is_rejected(self):

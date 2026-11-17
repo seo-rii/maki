@@ -19,7 +19,10 @@ use crate::{
 };
 use bytes::BytesMut;
 use log::*;
-use std::io::{self, Cursor, Error as IoError, ErrorKind as IoErrorKind, Read, Write};
+use std::{
+    io::{self, Cursor, Error as IoError, ErrorKind as IoErrorKind, Read, Write},
+    ptr, slice,
+};
 use zeroize::Zeroizing;
 
 /// Read buffer size used for `FrameSocket`.
@@ -105,6 +108,10 @@ where
 pub(super) struct FrameCodec {
     /// Buffer to read data from the stream.
     in_buffer: BytesMut,
+    /// Whether every byte of `in_buffer`'s spare capacity is initialized.
+    /// Set by `read_in` after zero-filling it; cleared by `reserve_in` when
+    /// the spare capacity may have moved to, or grown into, new storage.
+    in_spare_initialized: bool,
     /// Buffer to send packets to the network.
     out_buffer: Zeroizing<Vec<u8>>,
     /// Capacity limit for `out_buffer`.
@@ -124,6 +131,7 @@ impl FrameCodec {
     pub(super) fn new(in_buf_len: usize) -> Self {
         Self {
             in_buffer: BytesMut::with_capacity(in_buf_len),
+            in_spare_initialized: false,
             out_buffer: <_>::default(),
             max_out_buffer_len: usize::MAX,
             out_buffer_write_len: 0,
@@ -138,6 +146,7 @@ impl FrameCodec {
         in_buffer.reserve(min_in_buf_len.saturating_sub(in_buffer.len()));
         Self {
             in_buffer,
+            in_spare_initialized: false,
             out_buffer: <_>::default(),
             max_out_buffer_len: usize::MAX,
             out_buffer_write_len: 0,
@@ -194,7 +203,7 @@ impl FrameCodec {
             }
 
             // Not enough data in buffer.
-            self.in_buffer.reserve(self.header.as_ref().map(|(_, l)| *l as usize).unwrap_or(6));
+            self.reserve_in(self.header.as_ref().map(|(_, l)| *l as usize).unwrap_or(6));
             if self.read_in(stream)? == 0 {
                 trace!("no frame received");
                 return Ok(None);
@@ -223,13 +232,56 @@ impl FrameCodec {
         Ok(Some(frame))
     }
 
+    /// Reserve `in_buffer` capacity, tracking whether its spare capacity is
+    /// still the storage `read_in` initialized.
+    fn reserve_in(&mut self, additional: usize) {
+        let grows = additional > self.in_buffer.capacity() - self.in_buffer.len();
+        let before = (self.in_buffer.as_ptr(), self.in_buffer.capacity());
+        self.in_buffer.reserve(additional);
+        // `reserve` returns early when the spare capacity suffices. Every other
+        // path moves the view or changes its capacity: growth, reclaiming a
+        // shared buffer or compaction can expose uninitialized storage.
+        if grows || before != (self.in_buffer.as_ptr(), self.in_buffer.capacity()) {
+            self.in_spare_initialized = false;
+        }
+    }
+
     /// Read into available `in_buffer` capacity.
+    ///
+    /// Maki erasure: upstream zero-filled the whole spare capacity before
+    /// every read and truncated it afterwards; the patched `BytesMut::truncate`
+    /// adds a second full wipe, so one large frame made every later read
+    /// rewrite megabytes. The reader now gets the spare capacity directly, as
+    /// in the patched hyper, zero-filled once per allocation. Only the `n`
+    /// bytes `read` reports become data. Maki's TCP and tokio-rustls streams
+    /// write exactly those bytes, so the remaining spare capacity stays zero.
+    /// Bytes a non-conforming reader writes beyond `n` stay in spare capacity
+    /// that only `in_buffer` can reach, until a later read overwrites them or
+    /// the patched `BytesMut` erases them with the storage on growth,
+    /// compaction or release.
     fn read_in(&mut self, stream: &mut impl Read) -> io::Result<usize> {
         let len = self.in_buffer.len();
         debug_assert!(self.in_buffer.capacity() > len);
-        self.in_buffer.resize(self.in_buffer.capacity(), 0);
-        let size = stream.read(&mut self.in_buffer[len..]);
-        self.in_buffer.truncate(len + size.as_ref().copied().unwrap_or(0));
+        let spare = self.in_buffer.spare_capacity_mut();
+        let available = spare.len();
+        if !self.in_spare_initialized {
+            // SAFETY: `spare` is valid for writes of `available` bytes.
+            unsafe { ptr::write_bytes(spare.as_mut_ptr(), 0, available) };
+            self.in_spare_initialized = true;
+        }
+        // SAFETY: Every spare byte is initialized. It was zero-filled above or
+        // by an earlier call; since then this storage has only received reads,
+        // been consumed from the front or been reserved in place (otherwise
+        // `reserve_in` cleared the flag). `MaybeUninit<u8>` has the layout of
+        // `u8`.
+        let buf = unsafe { slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), available) };
+        let size = stream.read(buf);
+        if let Ok(read) = size {
+            // SAFETY: These bytes are initialized and within the capacity. A
+            // reader that reports more than `available` keeps upstream's
+            // result: the whole (initialized) spare capacity becomes data.
+            unsafe { self.in_buffer.set_len(len + read.min(available)) };
+        }
         size
     }
 
@@ -475,5 +527,106 @@ mod maki_erasure_tests {
         let codec = FrameCodec::from_partially_read(part, 64);
         assert_eq!(&codec.in_buffer[..], b"maki partial frame secret");
         released.assert_zeroized();
+    }
+
+    /// Hands out queued segments and records what each read was offered.
+    struct Segments {
+        queue: std::collections::VecDeque<Vec<u8>>,
+        offered: Vec<usize>,
+    }
+
+    impl Read for Segments {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // Upstream offered the whole spare capacity, zero-filled.
+            assert!(buf.iter().all(|byte| *byte == 0));
+            self.offered.push(buf.len());
+            let Some(front) = self.queue.front_mut() else { return Ok(0) };
+            let count = buf.len().min(front.len());
+            buf[..count].copy_from_slice(&front[..count]);
+            front.drain(..count);
+            if front.is_empty() {
+                self.queue.pop_front();
+            }
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn maki_read_offers_the_whole_zeroed_spare_capacity() {
+        let mut wire = vec![0x82, 126, 0x01, 0x00];
+        wire.extend((0..256).map(|index| index as u8));
+        wire.extend_from_slice(&[0x82, 0x02, 0xaa, 0xbb]);
+        let mut stream =
+            Segments { queue: wire.chunks(40).map(<[u8]>::to_vec).collect(), offered: Vec::new() };
+        let mut codec = FrameCodec::new(64);
+        let frame = codec.read_frame(&mut stream, None, false, true).unwrap().unwrap();
+        assert_eq!(&frame.payload()[..], &wire[4..260]);
+        // The first read is offered the initial capacity, the next one the
+        // capacity grown for the announced frame length.
+        assert_eq!(stream.offered[0], 64);
+        assert!(stream.offered[1] >= 256 - 36);
+        let frame = codec.read_frame(&mut stream, None, false, true).unwrap().unwrap();
+        assert_eq!(&frame.payload()[..], &[0xaa, 0xbb]);
+        assert!(codec.read_frame(&mut stream, None, false, true).unwrap().is_none());
+        assert!(codec.in_buffer.is_empty());
+    }
+
+    #[test]
+    fn maki_reserve_tracks_moved_spare_capacity() {
+        let mut codec = FrameCodec::new(64);
+        let mut stream = Segments { queue: vec![b"abc".to_vec()].into(), offered: Vec::new() };
+        assert_eq!(codec.read_in(&mut stream).unwrap(), 3);
+        assert!(codec.in_spare_initialized);
+        codec.reserve_in(61);
+        assert!(codec.in_spare_initialized, "a reservation that fits keeps the storage");
+        codec.reserve_in(62);
+        assert!(!codec.in_spare_initialized, "growth exposes new storage");
+        assert_eq!(&codec.in_buffer[..], b"abc");
+    }
+
+    /// Writes `fill` over the whole buffer but reports only `report` bytes.
+    struct Overwrite {
+        fill: u8,
+        report: usize,
+    }
+
+    impl Read for Overwrite {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(self.fill);
+            Ok(self.report)
+        }
+    }
+
+    struct Failing;
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn maki_read_keeps_only_reported_bytes_and_erases_the_rest_on_release() {
+        let mut codec = FrameCodec::new(64);
+        let released = watch(codec.in_buffer.as_ptr());
+        assert_eq!(codec.read_in(&mut Overwrite { fill: 0x5a, report: 3 }).unwrap(), 3);
+        assert_eq!(&codec.in_buffer[..], &[0x5a; 3]);
+        assert!(codec.read_in(&mut Failing).is_err());
+        assert_eq!(codec.in_buffer.len(), 3);
+        // Over-reporting keeps upstream's result: the whole buffer is data.
+        assert_eq!(codec.read_in(&mut Overwrite { fill: 0xa5, report: 1000 }).unwrap(), 1000);
+        assert_eq!(codec.in_buffer.len(), 64);
+        drop(codec);
+        released.assert_zeroized();
+    }
+
+    #[test]
+    fn maki_read_growth_erases_bytes_written_beyond_the_report() {
+        let mut codec = FrameCodec::new(64);
+        let retired = watch(codec.in_buffer.as_ptr());
+        codec.read_in(&mut Overwrite { fill: 0x5a, report: 3 }).unwrap();
+        codec.reserve_in(1024);
+        retired.assert_zeroized();
+        assert_eq!(&codec.in_buffer[..], &[0x5a; 3]);
     }
 }

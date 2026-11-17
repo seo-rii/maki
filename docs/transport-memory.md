@@ -294,9 +294,10 @@ workspace dependency overrides. All HTTP and WebSocket JSON parsing, and all
 rustls-based HTTP, WebSocket and gRPC TLS connections resolve to these patched
 sources. The [vendor guide](../vendor/README.md) records the covered owners and
 upgrade procedure. Published archive checksums record the original sources;
-source inventories, patch hashes, resolved dependency paths and parser feature
-compatibility are checked in CI. Silently replacing a patch or resolving a
-second library version fails the contract.
+source inventories, patch hashes, resolved dependency paths and each patched
+library's resolved Cargo features are checked in CI. Silently replacing a
+patch, resolving a second library version or enabling a feature outside the
+reviewed list fails the contract.
 
 The JSON parser's escaped-string scratch, reader scratch, integer128 scanning
 and formatted error-message heap buffers erase removed bytes before reuse.
@@ -329,9 +330,10 @@ Growth copies directly into a guarded replacement and erases the old full
 allocation. Removed limbs, cloned arrays, multiplication and Karatsuba
 temporaries, replaced results and final Drop retain this protection. Float
 results remain ordinary scalar values with the upstream rounding behavior.
-Maki's resolved default/std configuration enables none of these three optional
-modes. This protection covers owned heap arrays; stack arithmetic and compiler
-temporaries remain outside the allocation guards.
+Maki's resolved configuration enables `raw_value`, which the witness protocol
+uses to borrow its request payload, and neither `arbitrary_precision` nor
+`float_roundtrip`. This protection covers owned heap arrays; stack arithmetic
+and compiler temporaries remain outside the allocation guards.
 
 The convenience `from_slice`/`from_str` functions drop their parser before
 returning. A caller that keeps a `Deserializer` alive retains its latest
@@ -402,7 +404,13 @@ collectors, masked-formatting temporaries and handshake read/write buffers.
 Guards exist before copying and survive growth, rejection, partial writes,
 cancellation and Drop. Incoming frame allocations use patched `BytesMut`;
 returned messages and shared frame views preserve caller ownership and wire
-contents.
+contents. The frame reader reads directly into that buffer's spare capacity,
+zero-filled once per allocation, and keeps only the byte count the stream
+reports, so a read no longer rewrites the capacity a large frame left behind.
+Maki's TCP and TLS streams write exactly the reported bytes. Anything a
+non-conforming stream writes beyond them stays in that library-owned spare
+capacity until a later read overwrites it or the allocation is erased on
+growth, compaction or release.
 
 These changes cover application-data byte allocations on Maki's active framing
 paths. Public HTTP header/URI values, arbitrary user-supplied body buffers,
