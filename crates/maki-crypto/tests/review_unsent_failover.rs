@@ -165,6 +165,10 @@ impl CryptoProvider for Scripted {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(Some(error)) = self.script.lock().pop_front() {
+            return Err(error);
+        }
         self.inner.decrypt_batch(context, items).await
     }
 }
@@ -372,6 +376,34 @@ async fn an_unsent_later_chunk_does_not_mark_the_whole_call() {
         .encrypt_batch(&ctx(), &[pt(6), pt(7)])
         .await
         .unwrap_err();
+    assert_eq!(only.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(error.class(), ErrorClass::Retryable);
+    assert!(!error.is_not_sent(), "{error:?}");
+}
+
+#[tokio::test]
+async fn an_unsent_later_decrypt_chunk_does_not_mark_the_whole_call() {
+    let ciphertext = FakeCryptoProvider::new(UNIT as u32)
+        .encrypt_batch(&ctx(), &[pt(8), pt(9)])
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new());
+    let only = Scripted::new(
+        FakeCryptoProvider::new(UNIT as u32).with_max_batch(1, 1 << 20),
+        vec![
+            None,
+            Some(CryptoError::Retryable("connection refused".into()).not_sent()),
+        ],
+    );
+    let set = set_of(
+        &[("only", only.clone())],
+        DispatchConfig {
+            max_attempts: Some(1),
+            ..cfg(false)
+        },
+        &clock,
+    );
+    let error = set.decrypt_batch(&ctx(), &ciphertext).await.unwrap_err();
     assert_eq!(only.calls.load(Ordering::SeqCst), 2);
     assert_eq!(error.class(), ErrorClass::Retryable);
     assert!(!error.is_not_sent(), "{error:?}");
