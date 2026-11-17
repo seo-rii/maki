@@ -229,10 +229,34 @@ fn barriers_keep_failing_until_the_rewrite_persists() {
     assert_eq!(vol.read_ct(1).unwrap().map(|(_, d)| d), Some(ct(2)));
 }
 
+/// Let every backing operation through up to and including the sync of
+/// the journal's durable mark, then fail every later one: the recovering
+/// process loses power right after the mark is durable. Returns whether the
+/// mark sync was reached.
+fn stop_after_the_durable_mark_sync(backing: &CrashableBacking) -> Arc<AtomicBool> {
+    let reached = Arc::new(AtomicBool::new(false));
+    let flag = reached.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op| {
+        if flag.load(Ordering::SeqCst) {
+            return Some(io::Error::other("power lost after the durable mark sync"));
+        }
+        if matches!(op, FaultOp::SyncData { path } if *path == layout::JOURNAL_DURABLE_MARK) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        None
+    })));
+    reached
+}
+
 /// Process restart after a failed writeback: the page cache still shows
 /// the records, recovery accepts them, and its own fdatasync has nothing
 /// dirty to write. Recovery must rewrite what it accepts (K-01 was a sync
-/// only) before the next FLUSH can acknowledge it.
+/// only) before it syncs a durable mark covering it. A recovery that runs
+/// to the end also replays the records into synced slots and prunes the
+/// segment, which makes them durable without the rewrite. So the first
+/// recovery loses power right after its mark sync, while the segment is the
+/// only copy of the record: the next one must still attach and serve it,
+/// and a FLUSH after it must keep it across another power loss.
 #[test]
 fn recovery_rewrites_page_cache_bytes_it_accepts_after_a_failed_writeback() {
     let _guard = failpoints::test_lock();
@@ -244,8 +268,25 @@ fn recovery_rewrites_page_cache_bytes_it_accepts_after_a_failed_writeback() {
     backing.set_fault_hook(None);
     drop(vol); // restart, not a power loss: the page cache survives
 
-    let mut vol = recover(&backing).unwrap();
-    assert_eq!(vol.read_ct(0).unwrap().map(|(_, d)| d), Some(ct(1)));
+    let reached = stop_after_the_durable_mark_sync(&backing);
+    assert!(
+        recover(&backing).is_err(),
+        "recovery continued after the stop"
+    );
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "recovery never synced its mark"
+    );
+    backing.set_fault_hook(None);
+    backing.crash_all_lost();
+
+    let mut vol =
+        recover(&backing).expect("the durable mark covers bytes that never reached the disk");
+    assert_eq!(
+        vol.read_ct(0).unwrap().map(|(_, d)| d),
+        Some(ct(1)),
+        "record covered by recovery's durable mark was lost"
+    );
     vol.flush().unwrap();
     drop(vol);
 

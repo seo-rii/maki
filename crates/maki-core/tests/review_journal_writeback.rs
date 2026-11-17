@@ -1,6 +1,13 @@
 //! BUG-021: Linux writeback EIO can clear dirty cache bits. A later sync
 //! must not acknowledge bytes unless a verified rewrite makes them durable.
 //! https://www.kernel.org/doc/html/v6.17/filesystems/iomap/operations.html
+//!
+//! `WritebackBacking` fails a journal segment's writeback inside its
+//! `CrashableBacking`, whose Linux model keeps the failed writes readable
+//! but neither dirty nor durable: a later successful sync writes only the
+//! pages dirtied since, so a length change or a sync elsewhere in the file
+//! does not persist them. It also skips a segment sync that has nothing
+//! dirty to write, and can change accepted bytes right after a scan.
 
 use std::collections::HashMap;
 use std::io;
@@ -8,18 +15,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use maki_backing::{Backing, BackingFile, VolumeLock};
+use maki_core::recovery;
 use maki_core::volume::{Volume, VolumeOptions};
 use maki_format::geometry::Geometry;
 use maki_format::journal::{encode_record, JournalRecord, SEGMENT_HEADER_SIZE};
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
+use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::{failpoints, CrashableBacking};
 use uuid::Uuid;
 
 const CIPHERTEXT_SIZE: usize = 540;
 const SECOND_PAYLOAD_OFFSET: u64 = SEGMENT_HEADER_SIZE as u64 + 32 + CIPHERTEXT_SIZE as u64 + 32;
 
-#[derive(Default)]
+const SEGMENT_SIZE: u64 = 256 * 1024;
+
 struct WritebackBacking {
     inner: CrashableBacking,
     dirty: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -27,11 +37,36 @@ struct WritebackBacking {
     change_after_scan: Arc<AtomicBool>,
 }
 
+fn is_segment(path: &str) -> bool {
+    path.strip_prefix("journal/")
+        .and_then(layout::parse_journal_segment)
+        .is_some()
+}
+
+impl Default for WritebackBacking {
+    fn default() -> Self {
+        let inner = CrashableBacking::new();
+        let fail_sync = Arc::new(AtomicBool::new(false));
+        let failing = fail_sync.clone();
+        inner.set_fault_hook(Some(Arc::new(move |op| match op {
+            FaultOp::SyncData { path } if is_segment(path) && failing.load(Ordering::SeqCst) => {
+                Some(io::Error::other("writeback EIO cleared dirty bits"))
+            }
+            _ => None,
+        })));
+        Self {
+            inner,
+            dirty: Mutex::default(),
+            fail_sync,
+            change_after_scan: Arc::default(),
+        }
+    }
+}
+
 struct WritebackFile {
     inner: Arc<dyn BackingFile>,
     is_segment: bool,
     dirty: Arc<AtomicBool>,
-    fail_sync: Arc<AtomicBool>,
     change_after_scan: Arc<AtomicBool>,
 }
 
@@ -70,14 +105,10 @@ impl BackingFile for WritebackFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        if self.is_segment {
-            if !self.dirty.swap(false, Ordering::SeqCst) {
-                return Ok(()); // failed writes are no longer queued for writeback
-            }
-            if self.fail_sync.load(Ordering::SeqCst) {
-                return Err(io::Error::other("writeback EIO cleared dirty bits"));
-            }
+        if self.is_segment && !self.dirty.swap(false, Ordering::SeqCst) {
+            return Ok(()); // failed writes are no longer queued for writeback
         }
+        // With `fail_sync` set, the inner backing's fault hook fails this.
         self.inner.sync_data()
     }
 }
@@ -93,12 +124,8 @@ impl Backing for WritebackBacking {
             .clone();
         Ok(Arc::new(WritebackFile {
             inner: self.inner.open(path, create)?,
-            is_segment: path
-                .strip_prefix("journal/")
-                .and_then(layout::parse_journal_segment)
-                .is_some(),
+            is_segment: is_segment(path),
             dirty,
-            fail_sync: self.fail_sync.clone(),
             change_after_scan: self.change_after_scan.clone(),
         }))
     }
@@ -134,7 +161,7 @@ impl Backing for WritebackBacking {
 
 fn options() -> VolumeOptions {
     VolumeOptions {
-        journal_segment_size: 256 * 1024,
+        journal_segment_size: SEGMENT_SIZE,
     }
 }
 
@@ -182,6 +209,16 @@ fn a_flush_retry_rewrites_failed_writeback_bytes_before_acknowledging_them() {
     }
 }
 
+/// A process restart after a failed writeback hands recovery records that
+/// only the page cache holds; their dirty bits are clear, so a plain sync
+/// writes nothing. Full-replay recovery (`recovery::recover`) returns them
+/// to its caller and leaves them in the journal, sealed with a durable mark
+/// and both proof copies covering them: it must rewrite them first, or the
+/// next power loss leaves that horizon over bytes the disk never received
+/// and every later attach refuses the volume. Attach recovery also replays
+/// them into synced slots before it returns, which makes them durable
+/// without the rewrite once it finishes (`review_recovery_prefix_rewrite.rs`
+/// and `review_writeback.rs` stop it part-way).
 #[test]
 fn process_recovery_rewrites_clean_cache_bytes_before_sealing_the_journal() {
     let _guard = failpoints::test_lock();
@@ -194,10 +231,16 @@ fn process_recovery_rewrites_clean_cache_bytes_before_sealing_the_journal() {
     drop(volume); // cached bytes survive the process
     backing.fail_sync.store(false, Ordering::SeqCst);
 
-    let mut volume = Volume::recover(backing.clone(), options()).unwrap();
-    assert!(volume.read_ct(1).unwrap().is_some());
-    volume.flush().unwrap();
-    drop(volume);
+    let recovered = recovery::recover(&(backing.clone() as Arc<dyn Backing>), SEGMENT_SIZE)
+        .expect("recovery accepts the cached records");
+    assert!(
+        recovered
+            .replay
+            .iter()
+            .any(|record| record.unit_index == 1 && record.payload == [2; CIPHERTEXT_SIZE]),
+        "recovery did not accept the record whose writeback failed"
+    );
+    drop(recovered);
     backing.inner.crash_all_lost();
     let volume = Volume::recover(backing, options())
         .expect("the previous recovery must actually persist every byte it accepted");

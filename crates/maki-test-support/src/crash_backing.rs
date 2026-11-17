@@ -285,6 +285,20 @@ impl Inner {
         Ok(())
     }
 
+    /// The parent of `path` exists and `path` itself is not a directory: a
+    /// directory name cannot be opened, locked, renamed over or unlinked as
+    /// a file (EISDIR, as Linux `FileBacking` reports).
+    fn require_file_name(&self, path: &str) -> io::Result<()> {
+        self.require_dir(parent(path))?;
+        if self.dirs.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                path.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Persist only the selected operations and their dependency closure.
     /// A predecessor already compacted by an earlier sync is satisfied.
     fn persist_namespace(&mut self, selected: impl IntoIterator<Item = u64>) {
@@ -863,13 +877,7 @@ impl Backing for CrashableBacking {
         validate(path, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Open { path, create })?;
-        inner.require_dir(parent(path))?;
-        if inner.dirs.contains_key(path) {
-            return Err(io::Error::new(
-                io::ErrorKind::IsADirectory,
-                path.to_string(),
-            ));
-        }
+        inner.require_file_name(path)?;
         let inode = match inner.volatile(path) {
             Some(inode) => inode,
             None if create => {
@@ -909,7 +917,7 @@ impl Backing for CrashableBacking {
         validate(path, false)?;
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Remove { path })?;
-        inner.require_dir(parent(path))?;
+        inner.require_file_name(path)?;
         if inner.volatile(path).is_none() {
             return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string()));
         }
@@ -926,10 +934,7 @@ impl Backing for CrashableBacking {
         let mut inner = self.inner.lock();
         inner.check(&FaultOp::Rename { from, to })?;
         inner.require_dir(parent(from))?;
-        inner.require_dir(parent(to))?;
-        if inner.dirs.contains_key(to) {
-            return Err(io::Error::new(io::ErrorKind::IsADirectory, to.to_string()));
-        }
+        inner.require_file_name(to)?;
         let inode = inner
             .volatile(from)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, from.to_string()))?;
@@ -1042,7 +1047,7 @@ impl Backing for CrashableBacking {
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
         validate(path, false)?;
         let mut inner = self.inner.lock();
-        inner.require_dir(parent(path))?;
+        inner.require_file_name(path)?;
         if !inner.locks.insert(path.to_string()) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
