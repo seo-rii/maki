@@ -822,6 +822,14 @@ representation and takes no `encoding`: `unit_index`, `format_version` and
 hyphenated UUID string, and `compatibility_id` is a JSON string. WebSocket
 and gRPC use the fixed request schemas of their reference contracts.
 
+gRPC method paths are validated exactly as the provider sends them: HTTP/2
+carries a path as `:path`, an RFC 3986 absolute path with an optional query
+(RFC 9113 §8.3.1), so configuration validation MUST reject an
+`encrypt_path` or `decrypt_path` that does not start with `/`, contains a
+character outside RFC 3986 path and query characters or a malformed `%XX`
+escape, contains a `#` fragment (never sent), or exceeds the client's
+65534-byte URI limit; provider construction applies the same rule.
+
 HTTP request mappings are validated exactly as the provider builds them:
 configuration validation MUST reject an unknown field source or payload
 encoding, an `encoding` on a non-payload source, a request pointer that does

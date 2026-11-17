@@ -7,9 +7,11 @@
 //!   be `{ source = "credential", name = "…" }` references (SPEC §9),
 //! - human-friendly sizes ("128MiB"), durations ("150us"), rates ("1/s").
 
+mod grpc_method_path;
 mod http_mapping;
 mod transport_size;
 
+pub use grpc_method_path::{check_grpc_method_path, MAX_GRPC_METHOD_PATH_BYTES};
 pub use http_mapping::{
     decode_pointer_token, HttpFieldSource, HttpPayloadEncoding, HttpRequestMapping,
 };
@@ -387,8 +389,9 @@ pub struct TransportSection {
 }
 
 /// gRPC transport (SPEC §18). Method paths default to the reference contract
-/// (`packaging/examples/maki-crypto.proto`); metadata values follow the same
-/// SPEC §9 rules as HTTP headers (sensitive keys must be credential refs).
+/// (`packaging/examples/maki-crypto.proto`) and are checked with
+/// [`check_grpc_method_path`]; metadata values follow the same SPEC §9 rules
+/// as HTTP headers (sensitive keys must be credential refs).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrpcSection {
@@ -2292,6 +2295,19 @@ impl VolumeConfig {
                     validate_tls("grpc", tls)?;
                 }
                 validate_endpoints("grpc", &grpc.endpoint, "http", "https", grpc.tls.is_some())?;
+                // The provider checks the method paths with this same rule
+                // when it is built (attach); unset paths take the reference
+                // contract's methods. Never quote a path: like an endpoint
+                // URL it can carry a token.
+                for (field, path) in [
+                    ("encrypt_path", &grpc.encrypt_path),
+                    ("decrypt_path", &grpc.decrypt_path),
+                ] {
+                    if let Some(path) = path {
+                        check_grpc_method_path(path)
+                            .map_err(|reason| invalid(format!("[crypto.grpc] {field} {reason}")))?;
+                    }
+                }
                 if grpc.timeout.is_some_and(|t| t.0.is_zero()) {
                     return Err(invalid("[crypto.grpc] timeout must be positive"));
                 }

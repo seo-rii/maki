@@ -224,6 +224,13 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   and no top-level field may sit at, under or above the batch `items_path`;
   each batch element's `item_fields` are checked as their own object.
   `/vol` and `/volume`, or `/a~1b` (the key `a/b`) and `/a/b`, are distinct;
+- a gRPC `encrypt_path` or `decrypt_path` that the provider would not send
+  as written (validation and the provider apply one rule): it must start
+  with `/`, be at most 65534 bytes long, and contain only RFC 3986 path and
+  query characters (letters, digits, `-._~!$&'()*+,;=:@/?` and `%XX`
+  escapes), as HTTP/2 requires of the `:path` it is sent as. A `#` fragment
+  (never sent), a space or other character that needs escaping, and `*` or
+  a bare `?query` (no method) are refused. Errors never quote the path;
 - a declared `capabilities.context_binding` whose context does not reach
   the provider: each of `volume_id`, `compatibility_id` and `format_version`
   must be a source in the JSON `fields`, or in `item_fields` of a batch
@@ -491,8 +498,11 @@ when its final caller leaves. Other callers in that batch can still complete.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
-Service method paths are configurable, but request and response messages must
-match that contract and responses must preserve unit identity and order.
+Service method paths are configurable (`encrypt_path` and `decrypt_path`,
+default `/maki.CryptoService/EncryptBatch` and `/maki.CryptoService/DecryptBatch`;
+a gateway prefix or a query is sent unchanged), but request and response
+messages must match that contract and responses must preserve unit identity
+and order.
 The message-size limit bounds each received gRPC frame before decoding.
 Locally rejected oversized frames and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may
