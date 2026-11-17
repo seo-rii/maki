@@ -48,6 +48,9 @@ impl SlotHeader {
         let ciphertext_len = r.u32()?;
         let flags = r.u32()?;
         let ciphertext_crc = r.u32()?;
+        // `flags` (always 0 so far) and the reserved bytes are not checked:
+        // nothing interprets them, and refusing them could make a slot an
+        // earlier writer produced unreadable (`review_codec_canonical.rs`).
         Ok(Self {
             unit_index,
             write_sequence,
