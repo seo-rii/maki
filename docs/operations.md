@@ -81,11 +81,18 @@ maki check /etc/maki/volumes/example.toml
 
 `volume create` needs an empty backing root: it refuses a root whose `data/`,
 `journal/` or `checkpoint/` directory still holds a file, because an earlier
-volume's shards would otherwise be adopted and served by the new one.
-The superblock copies are written last, once everything else is durable, so a
-creation interrupted by a crash leaves no superblock: the root is not a volume.
-`volume create` refuses any files the interrupted run left in the layout
-directories until the root is emptied.
+volume's shards would otherwise be adopted and served by the new one, and a
+root that still holds an earlier volume's `superblock.*`, `shard-catalog.*` or
+`canary.*` (a stale key canary would otherwise fail the first attach as a key
+mismatch). A leftover `volume.lock` is accepted.
+The superblock copies are written last, once everything else is durable: a
+creation interrupted before it writes a superblock copy leaves a root that is
+not a volume, and `volume create` refuses any files the interrupted run left in
+the layout directories until the root is emptied. Once a copy is readable, a
+retried `volume create` reports `volume superblock already present`: the root
+is a complete volume, except that a failed or killed creation may have left
+that copy only in the page cache. The first attach makes both superblock copies
+durable before it accepts writes; empty the root instead to start over.
 
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing

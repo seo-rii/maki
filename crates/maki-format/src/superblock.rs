@@ -3,7 +3,9 @@
 //! Envelope v2 requires the durable-proof recovery policy; the cryptographic
 //! context's `format_version` is separate and is not changed by this envelope.
 //! Writable recovery must use [`load_volume_superblock`] and retain that policy
-//! version. [`Superblock::encode`] deliberately remains the frozen v1 format.
+//! version, then make the copies durable with [`persist_volume_superblock`]
+//! before it repairs anything. [`Superblock::encode`] deliberately remains the
+//! frozen v1 format.
 //!
 //! Layout: `MAKISB01 | version u32 | generation u64 | uuid[16] |`
 //! `device_block u32 | crypto_unit u32 | slot_align u32 | max_ct u32 |`
@@ -264,21 +266,22 @@ fn read_volume_copy(
     }
 }
 
-/// Load A/B superblocks without erasing their recovery-policy version.
-///
-/// Unlike the generic A/B record loader, this refuses supported-version
-/// mixtures, same-generation byte conflicts, and CRC-valid unknown versions.
-/// A different-sized image with a recognizable unsupported-version header is
-/// also refused; its checksum layout cannot be assumed to match this version.
-/// Hard I/O errors propagate; only absent, torn, or malformed copies may be
-/// replaced by the other side. No disk changes are made here.
-pub fn load_volume_superblock(
-    backing: &dyn maki_backing::Backing,
-) -> Result<VolumeSuperblock, FormatError> {
-    let a = read_volume_copy(backing, crate::layout::SUPERBLOCK_A)?;
-    let b = read_volume_copy(backing, crate::layout::SUPERBLOCK_B)?;
-    match (a, b) {
-        (Some((a, a_bytes)), Some((b, b_bytes))) => {
+/// Superblock copy A, then B, as `read_volume_copy` returns them.
+type VolumeCopies = [Option<(VolumeSuperblock, Vec<u8>)>; 2];
+
+const SUPERBLOCK_PATHS: [&str; 2] = [crate::layout::SUPERBLOCK_A, crate::layout::SUPERBLOCK_B];
+
+fn read_volume_copies(backing: &dyn maki_backing::Backing) -> Result<VolumeCopies, FormatError> {
+    Ok([
+        read_volume_copy(backing, SUPERBLOCK_PATHS[0])?,
+        read_volume_copy(backing, SUPERBLOCK_PATHS[1])?,
+    ])
+}
+
+/// The index (0 = A, 1 = B) of the copy [`load_volume_superblock`] selects.
+fn select_volume_copy(copies: &VolumeCopies) -> Result<usize, FormatError> {
+    match copies {
+        [Some((a, a_bytes)), Some((b, b_bytes))] => {
             if a.metadata_version != b.metadata_version {
                 return Err(FormatError::Invalid(
                     "mixed superblock metadata versions; refusing an interrupted format change"
@@ -290,15 +293,85 @@ pub fn load_volume_superblock(
                     "conflicting superblocks at the same generation".into(),
                 ));
             }
-            Ok(if a.superblock.generation >= b.superblock.generation {
-                a
-            } else {
-                b
-            })
+            Ok(usize::from(
+                a.superblock.generation < b.superblock.generation,
+            ))
         }
-        (Some((record, _)), None) | (None, Some((record, _))) => Ok(record),
-        (None, None) => Err(FormatError::Invalid("no valid superblock".into())),
+        [Some(_), None] => Ok(0),
+        [None, Some(_)] => Ok(1),
+        [None, None] => Err(FormatError::Invalid("no valid superblock".into())),
     }
+}
+
+/// Load A/B superblocks without erasing their recovery-policy version.
+///
+/// Unlike the generic A/B record loader, this refuses supported-version
+/// mixtures, same-generation byte conflicts, and CRC-valid unknown versions.
+/// A different-sized image with a recognizable unsupported-version header is
+/// also refused; its checksum layout cannot be assumed to match this version.
+/// Hard I/O errors propagate; only absent, torn, or malformed copies may be
+/// replaced by the other side. No disk changes are made here: readable bytes
+/// are not proof of durability, and writable recovery must follow this with
+/// [`persist_volume_superblock`].
+pub fn load_volume_superblock(
+    backing: &dyn maki_backing::Backing,
+) -> Result<VolumeSuperblock, FormatError> {
+    let mut copies = read_volume_copies(backing)?;
+    let selected = select_volume_copy(&copies)?;
+    copies[selected]
+        .take()
+        .map(|(record, _)| record)
+        .ok_or_else(|| FormatError::Invalid("no valid superblock".into()))
+}
+
+/// Make the superblock [`load_volume_superblock`] selects durable in both
+/// copies before writable recovery repairs anything or resumes the writer.
+///
+/// A failed or interrupted creation, or a process restart, can leave a
+/// CRC-valid copy that exists only in the page cache, after writeback EIO
+/// even with its dirty bits cleared, so a plain fsync would not persist it.
+/// Accepting it as is lets FUA/FLUSH succeed on a volume the next power loss
+/// removes. Each valid copy is therefore rewritten from its exact validated
+/// bytes and synced with the root directory, the selected copy first: the
+/// copy recovery uses is durable before the other one is touched, and a
+/// rewrite of identical bytes cannot damage a copy that is already durable.
+/// A missing or invalid copy (a creation that stopped after A) is completed
+/// through the A/B store, which preserves the selected copy before writing
+/// the other side one generation above every existing side, as creation does.
+/// Valid copies are never re-encoded, so once both exist repeated recoveries
+/// leave the files byte-identical.
+///
+/// `expected` is the envelope the caller validated; if the selection has
+/// changed since, nothing is written. Returns the envelope a later
+/// [`load_volume_superblock`] selects.
+pub fn persist_volume_superblock(
+    backing: &dyn maki_backing::Backing,
+    expected: &VolumeSuperblock,
+) -> Result<VolumeSuperblock, FormatError> {
+    let copies = read_volume_copies(backing)?;
+    let selected = select_volume_copy(&copies)?;
+    if copies[selected].as_ref().map(|(record, _)| record) != Some(expected) {
+        return Err(FormatError::Invalid(
+            "superblock changed after it was validated; refusing to persist it".into(),
+        ));
+    }
+    for side in [selected, 1 - selected] {
+        if let Some((_, bytes)) = &copies[side] {
+            let file = backing.open(SUPERBLOCK_PATHS[side], false)?;
+            file.set_len(bytes.len() as u64)?;
+            file.write_at(0, bytes)?;
+            file.sync_data()?;
+            backing.sync_dir(maki_backing::path::parent(SUPERBLOCK_PATHS[side]))?;
+        }
+    }
+    if copies[1 - selected].is_some() {
+        return Ok(expected.clone());
+    }
+    let mut completed = expected.clone();
+    crate::ab::AbStore::new(SUPERBLOCK_PATHS[0], SUPERBLOCK_PATHS[1])
+        .store(backing, &mut completed)?;
+    backing.sync_dir(maki_backing::path::parent(SUPERBLOCK_PATHS[1 - selected]))?;
+    Ok(completed)
 }
 
 impl crate::ab::AbRecord for Superblock {

@@ -145,6 +145,17 @@ inside that required prefix fails explicitly. A proof may name a pruned segment
 only when the checkpoint already covers its horizon. Both proof copies absent
 or invalid is an error even for an empty-looking v2 volume.
 
+The first recovery write makes the selected superblock durable. A creation that
+failed or was killed after writing superblock A (a failed fdatasync, or a kill
+before it) leaves a readable copy that may exist only in the page cache, and a
+retried creation refuses that root, so recovery is where the copy becomes
+durable. It rewrites each valid copy from its exact validated bytes and syncs
+it and the root directory, selected copy first, then completes a missing or
+invalid copy (creation stopped after A) through the A/B store, one generation
+above the existing copies, as creation would have. Valid copies are never
+re-encoded, so repeated recoveries leave both files unchanged. Read-only
+inspection, including the deep check, never writes them.
+
 Unproven final-tail bytes may be truncated after a crash. Intact later records
 do not prove the durability of earlier damaged bytes, because unsynced sectors
 may persist out of order. A missing/stale advisory mark cannot weaken the v2

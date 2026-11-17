@@ -1305,6 +1305,10 @@ load selected checkpoint state
  ↓
 scan journal and validate the required sequence and exact record-end boundary
  ↓
+make the selected superblock durable in both copies: rewrite each valid copy
+from its exact validated bytes and sync it and the root directory, selected
+copy first, then complete a missing or invalid copy through the A/B store
+ ↓
 persist selected checkpoint state and apply approved metadata repairs
  ↓
 discard/truncate partial tail
@@ -1335,6 +1339,14 @@ required horizon. Missing its entire segment or truncating it at an earlier
 complete-record boundary MUST fail. A proof's segment may have been pruned only
 when the checkpoint covers its horizon. Required-horizon validation MUST precede
 recovery metadata changes and tail repairs.
+
+The superblock is the volume's commit point, yet a creation that failed or was
+killed after writing a copy, or a process restart, can leave a CRC-valid copy
+only in the page cache. Writable recovery MUST make the selected superblock
+durable in both copies before any other recovery write and before READY. It
+MUST NOT re-encode a valid copy and MUST make the selected copy durable before
+touching the other, so an interruption at any point never destroys a copy that
+was already durable. Read-only checks and inspection MUST NOT write it.
 
 Damage beyond the required final-tail boundary MAY be treated as torn unsynced
 data. An intact later record MUST NOT be used to infer earlier durability:
