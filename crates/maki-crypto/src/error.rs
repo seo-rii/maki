@@ -48,6 +48,25 @@ pub enum CryptoError {
     /// The provider violated its declared contract (size, order, count…).
     #[error("provider contract violation: {0}")]
     Contract(String),
+    /// A transport failure that provably happened before any byte of the
+    /// request left Maki; see [`CryptoError::not_sent`]. Class and message
+    /// are the inner error's.
+    #[error(transparent)]
+    NotSent(NotSentError),
+}
+
+/// The error inside [`CryptoError::NotSent`]. Only
+/// [`CryptoError::not_sent`] builds one, so it always holds an unmarked
+/// `Retryable`, `Throttled` or `EndpointFatal` error.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct NotSentError(Box<CryptoError>);
+
+impl NotSentError {
+    /// The transport error itself.
+    pub fn error(&self) -> &CryptoError {
+        &self.0
+    }
 }
 
 impl CryptoError {
@@ -62,6 +81,44 @@ impl CryptoError {
             CryptoError::ProviderFatal(_)
             | CryptoError::UnsupportedContext(_)
             | CryptoError::Contract(_) => ErrorClass::ProviderFatal,
+            CryptoError::NotSent(inner) => inner.0.class(),
+        }
+    }
+
+    /// Mark an error that a transport raised before writing any byte of the
+    /// request: it failed to connect, to complete TLS or a WebSocket
+    /// upgrade, or to hand the request to its connection. Such a request
+    /// cannot have reached the provider, so the dispatcher may send it to
+    /// another endpoint even when the provider is not retry-safe (SPEC
+    /// §18). Mark only what the transport can prove; anything after the
+    /// first request byte may have been written must stay unmarked.
+    ///
+    /// Only the classes the dispatcher fails over on (`Retryable`,
+    /// `Throttled`, `EndpointFatal`) are marked. Other errors end the
+    /// operation whether or not the request was sent, so they are returned
+    /// unchanged; marking is idempotent.
+    pub fn not_sent(self) -> Self {
+        match self.class() {
+            ErrorClass::Retryable | ErrorClass::Throttled | ErrorClass::EndpointFatal
+                if !self.is_not_sent() =>
+            {
+                CryptoError::NotSent(NotSentError(Box::new(self)))
+            }
+            _ => self,
+        }
+    }
+
+    /// Whether the transport proved that no byte of the request was sent.
+    pub fn is_not_sent(&self) -> bool {
+        matches!(self, CryptoError::NotSent(_))
+    }
+
+    /// Drop the not-sent mark, keeping class and message: an earlier
+    /// attempt of the same call may have reached a provider.
+    pub fn maybe_sent(self) -> Self {
+        match self {
+            CryptoError::NotSent(inner) => *inner.0,
+            other => other,
         }
     }
 
@@ -81,6 +138,9 @@ impl CryptoError {
             CryptoError::UnsupportedContext(field) => CryptoError::UnsupportedContext(*field),
             CryptoError::Integrity(m) => CryptoError::Integrity(m.clone()),
             CryptoError::Contract(m) => CryptoError::Contract(m.clone()),
+            CryptoError::NotSent(inner) => {
+                CryptoError::NotSent(NotSentError(Box::new(inner.0.duplicate())))
+            }
         }
     }
 }
