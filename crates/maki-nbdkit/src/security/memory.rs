@@ -523,6 +523,57 @@ mod tests {
         }
     }
 
+    /// `layout` reads the mount table as text before this change.
+    fn layout_bytes(membership: &str, table: &[u8]) -> Result<Layout, String> {
+        layout(
+            membership,
+            std::str::from_utf8(table).map_err(|e| e.to_string())?,
+        )
+    }
+
+    #[test]
+    fn unrelated_mount_path_bytes_do_not_refuse_admission() {
+        // Linux escapes only space, tab, newline and backslash in mountinfo
+        // paths and emits every other byte as is. A user's FUSE mount, a
+        // Latin-1 USB label or a deep directory elsewhere in the namespace
+        // is ordinary state, not a malformed cgroup hierarchy.
+        let cgroup = mountinfo("/", "/sys/fs/cgroup").into_bytes();
+        let tmpfs =
+            |path: &[u8]| [b"44 31 0:55 / ".as_slice(), path, b" rw - tmpfs tmpfs rw\n"].concat();
+        let deep = [b"/srv".as_slice(), &b"/d".repeat(300)].concat();
+        let foreign = [
+            (
+                "path, FUSE subtype and source not UTF-8",
+                b"52 31 0:61 / /home/user/fuse-\xff rw,nosuid,nodev - fuse.\xfe \xfd rw\n".to_vec(),
+            ),
+            ("escaped newline", tmpfs(b"/media/usb\\012stick")),
+            ("301 components", tmpfs(&deep)),
+            ("non-UTF-8 sibling", tmpfs(b"/sys/fs/cgroup\xff")),
+            ("escaped newline sibling", tmpfs(b"/sys/fs/cgroup\\012")),
+        ];
+        let expected = Layout {
+            mount: "/sys/fs/cgroup".into(),
+            leaf: "/sys/fs/cgroup/slice/daemon".into(),
+        };
+        let all: Vec<u8> = foreign
+            .iter()
+            .flat_map(|(_, record)| record.clone())
+            .collect();
+        let mut refused = Vec::new();
+        for (case, record) in foreign.iter().chain([&("all of them", all)]) {
+            for (order, table) in [
+                ("after", [cgroup.as_slice(), record].concat()),
+                ("before", [record.as_slice(), &cgroup].concat()),
+            ] {
+                let result = layout_bytes("0::/slice/daemon\n", &table);
+                if result.as_ref() != Ok(&expected) {
+                    refused.push(format!("{case}, {order} the cgroup2 mount: {result:?}"));
+                }
+            }
+        }
+        assert!(refused.is_empty(), "{refused:#?}");
+    }
+
     #[test]
     fn admission_uses_leaf_limit_and_all_visible_ancestor_headroom() {
         let f = Fixture::new();
