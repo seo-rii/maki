@@ -52,14 +52,22 @@
 //! every file or lock handle opened before it is dead. Each file operation
 //! through such a handle fails with an `ErrorKind::Other` I/O error (the
 //! model's EIO) without touching the recovered state, and dropping it
-//! releases nothing. A process restart (`drop` + reopen, page cache intact)
-//! is not a crash and invalidates nothing.
+//! releases nothing. A process's namespace access dies with it too: the code
+//! under test runs on a process view ([`CrashableBacking::process`]), and
+//! every `Backing` operation of a view started before a power loss (open,
+//! create, remove, rename, list, `sync_dir`, `try_lock`, ...) fails the same
+//! way, so a volume, engine or worker the test still holds cannot create or
+//! sync a file afterwards. The backing a test creates is the machine, not a
+//! process: no power loss ends it, so the test inspects and damages files
+//! through it and starts every later process on a new view. A process
+//! restart (`drop` + reopen, page cache intact) is not a crash and
+//! invalidates nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rand::Rng;
 
 use maki_backing::path::validate;
@@ -514,6 +522,9 @@ pub struct CrashableBacking {
     inner: Arc<Mutex<Inner>>,
     /// Tear granularity for torn writes during random crashes (None = off).
     tearing: Option<usize>,
+    /// The power-loss epoch the process using this view started in; `None`
+    /// for the backing the test created, which no power loss ends.
+    process: Option<u64>,
 }
 
 impl CrashableBacking {
@@ -521,10 +532,40 @@ impl CrashableBacking {
         Self::default()
     }
 
-    /// The backing as one process of the code under test sees it: a view
-    /// that shares this backing's state.
+    /// The backing as one process of the code under test sees it, started
+    /// now. The view shares every file, name and lock with this backing, but
+    /// a power loss kills it: afterwards each of its `Backing` operations
+    /// fails with an `ErrorKind::Other` I/O error (the model's EIO) and
+    /// changes nothing, like the process's file and lock handles. Clones of
+    /// the view belong to the same process. Start every `Volume`, `Engine`
+    /// or adapter of the test on its own view; a process started after the
+    /// power loss takes a new one.
     pub fn process(&self) -> Arc<Self> {
-        Arc::new(self.clone())
+        let epoch = self.inner.lock().epoch;
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            tearing: self.tearing,
+            process: Some(epoch),
+        })
+    }
+
+    /// The shared state for a `Backing` operation of this view, refused once
+    /// a power loss has killed the view's process.
+    fn live(&self, op: &str, path: &str) -> io::Result<MutexGuard<'_, Inner>> {
+        let inner = self.inner.lock();
+        match self.process {
+            Some(epoch) if epoch != inner.epoch => {
+                let what = if path.is_empty() {
+                    op.to_string()
+                } else {
+                    format!("{op} {path}")
+                };
+                Err(io::Error::other(format!(
+                    "{what}: process killed by a power loss (EIO)"
+                )))
+            }
+            _ => Ok(inner),
+        }
     }
 
     /// Enable random torn-write simulation at `granularity` bytes.
@@ -879,9 +920,13 @@ impl Drop for CrashLock {
 }
 
 impl Backing for CrashableBacking {
+    fn check_freshness(&self) -> io::Result<()> {
+        self.live("check_freshness", "").map(drop)
+    }
+
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         validate(path, false)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.live("open", path)?;
         inner.check(&FaultOp::Open { path, create })?;
         inner.require_file_name(path)?;
         let inode = match inner.volatile(path) {
@@ -908,7 +953,7 @@ impl Backing for CrashableBacking {
 
     fn exists(&self, path: &str) -> io::Result<bool> {
         validate(path, false)?;
-        let inner = self.inner.lock();
+        let inner = self.live("exists", path)?;
         if let Err(error) = inner.require_dir(parent(path)) {
             return if error.kind() == io::ErrorKind::NotFound {
                 Ok(false)
@@ -921,7 +966,7 @@ impl Backing for CrashableBacking {
 
     fn remove(&self, path: &str) -> io::Result<()> {
         validate(path, false)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.live("remove", path)?;
         inner.check(&FaultOp::Remove { path })?;
         inner.require_file_name(path)?;
         if inner.volatile(path).is_none() {
@@ -937,7 +982,7 @@ impl Backing for CrashableBacking {
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         validate(from, false)?;
         validate(to, false)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.live("rename", from)?;
         inner.check(&FaultOp::Rename { from, to })?;
         inner.require_dir(parent(from))?;
         inner.require_file_name(to)?;
@@ -956,7 +1001,7 @@ impl Backing for CrashableBacking {
 
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
         validate(path, false)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.live("create_dir_all", path)?;
         let mut cur = String::new();
         for comp in path.split('/') {
             if !cur.is_empty() {
@@ -973,7 +1018,7 @@ impl Backing for CrashableBacking {
 
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
         validate(dir, true)?;
-        let inner = self.inner.lock();
+        let inner = self.live("list", dir)?;
         inner.require_dir(dir)?;
         let prefix = if dir.is_empty() {
             String::new()
@@ -1005,7 +1050,7 @@ impl Backing for CrashableBacking {
 
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
         validate(dir, true)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.live("sync_dir", dir)?;
         inner.check(&FaultOp::SyncDir { dir })?;
         inner.require_dir(dir)?;
         // Commit operations on entries directly inside `dir` and their
@@ -1047,12 +1092,12 @@ impl Backing for CrashableBacking {
     }
 
     fn free_bytes(&self) -> io::Result<Option<u64>> {
-        Ok(self.inner.lock().free_bytes)
+        Ok(self.live("free_bytes", "")?.free_bytes)
     }
 
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
         validate(path, false)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.live("try_lock", path)?;
         inner.require_file_name(path)?;
         if !inner.locks.insert(path.to_string()) {
             return Err(io::Error::new(
