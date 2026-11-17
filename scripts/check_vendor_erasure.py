@@ -84,16 +84,27 @@ def check(root: Path, metadata: dict) -> list[str]:
     return errors
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parents[1]
+def resolve(root: Path) -> dict | None:
+    """Return the locked dependency metadata of the workspace at root, or None."""
+    # Every feature of every workspace member: features are additive, so this
+    # is a superset of what any build of the workspace can select, including
+    # optional features and the optional dependencies they enable.
     result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked"],
+        ["cargo", "metadata", "--format-version", "1", "--locked", "--all-features"],
         cwd=root, capture_output=True, text=True, check=False,
     )
     if result.returncode:
+        return None
+    return json.loads(result.stdout)
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parents[1]
+    metadata = resolve(root)
+    if metadata is None:
         print("Cannot resolve the locked dependencies for the vendor contract.", file=sys.stderr)
         return 1
-    errors = check(root, json.loads(result.stdout))
+    errors = check(root, metadata)
     for error in errors:
         print(error, file=sys.stderr)
     if not errors:

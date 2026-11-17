@@ -326,9 +326,10 @@ rustls-based HTTP, WebSocket and gRPC TLS connections resolve to these patched
 sources. The [vendor guide](../vendor/README.md) records the covered owners and
 upgrade procedure. Published archive checksums record the original sources;
 source inventories, patch hashes, resolved dependency paths and each patched
-library's resolved Cargo features are checked in CI. Silently replacing a
-patch, resolving a second library version or enabling a feature outside the
-reviewed list fails the contract.
+library's Cargo features, resolved with every workspace feature enabled, are
+checked in CI. Silently replacing a patch, resolving a second library version
+or enabling a feature outside the reviewed list, even only through an optional
+workspace feature, fails the contract.
 
 The JSON parser's escaped-string scratch, reader scratch, integer128 scanning
 and formatted error-message heap buffers erase removed bytes before reuse.
@@ -344,7 +345,8 @@ serialized output and a seed that rejects its deserializer before consuming
 it. Borrowed raw slices and public returned `Box<RawValue>` keep their original
 ownership. An arbitrary visitor receives ownership when its `visit_string`
 callback is invoked; its subsequent cleanup is the caller's responsibility.
-The parser's own conversion visitors immediately adopt that String again.
+The parser's own conversion visitors immediately adopt that String again;
+the borrowed `&RawValue` seed adopts it before rejecting text it cannot borrow.
 Owned-string and enum callbacks retain upstream behavior.
 
 The `arbitrary_precision` path also guards scanned number text, owned number-map
