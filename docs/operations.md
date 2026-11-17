@@ -411,7 +411,7 @@ The packaged data-plane service uses `Type=notify`. The native plugin opens
 the configured volume in nbdkit's `after_fork` callback, before the first NBD
 client, and sends `READY=1` after recovery, the configured provider checks, and
 control socket binding succeed. `maki-attach@` therefore waits for this initial
-data-plane readiness through its existing `Requires=` and `After=` ordering.
+data-plane readiness through its existing `BindsTo=` and `After=` ordering.
 An initialization or notification failure fails startup. The initial deadline
 is 180 seconds. During journal recovery, completed scan, repair and replay work
 can send `EXTEND_TIMEOUT_USEC=180000000`, at most once every 30 seconds. There
