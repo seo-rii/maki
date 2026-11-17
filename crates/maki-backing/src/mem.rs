@@ -5,7 +5,7 @@
 //! The namespace follows POSIX path rules like the real backings: every
 //! ancestor of a path must be an existing directory (`NotFound`, or
 //! `NotADirectory` when one is a file), and a directory name cannot be
-//! opened, locked or renamed over as a file (`IsADirectory`).
+//! opened, locked, renamed over or removed as a file (`IsADirectory`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -188,7 +188,7 @@ impl Backing for MemBacking {
     fn remove(&self, path: &str) -> io::Result<()> {
         validate(path, false)?;
         let mut ns = self.ns.lock();
-        ns.require_dir(parent(path))?;
+        ns.require_file_name(path)?;
         ns.files
             .remove(path)
             .map(|_| ())
