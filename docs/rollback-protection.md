@@ -138,6 +138,17 @@ to create an inner v3 volume; the default initializes an inner v2 volume.
 This command completes normal initial volume creation after recovering the
 outer backing's enrollment.
 
+Run both commands as root: the administrator key must stay unreadable to the
+daemon user. `resume-enrollment` creates the new writer namespace owner-only
+(`0700` directories, `0600` files) as root, so the daemon cannot open it until
+the backing is handed back, as after takeover or restore
+([remote witness operations](remote-witness-service.md#snapshot-takeover-and-restore)).
+Do that before the next start:
+
+```sh
+chown -R maki:maki /var/lib/maki/protected
+```
+
 The authority must have `current = null`; successful first activation makes
 that condition permanently unavailable. Recovery compares the full inspected
 record, requires administrator credentials and selects a higher fence with a
@@ -196,10 +207,23 @@ capacity = "128MiB"
 ```
 
 Both directories must be empty for creation. Provision the independent witness
-mount first and give the daemon user exclusive access to its per-volume
-directory. Run `maki volume create <config.toml>` or add `--discard` for a v3
-volume. An existing raw or protected backing is refused; there is no implicit
-enrollment, in-place conversion or automatic witness recreation.
+mount first, create both per-volume directories for the daemon user, and run
+the creation as that user, as for any volume
+([volume lifecycle](operations.md#volume-lifecycle)). Add `--discard` for a v3
+volume:
+
+```sh
+install -d -o maki -g maki -m 0700 /var/lib/maki/protected /mnt/maki-witness/protected
+sudo -u maki maki volume create /etc/maki/volumes/protected.toml
+```
+
+Creation writes the backing tree and the witness files (`anchor`,
+`witness.lock`) owner-only (`0700` directories, `0600` files) as the user that
+runs it. Run as root, it leaves both root-owned, so the daemon cannot open
+them; the command then warns with the `chown -R maki:maki` of both paths to
+run before the first start. An existing raw or protected backing is refused;
+there is no implicit enrollment, in-place conversion or automatic witness
+recreation.
 
 The packaged daemon uses `ProtectSystem=strict`. For this example, add a
 per-instance systemd drop-in to `maki@protected.service`:
@@ -217,10 +241,22 @@ paths their own explicit access rule. The witness directory is sensitive state,
 not a cache. Do not include it in the backing's restore operation.
 
 Use `maki check <config.toml> --deep` or `maki volume inspect <config.toml>` while
-the volume is detached. These acquire the exclusive witness session and
-reestablish the selected witness record's durability without advancing it. The
-root-only `maki-check` utility cannot open this outer format. Removing the
-rollback configuration stanza does not enable raw fallback.
+the volume is detached, and run them as the daemon user:
+
+```sh
+sudo -u maki maki check /etc/maki/volumes/protected.toml --deep
+```
+
+These acquire the exclusive witness session and reestablish the selected
+witness record's durability without advancing it, by writing the record to a
+new file renamed over the old one. That file keeps the replaced record's owner
+even when root runs the command, but anything else a root run has to create is
+owned by root: a lock file or inactive manifest slot that is missing (after a
+partial restore, for example) is recreated for root, and the daemon then
+cannot attach. After such a run, return both paths with `chown -R maki:maki`
+before starting the daemon. `maki-check`, which takes only a backing root path
+and no configuration, cannot open this outer format. Removing the rollback
+configuration stanza does not enable raw fallback.
 
 ## Capacity and durability
 
@@ -328,11 +364,14 @@ complete recovery plan.
    advance the witness. Retain a separately verified application backup.
 4. For same-identity recovery, keep writers and restart automation stopped.
    Preserve the failed backing as evidence, recover the complete matching
-   backing under its trusted configuration, and run `maki check <config.toml>
-   --deep` offline. This acquires the witness lock and verifies structural
-   consistency and restores physical reservations. Provide the complete fixed
-   footprint even when the restored copy is sparse; reservation failure keeps
-   it offline. Normal attach additionally verifies the crypto key and provider.
+   backing under its trusted configuration, owned by the daemon user like the
+   original (`chown -R maki:maki` it if the copy did not keep its owners), and
+   run `sudo -u maki maki check <config.toml> --deep` offline
+   ([which user](#local-configuration-and-creation)). This acquires the
+   witness lock and verifies structural consistency and restores physical
+   reservations. Provide the complete fixed footprint even when the restored
+   copy is sparse; reservation failure keeps it offline. Normal attach
+   additionally verifies the crypto key and provider.
    Require application-level readback before permitting writes.
    Never run two writable copies against one witness.
 5. A witness mismatch, missing witness or authentication failure leaves the
@@ -449,10 +488,12 @@ later cleanup; the lock is removed last. The current directory and independent
 external snapshot directories are never cleanup targets. See
 [durable recovery](durable-recovery.md) for the persistence boundary.
 
-To retry cleanup after old handles close, without claiming a writer:
+To retry cleanup after old handles close, without claiming a writer, run GC
+with the writer configuration as the daemon user (a process run as root
+refuses the daemon-owned writer key):
 
 ```sh
-maki volume gc /etc/maki/protected-writer.toml
+sudo -u maki maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and
