@@ -1997,7 +1997,8 @@ impl EngineInner {
     /// One worker pass: checkpoint if the journal crossed its watermark,
     /// the overlay crossed half its bound, the backing is low on space, or
     /// the interval elapsed with work pending (unsynced records are synced
-    /// first so they can be applied).
+    /// first so they can be applied; when that sync fails, the records that
+    /// are already durable are still checkpointed).
     async fn worker_pass(self: &Arc<Self>) {
         let (
             total,
@@ -2102,19 +2103,34 @@ impl EngineInner {
                 return;
             }
             let inner = self.clone();
-            let flushed = storage_task(move || inner.sync_journal(&mut volume)).await;
-            if let Err(e) = flushed.and_then(|result| result.map_err(std::io::Error::other)) {
+            let flushed = storage_task(move || {
+                inner.sync_journal(&mut volume).map_err(|error| {
+                    // What a checkpoint can still do without the records
+                    // this sync was for, read under the same lock.
+                    let durable_work = volume.journal_durable_sequence()
+                        > volume.checkpoint_sequence()
+                        || volume.journal_covered_segment_count() > 0
+                        || volume.has_pending_checkpoint_cleanup()
+                        || volume.has_pending_reclamation();
+                    (error.to_string(), durable_work)
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err((error.to_string(), false)));
+            if let Err((e, durable_work)) = flushed {
                 tracing::warn!("checkpoint worker: journal sync failed: {e}");
                 // The sync is retried only after an interval (BUG-101). A
                 // failed sync does not advance the durable mark, so a
                 // checkpoint still applies only records that were durable
-                // before it. The watermark and low-space triggers exist to
-                // give journal and backing space back, and deleting covered
-                // sealed segments needs no sync: they still checkpoint what
-                // is durable, as they did before they synced first, so a
-                // journal whose syncs keep failing does not also stop that.
+                // before it, and deleting the sealed segments they cover
+                // needs no sync. Whatever started the pass, it still
+                // checkpoints what is durable: that applies those records,
+                // shrinks the overlay and gives journal and backing space
+                // back, so a journal whose syncs keep failing does not also
+                // stop every checkpoint. With nothing durable to apply or
+                // reclaim there is nothing to checkpoint until the retry.
                 self.defer_checkpoint_retry();
-                if !(by_size || by_space) {
+                if !(durable_work || retry_reclaim) {
                     return;
                 }
                 sync_failed = true;

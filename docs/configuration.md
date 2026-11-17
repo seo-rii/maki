@@ -655,10 +655,12 @@ does not postpone the worker's periodic sync of pending writes. After a failed
 pass the worker waits one interval before it tries again, however many writes
 cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
 checkpoints inline, and a success clears the wait. Each pass syncs unsynced
-records before it checkpoints; a failed sync counts as a failed pass, but a pass
-started by the watermark or by low free space still checkpoints the records
-that were durable before it (deleting the sealed segments they cover) and then
-waits, so a journal whose syncs keep failing still gives that space back.
+records before it checkpoints; a failed sync counts as a failed pass, but the
+pass still checkpoints the records that were durable before it, whatever started
+it (applying them, deleting the sealed segments they cover and shrinking the
+overlay), and then waits, so a journal whose syncs keep failing still gives that
+space and memory back. With nothing durable left to apply or reclaim, a pass
+whose sync fails runs no checkpoint.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
