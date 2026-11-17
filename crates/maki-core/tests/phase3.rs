@@ -45,7 +45,7 @@ fn superblock() -> Superblock {
 
 fn new_volume(backing: &Arc<CrashableBacking>) -> Volume {
     init::create_volume(backing.as_ref(), superblock()).unwrap();
-    Volume::recover(backing.clone() as Arc<dyn Backing>, small_segments()).unwrap()
+    Volume::recover(backing.process(), small_segments()).unwrap()
 }
 
 fn small_segments() -> maki_core::volume::VolumeOptions {
@@ -55,7 +55,7 @@ fn small_segments() -> maki_core::volume::VolumeOptions {
 }
 
 fn recover(backing: &Arc<CrashableBacking>) -> Result<Volume, RecoveryError> {
-    Volume::recover(backing.clone() as Arc<dyn Backing>, small_segments())
+    Volume::recover(backing.process(), small_segments())
 }
 
 fn ct(stamp: u8) -> Vec<u8> {

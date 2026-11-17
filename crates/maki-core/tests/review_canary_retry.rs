@@ -46,7 +46,7 @@ async fn attach(
     integrity: bool,
 ) -> Result<Engine, AttachError> {
     let result = Engine::attach(
-        backing.clone(),
+        backing.process(),
         Arc::new(
             FakeCryptoProvider::new(UNIT)
                 .with_key(key)

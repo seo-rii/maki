@@ -362,7 +362,14 @@ as the EPERM Linux returns from `connect()` when a firewall drops the
 connection, is a transport failure like a refused connection, not a denial. A
 trusted client certificate that a frontend's allow-list does not name is a
 denial: the frontend answers it, so an allow-list mistake is reported as
-`PermissionDenied`, not as an unavailable witness.
+`PermissionDenied`, not as an unavailable witness. A certificate that the
+frontend's CA bundle does not trust is refused during the TLS handshake with a
+fatal alert, which the client reports as `PermissionDenied` too. In TLS 1.3 the
+client writes its request before the frontend has checked its certificate, so
+the frontend has often closed the connection by then; the client then reads the
+alert the frontend sent before closing instead of reporting the broken pipe or
+reset. This relies on Linux keeping received data readable after a reset. A
+connection that closes without an alert remains a transport failure.
 
 Inspect through the configured client without claiming a session:
 

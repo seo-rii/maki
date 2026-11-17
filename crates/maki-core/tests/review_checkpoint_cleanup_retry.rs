@@ -68,7 +68,7 @@ async fn idle_worker_retries_a_late_directory_sync_failure() {
         sleeps: AtomicUsize::new(0),
     });
     let engine = Engine::attach(
-        backing,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(1024)),
         EngineOptions {
             checkpoint: CheckpointPolicy {
@@ -128,7 +128,7 @@ fn deleted_segments_do_not_hide_a_failed_journal_directory_barrier() {
     let options = VolumeOptions {
         journal_segment_size: 4096,
     };
-    let mut volume = Volume::recover(backing.clone(), options.clone()).unwrap();
+    let mut volume = Volume::recover(backing.process(), options.clone()).unwrap();
     for unit in 0..8 {
         volume
             .write_ct(unit, &[unit as u8 + 1; 1032], true)
@@ -167,7 +167,7 @@ fn deleted_segments_do_not_hide_a_failed_journal_directory_barrier() {
     drop(volume);
     backing.set_fault_hook(None);
     backing.crash_all_lost();
-    let recovered = Volume::recover(backing, options).unwrap();
+    let recovered = Volume::recover(backing.process(), options).unwrap();
     for unit in 0..8 {
         assert_eq!(
             recovered.read_ct(unit).unwrap().unwrap().1,

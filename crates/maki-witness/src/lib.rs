@@ -353,8 +353,10 @@ impl Client {
             rustls::ClientConnection::new(self.config.clone(), self.server_name.clone())
                 .map_err(tls_error)?;
         let mut tls = rustls::StreamOwned::new(connection, io);
-        write_frame(&mut tls, bytes.expose())?;
-        let response: WireResponse<R> = serde_json::from_slice(read_frame(&mut tls)?.expose())
+        let frame = write_frame(&mut tls, bytes.expose())
+            .and_then(|()| read_frame(&mut tls))
+            .map_err(|error| refusal(&mut tls, error))?;
+        let response: WireResponse<R> = serde_json::from_slice(frame.expose())
             .map_err(|_| corrupt("invalid witness response"))?;
         remaining(deadline)?;
         if response.version != WIRE_VERSION || response.id != id {
@@ -414,6 +416,7 @@ struct DeadlineIo {
     deadline: Instant,
 }
 
+type ClientStream = rustls::StreamOwned<rustls::ClientConnection, DeadlineIo>;
 type ServerStream = rustls::StreamOwned<rustls::ServerConnection, DeadlineIo>;
 impl Read for DeadlineIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -444,7 +447,8 @@ impl Write for DeadlineIo {
 /// `PermissionDenied`. Report them as a transport failure with the OS error
 /// text instead, so an outage refuses only the operation (BUG-103). Only the
 /// server's own answers and TLS failures, which rustls reports as
-/// `InvalidData` above this layer, keep a final kind.
+/// `InvalidData` above this layer (a refused client certificate as
+/// `PermissionDenied`, see [`refusal`]), keep a final kind.
 fn socket_error(error: io::Error) -> io::Error {
     match error.kind() {
         io::ErrorKind::WouldBlock => {
@@ -458,6 +462,77 @@ fn socket_error(error: io::Error) -> io::Error {
             format!("witness unreachable: local socket error: {error}"),
         ),
         _ => error,
+    }
+}
+
+/// Bounds the reads after a closed connection: rustls reads at most 4 KiB at
+/// a time, and a server sends far less before an alert.
+const MAX_ALERT_READS: usize = 32;
+
+/// Report the server's fatal TLS alert instead of the error it caused.
+///
+/// In TLS 1.3 the client finishes its side of the handshake and writes its
+/// request before the server has checked the client certificate. A server
+/// that refuses the certificate sends an alert and closes the connection, so
+/// the client's next write or read often fails with a broken pipe, a reset
+/// or an EOF while the alert sits unread in the socket. Those kinds mean the
+/// witness could not be asked: failover would try the next frontend,
+/// `transact` would retry and a remote session would keep running. After one
+/// of them, read what the server has already sent, without waiting for more
+/// (Linux keeps bytes that arrived before a reset readable), and report its
+/// alert. A connection that closed without one keeps its transport error.
+fn refusal(tls: &mut ClientStream, error: io::Error) -> io::Error {
+    let closed = matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    );
+    let drain = closed && tls.sock.socket.set_nonblocking(true).is_ok();
+    let mut reads = 0;
+    loop {
+        // A connection that already failed returns its stored error,
+        // including an alert received on the normal path.
+        match tls.conn.process_new_packets() {
+            Err(rustls::Error::AlertReceived(alert)) => return alert_error(alert),
+            Err(_) => return error,
+            Ok(_) if !drain || reads == MAX_ALERT_READS => return error,
+            Ok(_) => reads += 1,
+        }
+        if !matches!(tls.conn.read_tls(&mut &tls.sock.socket), Ok(1..)) {
+            return error;
+        }
+    }
+}
+
+/// A server sends these alerts when it does not accept the client's
+/// certificate chain or signature: the witness refusing this client, as
+/// final as its `permission_denied` answer. rustls reports a certificate
+/// signed by another key of a CA with the same name as `decrypt_error`.
+/// Other alerts stay TLS failures. Only the alert's name is reported.
+fn alert_error(alert: rustls::AlertDescription) -> io::Error {
+    use rustls::AlertDescription as Alert;
+    match alert {
+        Alert::BadCertificate
+        | Alert::UnsupportedCertificate
+        | Alert::CertificateRevoked
+        | Alert::CertificateExpired
+        | Alert::CertificateUnknown
+        | Alert::UnknownCA
+        | Alert::AccessDenied
+        | Alert::CertificateRequired
+        | Alert::DecryptError
+        | Alert::HandshakeFailure => io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "witness refused the client's TLS authentication: received fatal alert {alert:?}"
+            ),
+        ),
+        _ => io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(alert),
+        ),
     }
 }
 

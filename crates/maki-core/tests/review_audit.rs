@@ -56,11 +56,11 @@ fn options() -> VolumeOptions {
 
 fn new_volume(backing: &Arc<CrashableBacking>) -> Volume {
     init::create_volume(backing.as_ref(), superblock()).unwrap();
-    Volume::recover(backing.clone() as Arc<dyn Backing>, options()).unwrap()
+    Volume::recover(backing.process(), options()).unwrap()
 }
 
 fn recover(backing: &Arc<CrashableBacking>) -> Result<Volume, RecoveryError> {
-    Volume::recover(backing.clone() as Arc<dyn Backing>, options())
+    Volume::recover(backing.process(), options())
 }
 
 fn ct(stamp: u8) -> Vec<u8> {
@@ -321,7 +321,6 @@ mod wrong_size {
 
     use async_trait::async_trait;
 
-    use maki_backing::Backing;
     use maki_core::engine::{Engine, EngineOptions};
     use maki_core::error::CoreError;
     use maki_crypto::{
@@ -387,7 +386,7 @@ mod wrong_size {
             armed: std::sync::atomic::AtomicBool::new(false),
         });
         let engine = Engine::attach(
-            backing.clone() as Arc<dyn Backing>,
+            backing.process(),
             provider.clone(),
             EngineOptions {
                 volume: options(),

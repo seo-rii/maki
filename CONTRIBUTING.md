@@ -53,8 +53,10 @@ Rules the test infrastructure imposes:
   (failpoints are process-global).
 - Time-dependent code uses the injectable `Clock` (`ManualClock` in tests);
   never real sleeps.
-- Crash tests use `CrashableBacking::with_tearing`, and distinguish a restart
-  (`drop` + `recover`, page cache survives) from a power loss (`crash*`).
+- Crash tests use `CrashableBacking::with_tearing`, distinguish a restart
+  (`drop` + `recover`, page cache survives) from a power loss (`crash*`), and
+  start each process of the code under test on `backing.process()`, which a
+  power loss kills.
 - Debug builds run `check_invariants()` after every mutation; a sanitizer
   panic is a real bug, not flakiness.
 
