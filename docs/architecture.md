@@ -250,14 +250,17 @@ symptom.
 Checkpoints are not only a shutdown step. A background worker checkpoints when
 the journal crosses a size watermark, when backing free space drops below the
 checkpoint reserve, and on a time interval, syncing unsynced records first so
-each pass applies them. The
+each pass applies them. It also checkpoints when the in-memory overlay reaches
+half of its byte or unit bound, and as soon as a write is refused for backing
+space. The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims
-inline at the hard journal limit (other writes queue behind an inline reclaim,
+inline at the hard journal or overlay limit (other writes queue behind an
+inline reclaim,
 so the space it frees goes to the write that ran it), and refuses writes with
 ENOSPC unless fresh
 backing space covers the emergency reserve, configured checkpoint headroom,
 projected record bytes, and all segment headers created by that write, or when
-the journal cannot be
+the journal or overlay cannot be
 reclaimed. A
 failed reclaim marks the engine degraded until a later checkpoint succeeds; the
 [remediation log](review-remediation.md#bounded-journal) lists the exact rules.

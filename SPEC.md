@@ -1289,8 +1289,11 @@ Checkpoints MUST run automatically, not only at detach. Triggers:
 ```text
 journal bytes on disk >= journal_max_bytes / 2       (background worker, syncs first)
 backing free space   <  checkpoint_reserve_bytes     (background worker, syncs first)
+overlay >= max_overlay_{bytes,entries} / 2           (background worker, syncs first)
+write refused for backing free space                 (background worker, syncs first)
 interval elapsed with unapplied records              (background worker, syncs first)
 write would exceed journal_max_bytes                 (inline, before the append)
+write would exceed max_overlay_{bytes,entries}       (inline, before the append)
 ```
 
 A write that would exceed `journal_max_bytes` after an inline checkpoint, or
