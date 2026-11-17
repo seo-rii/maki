@@ -428,14 +428,24 @@ Example systemd configuration:
 LoadCredential=crypto-token:/secure/path/token
 ```
 
-Supported credential sources:
+Supported credential sources, named by a reference's `source`:
 
 ```text
-systemd credentials
-root-only secret file
-kernel keyring
-explicit secret-provider abstraction
+credential   systemd credentials ($CREDENTIALS_DIRECTORY/<name>)
+file         secret file at an absolute path
+env          environment variable MAKI_CREDENTIAL_<NAME> (development)
 ```
+
+Each reference is loaded from exactly the source it declares, through one
+key-source abstraction, with no fallback between sources. A secret file MUST
+be a regular file, opened without following a symlink, owned by root or by
+the user the loading process runs as, with no group or other access (for
+example `0600` or `0400`): its owner can read or replace it whatever its
+mode. A systemd credential follows the same rule, except that it MAY also
+grant read, and only read, to its group when that group is the process's own
+or root, as systemd 257 writes `LoadCredential=` files (`0440`). The kernel
+keyring is not implemented; configuration validation rejects a `keyring`
+source.
 
 Environment variables MAY be used in development environments but SHOULD NOT be the primary production secret source.
 
