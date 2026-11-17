@@ -485,19 +485,24 @@ pub struct StateStore {
 
 impl StateStore {
     /// Explicitly enroll an authority; existing state, even corrupt, refuses.
+    /// The directory must be private to this process's user (see `open`).
     pub fn create(path: &Path, identity: [u8; 16]) -> io::Result<Self> {
         if identity == [0; 16] {
             return Err(input("nil remote witness identity"));
         }
-        Self::create_backing(Arc::new(FileBacking::new(path)?), identity)
+        Self::create_backing(Arc::new(private_state(FileBacking::new(path)?)?), identity)
     }
 
     /// Open an enrolled authority. Serving never implicitly initializes it.
+    ///
+    /// On Unix the directory and its `remote.*` files must be owned by root
+    /// or by this process's effective user and must not be writable by
+    /// group or others: whoever can write them can put an older record back.
     pub fn open(path: &Path) -> io::Result<Self> {
         if !std::fs::metadata(path)?.is_dir() {
             return Err(input("remote witness path is not a directory"));
         }
-        Self::open_backing(Arc::new(FileBacking::new(path)?))
+        Self::open_backing(Arc::new(private_state(FileBacking::new(path)?)?))
     }
 
     /// The backing must uphold `Backing`'s persistence and exclusive-lock contract.
@@ -761,6 +766,60 @@ fn decode(bytes: &[u8]) -> io::Result<Stored> {
         return Err(invalid("noncanonical remote witness record"));
     }
     Ok(stored)
+}
+
+/// Refuse a state directory, or a `remote.*` file in it, that anyone but
+/// root or this process's user can write. Its owner can rewrite it whatever
+/// its mode, and so can group or others with a write bit (a sticky bit does
+/// not stop them creating the next `remote.next`): either could put an
+/// older record back and roll the authority back across a restart. The
+/// directory is described through the pinned descriptor every later
+/// operation resolves through; once it is trusted, nobody else can swap its
+/// entries, so they are described by name without following a symlink.
+/// Read access stays allowed: the files hold the public record that any
+/// authenticated client may inspect and domain-separated SHA-256 digests of
+/// the last request and of a random 256-bit session capability, neither of
+/// which reveals the capability. `FileBacking` has no such rule because
+/// volume roots have their own.
+fn private_state(backing: FileBacking) -> io::Result<FileBacking> {
+    #[cfg(unix)]
+    {
+        trusted_state("state directory", &backing.root_metadata()?)?;
+        for name in [STATE_FILE, TEMP_FILE, LOCK_FILE] {
+            let Some(metadata) = backing.entry_metadata(name)? else {
+                continue;
+            };
+            if !metadata.is_file() {
+                return Err(input("remote witness state entry is not a regular file"));
+            }
+            trusted_state(&format!("state file {name}"), &metadata)?;
+        }
+    }
+    Ok(backing)
+}
+
+#[cfg(unix)]
+fn trusted_state(what: &str, metadata: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let owner = metadata.uid();
+    if owner != 0 && owner != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote witness {what} is owned by uid {owner}, not by root or this process's \
+                 user (uid {euid}): its owner can roll the authority back whatever its mode"
+            ),
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("remote witness {what} must not be writable by group or others"),
+        ));
+    }
+    Ok(())
 }
 
 fn read(backing: &dyn Backing) -> io::Result<Stored> {
