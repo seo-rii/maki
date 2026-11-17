@@ -3,27 +3,35 @@ use super::*;
 
 const SECRET_LEN: usize = 347;
 
+/// The first kept item's `data`.
+fn first_data(value: &response::Value) -> Option<&str> {
+    value
+        .get("items")?
+        .as_array()?
+        .1
+        .first()?
+        .get("data")?
+        .as_str()
+}
+
 #[test]
 fn original_frame_is_erased_before_the_owned_response_tree_is_returned() {
     let secret = "Q".repeat(SECRET_LEN);
     for wire in [
-        json!({"id": 7, "unknown": secret}).to_string(),
-        json!({"unknown": secret}).to_string(),
+        json!({"id": 7, "items": [{"unit": 0, "data": secret}]}).to_string(),
+        json!({"items": [{"data": secret}]}).to_string(),
         format!(
             "{{\"id\":7,\"id\":8,\"error\":{{\"class\":\"integrity\",\"reason\":\"{secret}\"}}}}"
         ),
     ] {
         let frame = response::own_message(Message::Text(wire.into())).unwrap();
         let watch = Watch::initialized(frame.expose());
-        let value = frame.parse().unwrap();
+        let value = frame.parse(1).unwrap();
         let inspection = watch.finish();
         assert_eq!(inspection.freed, 1, "source frame retained: {inspection:?}");
         assert!(inspection.all_zero, "source frame survived: {inspection:?}");
-        let text = value
-            .get("unknown")
-            .or_else(|| value.get("error").unwrap().get("reason"))
-            .unwrap()
-            .as_str()
+        let text = first_data(&value)
+            .or_else(|| value.get("error")?.get("reason")?.as_str())
             .unwrap();
         assert_eq!(text, secret);
         if value.get("error").is_some() {
@@ -42,7 +50,7 @@ fn original_frame_is_erased_before_a_json_error_is_returned() {
     let wire = format!("{{\"unknown\":\"{}\",\"broken\":", "Q".repeat(SECRET_LEN));
     let frame = response::own_message(Message::Text(wire.into())).unwrap();
     let watch = Watch::initialized(frame.expose());
-    let result = frame.parse();
+    let result = frame.parse(1);
     let inspection = watch.finish();
     assert!(result.is_err());
     assert_eq!(
@@ -58,11 +66,11 @@ fn original_frame_is_erased_before_a_json_error_is_returned() {
 #[test]
 fn original_frame_copy_is_erased_while_a_shared_source_survives_parsing() {
     let secret = "Q".repeat(SECRET_LEN);
-    let wire = json!({"id": 7, "unknown": secret}).to_string();
+    let wire = json!({"id": 7, "items": [{"unit": 0, "data": secret}]}).to_string();
     let source = tokio_tungstenite::tungstenite::Bytes::from(wire.clone());
     let frame = response::own_message(Message::Binary(source.clone())).unwrap();
     let watch = Watch::initialized(frame.expose());
-    let value = frame.parse().unwrap();
+    let value = frame.parse(1).unwrap();
     let inspection = watch.finish();
     assert_eq!(
         inspection.freed, 1,
@@ -73,21 +81,18 @@ fn original_frame_copy_is_erased_while_a_shared_source_survives_parsing() {
         "shared frame copy survived: {inspection:?}"
     );
     assert_eq!(source.as_ref(), wire.as_bytes());
-    assert_eq!(
-        value.get("unknown").unwrap().as_str(),
-        Some(secret.as_str())
-    );
+    assert_eq!(first_data(&value), Some(secret.as_str()));
 }
 
 #[test]
 fn response_value_strings_are_wiped_when_the_response_is_dropped() {
     let secret = "Q".repeat(SECRET_LEN);
-    let wire = json!({"id": 1, "error": {"class": "bad-request", "message": secret}}).to_string();
-    let value = response::parse(&wire).unwrap();
+    let wire = json!({"id": 1, "error": {"class": "bad-request", "reason": secret}}).to_string();
+    let value = response::parse(&wire, 1).unwrap();
     let bytes = value
         .get("error")
         .unwrap()
-        .get("message")
+        .get("reason")
         .unwrap()
         .as_str()
         .unwrap()
@@ -106,17 +111,57 @@ fn response_value_strings_are_wiped_when_the_response_is_dropped() {
 fn malformed_json_wipes_strings_and_keys_created_before_the_error() {
     let secret = "Q".repeat(SECRET_LEN);
     let wires = [
-        format!("{{\"first\":\"{secret}\",\"broken\":"),
-        format!("{{\"{secret}\":0,\"broken\":"),
+        (
+            format!("{{\"error\":{{\"reason\":\"{secret}\"}},\"broken\":"),
+            SECRET_LEN,
+        ),
+        (
+            format!("{{\"items\":[{{\"data\":\"{secret}\"}},"),
+            SECRET_LEN,
+        ),
+        // The key is already owned when parsing its value fails.
+        ("{\"error\":".into(), "error".len()),
     ];
-    for wire in wires {
-        let watch = Watch::plain_sizes([SECRET_LEN, 0]);
-        let result = response::parse(&wire);
+    for (wire, size) in wires {
+        let watch = Watch::plain_sizes([size, 0]);
+        let result = response::parse(&wire, 1);
         let inspection = watch.finish();
         assert!(result.is_err());
         assert_eq!(inspection.allocated, 1);
         assert_eq!(inspection.freed, 1);
         assert!(inspection.all_zero, "partial JSON survived: {inspection:?}");
+    }
+}
+
+/// Strings and keys the response handling does not read are validated but
+/// never copied out of the guarded frame, so nothing about them needs erasing.
+#[test]
+fn unread_strings_and_keys_are_never_copied() {
+    let secret = "Q".repeat(SECRET_LEN);
+    let wires = [
+        format!(r#"{{"id":1,"unknown":"{secret}"}}"#),
+        format!(r#"{{"id":1,"{secret}":0}}"#),
+        format!(r#"{{"id":"{secret}"}}"#),
+        format!(r#"{{"data":"{secret}"}}"#),
+        format!(r#"{{"id":1,"error":{{"class":"bad-request","message":"{secret}"}}}}"#),
+        format!(r#"{{"id":1,"error":{{"class":"bad-request","{secret}":"x"}}}}"#),
+        format!(r#"{{"id":1,"items":[{{"unit":0,"data":"AA=="}},{{"data":"{secret}"}}]}}"#),
+        format!(r#"{{"id":1,"items":[{{"unit":0,"data":"AA==","note":"{secret}"}}]}}"#),
+        format!(r#"{{"id":1,"items":[{{"unit":0,"data":["{secret}"]}}]}}"#),
+        format!(r#"{{"id":1,"items":[["{secret}"]]}}"#),
+        // Malformed after an unread string: nothing to erase either.
+        format!(r#"{{"first":"{secret}","broken":"#),
+        format!(r#"{{"{secret}":0,"broken":"#),
+    ];
+    for wire in wires {
+        let watch = Watch::plain_sizes([SECRET_LEN, 0]);
+        let result = response::parse(&wire, 1);
+        drop(result);
+        let inspection = watch.finish();
+        assert_eq!(
+            inspection.allocated, 0,
+            "an unread string was copied: {inspection:?}"
+        );
     }
 }
 
@@ -198,26 +243,32 @@ fn all_message_payload_kinds_preserve_text_conversion_behavior() {
 
 #[test]
 fn owned_string_deserializer_transfers_the_original_allocation() {
-    use serde::Deserialize;
+    use serde::de::value::{Error, StringDeserializer};
     let string = "Q".repeat(SECRET_LEN);
     let address = string.as_ptr();
-    let deserializer = serde::de::value::StringDeserializer::<serde::de::value::Error>::new(string);
-    let value = response::Value::deserialize(deserializer).unwrap();
+    let deserializer = StringDeserializer::<Error>::new(string);
+    let value = response::deserialize_string(deserializer, true).unwrap();
     assert_eq!(value.as_str().unwrap().as_ptr(), address);
     let watch = Watch::initialized(value.as_str().unwrap().as_bytes());
     drop(value);
     let inspection = watch.finish();
     assert_eq!(inspection.freed, 1);
     assert!(inspection.all_zero);
+    // An owned string nothing reads is adopted too, and erased at once.
+    let string = "Q".repeat(SECRET_LEN);
+    let watch = Watch::initialized(string.as_bytes());
+    let value = response::deserialize_string(StringDeserializer::<Error>::new(string), false);
+    let inspection = watch.finish();
+    assert!(value.unwrap().as_str().is_none());
+    assert_eq!(inspection.freed, 1);
+    assert!(inspection.all_zero);
 }
 
 #[test]
 fn cancelled_response_receiver_wipes_the_rejected_tree() {
-    let wire = json!({"id": 1, "unknown": ["Q".repeat(SECRET_LEN)]}).to_string();
-    let value = response::parse(&wire).unwrap();
-    let string = value.get("unknown").unwrap().as_array().unwrap()[0]
-        .as_str()
-        .unwrap();
+    let wire = json!({"id": 1, "items": [{"unit": 0, "data": "Q".repeat(SECRET_LEN)}]}).to_string();
+    let value = response::parse(&wire, 1).unwrap();
+    let string = first_data(&value).unwrap();
     let watch = Watch::initialized(string.as_bytes());
     let (tx, rx) = oneshot::channel();
     drop(rx);
@@ -233,22 +284,23 @@ fn escaped_strings_keys_and_duplicate_values_keep_their_wire_meaning() {
         r#"{
         "i\u0064": 1, "id": 2,
         "items": [], "it\u0065ms": [{"unit": 3, "data": "Y\u0051=="}],
+        "error": {"cl\u0061ss": "x"}, "\u0065rror": {"reason": "secret\nvalue"},
         "unknown": {"\u0073ecret-key": [null, true, -1, 1.25, "secret\nvalue"]}
     }"#,
+        1,
     )
     .unwrap();
     assert_eq!(value.get("id").unwrap().as_u64(), Some(2));
-    assert_eq!(
-        value
-            .get("unknown")
-            .unwrap()
-            .get("secret-key")
-            .unwrap()
-            .as_array()
-            .unwrap()[4]
-            .as_str(),
-        Some("secret\nvalue")
-    );
+    let error = value.get("error").unwrap();
+    assert!(error.get("class").is_none());
+    assert_eq!(error.get("reason").unwrap().as_str(), Some("secret\nvalue"));
+    // Members nothing reads are validated, not kept.
+    assert!(value.get("unknown").is_none());
+    let value = response::parse(
+        r#"{"i\u0064": 1, "id": 2, "items": [], "it\u0065ms": [{"unit": 3, "data": "Y\u0051=="}]}"#,
+        1,
+    )
+    .unwrap();
     let output = decoded_response_tests::provider()
         .parse_response(&value, &[(3, &[])])
         .unwrap();
@@ -312,21 +364,34 @@ fn probe_envelope_shape_matches_the_previous_derived_parser() {
     }
     for wire in wires {
         let old = serde_json::from_str::<Envelope>(&wire).is_ok();
-        let value = response::parse(&wire).unwrap();
+        let value = response::parse(&wire, 1).unwrap();
         assert_eq!(value.valid_probe_envelope(), old, "shape: {wire}");
     }
 }
 
 #[test]
 fn guarded_json_keeps_the_default_recursion_and_syntax_limits() {
+    let nested = |open: &str, close: &str| format!("{}0{}", open.repeat(130), close.repeat(130));
     for wire in [
-        format!("{}0{}", "[".repeat(130), "]".repeat(130)),
+        nested("[", "]"),
+        format!(r#"{{"id":1,"pad":{}}}"#, nested("[", "]")),
+        format!(r#"{{"id":1,"pad":{}}}"#, nested(r#"{"a":"#, "}")),
+        format!(r#"{{"id":1,"items":[{{"unit":0}},{}]}}"#, nested("[", "]")),
+        format!(r#"{{"id":1,"error":{{"class":{}}}}}"#, nested("[", "]")),
         r#"{"secret":"value"} trailing"#.into(),
         r#"{"secret":"\uD800"}"#.into(),
+        r#"{"id":1,"\uD800":0}"#.into(),
+        r#"{"id":1,"items":[{"unit":0},{"data":"\uD800"}]}"#.into(),
+        r#"{"id":1,"pad":[1,]}"#.into(),
+        r#"{"id":1,"pad":[1e999]}"#.into(),
         "1e10000".into(),
     ] {
         assert!(serde_json::from_str::<serde_json::Value>(&wire).is_err());
-        assert!(response::parse(&wire).is_err());
+        assert!(
+            response::parse(&wire, 1).is_err(),
+            "accepted: {}",
+            &wire[..20]
+        );
     }
 }
 
@@ -354,11 +419,14 @@ fn adopting_a_unique_slice_wipes_its_original_initialized_capacity() {
 
 #[test]
 fn replacing_a_duplicate_field_wipes_its_previous_string() {
-    let wire = format!(r#"{{"data":"{}","data":false}}"#, "Q".repeat(SECRET_LEN));
+    let wire = format!(
+        r#"{{"items":[{{"data":"{}","data":false}}]}}"#,
+        "Q".repeat(SECRET_LEN)
+    );
     let watch = Watch::plain_sizes([SECRET_LEN, 0]);
-    let value = response::parse(&wire).unwrap();
+    let value = response::parse(&wire, 1).unwrap();
     let inspection = watch.finish();
-    assert!(value.get("data").unwrap().as_str().is_none());
+    assert!(first_data(&value).is_none());
     assert_eq!(inspection.allocated, 1);
     assert_eq!(inspection.freed, 1);
     assert!(inspection.all_zero);

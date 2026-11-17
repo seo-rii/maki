@@ -16,7 +16,7 @@ use tonic::codegen::tokio_stream::StreamExt;
 use tonic::codegen::{http, BoxFuture, Service};
 
 use super::{
-    protected::{WireItem, WireRequest, WireResponse},
+    protected::{ResponseDecodeError, WireItem, WireRequest, WireResponse},
     GrpcCryptoProvider, GrpcProviderSpec,
 };
 use maki_crypto::{CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, SecretBuffer};
@@ -265,6 +265,63 @@ fn partial_nested_decode_failure_erases_the_item_before_parent_push() {
         "item data allocation was not observed"
     );
     assert_zeroized();
+}
+
+#[test]
+fn bounded_response_decode_refuses_the_first_extra_item_before_decoding_it() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const PAYLOAD: usize = 8209;
+    let public = super::CryptoBatchResponse {
+        items: vec![
+            super::CryptoItem {
+                unit_index: 7,
+                data: vec![0xC7; PAYLOAD],
+            },
+            super::CryptoItem {
+                unit_index: 8,
+                data: vec![1, 2, 3],
+            },
+        ],
+    };
+    let wire = public.encode_to_vec();
+    let bounded = WireResponse::decode_bounded(wire.as_slice(), 2).unwrap();
+    assert!(bounded == WireResponse::decode(wire.as_slice()).unwrap());
+    assert!(WireResponse::decode_bounded(wire.as_slice(), 3).is_ok());
+
+    // The decoded first item is erased when the second is refused.
+    let shared = Bytes::from(wire);
+    reset_observer();
+    WATCH_NEXT_SIZE.store(PAYLOAD, Ordering::SeqCst);
+    let refused = WireResponse::decode_bounded(shared.clone(), 1);
+    assert_eq!(
+        WATCH_NEXT_SIZE.load(Ordering::SeqCst),
+        0,
+        "first item was not decoded"
+    );
+    assert_eq!(refused, Err(ResponseDecodeError::ExtraItem));
+    assert_zeroized();
+    assert_eq!(
+        WireResponse::decode_bounded(shared, 0),
+        Err(ResponseDecodeError::ExtraItem)
+    );
+
+    // An extra item is refused before its own bytes are decoded; within the
+    // count the same bytes are malformed. Unknown fields are still skipped
+    // once the count is reached.
+    let item = [0x0a, 2, 0x08, 7];
+    let malformed = [&item[..], &[0x0a, 10, 1]].concat();
+    assert_eq!(
+        WireResponse::decode_bounded(malformed.as_slice(), 1),
+        Err(ResponseDecodeError::ExtraItem)
+    );
+    assert_eq!(
+        WireResponse::decode_bounded(malformed.as_slice(), 2),
+        Err(ResponseDecodeError::Malformed)
+    );
+    let unknown = [&item[..], &[0x18, 0, 0x22, 1, 0]].concat();
+    let decoded = WireResponse::decode_bounded(unknown.as_slice(), 1).unwrap();
+    assert_eq!(decoded.items.len(), 1);
+    assert_eq!(decoded.items[0].unit_index, 7);
 }
 
 #[test]
