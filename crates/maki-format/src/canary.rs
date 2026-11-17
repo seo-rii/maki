@@ -100,6 +100,9 @@ impl KeyCanary {
             )));
         }
         let ciphertext = r.take(len as usize)?.to_vec();
+        // Bytes after the ciphertext are not checked: attach rewrites both
+        // copies from the decoded record, and refusing them could invalidate
+        // a copy an earlier writer produced (`review_codec_canonical.rs`).
         Ok(Self {
             generation,
             volume_uuid,

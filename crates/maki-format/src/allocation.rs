@@ -46,6 +46,7 @@ impl AllocationMap {
         }
     }
 
+    /// Number of allocated units (padding bits are always clear).
     pub fn set_count(&self) -> u64 {
         self.bits.iter().map(|b| b.count_ones() as u64).sum()
     }
@@ -84,11 +85,23 @@ impl AllocationMap {
             return Err(FormatError::Invalid(format!("allocation units {units}")));
         }
         let expected = units.div_ceil(8) as usize;
-        let bits = r.take(expected)?.to_vec();
+        let mut bits = r.take(expected)?.to_vec();
         if r.remaining() != 0 {
             return Err(FormatError::Invalid(
                 "trailing bytes after allocation bitmap".to_string(),
             ));
+        }
+        // The last byte's bits past `units` name no unit. No writer sets
+        // them, but they were never checked, so a copy with them set stays
+        // valid; they are cleared here instead. Counted, they would make an
+        // empty map look like one that lists a slot, which is how
+        // `SlotStore::open` tells a short never-finished shard from a
+        // truncated one (SPEC §22).
+        let used = units % 8;
+        if used != 0 {
+            if let Some(last) = bits.last_mut() {
+                *last &= (1u8 << used) - 1;
+            }
         }
         Ok(Self {
             generation,
