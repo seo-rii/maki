@@ -233,9 +233,15 @@ the target owns their ordering and the recovery unit
 ```bash
 systemctl disable --now maki-workload@demo.target &&
 wait_stopped maki-attach@demo.service maki@demo.service &&
+    rmdir /srv/demo &&
     rm -rf /var/lib/maki/demo /etc/maki/attach/demo.toml /etc/maki/volumes/demo.toml &&
     shred -u /etc/maki/secrets/demo.token
 ```
+
+`rmdir` removes the empty mountpoint the bootstrap created, so this guide can
+run again: the bootstrap refuses an existing mountpoint. It refuses a
+directory that is still a mountpoint or not empty, which stops the cleanup
+before any volume file is deleted.
 
 ## What you have and have not seen
 
