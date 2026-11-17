@@ -304,8 +304,10 @@ or a target or span selector followed by `=<level>` (`maki_core::engine=debug`,
 the misspelt `warning` or `err` or a bare `maki_core`, as a target enabled at
 `trace` and turn every other target off, ERROR included, so Maki refuses it.
 Unset or empty values mean `info`; so do invalid ones, and the process then
-logs one `WARN` line, `MAKI_LOG is not a valid filter`, naming the value and
-the reason. A list without a level alone logs only the targets it names:
+logs one `WARN` line, `MAKI_LOG is not a valid filter`, with a fixed reason
+and the 1-based directive index when available. Selector values and detailed
+parser errors are omitted because they can contain user data. A list without
+a level alone logs only the targets it names:
 `MAKI_LOG=maki_core=debug` hides the plugin's own `maki_nbdkit` errors, so
 give the rest a threshold too, as in `info,maki_core=debug`. Set it through a
 drop-in on the packaged unit:

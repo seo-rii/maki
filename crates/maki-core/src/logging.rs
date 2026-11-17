@@ -93,7 +93,6 @@ pub fn install_default_logging() -> bool {
         .is_ok();
     if let (true, Some(reason)) = (installed, refused) {
         tracing::warn!(
-            value = ?value.unwrap_or_default(),
             %reason,
             "MAKI_LOG is not a valid filter; logging at {DEFAULT_LEVEL}"
         );
@@ -115,15 +114,27 @@ fn parse_filter(value: &OsStr) -> Result<Option<EnvFilter>, String> {
     if directives.is_empty() {
         return Ok(None);
     }
-    if let Some(directive) = directives.iter().find(|d| !names_level(d)) {
+    if let Some(index) = directives.iter().position(|d| !names_level(d)) {
+        let index = index + 1;
         return Err(format!(
-            "directive {directive:?} does not name a level; use off, error, warn, info, \
+            "directive {index} does not name a level; use off, error, warn, info, \
              debug or trace, alone or as <target>=<level>"
         ));
     }
-    EnvFilter::try_new(value)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    EnvFilter::try_new(value).map(Some).map_err(|_| {
+        // Selector values and parser errors may contain user data. Locate
+        // the failed directive without formatting its input or error.
+        let index = directives
+            .iter()
+            .position(|directive| {
+                directive
+                    .parse::<tracing_subscriber::filter::Directive>()
+                    .is_err()
+            })
+            .unwrap_or(0)
+            + 1;
+        format!("directive {index} has invalid filter syntax")
+    })
 }
 
 /// Whether `directive` is a level or ends in `=<level>`. Whatever precedes
@@ -213,6 +224,26 @@ mod tests {
 
     const REFUSED: &str = "MAKI_LOG is not a valid filter";
 
+    #[test]
+    fn invalid_filter_diagnostics_never_expose_selector_values() {
+        const SECRET: &str = "FILTER_SELECTOR_SECRET_7e9b6c";
+        for (value, reason) in [
+            (
+                format!("info,[auth{{token={SECRET}}}]=bogus"),
+                "directive 2 does not name a level",
+            ),
+            (
+                format!("info,[auth{{token={SECRET}(}}]=trace"),
+                "directive 2 has invalid filter syntax",
+            ),
+        ] {
+            let stderr = child_stderr(Some(&value));
+            assert!(!stderr.contains(SECRET), "selector value leaked:\n{stderr}");
+            assert_eq!(stderr.matches(REFUSED).count(), 1, "{stderr}");
+            assert!(stderr.contains(reason), "{stderr}");
+        }
+    }
+
     /// EnvFilter reads a directive without a level as a target enabled at
     /// trace and turns every other target off, so a misspelt level such as
     /// `warning` silenced every Maki event, ERROR included. Such a value is
@@ -252,8 +283,10 @@ mod tests {
                 "MAKI_LOG={value:?} must be reported once:\n{stderr}"
             );
             assert!(
-                stderr.contains(&format!("value={value:?}")),
-                "the report names the value:\n{stderr}"
+                stderr.contains("reason=directive")
+                    && stderr.contains("does not name a level")
+                    && !stderr.contains("value="),
+                "the report identifies the failure without the value:\n{stderr}"
             );
         }
     }
