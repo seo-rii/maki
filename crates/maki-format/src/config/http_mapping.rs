@@ -4,9 +4,10 @@
 //! mapping with the same [`BodyConfig::request_mapping`], so a body mapping
 //! that validates is exactly one the provider constructs, and every mapped
 //! field reaches the wire: an unknown source or encoding, an `encoding` the
-//! source would ignore, a pointer the request builder cannot apply, and
-//! pointers that would replace one another are all refused before a volume
-//! is created.
+//! source would ignore, a pointer the request builder cannot apply,
+//! pointers that would replace one another, an item source the batch
+//! encoder evaluates with no item, and `item_fields` a per-item body never
+//! sends are all refused before a volume is created.
 
 use std::collections::BTreeMap;
 
@@ -58,6 +59,13 @@ pub enum HttpFieldSource {
 }
 
 impl HttpFieldSource {
+    /// Whether the value belongs to one item (its payload, unit index or
+    /// position) and so must be evaluated for each item: in `fields` of a
+    /// per-item body, in `item_fields` of a batch.
+    pub fn is_per_item(self) -> bool {
+        matches!(self, Self::Payload(_) | Self::UnitIndex | Self::BatchIndex)
+    }
+
     /// Parse a field mapping's `source` and optional `encoding`. The error
     /// says what is wrong, without a configuration section.
     pub fn parse(source: &str, encoding: Option<&str>) -> Result<Self, String> {
@@ -139,15 +147,16 @@ pub struct HttpRequestMapping {
     pub fields: Vec<(String, HttpFieldSource)>,
     /// Batch layout: where the array of per-item objects is inserted.
     pub items_path: Option<String>,
-    /// Fields of each batch element. Without `items_path` they are parsed
-    /// but never sent.
+    /// Fields of each batch element; always empty without `items_path`
+    /// (a per-item body would never send them, so they are refused).
     pub item_fields: Vec<(String, HttpFieldSource)>,
 }
 
 impl HttpRequestMapping {
     /// Fields evaluated once per item: `fields` of a per-item body,
     /// `item_fields` of a batch. Top-level batch fields are evaluated once
-    /// per request and carry no item's payload, unit or position.
+    /// per request, so they may carry only the context, never an item's
+    /// payload, unit or position.
     pub fn per_item_fields(&self) -> &[(String, HttpFieldSource)] {
         match self.items_path {
             Some(_) => &self.item_fields,
@@ -253,14 +262,35 @@ impl BodyConfig {
     /// Parse a JSON body mapping as the HTTP provider builds it, refusing
     /// any mapping the provider cannot build or send as written: unknown
     /// sources and payload encodings, an `encoding` on a non-payload
-    /// source, request pointers without a leading `/`, and pointers whose
+    /// source, request pointers without a leading `/`, pointers whose
     /// fields would replace one another on the wire (including fields at,
-    /// under or above a batch `items_path`). `op` names the operation in
+    /// under or above a batch `items_path`), an item source (payload, unit
+    /// index, position) among the top-level fields of a batch, and
+    /// `item_fields` on a per-item body. `op` names the operation in
     /// errors. Does not look at `type`: a raw body sends no fields.
     pub fn request_mapping(&self, op: &str) -> Result<HttpRequestMapping, ConfigError> {
         let body = format!("crypto.http.{op}.body");
         let fields = parse_fields(&format!("{body}.fields"), &self.fields)?;
         let item_fields = parse_fields(&format!("{body}.item_fields"), &self.item_fields)?;
+        if self.items_path.is_some() {
+            // The batch encoder evaluates top-level fields once per request,
+            // with no item: an item source there is sent as an empty payload
+            // or 0 in every request.
+            if let Some((pointer, _)) = fields.fields.iter().find(|(_, s)| s.is_per_item()) {
+                return Err(invalid(format!(
+                    "[{body}.fields] {pointer:?}: source {:?} describes one item, but a batch \
+                     evaluates its top-level fields once per request, with no item, and would \
+                     send an empty payload or 0; map it in item_fields",
+                    self.fields[pointer].source
+                )));
+            }
+        } else if !item_fields.fields.is_empty() {
+            // A per-item body sends `fields` for each item and nothing else.
+            return Err(invalid(format!(
+                "[{body}.item_fields] are sent only inside a batch (items_path); a per-item \
+                 body sends its fields once per item and would drop them, so map them in fields"
+            )));
+        }
         let items_keys = match &self.items_path {
             Some(path) => Some(pointer_keys(path).ok_or_else(|| {
                 invalid(format!("[{body}] items_path {path:?} must start with '/'"))

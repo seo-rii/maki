@@ -224,13 +224,24 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   and no top-level field may sit at, under or above the batch `items_path`;
   each batch element's `item_fields` are checked as their own object.
   `/vol` and `/volume`, or `/a~1b` (the key `a/b`) and `/a/b`, are distinct;
+- HTTP JSON body fields that no request carries: a `payload`, `unit_index`
+  or `batch_index` source among the top-level `fields` of a batch (they are
+  evaluated once per request, with no item, and would be sent as an empty
+  payload or zero; map them in `item_fields`), and a non-empty
+  `item_fields` table on a per-item body, which sends only `fields`;
+- a gRPC `encrypt_path` or `decrypt_path` that the provider would not send
+  as written (validation and the provider apply one rule): it must start
+  with `/`, be at most 65534 bytes long, and contain only RFC 3986 path and
+  query characters (letters, digits, `-._~!$&'()*+,;=:@/?` and `%XX`
+  escapes), as HTTP/2 requires of the `:path` it is sent as. A `#` fragment
+  (never sent), a space or other character that needs escaping, and `*` or
+  a bare `?query` (no method) are refused. Errors never quote the path;
 - a declared `capabilities.context_binding` whose context does not reach
   the provider: each of `volume_id`, `compatibility_id` and `format_version`
   must be a source in the JSON `fields`, or in `item_fields` of a batch
-  layout (a raw body sends no fields, and a per-item body never sends
-  `item_fields`), and the attach self-test's unit-index probe needs a
-  per-item `unit_index`: in `fields` of a per-item body, in `item_fields` of
-  a batch (top-level batch fields belong to no item);
+  layout (a raw body sends no fields), and the attach self-test's
+  unit-index probe needs a per-item `unit_index`: in `fields` of a per-item
+  body, in `item_fields` of a batch;
 - a transport limit that cannot carry one full crypto batch, including the
   declared maximum ciphertext size. The maximum batch is bounded by both
   `crypto.batch.max_items` and the number of provider plaintext units that fit
@@ -256,7 +267,8 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   in the endpoint URL);
 - the `keyring` credential source, which this build does not implement, the
   same credential name declared with different sources, a credential name the
-  loaders cannot read, and a credential `format` without exactly one `{}`
+  loaders cannot read or an `env` name no environment variable can have, and
+  a credential `format` without exactly one `{}`
   placeholder or on a reference that is not a header or metadata value (see
   [credentials](#credentials-and-secrets)).
 
@@ -326,6 +338,11 @@ A `credential` name, and the file name that ends a `file` path, may contain
 only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
 the loaders refuse any other name, so validation refuses it before a volume is
 created (a key's name is stored as the volume's immutable key identity).
+An `env` name is upper-cased, with `-` and `.` replaced by `_`, to form the
+variable name. It must not contain `=` or a NUL character, which no
+environment variable name can hold (a lookup of `A=B` would even return part
+of variable `A`); any other name is accepted, since the source is meant for
+development only.
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
@@ -376,9 +393,11 @@ sources:
 | `batch_index` | the item's position in its request, an unsigned JSON integer |
 
 Only `payload` takes an `encoding`. A per-item body sends `fields` once per
-item. A batch body sends `fields` once per request (a `payload`, `unit_index`
-or `batch_index` there carries no item: an empty payload and zero) and the
-array of `item_fields` objects at `items_path`.
+item and takes no `item_fields`. A batch body sends `fields` once per request,
+so they may carry only `volume_id`, `compatibility_id` and `format_version`
+(validation refuses a `payload`, `unit_index` or `batch_index` there, which
+would describe no item), and the array of `item_fields` objects at
+`items_path`.
 
 JSON requests default to `Content-Type: application/json`. An explicitly
 configured `Content-Type` overrides that default, including vendor media types;
@@ -491,8 +510,11 @@ when its final caller leaves. Other callers in that batch can still complete.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
-Service method paths are configurable, but request and response messages must
-match that contract and responses must preserve unit identity and order.
+Service method paths are configurable (`encrypt_path` and `decrypt_path`,
+default `/maki.CryptoService/EncryptBatch` and `/maki.CryptoService/DecryptBatch`;
+a gateway prefix or a query is sent unchanged), but request and response
+messages must match that contract and responses must preserve unit identity
+and order.
 The message-size limit bounds each received gRPC frame before decoding.
 Locally rejected oversized frames and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may

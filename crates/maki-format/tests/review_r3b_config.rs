@@ -98,8 +98,10 @@ fn context_fields_count_only_where_the_provider_sends_them() {
             ),
         );
     }
+    // Refused whatever the binding: a per-item body never sends
+    // item_fields (review_http_item_sources.rs).
     let err = validate(&item_fields_only).expect_err("item_fields are not sent per item");
-    assert!(err.contains("context_binding"), "{err}");
+    assert!(err.contains("item_fields"), "{err}");
 
     // Context declared in the fields of a raw body.
     let mut raw = config("contractual", FULL_CONTEXT);

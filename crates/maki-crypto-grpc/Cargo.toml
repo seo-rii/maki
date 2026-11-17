@@ -7,6 +7,8 @@ authors.workspace = true
 
 [dependencies]
 maki-crypto.workspace = true
+# The method-path rule configuration validation applies.
+maki-format.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
