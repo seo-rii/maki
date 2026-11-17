@@ -102,11 +102,14 @@ matching `WARN` line with the underlying error class. A failed NBD request
 with the operation, offset, length, errno and error, at most once per second;
 the next line counts the ones suppressed in between. Payload bytes are never
 logged, whatever `MAKI_LOG` says: Maki's own events never carry them, and the
-dependencies that print payload or credential bytes at trace level are capped
-at `debug` under every directive, including one naming their modules and span
-directives such as `[name]=trace`. The capped targets are `tungstenite` and `tokio_tungstenite` (the
-WebSocket transport, whose trace output holds every frame's payload and the
-upgrade request URL) and `reqwest` (its optional raw connection dump). The
-other libraries on the plaintext path (hyper, h2, rustls, tonic, tower,
+dependencies that print payload or credential bytes are capped under every
+directive, including one naming their modules and span directives such as
+`[name]=trace`. The targets `tungstenite` and `tokio_tungstenite` (the WebSocket
+transport, whose trace output holds every frame's payload and the upgrade
+request URL) and `reqwest` (its optional raw connection dump) are capped at
+`debug`. The `tungstenite::protocol` subtree has a stricter `info` cap because
+its debug output includes peer-supplied close reasons and reply frames, which
+may contain request contents. WebSocket handshake debug diagnostics remain
+available. The other libraries on the plaintext path (hyper, h2, rustls, tonic, tower,
 hyper-util) log no payload or credential bytes at any level. See
 [operations: logging](operations.md#logging).

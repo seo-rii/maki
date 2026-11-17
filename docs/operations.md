@@ -281,7 +281,9 @@ payloads are never passed to a log macro; `SecretBuffer` redacts itself.
 Dependencies that would print payloads or credentials at trace level
 (`tungstenite`, `tokio_tungstenite`, `reqwest`) are capped at `debug`, even
 under `MAKI_LOG=trace` or a directive that names them
-([observability](observability.md#logs)).
+([observability](observability.md#logs)). The `tungstenite::protocol` subtree
+is capped at `info` because its debug output also includes the peer's close
+reason and reply frame. WebSocket handshake debug diagnostics remain available.
 Read the journal with `journalctl -u maki@<volume>.service`.
 
 ## Rootless userspace smoke test

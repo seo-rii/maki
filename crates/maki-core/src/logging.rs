@@ -39,18 +39,22 @@ pub const DEFAULT_LEVEL: &str = "info";
 /// - `tungstenite` logs every frame's payload (hex), every received text
 ///   message and the client upgrade request (URL path, query and headers) at
 ///   trace. WebSocket requests and responses carry the unit plaintext.
-/// - `tokio_tungstenite` is its async wrapper and shares the cap.
+///   Its `protocol` target also prints peer-supplied close reasons and the
+///   reply frame at debug, so that subtree is capped at info.
+/// - `tokio_tungstenite` is its async wrapper and is capped at debug.
 /// - `reqwest` dumps the raw bytes it reads and writes above TLS at trace
 ///   when a client enables `connection_verbose`. The HTTP provider does not;
 ///   the cap keeps request bodies out of the log should that ever change.
 ///
-/// Their debug output is connection lifecycle and error descriptions. The
-/// other libraries on the plaintext path print no payload or credential bytes
+/// Outside the protocol subtree, their debug output on Maki's transport
+/// paths is connection lifecycle and error descriptions. The other libraries
+/// on the plaintext path print no payload or credential bytes
 /// at any level: hyper is built without logging, h2 leaves DATA payloads and
 /// header fields out of its frame formatting, rustls logs public handshake
 /// data only, and tonic, tower and hyper-util log connection state.
-const CAPPED_TARGETS: [(&str, LevelFilter); 3] = [
+const CAPPED_TARGETS: [(&str, LevelFilter); 4] = [
     ("tungstenite", LevelFilter::DEBUG),
+    ("tungstenite::protocol", LevelFilter::INFO),
     ("tokio_tungstenite", LevelFilter::DEBUG),
     ("reqwest", LevelFilter::DEBUG),
 ];
@@ -155,12 +159,12 @@ mod tests {
         assert!(stderr.contains("fixture debug is hidden"), "{stderr}");
     }
 
-    /// Dependency targets whose trace output carries payload or credential
-    /// bytes (tungstenite frames and messages, reqwest's raw connection dump).
-    const CAPPED: [&str; 3] = [
-        "tungstenite::protocol::frame",
-        "tokio_tungstenite::compat",
-        "reqwest::connect",
+    /// Payload-carrying targets and whether their debug output is safe.
+    const CAPPED: [(&str, bool); 4] = [
+        ("tungstenite::protocol::frame", false),
+        ("tungstenite::handshake::client", true),
+        ("tokio_tungstenite::compat", true),
+        ("reqwest::connect", true),
     ];
 
     #[test]
@@ -173,24 +177,26 @@ mod tests {
             ($target:literal) => {
                 tracing::trace!(target: $target, "trace from {}", $target);
                 tracing::debug!(target: $target, "debug from {}", $target);
+                tracing::info!(target: $target, "info from {}", $target);
             };
         }
         let span = tracing::info_span!("cap_probe");
         let _entered = span.enter();
         emit!("tungstenite::protocol::frame");
+        emit!("tungstenite::handshake::client");
         emit!("tokio_tungstenite::compat");
         emit!("reqwest::connect");
         emit!("maki_core::fixture");
     }
 
     #[test]
-    fn dependency_payload_targets_are_capped_at_debug_whatever_maki_log_says() {
+    fn dependency_payload_targets_cannot_exceed_safe_levels_whatever_maki_log_says() {
         for filter in [
             "trace",
             "warn,tungstenite=trace,tokio_tungstenite=trace,reqwest=trace",
             // More specific than a crate-level directive.
-            "warn,tungstenite::protocol::frame=trace,tokio_tungstenite::compat=trace,\
-             reqwest::connect=trace",
+            "warn,tungstenite::protocol::frame=trace,tungstenite::handshake::client=trace,\
+             tokio_tungstenite::compat=trace,reqwest::connect=trace",
             // A span directive enables every target inside the span.
             "warn,[cap_probe]=trace",
         ] {
@@ -198,14 +204,19 @@ mod tests {
                 "logging::tests::child_emits_dependency_events",
                 Some(filter),
             );
-            for target in CAPPED {
+            for (target, debug_safe) in CAPPED {
                 assert!(
                     !stderr.contains(&format!("trace from {target}")),
                     "MAKI_LOG={filter} let {target} log at trace:\n{stderr}"
                 );
-                assert!(
+                assert_eq!(
                     stderr.contains(&format!("debug from {target}")),
-                    "MAKI_LOG={filter} hid {target} debug diagnostics:\n{stderr}"
+                    debug_safe,
+                    "MAKI_LOG={filter} did not enforce {target}'s debug cap:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains(&format!("info from {target}")),
+                    "MAKI_LOG={filter} hid {target} info diagnostics:\n{stderr}"
                 );
             }
         }
@@ -218,7 +229,7 @@ mod tests {
             "Maki's own targets keep the operator's threshold:\n{stderr}"
         );
         let stderr = child_stderr_of("logging::tests::child_emits_dependency_events", None);
-        for target in CAPPED {
+        for (target, _) in CAPPED {
             assert!(
                 !stderr.contains(&format!("debug from {target}")),
                 "the default threshold stays info:\n{stderr}"
