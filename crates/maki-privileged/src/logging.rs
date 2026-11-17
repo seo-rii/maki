@@ -96,4 +96,78 @@ mod tests {
         assert!(stderr.contains("rollback halted"), "{stderr}");
         assert!(!stderr.contains("fixture step"), "{stderr}");
     }
+
+    const REFUSED: &str = "MAKI_LOG is not a valid filter";
+
+    /// A directive without a level is a target at trace for EnvFilter, which
+    /// then drops every other target: `MAKI_LOG=warning` hid halted
+    /// rollbacks. Such a value means `info`, and the helper says so once.
+    #[test]
+    fn a_maki_log_value_without_a_level_falls_back_to_info_and_says_so() {
+        for value in [
+            "warning",
+            "err",
+            "notice",
+            "wran",
+            "maki_privileged",
+            "maki_privileged=",
+            "warn,maki_privileged",
+            "[fixture]",
+            "info,maki_privileged=bogus",
+        ] {
+            let stderr = child_stderr(Some(value));
+            assert!(
+                stderr.contains("rollback halted, fixture reason")
+                    && stderr.contains("maki-attach: fixture step"),
+                "MAKI_LOG={value:?} hid the helper's log:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("fixture debug is hidden"),
+                "MAKI_LOG={value:?} did not fall back to info:\n{stderr}"
+            );
+            assert_eq!(
+                stderr.matches(REFUSED).count(),
+                1,
+                "MAKI_LOG={value:?} must be reported once:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("value={value:?}")),
+                "the report names the value:\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn documented_maki_log_forms_keep_working_without_a_report() {
+        for value in ["error", "ERROR", "1", "error,[fixture]=trace"] {
+            let stderr = child_stderr(Some(value));
+            assert!(
+                stderr.contains("rollback halted") && !stderr.contains("fixture step"),
+                "MAKI_LOG={value:?}:\n{stderr}"
+            );
+            assert!(!stderr.contains(REFUSED), "MAKI_LOG={value:?}:\n{stderr}");
+        }
+        let stderr = child_stderr(Some("info,maki_privileged=debug"));
+        assert!(
+            stderr.contains("fixture debug is hidden") && !stderr.contains(REFUSED),
+            "{stderr}"
+        );
+    }
+
+    /// An empty value (`Environment=MAKI_LOG=`) is an EnvFilter without any
+    /// directive, which enables nothing. It names no filter, like an unset
+    /// variable.
+    #[test]
+    fn an_empty_maki_log_means_info_like_an_unset_one() {
+        for value in ["", ","] {
+            let stderr = child_stderr(Some(value));
+            assert!(
+                stderr.contains("rollback halted")
+                    && stderr.contains("fixture step")
+                    && !stderr.contains("fixture debug is hidden"),
+                "MAKI_LOG={value:?}:\n{stderr}"
+            );
+            assert!(!stderr.contains(REFUSED), "MAKI_LOG={value:?}:\n{stderr}");
+        }
+    }
 }

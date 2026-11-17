@@ -159,6 +159,93 @@ mod tests {
         assert!(stderr.contains("fixture debug is hidden"), "{stderr}");
     }
 
+    const REFUSED: &str = "MAKI_LOG is not a valid filter";
+
+    /// EnvFilter reads a directive without a level as a target enabled at
+    /// trace and turns every other target off, so a misspelt level such as
+    /// `warning` silenced every Maki event, ERROR included. Such a value is
+    /// invalid and means `info`, like any other invalid value, and the
+    /// process says so once.
+    #[test]
+    fn a_maki_log_value_without_a_level_falls_back_to_info_and_says_so() {
+        for value in [
+            "warning",
+            "err",
+            "notice",
+            "wran",
+            "maki_core",
+            "maki_core=",
+            "warn,maki_core",
+            "[cap_probe]",
+            "info,maki_core=bogus",
+        ] {
+            let stderr = child_stderr(Some(value));
+            for line in [
+                "fixture warning reaches stderr",
+                "fixture info reaches stderr",
+                "fixture error reaches stderr",
+            ] {
+                assert!(
+                    stderr.contains(line),
+                    "MAKI_LOG={value:?} hid {line:?}:\n{stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("fixture debug is hidden"),
+                "MAKI_LOG={value:?} did not fall back to info:\n{stderr}"
+            );
+            assert_eq!(
+                stderr.matches(REFUSED).count(),
+                1,
+                "MAKI_LOG={value:?} must be reported once:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("value={value:?}")),
+                "the report names the value:\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn documented_maki_log_forms_keep_working_without_a_report() {
+        for value in ["warn", "WARN", "Warn", "2", "warn,[cap_probe]=trace"] {
+            let stderr = child_stderr(Some(value));
+            assert!(
+                stderr.contains("fixture warning reaches stderr")
+                    && stderr.contains("fixture error reaches stderr")
+                    && !stderr.contains("fixture info reaches stderr"),
+                "MAKI_LOG={value:?}:\n{stderr}"
+            );
+            assert!(!stderr.contains(REFUSED), "MAKI_LOG={value:?}:\n{stderr}");
+        }
+        for value in ["info,maki_core=debug", "info,maki_core::logging=debug"] {
+            let stderr = child_stderr(Some(value));
+            assert!(
+                stderr.contains("fixture debug is hidden") && stderr.contains("fixture info"),
+                "MAKI_LOG={value:?}:\n{stderr}"
+            );
+            assert!(!stderr.contains(REFUSED), "MAKI_LOG={value:?}:\n{stderr}");
+        }
+    }
+
+    /// An empty value (`Environment=MAKI_LOG=`) is an EnvFilter without any
+    /// directive, which enables nothing. It names no filter, like an unset
+    /// variable.
+    #[test]
+    fn an_empty_maki_log_means_info_like_an_unset_one() {
+        for value in ["", ","] {
+            let stderr = child_stderr(Some(value));
+            assert!(
+                stderr.contains("fixture warning reaches stderr")
+                    && stderr.contains("fixture info reaches stderr")
+                    && stderr.contains("fixture error reaches stderr")
+                    && !stderr.contains("fixture debug is hidden"),
+                "MAKI_LOG={value:?}:\n{stderr}"
+            );
+            assert!(!stderr.contains(REFUSED), "MAKI_LOG={value:?}:\n{stderr}");
+        }
+    }
+
     /// Payload-carrying targets and whether their debug output is safe.
     const CAPPED: [(&str, bool); 4] = [
         ("tungstenite::protocol::frame", false),
