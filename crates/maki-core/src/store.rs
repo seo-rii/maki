@@ -461,6 +461,14 @@ impl SlotStore {
             let mut dirty_alloc = dirty_alloc;
             let len = data.len()?;
             let physical = geometry.units_per_shard() * geometry.slot_size;
+            // Positions below this name a unit of the device; a partial last
+            // shard's positions past the device's last unit never hold data
+            // (R5-027).
+            let in_device = alloc.units().min(
+                geometry
+                    .num_units()
+                    .saturating_sub(shard_idx * geometry.units_per_shard()),
+            );
             // Creation finished ⇔ the shard was ever checkpointed into: the
             // catalog names it (its commit follows the synced full-size
             // file), or an allocation copy lists a slot (a checkpoint wrote
@@ -469,8 +477,11 @@ impl SlotStore {
             // earlier attempt can leave one behind after its never-dir-synced
             // data file vanished in the crash. Nor does the observed length:
             // after a failed sync and a plain restart the page cache shows
-            // the full size that the disk does not have (K-01).
-            let short = if adopted.contains(&shard_idx) && alloc.set_count() == 0 {
+            // the full size that the disk does not have (K-01). Only a bit
+            // at an in-device position lists a slot.
+            let short = if adopted.contains(&shard_idx)
+                && !(0..in_device).any(|in_shard| alloc.get(in_shard))
+            {
                 if len < physical {
                     tracing::warn!(
                         shard = shard_idx,
@@ -495,9 +506,7 @@ impl SlotStore {
                 // Positions past the device's last unit (a partial last
                 // shard) never held data and are never marked (R5-027).
                 let mut marked = 0u64;
-                let base = shard_idx * geometry.units_per_shard();
-                let in_device = geometry.num_units().saturating_sub(base);
-                for in_shard in 0..alloc.units().min(in_device) {
+                for in_shard in 0..in_device {
                     if !alloc.get(in_shard) && geometry.slot_offset(in_shard) + 64 > len {
                         alloc.set(in_shard, true);
                         marked += 1;
