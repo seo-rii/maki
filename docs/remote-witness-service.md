@@ -417,6 +417,21 @@ an authority read confirms the released new session. A concurrent new claim can
 cause confirmation failure even when the transition completed; inspect before
 proceeding.
 
+A restore cannot be undone from the backing root. Once the restored state is
+activated, the automatic GC pass ([below](#retire-old-writer-namespaces))
+retires every lower-fence namespace whose lifetime lock is free. With the
+daemon stopped (step 1), that includes the namespace holding the newer state
+the restore replaces, so the restore command itself deletes it; a process
+that still holds it open only defers the deletion to a later GC. The snapshot
+you restore from stays in its backup directory, which GC never touches. If
+the newer state may be needed again, as data or as evidence, first snapshot
+it into a new backup directory as described above and keep its approved
+root. That snapshot claims and releases a writer session, which raises the
+fence but keeps the current root, so inspect again with `maki volume witness`
+and use the new fence in the restore command. A current generation that no
+longer authenticates cannot be snapshotted; preserve a copy of the stopped
+backing directory as evidence instead.
+
 An intentional older-snapshot restoration requires its independently approved
 root as well:
 
