@@ -461,8 +461,10 @@ such as `/srv/<volume>` created by root (`install -d -m 0755 /srv/<volume>`):
 the mountpoint directory itself must also be root-owned and not writable by
 group or others, or a workload could stack a FUSE mount over it before the
 volume is mounted. It is hidden once the volume is mounted; the volume's own
-root directory carries the workload's ownership. `/` is refused as a
-mountpoint.
+root directory carries the workload's ownership. If the workload unit's
+`CapabilityBoundingSet=` drops both CAP_DAC_READ_SEARCH and CAP_DAC_OVERRIDE,
+that root must stay readable and searchable by root, or the workload's verify
+gate fails (see the gate requirements below). `/` is refused as a mountpoint.
 
 Before its LVM activation, attach inventories the recorded NBD and its kernel
 partitions, compares independently probed PV identifiers with the complete VG
