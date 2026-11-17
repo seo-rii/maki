@@ -98,7 +98,7 @@
         "Cargo.lock": "3df99baa22ca27d06b5446585d96ca1c3e70e0dad81c37e3690cfe6d6c153b9b",
         "Cargo.toml": "d474a571912f9e450ba22ec989891d16f6de7e3e958af325a107e2f35c90a85f",
         "src/de.rs": "c32b06120696682bd044680405f4518c7c11aa3d8e128b002d8836a58b326788",
-        "src/error.rs": "e886d41e2fd42495a7e349abb7ae67206b490fd423d40cb29f01979b667e8359",
+        "src/error.rs": "07f1c9f1192b2376f04a4f2db5940c4d39c3d986deb874c7810af505e6d8444d",
         "src/lexical/bignum.rs": "91d9ccf248f3f2f5475fcd1824749cb9a534fcc8265b1cd797ff4ebc2e02a9e3",
         "src/lexical/math.rs": "7712011ee7d8d839dc6bffd5538a1fdc246e6bfb41013751f4c8227e179d6c47",
         "src/lib.rs": "9a2c202d1755a61e2acfe9223d7857766e753a207ad7ef128b8cd792967dce3b",

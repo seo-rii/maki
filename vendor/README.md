@@ -9,7 +9,9 @@ buffer ownership, not the TLS wire protocol or JSON syntax.
 
 `serde_json` erases its private string/number scratch before reuse and its full
 allocation before growth or release. Integer128 scanning and error-message
-formatting use the same ownership. Parsed values, borrowed input and messages
+formatting use the same ownership. Reading a message's trailing line and
+column validates the guarded text once, so building an error stays linear in
+the message length. Parsed values, borrowed input and messages
 formatted by callers remain caller-owned. A caller-retained `Deserializer`
 keeps its latest scratch until reuse or Drop; a visitor may still borrow it.
 The optional `raw_value` path also guards reader accumulation, owned map/seed

@@ -491,7 +491,10 @@ fn make_error(mut msg: GuardedString) -> Error {
     }
 }
 
-fn parse_line_col(msg: &mut GuardedString) -> Option<(usize, usize)> {
+fn parse_line_col(guarded: &mut GuardedString) -> Option<(usize, usize)> {
+    // Each deref of the guard validates the whole message as UTF-8. Index one
+    // borrowed view instead, or every digit would validate the message again.
+    let msg: &str = guarded;
     let start_of_suffix = match msg.rfind(" at line ") {
         Some(index) => index,
         None => return None,
@@ -529,7 +532,7 @@ fn parse_line_col(msg: &mut GuardedString) -> Option<(usize, usize)> {
         Err(_) => return None,
     };
 
-    msg.truncate(start_of_suffix);
+    guarded.truncate(start_of_suffix);
     Some((line, column))
 }
 
