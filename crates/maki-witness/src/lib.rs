@@ -117,6 +117,13 @@ fn corrupt(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn unlisted() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "unlisted client certificate",
+    )
+}
+
 fn tls_error(_: impl std::fmt::Display) -> io::Error {
     // TLS errors must never format key material or a peer's application data.
     corrupt("witness TLS configuration or authentication failed")
@@ -690,12 +697,14 @@ impl Server {
         self.respond(tls, role, deadline, handler)
     }
 
-    /// TLS 1.3 with a listed client certificate, mapped to its role.
+    /// TLS 1.3 with a trusted client certificate, mapped to its listed role.
+    /// A trusted certificate the allow-list does not name has no role; its
+    /// request is answered with a denial (see [`Server::respond`]).
     fn authenticate(
         &self,
         socket: TcpStream,
         deadline: Instant,
-    ) -> io::Result<(ServerStream, Role)> {
+    ) -> io::Result<(ServerStream, Option<Role>)> {
         socket.set_nodelay(true)?;
         let mut io = DeadlineIo { socket, deadline };
         let mut connection =
@@ -715,20 +724,20 @@ impl Server {
         let role = self
             .principals
             .get(&certificate_fingerprint(certificate))
-            .copied()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "unlisted client certificate",
-                )
-            })?;
+            .copied();
         Ok((rustls::StreamOwned::new(connection, io), role))
     }
 
+    /// Answer the connection's one request. Without a role (a trusted but
+    /// unlisted certificate) the handler is never called and the answer is
+    /// a denial bound to the request id, which the client reports as
+    /// `PermissionDenied`, a final answer. Closing the connection instead
+    /// looks to the client like an outage: failover would try the next
+    /// frontend and a remote session would keep running.
     fn respond(
         &self,
         mut tls: ServerStream,
-        role: Role,
+        role: Option<Role>,
         deadline: Instant,
         handler: &Handler,
     ) -> io::Result<()> {
@@ -739,7 +748,11 @@ impl Server {
             return Err(corrupt("unsupported witness wire version"));
         }
         remaining(deadline)?;
-        let (response, error) = match handler(role, request.request.get().as_bytes()) {
+        let outcome = match role {
+            Some(role) => handler(role, request.request.get().as_bytes()),
+            None => Err(unlisted()),
+        };
+        let (response, error) = match outcome {
             Ok(response) => (Some(response), None),
             Err(error) => (
                 None,
@@ -761,7 +774,8 @@ impl Server {
             error,
         })
         .map_err(|_| corrupt("witness response serialization failed"))?;
-        write_frame(&mut tls, bytes.expose())
+        write_frame(&mut tls, bytes.expose())?;
+        role.map(|_| ()).ok_or_else(unlisted)
     }
 
     /// Serve connections, retrying accept and thread-creation failures.
@@ -775,7 +789,9 @@ impl Server {
     /// all connection tasks (including evicted tasks and their TLS objects)
     /// to five per worker. Admission waits for reclamation before spawning
     /// another task. Idle unauthenticated sockets therefore cannot starve a
-    /// client that completes TLS promptly (BUG-104).
+    /// client that completes TLS promptly (BUG-104). A trusted certificate
+    /// the allow-list does not name never takes a worker: its one request is
+    /// read and denied while it holds only its handshake slot.
     pub fn serve(self: Arc<Self>, listener: TcpListener, handler: Arc<Handler>) -> io::Result<()> {
         let handshakes = Arc::new(Handshakes::new(self.max_connections));
         self.serve_incoming(listener.incoming(), handler, handshakes, |task| {
@@ -821,8 +837,14 @@ impl Server {
                 // No application payloads or remote error text are logged.
                 let _ = (|| {
                     let (tls, role) = server.authenticate(socket, deadline)?;
-                    let _permit = server.reserve_until(deadline, &ticket)?;
-                    ticket.worker_acquired()?;
+                    let _permit = match role {
+                        Some(_) => {
+                            let permit = server.reserve_until(deadline, &ticket)?;
+                            ticket.worker_acquired()?;
+                            Some(permit)
+                        }
+                        None => None,
+                    };
                     server.respond(tls, role, deadline, handler.as_ref())
                 })();
             }));
