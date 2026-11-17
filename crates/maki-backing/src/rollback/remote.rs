@@ -8,7 +8,7 @@ use crate::remote_witness::{
 use crate::witness::Anchor;
 
 use super::enrollment::Enrollment;
-use super::gc::{namespace_fence, GcReport, OperationGuard, TOMBSTONE};
+use super::gc::{namespace_fence, GcReport, OperationGuard, OPERATION_LOCK, TOMBSTONE};
 
 const REMOTE_MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
 
@@ -211,6 +211,16 @@ impl Backing for Scope {
 }
 
 fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
+    open_root(root, create, false)
+}
+
+/// The snapshot root a restore copies from, through a read-only view: a
+/// restore only reads it, so it may be kept where nothing can change it.
+fn backup_root(root: &Path) -> io::Result<Arc<FileBacking>> {
+    open_root(root, false, true)
+}
+
+fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileBacking>> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -220,7 +230,11 @@ fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
     if !create && !root.is_dir() {
         return Err(missing());
     }
-    let disk = Arc::new(FileBacking::new(root)?);
+    let disk = Arc::new(if read_only {
+        FileBacking::read_only(root)?
+    } else {
+        FileBacking::new(root)?
+    });
     if !create {
         let marker = disk.open(MARKER, false)?;
         let mut bytes = vec![0; REMOTE_MAGIC.len()];
@@ -691,8 +705,13 @@ impl RollbackBacking {
         expected.validate()?;
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let backup = remote_root(source_root, false)?;
-        let _source_guard = OperationGuard::acquire(backup.as_ref())?;
+        // Every operation that changes a root holds its operation lock
+        // exclusively, so sharing it keeps them all off the source while it
+        // is read, as an exclusive lock did, without needing write access to
+        // the snapshot. Everything read from it is authenticated against the
+        // approved descriptor before it is used.
+        let backup = backup_root(source_root)?;
+        let _source_lock = backup.try_lock_shared(OPERATION_LOCK)?;
         let source_disk = scope(backup.clone(), &source.namespace)?;
         let (mut manifest, _) = load_generation(source_disk.as_ref(), source)?;
         let current = expected

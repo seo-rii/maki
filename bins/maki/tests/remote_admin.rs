@@ -405,6 +405,115 @@ fn restore_requires_approved_snapshot_root_and_advances_epoch_without_lowering_g
     assert_eq!(read(&reopened), b"ciphertext-old");
 }
 
+/// Every entry below `root` with its mode and, for a file, its bytes.
+fn tree(root: &std::path::Path) -> Vec<(PathBuf, u32, Option<Vec<u8>>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        let bytes = if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                pending.push(entry.unwrap().path());
+            }
+            None
+        } else {
+            Some(std::fs::read(&path).unwrap())
+        };
+        entries.push((path, metadata.permissions().mode(), bytes));
+    }
+    entries.sort();
+    entries
+}
+
+fn set_modes(root: &std::path::Path, file: u32, directory: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    for (path, mode, _) in tree(root) {
+        let mode = if mode & 0o040000 != 0 {
+            directory
+        } else {
+            file
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// `maki volume restore` only reads its snapshot, so a snapshot kept where
+/// the administrator cannot change it restores. The command opened
+/// `snapshot.json` and the snapshot's files read-write and failed with
+/// "Permission denied" (EROFS on a read-only mount) before asking the
+/// authority anything. Root ignores mode bits, so a root test drops
+/// CAP_DAC_OVERRIDE from the command's bounding set before it runs.
+#[test]
+fn restore_reads_a_snapshot_it_may_not_write() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::new();
+    let backing = fixture.create();
+    write(&backing, b"ciphertext-old");
+    drop(backing);
+    let backup = fixture.dir.path().join("backup");
+    let snapshot = success(&[
+        "volume",
+        "snapshot",
+        fixture.path(false),
+        backup.to_str().unwrap(),
+    ]);
+    let source: Descriptor = serde_json::from_slice(&snapshot.stdout).unwrap();
+    let live = RollbackBacking::open_remote(&fixture.root, fixture.writer.clone()).unwrap();
+    write(&live, b"ciphertext-new");
+    drop(live);
+    let before = inspect(fixture.writer.as_ref());
+    set_modes(&backup, 0o400, 0o500);
+    let unchanged = tree(&backup);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
+    command.args([
+        "volume",
+        "restore",
+        fixture.path(true),
+        backup.to_str().unwrap(),
+        &before.fence.to_string(),
+        &root_hex(&before),
+        &descriptor_hex(&source),
+    ]);
+    // SAFETY: runs in the forked child before exec and only makes raw
+    // system calls.
+    unsafe {
+        command.pre_exec(|| {
+            const CAP_DAC_OVERRIDE: libc::c_ulong = 1;
+            if libc::geteuid() == 0
+                && libc::prctl(libc::PR_CAPBSET_DROP, CAP_DAC_OVERRIDE, 0, 0, 0) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output();
+    let after = tree(&backup);
+    set_modes(&backup, 0o600, 0o700);
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("skipping: cannot drop CAP_DAC_OVERRIDE for the command ({error})");
+            return;
+        }
+    };
+    assert!(
+        output.status.success(),
+        "restore from a snapshot it may not write: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(after, unchanged, "restore changed its snapshot");
+    let record: Record = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(record.phase, Phase::Released);
+    assert_eq!(
+        record.current.as_ref().unwrap().epoch,
+        before.current.as_ref().unwrap().epoch + 1
+    );
+    let reopened = RollbackBacking::open_remote(&fixture.root, fixture.writer.clone()).unwrap();
+    assert_eq!(read(&reopened), b"ciphertext-old");
+}
+
 #[test]
 fn malformed_and_unbounded_snapshot_descriptors_do_not_change_authority() {
     use std::os::unix::fs::symlink;

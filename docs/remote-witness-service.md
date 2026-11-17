@@ -95,6 +95,19 @@ The line includes the actual listening address. Service-manager integration,
 network policy and independently managed persistent storage are operator
 provisioning steps.
 
+A local authority answers a change only after writing and syncing
+`remote.next`, renaming it over `remote.state` and syncing the directory. A
+failure before the rename (EMFILE, ENOSPC or EIO while opening, writing or
+syncing `remote.next`) leaves `remote.state` unchanged: that request is
+answered as unavailable and later requests are served normally. After a
+failed rename or directory sync either state may be the published one, so
+`serve` answers every request as unavailable until it is restarted; it keeps
+running and does not exit by itself. The restart serves and re-publishes the
+state it reads, and clients resolve their pending request against it. A
+`remote.state` that changes, disappears or stops decoding while `serve` holds
+its lock also makes it answer unavailable until a restart, which then serves
+whatever valid state the file holds: find out what changed it first.
+
 ## Initialize a replicated authority
 
 Provision an independently managed, persistent etcd cluster with at least three
@@ -444,6 +457,13 @@ an epoch change. It increases fence, generation and epoch. Malformed,
 truncated, oversized, noncanonical or symlinked descriptors are refused. Wrong
 approval values and writer credentials cannot authorize restore or takeover.
 Snapshot, takeover and restore require Linux.
+
+Restore only reads the snapshot directory: it opens its files read-only and
+shares the snapshot's `remote.operation.lock`, which an operation that changes
+that directory holds exclusively. The snapshot can therefore stay where nothing
+can change it, such as a read-only mount, immutable files, a read-only export,
+or files the administrator may not write. Keep the empty lock file in copies:
+restore creates a missing one, which needs write access.
 
 The configured `backing.root` must belong to the approved storage identity.
 Restore checks its immutable `remote.enrollment` identity and capacity before
