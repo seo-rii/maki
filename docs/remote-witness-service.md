@@ -443,6 +443,13 @@ truncated, oversized, noncanonical or symlinked descriptors are refused. Wrong
 approval values and writer credentials cannot authorize restore or takeover.
 Snapshot, takeover and restore require Linux.
 
+Restore only reads the snapshot directory: it opens its files read-only and
+shares the snapshot's `remote.operation.lock`, which an operation that changes
+that directory holds exclusively. The snapshot can therefore stay where nothing
+can change it, such as a read-only mount, immutable files, a read-only export,
+or files the administrator may not write. Keep the empty lock file in copies:
+restore creates a missing one, which needs write access.
+
 The configured `backing.root` must belong to the approved storage identity.
 Restore checks its immutable `remote.enrollment` identity and capacity before
 claiming the authority, so accidentally selecting another volume's root is

@@ -8,6 +8,8 @@ use crate::remote_witness::{namespace, Action, Record, Request, Rpc};
 use crate::{Backing, FileBacking, VolumeLock};
 
 pub(super) const TOMBSTONE: &str = ".remote-gc-";
+/// Held exclusively by every operation that changes a remote root.
+pub(super) const OPERATION_LOCK: &str = "remote.operation.lock";
 const MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
 const REPORT_DETAIL_LIMIT: usize = 4096;
 
@@ -97,7 +99,7 @@ impl<'a> OperationGuard<'a> {
     pub fn acquire(disk: &'a FileBacking) -> io::Result<Self> {
         Ok(Self {
             disk,
-            _lock: disk.try_lock("remote.operation.lock")?,
+            _lock: disk.try_lock(OPERATION_LOCK)?,
         })
     }
 

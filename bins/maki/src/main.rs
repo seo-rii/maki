@@ -497,7 +497,8 @@ fn read_snapshot(
     if !directory.is_dir() {
         return Err("snapshot directory does not exist".into());
     }
-    let disk = FileBacking::new(directory).map_err(|e| e.to_string())?;
+    // Restore only reads the snapshot, which may be kept on read-only media.
+    let disk = FileBacking::read_only(directory).map_err(|e| e.to_string())?;
     let file = disk
         .open("snapshot.json", false)
         .map_err(|e| e.to_string())?;
