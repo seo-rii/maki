@@ -382,9 +382,9 @@ async fn generic_4xx_upgrade_refusal_fails_over_and_opens_the_refusing_peer() {
             "HTTP {status}"
         );
 
-        // A provider that is not retry-safe is never resent: the request
-        // that met the refusal fails, but it opens the circuit, so every
-        // later request goes to the healthy peer.
+        // A refused upgrade proves the request never left Maki, so a
+        // provider that is not retry-safe fails over too: no request fails
+        // and the refusing peer is asked once, before its circuit opens.
         let bad = Server::refuse_upgrade(status).await;
         let good = Server::start().await;
         let set = dispatcher_with_breaker(
@@ -392,33 +392,25 @@ async fn generic_4xx_upgrade_refusal_fails_over_and_opens_the_refusing_peer() {
             false,
             breaker.clone(),
         );
-        let mut failures = Vec::new();
         for _ in 0..10 {
-            if let Err(error) = set.encrypt_batch(&context(), &input()).await {
-                failures.push(error);
-            }
+            let output = set
+                .encrypt_batch(&context(), &input())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "HTTP {status} upgrade refusal failed a request that is not \
+                         retry-safe although it was never sent: {error:?}"
+                    )
+                });
+            assert_eq!(output[0].data, vec![0x42 ^ 0x5a; UNIT]);
         }
-        assert!(
-            failures.len() <= 1,
-            "HTTP {status}: {} of 10 requests failed with a healthy peer available: {:?}",
-            failures.len(),
-            failures.first()
-        );
-        assert!(
-            failures
-                .iter()
-                .all(|error| error.class() == maki_crypto::ErrorClass::EndpointFatal),
-            "HTTP {status}: {failures:?}"
-        );
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 1, "HTTP {status}");
+        assert_eq!(good.calls.load(Ordering::SeqCst), 10, "HTTP {status}");
         assert_eq!(
-            bad.calls.load(Ordering::SeqCst),
-            failures.len(),
+            set.endpoint_status()[0].circuit,
+            CircuitState::Open,
             "HTTP {status}"
         );
-        assert_eq!(
-            good.calls.load(Ordering::SeqCst),
-            10 - failures.len(),
-            "HTTP {status}"
-        );
+        assert_eq!(set.metrics().retries_refused_unsafe_total(), 0);
     }
 }
