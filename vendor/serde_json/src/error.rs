@@ -539,3 +539,38 @@ fn starts_with_digit(slice: &str) -> bool {
         Some(&byte) => byte >= b'0' && byte <= b'9',
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::make_error;
+    use crate::scratch::{GuardedString, VALIDATIONS};
+    use alloc::format;
+    use alloc::string::ToString;
+
+    // Custom messages embed untrusted input (wrong-type strings, unknown field
+    // names), so their sender controls the digits after the last " at line ".
+    // Each deref of the guarded message validates all of it as UTF-8.
+    #[test]
+    fn position_parse_validates_the_message_a_fixed_number_of_times() {
+        for digits in [4096, 1] {
+            let zeros = "0".repeat(digits);
+            let unparsed = format!("x at line {zeros}");
+            let parsed = format!("x at line {zeros}1 column {zeros}2");
+            for (message, position, display) in [
+                (&unparsed, (0, 0), unparsed.as_str()),
+                (&parsed, (1, 2), "x at line 1 column 2"),
+            ] {
+                let message = GuardedString::from_display(message);
+                let before = VALIDATIONS.with(|count| count.get());
+                let error = make_error(message);
+                let validations = VALIDATIONS.with(|count| count.get()) - before;
+                assert_eq!((error.line(), error.column()), position);
+                assert!(
+                    validations <= 2,
+                    "{validations} message validations for {digits} digits",
+                );
+                assert_eq!(error.to_string(), display);
+            }
+        }
+    }
+}
