@@ -1,5 +1,6 @@
 //! Real-filesystem backing rooted at a volume directory.
 
+use std::ffi::{OsStr, OsString};
 #[cfg(any(not(target_os = "linux"), test))]
 use std::fs;
 use std::fs::File;
@@ -48,10 +49,45 @@ impl FileBacking {
         }
     }
 
+    /// Describe the root directory. On Linux this is the pinned descriptor
+    /// every operation resolves through, so a check concerns the directory
+    /// actually used; other development platforms describe the pathname.
+    /// `FileBacking` applies no owner or mode rule of its own: volume roots
+    /// and the remote witness state directory have different rules, which
+    /// their callers enforce.
+    #[cfg(unix)]
+    pub(crate) fn root_metadata(&self) -> io::Result<std::fs::Metadata> {
+        #[cfg(target_os = "linux")]
+        {
+            self.directory.root_metadata()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::symlink_metadata(&self.root)
+        }
+    }
+
+    /// Describe an existing entry without following a final symlink, or
+    /// `None` when it is absent.
+    #[cfg(unix)]
+    pub(crate) fn entry_metadata(&self, path: &str) -> io::Result<Option<std::fs::Metadata>> {
+        #[cfg(target_os = "linux")]
+        let metadata = self.directory.entry_metadata(path);
+        #[cfg(not(target_os = "linux"))]
+        let metadata = fs::symlink_metadata(self.resolve(path, false)?);
+        match metadata {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// GC uses bounded, sorted pages after an exclusive name cursor and a
     /// pinned-directory retirement operation;
     /// neither operation is available on pathname-only development backends.
-    pub(crate) fn gc_entries(&self, after: Option<&str>) -> io::Result<Vec<String>> {
+    /// Pages hold exact entry names in byte order; anyone who can write the
+    /// root can add a name that is not UTF-8.
+    pub(crate) fn gc_entries(&self, after: Option<&OsStr>) -> io::Result<Vec<OsString>> {
         #[cfg(target_os = "linux")]
         {
             self.directory.gc_entries(after)
@@ -282,6 +318,21 @@ impl BackingFile for RealFile {
 
     fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
+    }
+
+    #[cfg(unix)]
+    fn owner(&self) -> io::Result<Option<crate::FileOwner>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.file.metadata()?;
+        Ok(Some(crate::FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn set_owner(&self, owner: crate::FileOwner) -> io::Result<()> {
+        std::os::unix::fs::fchown(&self.file, Some(owner.uid), Some(owner.gid))
     }
 }
 

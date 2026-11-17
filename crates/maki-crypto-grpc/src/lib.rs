@@ -11,6 +11,7 @@
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -26,11 +27,14 @@ use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, ErrorClass,
     PlaintextUnit, SecretBuffer,
 };
+// Validation and the provider share one method-path rule, so a validated
+// path is exactly the one sent.
+use maki_format::config::check_grpc_method_path;
 
 mod connection;
 mod protected;
 use connection::ConnectionCache;
-use protected::{WireItem, WireRequest, WireResponse};
+use protected::{ResponseDecodeError, WireItem, WireRequest, WireResponse};
 
 #[cfg(test)]
 mod protected_tests;
@@ -406,12 +410,16 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
     }
 }
 
-#[derive(Default)]
-struct ResponseCodec(tonic::codec::ProstCodec<WireRequest, WireResponse>);
+struct ResponseCodec {
+    inner: tonic::codec::ProstCodec<WireRequest, WireResponse>,
+    /// Items in the request; a response with more is refused while decoding.
+    requested: usize,
+}
 
-struct ResponseDecoder(
-    <tonic::codec::ProstCodec<WireRequest, WireResponse> as tonic::codec::Codec>::Decoder,
-);
+struct ResponseDecoder {
+    inner: <tonic::codec::ProstCodec<WireRequest, WireResponse> as tonic::codec::Codec>::Decoder,
+    requested: usize,
+}
 
 impl tonic::codec::Codec for ResponseCodec {
     type Encode = WireRequest;
@@ -421,11 +429,14 @@ impl tonic::codec::Codec for ResponseCodec {
     type Decoder = ResponseDecoder;
 
     fn encoder(&mut self) -> Self::Encoder {
-        self.0.encoder()
+        self.inner.encoder()
     }
 
     fn decoder(&mut self) -> Self::Decoder {
-        ResponseDecoder(self.0.decoder())
+        ResponseDecoder {
+            inner: self.inner.decoder(),
+            requested: self.requested,
+        }
     }
 }
 
@@ -437,13 +448,20 @@ impl tonic::codec::Decoder for ResponseDecoder {
         &mut self,
         source: &mut tonic::codec::DecodeBuf<'_>,
     ) -> Result<Option<Self::Item>, Self::Error> {
-        self.0
-            .decode(source)
-            .map_err(|_| receive_contract_status("grpc response protobuf decoding failed"))
+        WireResponse::decode_bounded(source, self.requested)
+            .map(Some)
+            .map_err(|error| {
+                receive_contract_status(match error {
+                    ResponseDecodeError::ExtraItem => {
+                        "grpc response has more items than the request"
+                    }
+                    ResponseDecodeError::Malformed => "grpc response protobuf decoding failed",
+                })
+            })
     }
 
     fn buffer_settings(&self) -> tonic::codec::BufferSettings {
-        self.0.buffer_settings()
+        self.inner.buffer_settings()
     }
 }
 
@@ -704,6 +722,16 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
+/// A method path, checked with the rule configuration validation applies
+/// (maki-format `check_grpc_method_path`): a path that validates is built
+/// here and sent exactly as written, and one this refuses never validates.
+/// Errors never quote the path, which may carry a token.
+fn method_path(operation: &str, path: &str) -> Result<PathAndQuery, CryptoError> {
+    check_grpc_method_path(path)
+        .map_err(|reason| fatal(format!("bad {operation} path: the path {reason}")))?;
+    PathAndQuery::try_from(path.to_owned()).map_err(|e| fatal(format!("bad {operation} path: {e}")))
+}
+
 /// A URI host without the brackets that enclose an IPv6 literal.
 fn unbracketed(host: &str) -> &str {
     host.strip_prefix('[')
@@ -841,10 +869,8 @@ impl GrpcCryptoProvider {
             tcp,
             spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS),
         );
-        let encrypt_path = PathAndQuery::try_from(spec.encrypt_path.clone())
-            .map_err(|e| fatal(format!("bad encrypt path: {e}")))?;
-        let decrypt_path = PathAndQuery::try_from(spec.decrypt_path.clone())
-            .map_err(|e| fatal(format!("bad decrypt path: {e}")))?;
+        let encrypt_path = method_path("encrypt", &spec.encrypt_path)?;
+        let decrypt_path = method_path("decrypt", &spec.decrypt_path)?;
         // Validate metadata eagerly: a bad credential/config fails closed.
         for (key, value) in &spec.metadata {
             MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes())
@@ -895,7 +921,10 @@ impl GrpcCryptoProvider {
             request.metadata_mut().insert(key, value);
         }
 
-        let codec = ResponseCodec::default();
+        let codec = ResponseCodec {
+            inner: Default::default(),
+            requested: expected.len(),
+        };
 
         // `Channel::timeout` bounds the connection, not the whole exchange:
         // a server that stalls after the response headers, or between the
@@ -904,6 +933,13 @@ impl GrpcCryptoProvider {
         // failover (BUG-017). Bound readiness plus the unary call together
         // by the configured operation timeout. The `bounded-error` policy's
         // outer deadline (BUG-013) is separate and still applies.
+        //
+        // Until `handed_over` is set, the request is still owned here: the
+        // connection is established without an RPC body, and readiness only
+        // reserves capacity. A failure (or the timeout) before that point
+        // proves that no byte of the request was sent; it is marked so the
+        // dispatcher may send the request to a peer (SPEC §18).
+        let handed_over = AtomicBool::new(false);
         let exchange = async {
             let channel = connection.channel().await?;
             let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
@@ -915,11 +951,20 @@ impl GrpcCryptoProvider {
             grpc.ready()
                 .await
                 .map_err(|e| CryptoError::Retryable(format!("grpc endpoint not ready: {e}")))?;
+            handed_over.store(true, Ordering::SeqCst);
             grpc.unary(request, path, codec)
                 .await
                 .map_err(|status| map_status(&status))
         };
-        let response = match tokio::time::timeout(self.spec.timeout, exchange).await {
+        let result = tokio::time::timeout(self.spec.timeout, exchange).await;
+        let unsent = |error: CryptoError| {
+            if handed_over.load(Ordering::SeqCst) {
+                error
+            } else {
+                error.not_sent()
+            }
+        };
+        let response = match result {
             Ok(Ok(response)) => {
                 connection.succeeded();
                 response.into_inner()
@@ -928,16 +973,17 @@ impl GrpcCryptoProvider {
                 if error.class() != ErrorClass::Retryable {
                     connection.preserve();
                 }
-                return Err(error);
+                return Err(unsent(error));
             }
             Err(_) => {
-                return Err(CryptoError::Retryable(format!(
+                return Err(unsent(CryptoError::Retryable(format!(
                     "grpc operation exceeded the {:?} transport timeout",
                     self.spec.timeout
-                )));
+                ))));
             }
         };
 
+        // The decoder already refused any item beyond the request's count.
         if response.items.len() != expected.len() {
             return Err(CryptoError::Contract(format!(
                 "grpc response has {} item(s), expected {}",

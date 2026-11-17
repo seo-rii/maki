@@ -166,7 +166,14 @@ Above the selected checkpoint, the journal must bridge through the required
 sequence and match its exact segment/record-end boundary. A missing final segment or a file
 truncated exactly at an earlier complete record therefore fails explicitly.
 If the checkpoint already covers the horizon, its old segment may legitimately
-have been pruned; checkpointing does not lower the horizon.
+have been pruned; checkpointing does not lower the horizon. The reverse cannot
+happen: a checkpoint only consumes records both copies attest, so a checkpoint
+state above the proof's horizon is refused as damage by recovery and by the
+deep check, before any repair. Accepting it would treat the acknowledged
+records between the two as already applied. A covered proof is not matched
+against the journal, but when newer records survive, the record end recovery
+publishes for them must lie after the proof's stored location; a proof naming
+a later segment or record end is refused the same way.
 
 Unproven final-tail bytes may be discarded after a crash. Intact later records
 do not prove that earlier damaged bytes were durable: unsynced sectors may
@@ -186,10 +193,17 @@ refusal, not guaranteed availability after arbitrary damage.
 
 Recovery rejects a checkpoint, accepted record range, segment index or
 advisory index whose successor cannot be represented, before rewriting
-checkpoint/proof metadata or applying journal repairs. The last usable
-sequence/index (`u64::MAX - 1`) remains readable; exhaustion does not permit
-wraparound or index reuse. A writer refuses an exhausted append or segment
-roll before changing storage, including before sealing the previous segment.
+checkpoint/proof metadata or applying journal repairs. On a v2/v3 volume it
+also rejects a recovered durable sequence that leaves no sequence for one more
+record, and a highest segment index (of a surviving segment, the durable proof
+or the advisory mark) that leaves no index for one more segment: the resumed
+writer opens a segment for its first append, so every write to such a volume
+would fail. The deep check reports the same refusals. Exhaustion does not
+permit wraparound or index reuse. A writer refuses an exhausted append or
+segment roll before changing storage, including before sealing the previous
+segment; what it wrote stays readable while it remains attached, and the next
+recovery refuses the exhausted volume. Read-only inspection of a legacy v1
+volume keeps the last representable sequence/index (`u64::MAX - 1`) readable.
 This is an error-handling bound, not a change to the on-disk encoding.
 
 Proof publication adds preserved/replacement metadata-file syncs and directory

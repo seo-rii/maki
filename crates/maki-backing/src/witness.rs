@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use crate::{Backing, FileBacking, VolumeLock};
+use crate::{Backing, FileBacking, FileOwner, VolumeLock};
 
 const MAGIC: &[u8; 8] = b"MAKIWIT1";
 const VERSION: u16 = 1;
@@ -103,6 +103,7 @@ impl FileWitness {
         // A prior process may have observed rename success and directory-sync
         // failure. Re-publish the exact validated record before returning so
         // callers never reclaim data based only on page-cache-visible state.
+        // The new file keeps the replaced record's owner (`replaced_owner`).
         publish_anchor(backing.as_ref(), &anchor)?;
         Ok(Self {
             backing,
@@ -185,18 +186,70 @@ impl FileWitness {
     }
 }
 
-fn write_temporary(backing: &dyn Backing, bytes: &[u8; ENCODED_LEN]) -> io::Result<()> {
+fn write_temporary(
+    backing: &dyn Backing,
+    bytes: &[u8; ENCODED_LEN],
+    owner: Option<FileOwner>,
+) -> io::Result<()> {
     let file = backing.open(TEMP_FILE, true)?;
+    // Hand the new record over before it holds a byte; `publish_anchor`
+    // renames it over the anchor only after this change is synced with it.
+    let given = match owner {
+        Some(owner) if file.owner()? != Some(owner) => {
+            file.set_owner(owner).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot keep the witness anchor's owner (uid {}, gid {}): {error}",
+                        owner.uid, owner.gid
+                    ),
+                )
+            })?;
+            true
+        }
+        _ => false,
+    };
     file.set_len(0)?;
     file.write_at(0, bytes)?;
     file.set_len(ENCODED_LEN as u64)?;
-    file.sync_data()
+    // fdatasync need not persist an owner change; fsync does.
+    if given {
+        file.sync_all()
+    } else {
+        file.sync_data()
+    }
 }
 
 fn publish_anchor(backing: &dyn Backing, anchor: &Anchor) -> io::Result<()> {
-    write_temporary(backing, &encode(anchor))?;
+    write_temporary(backing, &encode(anchor), replaced_owner(backing)?)?;
     backing.rename(TEMP_FILE, ANCHOR_FILE)?;
     backing.sync_dir("")
+}
+
+/// The owner a publication must keep. The new record is a file this process
+/// creates, so a root process (an offline `maki check --deep` or `maki
+/// volume inspect`) would otherwise replace the daemon user's anchor with a
+/// root-owned one the daemon can no longer open. Only root can give a file
+/// to another user, and only root needs to: any other process creates the
+/// record as itself. The mode is not copied; every publication creates the
+/// record owner-only (`0600`).
+fn replaced_owner(backing: &dyn Backing) -> io::Result<Option<FileOwner>> {
+    if !running_as_root() {
+        return Ok(None);
+    }
+    backing.open(ANCHOR_FILE, false)?.owner()
+}
+
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn read_anchor(backing: &dyn Backing) -> io::Result<Anchor> {
@@ -287,7 +340,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{Anchor, FileWitness, ENCODED_LEN};
-    use crate::{Backing, BackingFile, FileBacking, VolumeLock};
+    use crate::{Backing, BackingFile, FileBacking, FileOwner, VolumeLock};
 
     const IDENTITY: [u8; 16] = *b"volume-identity!";
     const ROOT_A: [u8; 32] = [0x11; 32];
@@ -592,6 +645,51 @@ mod tests {
     }
 
     #[test]
+    fn only_root_gives_a_new_record_the_replaced_owner_and_syncs_it_first() {
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let dir = tempdir().unwrap();
+        drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+        let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+        // The anchor reports an owner this process's new files do not have.
+        fault.report_anchor_owner(daemon);
+        let backing: Arc<dyn Backing> = fault.clone();
+        let mut witness = FileWitness::open_backing(backing).unwrap();
+        witness.advance(ROOT_B).unwrap();
+        drop(witness);
+
+        if super::running_as_root() {
+            let publish = [
+                "temp_owner",
+                "temp_write",
+                "temp_sync_all",
+                "rename",
+                "directory_sync",
+            ];
+            assert_eq!(fault.trace(), [publish, publish].concat());
+            assert_eq!(fault.given(), [daemon, daemon]);
+
+            // A refused owner change refuses the open: publishing a record
+            // the owner cannot open would lock it out of its witness.
+            let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+            fault.report_anchor_owner(daemon);
+            fault.arm(FailAt::TempOwner);
+            let backing: Arc<dyn Backing> = fault.clone();
+            let error = FileWitness::open_backing(backing).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("uid 4242, gid 4343"), "{error}");
+            assert_eq!(fault.trace(), ["temp_owner"]);
+        } else {
+            // Nobody else can give a file away; they publish as themselves.
+            let publish = ["temp_write", "temp_sync", "rename", "directory_sync"];
+            assert_eq!(fault.trace(), [publish, publish].concat());
+            assert!(fault.given().is_empty());
+        }
+    }
+
+    #[test]
     fn encoding_has_a_fixed_vector() {
         let anchor = Anchor {
             identity: [0x01; 16],
@@ -652,6 +750,7 @@ mod tests {
         AnchorLen,
         AnchorRead,
         AnchorShortRead,
+        TempOwner,
         TempWrite,
         TempSync,
         Rename,
@@ -662,6 +761,8 @@ mod tests {
         inner: FileBacking,
         pending: Arc<Mutex<Option<FailAt>>>,
         trace: Arc<Mutex<Vec<&'static str>>>,
+        anchor_owner: Mutex<Option<FileOwner>>,
+        given: Arc<Mutex<Vec<FileOwner>>>,
     }
 
     impl FaultBacking {
@@ -670,6 +771,8 @@ mod tests {
                 inner: FileBacking::new(path)?,
                 pending: Arc::new(Mutex::new(None)),
                 trace: Arc::new(Mutex::new(Vec::new())),
+                anchor_owner: Mutex::new(None),
+                given: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
@@ -679,6 +782,17 @@ mod tests {
 
         fn trace(&self) -> Vec<&'static str> {
             self.trace.lock().unwrap().clone()
+        }
+
+        /// Make the anchor report `owner` instead of its real owner.
+        fn report_anchor_owner(&self, owner: FileOwner) {
+            *self.anchor_owner.lock().unwrap() = Some(owner);
+        }
+
+        /// Owners given to temporary files. They are recorded, not applied,
+        /// so the tests need no privilege.
+        fn given(&self) -> Vec<FileOwner> {
+            self.given.lock().unwrap().clone()
         }
 
         fn fail(&self, at: FailAt) -> io::Result<()> {
@@ -698,6 +812,8 @@ mod tests {
         trace: Arc<Mutex<Vec<&'static str>>>,
         temporary: bool,
         anchor: bool,
+        reported_owner: Option<FileOwner>,
+        given: Arc<Mutex<Vec<FileOwner>>>,
     }
 
     impl BackingFile for FaultFile {
@@ -765,6 +881,37 @@ mod tests {
             }
             self.inner.sync_data()
         }
+
+        fn sync_all(&self) -> io::Result<()> {
+            if self.temporary {
+                self.trace.lock().unwrap().push("temp_sync_all");
+                let mut pending = self.pending.lock().unwrap();
+                if *pending == Some(FailAt::TempSync) {
+                    *pending = None;
+                    return Err(io::Error::other("injected temporary sync failure"));
+                }
+            }
+            self.inner.sync_all()
+        }
+
+        fn owner(&self) -> io::Result<Option<FileOwner>> {
+            match self.reported_owner {
+                Some(owner) => Ok(Some(owner)),
+                None => self.inner.owner(),
+            }
+        }
+
+        fn set_owner(&self, owner: FileOwner) -> io::Result<()> {
+            assert!(self.temporary, "only a new record is given away");
+            self.trace.lock().unwrap().push("temp_owner");
+            let mut pending = self.pending.lock().unwrap();
+            if *pending == Some(FailAt::TempOwner) {
+                *pending = None;
+                return Err(io::Error::from_raw_os_error(1));
+            }
+            self.given.lock().unwrap().push(owner);
+            Ok(())
+        }
     }
 
     impl Backing for FaultBacking {
@@ -778,6 +925,12 @@ mod tests {
                 trace: Arc::clone(&self.trace),
                 temporary: path == super::TEMP_FILE,
                 anchor: path == super::ANCHOR_FILE,
+                reported_owner: if path == super::ANCHOR_FILE {
+                    *self.anchor_owner.lock().unwrap()
+                } else {
+                    None
+                },
+                given: Arc::clone(&self.given),
             }))
         }
 

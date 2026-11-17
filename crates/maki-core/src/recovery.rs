@@ -15,12 +15,18 @@
 //!   fdatasync'd before their successor was created), and only *after* the
 //!   prefix proved by the required v2 evidence (and advisory durable mark);
 //! - a final segment shorter than a header, or entirely zero-filled, is a
-//!   creation crash and is discarded; a *complete* but invalid header is
+//!   creation crash and is discarded, and so is a final segment exactly one
+//!   header long whose header fails its checksum at an index above every
+//!   segment the durable proof and mark name (the torn header writers that
+//!   preallocated it left; damage there cannot be told from that tear, and
+//!   such a file holds nothing acknowledged); any other invalid header is
 //!   durable damage;
 //! - the surviving journal must bridge from `checkpoint_sequence + 1` and
 //!   be contiguous — a missing segment is never silently skipped;
 //! - a segment larger than the writer can ever produce is rejected before
 //!   it is read into memory;
+//! - the selected checkpoint never lies above the required proof's horizon
+//!   (checkpoints only consume records the proof attests);
 //! - metadata read errors other than "not found" are I/O errors, never
 //!   "invalid copy" (an initialized volume must have checkpoint state).
 //!
@@ -33,8 +39,10 @@
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
-use maki_format::ab::AbStore;
+use maki_format::ab::{AbRecord, AbStore};
+use maki_format::canary::KeyCanary;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::codec::strip_verify_crc;
 use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
     max_segment_file_size, DurableMark, JournalRecord, ScanOutcome, SegmentHeader,
@@ -42,8 +50,8 @@ use maki_format::journal::{
 };
 use maki_format::layout;
 use maki_format::superblock::{
-    load_volume_superblock, persist_volume_superblock, Superblock, SUPERBLOCK_VERSION_V2,
-    SUPERBLOCK_VERSION_V3,
+    load_volume_superblock, persist_volume_superblock, Superblock, VolumeSuperblock,
+    SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
 };
 use maki_format::FormatError;
 
@@ -113,6 +121,10 @@ pub struct JournalScan {
     /// Units with at least one such record, when the scan was asked to
     /// collect units instead of payloads (`summarize_journal`).
     pub replay_units: std::collections::BTreeSet<u64>,
+    /// The subset of `replay_units` whose newest such record carries
+    /// ciphertext (not a v3 discard tombstone): after replay their slots
+    /// hold data.
+    pub replay_written: std::collections::BTreeSet<u64>,
     pub repairs: Vec<JournalRepair>,
     /// Whether a durable mark was found for the final segment.
     pub mark: Option<DurableMark>,
@@ -136,8 +148,12 @@ enum ReplayRecords {
     Discard,
     /// Only the units that have an uncovered replay record: what the deep
     /// checker needs to tell recoverable slot damage from unrecoverable
-    /// damage (R4-004). One `u64` per distinct unit, no payloads.
-    Units(std::collections::BTreeSet<u64>),
+    /// damage (R4-004), and which of them hold ciphertext after replay (the
+    /// key-canary verdict). At most two `u64` per distinct unit, no payloads.
+    Units {
+        units: std::collections::BTreeSet<u64>,
+        written: std::collections::BTreeSet<u64>,
+    },
 }
 
 impl ReplayRecords {
@@ -145,20 +161,33 @@ impl ReplayRecords {
         match self {
             Self::All(records) => records.push(record),
             Self::Discard => {}
-            Self::Units(units) => {
+            Self::Units { units, written } => {
                 units.insert(record.unit_index);
+                // Records arrive in sequence order: the newest one decides.
+                if record.payload.is_empty() {
+                    written.remove(&record.unit_index);
+                } else {
+                    written.insert(record.unit_index);
+                }
             }
         }
         Ok(())
     }
 
-    /// (retained records, units with an uncovered record). Only the mode
-    /// that was asked for is populated; the other side is empty.
-    fn into_parts(self) -> (Vec<JournalRecord>, std::collections::BTreeSet<u64>) {
+    /// (retained records, units with an uncovered record, those of them
+    /// whose newest record carries ciphertext). Only the mode that was
+    /// asked for is populated; the other parts are empty.
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<JournalRecord>,
+        std::collections::BTreeSet<u64>,
+        std::collections::BTreeSet<u64>,
+    ) {
         match self {
-            Self::All(records) => (records, Default::default()),
+            Self::All(records) => (records, Default::default(), Default::default()),
             Self::Discard => Default::default(),
-            Self::Units(units) => (Vec::new(), units),
+            Self::Units { units, written } => (Vec::new(), units, written),
         }
     }
 }
@@ -226,6 +255,7 @@ fn recover_with_replay(
 
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
+    check_checkpoint_horizon(checkpoint_state.checkpoint_sequence, &durable_proof)?;
     progress();
 
     // 5./6. scan journal, then apply the repairs the scan decided on
@@ -238,6 +268,9 @@ fn recover_with_replay(
         replay,
         progress,
     )?;
+    // This recovery, the attach after it and later checkpoints store A/B
+    // metadata; refuse a generation that leaves no room before any write.
+    check_metadata_generations(backing, &store)?;
     // The superblock is the volume's commit point; every repair below, and
     // the resumed writer, depends on it. A failed or interrupted creation, or
     // a restart, can hand recovery a copy that exists only in the page cache
@@ -325,9 +358,7 @@ fn recover_with_replay(
     // checkpoint already covers the old proof's segment, retain its location;
     // it is valid for that segment to have been pruned.
     if scan.durable_sequence > durable_proof.durable_sequence {
-        if let Some(last) = scan.segments.iter().rev().find(|segment| {
-            segment.record_count > 0 && segment.last_sequence() == scan.durable_sequence
-        }) {
+        if let Some(last) = horizon_end(&scan.segments, scan.durable_sequence) {
             durable_proof.durable_sequence = scan.durable_sequence;
             durable_proof.segment_index = last.index;
             durable_proof.durable_size = last.size;
@@ -581,6 +612,8 @@ pub(crate) struct JournalSummary {
     /// Units recovery would rewrite (or discard) from a validated record:
     /// damage to their slots is recoverable (R4-004).
     pub replay_units: std::collections::BTreeSet<u64>,
+    /// Those of them whose newest record carries ciphertext.
+    pub replay_written: std::collections::BTreeSet<u64>,
 }
 
 pub(crate) fn summarize_journal(
@@ -589,12 +622,23 @@ pub(crate) fn summarize_journal(
     checkpoint_sequence: u64,
     segment_size: u64,
 ) -> Result<JournalSummary, RecoveryError> {
-    let scan = scan_journal_with_replay(
+    // The deep check scans against the volume's stored checkpoint state, so
+    // it applies the rule recovery applies to that state.
+    let proof = load_required_proof(backing, superblock)?;
+    if let Some(proof) = &proof {
+        check_checkpoint_horizon(checkpoint_sequence, proof)?;
+    }
+    let scan = scan_journal_with_proof(
         backing,
         superblock,
         checkpoint_sequence,
         segment_size,
-        ReplayRecords::Units(Default::default()),
+        proof.as_ref(),
+        ReplayRecords::Units {
+            units: Default::default(),
+            written: Default::default(),
+        },
+        &|| {},
     )?;
     let uncovered_records = scan
         .segments
@@ -611,6 +655,7 @@ pub(crate) fn summarize_journal(
         durable_sequence: scan.durable_sequence,
         repairs: scan.repairs,
         replay_units: scan.replay_units,
+        replay_written: scan.replay_written,
     })
 }
 
@@ -621,23 +666,7 @@ fn scan_journal_with_replay(
     segment_size: u64,
     replay: ReplayRecords,
 ) -> Result<JournalScan, RecoveryError> {
-    let envelope = load_volume_superblock(backing.as_ref())?;
-    if envelope.superblock.volume_uuid != superblock.volume_uuid {
-        return Err(RecoveryError::Corrupt(
-            "journal scan superblock identity mismatch".into(),
-        ));
-    }
-    let proof = if matches!(
-        envelope.metadata_version,
-        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
-    ) {
-        Some(DurableProofStore::load(
-            backing.as_ref(),
-            superblock.volume_uuid,
-        )?)
-    } else {
-        None // read-only legacy inspection retains its historical classification
-    };
+    let proof = load_required_proof(backing, superblock)?;
     scan_journal_with_proof(
         backing,
         superblock,
@@ -647,6 +676,50 @@ fn scan_journal_with_replay(
         replay,
         &|| {},
     )
+}
+
+/// The required durable proof of a v2/v3 volume; `None` for a legacy v1
+/// volume, whose read-only inspection retains its historical classification.
+fn load_required_proof(
+    backing: &Arc<dyn Backing>,
+    superblock: &Superblock,
+) -> Result<Option<DurableProof>, RecoveryError> {
+    let envelope = load_volume_superblock(backing.as_ref())?;
+    if envelope.superblock.volume_uuid != superblock.volume_uuid {
+        return Err(RecoveryError::Corrupt(
+            "journal scan superblock identity mismatch".into(),
+        ));
+    }
+    if !matches!(
+        envelope.metadata_version,
+        SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(DurableProofStore::load(
+        backing.as_ref(),
+        superblock.volume_uuid,
+    )?))
+}
+
+/// A record becomes checkpoint-eligible only once both proof copies attest
+/// it, and recovery publishes the proof before it advances the checkpoint,
+/// so no crash or restart leaves the stored checkpoint above the proof.
+/// Accepting one would treat the acknowledged records between the two as
+/// applied, and let a later checkpoint prune them, although no slot holds
+/// them. Recovery and the deep check refuse it before any recovery write.
+fn check_checkpoint_horizon(
+    checkpoint_sequence: u64,
+    proof: &DurableProof,
+) -> Result<(), RecoveryError> {
+    if checkpoint_sequence > proof.durable_sequence {
+        return Err(RecoveryError::Corrupt(format!(
+            "checkpoint sequence {checkpoint_sequence} is above the required durable proof's \
+             horizon {}; checkpoints only consume records the proof attests",
+            proof.durable_sequence
+        )));
+    }
+    Ok(())
 }
 
 fn scan_journal_with_proof(
@@ -739,15 +812,28 @@ fn scan_journal_with_proof(
         let header = match SegmentHeader::decode(&header_bytes) {
             Ok(h) => h,
             Err(e) => {
-                // A never-written (zero-filled) final segment is a creation
-                // crash; anything else with a full-sized header is damage.
-                if is_last
-                    && marked_durable.is_none()
-                    && range_is_zero(file.as_ref(), 0..len, progress)?
-                {
-                    repairs.push(JournalRepair::Discard { path });
-                    continue;
+                if is_last && marked_durable.is_none() {
+                    // A never-written (zero-filled) final segment is a
+                    // creation crash.
+                    let unwritten = range_is_zero(file.as_ref(), 0..len, progress)?;
+                    // So is a final segment exactly one header long whose
+                    // header is torn (fails its checksum) above everything
+                    // the durable evidence names: writers that extended a
+                    // new segment to a full header before writing it left
+                    // this when the write tore and the failed creation's
+                    // cleanup never finished. It holds no record byte, and
+                    // no acknowledged record can live at its index.
+                    let torn_creation = len == SEGMENT_HEADER_SIZE as u64
+                        && strip_verify_crc(&header_bytes, "journal segment header").is_err()
+                        && above_durable_evidence(index, proof, mark);
+                    if unwritten || torn_creation {
+                        repairs.push(JournalRepair::Discard { path });
+                        continue;
+                    }
                 }
+                // Anything else with a full-sized header is damage,
+                // including an intact (checksum-valid) one that does not
+                // decode.
                 return Err(RecoveryError::Corrupt(format!(
                     "journal segment {name}: invalid header ({e})"
                 )));
@@ -931,18 +1017,87 @@ fn scan_journal_with_proof(
         })?,
         None => 0,
     };
+    // A resumed writer opens a new segment for its first append and refuses
+    // `u64::MAX` as a record sequence or a segment index
+    // (`JournalWriter::check_append`). A horizon or index that leaves no
+    // value for one more record and one more segment would make every write
+    // fail forever, on a volume the deep check called clean. Each value is
+    // consumed one record or one segment at a time, so in practice only
+    // damage gets there: refuse it rather than attach a volume nothing can
+    // write. The advisory mark counts like a segment (S-03: numbering never
+    // falls back below it). Read-only legacy inspection keeps its historical
+    // classification.
+    if proof.is_some() {
+        if durable_sequence.checked_add(2).is_none() {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal sequence space exhausted: durable sequence {durable_sequence} leaves no \
+                 sequence for another record"
+            )));
+        }
+        if next_segment_index == u64::MAX {
+            return Err(RecoveryError::Corrupt(format!(
+                "journal segment index space exhausted: segment index {} (of a surviving \
+                 segment, the durable proof or the durable mark) leaves no index for another \
+                 segment",
+                u64::MAX - 1
+            )));
+        }
+    }
 
-    let (replay, replay_units) = replay.into_parts();
+    // Recovery publishes the accepted horizon as the new proof, whose record
+    // end must follow the stored one (`DurableProof::follows`). A proof the
+    // checkpoint covers is not matched against the journal above it, so
+    // refuse here, read-only, a stored location at or beyond the end of the
+    // newer records: segment indexes only grow and a proof names its own
+    // record end, so no writer leaves one, and the deep check must refuse
+    // what recovery refuses.
+    if let Some(proof) = proof.filter(|proof| durable_sequence > proof.durable_sequence) {
+        if let Some(end) = horizon_end(&segments, durable_sequence) {
+            if (end.index, end.size) <= (proof.segment_index, proof.durable_size) {
+                return Err(RecoveryError::Corrupt(format!(
+                    "durable proof for sequence {} names segment {} byte {}, at or beyond \
+                     the end of the newer journal records (segment {} byte {})",
+                    proof.durable_sequence,
+                    proof.segment_index,
+                    proof.durable_size,
+                    end.index,
+                    end.size
+                )));
+            }
+        }
+    }
+
+    let (replay, replay_units, replay_written) = replay.into_parts();
     Ok(JournalScan {
         durable_sequence,
         next_segment_index,
         segments,
         replay,
         replay_units,
+        replay_written,
         repairs,
         mark: final_mark,
         verified_prefixes,
     })
+}
+
+/// Whether segment `index` lies above every segment the durable evidence
+/// names. The required proof is published to both copies before every
+/// acknowledgement and names the segment holding its horizon, so every
+/// acknowledged record lies in that segment or an earlier one; an empty proof
+/// (sequence 0) has acknowledged nothing. The advisory mark names a segment
+/// only once its creation completed. Without a proof (read-only legacy
+/// inspection) nothing vouches for any index.
+fn above_durable_evidence(
+    index: u64,
+    proof: Option<&DurableProof>,
+    mark: Option<DurableMark>,
+) -> bool {
+    let Some(proof) = proof else {
+        return false;
+    };
+    (proof.durable_sequence == 0 || index > proof.segment_index)
+        && mark.is_none_or(|mark| index > mark.segment_index)
 }
 
 /// The durable mark, if present and intact. Absent, empty, short, or
@@ -964,4 +1119,82 @@ pub fn load_durable_mark(backing: &Arc<dyn Backing>) -> Result<Option<DurableMar
         Err(e) => return Err(RecoveryError::Io(e)),
     }
     Ok(DurableMark::decode(&buf).ok())
+}
+
+/// The surviving segment whose records end at `sequence`: the record end
+/// recovery publishes in the durable proof when it adopts that horizon.
+fn horizon_end(segments: &[SegmentInfo], sequence: u64) -> Option<&SegmentInfo> {
+    segments
+        .iter()
+        .rev()
+        .find(|segment| segment.record_count > 0 && segment.last_sequence() == sequence)
+}
+
+/// The highest A/B metadata generation recovery accepts: the top quarter of
+/// the generation space is refused. Every store advances a record's
+/// generation by one from zero, so no writer comes near it, and a larger
+/// CRC-valid generation is damage. The bound sits `2^62` stores below the
+/// store's own exhaustion check, so no attach, replay or later checkpoint
+/// can reach that check, however many stores the journal makes it perform:
+/// the read-only deep check can then refuse exactly what recovery refuses,
+/// without predicting how often each record is stored. It also sits `2^62`
+/// above `i64::MAX`, so a damaged generation at that common boundary value
+/// keeps working instead of crossing the bound after a few stores.
+const MAX_METADATA_GENERATION: u64 = u64::MAX - (1 << 62);
+
+/// Refuse, read-only, A/B metadata whose raw generation (as a store ranks
+/// it) is above [`MAX_METADATA_GENERATION`]: the superblock, checkpoint
+/// state, durable proof, key canary, shard catalog and each loaded shard's
+/// allocation and discard maps. Recovery runs this before its first write;
+/// the deep check reports the same refusal.
+pub(crate) fn check_metadata_generations(
+    backing: &Arc<dyn Backing>,
+    store: &SlotStore,
+) -> Result<(), RecoveryError> {
+    fn highest<T: AbRecord>(
+        backing: &Arc<dyn Backing>,
+        a: &str,
+        b: &str,
+    ) -> Result<Option<u64>, RecoveryError> {
+        let (a, b) = AbStore::new(a, b).raw_generations::<T>(backing.as_ref())?;
+        Ok(a.max(b))
+    }
+    let mut pairs = Vec::new();
+    for (what, generation) in [
+        (
+            "superblock",
+            highest::<VolumeSuperblock>(backing, layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)?,
+        ),
+        (
+            "checkpoint state",
+            highest::<CheckpointState>(backing, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B)?,
+        ),
+        (
+            "durable proof",
+            highest::<DurableProof>(
+                backing,
+                maki_format::durable_proof::DURABLE_PROOF_A,
+                maki_format::durable_proof::DURABLE_PROOF_B,
+            )?,
+        ),
+        (
+            "key canary",
+            highest::<KeyCanary>(backing, layout::KEY_CANARY_A, layout::KEY_CANARY_B)?,
+        ),
+    ] {
+        if let Some(generation) = generation {
+            pairs.push((what.to_string(), generation));
+        }
+    }
+    pairs.extend(store.metadata_generations()?);
+    if let Some((what, generation)) = pairs
+        .into_iter()
+        .find(|(_, generation)| *generation > MAX_METADATA_GENERATION)
+    {
+        return Err(RecoveryError::Corrupt(format!(
+            "{what}: A/B generation {generation} is above {MAX_METADATA_GENERATION}; every store \
+             advances it by one, so no writer produces it, and later stores could exhaust it"
+        )));
+    }
+    Ok(())
 }

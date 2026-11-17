@@ -3,10 +3,11 @@
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
-from scripts.check_vendor_erasure import check
+from scripts.check_vendor_erasure import check, resolve
 
 
 class VendorErasureContract(unittest.TestCase):
@@ -165,6 +166,98 @@ class VendorErasureContract(unittest.TestCase):
             "files": {"test-ca/certificate.der": {"sha256": "0" * 64}}
         }))
         self.assertTrue(check(self.root, self.metadata))
+
+
+class WorkspaceFeatureResolution(unittest.TestCase):
+    """Optional workspace features cannot enable unreviewed patched features."""
+
+    # One reviewed and one unreviewed feature of each patched package.
+    PACKAGES = {
+        "serde_json": ("1.0.151", "raw_value", "unbounded_depth"),
+        "rustls": ("0.23.46", "tls12", "brotli"),
+        "bytes": ("1.12.1", "std", "serde"),
+        "hyper": ("1.11.1", "http2", "ffi"),
+        "tungstenite": ("0.26.2", "handshake", "native-tls"),
+    }
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def resolve_workspace(self, optional, helper_features=()):
+        """Resolve a path-only copy of Maki's layout through the contract.
+
+        The patched packages are excluded from the workspace, as in Maki, and
+        the member enables `optional` only through its non-default `extra`
+        feature, optionally by way of an optional, excluded `helper` package.
+        """
+        root = Path(tempfile.mkdtemp(dir=self.directory.name))
+        upstream = {"schema": 1, "packages": {}}
+        patches = {"schema": 1, "packages": {}}
+        dependencies = patch = ""
+        for name, (version, reviewed, unreviewed) in self.PACKAGES.items():
+            files = {
+                "Cargo.toml": (f'[package]\nname = "{name}"\nversion = "{version}"\n'
+                               f'edition = "2021"\n\n[features]\n{reviewed} = []\n'
+                               f'{unreviewed} = []\n'),
+                "src/lib.rs": "",
+            }
+            for rel, text in files.items():
+                (root / "vendor" / name / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / "vendor" / name / rel).write_text(text)
+            upstream["packages"][name] = {
+                "version": version, "crate_sha256": "0" * 64,
+                "upstream_files": {rel: hashlib.sha256(text.encode()).hexdigest()
+                                   for rel, text in files.items()},
+            }
+            patches["packages"][name] = {"files": {}}
+            dependencies += f'{name} = {{ path = "../vendor/{name}" }}\n'
+            patch += f'{name} = {{ path = "vendor/{name}" }}\n'
+        excluded = [f"vendor/{name}" for name in self.PACKAGES] + ["helper"]
+        (root / "Cargo.toml").write_text(
+            f'[workspace]\nresolver = "2"\nmembers = ["member"]\n'
+            f"exclude = {json.dumps(excluded)}\n\n[patch.crates-io]\n{patch}")
+        helper = ""
+        if helper_features:
+            (root / "helper/src").mkdir(parents=True)
+            (root / "helper/src/lib.rs").write_text("")
+            (root / "helper/Cargo.toml").write_text(
+                '[package]\nname = "helper"\nversion = "0.0.0"\nedition = "2021"\n\n'
+                '[dependencies]\nserde_json = { path = "../vendor/serde_json", '
+                f"features = {json.dumps(list(helper_features))} }}\n")
+            helper = 'helper = { path = "../helper", optional = true }\n'
+            optional = [*optional, "dep:helper"]
+        (root / "member/src").mkdir(parents=True)
+        (root / "member/src/lib.rs").write_text("")
+        (root / "member/Cargo.toml").write_text(
+            '[package]\nname = "member"\nversion = "0.0.0"\nedition = "2021"\n\n'
+            f"[dependencies]\n{dependencies}{helper}\n"
+            f"[features]\nextra = {json.dumps(list(optional))}\n")
+        (root / "vendor/upstream.json").write_text(json.dumps(upstream))
+        (root / "vendor/patches.json").write_text(json.dumps(patches))
+        (root / "vendor/test-ca-provenance.json").write_text(json.dumps({"files": {}}))
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root,
+                       check=True, capture_output=True)
+        metadata = resolve(root)
+        self.assertIsNotNone(metadata, "the fixture workspace does not resolve")
+        return check(root, metadata)
+
+    def test_optional_workspace_feature_with_reviewed_features_passes(self):
+        reviewed = [f"{name}/{feature}" for name, (_, feature, _) in self.PACKAGES.items()]
+        self.assertEqual(self.resolve_workspace(reviewed), [])
+        self.assertEqual(self.resolve_workspace([], helper_features=["raw_value"]), [])
+
+    def test_unreviewed_feature_behind_optional_workspace_feature_is_rejected(self):
+        for name, (_, _, feature) in self.PACKAGES.items():
+            with self.subTest(name=name, feature=feature):
+                errors = self.resolve_workspace([f"{name}/{feature}"])
+                self.assertTrue(any(name in error and feature in error for error in errors),
+                                errors)
+
+    def test_unreviewed_feature_behind_optional_dependency_is_rejected(self):
+        errors = self.resolve_workspace([], helper_features=["unbounded_depth"])
+        self.assertTrue(any("serde_json" in error and "unbounded_depth" in error
+                            for error in errors), errors)
 
 
 if __name__ == "__main__":

@@ -237,6 +237,34 @@ fn owned_and_borrowed_value_to_raw_erase_formatted_private_copies() {
 }
 
 #[test]
+fn borrowed_raw_rejection_of_owned_raw_text_erases_it() {
+    // Reader input and Value conversions hand `&RawValue` an owned String that
+    // cannot be borrowed. Its rejection keeps serde's default error text.
+    let wire = wire();
+    let expected: serde_json::Error =
+        de::Error::invalid_type(de::Unexpected::Str(&wire), &"raw value");
+    let expected = expected.to_string();
+    let (result, inspection) = observe(|| {
+        let mut deserializer = serde_json::Deserializer::from_reader(wire.as_bytes());
+        <&RawValue>::deserialize(&mut deserializer).map(|_| ())
+    });
+    let error = result.unwrap_err();
+    assert!(error.is_data());
+    assert!(error.to_string().starts_with(&expected), "{error}");
+    assert_wiped(inspection);
+    drop(error);
+
+    let value = serde_json::Value::String("Q".repeat(1025));
+    let (result, inspection) = observe(|| <&RawValue>::deserialize(&value).map(|_| ()));
+    assert_eq!(result.unwrap_err().to_string(), expected);
+    assert_wiped(inspection);
+    // The consumed Value was allocated before observation and is excluded.
+    let (result, inspection) = observe(|| <&RawValue>::deserialize(value).map(|_| ()));
+    assert_eq!(result.unwrap_err().to_string(), expected);
+    assert_wiped(inspection);
+}
+
+#[test]
 fn raw_token_to_value_erases_the_internal_raw_parse_temporary() {
     let raw_wire = wire();
     let encoded = serde_json::to_string(&raw_wire).unwrap();

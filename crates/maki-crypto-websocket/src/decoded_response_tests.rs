@@ -194,7 +194,7 @@ fn later_item_failure_wipes_previously_decoded_plaintext() {
             {"unit": 1, "data": first},
             later,
         ]});
-        let response = response::parse(&response.to_string()).unwrap();
+        let response = response::parse(&response.to_string(), 2).unwrap();
         let watch = Watch::start();
         let result = provider.parse_response(&response, &[(1, &[]), (2, &[])]);
         let inspection = watch.finish();
@@ -218,7 +218,7 @@ fn invalid_base64_wipes_bytes_decoded_before_the_error() {
         .is_err());
     assert_eq!(&partial[..64], &[FILL; 64]);
     let response = json!({"items": [{"unit": 1, "data": encoded}]});
-    let response = response::parse(&response.to_string()).unwrap();
+    let response = response::parse(&response.to_string(), 1).unwrap();
     let watch = Watch::start();
     let result = provider.parse_response(&response, &[(1, &[])]);
     let inspection = watch.finish();
@@ -250,7 +250,7 @@ fn valid_standard_padding_preserves_exact_payload_bytes_and_lengths() {
     for len in [0, 1, 2, 3, 4, 63, 64, 255, 256, 257, 258] {
         let expected: Vec<u8> = (0..len).map(|index| index as u8).collect();
         let response = json!({"items": [{"unit": 1, "data": b64(&expected)}]});
-        let response = response::parse(&response.to_string()).unwrap();
+        let response = response::parse(&response.to_string(), 1).unwrap();
         let result = provider.parse_response(&response, &[(1, &[])]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].bytes(), expected, "decoded length {len}");
@@ -268,7 +268,7 @@ fn invalid_standard_alphabet_padding_and_trailing_bits_still_fail() {
             .decode(encoded)
             .is_err());
         let response = json!({"items": [{"unit": 1, "data": encoded}]});
-        let response = response::parse(&response.to_string()).unwrap();
+        let response = response::parse(&response.to_string(), 1).unwrap();
         assert!(
             matches!(
                 provider.parse_response(&response, &[(1, &[])]),
@@ -277,4 +277,31 @@ fn invalid_standard_alphabet_padding_and_trailing_bits_still_fail() {
             "invalid STANDARD input was accepted: {encoded:?}"
         );
     }
+}
+
+#[test]
+fn items_beyond_the_kept_count_are_counted_and_refused() {
+    let provider = provider();
+    let requested: [(u64, &[u8]); 2] = [(1, &[]), (2, &[])];
+    let wire = r#"{"items":[{"unit":1,"data":"YQ=="},{"unit":2,"data":"Yg=="},{}]}"#;
+    let response = response::parse(wire, 2).unwrap();
+    let (length, kept) = response.get("items").unwrap().as_array().unwrap();
+    assert_eq!((length, kept.len()), (3, 2));
+    assert!(matches!(
+        provider.parse_response(&response, &requested),
+        Err(CryptoError::Contract(message)) if message == "response has 3 item(s), expected 2"
+    ));
+    // A frame parsed while no registered request had this request's item
+    // count cannot have been its answer: refuse it rather than lose items.
+    let wire = r#"{"items":[{"unit":1,"data":"YQ=="},{"unit":2,"data":"Yg=="}]}"#;
+    let response = response::parse(wire, 1).unwrap();
+    assert!(matches!(
+        provider.parse_response(&response, &requested),
+        Err(CryptoError::Contract(message))
+            if message == "response arrived before its request was sent"
+    ));
+    let response = response::parse(wire, 2).unwrap();
+    let output = provider.parse_response(&response, &requested).unwrap();
+    assert_eq!(output[0].expose(), b"a");
+    assert_eq!(output[1].expose(), b"b");
 }

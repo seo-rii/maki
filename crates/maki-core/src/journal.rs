@@ -8,7 +8,8 @@
 //! header is written, so a torn header write leaves a file shorter than a
 //! header or an all-zero one (creation crashes recovery discards), never a
 //! complete header that fails its checksum (durable damage, which recovery
-//! refuses).
+//! refuses unless the durable proof and mark show that a header-only final
+//! segment cannot hold an acknowledged record).
 //!
 //! Durability boundary contract: `durable_sequence` only advances after a
 //! successful data sync and (for v2 volumes) mirrored proof publication.
@@ -203,6 +204,12 @@ impl JournalWriter {
 
     pub fn segment_count(&self) -> usize {
         self.sealed.len() + usize::from(self.active.is_some())
+    }
+
+    /// Sealed segments on disk. Every one is durable (a seal syncs it), so
+    /// a checkpoint can cover and delete it; the active segment never is.
+    pub fn sealed_segment_count(&self) -> usize {
+        self.sealed.len()
     }
 
     pub fn active_segment_index(&self) -> Option<u64> {
@@ -408,8 +415,10 @@ impl JournalWriter {
             // than a header, which recovery discards as an unfinished
             // creation; a file preallocated to the full header length would
             // instead show a complete header with a bad checksum, which
-            // recovery must treat as durable damage although the segment
-            // never held a record. The header's blocks are allocated by its
+            // recovery treats as durable damage unless the durable proof and
+            // mark rule out a record there (a header-only final segment above
+            // every segment they name, the state older writers that
+            // preallocated left). The header's blocks are allocated by its
             // write and made durable by the sync below, before any record
             // (with its own exact-range reservation) can follow.
             let header = SegmentHeader {

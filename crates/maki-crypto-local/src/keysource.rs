@@ -172,11 +172,11 @@ fn read_guarded(mut file: std::fs::File, expected_len: u64) -> std::io::Result<S
 }
 
 /// Why a secret file's owner cannot be trusted, or `None` when it is root
-/// or the effective user of this process. SPEC §9 asks for a *root-only*
-/// secret file, and a file's owner can read and rewrite it whatever its
-/// mode: a `0600` key owned by an unprivileged user is that user's to read
-/// or replace, so a root process must not load it. A process running as
-/// the service user may still load its own files.
+/// or the effective user of this process (SPEC §9). A file's owner can
+/// read and rewrite it whatever its mode: a `0600` key owned by an
+/// unprivileged user is that user's to read or replace, so a root process
+/// must not load it. A process running as the service user may still load
+/// its own files.
 #[cfg(unix)]
 pub fn untrusted_secret_owner(meta: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -228,7 +228,7 @@ impl FileKeySource {
             )));
         }
         let path = self.dir.join(name);
-        // SPEC §9: a file credential is a *root-only secret file*. A file
+        // SPEC §9: a file credential is a secret file. A file
         // owned by anyone but root or this process's user, any group or
         // other access, or anything but a regular file (a symlink to
         // somewhere else, a FIFO), is refused rather than loaded. The one

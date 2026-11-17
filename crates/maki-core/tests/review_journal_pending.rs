@@ -11,6 +11,7 @@ use std::time::Duration;
 use uuid::Uuid;
 const UNIT: u32 = 1024;
 const RECORD: u64 = 32 + 1024 + 8;
+const SEGMENT: u64 = 8192;
 fn block() -> Superblock {
     Superblock {
         generation: 0,
@@ -42,13 +43,14 @@ fn policy() -> CheckpointPolicy {
     }
 }
 async fn engine(p: CheckpointPolicy, clock: Option<Arc<dyn Clock>>) -> Result<Engine, AttachError> {
-    engine_with_backing(p, clock)
+    engine_with_backing(p, clock, SEGMENT)
         .await
         .map(|(engine, _)| engine)
 }
 async fn engine_with_backing(
     p: CheckpointPolicy,
     clock: Option<Arc<dyn Clock>>,
+    journal_segment_size: u64,
 ) -> Result<(Engine, Arc<CrashableBacking>), AttachError> {
     let backing = Arc::new(CrashableBacking::new().with_tearing(17));
     init::create_volume(backing.as_ref(), block()).unwrap();
@@ -57,7 +59,7 @@ async fn engine_with_backing(
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             volume: VolumeOptions {
-                journal_segment_size: 8192,
+                journal_segment_size,
             },
             checkpoint: p,
             clock,
@@ -169,13 +171,22 @@ async fn one_record_pending_budget_accepts_a_multi_unit_fua() {
     assert_eq!(e.read(0, 4096).await.unwrap(), vec![5; 4096]);
 }
 
+/// A sync that fails between two records of one request stops the request
+/// with the failed records still counted as pending; a FLUSH then resumes
+/// the journal. That FLUSH must rewrite the failed records before it syncs
+/// (F01): their pages are clean, so a plain retry writes nothing. The kernel
+/// writes back whole pages, so a later record in the failed records' page
+/// would persist them even without the rewrite; the segment therefore holds
+/// exactly the two records pending at the failure, and every later record
+/// goes to a successor segment.
 #[tokio::test]
 async fn a_failed_intermediate_sync_stops_append_and_can_resume() {
     use maki_test_support::crash_backing::FaultOp;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const TWO_RECORDS: u64 = maki_format::journal::SEGMENT_HEADER_SIZE as u64 + 2 * RECORD;
     let mut p = policy();
     p.max_pending_bytes = 2 * RECORD;
-    let (e, backing) = engine_with_backing(p, Some(Arc::new(ManualClock::new())))
+    let (e, backing) = engine_with_backing(p, Some(Arc::new(ManualClock::new())), TWO_RECORDS)
         .await
         .unwrap();
     let failed = Arc::new(AtomicBool::new(false));
@@ -211,6 +222,10 @@ async fn a_failed_intermediate_sync_stops_append_and_can_resume() {
     e.flush().await.unwrap();
     assert_eq!(e.stats().await.durable_sequence, 2);
     e.write(0, &[7; 4096], true).await.unwrap();
+    assert!(
+        e.stats().await.journal_segments > 1,
+        "the records after the resume share the failed records' segment"
+    );
     drop(e);
     backing.crash_all_lost();
     let reopened = Engine::attach(
@@ -218,7 +233,7 @@ async fn a_failed_intermediate_sync_stops_append_and_can_resume() {
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             volume: VolumeOptions {
-                journal_segment_size: 8192,
+                journal_segment_size: TWO_RECORDS,
             },
             checkpoint: policy(),
             clock: Some(Arc::new(ManualClock::new())),
@@ -226,6 +241,6 @@ async fn a_failed_intermediate_sync_stops_append_and_can_resume() {
         },
     )
     .await
-    .unwrap();
+    .expect("the FLUSH acknowledged records that never reached the disk");
     assert_eq!(reopened.read(0, 4096).await.unwrap(), vec![7; 4096]);
 }

@@ -699,6 +699,40 @@ impl SlotStore {
         self.shards.len()
     }
 
+    /// The highest raw generation, as an A/B store ranks it, of every pair
+    /// this store writes: the shard catalog and each loaded shard's
+    /// allocation and discard maps. Read-only; pairs with no CRC-valid side
+    /// are left out.
+    pub(crate) fn metadata_generations(&self) -> Result<Vec<(String, u64)>, CoreError> {
+        let backing = self.backing.as_ref();
+        let mut pairs = Vec::new();
+        let mut push = |what: String, (a, b): (Option<u64>, Option<u64>)| {
+            if let Some(generation) = a.max(b) {
+                pairs.push((what, generation));
+            }
+        };
+        push(
+            "shard catalog".into(),
+            self.catalog_ab.raw_generations::<ShardCatalog>(backing)?,
+        );
+        let mut shards: Vec<u64> = self.shards.keys().copied().collect();
+        shards.sort_unstable();
+        for idx in shards {
+            let shard = &self.shards[&idx];
+            push(
+                format!("shard {idx} allocation map"),
+                shard.alloc_ab.raw_generations::<AllocationMap>(backing)?,
+            );
+            if let Some(discard_ab) = &shard.discard_ab {
+                push(
+                    format!("shard {idx} discard map"),
+                    discard_ab.raw_generations::<AllocationMap>(backing)?,
+                );
+            }
+        }
+        Ok(pairs)
+    }
+
     fn validate_unit(&self, unit: u64) -> Result<(), CoreError> {
         if unit >= self.geometry.num_units() {
             return Err(CoreError::Corrupt(format!(

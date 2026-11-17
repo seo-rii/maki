@@ -224,13 +224,24 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   and no top-level field may sit at, under or above the batch `items_path`;
   each batch element's `item_fields` are checked as their own object.
   `/vol` and `/volume`, or `/a~1b` (the key `a/b`) and `/a/b`, are distinct;
+- HTTP JSON body fields that no request carries: a `payload`, `unit_index`
+  or `batch_index` source among the top-level `fields` of a batch (they are
+  evaluated once per request, with no item, and would be sent as an empty
+  payload or zero; map them in `item_fields`), and a non-empty
+  `item_fields` table on a per-item body, which sends only `fields`;
+- a gRPC `encrypt_path` or `decrypt_path` that the provider would not send
+  as written (validation and the provider apply one rule): it must start
+  with `/`, be at most 65534 bytes long, and contain only RFC 3986 path and
+  query characters (letters, digits, `-._~!$&'()*+,;=:@/?` and `%XX`
+  escapes), as HTTP/2 requires of the `:path` it is sent as. A `#` fragment
+  (never sent), a space or other character that needs escaping, and `*` or
+  a bare `?query` (no method) are refused. Errors never quote the path;
 - a declared `capabilities.context_binding` whose context does not reach
   the provider: each of `volume_id`, `compatibility_id` and `format_version`
   must be a source in the JSON `fields`, or in `item_fields` of a batch
-  layout (a raw body sends no fields, and a per-item body never sends
-  `item_fields`), and the attach self-test's unit-index probe needs a
-  per-item `unit_index`: in `fields` of a per-item body, in `item_fields` of
-  a batch (top-level batch fields belong to no item);
+  layout (a raw body sends no fields), and the attach self-test's
+  unit-index probe needs a per-item `unit_index`: in `fields` of a per-item
+  body, in `item_fields` of a batch;
 - a transport limit that cannot carry one full crypto batch, including the
   declared maximum ciphertext size. The maximum batch is bounded by both
   `crypto.batch.max_items` and the number of provider plaintext units that fit
@@ -245,8 +256,9 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   base64/base64url/hex encoding, JSON pointer wrappers and echoed indices; raw
   and single-item responses are checked too. JSON bounds cover compact documents
   containing the declared fields, including the required null-filled
-  array prefixes selected by numeric JSON-pointer tokens. Only RFC 6901 `~0`
-  and `~1` pointer escapes are accepted. Optional provider metadata, non-null
+  array prefixes selected by numeric JSON-pointer tokens. Response pointers
+  accept only the RFC 6901 `~0` and `~1` escapes (a request pointer keeps any
+  other `~` literally, as in `/x~2` above). Optional provider metadata, non-null
   data in unmapped array siblings, whitespace and redundant escaping need
   additional response capacity. Remote responses still obey the hard
   runtime cap. A zero limit is rejected;
@@ -256,7 +268,8 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   in the endpoint URL);
 - the `keyring` credential source, which this build does not implement, the
   same credential name declared with different sources, a credential name the
-  loaders cannot read, and a credential `format` without exactly one `{}`
+  loaders cannot read or an `env` name no environment variable can have, and
+  a credential `format` without exactly one `{}`
   placeholder or on a reference that is not a header or metadata value (see
   [credentials](#credentials-and-secrets)).
 
@@ -308,7 +321,8 @@ systemd 257 and later write those files `0440` for the service's group, which
 Maki accepts in the credentials directory only (R5-037). The
 privileged attach helper has no crypto dependency and no credential directive.
 
-A `file` credential must be a regular file with mode `0600` or `0400`, and
+A `file` credential must be a regular file with no group or other permission
+bits (for example `0600` or `0400`), and
 every credential file, in the credentials directory too, must be owned by root
 or by the user the loading process runs as (the daemon user for the packaged
 service). A file owned by any other user is refused whatever its mode, because
@@ -326,6 +340,11 @@ A `credential` name, and the file name that ends a `file` path, may contain
 only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
 the loaders refuse any other name, so validation refuses it before a volume is
 created (a key's name is stored as the volume's immutable key identity).
+An `env` name is upper-cased, with `-` and `.` replaced by `_`, to form the
+variable name. It must not contain `=` or a NUL character, which no
+environment variable name can hold (a lookup of `A=B` would even return part
+of variable `A`); any other name is accepted, since the source is meant for
+development only.
 A local provider key may be stored raw or as a hex string (decoded on load).
 Every other credential (a header or metadata value, a `client_key` PEM) is
 text and is used exactly as stored, surrounding whitespace aside for header
@@ -376,9 +395,11 @@ sources:
 | `batch_index` | the item's position in its request, an unsigned JSON integer |
 
 Only `payload` takes an `encoding`. A per-item body sends `fields` once per
-item. A batch body sends `fields` once per request (a `payload`, `unit_index`
-or `batch_index` there carries no item: an empty payload and zero) and the
-array of `item_fields` objects at `items_path`.
+item and takes no `item_fields`. A batch body sends `fields` once per request,
+so they may carry only `volume_id`, `compatibility_id` and `format_version`
+(validation refuses a `payload`, `unit_index` or `batch_index` there, which
+would describe no item), and the array of `item_fields` objects at
+`items_path`.
 
 JSON requests default to `Content-Type: application/json`. An explicitly
 configured `Content-Type` overrides that default, including vendor media types;
@@ -431,6 +452,11 @@ ignored, and a close frame ends the connection. Pending requests are scoped to a
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
+A response frame is parsed against this protocol: only its `id`, the error's
+`class` and `reason`, and the `unit` and `data` of at most as many items as the
+largest request awaiting a response on that connection are kept. Other values
+are validated but not kept, so the frame-size limit also bounds the memory a
+response takes, not only its wire bytes.
 Once a request has registered on an established connection, cancelling it or
 expiring its overall attempt deadline or response-wait timeout removes that
 request and stops new requests from joining its connection generation.
@@ -455,8 +481,9 @@ carries no crypto request, so its refusal is never blamed on a request: HTTP
 408 and 5xx are retryable, 429 is throttling, and every other status (a
 redirect, an authentication refusal, or a generic 4xx such as 400 or 426 from
 a proxy that cannot upgrade) is an endpoint failure. The dispatcher opens that
-endpoint's circuit, so later requests go to a peer (a retry-safe request also
-fails over at once), and attach quarantines it like an unreachable endpoint.
+endpoint's circuit, so later requests go to a peer, and attach quarantines it
+like an unreachable endpoint. The refused request itself fails over at once,
+even with `retry_safe = false`: no byte of it was sent (see below).
 
 A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
@@ -464,8 +491,19 @@ A gRPC request gives up after `timeout`, but the connection attempt behind it
 completes the handshake is abandoned then and the next request reconnects.
 
 Providers that do not declare `retry_safe` are sent every request at most
-once: the dispatcher performs no retry or failover after a request has been
-sent, and the WebSocket transport does not resend over a fresh connection. With
+once: the dispatcher performs no retry or failover after a request may have
+been sent, and the WebSocket transport does not resend over a fresh connection.
+A request that provably never left Maki has not been sent, so it fails over to
+another endpoint and is retried under the availability policy like any request
+not yet sent. The transports claim this only where they can prove it: HTTP
+when reqwest reports a connect error (the TCP connection or the TLS handshake
+failed), gRPC when the connection, TLS handshake or channel readiness fails,
+or the request timeout expires, before the request is handed to the
+established connection, and WebSocket when the TCP connection, TLS, the
+upgrade or the send queue fails, or the request timeout expires, before the
+request frame reaches the connection. A timeout, reset or error status after
+that point counts as sent, as does a later unit of an HTTP per-item mapping
+once an earlier unit was sent. With
 `availability_policy = "bounded-error"`, `max_operation_time` is an absolute
 wall-clock deadline: backoff never sleeps past it and an expired caller receives
 an error. A shared RPC remains active while it still has a live caller.
@@ -491,10 +529,15 @@ when its final caller leaves. Other callers in that batch can still complete.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
-Service method paths are configurable, but request and response messages must
-match that contract and responses must preserve unit identity and order.
-The message-size limit bounds each received gRPC frame before decoding.
-Locally rejected oversized frames and invalid protobuf results are endpoint
+Service method paths are configurable (`encrypt_path` and `decrypt_path`,
+default `/maki.CryptoService/EncryptBatch` and `/maki.CryptoService/DecryptBatch`;
+a gateway prefix or a query is sent unchanged), but request and response
+messages must match that contract and responses must preserve unit identity
+and order.
+The message-size limit bounds each received gRPC frame before decoding, and
+decoding refuses the first item beyond the number the request carried, so the
+limit also bounds the memory a response's items take. Locally rejected
+oversized frames, extra items and invalid protobuf results are endpoint
 contract failures: their breaker is charged, and only retry-safe requests may
 move to another peer. An actual remote `OutOfRange` status remains a request
 error, regardless of its message text. Remote status text (`grpc-message`) and
@@ -655,10 +698,17 @@ does not postpone the worker's periodic sync of pending writes. After a failed
 pass the worker waits one interval before it tries again, however many writes
 cross the watermark meanwhile; a write that reaches `journal_max_bytes` still
 checkpoints inline, and a success clears the wait. Each pass syncs unsynced
-records before it checkpoints; a failed sync counts as a failed pass, but a pass
-started by the watermark or by low free space still checkpoints the records
-that were durable before it (deleting the sealed segments they cover) and then
-waits, so a journal whose syncs keep failing still gives that space back.
+records before it checkpoints; a failed sync counts as a failed pass, but the
+pass still checkpoints the records that were durable before it, whatever started
+it (applying them, deleting the sealed segments they cover and shrinking the
+overlay), and then waits, so a journal whose syncs keep failing still gives that
+space and memory back. With nothing durable left to apply or reclaim, a pass
+whose sync fails runs no checkpoint. The watermark counts only journal a
+checkpoint can delete: the active segment is never deleted, so the worker
+checkpoints for size only once a sealed segment exists. Half of
+`journal_max_bytes` is always above one segment, so this only matters to an
+engine embedded with a lower watermark, which then checkpoints once per sealed
+segment instead of on every write.
 
 The overlay bounds exist because `journal_max_bytes` is a *disk* budget: with
 a slow or failing checkpoint the overlay would otherwise grow toward the whole
@@ -677,12 +727,13 @@ space while holding the volume write lock. It requires enough space for the
 configured emergency reserve and checkpoint headroom after all record bytes and
 segment headers created by that request. A discard (v3) needs only the
 emergency reserve: its tombstones carry no payload and their checkpoint writes
-no slot data, so `fstrim` still returns space the filesystem had *already*
-freed when free space is inside the checkpoint headroom. It cannot free more:
-deleting a file is itself a write, which is refused there, and a filesystem on
-the volume sees those refusals as I/O errors (XFS reported EIO in the
-2026-10-03 pressure run). Keep backing free space above the reserve plus the
-headroom, and recover from that state by freeing space on the backing
+no slot data, so a raw discard of the exported device is still admitted when
+free space is inside the checkpoint headroom. A filesystem on the volume
+cannot use that: deleting a file is itself a write, and XFS `fstrim` forces a
+log write before it discards, so both are refused there and the filesystem
+sees I/O errors ([known limitations](status.md#known-limitations)). Keep
+backing free space above the reserve plus the headroom, and recover from that
+state by freeing space on the backing
 filesystem, not inside the volume. Checked arithmetic fails closed on an
 overflow. It does not reuse the statistics cache, so space lost or restored
 between consecutive writes is observed even within the same second. Setting
@@ -695,9 +746,12 @@ each write additionally uses `posix_fallocate` for its exact journal range and
 the complete destination slot before the journal accepts the record. A new
 shard also has both allocation-map copies and its catalog entry created and
 synced first. An unrelated filesystem consumer therefore cannot take the
-already allocated journal or slot blocks before checkpoint completes. A
-reservation failure returns ENOSPC without consuming a journal sequence and is
-retryable.
+already allocated journal or slot blocks before checkpoint completes. That
+holds only where the backing filesystem overwrites allocated blocks in place:
+not for extents shared with a reflink copy, and not on a copy-on-write
+filesystem ([backing store](deployment/support-matrix.md#backing-store-below-maki)).
+A reservation failure returns ENOSPC without consuming a journal sequence and
+is retryable.
 
 Untouched slots remain sparse and unreserved. Filesystem directory metadata,
 copy-on-write amplification, snapshots, journal/checkpoint headroom beyond the
@@ -770,7 +824,7 @@ attached, fails closed on Linux, and is reported under `security` in
 | `madv_dontdump` (default true) | Honoured through `disable_core_dump`; validation refuses it when core dumps stay enabled |
 | `memory_lock_mode = "secure-buffers"` (default) | Attempts to `mlock` registered `SecretBuffer` allocations (including plaintext, keys and cache entries); shared pages stay locked until their last buffer owner releases them, and failures are counted and reported. Local providers produce plaintext in place inside such buffers; their expanded AES key schedules are page-locked in a `SecretBox` and zeroized on drop (see [local providers and key material](transport-memory.md#local-providers-and-key-material)). Separate transport allocations are described in [buffer lifetime limits](transport-memory.md) |
 | `memory_lock_mode = "all"` | `mlockall(MCL_CURRENT \| MCL_FUTURE)`; a failure refuses attach (raise `LimitMEMLOCK`) |
-| `memory_lock_mode = "off"` | No locking; validation then refuses `cache.lock_memory = true` |
+| `memory_lock_mode = "off"` | No locking. `cache.lock_memory` defaults to `true` (also with the cache off), which validation refuses with this mode, so set `cache.lock_memory = false` too |
 | `require_secure_swap_policy` (default false) | Requires readable, parseable `/proc/swaps` and accepts only RAM-only zram or dm-crypt with proven independent physical backing, including zram writeback. NBD ancestors, cycles, and unknown backing are refused. Device identity determines classification; keep the topology fixed while attached. See [swap dependency checks](operations.md#swap-dependency-checks). The shipped production example enables this policy |
 
 Buffers are zeroized before their page-lock ownership is released. Exporting a
@@ -804,9 +858,11 @@ the recovered engine. A smaller ancestor ceiling is rejected because it changes
 the configured envelope. Missing, malformed, unreadable or unlimited leaf
 limits fail attach. Ancestors may be unlimited; the real hierarchy root has no
 `memory.max`. Paths come from `/proc/self/cgroup` and `/proc/self/mountinfo`,
-including mountinfo escaping. Ambiguous mounts, subtree mounts hiding ancestors,
-root membership, nested mounts shadowing controller files and escaping paths
-are refused. Run under the host cgroup
+including mountinfo escaping. Other mounts are compared with the cgroup-v2 mount
+by their exact path bytes, so one elsewhere whose path is not UTF-8, contains a
+newline or is deeply nested does not affect admission. Ambiguous mounts, subtree
+mounts hiding ancestors, root membership, nested mounts shadowing controller
+files and escaping paths are refused. Run under the host cgroup
 namespace with the complete hierarchy visible; a container can hide further
 ancestors, and visibility is not a proof of their headroom.
 

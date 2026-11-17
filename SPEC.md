@@ -428,14 +428,24 @@ Example systemd configuration:
 LoadCredential=crypto-token:/secure/path/token
 ```
 
-Supported credential sources:
+Supported credential sources, named by a reference's `source`:
 
 ```text
-systemd credentials
-root-only secret file
-kernel keyring
-explicit secret-provider abstraction
+credential   systemd credentials ($CREDENTIALS_DIRECTORY/<name>)
+file         secret file at an absolute path
+env          environment variable MAKI_CREDENTIAL_<NAME> (development)
 ```
+
+Each reference is loaded from exactly the source it declares, through one
+key-source abstraction, with no fallback between sources. A secret file MUST
+be a regular file, opened without following a symlink, owned by root or by
+the user the loading process runs as, with no group or other access (for
+example `0600` or `0400`): its owner can read or replace it whatever its
+mode. A systemd credential follows the same rule, except that it MAY also
+grant read, and only read, to its group when that group is the process's own
+or root, as systemd 257 writes `LoadCredential=` files (`0440`). The kernel
+keyring is not implemented; configuration validation rejects a `keyring`
+source.
 
 Environment variables MAY be used in development environments but SHOULD NOT be the primary production secret source.
 
@@ -665,7 +675,9 @@ Geometry creation MUST reject more than 2^24 possible shards, matching the
 supported shard-catalog limit, any capacity calculation that overflows an
 unsigned 64-bit byte count, and a unit count that reaches the reserved
 key-canary unit index (§27), which attach refuses. `maki volume inspect`
-reports these five maximum-layout values. They exclude journal and checkpoint
+reports the five maximum-layout values above (all but `units_per_shard`) and
+a sixth, the discard-map A/B bytes, which equal `allocation_map_ab_bytes` for
+a v3 volume and are zero for v2. They exclude journal and checkpoint
 headroom, filesystem metadata and copy-on-write overhead, and application
 temporary space; they are not a full-volume physical reservation. Before
 accepting a journal record, a Linux backing MUST physically allocate the exact
@@ -822,6 +834,14 @@ representation and takes no `encoding`: `unit_index`, `format_version` and
 hyphenated UUID string, and `compatibility_id` is a JSON string. WebSocket
 and gRPC use the fixed request schemas of their reference contracts.
 
+gRPC method paths are validated exactly as the provider sends them: HTTP/2
+carries a path as `:path`, an RFC 3986 absolute path with an optional query
+(RFC 9113 §8.3.1), so configuration validation MUST reject an
+`encrypt_path` or `decrypt_path` that does not start with `/`, contains a
+character outside RFC 3986 path and query characters or a malformed `%XX`
+escape, contains a `#` fragment (never sent), or exceeds the client's
+65534-byte URI limit; provider construction applies the same rule.
+
 HTTP request mappings are validated exactly as the provider builds them:
 configuration validation MUST reject an unknown field source or payload
 encoding, an `encoding` on a non-payload source, a request pointer that does
@@ -829,7 +849,12 @@ not start with `/`, and request pointers that would replace one another on
 the wire. Pointers are applied in order and replace what they address, so two
 pointers of one JSON object conflict when, after RFC 6901 decoding, one
 equals the other or addresses a field inside it; a batch `items_path` also
-conflicts with any top-level field at, under or above it.
+conflicts with any top-level field at, under or above it. Validation MUST
+also reject fields no request carries: a batch evaluates its top-level
+`fields` once per request, with no item, so a `payload`, `unit_index` or
+`batch_index` source there (which would be sent as an empty payload or 0)
+belongs in `item_fields`; and a per-item body sends only `fields`, so it
+takes no `item_fields`.
 
 Batch result identity: every batch element a remote provider returns MUST
 carry the unit index of the request item it answers, in request order. Maki
@@ -841,7 +866,16 @@ the `unit_index` field of `CryptoItem`.
 
 Retry safety: a provider whose capabilities do not declare `retry_safe` is
 sent each request at most once. No retry, failover, or transport-level resend
-happens after the request has been sent.
+happens after the request may have been sent. A request that the transport
+proves was never sent has not been sent: its TCP connection, TLS handshake or
+WebSocket upgrade failed, or the attempt failed or timed out before the
+request was handed to an established connection. Such a request MAY fail over
+to another endpoint, and the availability policy MAY retry it, as for any
+request not yet sent. A transport MUST mark only failures it can prove
+happened before the first request byte was written; every other failure,
+including a timeout or reset after the request was handed over, counts as
+sent. Once any attempt, or an earlier part of the same provider call, may have
+been sent, the call's error no longer carries the mark.
 
 Context on the wire: every request carries the whole crypto context — the
 volume UUID, the crypto compatibility ID and the format version. For HTTP
@@ -1172,9 +1206,10 @@ pending until truncation and synchronization succeed, including before a roll.
 Segment creation MUST NOT extend a new segment file before its header is
 written. A header write that persists only a prefix then leaves a file shorter
 than a header, a creation crash that recovery discards, whereas a complete
-header that fails validation is durable damage. The header's storage is
-allocated by its write and made durable by the creation's data sync, before any
-record of the segment is reserved or accepted.
+header that fails validation is durable damage outside the one header-only
+case §27 discards (which writers that extended the file first could leave).
+The header's storage is allocated by its write and made durable by the
+creation's data sync, before any record of the segment is reserved or accepted.
 
 Tracked state includes:
 
@@ -1277,11 +1312,21 @@ fsync journal directory
 Checkpoints MUST run automatically, not only at detach. Triggers:
 
 ```text
-journal bytes on disk >= journal_max_bytes / 2       (background worker, syncs first)
+journal bytes on disk >= journal_max_bytes / 2
+  and at least one sealed segment on disk            (background worker, syncs first)
 backing free space   <  checkpoint_reserve_bytes     (background worker, syncs first)
+overlay >= max_overlay_{bytes,entries} / 2           (background worker, syncs first)
+write refused for backing free space                 (background worker, syncs first)
 interval elapsed with unapplied records              (background worker, syncs first)
 write would exceed journal_max_bytes                 (inline, before the append)
+write would exceed max_overlay_{bytes,entries}       (inline, before the append)
 ```
+
+A checkpoint deletes covered sealed segments and never the active one, so the
+journal-size trigger counts only a journal it can shrink. Half of a validated
+`journal_max_bytes` is above one segment, so the active segment alone never
+reaches it; an engine configured directly with a lower watermark still
+checkpoints for size once per sealed segment, not on every write.
 
 A write that would exceed `journal_max_bytes` after an inline checkpoint, or
 whose fresh backing-space observation does not cover
@@ -1350,6 +1395,17 @@ complete-record boundary MUST fail. A proof's segment may have been pruned only
 when the checkpoint covers its horizon. Required-horizon validation MUST precede
 recovery metadata changes and tail repairs.
 
+A final segment that holds no record and that no durable evidence names is an
+unfinished creation: one shorter than a header or entirely zero that neither
+the proof nor the durable mark names, or one exactly one header long whose
+header fails its checksum at an index above the segments the proof and the
+mark name. Recovery MUST discard it, removing it and syncing the journal
+directory before the writer resumes. Every acknowledged record lies at or
+below the proof's horizon, in the segment the proof names or an earlier one,
+and the mark names a segment only once its creation completed, so no
+acknowledged record is lost. Any other invalid segment header, including a
+checksum-valid one that does not decode, MUST fail recovery.
+
 The superblock is the volume's commit point, yet a creation that failed or was
 killed after writing a copy, or a process restart, can leave a CRC-valid copy
 only in the page cache. Writable recovery MUST make the selected superblock
@@ -1363,6 +1419,17 @@ data. An intact later record MUST NOT be used to infer earlier durability:
 unsynced sectors may persist out of order. Recovery MUST rewrite, verify and
 sync accepted prefixes, then publish both proofs before READY. It MUST NOT
 lower the horizon to make a damaged volume attach.
+
+Checkpointing consumes only records both proof copies attest, and recovery
+publishes the proof before it advances the checkpoint, so a selected checkpoint
+above the proof's horizon is damage, not a crash state. Recovery and the deep
+check MUST refuse it before any recovery write. They MUST likewise refuse a
+recovered durable sequence or highest segment index (of a surviving segment,
+the proof or the advisory mark) that leaves the resumed writer no sequence for
+one more record or no index for one more segment. When records above a covered
+proof survive, the record end recovery publishes for them MUST follow the
+proof's stored location; a covered proof naming a later segment or record end
+is damage and MUST be refused the same way.
 
 The first scan streams segment data and retains no replay payloads. After all
 durability checks and repairs succeed, a second scan replays accepted records
@@ -1523,6 +1590,11 @@ EndpointFatal
 ProviderFatal
 ```
 
+A `Retryable`, `Throttled` or `EndpointFatal` error may additionally be marked
+*not sent* when the transport proves that no byte of the request left Maki
+(§18). The mark keeps the class and its circuit-breaker charge; it only lets a
+request to a provider that is not retry-safe fail over or be retried.
+
 Retry backoff uses:
 
 ```text
@@ -1619,6 +1691,10 @@ Supported policies:
 stall
 bounded-error
 ```
+
+Under either policy, a request to a provider that is not retry-safe ends with
+an error as soon as an attempt that may have sent it fails (§18); attempts
+proven unsent do not count.
 
 ## `stall`
 
@@ -1933,9 +2009,12 @@ panicking. Geometry uses checked arithmetic. Superblocks, allocation maps,
 shard catalogs, slots, journal records, and checkpoint state use versioned,
 CRC-protected encodings with frozen golden vectors.
 
-A/B metadata MUST fall back to the highest valid generation. Torn final journal
-tails may be truncated; corruption before a valid successor record MUST refuse
-recovery.
+A/B metadata MUST fall back to the highest valid generation. Each store advances
+a generation by one; recovery and the deep check MUST refuse, before any
+recovery write, A/B metadata (superblock, shard catalog, allocation and discard
+maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
+is above `u64::MAX - 2^62`. Torn final journal tails may be truncated;
+corruption before a valid successor record MUST refuse recovery.
 
 ---
 

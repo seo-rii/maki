@@ -19,15 +19,34 @@ deployment or an external qualification campaign.
 
 Build the binary with `cargo build --release --locked -p maki-witness-cli`.
 Initialize one authority directory with a fresh, nonzero storage-identity UUID.
-This identity differs from the inner volume superblock UUID:
+This identity differs from the inner volume superblock UUID. Run it as the
+service account that will serve the authority (`maki-witness` here), below a
+directory that account owns:
 
 ```sh
-maki-witness init /var/lib/maki-witness/volume 01234567-89ab-cdef-0123-456789abcdef
+install -d -o maki-witness -g maki-witness -m 0700 /var/lib/maki-witness
+sudo -u maki-witness maki-witness init /var/lib/maki-witness/volume 01234567-89ab-cdef-0123-456789abcdef
 ```
 
 Initialization refuses existing state. Local `serve` holds the authority's
 exclusive process lock until exit. Copied local directories are separate
 histories; they cannot be used as failover replicas.
+
+Whoever can write the state directory or its `remote.*` files can put an older
+record back and roll the authority back. On Unix, `init` and `serve` therefore
+require the directory (checked on the opened directory, without following a
+symlink) and those files to be owned by root or by the user the command runs
+as, and not writable by group or others; a sticky bit does not make shared
+write access safe. Anything else is refused before state is written or the
+listener is bound, with an error naming the owner. `init` creates missing
+directories owner-only (`0700`) as the user that runs it, so an authority
+initialized as root must be handed over with `chown -R` before the service
+account serves it, and a `serve` run as root refuses a directory owned by the
+service account. Group and other read access is allowed: the files hold the
+public record that any authenticated client can inspect and SHA-256 digests of
+the last request and of the current random 256-bit session capability, which do
+not reveal the capability. The check covers the state directory, not its
+ancestors; keep those writable only by root or the service account.
 
 Provision a server certificate with the intended DNS name or IP address in its
 subject alternative names, plus separate writer and administrator client
@@ -197,16 +216,28 @@ operator-controlled cutover after destination verification.
 ## Credential and configuration files
 
 Configuration files are bounded to 64 KiB and reject unknown fields. On Unix,
-they must not be symlinks or writable by group/others. Credential files are
+they must not be symlinks or writable by group/others, and must be owned by
+root or by the user that runs the command (`serve`, `init-etcd` or `inspect`).
+A configuration owned by any other user is refused whatever its mode, because
+its owner can rewrite the administrator allow-list, the key path or the
+authority it names. A root-owned `0644` file suits both the service account
+and root; a command run as root refuses a configuration owned by the service
+account. Configurations hold no secrets, so group and other read access is
+allowed. Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
 accessible to group/others (`0600` is appropriate), and must be owned by root
 or by the user the loading process runs as. A key owned by any other user is
 refused whatever its mode, because its owner can read or replace it; a process
 run as root therefore refuses a key owned by the service or daemon user. Run
-the server as its service account, and run `maki volume witness` with the
-daemon's writer configuration as the daemon user (`sudo -u maki`), or use the
-administrator configuration as root. Certificates and CA bundles may have any
-owner. The key loader accepts one
+the server as its service account. The remote `maki volume` commands load
+their configuration's client key before they contact the authority, so run
+`witness`, `snapshot` and `gc` with the daemon's writer configuration as the
+daemon user (`sudo -u maki`); a snapshot also needs a backup directory that
+user can create. `witness` may instead use the administrator configuration as
+root. `takeover`, `restore` and `resume-enrollment` need the administrator
+configuration: run them as root and then hand the new writer namespace back
+([below](#snapshot-takeover-and-restore)). Certificates and CA bundles may have
+any owner. The key loader accepts one
 unencrypted PKCS#8, PKCS#1 RSA or SEC1 EC PEM block. Encrypted keys, bag
 attributes, extra blocks and trailing non-whitespace text are refused.
 Private-key PEM, base64 scratch and decoded DER are erased on drop; the pinned
@@ -311,24 +342,31 @@ all mutation retries preserve their exact operation and session authorization.
 If the preferred frontend fails, the remaining frontends share the original
 overall deadline and a successful alternate becomes the next preferred address.
 Authentication failures, malformed records and predecessor conflicts remain
-terminal. A stalled former first address therefore consumes time once during
+terminal: the client returns them without trying another frontend. A
+stalled former first address therefore consumes time once during
 failover rather than on every later successful call. A local socket error, such
 as the EPERM Linux returns from `connect()` when a firewall drops the
-connection, is a transport failure like a refused connection, not a denial.
+connection, is a transport failure like a refused connection, not a denial. A
+trusted client certificate that a frontend's allow-list does not name is a
+denial: the frontend answers it, so an allow-list mistake is reported as
+`PermissionDenied`, not as an unavailable witness.
 
 Inspect through the configured client without claiming a session:
 
 ```sh
-maki volume witness /etc/maki/volume-writer.toml
+sudo -u maki maki volume witness /etc/maki/volume-writer.toml
 ```
 
 ## Snapshot, takeover and restore
 
 Stop the volume daemon before an ordinary snapshot while keeping the authority
-online. Snapshot refuses a live writer and an occupied backup directory:
+online. Snapshot refuses a live writer and an occupied backup directory. Run it
+as the daemon user, who owns the writer key (a process run as root refuses
+that key), into a location that user can create:
 
 ```sh
-maki volume snapshot /etc/maki/volume-writer.toml /backup/maki/snapshot-001
+install -d -o maki -g maki -m 0700 /backup/maki
+sudo -u maki maki volume snapshot /etc/maki/volume-writer.toml /backup/maki/snapshot-001
 ```
 
 The command copies authenticated committed data, durably writes the bounded
@@ -441,10 +479,11 @@ for the compatibility and initialization limits.
 ## Retire old writer namespaces
 
 A GC pass runs automatically after successful remote activation. To collect
-again after old processes have exited, run:
+again after old processes have exited, run it with the writer configuration as
+the daemon user (a process run as root refuses the daemon-owned writer key):
 
 ```sh
-maki volume gc /etc/maki/volume-writer.toml
+sudo -u maki maki volume gc /etc/maki/volume-writer.toml
 ```
 
 The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
@@ -452,6 +491,9 @@ and `retained` namespace arrays. Each array retains at most the first 4,096
 names in that category. The corresponding fields in `counts` give the total
 numbers processed, including any omitted details; `details_truncated` is true
 if any array omitted names. Use `counts`, not array lengths, for totals.
+An entry whose name is not valid UTF-8 is never a namespace: GC keeps it,
+lists it under `skipped_unrecognized` with U+FFFD in place of each invalid
+byte sequence, and goes on.
 
 GC walks the root in sorted pages of at most 4,096 names and continues past
 pages containing only retained, live or unrecognized entries. Each page scans
@@ -499,7 +541,10 @@ there is no stale replica or offline fallback.
 
 The server admits 1–256 connection workers and requires 1–256 distinct
 allow-listed certificate identities. A connection takes a worker only after
-TLS has authenticated an allow-listed certificate. Until it acquires a worker,
+TLS has authenticated an allow-listed certificate. A trusted certificate that
+the allow-list does not name never takes one: the server reads its single
+request while it holds a pending slot and answers it with a denial bound to that
+request, never calling the authority. Until it acquires a worker,
 it occupies one of four pending slots per worker, including while waiting after
 authentication. If these slots fill, a new arrival evicts the oldest pending
 connection and closes its socket. An authenticated waiter can therefore be

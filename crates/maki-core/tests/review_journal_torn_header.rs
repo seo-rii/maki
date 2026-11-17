@@ -8,8 +8,9 @@
 //! sync fails before a power loss, recovery finds the file as the final
 //! segment. It never held a record and nothing durable names it, so it must
 //! read as a creation crash (a file shorter than a header), never as a
-//! complete-length header with a bad checksum, which recovery rightly treats
-//! as durable damage.
+//! complete-length header with a bad checksum, which recovery treats as
+//! durable damage unless the durable proof and mark rule out a record there
+//! (`review_journal_legacy_torn_header.rs`).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,12 +50,30 @@ fn backing(discard: bool) -> Arc<CrashableBacking> {
         format_version: 1,
         created_unix: 0,
     };
+    let volume_uuid = sb.volume_uuid;
     if discard {
         init::create_volume_with_discard(backing.as_ref(), sb).unwrap();
     } else {
         init::create_volume(backing.as_ref(), sb).unwrap();
     }
+    bind_key_canary(backing.as_ref(), volume_uuid);
     backing
+}
+
+/// What an engine's first attach stores before any write: a key canary bound
+/// to the volume. Without one, a volume with history but no ciphertext is
+/// refused by every attach, and the deep check reports that; this fixture is
+/// about the journal, not the canary.
+fn bind_key_canary(backing: &dyn Backing, volume_uuid: uuid::Uuid) {
+    let ab = maki_format::ab::AbStore::new(layout::KEY_CANARY_A, layout::KEY_CANARY_B);
+    let mut canary = maki_format::canary::KeyCanary {
+        generation: 0,
+        volume_uuid,
+        unit_index: maki_format::canary::CANARY_UNIT_INDEX,
+        ciphertext: vec![0x5a; 64],
+    };
+    ab.store(backing, &mut canary).unwrap();
+    ab.store(backing, &mut canary).unwrap();
 }
 
 fn recover(backing: &Arc<CrashableBacking>) -> Result<Volume, String> {

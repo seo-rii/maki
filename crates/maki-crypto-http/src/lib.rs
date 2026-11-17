@@ -676,8 +676,26 @@ fn pointer_set(root: &mut Value, pointer: &str, value: Value) -> Result<(), Cryp
     Err(fatal(format!("empty JSON pointer {pointer:?}")))
 }
 
-/// Classify a transport error (SPEC §31).
+/// Classify a transport error (SPEC §31), marking one raised before any
+/// byte of the request was written as not sent.
 fn classify_transport(e: reqwest::Error) -> CryptoError {
+    // `is_connect` holds only for a failure to establish a connection (TCP
+    // connect or TLS handshake in reqwest's connector, or a pool checkout).
+    // hyper-util hands a request to a connection only after that succeeded,
+    // and resends only a request a connection returned unwritten; this
+    // client never resends one itself (see `retry::never` in `new`). So no
+    // byte of the request was written. Everything else, timeouts included,
+    // may follow a written request and stays unmarked.
+    let not_sent = e.is_connect();
+    let error = classify_transport_error(e);
+    if not_sent {
+        error.not_sent()
+    } else {
+        error
+    }
+}
+
+fn classify_transport_error(e: reqwest::Error) -> CryptoError {
     // Transport errors include the request URL in Display and Debug. Drop
     // it before either classification or logging can expose query secrets.
     let e = e.without_url();
@@ -812,9 +830,15 @@ impl HttpCryptoProvider {
         // Never use an environment proxy either: `HTTP_PROXY`/`ALL_PROXY`
         // inherited by the daemon would receive every plaintext request and
         // answer it with "ciphertext" of its own (R5-003).
+        // Never let reqwest resend a request on its own either: its default
+        // policy retries some HTTP/2 refusals (compiled out without the
+        // `http2` feature). A request that is not retry-safe is sent at most
+        // once, and a connect failure proves the request unsent only while
+        // no earlier copy of it can have gone out (SPEC §18).
         let mut builder = reqwest::Client::builder()
             .timeout(spec.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy()
             .use_rustls_tls();
         if let Some(tls) = &spec.tls {
@@ -1039,7 +1063,15 @@ impl HttpCryptoProvider {
                     (body_from(encoded), true)
                 }
             };
-            let response = self.send(op, body, json).await?;
+            let response = self.send(op, body, json).await.map_err(|error| {
+                // Earlier units of this call were sent: a later unit's
+                // unsent request does not make the call unsent.
+                if batch_index > 0 {
+                    error.maybe_sent()
+                } else {
+                    error
+                }
+            })?;
             // The whole raw body becomes the unit's ciphertext, and nothing
             // else in it distinguishes ciphertext from, say, a proxy's error
             // page, so it must be at least as long as its plaintext. This

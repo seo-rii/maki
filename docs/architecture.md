@@ -97,7 +97,12 @@ Before touching it, the store rewrites the preserved, typed-valid copy's exact
 bytes without truncation, synchronizes that file, and synchronizes its parent
 directory. Only then does it advance the generation, write the replacement,
 and synchronize the new contents. The caller must synchronize the replacement's
-directory entry when it creates a file.
+directory entry when it creates a file. Each store advances the generation by
+one, and recovery and the deep check refuse a volume whose A/B metadata carries
+a CRC-valid generation in the top quarter of the generation space (above
+`u64::MAX - 2^62`) before any recovery write: no writer produces one, and
+`2^62` stores below the store's own exhaustion check no attach, replay or later
+checkpoint can exhaust a generation.
 
 This preservation step also runs after a failed store or a process restart:
 readable, CRC-valid bytes may still be volatile, and writeback errors can clear
@@ -135,11 +140,16 @@ and rebuilds the in-memory overlay from records newer than the checkpoint. It
 fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
 larger than the writer can produce is rejected before it is read, and a
-complete-but-invalid final segment header is treated as damage rather than as
-a creation crash. That rule relies on the writer never extending a new segment
-before its header write: a header write that persists only a prefix leaves a
-file shorter than a header (or all zero), which recovery discards as a creation
-that never completed.
+complete-but-invalid segment header is treated as damage rather than as a
+creation crash. The writer never extends a new segment before its header
+write, so a header write that persists only a prefix leaves a final file
+shorter than a header (or all zero), which recovery discards as a creation that
+never completed. Writers that preallocated the header could instead leave a
+final segment exactly one header long whose header fails its checksum; recovery
+discards that too, but only at an index above every segment the durable proof
+and mark name. The proof names the segment of the newest acknowledged record
+and the mark names a segment only once its creation completed, so such a file
+holds nothing acknowledged. Every other invalid header still fails closed.
 
 The journal above the selected checkpoint must bridge through the proof's
 required sequence and exact record-end offset before recovery changes metadata.
@@ -248,16 +258,20 @@ every mutation (`check_invariants`), so the randomized suites described in
 symptom.
 
 Checkpoints are not only a shutdown step. A background worker checkpoints when
-the journal crosses a size watermark, when backing free space drops below the
+the journal crosses a size watermark with a sealed segment to delete (the
+active segment never is), when backing free space drops below the
 checkpoint reserve, and on a time interval, syncing unsynced records first so
-each pass applies them. The
+each pass applies them. It also checkpoints when the in-memory overlay reaches
+half of its byte or unit bound, and as soon as a write is refused for backing
+space. The
 write path forces a journal sync once unsynced bytes reach their limit, reclaims
-inline at the hard journal limit (other writes queue behind an inline reclaim,
+inline at the hard journal or overlay limit (other writes queue behind an
+inline reclaim,
 so the space it frees goes to the write that ran it), and refuses writes with
 ENOSPC unless fresh
 backing space covers the emergency reserve, configured checkpoint headroom,
 projected record bytes, and all segment headers created by that write, or when
-the journal cannot be
+the journal or overlay cannot be
 reclaimed. A
 failed reclaim marks the engine degraded until a later checkpoint succeeds; the
 [remediation log](review-remediation.md#bounded-journal) lists the exact rules.
@@ -338,6 +352,22 @@ endpoints were tried in: under `stall` it stays pending, and under
 breakers, endpoint limits, and global byte and request semaphores prevent a
 failing provider from causing unbounded work.
 
+A provider that is not retry-safe is sent each request at most once: after an
+attempt that may have reached the endpoint fails, the dispatcher neither
+retries nor fails over, under either availability policy. An attempt that
+provably never left Maki does not count. Transports mark such an error as not
+sent (`CryptoError::not_sent`, which keeps its class and breaker charge) only
+where they can prove that no request byte was written: HTTP for reqwest
+connect errors (TCP connect or TLS handshake), gRPC for failures and timeouts
+before the request is handed to tonic on an established connection, and
+WebSocket for failures before the request frame reaches an upgraded
+connection (TCP, TLS, the upgrade, the send queue or the attempt timeout).
+The dispatcher fails such a request over and, under the availability policy,
+retries it like a request not yet sent. The mark describes the whole call: it
+is dropped once any attempt, an earlier chunk of the dispatch, an earlier
+per-item HTTP request, or an earlier transparent WebSocket reconnect attempt
+may have sent the request.
+
 ## Cache and growth
 
 The optional cache stores plaintext under `(unit_index, write_sequence)`. A
@@ -362,7 +392,8 @@ separate privileged `lvextend` and `xfs_growfs` operation.
 - The plugin advertises configured NBD block sizes and validates request
   length, range, and alignment before copying write plaintext into Maki or
   submitting work to the engine.
-- The control socket exposes status, metrics, checkpoint, and reload only.
+- The control socket exposes status, metrics, checkpoint, drain, and reload
+  only.
 - Socket creation keeps the process umask unchanged. A private staging
   directory hides the socket until its group and mode are set; rename then
   publishes the ready socket at its configured path.

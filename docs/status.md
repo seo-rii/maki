@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-11-13. External campaign evidence below runs through
+Last updated: 2026-11-17. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -89,11 +89,16 @@ See [cache reload](operations.md#growth-and-cache-reload).
   Hardlink-based backing copies are unsupported while the extra links exist.
   The check occurs on open; later link creation and already-open handles are
   outside its protection ([namespace boundary](architecture.md#backing-namespace)).
-- Backing files must not share extents with reflink copies (`cp --reflink`,
-  and coreutils 9 `cp` by default on XFS or btrfs). `posix_fallocate` does not
-  unshare them, so an in-place overwrite can fail with ENOSPC despite Maki's
-  space reservation; Maki does not detect sharing
-  ([backing store](deployment/support-matrix.md#backing-store-below-maki)).
+- Maki's space reservation (`posix_fallocate`) holds only where the backing
+  filesystem overwrites allocated blocks in place. Backing files must not
+  share extents with reflink copies (`cp --reflink`, and coreutils 9 `cp` by
+  default on XFS or btrfs) or btrfs snapshots, and a copy-on-write backing
+  filesystem (btrfs with its default copy-on-write data, ZFS) is unsupported:
+  there an overwrite needs new space and can fail with ENOSPC despite the
+  reservation. btrfs with NOCOW backing files is not qualified. Maki detects
+  neither shared extents nor copy-on-write
+  ([backing store](deployment/support-matrix.md#backing-store-below-maki),
+  [copy-on-write filesystems](deployment/support-matrix.md#copy-on-write-filesystems)).
 - Admission limits cover Maki-owned engine work and plugin handles.
   nbdkit owns sockets and threads before plugin open; these limits do not
   establish a process-wide cap on negotiation resources.

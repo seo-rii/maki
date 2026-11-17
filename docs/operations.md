@@ -121,6 +121,13 @@ install -d -o maki -g maki -m 0700 /var/lib/maki/example
 sudo -u maki maki volume create /etc/maki/volumes/example.toml
 ```
 
+The backing filesystem must overwrite allocated blocks in place, or the
+space reservation does not hold. A copy-on-write backing (btrfs with its
+default copy-on-write data, ZFS) is unsupported. On btrfs, running
+`chattr +C /var/lib/maki/example` between the two commands makes every backing
+file created afterwards NOCOW; that configuration is not qualified
+([copy-on-write filesystems](deployment/support-matrix.md#copy-on-write-filesystems)).
+
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
 instance `example`:
@@ -173,7 +180,17 @@ line, printed before any `warning:` and `ERROR:` lines; the report ends with
 |---|---|---|
 | `clean` | Every allocated slot reads back and no unlisted slot holds a damaged header; ordinary replay of the journal is all the next attach does | None |
 | `recoverable` | Some slot payloads are damaged, but each such unit has a validated journal record newer than the checkpoint, so recovery rewrites (or discards) the slot before the volume is exposed. The report lists them as `warning: slot: recoverable: …` and `check passed` | Attach normally; re-run the deep check afterwards and expect `clean` |
-| `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
+| `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation in a way attach refuses. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
+
+A key canary with no valid copy is reported as `key canary: absent` or, when
+canary files exist but none validates, `key canary: copies exist but no copy
+validates`. Attach binds a new canary on a volume that holds no data, and on a
+volume with data only after an integrity-capable provider decrypts existing
+ciphertext; without such a provider, or with no ciphertext left (every unit
+trimmed), it refuses. The offline check does not know the provider, so it
+reports a lost canary as an `ERROR:` only when the volume has history but no
+ciphertext to probe, which every attach refuses; otherwise it is a `warning:`
+that says what attach needs.
 
 The check reads every slot the map lists and probes the header of every
 slot it does not list in an existing shard, exactly like the read path: a
@@ -653,6 +670,22 @@ service's other restrictions, including its filesystem view. The gate must
 still be able to read the trusted configuration/state and probe the verified LV
 under those restrictions: it opens `/dev/<vg>/<lv>`, so the unit must not use
 `PrivateDevices=yes`, and any `DevicePolicy=` must allow reading that node.
+It also opens the mounted volume's root directory and reads `.maki-sentinel`
+in it. The gate runs as root, but only with the capabilities the unit's
+`CapabilityBoundingSet=` keeps. If that drops both CAP_DAC_READ_SEARCH and
+CAP_DAC_OVERRIDE, the kernel checks the gate's opens against the mode bits as
+for any process with user and group root: it needs read and search
+permission on the volume root and read permission on the sentinel. A volume
+root owned by the workload user with mode `0700` (or `0750` with the
+workload's group) then fails the gate with EACCES (`Permission denied`), and
+so does a sentinel the workload replaced with one root cannot read (attach
+creates it root-owned, mode `0600`). For such a unit, keep CAP_DAC_READ_SEARCH
+(sufficient on its own) or CAP_DAC_OVERRIDE in the bounding set, or leave the
+volume root readable and searchable by others (for example `0755`) with the
+workload's private directory below it, as the
+[PostgreSQL guide](deployment/postgres.md) does. The gate retries an open only
+without `O_NOATIME`, when the kernel refuses that flag (it needs CAP_FOWNER
+for an inode root does not own), never after EACCES.
 Keep the configuration root-controlled; this is not a generic sudo grant. A
 failed check prevents that start. Qualify the service's actual mount namespace
 and sandbox on the target host. A host check cannot establish which
@@ -1054,7 +1087,8 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
 - Volume directories are created `0700` and their files `0600`; a `file`
-  credential must be a regular file with mode `0600` or `0400`, owned by root
+  credential must be a regular file with no group or other permission bits
+  (for example `0600` or `0400`), owned by root
   or by the user the daemon runs as, or attach is refused. A `credential`
   (systemd `LoadCredential=`) has the same owner rule and may also be `0440`
   when its group is the daemon's own or root, as systemd 257 (Debian 13)
