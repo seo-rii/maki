@@ -138,10 +138,13 @@ fn options() -> EngineOptions {
     }
 }
 
+/// The second write seals a one-record segment above the watermark, which
+/// wakes the worker into a pass that queries free space.
 fn low_space_options() -> EngineOptions {
     let mut options = options();
     options.checkpoint.low_space_checkpoint_bytes = 2 << 30;
     options.checkpoint.journal_high_watermark_bytes = 1;
+    options.volume.journal_segment_size = 1024;
     options
 }
 
@@ -295,6 +298,7 @@ async fn stopping_checkpoint_worker_waits_for_dispatched_space_query() {
 
     backing.gate.operation.store(SPACE, Ordering::SeqCst);
     engine.write(0, &[0x51; 1024], false).await.unwrap();
+    engine.write(1024, &[0x51; 1024], false).await.unwrap();
     backing.gate.entered.notified().await;
 
     let stopping_engine = engine.clone();
@@ -340,6 +344,7 @@ async fn cancelled_worker_stop_does_not_detach_the_worker() {
 
     backing.gate.operation.store(SPACE, Ordering::SeqCst);
     engine.write(0, &[0x61; 1024], false).await.unwrap();
+    engine.write(1024, &[0x61; 1024], false).await.unwrap();
     backing.gate.entered.notified().await;
 
     let first_engine = engine.clone();

@@ -206,6 +206,12 @@ impl Volume {
         self.journal.segment_count()
     }
 
+    /// Sealed journal segments on disk: what a checkpoint can delete (the
+    /// active segment is never deleted).
+    pub fn journal_sealed_segment_count(&self) -> usize {
+        self.journal.sealed_segment_count()
+    }
+
     /// Sealed segments the checkpoint already covers but that are still on
     /// disk (reclaimable by any checkpoint, even one with nothing new).
     pub fn journal_covered_segment_count(&self) -> usize {

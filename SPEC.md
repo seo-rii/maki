@@ -1290,11 +1290,18 @@ fsync journal directory
 Checkpoints MUST run automatically, not only at detach. Triggers:
 
 ```text
-journal bytes on disk >= journal_max_bytes / 2       (background worker, syncs first)
+journal bytes on disk >= journal_max_bytes / 2
+  and at least one sealed segment on disk            (background worker, syncs first)
 backing free space   <  checkpoint_reserve_bytes     (background worker, syncs first)
 interval elapsed with unapplied records              (background worker, syncs first)
 write would exceed journal_max_bytes                 (inline, before the append)
 ```
+
+A checkpoint deletes covered sealed segments and never the active one, so the
+journal-size trigger counts only a journal it can shrink. Half of a validated
+`journal_max_bytes` is above one segment, so the active segment alone never
+reaches it; an engine configured directly with a lower watermark still
+checkpoints for size once per sealed segment, not on every write.
 
 A write that would exceed `journal_max_bytes` after an inline checkpoint, or
 whose fresh backing-space observation does not cover
