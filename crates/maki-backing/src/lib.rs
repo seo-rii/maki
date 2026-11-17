@@ -95,8 +95,13 @@ pub trait BackingFile: Send + Sync {
     /// `mkfs.xfs` default since xfsprogs 5.1), a `cp --reflink` copy (GNU
     /// coreutils 9 `cp` defaults to `--reflink=auto`) shares every extent,
     /// `posix_fallocate` still returns success, and an in-place overwrite is
-    /// copy-on-write and can fail with ENOSPC. Copy-on-write filesystems are
-    /// not covered either. Backing files must not share extents with copies.
+    /// copy-on-write and can fail with ENOSPC. Backing files must not share
+    /// extents with copies. Nor does it cover a copy-on-write filesystem,
+    /// where every overwrite of data already written needs new space even
+    /// without sharing: btrfs by default, and ZFS. A btrfs NOCOW file
+    /// (`chattr +C` while it is still empty, or inherited from its directory
+    /// at creation) is overwritten in place unless btrfs falls back to
+    /// copy-on-write, as it does for an extent a snapshot or reflink shares.
     /// Allocation metadata may remain volatile after this call even when
     /// the file length is already durable. Call `sync_all` before publishing
     /// a journal record that depends on crash-surviving completion space.

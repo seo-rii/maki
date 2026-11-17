@@ -121,6 +121,13 @@ install -d -o maki -g maki -m 0700 /var/lib/maki/example
 sudo -u maki maki volume create /etc/maki/volumes/example.toml
 ```
 
+The backing filesystem must overwrite allocated blocks in place, or the
+space reservation does not hold. A copy-on-write backing (btrfs with its
+default copy-on-write data, ZFS) is unsupported. On btrfs, running
+`chattr +C /var/lib/maki/example` between the two commands makes every backing
+file created afterwards NOCOW; that configuration is not qualified
+([copy-on-write filesystems](deployment/support-matrix.md#copy-on-write-filesystems)).
+
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
 instance `example`:
