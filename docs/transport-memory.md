@@ -313,7 +313,8 @@ serialized output and a seed that rejects its deserializer before consuming
 it. Borrowed raw slices and public returned `Box<RawValue>` keep their original
 ownership. An arbitrary visitor receives ownership when its `visit_string`
 callback is invoked; its subsequent cleanup is the caller's responsibility.
-The parser's own conversion visitors immediately adopt that String again.
+The parser's own conversion visitors immediately adopt that String again;
+the borrowed `&RawValue` seed adopts it before rejecting text it cannot borrow.
 Owned-string and enum callbacks retain upstream behavior.
 
 The `arbitrary_precision` path also guards scanned number text, owned number-map

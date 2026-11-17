@@ -21,6 +21,7 @@ UTF-8, serializer and seed errors and normal unwinding. Borrowed raw input and
 public `Box<RawValue>` outputs keep their upstream ownership. Passing an owned
 String to an arbitrary visitor transfers cleanup responsibility at
 `visit_string`; the library's own visitors immediately adopt it again.
+The borrowed `&RawValue` seed also adopts owned text before rejecting it.
 The `arbitrary_precision` path guards scanned number text, owned number-map
 and seed storage, internal number-visitor handoffs and float display
 temporaries. Consuming a `Number` as a deserializer adopts its owned string
