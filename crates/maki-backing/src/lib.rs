@@ -102,10 +102,16 @@ pub trait BackingFile: Send + Sync {
     /// a journal record that depends on crash-surviving completion space.
     /// In-memory backings may model allocation by extending the file;
     /// extent-aware tests must track unwritten reservations separately.
+    /// A zero-length range reserves nothing: every backing returns success
+    /// without changing the file (Linux `fallocate(2)` itself would refuse
+    /// it with EINVAL).
     fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        if len == 0 {
+            return Ok(());
+        }
         if self.len()? < end {
             self.set_len(end)?;
         }

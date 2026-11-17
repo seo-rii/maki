@@ -183,6 +183,10 @@ impl BackingFile for RealFile {
         let _end = offset
             .checked_add(len)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocation overflow"))?;
+        if len == 0 {
+            // Nothing to reserve; posix_fallocate would fail with EINVAL.
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         {
             let offset = i64::try_from(offset).map_err(|_| {

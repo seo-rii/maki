@@ -461,6 +461,66 @@ fn planted_current_tombstone_and_original_collision_are_preserved() {
     }
 }
 
+/// Linux capability sets (`capget(2)`), version 3: two 32-bit words.
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_DAC_OVERRIDE: u32 = 1;
+
+fn capabilities(set: Option<&[CapabilityData; 2]>) -> io::Result<[CapabilityData; 2]> {
+    // pid 0 names the calling thread.
+    let mut header = CapabilityHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = set.copied().unwrap_or_default();
+    let call = if set.is_some() {
+        libc::SYS_capset
+    } else {
+        libc::SYS_capget
+    };
+    // SAFETY: both pointers reference live, correctly laid out structures
+    // for the duration of the call; capget writes two data words.
+    if unsafe { libc::syscall(call, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(data)
+}
+
+/// Clears `capability` from the calling thread's effective set until the
+/// guard drops. Linux credentials are per thread (libtest runs each test on
+/// its own thread), so concurrent tests keep theirs; an unprivileged user
+/// has nothing to clear.
+struct WithoutCapability([CapabilityData; 2]);
+
+impl WithoutCapability {
+    fn new(capability: u32) -> io::Result<Self> {
+        let saved = capabilities(None)?;
+        let mut reduced = saved;
+        reduced[(capability / 32) as usize].effective &= !(1 << (capability % 32));
+        capabilities(Some(&reduced))?;
+        Ok(Self(saved))
+    }
+}
+
+impl Drop for WithoutCapability {
+    fn drop(&mut self) {
+        let _ = capabilities(Some(&self.0));
+    }
+}
+
 #[test]
 fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current() {
     let _process = PROCESS_SPAWN
@@ -468,6 +528,15 @@ fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let (dir, disk) = root();
+    // The unlink failure is a directory without write permission, which
+    // CAP_DAC_OVERRIDE (root) ignores: give it up for this test's thread.
+    let _unprivileged = match WithoutCapability::new(CAP_DAC_OVERRIDE) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("skipping: cannot drop CAP_DAC_OVERRIDE ({error})");
+            return;
+        }
+    };
     let old = descriptor(1).namespace;
     let current = descriptor(3).namespace;
     populate(&disk, &old);
@@ -477,6 +546,10 @@ fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current
         std::fs::Permissions::from_mode(0o500),
     )
     .unwrap();
+    assert!(
+        disk.open(&format!("{old}/probe"), true).is_err(),
+        "a mode-0500 directory must refuse new entries for this test to inject an unlink failure"
+    );
     let rpc = authority(&disk, record(3));
     let result = OperationGuard::acquire(&disk).unwrap().collect(&rpc);
     assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
