@@ -1169,6 +1169,13 @@ A failed append MAY leave a partial physical tail, but subsequent appends and
 barriers MUST remove bytes beyond the last accepted record. Cleanup MUST stay
 pending until truncation and synchronization succeed, including before a roll.
 
+Segment creation MUST NOT extend a new segment file before its header is
+written. A header write that persists only a prefix then leaves a file shorter
+than a header, a creation crash that recovery discards, whereas a complete
+header that fails validation is durable damage. The header's storage is
+allocated by its write and made durable by the creation's data sync, before any
+record of the segment is reserved or accepted.
+
 Tracked state includes:
 
 ```text

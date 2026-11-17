@@ -4,7 +4,11 @@
 //! `durable_sequence`, and the active segment. Segment-creation protocol
 //! (create → header → fdatasync → dir fsync) completes before any record in
 //! the segment can be acknowledged, so a durable record can never live in a
-//! file whose dirent might vanish.
+//! file whose dirent might vanish. The file is not extended before its
+//! header is written, so a torn header write leaves a file shorter than a
+//! header or an all-zero one (creation crashes recovery discards), never a
+//! complete header that fails its checksum (durable damage, which recovery
+//! refuses).
 //!
 //! Durability boundary contract: `durable_sequence` only advances after a
 //! successful data sync and (for v2 volumes) mirrored proof publication.
@@ -399,7 +403,15 @@ impl JournalWriter {
             fp("journal.segment.create")?;
             let file = self.backing.open(&path, true)?;
             file.set_len(0)?;
-            file.allocate_range(0, SEGMENT_HEADER_SIZE as u64)?;
+            // Never extend the file before its header is written. A header
+            // write that persists only a prefix must leave a file shorter
+            // than a header, which recovery discards as an unfinished
+            // creation; a file preallocated to the full header length would
+            // instead show a complete header with a bad checksum, which
+            // recovery must treat as durable damage although the segment
+            // never held a record. The header's blocks are allocated by its
+            // write and made durable by the sync below, before any record
+            // (with its own exact-range reservation) can follow.
             let header = SegmentHeader {
                 segment_index: index,
                 volume_uuid: self.volume_uuid,
