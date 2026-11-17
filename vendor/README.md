@@ -66,6 +66,16 @@ addresses the I/O-safety warning
 The standalone lockfile hash is recorded in `patches.json`; the vendored
 plaintext-erasure source patches are unchanged.
 
+The standalone `hyper` and `tungstenite` test graphs use `env_logger` 0.11.11
+instead of logger versions that depend on unmaintained `humantime`
+([RUSTSEC-2026-0542](https://rustsec.org/advisories/RUSTSEC-2026-0542.html)).
+Hyper keeps the upstream `pretty_env_logger` dependency name as an alias for
+`env_logger`, whose `try_init` API its tests already use. Tungstenite's lockfile
+also updates the Serde and procedural-macro dependencies required by the new
+logger's timestamp dependency. These changes affect standalone vendor tests;
+the workspace lockfile, production logging and plaintext-erasure code are
+unchanged. The manifest and lockfile hashes are recorded in `patches.json`.
+
 The unbuffered TLS 1.3 regression tests lower the record limit and send the
 bytes returned by `WriteTraffic::encrypt` directly to a peer. They verify that
 an automatic KeyUpdate precedes application data in the same output, including
