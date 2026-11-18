@@ -78,9 +78,10 @@ pub fn parse(text: &str) -> Result<AttachConfig, ConfigError> {
     })
 }
 
-pub fn load(path: &str) -> Result<AttachConfig, ConfigError> {
+pub fn load(path: impl AsRef<std::path::Path>) -> Result<AttachConfig, ConfigError> {
+    let path = path.as_ref();
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_string(),
+        path: path.display().to_string(),
         source,
     })?;
     parse(&text)
@@ -127,6 +128,12 @@ impl AttachConfig {
             .or(self.nbd_socket)
             .unwrap_or_else(|| format!("/run/maki/{volume}/nbd.sock"));
         check_abs_path("nbd_socket", &nbd_socket)?;
+        #[cfg(unix)]
+        if std::os::unix::net::SocketAddr::from_pathname(&nbd_socket).is_err() {
+            return Err(ConfigError::Invalid(
+                "nbd_socket is not a usable Unix socket pathname".into(),
+            ));
+        }
         let vg_name = overrides
             .vg_name
             .or(self.vg_name)
@@ -152,10 +159,18 @@ impl AttachConfig {
             ));
         }
         let device_block_size = self.device_block_size.unwrap_or(4096);
-        if device_block_size == 0 || !device_block_size.is_power_of_two() {
-            return Err(ConfigError::Invalid(
-                "device_block_size must be a power of two".into(),
-            ));
+        // Linux BLKBSZSET accepts powers of two from 512 through PAGE_SIZE.
+        #[cfg(target_os = "linux")]
+        let maximum_block_size = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .map_err(|_| ConfigError::Invalid("cannot determine the kernel page size".into()))?;
+        #[cfg(not(target_os = "linux"))]
+        let maximum_block_size = 65536;
+        if !(512..=maximum_block_size).contains(&device_block_size)
+            || !device_block_size.is_power_of_two()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "device_block_size must be a power of two between 512 and {maximum_block_size}"
+            )));
         }
         let volume_uuid = match overrides.volume_uuid.or(self.volume_uuid) {
             Some(uuid) => {

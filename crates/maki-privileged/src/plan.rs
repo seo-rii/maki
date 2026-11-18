@@ -56,6 +56,8 @@ pub struct AttachRequest {
 #[derive(Debug, Clone)]
 pub struct GrowRequest {
     pub volume: String,
+    /// A concrete device pin, or AUTO_NBD_DEVICE to use the attachment record.
+    pub nbd_device: String,
     /// The Maki volume UUID and NBD socket of the attachment being grown;
     /// carried so the executor can verify the grow against the trusted
     /// attach record before running LVM/XFS commands (BUG-018).
@@ -122,6 +124,7 @@ pub enum PlannedStep {
         device: String,
     },
     LvExtend {
+        nbd_device: String,
         vg_name: String,
         lv_name: String,
         target_bytes: u64,
@@ -208,7 +211,7 @@ impl fmt::Display for PlannedStep {
                 volume_uuid,
             } => write!(
                 f,
-                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (only if absent)"
+                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (create if absent, rewrite and sync a matching UUID, refuse a different UUID)"
             ),
             PlannedStep::VerifyMountIdentity {
                 mountpoint,
@@ -230,6 +233,7 @@ impl fmt::Display for PlannedStep {
                 vg_name,
                 lv_name,
                 target_bytes,
+                ..
             } => write!(f, "lvextend -L {target_bytes}b {vg_name}/{lv_name}"),
             PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {mountpoint}"),
         }
@@ -434,11 +438,20 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
 /// Online growth (SPEC §38): `lvextend` then `xfs_growfs`; no NBD resize.
 pub fn plan_grow(request: &GrowRequest) -> Plan {
     Plan {
-        description: format!("grow volume {}", request.volume),
+        description: format!(
+            "grow volume {} on {}",
+            request.volume,
+            if request.nbd_device == AUTO_NBD_DEVICE {
+                "the recorded NBD device"
+            } else {
+                &request.nbd_device
+            }
+        ),
         volume: request.volume.clone(),
         attachment: Some(request.into()),
         steps: vec![
             PlannedStep::LvExtend {
+                nbd_device: request.nbd_device.clone(),
                 vg_name: request.vg_name.clone(),
                 lv_name: request.lv_name.clone(),
                 target_bytes: request.target_bytes,

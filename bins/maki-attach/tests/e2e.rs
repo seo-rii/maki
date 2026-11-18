@@ -46,10 +46,12 @@ fn detach_and_grow_plans_print() {
         "v3",
         "--size-bytes",
         "1048576",
+        "--nbd-device",
+        "/dev/nbd7",
         "--plan",
     ]);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("grow"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("grow volume v3 on /dev/nbd7"));
 
     // grow without --size-bytes is a usage error.
     let out = run(&["grow", "--volume", "v3", "--plan"]);
@@ -254,4 +256,33 @@ fn executing_verbs_refuse_an_attach_config_a_non_root_user_controls() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_reads_a_config_with_a_non_utf8_filename() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9.toml"));
+    std::fs::write(&path, "mountpoint = \"/srv/native-path\"\n").unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+        .args(["attach", "--volume", "example", "--plan", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("/srv/native-path"));
+
+    let invalid_name = std::process::Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+        .args(["attach", "--plan", "--volume"])
+        .arg(std::ffi::OsStr::from_bytes(b"t\xe9"))
+        .output()
+        .unwrap();
+    assert_eq!(invalid_name.status.code(), Some(2));
 }

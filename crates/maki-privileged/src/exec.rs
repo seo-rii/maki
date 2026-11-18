@@ -149,8 +149,9 @@ fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError
 /// access, read through held descriptors. The verb runs as root on what the
 /// file says (mountpoint, VG, NBD socket), so a file a non-root user could
 /// write would hand them those choices (R5-030).
-pub fn load_trusted_config(path: &str) -> Result<crate::config::AttachConfig, String> {
-    let text = crate::state::read_verify_config(Path::new(path)).map_err(|error| {
+pub fn load_trusted_config(path: impl AsRef<Path>) -> Result<crate::config::AttachConfig, String> {
+    let path = path.as_ref();
+    let text = crate::state::read_verify_config(path).map_err(|error| {
         format!(
             "attach config {path:?} must be a root-owned regular file below root-owned \
              directories without group/other write access: {error}"
@@ -724,6 +725,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             vg_name,
             lv_name,
             target_bytes,
+            ..
         } => run(
             step,
             "lvextend",
@@ -1001,6 +1003,9 @@ fn verify_live_attachment(
             "attachment is not fully live (mount or VG mapping missing); refusing to grow",
         ));
     }
+    if !observed.writable {
+        return Err(identity_error("grow requires a writable XFS mount"));
+    }
     if let Some(proof) = &record.recovery {
         proof.verify_growth_topology(record)?;
     }
@@ -1227,7 +1232,7 @@ fn execute_with_options(
             if plan.attachment.as_ref() != Some(&prior.attachment)
                 || plan.steps.iter().any(|step| {
                     matches!(step,
-                        PlannedStep::NbdDisconnect { device }
+                        PlannedStep::NbdDisconnect { device } | PlannedStep::LvExtend { nbd_device: device, .. }
                             if device != crate::plan::AUTO_NBD_DEVICE && device != &prior.device
                     )
                 })
@@ -1320,6 +1325,7 @@ fn execute_with_options(
                 vg_name,
                 lv_name,
                 target_bytes,
+                ..
             } = step
             {
                 if *target_bytes == 0 {
@@ -1534,8 +1540,8 @@ pub fn cleanup(plan: &Plan) -> Result<(), ExecError> {
 
 /// Check the current caller namespace's complete attachment before starting
 /// a workload. Uses existing trusted state and config only, without repairs.
-pub fn verify(volume: &str, config_path: &str) -> Result<(), ExecError> {
-    workload_verify::execute(volume, config_path)
+pub fn verify(volume: &str, config_path: impl AsRef<Path>) -> Result<(), ExecError> {
+    workload_verify::execute(volume, config_path.as_ref())
 }
 
 fn recover_with(

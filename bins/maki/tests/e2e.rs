@@ -269,3 +269,52 @@ fn drain_command_propagates_the_control_result() {
         }
     }
 }
+
+#[test]
+fn helper_hint_preserves_the_operation_and_shell_arguments() {
+    for verb in ["attach", "detach", "grow"] {
+        let result = maki(
+            &[
+                verb,
+                "--volume",
+                "example",
+                "--mountpoint",
+                "/srv/dog's bed",
+            ],
+            None,
+        );
+        assert_eq!(result.status.code(), Some(3));
+        let hint = stderr(&result);
+        assert!(
+            hint.contains(&format!(
+                "maki-attach {verb} --volume example --mountpoint '/srv/dog'\\''s bed'"
+            )),
+            "{hint}"
+        );
+        assert!(!hint.contains("systemctl"), "{hint}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_reads_a_config_with_a_non_utf8_filename() {
+    use std::os::unix::ffi::OsStrExt;
+    let vol = setup("nativepath", "e2e-cli-key");
+    let create = maki(
+        &["volume", "create", &vol.config_path],
+        Some(("MAKI_CREDENTIAL_E2E_CLI_KEY", KEY_HEX)),
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let path = vol
+        ._dir
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9.toml"));
+    std::fs::rename(&vol.config_path, &path).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(["volume", "inspect"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(stdout(&result).contains("nativepath"));
+}

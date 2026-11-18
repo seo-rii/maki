@@ -36,8 +36,11 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn read_config(path: &str) -> Result<maki_format::config::VolumeConfig, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+fn read_config(
+    path: impl AsRef<std::path::Path>,
+) -> Result<maki_format::config::VolumeConfig, String> {
+    let path = path.as_ref();
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cfg = maki_format::config::parse_config(&raw).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -153,7 +156,24 @@ fn main() -> ExitCode {
     if let Err(e) = maki_backing::raise_open_file_limit() {
         eprintln!("warning: cannot raise the open-file soft limit: {e}");
     }
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [volume, verb, config] = raw_args.as_slice() {
+        if volume == "volume" && verb == "inspect" && config != "--socket" && config != "--timeout"
+        {
+            return match inspect(std::path::Path::new(config)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(error),
+            };
+        }
+    }
+    let Ok(mut args) = raw_args
+        .into_iter()
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        eprintln!("error: command-line arguments must be valid UTF-8");
+        return ExitCode::from(2);
+    };
     // Helper options belong to the helper, including its NBD --socket
     // override. Preserve them before interpreting any control options.
     if matches!(
@@ -243,10 +263,6 @@ fn main() -> ExitCode {
                 Err(error) => fail(error),
             }
         }
-        ["volume", "inspect", config] => match inspect(config) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(e),
-        },
         ["check", config] => match check(config, false) {
             Ok(clean) => {
                 if clean {
@@ -311,12 +327,25 @@ fn main() -> ExitCode {
     }
 }
 
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn privileged_helper(args: &[String]) -> ExitCode {
-    eprintln!(
-        "this operation requires the privileged helper: run `maki-attach {}` \
-         (or systemctl start maki-attach@<volume>)",
-        args.join(" ")
-    );
+    let command = args
+        .iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("this operation requires the privileged helper: run `maki-attach {command}`");
     ExitCode::from(3)
 }
 
@@ -424,7 +453,9 @@ fn ownership_hint(
             "the volume tree {root} and the rollback witness in {witness} were created \
              owner-only by root; the daemon runs as the maki user and cannot open them. Run \
              `maki volume create` as that user (sudo -u maki ...) or \
-             `chown -R maki:maki {root} {witness}` before starting the service"
+             `chown -R maki:maki {root_arg} {witness_arg}` before starting the service",
+            root_arg = shell_word(root),
+            witness_arg = shell_word(witness)
         ),
         None => "the volume tree was created owner-only by root; the daemon runs as the maki \
                  user and cannot open it. Run `maki volume create` as that user \
@@ -641,6 +672,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
         }
         ["snapshot", _, directory] => {
             let target = Path::new(directory);
+            RollbackBacking::check_snapshot_destination(target).map_err(|e| e.to_string())?;
             let backing = RollbackBacking::open_remote(Path::new(&cfg.backing.root), rpc.clone())
                 .map_err(|e| e.to_string())?;
             let descriptor = backing.snapshot_remote(target).map_err(|e| e.to_string())?;
@@ -736,7 +768,7 @@ fn existing_backing(
     maki_nbdkit::daemon::build_backing(cfg).map_err(|error| error.to_string())
 }
 
-fn inspect(config: &str) -> Result<(), String> {
+fn inspect(config: &std::path::Path) -> Result<(), String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())

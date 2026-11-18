@@ -53,6 +53,8 @@ fn remote_witness_requires_bounded_authenticated_transport() {
         ("127.0.0.1:9443", "witness.example.test:9443"),
         ("127.0.0.1:9443", "127.0.0.1:0"),
         ("witness.example.test", ""),
+        ("witness.example.test", "witness.example.test:9443"),
+        ("witness.example.test", "witness..test"),
         ("timeout_ms = 1500", "timeout_ms = 0"),
         ("timeout_ms = 1500", "timeout_ms = 60001"),
         ("/etc/maki/witness-ca.pem", "relative.pem"),
@@ -88,5 +90,14 @@ fn multiple_witness_addresses_require_an_explicit_storage_identity() {
                 .is_err(),
             "accepted {bad}"
         );
+    }
+}
+
+#[test]
+fn witness_tls_names_accept_both_ip_families() {
+    for address in ["127.0.0.1", "::1"] {
+        let cfg =
+            parse_config(&config(&remote().replace("witness.example.test", address))).unwrap();
+        cfg.validate().unwrap();
     }
 }

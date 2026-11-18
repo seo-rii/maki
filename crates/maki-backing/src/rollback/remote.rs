@@ -249,8 +249,7 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
     Ok(disk)
 }
 
-/// Called with both root operation and enrollment locks held.
-fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
     if disk.list("")?.iter().any(|name| {
         !matches!(
             name.as_str(),
@@ -259,6 +258,12 @@ fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
     }) {
         return Err(input("remote enrollment requires an empty backing"));
     }
+    Ok(())
+}
+
+/// Called with both root operation and enrollment locks held.
+fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+    require_empty_remote_root(disk)?;
     let marker = disk.open(MARKER, true)?;
     marker.write_at(0, REMOTE_MAGIC)?;
     marker.set_len(REMOTE_MAGIC.len() as u64)?;
@@ -766,6 +771,17 @@ impl RollbackBacking {
         )?;
         collect_after_activation(&guard, rpc.as_ref(), None);
         Ok(result)
+    }
+
+    /// Refuse an occupied or unreadable destination before claiming a writer.
+    /// A missing directory is created by the copy, which rechecks emptiness
+    /// under the destination locks even if this preflight succeeded.
+    pub fn check_snapshot_destination(target: &Path) -> io::Result<()> {
+        match FileBacking::read_only(target) {
+            Ok(disk) => require_empty_remote_root(&disk),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Copy the committed state under the session mutex. The caller must keep

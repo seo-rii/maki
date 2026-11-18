@@ -861,3 +861,15 @@ fn websocket_and_grpc_timeouts_must_be_positive() {
         ));
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_socket_path_lengths_are_checked_in_bytes() {
+    for section in ["nbd", "control"] {
+        for (suffix, valid) in [("", true), ("x", false)] {
+            let path = format!("/{}{suffix}", "é".repeat(53));
+            let cfg = parse(&format!("{}[{section}]\nsocket = {path:?}\n", local()));
+            assert_eq!(cfg.validate().is_ok(), valid, "{section}: {path}");
+        }
+    }
+}

@@ -654,3 +654,41 @@ fn pinned_nbd_devices_must_be_canonical() {
         assert!(result.is_err(), "{device} must be refused");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_checks_the_socket_path_byte_limit() {
+    for (suffix, valid) in [("", true), ("x", false)] {
+        let cfg = AttachConfig {
+            nbd_socket: Some(format!("/{}{suffix}", "é".repeat(53))),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.into_request("pg", AttachOverrides::default(), false)
+                .is_ok(),
+            valid
+        );
+    }
+}
+
+#[test]
+fn attach_checks_device_block_size_before_planning() {
+    for (size, valid) in [
+        (256, false),
+        (512, true),
+        (768, false),
+        (4096, true),
+        (1 << 30, false),
+    ] {
+        let cfg = AttachConfig {
+            device_block_size: Some(size),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.into_request("pg", AttachOverrides::default(), false)
+                .is_ok(),
+            valid,
+            "{size}"
+        );
+    }
+}
