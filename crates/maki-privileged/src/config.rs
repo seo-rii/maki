@@ -127,6 +127,10 @@ impl AttachConfig {
             .or(self.nbd_socket)
             .unwrap_or_else(|| format!("/run/maki/{volume}/nbd.sock"));
         check_abs_path("nbd_socket", &nbd_socket)?;
+        #[cfg(unix)]
+        if std::os::unix::net::SocketAddr::from_pathname(&nbd_socket).is_err() {
+            return Err(ConfigError::Invalid("nbd_socket is not a usable Unix socket pathname".into()));
+        }
         let vg_name = overrides
             .vg_name
             .or(self.vg_name)

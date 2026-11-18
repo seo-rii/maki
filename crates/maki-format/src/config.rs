@@ -2058,6 +2058,10 @@ impl VolumeConfig {
                         "{name} {socket:?} must be an absolute path"
                     )));
                 }
+                #[cfg(unix)]
+                if socket.contains('\0') || std::os::unix::net::SocketAddr::from_pathname(socket).is_err() {
+                    return Err(invalid(format!("{name} is not a usable Unix socket pathname")));
+                }
             }
         }
         // Binding the control socket reclaims a dead socket at its path, so

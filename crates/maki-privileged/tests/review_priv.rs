@@ -654,3 +654,12 @@ fn pinned_nbd_devices_must_be_canonical() {
         assert!(result.is_err(), "{device} must be refused");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_checks_the_socket_path_byte_limit() {
+    for (suffix, valid) in [("", true), ("x", false)] {
+        let cfg = AttachConfig { nbd_socket: Some(format!("/{}{suffix}", "é".repeat(53))), ..Default::default() };
+        assert_eq!(cfg.into_request("pg", AttachOverrides::default(), false).is_ok(), valid);
+    }
+}
