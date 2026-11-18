@@ -547,6 +547,15 @@ class DebianPackageTests(unittest.TestCase):
         stderr = self.build_failure("invalid.deb")
         self.assertIn("maki-check", stderr)
 
+    def test_rebuild_replaces_the_directory_entry_after_output_is_complete(self):
+        output = self.work / "maki.deb"
+        output.write_bytes(b"previous package")
+        previous = self.work / "previous.deb"
+        os.link(output, previous)
+        self.build()
+        self.assertEqual(previous.read_bytes(), b"previous package")
+        self.assertEqual(self.field(output, "Package"), "maki")
+
     def test_build_succeeds_with_restrictive_caller_umask(self):
         package = self.build(umask=0o077)
         root, control = self.extract(package, "restrictive-umask")

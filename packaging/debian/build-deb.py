@@ -431,19 +431,20 @@ def main():
         create_tree(package_root, args)
         normalize_directory_permissions(package_root)
         normalize_timestamps(package_root, epoch)
-        temporary_output = pathlib.Path(temporary) / "maki.deb"
-        subprocess.run(
-            [
-                "dpkg-deb",
-                "--build",
-                "--root-owner-group",
-                str(package_root),
-                str(temporary_output),
-            ],
-            check=True,
-        )
-        shutil.copyfile(temporary_output, args.output)
-        args.output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        with tempfile.TemporaryDirectory(prefix=".maki-deb-", dir=args.output.parent) as staging:
+            temporary_output = pathlib.Path(staging) / "maki.deb"
+            subprocess.run(
+                [
+                    "dpkg-deb",
+                    "--build",
+                    "--root-owner-group",
+                    str(package_root),
+                    str(temporary_output),
+                ],
+                check=True,
+            )
+            temporary_output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            temporary_output.replace(args.output)
     print(args.output)
 
 
