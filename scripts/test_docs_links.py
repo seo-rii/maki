@@ -117,6 +117,15 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", '`<a id="sample"> [sample](inside.md)`\n[real](#sample)\n')
         self.assertEqual(broken_links(self.root), ["README.md:2: #sample (missing anchor)"])
 
+    def test_inline_destinations_with_spaces_parentheses_and_titles(self):
+        self.write("User Guide.md", "## here\n")
+        self.write("right(one).md", "# yes\n")
+        self.write("README.md", "[guide](User%20Guide.md#here)\n[guide](<User Guide.md>)\n"
+                   "[guide](right(one).md 'title')\n[item](<Missing Guide.md>)\n"
+                   "[![image](missing.png)](right(one).md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:4: Missing Guide.md", "README.md:5: missing.png"])
+
     def test_regular_link_filtering_and_locations_are_preserved(self):
         self.write("target.md", "# Present\n\n## Heading\n")
         self.write("README.md", """[Present](target.md#heading)

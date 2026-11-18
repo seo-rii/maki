@@ -40,7 +40,6 @@ import sys
 import unicodedata
 import urllib.parse
 
-LINK = re.compile(r"(?<!\\)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 SKIP_PREFIXES = ("http://", "https://", "mailto:")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
@@ -191,6 +190,43 @@ def link_destination(text, start):
     if index == start or depth:
         return None
     return text[start:index], index
+
+
+def inline_destinations(line):
+    """Find inline link and image destinations, including nested image labels."""
+    masked = mask_code_spans(line)
+    opens = []
+    index = 0
+    while index < len(masked):
+        char = masked[index]
+        index += 1
+        if char == "\\":
+            index += 1
+        elif char == "[":
+            opens.append(index)
+        elif char == "]" and opens:
+            opens.pop()
+            if masked[index:index + 1] != "(":
+                continue
+            start = index + 1
+            while line[start:start + 1] in (" ", "\t"):
+                start += 1
+            parsed = link_destination(line, start)
+            if parsed is None:
+                continue
+            destination, end = parsed
+            tail = end
+            while line[tail:tail + 1] in (" ", "\t"):
+                tail += 1
+            if tail > end and line[tail:tail + 1] in ('"', "'", "("):
+                tail = link_title_end(line, tail)
+                if tail == -1:
+                    continue
+                while line[tail:tail + 1] in (" ", "\t"):
+                    tail += 1
+            if line[tail:tail + 1] == ")":
+                yield unescape(destination)
+                index = tail + 1
 
 
 def link_title_end(text, start):
@@ -596,7 +632,7 @@ def broken_links(root):
         if not target or target.startswith(SKIP_PREFIXES):
             return None
         file_part, _, fragment = target.partition("#")
-        target_path = path.parent / file_part if file_part else path
+        target_path = path.parent / urllib.parse.unquote(file_part) if file_part else path
         if not target_path.exists():
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
@@ -624,8 +660,8 @@ def broken_links(root):
         ]
         for number, line in unfenced_lines(text):
             problems.extend(
-                (number, target_problem(path, content, match.group(1)))
-                for match in LINK.finditer(mask_code_spans(line))
+                (number, target_problem(path, content, destination))
+                for destination in inline_destinations(line)
             )
             problems.extend(
                 (number, f"{reference} (undefined reference)")
