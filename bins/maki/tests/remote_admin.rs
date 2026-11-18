@@ -277,7 +277,8 @@ fn snapshot_is_durable_canonical_and_refuses_live_writer_or_existing_target() {
     let descriptor: Descriptor = serde_json::from_slice(&output.stdout).unwrap();
     let bytes = std::fs::read(target.join("snapshot.json")).unwrap();
     assert_eq!(bytes, serde_json::to_vec(&descriptor).unwrap());
-    assert_eq!(inspect(fixture.writer.as_ref()).phase, Phase::Released);
+    let before = inspect(fixture.writer.as_ref());
+    assert_eq!(before.phase, Phase::Released);
     assert!(!run(&[
         "volume",
         "snapshot",
@@ -286,6 +287,7 @@ fn snapshot_is_durable_canonical_and_refuses_live_writer_or_existing_target() {
     ])
     .status
     .success());
+    assert_eq!(inspect(fixture.writer.as_ref()), before);
     assert_eq!(std::fs::read(target.join("snapshot.json")).unwrap(), bytes);
 }
 

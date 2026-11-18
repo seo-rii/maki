@@ -648,6 +648,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
         }
         ["snapshot", _, directory] => {
             let target = Path::new(directory);
+            RollbackBacking::check_snapshot_destination(target).map_err(|e| e.to_string())?;
             let backing = RollbackBacking::open_remote(Path::new(&cfg.backing.root), rpc.clone())
                 .map_err(|e| e.to_string())?;
             let descriptor = backing.snapshot_remote(target).map_err(|e| e.to_string())?;
