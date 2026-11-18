@@ -21,7 +21,7 @@
 //! Frame sizes are bounded in both directions. Invalid receive framing is
 //! an endpoint contract failure, so that operation is never resent to it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,13 +119,34 @@ impl std::fmt::Debug for WsProviderSpec {
     }
 }
 
-/// id → (connection generation the request was sent on, its item count,
-/// responder). The generation lets a dying connection's sweep fail only *its
-/// own* requests — never ones already in flight on a successor connection.
-/// The item counts bound how many response items the reader keeps.
-type Pending = Arc<
-    parking_lot::Mutex<HashMap<u64, (u64, usize, oneshot::Sender<Result<Value, CryptoError>>)>>,
->;
+/// Each connection owns its replies, including while it drains after replacement.
+type Pending = Arc<parking_lot::Mutex<PendingReplies>>;
+type Reply = oneshot::Sender<Result<Value, CryptoError>>;
+
+#[derive(Default)]
+struct PendingReplies {
+    by_id: HashMap<u64, (usize, Reply)>,
+    by_size: BTreeSet<(usize, u64)>,
+}
+
+impl PendingReplies {
+    fn insert(&mut self, id: u64, items: usize, reply: Reply) {
+        if let Some((old, _)) = self.by_id.insert(id, (items, reply)) {
+            self.by_size.remove(&(old, id));
+        }
+        self.by_size.insert((items, id));
+    }
+
+    fn remove(&mut self, id: u64) -> Option<Reply> {
+        let (items, reply) = self.by_id.remove(&id)?;
+        self.by_size.remove(&(items, id));
+        Some(reply)
+    }
+
+    fn max_items(&self) -> usize {
+        self.by_size.last().map_or(0, |(items, _)| *items)
+    }
+}
 
 struct Connection {
     sender: mpsc::Sender<QueuedMessage>,
@@ -208,7 +229,6 @@ impl ConnectionCancellation {
 
 struct PendingRequest {
     id: u64,
-    pending: Pending,
     cancellation: ConnectionCancellation,
     queued: QueuedMessage,
     // Keep the writer alive when a replacement evicts a draining connection
@@ -219,7 +239,7 @@ struct PendingRequest {
 
 impl Drop for PendingRequest {
     fn drop(&mut self) {
-        self.pending.lock().remove(&self.id);
+        self.cancellation.pending.lock().remove(self.id);
         self.queued.lock().take();
         self.cancellation.finish_request(self.completed);
     }
@@ -247,7 +267,6 @@ pub struct WsCryptoProvider {
     spec: WsProviderSpec,
     tls_connector: Result<Option<Connector>, String>,
     connection: AsyncMutex<Option<Connection>>,
-    pending: Pending,
     next_id: AtomicU64,
     generation: AtomicU64,
     /// Highest connection generation whose reader has exited. A registered
@@ -323,7 +342,6 @@ impl WsCryptoProvider {
             spec,
             tls_connector,
             connection: AsyncMutex::new(None),
-            pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             generation: AtomicU64::new(0),
             dead_generation: Arc::new(AtomicU64::new(0)),
@@ -341,7 +359,6 @@ impl WsCryptoProvider {
             spec,
             tls_connector: Ok(tls_connector),
             connection: AsyncMutex::new(None),
-            pending: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             generation: AtomicU64::new(0),
             dead_generation: Arc::new(AtomicU64::new(0)),
@@ -430,15 +447,10 @@ impl WsCryptoProvider {
         // reconnect could see the dead flag and retire this connection with
         // a generic Retryable sweep before its Contract reaches the callers.
         dead_generation.fetch_max(generation, Ordering::SeqCst);
-        let ids: Vec<u64> = map
-            .iter()
-            .filter(|(_, (g, _, _))| *g == generation)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            if let Some((_, _, tx)) = map.remove(&id) {
-                let _ = tx.send(Err(failure.duplicate()));
-            }
+        let replies = std::mem::take(&mut *map);
+        drop(map);
+        for (_, tx) in replies.by_id.into_values() {
+            let _ = tx.send(Err(failure.duplicate()));
         }
     }
 
@@ -511,9 +523,10 @@ impl WsCryptoProvider {
         };
 
         // Correlate responses only with requests on this generation.
-        let pending = self.pending.clone();
+        let pending = Pending::default();
+        let connection_pending = pending.clone();
         let dead_generation = self.dead_generation.clone();
-        let reader_pending = self.pending.clone();
+        let reader_pending = pending.clone();
         let reader = async move {
             loop {
                 match source.next().await {
@@ -553,13 +566,7 @@ impl WsCryptoProvider {
                         // Later items are only counted, so a frame of many
                         // small items costs no more than the items it may
                         // carry (`max_frame_bytes` bounds only wire bytes).
-                        let items = reader_pending
-                            .lock()
-                            .values()
-                            .filter(|(g, _, _)| *g == generation)
-                            .map(|(_, items, _)| *items)
-                            .max()
-                            .unwrap_or(0);
+                        let items = reader_pending.lock().max_items();
                         let Ok(value) = frame.parse(items) else {
                             return violation("a text frame that is not a JSON response");
                         };
@@ -581,16 +588,9 @@ impl WsCryptoProvider {
                         } else {
                             Ok(value)
                         };
-                        let response = {
-                            let mut pending = reader_pending.lock();
-                            if pending.get(&id).is_some_and(|(g, _, _)| *g == generation) {
-                                pending.remove(&id)
-                            } else {
-                                None
-                            }
-                        };
+                        let response = reader_pending.lock().remove(id);
                         match response {
-                            Some((_, _, tx)) => {
+                            Some(tx) => {
                                 let _ = tx.send(frame);
                             }
                             None => {
@@ -649,7 +649,7 @@ impl WsCryptoProvider {
             generation,
             cancellation: ConnectionCancellation {
                 task: task.abort_handle(),
-                pending: self.pending.clone(),
+                pending: connection_pending,
                 dead_generation: self.dead_generation.clone(),
                 generation,
                 owners: Arc::new(parking_lot::Mutex::new(RequestOwners {
@@ -688,9 +688,9 @@ impl WsCryptoProvider {
                 // mark/sweep dead generations, so a dying reader cannot miss
                 // a request registered just after its final sweep.
                 let registered = {
-                    let mut pending = self.pending.lock();
+                    let mut pending = conn.cancellation.pending.lock();
                     if conn.cancellation.register() {
-                        pending.insert(id, (conn.generation, items, reply.take().unwrap()));
+                        pending.insert(id, items, reply.take().unwrap());
                         true
                     } else {
                         false
@@ -714,7 +714,6 @@ impl WsCryptoProvider {
             let generation = conn.generation;
             let pending_request = PendingRequest {
                 id,
-                pending: self.pending.clone(),
                 cancellation: conn.cancellation.clone(),
                 queued: queued.clone(),
                 _sender: conn.sender.clone(),
@@ -986,3 +985,23 @@ mod connect_deadline_tests;
 
 #[cfg(test)]
 mod cancellation_tests;
+
+#[cfg(test)]
+mod pending_reply_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_limit_tracks_surviving_requests_on_this_connection() {
+        let mut pending = PendingReplies::default();
+        for (id, items) in [(1, 2), (2, 8), (3, 8)] {
+            pending.insert(id, items, oneshot::channel().0);
+        }
+        assert_eq!(pending.max_items(), 8);
+        pending.remove(2);
+        assert_eq!(pending.max_items(), 8);
+        pending.remove(3);
+        assert_eq!(pending.max_items(), 2);
+        pending.remove(1);
+        assert_eq!(pending.max_items(), 0);
+    }
+}

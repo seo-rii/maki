@@ -394,6 +394,8 @@ sources:
 | `format_version` | the on-disk format version, an unsigned JSON integer |
 | `batch_index` | the item's position in its request, an unsigned JSON integer |
 
+Every JSON request maps a per-item `payload`. Batch requests also map the volume
+`unit_index` so the server can echo it, including when context binding is disabled.
 Only `payload` takes an `encoding`. A per-item body sends `fields` once per
 item and takes no `item_fields`. A batch body sends `fields` once per request,
 so they may carry only `volume_id`, `compatibility_id` and `format_version`
@@ -529,6 +531,12 @@ when its final caller leaves. Other callers in that batch can still complete.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
+A gateway endpoint path prefixes the method path. Endpoint query parameters precede
+method query parameters on the request. ASCII metadata names are case-insensitive
+and unique. Binary keys ending in `-bin` and the protocol fields `te`,
+`content-type`, `user-agent`, `grpc-message`, `grpc-message-type`, and
+`grpc-status` are rejected in configured metadata.
+
 Service method paths are configurable (`encrypt_path` and `decrypt_path`,
 default `/maki.CryptoService/EncryptBatch` and `/maki.CryptoService/DecryptBatch`;
 a gateway prefix or a query is sent unchanged), but request and response

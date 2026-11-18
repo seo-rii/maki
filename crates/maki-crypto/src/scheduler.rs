@@ -660,9 +660,10 @@ fn deliver<O>(
     replies: Vec<oneshot::Sender<Result<Vec<O>, CryptoError>>>,
 ) {
     match result {
-        Ok(mut out) if out.len() == items => {
+        Ok(out) if out.len() == items => {
+            let mut out = out.into_iter();
             for (len, reply) in lengths.into_iter().zip(replies) {
-                let part: Vec<O> = out.drain(..len).collect();
+                let part: Vec<O> = out.by_ref().take(len).collect();
                 let _ = reply.send(Ok(part));
             }
         }

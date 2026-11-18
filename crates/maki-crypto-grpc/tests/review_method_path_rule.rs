@@ -136,3 +136,41 @@ fn verdict(accepted: bool) -> &'static str {
         "refuses"
     }
 }
+
+#[tokio::test]
+async fn gateway_prefix_and_query_are_part_of_the_unary_route() {
+    let url = "http://127.0.0.1:7000/gw%2Ftenant/?region=west";
+    let path = "/vendor.Service/Encrypt?mode=1";
+    let mut configuration = spec(path);
+    configuration.url = url.into();
+    GrpcCryptoProvider::new(configuration).unwrap();
+    assert_eq!(
+        maki_format::config::grpc_request_path(url, path)
+            .unwrap()
+            .as_str(),
+        "/gw%2Ftenant/vendor.Service/Encrypt?region=west&mode=1"
+    );
+    assert_eq!(
+        maki_format::config::grpc_request_path("http://localhost", "/x?")
+            .unwrap()
+            .as_str(),
+        "/x?"
+    );
+}
+
+#[tokio::test]
+async fn constructor_refuses_reserved_binary_and_duplicate_metadata() {
+    for keys in [
+        vec!["trace-bin"],
+        vec!["user-agent"],
+        vec!["grpc-message-type"],
+        vec!["X-Region", "x-region"],
+    ] {
+        let mut configuration = spec("/test");
+        configuration.metadata = keys
+            .iter()
+            .map(|key| (key.to_string(), "test".into()))
+            .collect();
+        assert!(GrpcCryptoProvider::new(configuration).is_err(), "{keys:?}");
+    }
+}
