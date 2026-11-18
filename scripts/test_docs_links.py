@@ -108,6 +108,15 @@ class DocumentationLinks(unittest.TestCase):
             "vendor/hyper/README.md:1: ../missing.md",
         ])
 
+    def test_fence_closer_must_match_marker_length_and_have_no_info(self):
+        self.write("README.md", "````md\n```\n~~~\n````example\n"
+                   "[sample](inside.md)\n`````\n[real](outside.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: outside.md"])
+
+    def test_inline_code_is_not_a_link_or_an_html_anchor(self):
+        self.write("README.md", '`<a id="sample"> [sample](inside.md)`\n[real](#sample)\n')
+        self.assertEqual(broken_links(self.root), ["README.md:2: #sample (missing anchor)"])
+
     def test_regular_link_filtering_and_locations_are_preserved(self):
         self.write("target.md", "# Present\n\n## Heading\n")
         self.write("README.md", """[Present](target.md#heading)

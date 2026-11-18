@@ -77,14 +77,25 @@ def candidate_markdown(root):
 
 def unfenced_lines(text):
     """Yield (line number, line) for every line outside fenced code blocks."""
-    in_fence = False
+    fence = None
     for number, line in enumerate(text.splitlines(), start=1):
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
+        quote = CONTAINER_PREFIX.match(line).group(1)
+        depth = quote.count(">")
+        if fence is not None:
+            marker, quote_depth = fence
+            if depth >= quote_depth:
+                content = line[len(quote):]
+                if depth == quote_depth and re.fullmatch(
+                        r" {0,3}" + marker[0] + "{" + str(len(marker)) + r",}[ \t]*", content):
+                    fence = None
+                continue
+            fence = None  # an unclosed fence ends with its block quote
+        content = line[CONTAINER_PREFIX.match(line).end():]
+        match = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", content)
+        if match and not (match[1][0] == "`" and "`" in match[2]):
+            fence = match[1], depth
             continue
-        if not in_fence:
-            yield number, line
+        yield number, line
 
 
 def closing_bracket(text, start):
@@ -536,7 +547,7 @@ def document_anchors(text):
         occurrences[slug] = 0
         anchors.add(slug)
     for _, line in unfenced_lines(text):
-        for match in HTML_ANCHOR.finditer(line):
+        for match in HTML_ANCHOR.finditer(mask_code_spans(line)):
             anchors.add(match.group(1) if match.group(1) is not None else match.group(2))
     return anchors
 
@@ -614,7 +625,7 @@ def broken_links(root):
         for number, line in unfenced_lines(text):
             problems.extend(
                 (number, target_problem(path, content, match.group(1)))
-                for match in LINK.finditer(line)
+                for match in LINK.finditer(mask_code_spans(line))
             )
             problems.extend(
                 (number, f"{reference} (undefined reference)")
