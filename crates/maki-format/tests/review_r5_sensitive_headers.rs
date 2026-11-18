@@ -113,10 +113,13 @@ fn ordinary_headers_keep_literal_values() {
         "X-Tenant",
     ] {
         assert!(valid(&http_config(name, "\"plain\"")), "{name}");
-        assert!(
-            valid(&grpc_config(&name.to_lowercase(), "\"plain\"")),
-            "{name}"
-        );
+    }
+    for name in ["accept", "x-request-id", "x-tenant"] {
+        assert!(valid(&grpc_config(name, "\"plain\"")), "{name}");
+    }
+    // Tonic sets these fields itself on unary requests.
+    for name in ["content-type", "user-agent"] {
+        assert!(!valid(&grpc_config(name, "\"plain\"")), "{name}");
     }
 }
 
