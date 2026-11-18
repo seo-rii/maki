@@ -321,7 +321,7 @@ def create_tree(package_root, args):
             relative = source.relative_to(ROOT / "packaging/examples")
             install_file(source, package_root / "usr/share/doc/maki/examples" / relative, 0o644)
 
-    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd"]
+    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd", "kmod"]
     if args.shlibdeps:
         for entry in shared_library_dependencies(package_root):
             if entry not in depends:
