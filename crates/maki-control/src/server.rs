@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
 
-use crate::protocol::{read_line, serialize_line, ProtocolError, Request};
+use crate::protocol::{read_buffered_line, serialize_line, ProtocolError, Request};
 
 /// Bounds on control sessions. Fixed values: the control plane is local
 /// and single-purpose, so there is nothing to tune per deployment.
@@ -186,14 +186,16 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut rd = BufReader::new(rd);
     loop {
-        let line = match tokio::time::timeout(limits.idle_timeout, read_line(&mut rd)).await {
-            Ok(Ok(line)) => line,
-            Ok(Err(ProtocolError::Closed)) => return Ok(()),
-            Ok(Err(e)) => return Err(e),
-            Err(_elapsed) => return Err(ProtocolError::IdleTimeout),
-        };
+        let line =
+            match tokio::time::timeout(limits.idle_timeout, read_buffered_line(&mut rd)).await {
+                Ok(Ok(line)) => line,
+                Ok(Err(ProtocolError::Closed)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => return Err(ProtocolError::IdleTimeout),
+            };
         let response = match serde_json::from_slice::<Request>(&line) {
             Ok(request) => handle(&backend, request).await,
             Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),

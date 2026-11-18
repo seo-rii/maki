@@ -162,3 +162,36 @@ async fn cache_off_refuses_size_and_ttl_reload() {
     assert_eq!(engine.monitoring_snapshot().cache.unwrap().bytes, 0);
     engine.stop_checkpoint_worker().await;
 }
+
+#[test]
+fn cache_reload_leaves_the_single_runtime_worker_available() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (engine, backend, _) = fixture(true).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        started_rx.await.unwrap();
+        let payload = json!({"max_bytes":4096});
+        let reload = backend.reload("cache", &payload);
+        tokio::pin!(reload);
+        tokio::select! {
+            biased;
+            result = &mut reload => panic!("eviction ran despite the occupied blocking pool: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(backend.metrics().await["maki_cache_entries"], 2);
+        release_tx.send(()).unwrap();
+        reload.await.unwrap();
+        blocker.await.unwrap();
+        assert_eq!(backend.metrics().await["maki_cache_entries"], 1);
+        engine.stop_checkpoint_worker().await;
+    });
+}

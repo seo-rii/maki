@@ -303,7 +303,7 @@ impl ControlBackend for EngineControlBackend {
     }
 
     async fn reload(&self, section: &str, payload: &Value) -> Result<(), String> {
-        let _callback = self.admission.enter().map_err(str::to_owned)?;
+        let callback = self.admission.enter().map_err(str::to_owned)?;
         match section {
             // Hot-reloadable and actually applied (SPEC §20).
             "cache" => {
@@ -347,7 +347,16 @@ impl ControlBackend for EngineControlBackend {
                             }
                         })
                 }).transpose()?;
-                if !self.engine.configure_cache(max_bytes, ttl) {
+                let engine = self.engine.clone();
+                // Shrinking can evict and zeroize the entire cache. Keep the
+                // drain guard with that work even if the session is cancelled.
+                let applied = tokio::task::spawn_blocking(move || {
+                    let _callback = callback;
+                    engine.configure_cache(max_bytes, ttl)
+                })
+                .await
+                .map_err(|error| format!("cache reload task failed: {error}"))?;
+                if !applied {
                     return Err(
                         "reload cache: this daemon runs with cache.mode = off, so there is no \
                          cache to resize; the change was NOT applied (restart with cache.mode = read)"

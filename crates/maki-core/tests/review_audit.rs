@@ -137,6 +137,44 @@ fn resumed_segment_is_durable_before_a_successor_is_opened() {
 
 // ---------- K-02: covered segments are reclaimed even by an idle checkpoint ----------
 
+#[test]
+fn journal_byte_total_tracks_partial_reclaim_and_recovery() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    let segment_bytes = 48 + RECORDS_PER_SEGMENT * RECORD;
+    for i in 0..3 * RECORDS_PER_SEGMENT {
+        vol.write_ct(i, &ct(1), false).unwrap();
+    }
+    vol.flush().unwrap();
+    assert_eq!(vol.journal_total_bytes(), 3 * segment_bytes);
+
+    let second_segment = layout::journal_segment(1);
+    backing.set_fault_hook(Some(Arc::new(move |op| match op {
+        maki_test_support::crash_backing::FaultOp::Remove { path } if *path == second_segment => {
+            Some(std::io::Error::other("second unlink failed"))
+        }
+        _ => None,
+    })));
+    assert!(vol.checkpoint().is_err());
+    assert_eq!(vol.journal_total_bytes(), 2 * segment_bytes);
+    backing.set_fault_hook(None);
+    vol.checkpoint().unwrap();
+    assert_eq!(vol.journal_total_bytes(), segment_bytes);
+    drop(vol);
+
+    backing.crash_all_lost();
+    let mut reopened = recover(&backing).unwrap();
+    // Recovery carries the previously active, already covered segment as
+    // sealed; the first new write opens its successor.
+    assert_eq!(reopened.journal_sealed_segment_count(), 1);
+    assert_eq!(reopened.journal_total_bytes(), segment_bytes);
+    reopened.write_ct(0, &ct(2), true).unwrap();
+    assert_eq!(reopened.journal_total_bytes(), segment_bytes + 48 + RECORD);
+    reopened.checkpoint().unwrap();
+    assert_eq!(reopened.journal_total_bytes(), 48 + RECORD);
+}
+
 /// A checkpoint that advanced its state but failed to delete the covered
 /// segments (transient unlink error, or the deletions lost in a crash)
 /// used to leave them on disk forever: every later checkpoint took the
