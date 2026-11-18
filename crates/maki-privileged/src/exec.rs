@@ -724,6 +724,7 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             vg_name,
             lv_name,
             target_bytes,
+            ..
         } => run(
             step,
             "lvextend",
@@ -1227,7 +1228,7 @@ fn execute_with_options(
             if plan.attachment.as_ref() != Some(&prior.attachment)
                 || plan.steps.iter().any(|step| {
                     matches!(step,
-                        PlannedStep::NbdDisconnect { device }
+                        PlannedStep::NbdDisconnect { device } | PlannedStep::LvExtend { nbd_device: device, .. }
                             if device != crate::plan::AUTO_NBD_DEVICE && device != &prior.device
                     )
                 })
@@ -1320,6 +1321,7 @@ fn execute_with_options(
                 vg_name,
                 lv_name,
                 target_bytes,
+                ..
             } = step
             {
                 if *target_bytes == 0 {

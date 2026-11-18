@@ -1054,6 +1054,7 @@ fn grow_request() -> GrowRequest {
     let r = request();
     GrowRequest {
         volume: r.volume,
+        nbd_device: r.nbd_device,
         volume_uuid: r.volume_uuid,
         nbd_socket: r.nbd_socket,
         vg_name: r.vg_name,
@@ -1098,7 +1099,8 @@ fn review_next_grow_rejects_reused_backend_and_changed_targets() {
     system.steps.clear();
 
     // Changed targets: a different VG/LV/mountpoint/uuid does not match.
-    let mutations: [fn(&mut GrowRequest); 4] = [
+    let mutations: [fn(&mut GrowRequest); 5] = [
+        |g| g.nbd_device = "/dev/nbd8".into(),
         |g| g.vg_name = "vg_other".into(),
         |g| g.lv_name = "other".into(),
         |g| g.mountpoint = "/srv/other".into(),

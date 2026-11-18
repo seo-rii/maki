@@ -155,6 +155,7 @@ fn setup(partitioned: bool) -> (Fixture, TrustedState, Plan, BoundDeviceRecord, 
     state.write(&record).unwrap();
     let plan = crate::plan::plan_grow(&crate::plan::GrowRequest {
         volume: request.volume,
+        nbd_device: crate::plan::AUTO_NBD_DEVICE.into(),
         volume_uuid: request.volume_uuid,
         nbd_socket: request.nbd_socket,
         vg_name: request.vg_name,
