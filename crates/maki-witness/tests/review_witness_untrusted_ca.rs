@@ -14,7 +14,7 @@
 //! Linux only: the client reads the alert the frontend sent before its reset,
 //! which Linux keeps readable after the reset arrives.
 #![cfg(target_os = "linux")]
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::Range;
 use std::path::Path;
@@ -501,6 +501,45 @@ fn a_reset_without_an_alert_stays_a_transport_failure() {
         assert_eq!(trusting.accepted(), attempt);
     }
     assert_eq!(calls.load(Ordering::SeqCst), ATTEMPTS / 4);
+}
+
+#[test]
+fn an_alert_before_client_authentication_stays_a_tls_failure() {
+    use rustls::AlertDescription as Alert;
+
+    let fixture = Fixture::new();
+    for alert in [
+        Alert::HandshakeFailure,
+        Alert::DecryptError,
+        Alert::AccessDenied,
+    ] {
+        let service = Service::spawn(fixture.cpu, move |_, _, mut socket| {
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            // Consume the ClientHello record so closing the socket does not
+            // reset it. The peer returns its alert before sending ServerHello.
+            let mut header = [0; 5];
+            socket.read_exact(&mut header).unwrap();
+            assert_eq!(header[0], 22, "expected a TLS handshake record");
+            let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            let mut hello = vec![0; length];
+            socket.read_exact(&mut hello).unwrap();
+            assert_eq!(hello.first(), Some(&1), "expected ClientHello");
+            // Alert record, legacy version 0x0303, two-byte payload, fatal.
+            socket
+                .write_all(&[21, 3, 3, 0, 2, 2, u8::from(alert)])
+                .unwrap();
+        });
+        let client = Client::new(fixture.options(service.address)).unwrap();
+        let error = Rpc::call(&client, &inspect()).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "{alert:?}: {error}"
+        );
+        assert!(error.to_string().contains(&format!("{alert:?}")), "{error}");
+    }
 }
 
 #[test]
