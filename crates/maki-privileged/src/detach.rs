@@ -223,9 +223,9 @@ pub(crate) fn observe_kernel(
                 ));
             }
             mounted_device = Some(device);
-            writable = [fields[5], filesystem[2]].iter().all(|options| {
-                crate::probe::mount_options(options).any(|option| option == b"rw")
-            });
+            writable = [fields[5], filesystem[2]]
+                .iter()
+                .all(|options| crate::probe::mount_options(options).any(|option| option == b"rw"));
         }
     }
     let mounted = mounted_device.is_some();

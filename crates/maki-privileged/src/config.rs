@@ -129,7 +129,9 @@ impl AttachConfig {
         check_abs_path("nbd_socket", &nbd_socket)?;
         #[cfg(unix)]
         if std::os::unix::net::SocketAddr::from_pathname(&nbd_socket).is_err() {
-            return Err(ConfigError::Invalid("nbd_socket is not a usable Unix socket pathname".into()));
+            return Err(ConfigError::Invalid(
+                "nbd_socket is not a usable Unix socket pathname".into(),
+            ));
         }
         let vg_name = overrides
             .vg_name
@@ -162,10 +164,12 @@ impl AttachConfig {
             .map_err(|_| ConfigError::Invalid("cannot determine the kernel page size".into()))?;
         #[cfg(not(target_os = "linux"))]
         let maximum_block_size = 65536;
-        if !(512..=maximum_block_size).contains(&device_block_size) || !device_block_size.is_power_of_two() {
-            return Err(ConfigError::Invalid(
-                format!("device_block_size must be a power of two between 512 and {maximum_block_size}"),
-            ));
+        if !(512..=maximum_block_size).contains(&device_block_size)
+            || !device_block_size.is_power_of_two()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "device_block_size must be a power of two between 512 and {maximum_block_size}"
+            )));
         }
         let volume_uuid = match overrides.volume_uuid.or(self.volume_uuid) {
             Some(uuid) => {

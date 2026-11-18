@@ -2055,8 +2055,12 @@ impl VolumeConfig {
                     )));
                 }
                 #[cfg(unix)]
-                if socket.contains('\0') || std::os::unix::net::SocketAddr::from_pathname(socket).is_err() {
-                    return Err(invalid(format!("{name} is not a usable Unix socket pathname")));
+                if socket.contains('\0')
+                    || std::os::unix::net::SocketAddr::from_pathname(socket).is_err()
+                {
+                    return Err(invalid(format!(
+                        "{name} is not a usable Unix socket pathname"
+                    )));
                 }
             }
         }

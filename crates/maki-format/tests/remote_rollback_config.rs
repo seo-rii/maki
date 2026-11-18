@@ -96,7 +96,8 @@ fn multiple_witness_addresses_require_an_explicit_storage_identity() {
 #[test]
 fn witness_tls_names_accept_both_ip_families() {
     for address in ["127.0.0.1", "::1"] {
-        let cfg = parse_config(&config(&remote().replace("witness.example.test", address))).unwrap();
+        let cfg =
+            parse_config(&config(&remote().replace("witness.example.test", address))).unwrap();
         cfg.validate().unwrap();
     }
 }
