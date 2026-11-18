@@ -657,6 +657,80 @@ fn resolve_metadata_value(
     }
 }
 
+fn transport_failure(e: &maki_crypto::CryptoError) -> bool {
+    matches!(
+        e.class(),
+        maki_crypto::ErrorClass::Retryable
+            | maki_crypto::ErrorClass::Throttled
+            | maki_crypto::ErrorClass::EndpointFatal
+    )
+}
+
+type NamedEndpoint = (String, Arc<dyn CryptoProvider>);
+type CheckedEndpoint = (String, Arc<dyn CryptoProvider>, bool);
+
+async fn cross_validate_reachable(
+    reachable: Vec<NamedEndpoint>,
+    context: &maki_crypto::CryptoContext,
+    unit: usize,
+    prefix_bytes: u32,
+) -> Result<Vec<CheckedEndpoint>, maki_crypto::CryptoError> {
+    use maki_crypto::selftest::{cross_endpoint_self_test_attributed, CrossCheckSide};
+    let mut quarantined = Vec::new();
+    let mut verified = Vec::new();
+    let mut remaining = std::collections::VecDeque::from(reachable);
+    let mut reference = remaining.pop_front().expect("at least one reachable peer");
+    while let Some(candidate) = remaining.pop_front() {
+        let a = apply_random_prefix(
+            reference.1.clone(),
+            unit as u32,
+            prefix_bytes,
+            &context.crypto_compatibility_id,
+        )
+        .await?;
+        let b = apply_random_prefix(
+            candidate.1.clone(),
+            unit as u32,
+            prefix_bytes,
+            &context.crypto_compatibility_id,
+        )
+        .await?;
+        match cross_endpoint_self_test_attributed(a.as_ref(), b.as_ref(), context, unit).await {
+            Ok(()) => verified.push(candidate),
+            Err((side, error)) if transport_failure(&error) => {
+                let unavailable = match side {
+                    CrossCheckSide::Candidate => candidate,
+                    CrossCheckSide::Reference => {
+                        // Compare the candidate with a surviving verified peer when one
+                        // exists. Otherwise use its successful individual check to start
+                        // a new reference and cross-check the remaining peers against it.
+                        let next = match verified.pop() {
+                            Some(peer) => {
+                                remaining.push_front(candidate);
+                                peer
+                            }
+                            None => candidate,
+                        };
+                        std::mem::replace(&mut reference, next)
+                    }
+                };
+                tracing::warn!(endpoint = %unavailable.0, "quarantined: cross-endpoint self-test could not run ({error})");
+                quarantined.push(unavailable);
+            }
+            Err((_, error)) => return Err(error.into()),
+        }
+    }
+    let mut flagged: Vec<_> = std::iter::once(reference)
+        .chain(verified)
+        .map(|(name, provider)| (name, provider, true))
+        .collect();
+    for (name, provider) in quarantined {
+        flagged.push((name, provider, false));
+    }
+
+    Ok(flagged)
+}
+
 /// Cross-endpoint interchangeability check (SPEC 34) plus the dispatcher
 /// (retry/budget/breaker/failover) shared by every remote transport.
 ///
@@ -698,14 +772,6 @@ async fn dispatch_endpoint_set(
     let unit = config.volume.crypto_unit_size as usize;
     let prefix_bytes = config.crypto.random_prefix_bytes;
     let compat = config.crypto.effective_compatibility_id();
-    let transport_failure = |e: &maki_crypto::CryptoError| {
-        matches!(
-            e.class(),
-            maki_crypto::ErrorClass::Retryable
-                | maki_crypto::ErrorClass::Throttled
-                | maki_crypto::ErrorClass::EndpointFatal
-        )
-    };
     let superblock = volume.superblock();
     if superblock.provider_type != config.crypto.provider
         || superblock.crypto_compatibility_id != compat
@@ -797,39 +863,12 @@ async fn dispatch_endpoint_set(
     }
 
     // 2. Interchangeability among the reachable ones (SPEC 34).
-    let mut flagged: Vec<(String, Arc<dyn CryptoProvider>, bool)> = Vec::new();
-    let reference =
-        apply_random_prefix(reachable[0].1.clone(), unit as u32, prefix_bytes, &compat).await?;
-    for (index, (name, provider)) in reachable.into_iter().enumerate() {
-        if index == 0 {
-            flagged.push((name, provider, true));
-            continue;
-        }
-        let validation_provider =
-            apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
-        match cross_endpoint_self_test(
-            reference.as_ref(),
-            validation_provider.as_ref(),
-            &context,
-            unit,
-        )
-        .await
-        {
-            Ok(()) => flagged.push((name, provider, true)),
-            Err(e) if transport_failure(&e) => {
-                tracing::warn!(
-                    "endpoint {name:?} quarantined: cross-endpoint self-test could not run ({e})"
-                );
-                flagged.push((name, provider, false));
-            }
-            // Proven non-interchangeability (ProviderFatal / contract)
-            // refuses attach (SPEC 12, 34).
-            Err(e) => return Err(e.into()),
-        }
-    }
-    for (name, provider) in quarantined {
-        flagged.push((name, provider, false));
-    }
+    let mut flagged = cross_validate_reachable(reachable, &context, unit, prefix_bytes).await?;
+    flagged.extend(
+        quarantined
+            .into_iter()
+            .map(|(name, provider)| (name, provider, false)),
+    );
 
     // Snapshot the canary for later endpoint revalidation without blocking
     // the async dispatcher; cancellation retains the recovered volume lock.
@@ -1467,5 +1506,36 @@ mod capability_mode_tests {
         assert_eq!(capabilities.integrity, Capability::Verified);
         assert_eq!(capabilities.context_binding, Capability::Verified);
         assert_eq!(capabilities.replay_protection, Capability::Absent);
+    }
+}
+
+#[cfg(all(test, feature = "fake-provider"))]
+mod startup_reference_tests {
+    use super::*;
+    use maki_test_support::fake_provider::FakeCryptoProvider;
+
+    #[tokio::test]
+    async fn elects_a_healthy_pair_after_the_reference_goes_offline() {
+        let context = maki_crypto::CryptoContext {
+            volume_uuid: uuid::Uuid::nil(),
+            format_version: 1,
+            crypto_compatibility_id: "test-profile-v1".into(),
+        };
+        let a = Arc::new(FakeCryptoProvider::new(512));
+        a.fail_next([maki_crypto::CryptoError::Retryable("offline".into())]);
+        let peers: Vec<NamedEndpoint> = vec![
+            ("a".into(), a),
+            ("b".into(), Arc::new(FakeCryptoProvider::new(512))),
+            ("c".into(), Arc::new(FakeCryptoProvider::new(512))),
+        ];
+        let checked = cross_validate_reachable(peers, &context, 512, 0)
+            .await
+            .unwrap();
+        let flags: std::collections::BTreeMap<_, _> = checked
+            .into_iter()
+            .map(|(name, _, accepted)| (name, accepted))
+            .collect();
+        assert!(!flags["a"]);
+        assert!(flags["b"] && flags["c"]);
     }
 }
