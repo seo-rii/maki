@@ -46,10 +46,12 @@ fn detach_and_grow_plans_print() {
         "v3",
         "--size-bytes",
         "1048576",
+        "--nbd-device",
+        "/dev/nbd7",
         "--plan",
     ]);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("grow"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("grow volume v3 on /dev/nbd7"));
 
     // grow without --size-bytes is a usage error.
     let out = run(&["grow", "--volume", "v3", "--plan"]);

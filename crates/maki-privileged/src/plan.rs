@@ -211,7 +211,7 @@ impl fmt::Display for PlannedStep {
                 volume_uuid,
             } => write!(
                 f,
-                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (create if absent; rewrite and sync a matching UUID; refuse a different UUID)"
+                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (create if absent, rewrite and sync a matching UUID, refuse a different UUID)"
             ),
             PlannedStep::VerifyMountIdentity {
                 mountpoint,
@@ -438,7 +438,15 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
 /// Online growth (SPEC §38): `lvextend` then `xfs_growfs`; no NBD resize.
 pub fn plan_grow(request: &GrowRequest) -> Plan {
     Plan {
-        description: format!("grow volume {} on {}", request.volume, request.nbd_device),
+        description: format!(
+            "grow volume {} on {}",
+            request.volume,
+            if request.nbd_device == AUTO_NBD_DEVICE {
+                "the recorded NBD device"
+            } else {
+                &request.nbd_device
+            }
+        ),
         volume: request.volume.clone(),
         attachment: Some(request.into()),
         steps: vec![
