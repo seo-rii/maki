@@ -663,3 +663,11 @@ fn attach_checks_the_socket_path_byte_limit() {
         assert_eq!(cfg.into_request("pg", AttachOverrides::default(), false).is_ok(), valid);
     }
 }
+
+#[test]
+fn attach_checks_device_block_size_before_planning() {
+    for (size, valid) in [(256, false), (512, true), (768, false), (4096, true), (1 << 30, false)] {
+        let cfg = AttachConfig { device_block_size: Some(size), ..Default::default() };
+        assert_eq!(cfg.into_request("pg", AttachOverrides::default(), false).is_ok(), valid, "{size}");
+    }
+}

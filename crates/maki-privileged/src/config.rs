@@ -156,9 +156,15 @@ impl AttachConfig {
             ));
         }
         let device_block_size = self.device_block_size.unwrap_or(4096);
-        if device_block_size == 0 || !device_block_size.is_power_of_two() {
+        // Linux BLKBSZSET accepts powers of two from 512 through PAGE_SIZE.
+        #[cfg(target_os = "linux")]
+        let maximum_block_size = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .map_err(|_| ConfigError::Invalid("cannot determine the kernel page size".into()))?;
+        #[cfg(not(target_os = "linux"))]
+        let maximum_block_size = 65536;
+        if !(512..=maximum_block_size).contains(&device_block_size) || !device_block_size.is_power_of_two() {
             return Err(ConfigError::Invalid(
-                "device_block_size must be a power of two".into(),
+                format!("device_block_size must be a power of two between 512 and {maximum_block_size}"),
             ));
         }
         let volume_uuid = match overrides.volume_uuid.or(self.volume_uuid) {
