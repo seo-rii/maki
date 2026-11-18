@@ -1095,6 +1095,7 @@ dependencies = [
  "maki-backing",
  "maki-test-support",
  "rand 0.9.5",
+ "rustls-pki-types",
  "serde",
  "tempfile",
  "thiserror",

@@ -1099,12 +1099,8 @@ impl VolumeConfig {
                             .parse::<std::net::SocketAddr>()
                             .map_or(true, |a| a.port() == 0 || !unique.insert(a))
                     })
-                    || remote.server_name.is_empty()
                     || remote.server_name.len() > 253
-                    || remote
-                        .server_name
-                        .bytes()
-                        .any(|b| !b.is_ascii_alphanumeric() && !b".-:".contains(&b))
+                    || rustls_pki_types::ServerName::try_from(remote.server_name.as_str()).is_err()
                     || !(1..=60_000).contains(&remote.timeout_ms)
                 {
                     return Err(ConfigError::Invalid(
