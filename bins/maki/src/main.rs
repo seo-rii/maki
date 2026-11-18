@@ -810,14 +810,15 @@ fn control(
         let stream = tokio::net::UnixStream::connect(&socket)
             .await
             .map_err(|e| format!("{socket}: {e}"))?;
-        let (mut rd, mut wr) = tokio::io::split(stream);
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut rd = tokio::io::BufReader::new(rd);
         let mut request = maki_control::protocol::Request::new(command);
         request.section = section.map(|s| s.to_string());
         request.payload = payload;
         maki_control::protocol::send_command(&mut wr, &request)
             .await
             .map_err(|e| e.to_string())?;
-        maki_control::protocol::read_response(&mut rd)
+        maki_control::protocol::read_buffered_response(&mut rd)
             .await
             .map_err(|e| e.to_string())
     };

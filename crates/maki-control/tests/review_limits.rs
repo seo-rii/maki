@@ -103,6 +103,34 @@ async fn an_active_session_outlives_the_idle_timeout() {
     assert!(task.await.unwrap().is_ok());
 }
 
+#[tokio::test]
+async fn a_session_retains_prefetched_requests_after_the_first_frame() {
+    use maki_control::protocol::read_buffered_response;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let (client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(serve_connection(server, Arc::new(Fake), limits()));
+    let (rd, mut wr) = tokio::io::split(client);
+    wr.write_all(b"{\"command\":\"status\"}\n{\"command\":\"checkpoint\"}\n")
+        .await
+        .unwrap();
+    wr.shutdown().await.unwrap();
+    let mut rd = BufReader::new(rd);
+    assert_eq!(
+        read_buffered_response(&mut rd).await.unwrap()["data"]["state"],
+        "ready"
+    );
+    assert_eq!(
+        read_buffered_response(&mut rd).await.unwrap()["data"]["checkpoint_sequence"],
+        1
+    );
+    assert!(matches!(
+        read_buffered_response(&mut rd).await,
+        Err(ProtocolError::Closed)
+    ));
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_client_that_never_reads_is_disconnected_after_the_write_timeout() {
     // An 8-byte pipe: the response cannot be written until the client

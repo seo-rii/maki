@@ -69,3 +69,38 @@ async fn rejected_request_leaves_the_stream_usable_for_the_next_command() {
     let received: Request = serde_json::from_slice(&line).unwrap();
     assert_eq!(received.command, "status");
 }
+
+#[tokio::test]
+async fn buffered_frames_preserve_pipelined_and_eof_terminated_responses() {
+    use maki_control::protocol::{read_buffered_line, read_buffered_response};
+    use tokio::io::BufReader;
+
+    let mut wire = vec![b'x'; MAX_LINE];
+    wire.extend_from_slice(b"\n{\"id\":1}\n{\"id\":2}");
+    let mut reader = BufReader::with_capacity(1024, wire.as_slice());
+    assert_eq!(
+        read_buffered_line(&mut reader).await.unwrap(),
+        vec![b'x'; MAX_LINE]
+    );
+    // The response after the first newline was prefetched into the reader.
+    assert!(!reader.buffer().is_empty());
+    assert_eq!(
+        read_buffered_response(&mut reader).await.unwrap(),
+        json!({"id":1})
+    );
+    assert_eq!(
+        read_buffered_response(&mut reader).await.unwrap(),
+        json!({"id":2})
+    );
+    assert!(matches!(
+        read_buffered_line(&mut reader).await,
+        Err(ProtocolError::Closed)
+    ));
+
+    let oversized = vec![b'x'; MAX_LINE + 1];
+    let mut reader = BufReader::new(oversized.as_slice());
+    assert!(matches!(
+        read_buffered_line(&mut reader).await,
+        Err(ProtocolError::LineTooLong)
+    ));
+}

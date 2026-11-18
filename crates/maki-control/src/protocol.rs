@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 
 /// Hard bound on a single protocol line (requests and responses).
 pub const MAX_LINE: usize = 64 * 1024;
@@ -44,30 +46,33 @@ pub enum ProtocolError {
     WriteTimeout,
 }
 
-/// Read one bounded line. Returns `Closed` on clean EOF before any byte.
-pub async fn read_line<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Vec<u8>, ProtocolError> {
+/// Read a frame from a session's persistent buffered reader. Bytes prefetched
+/// after the newline stay in that reader for the next frame.
+pub async fn read_buffered_line<R: AsyncBufRead + Unpin>(
+    rd: &mut R,
+) -> Result<Vec<u8>, ProtocolError> {
     let mut line = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
-    loop {
-        match rd.read(&mut byte).await? {
-            0 => {
-                return if line.is_empty() {
-                    Err(ProtocolError::Closed)
-                } else {
-                    Ok(line)
-                }
-            }
-            _ => {
-                if byte[0] == b'\n' {
-                    return Ok(line);
-                }
-                line.push(byte[0]);
-                if line.len() > MAX_LINE {
-                    return Err(ProtocolError::LineTooLong);
-                }
-            }
-        }
+    // One extra byte distinguishes an exact-limit newline from an oversized
+    // payload, even if the sender never terminates the frame.
+    let len = rd
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if len == 0 {
+        return Err(ProtocolError::Closed);
     }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    } else if len > MAX_LINE {
+        return Err(ProtocolError::LineTooLong);
+    }
+    Ok(line)
+}
+
+/// Read one frame from an arbitrary stream without consuming the next
+/// frame's bytes. Persistent sessions should use [`read_buffered_line`].
+pub async fn read_line<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Vec<u8>, ProtocolError> {
+    read_buffered_line(&mut BufReader::with_capacity(1, rd)).await
 }
 
 pub async fn send_command<W: AsyncWrite + Unpin>(
@@ -113,5 +118,13 @@ pub(crate) fn serialize_line(value: &impl Serialize) -> Result<Vec<u8>, Protocol
 
 pub async fn read_response<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Value, ProtocolError> {
     let line = read_line(rd).await?;
+    Ok(serde_json::from_slice(&line)?)
+}
+
+/// Read a response efficiently, keeping subsequent frames in the same reader.
+pub async fn read_buffered_response<R: AsyncBufRead + Unpin>(
+    rd: &mut R,
+) -> Result<Value, ProtocolError> {
+    let line = read_buffered_line(rd).await?;
     Ok(serde_json::from_slice(&line)?)
 }
