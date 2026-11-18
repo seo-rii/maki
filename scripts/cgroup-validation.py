@@ -140,7 +140,7 @@ def client_main(args):
                 progress_path.write_text(json.dumps(progress))
             print(json.dumps({"pressure_bytes_written": 64 << 20}))
         else:
-            for epoch in range(args.rounds):
+            for epoch in range(args.start_epoch, args.start_epoch + args.rounds):
                 writes = [(index * 4096, hashlib.sha256(f"{epoch}:{index}".encode()).digest() * 128)
                           for index in range(128)]
                 durable_write(client, args.ledger, writes, "flush")
@@ -277,10 +277,10 @@ socket = "/case/control.sock"
             result["process.status"] = f"unavailable: {error.__class__.__name__}"
         return result
 
-    def client_command(self, mode, rounds=1):
+    def client_command(self, mode, rounds=1, start_epoch=0):
         return [sys.executable, str(pathlib.Path(__file__).resolve()), "--client",
                 "--socket", str(self.case / "nbd.sock"), "--ledger", str(self.ledger),
-                "--mode", mode, "--rounds", str(rounds)]
+                "--mode", mode, "--rounds", str(rounds), "--start-epoch", str(start_epoch)]
 
     def client(self, mode, rounds=1, check=True):
         result = run(self.client_command(mode, rounds), timeout=120, check=check)
@@ -368,7 +368,8 @@ def campaign(args):
                     before = target.ledger.read_bytes()
                     run(["docker", "pause", target.identifier])
                     with (directory / "paused-client.log").open("w") as stream:
-                        child = subprocess.Popen(target.client_command("write"), stdout=stream, stderr=subprocess.STDOUT)
+                        command = target.client_command("write", start_epoch=args.rounds)
+                        child = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT)
                         try:
                             time.sleep(0.5)
                             ensure(child.poll() is None, "paused server unexpectedly completed client")
@@ -423,6 +424,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--recovery-memory-mib", type=int, default=32,
                         help="memory and swap cap for the post-OOM constrained recovery")
+    parser.add_argument("--start-epoch", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--socket", help=argparse.SUPPRESS)
     parser.add_argument("--ledger", type=pathlib.Path, help=argparse.SUPPRESS)

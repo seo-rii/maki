@@ -180,12 +180,12 @@ class HostContracts(unittest.TestCase):
 
     def test_ready_requires_native_provider_capabilities_and_stable_fs_uuid(self):
         ready = {"event": "ready", "provider": "local-aes-gcm-siv", "can_flush": True,
-                 "can_fua": True, "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
+                 "can_fua": True, "can_trim": False, "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
                  "witness_service": "active", "graceful_stop_witness": "absent"}
         self.host.validate_ready(ready, None)
         self.host.validate_ready(ready, ready["fs_uuid"])
         for field, value in (("provider", "wrong"), ("can_flush", False),
-                             ("can_fua", False), ("fs_uuid", "changed"),
+                             ("can_fua", False), ("can_trim", True), ("can_trim", None), ("fs_uuid", "changed"),
                              ("witness_service", "inactive"),
                              ("graceful_stop_witness", "present")):
             invalid = dict(ready)
@@ -314,7 +314,7 @@ class HostContracts(unittest.TestCase):
                 self.addCleanup(process.close)
                 process.expect = mock.Mock(side_effect=ValueError("fixture ACK failure"))
                 ready = dict(event="ready", boot_id=self.boot_id,
-                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True,
+                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True, can_trim=False,
                              fs_uuid="00112233-4455-6677-8899-aabbccddeeff",
                              witness_service="active", graceful_stop_witness="absent")
                 current = dict(baseline)
@@ -337,6 +337,21 @@ class HostContracts(unittest.TestCase):
                 self.assertFalse(result["passed"])
                 self.assertIn("ValueError", result["error"])
                 self.assertFalse((args.output / "host-acks.jsonl").exists())
+
+    def test_slow_guest_readiness_keeps_the_established_session(self):
+        args = types.SimpleNamespace(timeout=180, connect_timeout=10)
+        guest = mock.Mock()
+        def ready(event, timeout):
+            self.assertEqual(event, "ready")
+            self.assertEqual(timeout, 175)
+            return {"event": "ready"}
+        guest.expect.side_effect = ready
+        with mock.patch.object(self.host, "ssh_command", return_value=["gcloud"]), \
+                mock.patch.object(self.host, "RemoteProcess", return_value=guest), \
+                mock.patch.object(self.host.time, "monotonic", side_effect=[100, 100, 105]):
+            session, _ = self.host.launch_guest(args, self.token, 0, False, self.path)
+        self.assertIs(session, guest)
+        guest.close.assert_not_called()
 
     def test_post_reset_ssh_timeout_is_retried_with_a_fresh_owned_child(self):
         args = types.SimpleNamespace(timeout=60, connect_timeout=1)
@@ -668,10 +683,13 @@ class GuestContracts(unittest.TestCase):
         client = object.__new__(self.guest.Nbd)
         client.can_flush = True
         client.can_fua = True
-        client.can_trim = True
+        client.can_trim = False
         self.assertEqual(self.guest.capabilities(client), {
-            "can_flush": True, "can_fua": True
+            "can_flush": True, "can_fua": True, "can_trim": False
         })
+        client.can_trim = True
+        with self.assertRaisesRegex((AssertionError, ValueError), "TRIM"):
+            self.guest.capabilities(client)
         self.assertEqual(self.guest.capabilities(client, "v3-discard"), {
             "can_flush": True, "can_fua": True, "can_trim": True
         })

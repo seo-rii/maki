@@ -52,7 +52,7 @@ class GuestProviderContracts(unittest.TestCase):
 
     def run_guest(self, text, *, profile="v2", verify_only=True, read_error=None):
         self.config.write_bytes(text.encode() if isinstance(text, str) else text)
-        client = mock.Mock(can_fua=True, can_flush=True, can_trim=True)
+        client = mock.Mock(can_fua=True, can_flush=True, can_trim=profile == "v3-discard")
         client.read.side_effect = lambda offset: self.guest.payload(
             0, self.guest.index_for_offset(offset))
         captured = io.BytesIO()

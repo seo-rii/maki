@@ -87,8 +87,8 @@ def validate_ready(ready, expected_fs_uuid, profile="v2"):
             or ready.get("provider") != "local-aes-gcm-siv"
             or ready.get("can_flush") is not True or ready.get("can_fua") is not True):
         raise ValueError("guest did not prove native provider FLUSH and FUA support")
-    if profile == "v3-discard" and ready.get("can_trim") is not True:
-        raise ValueError("guest did not prove native TRIM support")
+    if ready.get("can_trim") is not (profile == "v3-discard"):
+        raise ValueError("guest TRIM capability does not match the qualification profile")
     if (ready.get("witness_service") != "active"
             or ready.get("graceful_stop_witness") != "absent"):
         raise ValueError("graceful shutdown witness invalidated hard-reset evidence")
@@ -547,7 +547,9 @@ def launch_guest(args, token, cycle, verify_only, output):
         process = RemoteProcess(ssh_command(args, token, cycle, verify_only),
                                 output / f"attempt-{attempt}", token, cycle)
         try:
-            ready = process.expect("ready", min(remaining, args.connect_timeout + 30))
+            # SSH enforces ConnectTimeout itself; recovery after connection can
+            # legitimately consume the remaining guest startup budget.
+            ready = process.expect("ready", max(0, until - time.monotonic()))
             return process, ready
         except (RuntimeError, TimeoutError) as error:
             errors.append(str(error))
