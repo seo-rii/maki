@@ -121,6 +121,14 @@ class DocumentationLinks(unittest.TestCase):
         self.assertEqual(broken_links(self.root),
                          ["README.md:6: one.md", "README.md:10: two.md", "README.md:15: three.md"])
 
+    def test_list_fences_count_tab_stops_in_the_container_indent(self):
+        self.write("README.md", "- Docs\n  ```md\n\t[example](inside.md)\n  ```\n"
+                   "[broken](outside.md)\n\n"
+                   "1.\tExample\n\t~~~\n\t[sample](nested.md)\n\t~~~\n"
+                   "[next](after.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:5: outside.md", "README.md:11: after.md"])
+
     def test_multiline_code_masks_links_references_and_anchors_only_in_its_paragraph(self):
         self.write("README.md", 'Text ``example `\n[shown](inside.md) [x][label] <a id="inside">\n'
                    'end`` [real](outside.md)\n\n[anchor](#inside)\n'

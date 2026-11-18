@@ -81,16 +81,18 @@ def unfenced_lines(text):
     list_indents = []
     last_depth = 0
     for number, line in enumerate(text.splitlines(), start=1):
+        # CommonMark counts block indentation in columns, with four-column tab stops.
+        columns = line.expandtabs(4)
         if fence is not None:
             marker, quote_depth, list_indent = fence
             pos = 0
             for _ in range(quote_depth):
-                quote = QUOTE_MARKER.match(line, pos)
+                quote = QUOTE_MARKER.match(columns, pos)
                 if quote is None:
                     break
                 pos = quote.end()
             else:
-                content = line[pos:]
+                content = columns[pos:]
                 if not content.strip() or content.startswith(" " * list_indent):
                     close = FENCE.fullmatch(content[list_indent:])
                     if (close and close[1][0] == marker[0] and len(close[1]) >= len(marker)
@@ -99,9 +101,9 @@ def unfenced_lines(text):
                     continue
             # A fence inside a quote or list item ends with its container.
             fence = None
-        prefix = CONTAINER_PREFIX.match(line)
+        prefix = CONTAINER_PREFIX.match(columns)
         depth = prefix[1].count(">")
-        body = line[prefix.end(1):]
+        body = columns[prefix.end(1):]
         if last_depth != depth:
             list_indents.clear()
         last_depth = depth
