@@ -29,7 +29,7 @@ use maki_crypto::{
 };
 // Validation and the provider share one method-path rule, so a validated
 // path is exactly the one sent.
-use maki_format::config::check_grpc_method_path;
+use maki_format::config::{check_grpc_metadata_keys, grpc_request_path};
 
 mod connection;
 mod protected;
@@ -722,16 +722,6 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
-/// A method path, checked with the rule configuration validation applies
-/// (maki-format `check_grpc_method_path`): a path that validates is built
-/// here and sent exactly as written, and one this refuses never validates.
-/// Errors never quote the path, which may carry a token.
-fn method_path(operation: &str, path: &str) -> Result<PathAndQuery, CryptoError> {
-    check_grpc_method_path(path)
-        .map_err(|reason| fatal(format!("bad {operation} path: the path {reason}")))?;
-    PathAndQuery::try_from(path.to_owned()).map_err(|e| fatal(format!("bad {operation} path: {e}")))
-}
-
 /// A URI host without the brackets that enclose an IPv6 literal.
 fn unbracketed(host: &str) -> &str {
     host.strip_prefix('[')
@@ -869,12 +859,14 @@ impl GrpcCryptoProvider {
             tcp,
             spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS),
         );
-        let encrypt_path = method_path("encrypt", &spec.encrypt_path)?;
-        let decrypt_path = method_path("decrypt", &spec.decrypt_path)?;
+        let encrypt_path = grpc_request_path(&spec.url, &spec.encrypt_path)
+            .map_err(|reason| fatal(format!("bad encrypt path: {reason}")))?;
+        let decrypt_path = grpc_request_path(&spec.url, &spec.decrypt_path)
+            .map_err(|reason| fatal(format!("bad decrypt path: {reason}")))?;
         // Validate metadata eagerly: a bad credential/config fails closed.
+        check_grpc_metadata_keys(spec.metadata.iter().map(|(name, _)| name.as_str()))
+            .map_err(|e| fatal(e.to_string()))?;
         for (key, value) in &spec.metadata {
-            MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes())
-                .map_err(|e| fatal(format!("bad metadata key {key:?}: {e}")))?;
             value
                 .parse::<MetadataValue<tonic::metadata::Ascii>>()
                 .map_err(|e| fatal(format!("bad metadata value for {key:?}: {e}")))?;

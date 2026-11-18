@@ -313,10 +313,27 @@ impl BodyConfig {
         }
         refuse_overlap(&body, top)?;
 
-        Ok(HttpRequestMapping {
+        let mapping = HttpRequestMapping {
             fields: fields.fields,
             items_path: self.items_path.clone(),
             item_fields: item_fields.fields,
-        })
+        };
+        let sources = mapping.per_item_fields();
+        if !sources
+            .iter()
+            .any(|(_, source)| matches!(source, HttpFieldSource::Payload(_)))
+        {
+            return Err(invalid(format!(
+                "[{body}] must send a payload field for each item"
+            )));
+        }
+        if mapping.items_path.is_some()
+            && !sources
+                .iter()
+                .any(|(_, source)| *source == HttpFieldSource::UnitIndex)
+        {
+            return Err(invalid(format!("[{body}.item_fields] must send unit_index for the required response echo, independent of context_binding")));
+        }
+        Ok(mapping)
     }
 }

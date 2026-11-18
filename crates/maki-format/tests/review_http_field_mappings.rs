@@ -404,3 +404,14 @@ fn shipped_http_configurations_still_validate() {
         .unwrap();
     }
 }
+
+#[test]
+fn json_requests_must_deliver_payload_and_batches_must_supply_the_echo() {
+    assert_refused(&single("none", UNIT), &["payload"], "no single payload");
+    assert_refused(&batch("none", "", UNIT), &["payload"], "no batch payload");
+    assert_refused(
+        &batch("none", "", PAYLOAD),
+        &["unit_index"],
+        "no batch unit",
+    );
+}

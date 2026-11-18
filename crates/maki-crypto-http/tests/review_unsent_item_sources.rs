@@ -106,3 +106,38 @@ async fn fields_no_request_carries_are_refused_by_validation_and_construction() 
         "no request may be sent for such a mapping"
     );
 }
+
+#[test]
+fn raw_response_ignores_json_encoding_and_http_headers_validate_before_attach() {
+    let url = "http://127.0.0.1:7000";
+    let payload = "\"/data\" = { source = \"payload\" }";
+    let mut config = config(url, &body(false, payload, ""));
+    let encrypt = config
+        .crypto
+        .http
+        .as_mut()
+        .unwrap()
+        .encrypt
+        .as_mut()
+        .unwrap();
+    let response = encrypt.response.as_mut().unwrap();
+    response.response_type = "raw".into();
+    response.encoding = Some("binary".into());
+    config.validate().unwrap();
+    HttpCryptoProvider::from_config(&config, url, &MapKeySource::new()).unwrap();
+    config
+        .crypto
+        .http
+        .as_mut()
+        .unwrap()
+        .encrypt
+        .as_mut()
+        .unwrap()
+        .headers
+        .insert(
+            "x region".into(),
+            maki_format::config::HeaderValue::Literal("west".into()),
+        );
+    assert!(config.validate().is_err());
+    assert!(HttpCryptoProvider::from_config(&config, url, &MapKeySource::new()).is_err());
+}

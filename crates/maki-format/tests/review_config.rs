@@ -435,7 +435,7 @@ fn keyring_credential_source_is_refused() {
 fn http_batch_layout_requires_unit_echo() {
     let batch_without_echo = base().replace(
         "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.encrypt.response]\ndata_path = \"/ct\"\nencoding = \"base64\"\n",
-        "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.encrypt.body]\nitems_path = \"/items\"\n[crypto.http.encrypt.body.item_fields]\n\"/data\" = { source = \"payload\", encoding = \"base64\" }\n[crypto.http.encrypt.response]\nitems_path = \"/items\"\ndata_path = \"/ct\"\nencoding = \"base64\"\n",
+        "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.encrypt.body]\nitems_path = \"/items\"\n[crypto.http.encrypt.body.item_fields]\n\"/unit\" = { source = \"unit_index\" }\n\"/data\" = { source = \"payload\", encoding = \"base64\" }\n[crypto.http.encrypt.response]\nitems_path = \"/items\"\ndata_path = \"/ct\"\nencoding = \"base64\"\n",
     );
     let msg = err(&batch_without_echo);
     assert!(msg.contains("item_index_path"), "{msg}");

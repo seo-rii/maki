@@ -1092,6 +1092,7 @@ name = "maki-format"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "http",
  "maki-backing",
  "maki-test-support",
  "rand 0.9.5",

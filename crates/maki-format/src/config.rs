@@ -11,7 +11,7 @@ mod grpc_method_path;
 mod http_mapping;
 mod transport_size;
 
-pub use grpc_method_path::{check_grpc_method_path, MAX_GRPC_METHOD_PATH_BYTES};
+pub use grpc_method_path::{check_grpc_method_path, grpc_request_path, MAX_GRPC_METHOD_PATH_BYTES};
 pub use http_mapping::{
     decode_pointer_token, HttpFieldSource, HttpPayloadEncoding, HttpRequestMapping,
 };
@@ -1544,6 +1544,41 @@ pub fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Validate the ASCII metadata keys sent through tonic's unary client.
+pub fn check_grpc_metadata_keys<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let key = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid("bad metadata key: invalid HTTP field name"))?;
+        if key.as_str().ends_with("-bin") {
+            return Err(invalid(
+                "bad metadata key: binary metadata requires a binary encoding",
+            ));
+        }
+        if matches!(
+            key.as_str(),
+            "te" | "user-agent"
+                | "content-type"
+                | "grpc-message"
+                | "grpc-message-type"
+                | "grpc-status"
+        ) {
+            return Err(invalid("bad metadata key: reserved by the gRPC transport"));
+        }
+        if !seen.insert(key) {
+            return Err(invalid(
+                "duplicate gRPC metadata key after case normalization",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub const DEFAULT_GRPC_ENCRYPT_PATH: &str = "/maki.CryptoService/EncryptBatch";
+pub const DEFAULT_GRPC_DECRYPT_PATH: &str = "/maki.CryptoService/DecryptBatch";
+
 fn validate_endpoints(
     transport: &str,
     endpoints: &[EndpointConfig],
@@ -1674,8 +1709,10 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
         )));
     }
     for (header, value) in &op.headers {
-        if header.trim().is_empty() {
-            return Err(invalid(format!("[crypto.http.{name}] empty header name")));
+        if http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+            return Err(invalid(format!(
+                "[crypto.http.{name}] invalid HTTP header name"
+            )));
         }
         if let HeaderValue::Credential(c) = value {
             validate_credential(c)?;
@@ -2307,26 +2344,30 @@ impl VolumeConfig {
                     validate_tls("grpc", tls)?;
                 }
                 validate_endpoints("grpc", &grpc.endpoint, "http", "https", grpc.tls.is_some())?;
-                // The provider checks the method paths with this same rule
-                // when it is built (attach); unset paths take the reference
-                // contract's methods. Never quote a path: like an endpoint
-                // URL it can carry a token.
                 for (field, path) in [
-                    ("encrypt_path", &grpc.encrypt_path),
-                    ("decrypt_path", &grpc.decrypt_path),
+                    (
+                        "encrypt_path",
+                        grpc.encrypt_path
+                            .as_deref()
+                            .unwrap_or(DEFAULT_GRPC_ENCRYPT_PATH),
+                    ),
+                    (
+                        "decrypt_path",
+                        grpc.decrypt_path
+                            .as_deref()
+                            .unwrap_or(DEFAULT_GRPC_DECRYPT_PATH),
+                    ),
                 ] {
-                    if let Some(path) = path {
-                        check_grpc_method_path(path)
+                    for endpoint in &grpc.endpoint {
+                        grpc_request_path(&endpoint.url, path)
                             .map_err(|reason| invalid(format!("[crypto.grpc] {field} {reason}")))?;
                     }
                 }
                 if grpc.timeout.is_some_and(|t| t.0.is_zero()) {
                     return Err(invalid("[crypto.grpc] timeout must be positive"));
                 }
-                for (name, value) in &grpc.metadata {
-                    if name.trim().is_empty() {
-                        return Err(invalid("[crypto.grpc.metadata] empty key"));
-                    }
+                check_grpc_metadata_keys(grpc.metadata.keys().map(String::as_str))?;
+                for value in grpc.metadata.values() {
                     if let HeaderValue::Credential(c) = value {
                         validate_credential(c)?;
                     }

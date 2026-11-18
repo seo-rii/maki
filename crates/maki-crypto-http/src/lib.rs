@@ -1290,7 +1290,11 @@ impl HttpCryptoProvider {
                     }
                 }
             };
-            let response = match &op_cfg.response {
+            let response = match op_cfg
+                .response
+                .as_ref()
+                .filter(|r| r.response_type != "raw")
+            {
                 None => RespSpec {
                     kind: RespKind::Raw,
                     data_path: None,
@@ -1299,11 +1303,7 @@ impl HttpCryptoProvider {
                     item_index_path: None,
                 },
                 Some(r) => RespSpec {
-                    kind: if r.response_type == "raw" {
-                        RespKind::Raw
-                    } else {
-                        RespKind::Json
-                    },
+                    kind: RespKind::Json,
                     data_path: r.data_path.clone(),
                     encoding: PayloadEncoding::parse(r.encoding.as_deref().unwrap_or("base64"))?,
                     items_path: r.items_path.clone(),

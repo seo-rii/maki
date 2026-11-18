@@ -543,11 +543,11 @@ async fn remote_grpc_provider(
         encrypt_path: grpc
             .encrypt_path
             .clone()
-            .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
+            .unwrap_or_else(|| maki_format::config::DEFAULT_GRPC_ENCRYPT_PATH.to_string()),
         decrypt_path: grpc
             .decrypt_path
             .clone()
-            .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
+            .unwrap_or_else(|| maki_format::config::DEFAULT_GRPC_DECRYPT_PATH.to_string()),
         metadata: Vec::new(),
         capabilities: capabilities_from_config(config, "remote-grpc"),
         timeout: grpc

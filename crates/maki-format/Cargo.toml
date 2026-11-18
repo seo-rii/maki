@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+http = "1"
 maki-backing.workspace = true
 thiserror.workspace = true
 serde.workspace = true

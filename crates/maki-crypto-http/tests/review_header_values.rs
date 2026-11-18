@@ -67,7 +67,7 @@ fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
     );
     assert_ne!(text, original, "the fixture substitution must apply");
     let config = parse_config(&text).unwrap();
-    config.validate().unwrap();
+    assert!(config.validate().is_err());
     let keys = Counting(AtomicUsize::new(0));
     let Err(error) = HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys)
     else {
