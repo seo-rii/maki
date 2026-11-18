@@ -338,6 +338,21 @@ class HostContracts(unittest.TestCase):
                 self.assertIn("ValueError", result["error"])
                 self.assertFalse((args.output / "host-acks.jsonl").exists())
 
+    def test_slow_guest_readiness_keeps_the_established_session(self):
+        args = types.SimpleNamespace(timeout=180, connect_timeout=10)
+        guest = mock.Mock()
+        def ready(event, timeout):
+            self.assertEqual(event, "ready")
+            self.assertEqual(timeout, 175)
+            return {"event": "ready"}
+        guest.expect.side_effect = ready
+        with mock.patch.object(self.host, "ssh_command", return_value=["gcloud"]), \
+                mock.patch.object(self.host, "RemoteProcess", return_value=guest), \
+                mock.patch.object(self.host.time, "monotonic", side_effect=[100, 100, 105]):
+            session, _ = self.host.launch_guest(args, self.token, 0, False, self.path)
+        self.assertIs(session, guest)
+        guest.close.assert_not_called()
+
     def test_post_reset_ssh_timeout_is_retried_with_a_fresh_owned_child(self):
         args = types.SimpleNamespace(timeout=60, connect_timeout=1)
         first = mock.Mock()

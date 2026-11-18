@@ -547,7 +547,9 @@ def launch_guest(args, token, cycle, verify_only, output):
         process = RemoteProcess(ssh_command(args, token, cycle, verify_only),
                                 output / f"attempt-{attempt}", token, cycle)
         try:
-            ready = process.expect("ready", min(remaining, args.connect_timeout + 30))
+            # SSH enforces ConnectTimeout itself; recovery after connection can
+            # legitimately consume the remaining guest startup budget.
+            ready = process.expect("ready", max(0, until - time.monotonic()))
             return process, ready
         except (RuntimeError, TimeoutError) as error:
             errors.append(str(error))
