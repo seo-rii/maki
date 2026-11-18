@@ -87,8 +87,8 @@ def validate_ready(ready, expected_fs_uuid, profile="v2"):
             or ready.get("provider") != "local-aes-gcm-siv"
             or ready.get("can_flush") is not True or ready.get("can_fua") is not True):
         raise ValueError("guest did not prove native provider FLUSH and FUA support")
-    if profile == "v3-discard" and ready.get("can_trim") is not True:
-        raise ValueError("guest did not prove native TRIM support")
+    if ready.get("can_trim") is not (profile == "v3-discard"):
+        raise ValueError("guest TRIM capability does not match the qualification profile")
     if (ready.get("witness_service") != "active"
             or ready.get("graceful_stop_witness") != "absent"):
         raise ValueError("graceful shutdown witness invalidated hard-reset evidence")

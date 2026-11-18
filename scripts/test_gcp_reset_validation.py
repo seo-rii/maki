@@ -180,12 +180,12 @@ class HostContracts(unittest.TestCase):
 
     def test_ready_requires_native_provider_capabilities_and_stable_fs_uuid(self):
         ready = {"event": "ready", "provider": "local-aes-gcm-siv", "can_flush": True,
-                 "can_fua": True, "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
+                 "can_fua": True, "can_trim": False, "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
                  "witness_service": "active", "graceful_stop_witness": "absent"}
         self.host.validate_ready(ready, None)
         self.host.validate_ready(ready, ready["fs_uuid"])
         for field, value in (("provider", "wrong"), ("can_flush", False),
-                             ("can_fua", False), ("fs_uuid", "changed"),
+                             ("can_fua", False), ("can_trim", True), ("can_trim", None), ("fs_uuid", "changed"),
                              ("witness_service", "inactive"),
                              ("graceful_stop_witness", "present")):
             invalid = dict(ready)
@@ -314,7 +314,7 @@ class HostContracts(unittest.TestCase):
                 self.addCleanup(process.close)
                 process.expect = mock.Mock(side_effect=ValueError("fixture ACK failure"))
                 ready = dict(event="ready", boot_id=self.boot_id,
-                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True,
+                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True, can_trim=False,
                              fs_uuid="00112233-4455-6677-8899-aabbccddeeff",
                              witness_service="active", graceful_stop_witness="absent")
                 current = dict(baseline)
@@ -668,10 +668,13 @@ class GuestContracts(unittest.TestCase):
         client = object.__new__(self.guest.Nbd)
         client.can_flush = True
         client.can_fua = True
-        client.can_trim = True
+        client.can_trim = False
         self.assertEqual(self.guest.capabilities(client), {
-            "can_flush": True, "can_fua": True
+            "can_flush": True, "can_fua": True, "can_trim": False
         })
+        client.can_trim = True
+        with self.assertRaisesRegex((AssertionError, ValueError), "TRIM"):
+            self.guest.capabilities(client)
         self.assertEqual(self.guest.capabilities(client, "v3-discard"), {
             "can_flush": True, "can_fua": True, "can_trim": True
         })

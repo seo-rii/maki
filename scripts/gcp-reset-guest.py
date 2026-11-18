@@ -103,7 +103,9 @@ class Nbd:
         self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(socket_path)))
         self.can_fua = self.lib.nbd_can_fua(self.handle) == 1
         self.can_flush = self.lib.nbd_can_flush(self.handle) == 1
-        self.can_trim = self.lib.nbd_can_trim(self.handle) == 1
+        trim = self.lib.nbd_can_trim(self.handle)
+        self.check(trim)
+        self.can_trim = trim == 1
         ensure(self.can_fua, "native FUA unavailable")
         ensure(self.can_flush, "FLUSH unavailable")
 
@@ -166,10 +168,9 @@ def discard_barrier(client, cycle, mode):
 
 
 def capabilities(client, profile="v2"):
-    result = {"can_flush": client.can_flush is True, "can_fua": client.can_fua is True}
-    if profile == "v3-discard":
-        result["can_trim"] = client.can_trim is True
-    return result
+    ensure(client.can_trim is (profile == "v3-discard"), "native TRIM capability does not match the qualification profile")
+    return {"can_flush": client.can_flush is True, "can_fua": client.can_fua is True,
+            "can_trim": client.can_trim}
 
 
 def configured_provider(path):
