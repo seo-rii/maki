@@ -717,7 +717,7 @@ async fn cross_validate_reachable(
                 tracing::warn!(endpoint = %unavailable.0, "quarantined: cross-endpoint self-test could not run ({error})");
                 quarantined.push(unavailable);
             }
-            Err((_, error)) => return Err(error.into()),
+            Err((_, error)) => return Err(error),
         }
     }
     let mut flagged: Vec<_> = std::iter::once(reference)
