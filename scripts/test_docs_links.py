@@ -126,6 +126,11 @@ class DocumentationLinks(unittest.TestCase):
         self.assertEqual(broken_links(self.root),
                          ["README.md:4: Missing Guide.md", "README.md:5: missing.png"])
 
+    def test_unstaged_deletion_still_reports_links_to_the_removed_document(self):
+        self.write("old.md", "# Old\n").unlink()
+        self.write("README.md", "[old](old.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: old.md"])
+
     def test_regular_link_filtering_and_locations_are_preserved(self):
         self.write("target.md", "# Present\n\n## Heading\n")
         self.write("README.md", """[Present](target.md#heading)

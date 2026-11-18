@@ -649,7 +649,10 @@ def broken_links(root):
 
     broken = []
     for path in candidate_markdown(root):
-        content = path.read_bytes()
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            continue  # tracked document deleted from the working tree
         text = content.decode("utf-8")
         relative = path.relative_to(root).as_posix()
         definitions = reference_definitions(text)
