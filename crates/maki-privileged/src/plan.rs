@@ -211,7 +211,7 @@ impl fmt::Display for PlannedStep {
                 volume_uuid,
             } => write!(
                 f,
-                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (only if absent)"
+                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (create if absent; rewrite and sync a matching UUID; refuse a different UUID)"
             ),
             PlannedStep::VerifyMountIdentity {
                 mountpoint,
