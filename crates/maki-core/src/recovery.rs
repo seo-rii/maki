@@ -27,6 +27,8 @@
 //!   it is read into memory;
 //! - the selected checkpoint never lies above the required proof's horizon
 //!   (checkpoints only consume records the proof attests);
+//! - a surviving contiguous journal suffix through the checkpoint must
+//!   agree with readable slot metadata for units recovery will not replay;
 //! - metadata read errors other than "not found" are I/O errors, never
 //!   "invalid copy" (an initialized volume must have checkpoint state).
 //!
@@ -61,6 +63,10 @@ use crate::store::SlotStore;
 #[path = "recovery_scan.rs"]
 mod scan;
 use scan::{range_is_zero, SegmentScanner};
+
+#[path = "checkpoint_evidence.rs"]
+mod checkpoint_evidence;
+use checkpoint_evidence::{CheckpointEvidence, MAX_CHECKPOINT_UNITS};
 
 /// Observes completed, bounded recovery work, without claiming that a new
 /// checkpoint is durable. The callback is borrowed only during recovery and
@@ -131,6 +137,7 @@ pub struct JournalScan {
     /// Fingerprints bind recovery's later rewrite to the exact bytes this
     /// read-only scan accepted, with constant metadata per segment.
     verified_prefixes: Vec<VerifiedPrefix>,
+    checkpoint_evidence: Option<CheckpointEvidence>,
 }
 
 struct VerifiedPrefix {
@@ -139,12 +146,73 @@ struct VerifiedPrefix {
     fingerprint: u64,
 }
 
+impl JournalScan {
+    /// Validate covered record effects before any recovery writes. The
+    /// initial scan collected the first window. On larger journals, reread
+    /// the verified prefixes with fixed memory to check further unit ranges.
+    fn verify_checkpoint_slots(
+        &mut self,
+        backing: &Arc<dyn Backing>,
+        superblock: &Superblock,
+        store: &SlotStore,
+        checkpoint_sequence: u64,
+        progress: &RecoveryProgress<'_>,
+    ) -> Result<(), RecoveryError> {
+        let Some(mut evidence) = self.checkpoint_evidence.take() else {
+            return Ok(());
+        };
+        let suffix_start = evidence.suffix_start();
+        while let Some(first_unit) = evidence.verify(store, progress)? {
+            evidence =
+                CheckpointEvidence::new(checkpoint_sequence, first_unit, MAX_CHECKPOINT_UNITS);
+            for (segment, prefix) in self.segments.iter().zip(&self.verified_prefixes) {
+                if segment.record_count == 0
+                    || suffix_start.is_some_and(|first| segment.last_sequence() < first)
+                {
+                    continue;
+                }
+                let file = backing.open(&prefix.path, false)?;
+                let mut header = [0u8; SEGMENT_HEADER_SIZE];
+                file.read_at(0, &mut header)?;
+                let body_len = prefix.len - SEGMENT_HEADER_SIZE as u64;
+                let scan = SegmentScanner {
+                    file: file.as_ref(),
+                    header: &header,
+                    body_len,
+                    first_sequence: segment.base_sequence,
+                    durable_len: body_len,
+                    required_boundary: None,
+                    geometry: &superblock.geometry,
+                    // This pass needs only metadata from the accepted prefix.
+                    checkpoint_sequence: u64::MAX,
+                    name: &prefix.path,
+                    progress,
+                }
+                .scan_observing(|_| Ok(()), |record| evidence.observe(record))?;
+                if !matches!(scan.outcome, ScanOutcome::Clean)
+                    || scan.valid_body_bytes != body_len
+                    || scan.record_count != segment.record_count
+                    || scan.fingerprint != prefix.fingerprint
+                {
+                    return Err(RecoveryError::Corrupt(format!(
+                        "{} changed during checkpoint verification",
+                        prefix.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The public scan/recovery APIs expose every uncovered record. Volume attach
 /// discards payloads during validation and reads them again through a bounded
 /// checkpoint batch. Select retention independently of validation so the
 /// public API and attach can share every durability check.
 enum ReplayRecords {
     All(Vec<JournalRecord>),
+    /// The public journal-only API returns records without comparing slots.
+    ScanOnly(Vec<JournalRecord>),
     Discard,
     /// Only the units that have an uncovered replay record: what the deep
     /// checker needs to tell recoverable slot damage from unrecoverable
@@ -159,7 +227,7 @@ enum ReplayRecords {
 impl ReplayRecords {
     fn push(&mut self, record: JournalRecord) -> Result<(), RecoveryError> {
         match self {
-            Self::All(records) => records.push(record),
+            Self::All(records) | Self::ScanOnly(records) => records.push(record),
             Self::Discard => {}
             Self::Units { units, written } => {
                 units.insert(record.unit_index);
@@ -185,7 +253,9 @@ impl ReplayRecords {
         std::collections::BTreeSet<u64>,
     ) {
         match self {
-            Self::All(records) => (records, Default::default(), Default::default()),
+            Self::All(records) | Self::ScanOnly(records) => {
+                (records, Default::default(), Default::default())
+            }
             Self::Discard => Default::default(),
             Self::Units { units, written } => (Vec::new(), units, written),
         }
@@ -259,13 +329,20 @@ fn recover_with_replay(
     progress();
 
     // 5./6. scan journal, then apply the repairs the scan decided on
-    let scan = scan_journal_with_proof(
+    let mut scan = scan_journal_with_proof(
         backing,
         &superblock,
         checkpoint_state.checkpoint_sequence,
         segment_size,
         Some(&durable_proof),
         replay,
+        progress,
+    )?;
+    scan.verify_checkpoint_slots(
+        backing,
+        &superblock,
+        &store,
+        checkpoint_state.checkpoint_sequence,
         progress,
     )?;
     // This recovery, the attach after it and later checkpoints store A/B
@@ -596,7 +673,7 @@ pub fn scan_journal(
         superblock,
         checkpoint_sequence,
         segment_size,
-        ReplayRecords::All(Vec::new()),
+        ReplayRecords::ScanOnly(Vec::new()),
     )
 }
 
@@ -621,6 +698,7 @@ pub(crate) fn summarize_journal(
     superblock: &Superblock,
     checkpoint_sequence: u64,
     segment_size: u64,
+    store: Option<&SlotStore>,
 ) -> Result<JournalSummary, RecoveryError> {
     // The deep check scans against the volume's stored checkpoint state, so
     // it applies the rule recovery applies to that state.
@@ -628,7 +706,7 @@ pub(crate) fn summarize_journal(
     if let Some(proof) = &proof {
         check_checkpoint_horizon(checkpoint_sequence, proof)?;
     }
-    let scan = scan_journal_with_proof(
+    let mut scan = scan_journal_with_proof(
         backing,
         superblock,
         checkpoint_sequence,
@@ -640,6 +718,9 @@ pub(crate) fn summarize_journal(
         },
         &|| {},
     )?;
+    if let Some(store) = store {
+        scan.verify_checkpoint_slots(backing, superblock, store, checkpoint_sequence, &|| {})?;
+    }
     let uncovered_records = scan
         .segments
         .iter()
@@ -741,6 +822,9 @@ fn scan_journal_with_proof(
     let mark = load_durable_mark(backing)?;
     let required = proof.filter(|proof| proof.durable_sequence > checkpoint_sequence);
     let mut required_seen = false;
+    let mut checkpoint_evidence = proof
+        .filter(|_| checkpoint_sequence != 0 && !matches!(&replay, ReplayRecords::ScanOnly(_)))
+        .map(|_| CheckpointEvidence::new(checkpoint_sequence, 0, MAX_CHECKPOINT_UNITS));
 
     let mut names: Vec<(u64, String)> = backing
         .list(layout::JOURNAL_DIR)?
@@ -893,7 +977,14 @@ fn scan_journal_with_proof(
             name: &name,
             progress,
         }
-        .scan(|record| replay.push(record))?;
+        .scan_observing(
+            |record| replay.push(record),
+            |record| {
+                if let Some(evidence) = &mut checkpoint_evidence {
+                    evidence.observe(record);
+                }
+            },
+        )?;
         if required.is_some_and(|p| p.segment_index == index) {
             required_seen = true;
         }
@@ -1078,6 +1169,7 @@ fn scan_journal_with_proof(
         repairs,
         mark: final_mark,
         verified_prefixes,
+        checkpoint_evidence,
     })
 }
 

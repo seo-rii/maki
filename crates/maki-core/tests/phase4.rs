@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use maki_backing::Backing;
 use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineOptions};
+use maki_core::recovery::RecoveryError;
 use maki_core::volume::VolumeOptions;
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
@@ -324,10 +325,10 @@ async fn attach_refuses_wrong_unit_size_provider() {
     );
 }
 
-// ---------- corrupted ciphertext is EIO, never plaintext ----------
+// ---------- covered journal validation ----------
 
 #[tokio::test]
-async fn corrupted_ciphertext_with_valid_slot_crc_is_eio() {
+async fn corrupted_ciphertext_with_valid_slot_crc_and_covered_journal_refuses_attach() {
     let backing = Arc::new(CrashableBacking::new());
     let engine = new_engine(&backing).await;
     engine
@@ -337,8 +338,8 @@ async fn corrupted_ciphertext_with_valid_slot_crc_is_eio() {
     engine.checkpoint().await.unwrap();
     drop(engine);
 
-    // Tamper with the ciphertext on disk and FIX the slot CRC so only the
-    // provider's integrity check can catch it.
+    // The slot's own checksum validates, so attach needs independent
+    // evidence from the surviving journal to detect the mismatch.
     let g = geometry();
     let f = backing.open(&layout::shard_data(0), false).unwrap();
     let mut header = vec![0u8; 64];
@@ -356,10 +357,14 @@ async fn corrupted_ciphertext_with_valid_slot_crc_is_eio() {
     f.sync_data().unwrap();
     let _ = g;
 
-    let engine = attach(&backing).await.unwrap();
+    let result = attach(&backing).await;
     assert!(
-        engine.read(0, UNIT as usize).await.is_err(),
-        "corrupted ciphertext must be EIO, never decrypted garbage"
+        matches!(
+            &result,
+            Err(AttachError::Recovery(RecoveryError::Corrupt(reason)))
+                if reason.contains("slot metadata does not match covered journal payload")
+        ),
+        "attach must refuse the covered journal mismatch: {result:?}"
     );
 }
 

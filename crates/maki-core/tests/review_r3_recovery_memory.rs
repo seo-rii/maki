@@ -396,22 +396,32 @@ fn deep_check_preserves_checkpoint_counts_tail_repairs_and_read_only_state() {
     use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 
     for checkpoint in [0, 5, 12] {
-        let fixture = overwrite_fixture(12);
+        let fixture = Fixture::new();
         bind_key_canary(fixture.backing.as_ref(), fixture.superblock.volume_uuid);
+        let mut volume =
+            Volume::recover(fixture.backing.clone(), VolumeOptions::default()).unwrap();
+        // Publish covered writes to their slots through a normal checkpoint.
+        // The active segment retains the covered and uncovered records.
+        for sequence in 1..=12 {
+            assert_eq!(
+                volume
+                    .write_ct((sequence - 1) % 4, &[sequence as u8; 4096], true)
+                    .unwrap(),
+                sequence
+            );
+            if sequence == checkpoint {
+                assert_eq!(volume.checkpoint().unwrap(), checkpoint);
+            }
+        }
+        assert_eq!(volume.checkpoint_sequence(), checkpoint);
+        assert_eq!(volume.journal_segment_count(), 1);
+        let active = volume.journal_active_segment_path().unwrap();
+        drop(volume);
         let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
-        let mut state = store
-            .load::<CheckpointState>(fixture.backing.as_ref())
-            .unwrap()
-            .unwrap();
-        state.checkpoint_sequence = checkpoint;
-        store.store(fixture.backing.as_ref(), &mut state).unwrap();
         let before = store
             .side_generations::<CheckpointState>(fixture.backing.as_ref())
             .unwrap();
-        let file = fixture
-            .backing
-            .open(&layout::journal_segment(0), false)
-            .unwrap();
+        let file = fixture.backing.open(&active, false).unwrap();
         let valid_end = file.len().unwrap();
         file.write_at(valid_end, &record(13)[..47]).unwrap();
         let report = maki_core::check::deep_check(fixture.backing.clone(), 256 << 20).unwrap();
