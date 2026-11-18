@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -37,16 +38,20 @@ def suite_groups(config):
 
 
 def save_json(path, value, before_publish=None):
-    temporary = path.with_name(path.name + ".tmp")
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as out:
-        json.dump(value, out, indent=2, sort_keys=True)
-        out.write("\n")
-        out.flush()
-        os.fsync(out.fileno())
-    if before_publish is not None and not before_publish():
-        return False
-    os.replace(temporary, path)
-    return True
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(value, out, indent=2, sort_keys=True)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        if before_publish is not None and not before_publish():
+            return False
+        os.replace(temporary, path)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def process_identity(pid):

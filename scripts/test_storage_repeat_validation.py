@@ -465,12 +465,12 @@ class BackgroundStorageTests(unittest.TestCase):
                     "revision": "fixture", "source": str(directory),
                 })
                 original_sync, original_replace = os.fsync, os.replace
-                temporary = directory / "status.json.tmp"
 
                 def sync(fd):
                     # Exercise the real final JSON flush/fsync, after all
                     # suite/result checks but before atomic status publication.
-                    if temporary.exists():
+                    temporary = next(directory.glob(".status.json.*.tmp"), None)
+                    if temporary is not None:
                         candidate = json.loads(temporary.read_text())
                         if candidate["state"] in self.runner.TERMINAL:
                             terminal_syncs.append(candidate["state"])
@@ -510,7 +510,7 @@ class BackgroundStorageTests(unittest.TestCase):
                     self.assertNotIn("passed", published, "an ineligible pass must stay private")
                     self.assertEqual(terminal_syncs, ["passed", expected])
                     self.assertEqual(report["elapsed_seconds"], elapsed)
-                self.assertFalse(temporary.exists())
+                self.assertEqual(list(directory.glob(".status.json.*.tmp")), [])
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_supervisor_signal_cleans_build_and_suite_groups_and_records_cancellation(self):
@@ -649,6 +649,16 @@ class BackgroundStorageTests(unittest.TestCase):
             self.root, self.root / "noisy.log", self.root / "STOP", 10, max_bytes=1024)
         self.assertEqual(result["reason"], "output_limit")
         self.assertEqual((self.root / "noisy.log").stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_publications_use_independent_temporary_files(self):
+        path = self.root / "latest.json"
+        def publish_second():
+            self.assertTrue(self.runner.save_json(path, {"run": "second"}))
+            self.assertEqual(json.loads(path.read_text()), {"run": "second"})
+            return True
+        self.assertTrue(self.runner.save_json(path, {"run": "first"}, before_publish=publish_second))
+        self.assertEqual(json.loads(path.read_text()), {"run": "first"})
+        self.assertEqual(list(self.root.iterdir()), [path])
 
     def test_atomic_state_is_private(self):
         self.runner.save_json(self.root / "status.json", {"state": "running"})
