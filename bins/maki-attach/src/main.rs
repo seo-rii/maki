@@ -92,7 +92,14 @@ fn main() -> ExitCode {
     // `tracing`; without a sink they vanish and the operator sees only the
     // exit status.
     maki_privileged::logging::install_default_logging();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Ok(args) = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        eprintln!("error: command-line arguments must be valid UTF-8");
+        return ExitCode::from(2);
+    };
     if let Err(error) = validate_arguments(&args) {
         eprintln!("error: {error}");
         return usage();

@@ -255,3 +255,18 @@ fn executing_verbs_refuse_an_attach_config_a_non_root_user_controls() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_argument_returns_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+        .args(["attach", "--volume", "example", "--plan", "--config"])
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.toml"))
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8(result.stderr)
+        .unwrap()
+        .contains("valid UTF-8"));
+}

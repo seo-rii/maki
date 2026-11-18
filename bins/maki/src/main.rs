@@ -153,7 +153,14 @@ fn main() -> ExitCode {
     if let Err(e) = maki_backing::raise_open_file_limit() {
         eprintln!("warning: cannot raise the open-file soft limit: {e}");
     }
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let Ok(mut args) = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        eprintln!("error: command-line arguments must be valid UTF-8");
+        return ExitCode::from(2);
+    };
     // Helper options belong to the helper, including its NBD --socket
     // override. Preserve them before interpreting any control options.
     if matches!(
@@ -312,7 +319,11 @@ fn main() -> ExitCode {
 }
 
 fn shell_word(value: &str) -> String {
-    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b)) {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b))
+    {
         value.to_owned()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
@@ -320,7 +331,11 @@ fn shell_word(value: &str) -> String {
 }
 
 fn privileged_helper(args: &[String]) -> ExitCode {
-    let command = args.iter().map(|arg| shell_word(arg)).collect::<Vec<_>>().join(" ");
+    let command = args
+        .iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
     eprintln!("this operation requires the privileged helper: run `maki-attach {command}`");
     ExitCode::from(3)
 }

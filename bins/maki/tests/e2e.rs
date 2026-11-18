@@ -273,10 +273,39 @@ fn drain_command_propagates_the_control_result() {
 #[test]
 fn helper_hint_preserves_the_operation_and_shell_arguments() {
     for verb in ["attach", "detach", "grow"] {
-        let result = maki(&[verb, "--volume", "example", "--mountpoint", "/srv/dog's bed"], None);
+        let result = maki(
+            &[
+                verb,
+                "--volume",
+                "example",
+                "--mountpoint",
+                "/srv/dog's bed",
+            ],
+            None,
+        );
         assert_eq!(result.status.code(), Some(3));
         let hint = stderr(&result);
-        assert!(hint.contains(&format!("maki-attach {verb} --volume example --mountpoint '/srv/dog'\\''s bed'")), "{hint}");
+        assert!(
+            hint.contains(&format!(
+                "maki-attach {verb} --volume example --mountpoint '/srv/dog'\\''s bed'"
+            )),
+            "{hint}"
+        );
         assert!(!hint.contains("systemctl"), "{hint}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_argument_returns_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(["volume", "inspect"])
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.toml"))
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8(result.stderr)
+        .unwrap()
+        .contains("valid UTF-8"));
 }
