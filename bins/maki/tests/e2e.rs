@@ -269,3 +269,14 @@ fn drain_command_propagates_the_control_result() {
         }
     }
 }
+
+#[test]
+fn helper_hint_preserves_the_operation_and_shell_arguments() {
+    for verb in ["attach", "detach", "grow"] {
+        let result = maki(&[verb, "--volume", "example", "--mountpoint", "/srv/dog's bed"], None);
+        assert_eq!(result.status.code(), Some(3));
+        let hint = stderr(&result);
+        assert!(hint.contains(&format!("maki-attach {verb} --volume example --mountpoint '/srv/dog'\\''s bed'")), "{hint}");
+        assert!(!hint.contains("systemctl"), "{hint}");
+    }
+}

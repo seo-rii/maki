@@ -311,12 +311,17 @@ fn main() -> ExitCode {
     }
 }
 
+fn shell_word(value: &str) -> String {
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b)) {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn privileged_helper(args: &[String]) -> ExitCode {
-    eprintln!(
-        "this operation requires the privileged helper: run `maki-attach {}` \
-         (or systemctl start maki-attach@<volume>)",
-        args.join(" ")
-    );
+    let command = args.iter().map(|arg| shell_word(arg)).collect::<Vec<_>>().join(" ");
+    eprintln!("this operation requires the privileged helper: run `maki-attach {command}`");
     ExitCode::from(3)
 }
 
@@ -424,7 +429,9 @@ fn ownership_hint(
             "the volume tree {root} and the rollback witness in {witness} were created \
              owner-only by root; the daemon runs as the maki user and cannot open them. Run \
              `maki volume create` as that user (sudo -u maki ...) or \
-             `chown -R maki:maki {root} {witness}` before starting the service"
+             `chown -R maki:maki {root_arg} {witness_arg}` before starting the service",
+            root_arg = shell_word(root),
+            witness_arg = shell_word(witness)
         ),
         None => "the volume tree was created owner-only by root; the daemon runs as the maki \
                  user and cannot open it. Run `maki volume create` as that user \
