@@ -141,6 +141,43 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
     return result
 
 
+def cargo_compiler(source, directory, environment, remaining):
+    # Cargo gives build scripts its resolved compiler and both wrapper paths.
+    # Run from the same cwd as the campaign so Cargo and rustup load its configuration.
+    with tempfile.TemporaryDirectory(dir=directory, prefix="toolchain-") as temporary:
+        probe = Path(temporary)
+        (probe / "Cargo.toml").write_text(
+            '[workspace]\n[package]\nname = "maki-toolchain-probe"\nversion = "0.0.0"\n'
+            'edition = "2021"\n[lib]\npath = "lib.rs"\n')
+        (probe / "lib.rs").touch()
+        (probe / "build.rs").write_text("""
+use std::{env, fs, process::Command};
+
+fn main() {
+    let compiler = env::var_os("RUSTC").unwrap();
+    let mut command = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"].iter()
+        .filter_map(env::var_os)
+        .filter(|path| !path.is_empty())
+        .chain(std::iter::once(compiler.clone()));
+    let version = Command::new(command.next().unwrap()).args(command).arg("-vV")
+        .current_dir(env::var_os("MAKI_PROBE_SOURCE").unwrap()).output().unwrap();
+    assert!(version.status.success(), "{}", String::from_utf8_lossy(&version.stderr));
+    fs::write("rustc-path", compiler.as_encoded_bytes()).unwrap();
+    fs::write("rustc-version", version.stdout).unwrap();
+}
+""")
+        environment = dict(environment, CARGO_TARGET_DIR=str(probe / "target"),
+                           CARGO_BUILD_BUILD_DIR=str(probe / "build"), MAKI_PROBE_SOURCE=str(source))
+        command = ["cargo", "check", "--quiet", "--offline", "--manifest-path", str(probe / "Cargo.toml")]
+        result = run_child(command, source, directory / "toolchain.log", directory / "STOP",
+                           remaining(1800), env=environment)
+        if result["reason"] == "timeout":
+            raise TimeoutError(f"compiler probe timed out: {result}")
+        if result["exit_code"] != 0 or result["reason"] != "exited":
+            raise RuntimeError(f"compiler probe did not complete (see toolchain.log): {result}")
+        return os.fsdecode((probe / "rustc-path").read_bytes()), (probe / "rustc-version").read_text()
+
+
 def prepare(directory, config, deadline):
     groups = suite_groups(config)
     source = Path(config["source"])
@@ -159,8 +196,8 @@ def prepare(directory, config, deadline):
     # when the shell or Cargo configuration supplies a shared build directory.
     environment.update(CARGO_TARGET_DIR=config["target_dir"],
                        CARGO_BUILD_BUILD_DIR=str(directory / "build"), CARGO_BUILD_JOBS="2")
-    if "rustc_executable" in config:
-        environment["RUSTC"] = config["rustc_executable"]
+    config["rustc_executable"], config["rustc"] = cargo_compiler(source, directory, environment, remaining)
+    save_json(directory / "config.json", config)
     executables = {}
     suites = [suite for group in groups.values() for suite in group]
     for package, selected in groups.items():
@@ -320,13 +357,6 @@ def start(args):
     runner = directory / "runner.py"
     shutil.copyfile(__file__, runner)
     runner.chmod(0o400)
-    selected = os.environ.get("RUSTC") or os.environ.get("CARGO_BUILD_RUSTC") or "rustc"
-    compiler = shutil.which(selected)
-    if compiler is None:
-        raise RuntimeError("selected Rust compiler was not found")
-    # Preserve rustup proxy names and resolve relative selections in the caller's cwd.
-    compiler = os.path.abspath(compiler)
-    environment = dict(os.environ, RUSTC=compiler)
     save_json(directory / "config.json", {
         "revision": revision, "source": str(source), "target_dir": str(target),
         "build_dir": str(directory / "build"),
@@ -335,9 +365,7 @@ def start(args):
         "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
         "profile": profile,
         "suites": [suite for group in groups.values() for suite in group],
-        "rustc_executable": compiler,
-        "rustc": subprocess.check_output([compiler, "-Vv"], cwd=source, env=environment, text=True),
-        "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, env=environment, text=True).strip(),
+        "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, text=True).strip(),
     })
     with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
         process = subprocess.Popen([sys.executable, "-B", str(runner), "_worker", "--run-dir", str(directory)],

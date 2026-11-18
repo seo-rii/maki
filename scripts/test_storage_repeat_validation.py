@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,7 +34,7 @@ class BackgroundStorageTests(unittest.TestCase):
         def child(command, _cwd, log, _stop, _timeout, **_kwargs):
             calls.append(command)
             if command[0] == "cargo":
-                self.assertEqual(_kwargs["env"]["RUSTC"], "/path/to/selected-rustc")
+                self.assertEqual(_kwargs["env"].get("RUSTC"), os.environ.get("RUSTC"))
                 package = command[command.index("-p") + 1]
                 self.assertIn(package, expected)
                 selected = tuple(command[i + 1] for i, arg in enumerate(command) if arg == "--test")
@@ -50,8 +51,9 @@ class BackgroundStorageTests(unittest.TestCase):
             return {"exit_code": 0, "reason": "exited"}
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target"),
-                  "profile": "rollback", "rustc_executable": "/path/to/selected-rustc"}
-        with mock.patch.object(self.runner, "run_child", side_effect=child):
+                  "profile": "rollback"}
+        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version")), \
+                mock.patch.object(self.runner, "run_child", side_effect=child):
             binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
         self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
         manifest = json.loads((self.root / "binaries.json").read_text())
@@ -99,7 +101,8 @@ class BackgroundStorageTests(unittest.TestCase):
             return result
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target")}
-        with mock.patch.object(self.runner, "suite_groups", return_value=groups), \
+        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version")), \
+                mock.patch.object(self.runner, "suite_groups", return_value=groups), \
                 mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]), \
                 mock.patch.object(self.runner, "run_child", side_effect=child):
             error = None
@@ -209,12 +212,9 @@ class BackgroundStorageTests(unittest.TestCase):
                 Path(output.split("=", 1)[1]).write_bytes(b"frozen source")
             return subprocess.CompletedProcess(command, 0)
 
-        compiler = self.root / "test rustc"
-        compiler.touch(mode=0o700)
         process = mock.Mock(pid=os.getpid())
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
-        with mock.patch.dict(os.environ, RUSTC=str(compiler)), \
-                mock.patch.object(self.runner.Path, "home", return_value=self.root), \
+        with mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                 mock.patch.object(
                     self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)
                 ), \
@@ -222,8 +222,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 mock.patch.object(
                     self.runner.subprocess,
                     "check_output",
-                    side_effect=["revision-one\n", "rustc fixture\n", "cargo fixture\n",
-                                 "revision-two\n", "rustc fixture\n", "cargo fixture\n"],
+                    side_effect=["revision-one\n", "cargo fixture\n", "revision-two\n", "cargo fixture\n"],
                 ) as probes, \
                 mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
             self.runner.start(args)
@@ -236,13 +235,9 @@ class BackgroundStorageTests(unittest.TestCase):
         second_config = json.loads((Path(second["run_dir"]) / "config.json").read_text())
         self.assertEqual(Path(first_config["target_dir"]), Path(first["run_dir"]) / "target")
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
-        for start, config in ((0, first_config), (3, second_config)):
-            self.assertEqual(config["rustc_executable"], str(compiler))
-            probe = probes.call_args_list[start + 1]
-            self.assertEqual(probe.args[0], [str(compiler), "-Vv"])
-            self.assertEqual(probe.kwargs["cwd"], Path(config["source"]))
-            self.assertEqual(probe.kwargs["env"]["RUSTC"], str(compiler))
-            self.assertEqual(probes.call_args_list[start + 2].kwargs["cwd"], Path(config["source"]))
+        for index, config in enumerate((first_config, second_config)):
+            source = Path(config["source"])
+            self.assertEqual(probes.call_args_list[index * 2 + 1], mock.call(["cargo", "-V"], cwd=source, text=True))
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
         self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
         self.assertEqual(Path(second_config["build_dir"]), Path(second["run_dir"]) / "build")
@@ -253,6 +248,77 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(second_config["suites"], [
             "rollback_backing", "rollback_model", "rollback_protection", "rollback_process",
         ])
+
+    def test_cargo_records_same_compiler_and_wrappers_used_for_suite_build(self):
+        source = self.root / "source"
+        (source / "tests").mkdir(parents=True)
+        (source / "Cargo.toml").write_text(
+            '[package]\nname="fixture"\nversion="0.0.0"\nedition="2021"\n')
+        (source / "Cargo.lock").write_text('version=3\n[[package]]\nname="fixture"\nversion="0.0.0"\n')
+        (source / "tests" / "campaign.rs").write_text("#[test] fn passes() {}\n")
+        compiler = shutil.which("rustc")
+        self.assertIsNotNone(compiler)
+        for name in ("ancestor", "project", "env-config", "env-rustc"):
+            path = self.root / name
+            path.write_text(
+                '#!/bin/sh\nif [ "$1" = "-vV" ]; then\n'
+                f'  "$FIXTURE_RUSTC" "$@" && echo "fixture compiler: {name}"\n'
+                'else\n  case " $* " in *" --crate-name campaign "*) '
+                f'echo {name} >> "$FIXTURE_BUILDS";; esac\n'
+                '  exec "$FIXTURE_RUSTC" "$@"\nfi\n')
+            path.chmod(0o700)
+        for name in ("outer", "inner"):
+            path = self.root / name
+            path.write_text('#!/bin/sh\nfor last do :; done\nif [ "$last" = "-vV" ]; then\n'
+                            f'  "$@" && echo "fixture wrapper: {name}"\nelse\n  exec "$@"\nfi\n')
+            path.chmod(0o700)
+        (self.root / ".cargo").mkdir()
+        (self.root / ".cargo/config.toml").write_text(
+            '[build]\nrustc="./ancestor"\nrustc-wrapper="./outer"\n'
+            'rustc-workspace-wrapper="./inner"\n')
+        (source / ".cargo").mkdir()
+        environment = {k: v for k, v in os.environ.items() if k not in (
+            "RUSTC", "CARGO_BUILD_RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")}
+        environment.update(FIXTURE_RUSTC=compiler, FIXTURE_BUILDS=str(self.root / "compilations"))
+        for selected in ("ancestor", "project", "env-config", "env-rustc"):
+            with self.subTest(selected=selected):
+                if selected == "project":
+                    (source / ".cargo/config.toml").write_text('[build]\nrustc="../project"\n')
+                if selected == "env-config":
+                    environment["CARGO_BUILD_RUSTC"] = str(self.root / selected)
+                if selected == "env-rustc":
+                    environment["RUSTC"] = str(self.root / selected)
+                directory = self.root / f"run-{selected}"
+                directory.mkdir()
+                config = {"source": str(source), "target_dir": str(directory / "target")}
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                        mock.patch.object(self.runner, "suite_groups", return_value={"fixture": ("campaign",)}):
+                    self.runner.prepare(directory, config, time.monotonic() + 60)
+                recorded = json.loads((directory / "config.json").read_text())
+                self.assertTrue((self.root / selected).samefile(recorded["rustc_executable"]))
+                self.assertIn(f"fixture compiler: {selected}", recorded["rustc"])
+                self.assertIn("fixture wrapper: inner\nfixture wrapper: outer", recorded["rustc"])
+                self.assertEqual((self.root / "compilations").read_text().splitlines()[-1], selected)
+
+    def test_unavailable_or_timed_out_compiler_probe_records_terminal_status(self):
+        for reason, expected in (("exited", "failed"), ("timeout", "incomplete")):
+            with self.subTest(reason=reason):
+                directory = self.root / reason
+                directory.mkdir()
+                self.runner.save_json(directory / "config.json", {
+                    "source": str(directory), "target_dir": str(directory / "target"),
+                    "revision": "fixture", "rounds": 1, "max_seconds": 10, "suite_timeout": 5,
+                })
+                with mock.patch.object(self.runner, "run_child", return_value={
+                        "reason": reason, "exit_code": 1}) as child:
+                    self.assertEqual(self.runner.worker(directory), 1)
+                child.assert_called_once()
+                self.assertLessEqual(child.call_args.args[4], 10)
+                self.assertEqual(child.call_args.args[2], directory / "toolchain.log")
+                status = json.loads((directory / "status.json").read_text())
+                self.assertEqual(status["state"], expected)
+                self.assertIn("compiler probe", status["error"])
 
     def test_prepare_isolates_all_packages_from_inherited_cargo_directories(self):
         calls = []
@@ -282,6 +348,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 return {"exit_code": 0, "reason": "exited"}
 
             with mock.patch.dict(os.environ, inherited), \
+                    mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version")), \
                     mock.patch.object(self.runner, "run_child", side_effect=child):
                 self.runner.prepare(directory, config, time.monotonic() + 30)
                 self.assertEqual(os.environ["CARGO_BUILD_BUILD_DIR"], inherited["CARGO_BUILD_BUILD_DIR"])
