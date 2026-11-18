@@ -321,7 +321,7 @@ def create_tree(package_root, args):
             relative = source.relative_to(ROOT / "packaging/examples")
             install_file(source, package_root / "usr/share/doc/maki/examples" / relative, 0o644)
 
-    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd"]
+    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd", "kmod"]
     if args.shlibdeps:
         for entry in shared_library_dependencies(package_root):
             if entry not in depends:
@@ -431,19 +431,21 @@ def main():
         create_tree(package_root, args)
         normalize_directory_permissions(package_root)
         normalize_timestamps(package_root, epoch)
-        temporary_output = pathlib.Path(temporary) / "maki.deb"
-        subprocess.run(
-            [
-                "dpkg-deb",
-                "--build",
-                "--root-owner-group",
-                str(package_root),
-                str(temporary_output),
-            ],
-            check=True,
-        )
-        shutil.copyfile(temporary_output, args.output)
-        args.output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        with tempfile.TemporaryDirectory(prefix=".maki-deb-", dir=args.output.parent) as staging:
+            temporary_output = pathlib.Path(staging) / "maki.deb"
+            subprocess.run(
+                [
+                    "dpkg-deb",
+                    "--build",
+                    "--root-owner-group",
+                    str(package_root),
+                    str(temporary_output),
+                ],
+                env={**os.environ, "SOURCE_DATE_EPOCH": str(epoch)},
+                check=True,
+            )
+            temporary_output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            temporary_output.replace(args.output)
     print(args.output)
 
 

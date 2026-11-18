@@ -173,7 +173,7 @@ class DebianPackageTests(unittest.TestCase):
         self.assertEqual(self.field(package, "Architecture"), "amd64")
         dependencies = self.field(package, "Depends")
         self.assertIn("nbd-client (>= 1:3.27.0)", dependencies)
-        for dependency in ("nbdkit", "lvm2", "xfsprogs", "systemd"):
+        for dependency in ("nbdkit", "lvm2", "xfsprogs", "systemd", "kmod"):
             self.assertIn(dependency, dependencies)
 
         root, control = self.extract(package)
@@ -534,8 +534,19 @@ class DebianPackageTests(unittest.TestCase):
         self.assertIn("native library dependencies", result.stderr)
         self.assertEqual(
             self.field(output, "Depends"),
-            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd",
+            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd, kmod",
         )
+
+    def test_unspecified_epoch_also_applies_to_archive_headers(self):
+        output, command = self.builder_command("default-epoch.deb", "0.1.0+test1",
+                                               extra=["--no-shlibdeps"])
+        environment = os.environ.copy()
+        environment.pop("SOURCE_DATE_EPOCH", None)
+        subprocess.run(command, cwd=ROOT, env=environment, check=True, capture_output=True)
+        with output.open("rb") as stream:
+            self.assertEqual(stream.read(8), b"!<arch>\n")
+            header = stream.read(60)
+        self.assertEqual(int(header[16:28]), 0)
 
     def test_build_is_reproducible_and_rejects_invalid_inputs(self):
         first = self.build("first.deb")
@@ -546,6 +557,15 @@ class DebianPackageTests(unittest.TestCase):
         (self.release / "maki-check").unlink()
         stderr = self.build_failure("invalid.deb")
         self.assertIn("maki-check", stderr)
+
+    def test_rebuild_replaces_the_directory_entry_after_output_is_complete(self):
+        output = self.work / "maki.deb"
+        output.write_bytes(b"previous package")
+        previous = self.work / "previous.deb"
+        os.link(output, previous)
+        self.build()
+        self.assertEqual(previous.read_bytes(), b"previous package")
+        self.assertEqual(self.field(output, "Package"), "maki")
 
     def test_build_succeeds_with_restrictive_caller_umask(self):
         package = self.build(umask=0o077)

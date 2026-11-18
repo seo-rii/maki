@@ -15,6 +15,7 @@ for a first installation.
 |---|---|---|
 | `nbdkit` | Any recent release with API v2 (1.32.5 tested) | `apt install nbdkit` |
 | `nbd-client` | **3.27.0 or later**, built with netlink support | Stock package is 3.24: **too old**, see below |
+| kmod | `modprobe` to load the NBD module | `apt install kmod` |
 | Kernel NBD module | `nbd` with the sysfs backend identifier (Linux 6.1 tested) | Included |
 | LVM2 | `fullreport`, `--devices` and UUID-scoped activation (2.03.16 tested) | `apt install lvm2` |
 | XFS tools | `mkfs.xfs`, `xfs_growfs` (6.1.0 tested) | `apt install xfsprogs` |
@@ -24,7 +25,7 @@ for a first installation.
 The Debian package declares these dependencies:
 
 ```text
-Depends: nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd
+Depends: nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd, kmod
 ```
 
 so `apt install ./maki_*.deb` refuses to install until a suitable
