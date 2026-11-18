@@ -38,11 +38,12 @@ pub(super) fn range_is_zero(
     Ok(zero)
 }
 
-struct RecordHeader {
-    sequence: u64,
-    unit: u64,
-    payload_len: u32,
-    payload_crc: u32,
+#[derive(Clone, Copy)]
+pub(super) struct RecordHeader {
+    pub(super) sequence: u64,
+    pub(super) unit: u64,
+    pub(super) payload_len: u32,
+    pub(super) payload_crc: u32,
 }
 
 impl RecordHeader {
@@ -89,7 +90,17 @@ impl SegmentScanner<'_> {
     /// the caller controls whether superseded records remain in memory.
     pub fn scan(
         self,
+        accept: impl FnMut(JournalRecord) -> Result<(), RecoveryError>,
+    ) -> Result<SegmentBodyScan, RecoveryError> {
+        self.scan_observing(accept, |_| {})
+    }
+
+    /// Report compact metadata for every validated record, including those
+    /// already covered by the checkpoint, without retaining their payloads.
+    pub(super) fn scan_observing(
+        self,
         mut accept: impl FnMut(JournalRecord) -> Result<(), RecoveryError>,
+        mut observe: impl FnMut(RecordHeader),
     ) -> Result<SegmentBodyScan, RecoveryError> {
         let mut fingerprint = DefaultHasher::new();
         fingerprint.write(self.header);
@@ -243,6 +254,7 @@ impl SegmentScanner<'_> {
                     required_boundary_seen = true;
                 }
             }
+            observe(header);
             if let Some(payload) = payload {
                 accept(JournalRecord {
                     sequence: header.sequence,

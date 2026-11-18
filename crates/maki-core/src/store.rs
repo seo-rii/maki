@@ -1325,6 +1325,58 @@ impl SlotStore {
         Ok(self.slot_header(unit)?.map(|header| header.write_sequence))
     }
 
+    /// Compare slot metadata with the last surviving journal record for a
+    /// unit when no later record can account for a different value. The
+    /// deep check separately reads and verifies ciphertext.
+    pub(crate) fn verify_covered_slot(
+        &self,
+        unit: u64,
+        sequence: u64,
+        payload_len: u32,
+        payload_crc: u32,
+    ) -> Result<(), CoreError> {
+        self.validate_unit(unit)?;
+        if self.discard_enabled && payload_len == 0 {
+            let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
+            let discarded = self
+                .shards
+                .get(&shard_idx)
+                .and_then(|shard| shard.discard.as_ref())
+                .is_some_and(|map| map.get(in_shard));
+            return if discarded {
+                Ok(())
+            } else {
+                Err(CoreError::Corrupt(format!(
+                    "unit {unit}: covered journal discard at sequence {sequence} is missing from the discard map"
+                )))
+            };
+        }
+        let header = match self.slot_header(unit) {
+            Ok(header) => header,
+            // A damaged header already reads as EIO and is reported by the
+            // deep check. This comparison detects valid but stale state.
+            Err(CoreError::Corrupt(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(header) = header else {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit}: covered journal write at sequence {sequence} has no visible slot"
+            )));
+        };
+        if header.write_sequence != sequence {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit}: slot sequence {} does not match covered journal sequence {sequence}",
+                header.write_sequence
+            )));
+        }
+        if header.ciphertext_len != payload_len || header.ciphertext_crc != payload_crc {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit}: slot metadata does not match covered journal payload at sequence {sequence}"
+            )));
+        }
+        Ok(())
+    }
+
     /// SPEC §22 read classification, header part: which version the slot
     /// holds, or `None` for zeros. Refuses undecodable, foreign-unit and
     /// oversized headers and damaged unlisted slots exactly as a full read
@@ -1421,5 +1473,53 @@ impl SlotStore {
     /// Shards touched by the given unit list (for checkpoint fdatasync).
     pub fn shards_of_units<'a>(&self, units: impl Iterator<Item = &'a u64>) -> BTreeSet<u64> {
         units.map(|u| self.geometry.shard_of_unit(*u).0).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maki_backing::MemBacking;
+    use maki_format::{init, superblock::Superblock};
+
+    #[test]
+    fn covered_slot_requires_matching_write_metadata() {
+        let backing = Arc::new(MemBacking::new());
+        let geometry = Geometry::compute(512, 512, 512, 520, 512 * 64, 512 * 64).unwrap();
+        init::create_volume(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "test".into(),
+                key_identity: "test".into(),
+                geometry: geometry.clone(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut store = SlotStore::open(backing, geometry).unwrap();
+        let payload = b"ciphertext";
+        let len = payload.len() as u32;
+        let crc = crc32fast::hash(payload);
+        store.write_slot(0, 1, payload).unwrap();
+        store.sync_shard_data(0).unwrap();
+        store.mark_allocated(0).unwrap();
+        store.persist_allocations().unwrap();
+
+        store.verify_covered_slot(0, 1, len, crc).unwrap();
+        for (unit, sequence, len, crc) in [
+            (0, 2, len, crc),
+            (0, 1, len + 1, crc),
+            (0, 1, len, crc ^ 1),
+            (1, 1, len, crc),
+        ] {
+            assert!(matches!(
+                store.verify_covered_slot(unit, sequence, len, crc),
+                Err(CoreError::Corrupt(_))
+            ));
+        }
     }
 }

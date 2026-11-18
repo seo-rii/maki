@@ -160,6 +160,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // Apply recovery's validation and repair policy without retaining the
     // replay payloads: this report needs counts, repair decisions and the
     // set of units a replay would rewrite.
+    let store = SlotStore::open(backing.clone(), superblock.geometry.clone());
     let mut replay_units = std::collections::BTreeSet::new();
     let mut replay_written = std::collections::BTreeSet::new();
     let mut journal_durable = None;
@@ -169,6 +170,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         &superblock,
         checkpoint_sequence,
         effective_segment_size(segment_size),
+        store.as_ref().ok(),
     ) {
         Ok(scan) => {
             report.info.push(format!(
@@ -213,7 +215,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // unit that replay neither rewrites nor discards first.
     let mut stored_ciphertext = false;
     let mut shard_count = None;
-    match SlotStore::open(backing.clone(), superblock.geometry.clone()) {
+    match store {
         Ok(store) => {
             shard_count = Some(store.shard_count());
             // The A/B generations recovery checks before its first write.
