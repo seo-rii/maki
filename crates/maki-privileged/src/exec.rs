@@ -149,8 +149,9 @@ fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError
 /// access, read through held descriptors. The verb runs as root on what the
 /// file says (mountpoint, VG, NBD socket), so a file a non-root user could
 /// write would hand them those choices (R5-030).
-pub fn load_trusted_config(path: &str) -> Result<crate::config::AttachConfig, String> {
-    let text = crate::state::read_verify_config(Path::new(path)).map_err(|error| {
+pub fn load_trusted_config(path: impl AsRef<Path>) -> Result<crate::config::AttachConfig, String> {
+    let path = path.as_ref();
+    let text = crate::state::read_verify_config(path).map_err(|error| {
         format!(
             "attach config {path:?} must be a root-owned regular file below root-owned \
              directories without group/other write access: {error}"
@@ -1539,8 +1540,8 @@ pub fn cleanup(plan: &Plan) -> Result<(), ExecError> {
 
 /// Check the current caller namespace's complete attachment before starting
 /// a workload. Uses existing trusted state and config only, without repairs.
-pub fn verify(volume: &str, config_path: &str) -> Result<(), ExecError> {
-    workload_verify::execute(volume, config_path)
+pub fn verify(volume: &str, config_path: impl AsRef<Path>) -> Result<(), ExecError> {
+    workload_verify::execute(volume, config_path.as_ref())
 }
 
 fn recover_with(

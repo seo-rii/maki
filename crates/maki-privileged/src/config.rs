@@ -78,9 +78,10 @@ pub fn parse(text: &str) -> Result<AttachConfig, ConfigError> {
     })
 }
 
-pub fn load(path: &str) -> Result<AttachConfig, ConfigError> {
+pub fn load(path: impl AsRef<std::path::Path>) -> Result<AttachConfig, ConfigError> {
+    let path = path.as_ref();
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_string(),
+        path: path.display().to_string(),
         source,
     })?;
     parse(&text)

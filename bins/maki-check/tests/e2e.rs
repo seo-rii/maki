@@ -24,11 +24,8 @@ fn scribble(path: &str, offset: u64) {
     f.write_all(&[0xFF; 16]).unwrap();
 }
 
-#[test]
-fn check_passes_then_fails_closed_on_corruption() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("vol").to_string_lossy().into_owned();
-    let backing = FileBacking::new(&root).unwrap();
+fn create_test_volume(root: &std::path::Path) {
+    let backing = FileBacking::new(root).unwrap();
     init::create_volume(
         &backing,
         Superblock {
@@ -43,6 +40,13 @@ fn check_passes_then_fails_closed_on_corruption() {
         },
     )
     .unwrap();
+}
+
+#[test]
+fn check_passes_then_fails_closed_on_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("vol").to_string_lossy().into_owned();
+    create_test_volume(std::path::Path::new(&root));
 
     let out = run(&root);
     assert!(
@@ -111,4 +115,23 @@ fn maki_check_help_and_version_succeed() {
         String::from_utf8_lossy(&version.stdout).trim(),
         format!("maki-check {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn checker_reads_a_volume_with_a_non_utf8_backing_path() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    create_test_volume(&root);
+    let result = Command::new(env!("CARGO_BIN_EXE_maki-check"))
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("check passed"));
 }

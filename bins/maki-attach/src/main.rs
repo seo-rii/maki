@@ -7,6 +7,8 @@
 //! only, with NBD device allocation, mount-identity verification and
 //! reverse rollback on failure.
 
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use maki_privileged::config::{self, AttachConfig, AttachOverrides};
@@ -33,17 +35,24 @@ requires the volume UUID (config or --uuid); --plan prints the plan without it."
     ExitCode::from(2)
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1).cloned())
+fn flag_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a OsStr> {
+    let index = args.iter().position(|argument| argument == name)?;
+    args.get(index + 1).map(OsString::as_os_str)
+}
+
+fn flag(args: &[OsString], name: &str) -> Option<String> {
+    flag_value(args, name)?.to_str().map(str::to_owned)
 }
 
 /// Validate the complete command before reading configuration or printing a
 /// plan. Missing values, duplicates and flags belonging to another verb are
 /// usage errors; an omitted flag alone may select a default.
-fn validate_arguments(args: &[String]) -> Result<(), String> {
-    let verb = args.first().map(String::as_str).ok_or("missing command")?;
+fn validate_arguments(args: &[OsString]) -> Result<(), String> {
+    let verb = args
+        .first()
+        .ok_or("missing command")?
+        .to_str()
+        .ok_or("command must be valid UTF-8")?;
     if !matches!(
         verb,
         "attach" | "detach" | "recover" | "cleanup" | "grow" | "verify" | "recover-failed-start"
@@ -53,10 +62,11 @@ fn validate_arguments(args: &[String]) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     let mut arguments = args.iter().skip(1);
     while let Some(argument) = arguments.next() {
-        if !seen.insert(argument.as_str()) {
+        let argument = argument.to_str().ok_or("option must be valid UTF-8")?;
+        if !seen.insert(argument) {
             return Err(format!("duplicate option {argument}"));
         }
-        let takes_value = match argument.as_str() {
+        let takes_value = match argument {
             "--volume" => true,
             "--config" if verb != "recover-failed-start" => true,
             "--plan" => false,
@@ -73,9 +83,19 @@ fn validate_arguments(args: &[String]) -> Result<(), String> {
         if takes_value {
             let value = arguments
                 .next()
-                .filter(|value| !value.starts_with('-'))
+                .filter(|value| !value.as_encoded_bytes().starts_with(b"-"))
                 .ok_or_else(|| format!("missing value for {argument}"))?;
-            config::check_argument(argument, value).map_err(|error| error.to_string())?;
+            if argument == "--config" {
+                // Only syntax is checked through this display view. The filesystem
+                // receives the original OS pathname, including non-Unicode bytes.
+                config::check_argument(argument, &value.to_string_lossy())
+            } else {
+                config::check_argument(
+                    argument,
+                    value.to_str().ok_or("option value must be valid UTF-8")?,
+                )
+            }
+            .map_err(|error| error.to_string())?;
         }
     }
     if !seen.contains("--volume") {
@@ -92,19 +112,12 @@ fn main() -> ExitCode {
     // `tracing`; without a sink they vanish and the operator sees only the
     // exit status.
     maki_privileged::logging::install_default_logging();
-    let Ok(args) = std::env::args_os()
-        .skip(1)
-        .map(std::ffi::OsString::into_string)
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        eprintln!("error: command-line arguments must be valid UTF-8");
-        return ExitCode::from(2);
-    };
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let Err(error) = validate_arguments(&args) {
         eprintln!("error: {error}");
         return usage();
     }
-    let Some(verb) = args.first().cloned() else {
+    let Some(verb) = args.first().and_then(|verb| verb.to_str()) else {
         return usage();
     };
     let Some(volume) = flag(&args, "--volume") else {
@@ -122,17 +135,20 @@ fn main() -> ExitCode {
         };
     }
 
-    let config_path = flag(&args, "--config").unwrap_or_else(|| config::default_path(&volume));
+    let explicit_config = flag_value(&args, "--config").map(Path::new);
+    let config_path = explicit_config
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(config::default_path(&volume)));
     if verb == "verify" {
         // Workload gates use only the root-controlled config. An argument
         // cannot replace its filesystem pin or any stored attachment identity.
-        if let Err(error) = config::check_abs_path("config", &config_path) {
+        if let Err(error) = config::check_abs_path("config", &config_path.to_string_lossy()) {
             eprintln!("error: {error}");
             return ExitCode::from(2);
         }
         if plan_only {
             println!("# verify volume {volume}: PLAN ONLY; no live evidence has been checked");
-            println!("Require trusted config {config_path} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.");
+            println!("Require trusted config {} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.", config_path.display());
             println!("Check the connected backend identifier, complete persisted mapping proof and complete read/write XFS mount in this namespace.");
             println!("Read the pinned XFS UUID and volume sentinel; recheck kernel identity around reads. No write probe or repair.");
             return ExitCode::SUCCESS;
@@ -156,29 +172,28 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     }
-    let attach_config =
-        if flag(&args, "--config").is_some() || std::path::Path::new(&config_path).exists() {
-            // An executing verb runs as root on what the file says: only a
-            // root-controlled file is accepted (R5-030). A plan executes
-            // nothing and reads any file.
-            #[cfg(target_os = "linux")]
-            let loaded = if plan_only {
-                config::load(&config_path).map_err(|e| e.to_string())
-            } else {
-                maki_privileged::exec::load_trusted_config(&config_path)
-            };
-            #[cfg(not(target_os = "linux"))]
-            let loaded = config::load(&config_path).map_err(|e| e.to_string());
-            match loaded {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+    let attach_config = if explicit_config.is_some() || config_path.exists() {
+        // An executing verb runs as root on what the file says: only a
+        // root-controlled file is accepted (R5-030). A plan executes
+        // nothing and reads any file.
+        #[cfg(target_os = "linux")]
+        let loaded = if plan_only {
+            config::load(&config_path).map_err(|e| e.to_string())
         } else {
-            AttachConfig::default()
+            maki_privileged::exec::load_trusted_config(&config_path)
         };
+        #[cfg(not(target_os = "linux"))]
+        let loaded = config::load(&config_path).map_err(|e| e.to_string());
+        match loaded {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        AttachConfig::default()
+    };
 
     let overrides = AttachOverrides {
         nbd_device: flag(&args, "--nbd-device"),
@@ -199,7 +214,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let plan = match verb.as_str() {
+    let plan = match verb {
         "attach" => plan_attach(&request),
         "detach" | "recover" | "cleanup" => plan_detach(&request),
         "grow" => {
@@ -267,7 +282,7 @@ fn main() -> ExitCode {
 
     #[cfg(target_os = "linux")]
     {
-        let result = match verb.as_str() {
+        let result = match verb {
             "recover" => maki_privileged::exec::recover(&plan),
             "cleanup" => maki_privileged::exec::cleanup(&plan),
             _ => maki_privileged::exec::execute(&plan),

@@ -297,15 +297,24 @@ fn helper_hint_preserves_the_operation_and_shell_arguments() {
 
 #[cfg(unix)]
 #[test]
-fn non_utf8_argument_returns_a_usage_error() {
+fn inspect_reads_a_config_with_a_non_utf8_filename() {
     use std::os::unix::ffi::OsStrExt;
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_maki"))
+    let vol = setup("nativepath", "e2e-cli-key");
+    let create = maki(
+        &["volume", "create", &vol.config_path],
+        Some(("MAKI_CREDENTIAL_E2E_CLI_KEY", KEY_HEX)),
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let path = vol
+        ._dir
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9.toml"));
+    std::fs::rename(&vol.config_path, &path).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_maki"))
         .args(["volume", "inspect"])
-        .arg(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.toml"))
+        .arg(&path)
         .output()
         .unwrap();
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8(result.stderr)
-        .unwrap()
-        .contains("valid UTF-8"));
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(stdout(&result).contains("nativepath"));
 }

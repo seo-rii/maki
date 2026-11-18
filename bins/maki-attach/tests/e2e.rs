@@ -258,15 +258,29 @@ fn executing_verbs_refuse_an_attach_config_a_non_root_user_controls() {
 
 #[cfg(unix)]
 #[test]
-fn non_utf8_argument_returns_a_usage_error() {
+fn plan_reads_a_config_with_a_non_utf8_filename() {
     use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9.toml"));
+    std::fs::write(&path, "mountpoint = \"/srv/native-path\"\n").unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_maki-attach"))
         .args(["attach", "--volume", "example", "--plan", "--config"])
-        .arg(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.toml"))
+        .arg(&path)
         .output()
         .unwrap();
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8(result.stderr)
-        .unwrap()
-        .contains("valid UTF-8"));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("/srv/native-path"));
+
+    let invalid_name = std::process::Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+        .args(["attach", "--plan", "--volume"])
+        .arg(std::ffi::OsStr::from_bytes(b"t\xe9"))
+        .output()
+        .unwrap();
+    assert_eq!(invalid_name.status.code(), Some(2));
 }

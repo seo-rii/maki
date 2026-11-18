@@ -36,8 +36,11 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn read_config(path: &str) -> Result<maki_format::config::VolumeConfig, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+fn read_config(
+    path: impl AsRef<std::path::Path>,
+) -> Result<maki_format::config::VolumeConfig, String> {
+    let path = path.as_ref();
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cfg = maki_format::config::parse_config(&raw).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -153,8 +156,18 @@ fn main() -> ExitCode {
     if let Err(e) = maki_backing::raise_open_file_limit() {
         eprintln!("warning: cannot raise the open-file soft limit: {e}");
     }
-    let Ok(mut args) = std::env::args_os()
-        .skip(1)
+    let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [volume, verb, config] = raw_args.as_slice() {
+        if volume == "volume" && verb == "inspect" && config != "--socket" && config != "--timeout"
+        {
+            return match inspect(std::path::Path::new(config)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(error),
+            };
+        }
+    }
+    let Ok(mut args) = raw_args
+        .into_iter()
         .map(std::ffi::OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
     else {
@@ -250,10 +263,6 @@ fn main() -> ExitCode {
                 Err(error) => fail(error),
             }
         }
-        ["volume", "inspect", config] => match inspect(config) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(e),
-        },
         ["check", config] => match check(config, false) {
             Ok(clean) => {
                 if clean {
@@ -759,7 +768,7 @@ fn existing_backing(
     maki_nbdkit::daemon::build_backing(cfg).map_err(|error| error.to_string())
 }
 
-fn inspect(config: &str) -> Result<(), String> {
+fn inspect(config: &std::path::Path) -> Result<(), String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
