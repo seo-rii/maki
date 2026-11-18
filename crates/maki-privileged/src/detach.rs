@@ -11,6 +11,7 @@ use crate::state::BoundDeviceRecord;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DetachObservation {
     pub mounted: bool,
+    pub writable: bool,
     pub vg_active: bool,
     pub nbd_in_use: bool,
     /// Something is mounted strictly below the mountpoint (by path component).
@@ -189,6 +190,7 @@ pub(crate) fn observe_kernel(
     }
 
     let mut mounted_device = None;
+    let mut writable = false;
     let mut nested = false;
     for line in
         crate::probe::mountinfo_lines(mountinfo).filter(|line| !line.trim_ascii().is_empty())
@@ -221,11 +223,15 @@ pub(crate) fn observe_kernel(
                 ));
             }
             mounted_device = Some(device);
+            writable = [fields[5], filesystem[2]].iter().all(|options| {
+                crate::probe::mount_options(options).any(|option| option == b"rw")
+            });
         }
     }
     let mounted = mounted_device.is_some();
     Ok(DetachObservation {
         mounted,
+        writable,
         vg_active,
         nbd_in_use,
         nested,

@@ -1002,6 +1002,9 @@ fn verify_live_attachment(
             "attachment is not fully live (mount or VG mapping missing); refusing to grow",
         ));
     }
+    if !observed.writable {
+        return Err(identity_error("grow requires a writable XFS mount"));
+    }
     if let Some(proof) = &record.recovery {
         proof.verify_growth_topology(record)?;
     }

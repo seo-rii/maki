@@ -472,6 +472,7 @@ impl System for FakeSystem {
         }
         Ok(DetachObservation {
             mounted: self.mounted,
+            writable: self.mounted,
             vg_active: self.vg_active,
             nbd_in_use: self.vg_active || self.extra_holders,
             nested: false,

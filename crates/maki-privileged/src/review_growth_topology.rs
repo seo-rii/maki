@@ -42,6 +42,7 @@ struct GrowthSystem {
     connection: String,
     mountpoint: String,
     size: u64,
+    mount_modes: (&'static str, &'static str),
     add_partition: bool,
     fail_after_extension: bool,
     steps: Vec<&'static str>,
@@ -50,8 +51,8 @@ struct GrowthSystem {
 impl GrowthSystem {
     fn mounts(&self) -> String {
         format!(
-            "40 25 253:0 / {} rw,nosuid,nodev - xfs /dev/mapper/vg_maki_pg-data rw\n",
-            self.mountpoint
+            "40 25 253:0 / {} {},nosuid,nodev - xfs /dev/mapper/vg_maki_pg-data {}\n",
+            self.mountpoint, self.mount_modes.0, self.mount_modes.1
         )
     }
 }
@@ -169,6 +170,7 @@ fn setup(partitioned: bool) -> (Fixture, TrustedState, Plan, BoundDeviceRecord, 
         connection: record.connection_id.clone(),
         mountpoint: request.mountpoint,
         size: 1 << 30,
+        mount_modes: ("rw", "rw"),
         add_partition: partitioned,
         fail_after_extension: false,
         steps: Vec::new(),
@@ -247,4 +249,16 @@ fn foreign_mapping_is_still_refused_before_growth() {
     std::fs::write(system.root.join("dm-0/dm/uuid"), "LVM-foreign").unwrap();
     assert!(execute_with(&plan, Some(&state), &mut system).is_err());
     assert!(system.steps.is_empty());
+}
+
+#[test]
+fn read_only_mount_or_superblock_refuses_growth_before_extending() {
+    let (_fixture, state, plan, _, mut system) = setup(false);
+    for modes in [("ro", "rw"), ("rw", "ro")] {
+        system.mount_modes = modes;
+        let error = execute_with(&plan, Some(&state), &mut system).unwrap_err();
+        assert!(error.to_string().contains("writable XFS"), "{error}");
+        assert!(system.steps.is_empty());
+        assert_eq!(system.size, 1 << 30);
+    }
 }
