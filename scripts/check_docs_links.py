@@ -16,8 +16,8 @@ when its label is unused or repeated. A full or collapsed reference
 (`[text][label]`, `[label][]`) whose label no definition of the same document
 matches (case-insensitively, whitespace collapsed) is reported: GitHub renders
 it as literal bracketed text. An undefined shortcut (`[label]`) is ordinary
-text and is not reported. Multi-line titles and link texts are not parsed, and
-indented code blocks are not distinguished from list-item content.
+text and is not reported. Multi-line titles and full reference labels are not parsed,
+and indented code blocks are not distinguished from list-item content.
 
 A fragment, in-page (`#anchor`) or on another Markdown file (`other.md#anchor`),
 must name exactly a heading slug as GitHub computes it, or an explicit
@@ -40,7 +40,6 @@ import sys
 import unicodedata
 import urllib.parse
 
-LINK = re.compile(r"(?<!\\)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 SKIP_PREFIXES = ("http://", "https://", "mailto:")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
@@ -53,14 +52,15 @@ HTML_ANCHOR = re.compile(
 )
 HTML_TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
 AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 BACKTICKS = re.compile(r"`+")
 ASCII_PUNCTUATION = frozenset(string.punctuation)
 # A link label: at most 999 characters, no unescaped brackets.
 LINK_LABEL = re.compile(r"\[((?:[^\\\[\]]|\\.){0,999})\]")
 # Block-quote markers, then at most one list-item marker, before a block.
-CONTAINER_PREFIX = re.compile(
-    r"^((?: {0,3}>[ \t]?)*)( {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$))?"
-)
+QUOTE_MARKER = re.compile(r" {0,3}>[ \t]?")
+LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)")
+CONTAINER_PREFIX = re.compile(rf"^((?:{QUOTE_MARKER.pattern})*)({LIST_MARKER.pattern})?")
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
@@ -77,14 +77,50 @@ def candidate_markdown(root):
 
 def unfenced_lines(text):
     """Yield (line number, line) for every line outside fenced code blocks."""
-    in_fence = False
+    fence = None
+    list_indents = []
+    last_depth = 0
     for number, line in enumerate(text.splitlines(), start=1):
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
+        # CommonMark counts block indentation in columns, with four-column tab stops.
+        columns = line.expandtabs(4)
+        if fence is not None:
+            marker, quote_depth, list_indent = fence
+            pos = 0
+            for _ in range(quote_depth):
+                quote = QUOTE_MARKER.match(columns, pos)
+                if quote is None:
+                    break
+                pos = quote.end()
+            else:
+                content = columns[pos:]
+                if not content.strip() or content.startswith(" " * list_indent):
+                    close = FENCE.fullmatch(content[list_indent:])
+                    if (close and close[1][0] == marker[0] and len(close[1]) >= len(marker)
+                            and not close[2].strip(" \t")):
+                        fence = None
+                    continue
+            # A fence inside a quote or list item ends with its container.
+            fence = None
+        prefix = CONTAINER_PREFIX.match(columns)
+        depth = prefix[1].count(">")
+        body = columns[prefix.end(1):]
+        if last_depth != depth:
+            list_indents.clear()
+        last_depth = depth
+        indent = len(body) - len(body.lstrip(" "))
+        if body.strip():
+            while list_indents and list_indents[-1] > indent:
+                list_indents.pop()
+        list_indent = list_indents[-1] if list_indents else 0
+        item = LIST_MARKER.match(body, list_indent)
+        if item:
+            list_indent = item.end()
+            list_indents.append(list_indent)
+        match = FENCE.fullmatch(body[list_indent:])
+        if match and not (match[1][0] == "`" and "`" in match[2]):
+            fence = match[1], depth, list_indent
             continue
-        if not in_fence:
-            yield number, line
+        yield number, line
 
 
 def closing_bracket(text, start):
@@ -103,19 +139,6 @@ def closing_bracket(text, start):
             if depth == 0:
                 return index
         index += 1
-    return -1
-
-
-def closing_parenthesis(text, start):
-    """Index of the `)` closing the `(` at `start`, or -1."""
-    depth = 0
-    for index in range(start, len(text)):
-        if text[index] == "(":
-            depth += 1
-        elif text[index] == ")":
-            depth -= 1
-            if depth == 0:
-                return index
     return -1
 
 
@@ -180,6 +203,52 @@ def link_destination(text, start):
     if index == start or depth:
         return None
     return text[start:index], index
+
+
+def inline_destination(line, opening):
+    """Parse the destination and optional title after a link label's `(`."""
+    start = opening + 1
+    while line[start:start + 1] in (" ", "\t"):
+        start += 1
+    if line[start:start + 1] == ")":
+        return "", start + 1
+    parsed = link_destination(line, start)
+    if parsed is None:
+        return None
+    destination, end = parsed
+    tail = end
+    while line[tail:tail + 1] in (" ", "\t"):
+        tail += 1
+    if tail > end and line[tail:tail + 1] in ('"', "'", "("):
+        tail = link_title_end(line, tail)
+        if tail == -1:
+            return None
+        while line[tail:tail + 1] in (" ", "\t"):
+            tail += 1
+    if line[tail:tail + 1] == ")":
+        return destination, tail + 1
+    return None
+
+
+def inline_destinations(line, masked, depth):
+    """Find link and image targets on this line, carrying open labels within the paragraph."""
+    targets = []
+    index = 0
+    while index < len(masked):
+        char = masked[index]
+        index += 1
+        if char == "\\":
+            index += 1
+        elif char == "[":
+            depth += 1
+        elif char == "]" and depth:
+            depth -= 1
+            if masked[index:index + 1] == "(":
+                parsed = inline_destination(line, index)
+                if parsed is not None:
+                    destination, index = parsed
+                    targets.append(unescape(destination))
+    return targets, depth
 
 
 def link_title_end(text, start):
@@ -296,9 +365,10 @@ def reference_definitions(text):
     return definitions
 
 
-def mask_code_spans(line):
-    """`line` with each code span replaced by spaces of the same length."""
+def mask_inline_literals(line):
+    """Mask code spans and link destinations/titles while preserving offsets and link delimiters."""
     out = []
+    depth = 0
     index = 0
     while index < len(line):
         char = line[index]
@@ -306,6 +376,18 @@ def mask_code_spans(line):
             out.append(line[index:index + 2])
             index += 2
             continue
+        if char == "[":
+            depth += 1
+        elif char == "]" and depth:
+            depth -= 1
+            if line[index + 1:index + 2] == "(":
+                parsed = inline_destination(line, index + 1)
+                if parsed is not None:
+                    # Backticks in a destination or title do not start code.
+                    end = parsed[1]
+                    out.append("](" + " " * (end - index - 3) + ")")
+                    index = end
+                    continue
         if char == "`":
             opening = BACKTICKS.match(line, index).group(0)
             closing = next(
@@ -325,7 +407,41 @@ def mask_code_spans(line):
     return "".join(out)
 
 
-def undefined_references(line, labels):
+def inline_lines(text, definition_lines):
+    """Mask code spans across soft line breaks within the same paragraph."""
+    paragraph = []
+    quote_depth = 0
+
+    def masked_lines():
+        masked = mask_inline_literals("\n".join(line for _, line in paragraph))
+        start = 0
+        depth = 0
+        for number, line in paragraph:
+            view = masked[start:start + len(line)]
+            targets, depth = inline_destinations(line, view, depth)
+            yield number, line, view, targets
+            start += len(line) + 1
+
+    for number, line in unfenced_lines(text):
+        prefix = CONTAINER_PREFIX.match(line)
+        depth = prefix[1].count(">")
+        content = line[prefix.end():]
+        single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
+                      or SETEXT_UNDERLINE.match(content) or content.lstrip().startswith("|"))
+        if (not content.strip() or number in definition_lines or single or prefix[2]
+                or depth != quote_depth or (paragraph and number != paragraph[-1][0] + 1)):
+            yield from masked_lines()
+            paragraph.clear()
+        if content.strip() and number not in definition_lines:
+            paragraph.append((number, line))
+            if single:
+                yield from masked_lines()
+                paragraph.clear()
+        quote_depth = depth
+    yield from masked_lines()
+
+
+def undefined_references(line, masked, labels):
     """Full (`[text][label]`) and collapsed (`[label][]`) references on
     `line` whose label `labels` does not define, as written.
 
@@ -335,7 +451,6 @@ def undefined_references(line, labels):
     label or an inline destination may be the text of the next construct
     (CommonMark retries from there), so it is not reported on its own.
     """
-    masked = mask_code_spans(line)
     found = []
     skip = {}  # start of a label or destination -> its end
     index = 0
@@ -351,9 +466,9 @@ def undefined_references(line, labels):
         if close == -1:
             continue
         if masked[close + 1:close + 2] == "(":
-            end = closing_parenthesis(masked, close + 1)
-            if end != -1:
-                skip[close + 1] = end + 1
+            parsed = inline_destination(line, close + 1)
+            if parsed is not None:
+                skip[close + 1] = parsed[1]
             continue
         reference = LINK_LABEL.match(masked, close + 1)
         if reference is None:
@@ -410,13 +525,13 @@ def inline_text(raw, labels=frozenset()):
             opening = index if char == "[" else index + 1
             close = closing_bracket(raw, opening)
             if close != -1 and raw[close + 1:close + 2] == "(":
-                end = closing_parenthesis(raw, close + 1)
-                if end != -1:
+                parsed = inline_destination(raw, close + 1)
+                if parsed is not None:
                     # A link contributes its text; an image's alt text is an
                     # attribute, not part of the heading's text.
                     if char == "[":
                         out.extend(inline_text(raw[opening + 1:close], labels))
-                    index = end + 1
+                    index = parsed[1]
                     continue
             if close != -1 and labels:
                 # A full reference uses its own label; a collapsed (`[]`)
@@ -535,8 +650,8 @@ def document_anchors(text):
             slug = f"{base}-{occurrences[base]}"
         occurrences[slug] = 0
         anchors.add(slug)
-    for _, line in unfenced_lines(text):
-        for match in HTML_ANCHOR.finditer(line):
+    for _, _, masked, _ in inline_lines(text, definition_lines):
+        for match in HTML_ANCHOR.finditer(masked):
             anchors.add(match.group(1) if match.group(1) is not None else match.group(2))
     return anchors
 
@@ -585,7 +700,8 @@ def broken_links(root):
         if not target or target.startswith(SKIP_PREFIXES):
             return None
         file_part, _, fragment = target.partition("#")
-        target_path = path.parent / file_part if file_part else path
+        file_part = file_part.partition("?")[0]
+        target_path = path.parent / urllib.parse.unquote(file_part) if file_part else path
         if not target_path.exists():
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
@@ -602,23 +718,30 @@ def broken_links(root):
 
     broken = []
     for path in candidate_markdown(root):
-        content = path.read_bytes()
-        text = content.decode("utf-8")
         relative = path.relative_to(root).as_posix()
+        if path.is_symlink() and not path.is_file():
+            broken.append(f"{relative}: invalid Markdown symlink target")
+            continue
+        try:
+            content = path.read_bytes()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            continue  # the indexed file was deleted or replaced by a directory
+        text = content.decode("utf-8")
         definitions = reference_definitions(text)
         labels = frozenset(definition[3] for definition in definitions)
         problems = [
             (number, target_problem(path, content, destination))
             for _, _, number, _, destination in definitions
         ]
-        for number, line in unfenced_lines(text):
+        definition_lines = {n for first, last, *_ in definitions for n in range(first, last + 1)}
+        for number, line, masked, targets in inline_lines(text, definition_lines):
             problems.extend(
-                (number, target_problem(path, content, match.group(1)))
-                for match in LINK.finditer(line)
+                (number, target_problem(path, content, destination))
+                for destination in targets
             )
             problems.extend(
                 (number, f"{reference} (undefined reference)")
-                for reference in undefined_references(line, labels)
+                for reference in undefined_references(line, masked, labels)
             )
         broken.extend(
             f"{relative}:{number}: {problem}"

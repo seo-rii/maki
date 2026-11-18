@@ -108,6 +108,80 @@ class DocumentationLinks(unittest.TestCase):
             "vendor/hyper/README.md:1: ../missing.md",
         ])
 
+    def test_fence_closer_must_match_marker_length_and_have_no_info(self):
+        self.write("README.md", "````md\n```\n~~~\n````example\n"
+                   "[sample](inside.md)\n`````\n[real](outside.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: outside.md"])
+
+    def test_fences_end_at_the_list_item_or_quote_boundary(self):
+        self.write("README.md", "10. example\n    ````md\n    [sample](inside.md)\n"
+                   "    ```\n    ````\n[outside](one.md)\n\n"
+                   "> - ~~~\n>   [sample](inside.md)\n> [outside](two.md)\n\n"
+                   "- example\n  ```\n  [sample](inside.md)\n> [outside](three.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:6: one.md", "README.md:10: two.md", "README.md:15: three.md"])
+
+    def test_list_fences_count_tab_stops_in_the_container_indent(self):
+        self.write("README.md", "- Docs\n  ```md\n\t[example](inside.md)\n  ```\n"
+                   "[broken](outside.md)\n\n"
+                   "1.\tExample\n\t~~~\n\t[sample](nested.md)\n\t~~~\n"
+                   "[next](after.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:5: outside.md", "README.md:11: after.md"])
+
+    def test_multiline_code_masks_links_references_and_anchors_only_in_its_paragraph(self):
+        self.write("README.md", 'Text ``example `\n[shown](inside.md) [x][label] <a id="inside">\n'
+                   'end`` [real](outside.md)\n\n[anchor](#inside)\n'
+                   'Unmatched `tick\n\n[another](after.md) `literal\n')
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:3: outside.md", "README.md:5: #inside (missing anchor)",
+                          "README.md:8: after.md"])
+
+    def test_backticks_and_brackets_in_a_destination_or_title_do_not_change_later_links(self):
+        self.write("file`with).md", "# OK\n")
+        self.write("README.md", """[ok](<file`with).md> 'title [x][label] <a id="hidden">') [bad](lost.md) `code`
+[query](<file%60with%29.md?plain=1#ok>) [anchor](#hidden)
+""")
+        self.assertEqual(broken_links(self.root), ["README.md:1: lost.md",
+                                                   "README.md:2: #hidden (missing anchor)"])
+
+    def test_inline_code_is_not_a_link_or_an_html_anchor(self):
+        self.write("README.md", '`<a id="sample"> [sample](inside.md)`\n[real](#sample)\n')
+        self.assertEqual(broken_links(self.root), ["README.md:2: #sample (missing anchor)"])
+
+    def test_inline_destinations_with_spaces_parentheses_and_titles(self):
+        self.write("User Guide.md", "## here\n")
+        self.write("right(one).md", "# yes\n")
+        self.write("README.md", "[guide](User%20Guide.md#here)\n[guide](<User Guide.md>)\n"
+                   "[guide](right(one).md 'title')\n[item](<Missing Guide.md>)\n"
+                   "[![image](missing.png)](right(one).md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:4: Missing Guide.md", "README.md:5: missing.png"])
+
+    def test_wrapped_label_retains_its_destination_and_report_line(self):
+        self.write("guide#one%.md", "# Start\n")
+        self.write("README.md", "[a wrapped\nlabel](guide%23one%25.md#start) and [a second\n"
+                   "label](missing.md)\n\n[unmatched\n\nclosing](not-a-link.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:3: missing.md"])
+
+    def test_unstaged_deletion_still_reports_links_to_the_removed_document(self):
+        self.write("old.md", "# Old\n").unlink()
+        self.write("README.md", "[old](old.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: old.md"])
+
+    def test_dangling_markdown_symlink_is_reported_even_without_inbound_links(self):
+        self.write("missing.md", "# Former file\n").unlink()
+        (self.root / "guide.md").symlink_to("missing.md")
+        self.write("README.md", "[other](no.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:1: no.md", "guide.md: invalid Markdown symlink target"])
+
+    def test_replacing_a_tracked_file_with_a_directory_checks_its_new_documents(self):
+        old = self.write("old.md", "# Former file\n")
+        old.unlink()
+        self.write("old.md/new.md", "[missing](target.md)\n", tracked=False)
+        self.assertEqual(broken_links(self.root), ["old.md/new.md:1: target.md"])
+
     def test_regular_link_filtering_and_locations_are_preserved(self):
         self.write("target.md", "# Present\n\n## Heading\n")
         self.write("README.md", """[Present](target.md#heading)
