@@ -118,6 +118,7 @@ pub struct JournalWriter {
     appended_sequence: u64,
     durable_sequence: u64,
     sealed: Vec<SegmentInfo>,
+    sealed_bytes: u64,
     active: Option<ActiveSegment>,
     next_segment_index: u64,
     /// A failed creation can leave a durable partial header even after its
@@ -156,6 +157,7 @@ impl JournalWriter {
             next_sequence: durable_sequence + 1,
             appended_sequence: durable_sequence,
             durable_sequence,
+            sealed_bytes: sealed.iter().map(|segment| segment.size).sum(),
             sealed,
             active: None,
             next_segment_index,
@@ -247,8 +249,7 @@ impl JournalWriter {
     /// Total bytes of every journal segment on disk (sealed + active): the
     /// quantity a journal size limit bounds.
     pub fn total_bytes(&self) -> u64 {
-        self.sealed.iter().map(|s| s.size).sum::<u64>()
-            + self.active.as_ref().map(|a| a.info.size).unwrap_or(0)
+        self.sealed_bytes + self.active.as_ref().map(|a| a.info.size).unwrap_or(0)
     }
 
     /// Exact bytes appending records of the given on-disk lengths would add
@@ -371,6 +372,7 @@ impl JournalWriter {
     fn seal_active(&mut self) -> Result<(), CoreError> {
         self.sync_active()?;
         if let Some(active) = self.active.take() {
+            self.sealed_bytes += active.info.size;
             self.sealed.push(active.info);
         }
         self.sanitize();
@@ -593,6 +595,7 @@ impl JournalWriter {
             self.appended_sequence + 1,
             "journal sanitizer: next sequence not appended + 1"
         );
+        let mut sealed_bytes = 0;
         let mut prev_index: Option<u64> = None;
         let mut expected_base: Option<u64> = None;
         let all = self
@@ -601,6 +604,9 @@ impl JournalWriter {
             .map(|s| (s, false))
             .chain(self.active.as_ref().map(|a| (&a.info, true)));
         for (seg, is_active) in all {
+            if !is_active {
+                sealed_bytes += seg.size;
+            }
             if let Some(p) = prev_index {
                 assert!(
                     seg.index > p,
@@ -642,6 +648,7 @@ impl JournalWriter {
                 );
             }
         }
+        assert_eq!(self.sealed_bytes, sealed_bytes, "sealed journal byte count");
         if let Some(a) = &self.active {
             assert_eq!(
                 a.info.base_sequence + a.info.record_count,
@@ -716,7 +723,10 @@ impl JournalWriter {
                     Ok(())
                 })();
                 match step {
-                    Ok(()) => deleted += 1,
+                    Ok(()) => {
+                        self.sealed_bytes -= seg.size;
+                        deleted += 1;
+                    }
                     Err(e) => {
                         error = Some(e);
                         kept.push(seg);
