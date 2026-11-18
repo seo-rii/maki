@@ -22,10 +22,9 @@ impl Drop for ObservedFrame {
 #[tokio::test]
 async fn cancelled_queued_frame_drops_while_a_live_sibling_keeps_its_connection() {
     let task = tokio::spawn(std::future::pending::<()>());
-    let pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let cancellation = ConnectionCancellation {
         task: task.abort_handle(),
-        pending: pending.clone(),
+        pending: Pending::default(),
         dead_generation: Arc::new(AtomicU64::new(0)),
         generation: 1,
         owners: Arc::new(parking_lot::Mutex::new(RequestOwners {
@@ -44,7 +43,6 @@ async fn cancelled_queued_frame_drops_while_a_live_sibling_keeps_its_connection(
     assert!(cancellation.register());
     let cancelled = PendingRequest {
         id: 1,
-        pending: pending.clone(),
         cancellation: cancellation.clone(),
         queued: queued.clone(),
         _sender: sender.clone(),
@@ -53,7 +51,6 @@ async fn cancelled_queued_frame_drops_while_a_live_sibling_keeps_its_connection(
     assert!(cancellation.register());
     let sibling = PendingRequest {
         id: 2,
-        pending,
         cancellation: cancellation.clone(),
         queued: Arc::new(parking_lot::Mutex::new(None)),
         _sender: sender.clone(),
