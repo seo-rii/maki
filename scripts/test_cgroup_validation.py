@@ -1,5 +1,8 @@
 """The fault campaign's oracle must not manufacture durability evidence."""
+import argparse
+import contextlib
 import importlib.util
+import io
 import pathlib
 import tempfile
 import unittest
@@ -25,6 +28,9 @@ class Client:
     def flush(self):
         if self.fail == "flush":
             raise RuntimeError("flush failed")
+
+    def close(self):
+        pass
 
     def read(self, offset, length):
         return self.data.get(offset, bytes(length))
@@ -61,6 +67,21 @@ class OracleTests(unittest.TestCase):
         client.write(4096, b"b" * 4096)
         del client.data[4096]
         self.assertEqual(campaign.verify(client, self.ledger), 1)
+
+    def test_resumed_epoch_requires_fresh_contents_for_every_durable_unit(self):
+        client = Client()
+        args = argparse.Namespace(mode="write", rounds=1, start_epoch=0, socket=None, ledger=self.ledger)
+        with mock.patch.object(campaign, "Nbd", return_value=client), contextlib.redirect_stdout(io.StringIO()):
+            campaign.client_main(args)
+            before = client.data.copy()
+            args.start_epoch = args.rounds
+            campaign.client_main(args)
+        self.assertEqual(campaign.verify(client, self.ledger), 136)
+        for index in range(136):
+            self.assertNotEqual(before[index * 4096], client.data[index * 4096])
+        client.data = before
+        with self.assertRaisesRegex(AssertionError, "durable data mismatch"):
+            campaign.verify(client, self.ledger)
 
     def test_empty_or_truncated_oracle_cannot_pass(self):
         self.ledger.write_text("")
