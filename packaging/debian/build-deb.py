@@ -441,6 +441,7 @@ def main():
                     str(package_root),
                     str(temporary_output),
                 ],
+                env={**os.environ, "SOURCE_DATE_EPOCH": str(epoch)},
                 check=True,
             )
             temporary_output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)

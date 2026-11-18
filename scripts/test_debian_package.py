@@ -537,6 +537,17 @@ class DebianPackageTests(unittest.TestCase):
             "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd, kmod",
         )
 
+    def test_unspecified_epoch_also_applies_to_archive_headers(self):
+        output, command = self.builder_command("default-epoch.deb", "0.1.0+test1",
+                                               extra=["--no-shlibdeps"])
+        environment = os.environ.copy()
+        environment.pop("SOURCE_DATE_EPOCH", None)
+        subprocess.run(command, cwd=ROOT, env=environment, check=True, capture_output=True)
+        with output.open("rb") as stream:
+            self.assertEqual(stream.read(8), b"!<arch>\n")
+            header = stream.read(60)
+        self.assertEqual(int(header[16:28]), 0)
+
     def test_build_is_reproducible_and_rejects_invalid_inputs(self):
         first = self.build("first.deb")
         second = self.build("second.deb")
