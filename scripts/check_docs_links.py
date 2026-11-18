@@ -649,12 +649,15 @@ def broken_links(root):
 
     broken = []
     for path in candidate_markdown(root):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink() and not path.is_file():
+            broken.append(f"{relative}: invalid Markdown symlink target")
+            continue
         try:
             content = path.read_bytes()
-        except FileNotFoundError:
-            continue  # tracked document deleted from the working tree
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            continue  # the indexed file was deleted or replaced by a directory
         text = content.decode("utf-8")
-        relative = path.relative_to(root).as_posix()
         definitions = reference_definitions(text)
         labels = frozenset(definition[3] for definition in definitions)
         problems = [

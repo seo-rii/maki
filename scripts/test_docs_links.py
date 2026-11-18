@@ -131,6 +131,19 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "[old](old.md)\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: old.md"])
 
+    def test_dangling_markdown_symlink_is_reported_even_without_inbound_links(self):
+        self.write("missing.md", "# Former file\n").unlink()
+        (self.root / "guide.md").symlink_to("missing.md")
+        self.write("README.md", "[other](no.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:1: no.md", "guide.md: invalid Markdown symlink target"])
+
+    def test_replacing_a_tracked_file_with_a_directory_checks_its_new_documents(self):
+        old = self.write("old.md", "# Former file\n")
+        old.unlink()
+        self.write("old.md/new.md", "[missing](target.md)\n", tracked=False)
+        self.assertEqual(broken_links(self.root), ["old.md/new.md:1: target.md"])
+
     def test_regular_link_filtering_and_locations_are_preserved(self):
         self.write("target.md", "# Present\n\n## Heading\n")
         self.write("README.md", """[Present](target.md#heading)
