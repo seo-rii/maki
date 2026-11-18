@@ -33,6 +33,7 @@ class BackgroundStorageTests(unittest.TestCase):
         def child(command, _cwd, log, _stop, _timeout, **_kwargs):
             calls.append(command)
             if command[0] == "cargo":
+                self.assertEqual(_kwargs["env"]["RUSTC"], "/path/to/selected-rustc")
                 package = command[command.index("-p") + 1]
                 self.assertIn(package, expected)
                 selected = tuple(command[i + 1] for i, arg in enumerate(command) if arg == "--test")
@@ -49,7 +50,7 @@ class BackgroundStorageTests(unittest.TestCase):
             return {"exit_code": 0, "reason": "exited"}
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target"),
-                  "profile": "rollback"}
+                  "profile": "rollback", "rustc_executable": "/path/to/selected-rustc"}
         with mock.patch.object(self.runner, "run_child", side_effect=child):
             binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
         self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
@@ -208,9 +209,12 @@ class BackgroundStorageTests(unittest.TestCase):
                 Path(output.split("=", 1)[1]).write_bytes(b"frozen source")
             return subprocess.CompletedProcess(command, 0)
 
+        compiler = self.root / "test rustc"
+        compiler.touch(mode=0o700)
         process = mock.Mock(pid=os.getpid())
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
-        with mock.patch.object(self.runner.Path, "home", return_value=self.root), \
+        with mock.patch.dict(os.environ, RUSTC=str(compiler)), \
+                mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                 mock.patch.object(
                     self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)
                 ), \
@@ -220,7 +224,7 @@ class BackgroundStorageTests(unittest.TestCase):
                     "check_output",
                     side_effect=["revision-one\n", "rustc fixture\n", "cargo fixture\n",
                                  "revision-two\n", "rustc fixture\n", "cargo fixture\n"],
-                ), \
+                ) as probes, \
                 mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
             self.runner.start(args)
             first = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
@@ -232,6 +236,13 @@ class BackgroundStorageTests(unittest.TestCase):
         second_config = json.loads((Path(second["run_dir"]) / "config.json").read_text())
         self.assertEqual(Path(first_config["target_dir"]), Path(first["run_dir"]) / "target")
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
+        for start, config in ((0, first_config), (3, second_config)):
+            self.assertEqual(config["rustc_executable"], str(compiler))
+            probe = probes.call_args_list[start + 1]
+            self.assertEqual(probe.args[0], [str(compiler), "-Vv"])
+            self.assertEqual(probe.kwargs["cwd"], Path(config["source"]))
+            self.assertEqual(probe.kwargs["env"]["RUSTC"], str(compiler))
+            self.assertEqual(probes.call_args_list[start + 2].kwargs["cwd"], Path(config["source"]))
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
         self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
         self.assertEqual(Path(second_config["build_dir"]), Path(second["run_dir"]) / "build")

@@ -159,6 +159,8 @@ def prepare(directory, config, deadline):
     # when the shell or Cargo configuration supplies a shared build directory.
     environment.update(CARGO_TARGET_DIR=config["target_dir"],
                        CARGO_BUILD_BUILD_DIR=str(directory / "build"), CARGO_BUILD_JOBS="2")
+    if "rustc_executable" in config:
+        environment["RUSTC"] = config["rustc_executable"]
     executables = {}
     suites = [suite for group in groups.values() for suite in group]
     for package, selected in groups.items():
@@ -318,6 +320,13 @@ def start(args):
     runner = directory / "runner.py"
     shutil.copyfile(__file__, runner)
     runner.chmod(0o400)
+    selected = os.environ.get("RUSTC") or os.environ.get("CARGO_BUILD_RUSTC") or "rustc"
+    compiler = shutil.which(selected)
+    if compiler is None:
+        raise RuntimeError("selected Rust compiler was not found")
+    # Preserve rustup proxy names and resolve relative selections in the caller's cwd.
+    compiler = os.path.abspath(compiler)
+    environment = dict(os.environ, RUSTC=compiler)
     save_json(directory / "config.json", {
         "revision": revision, "source": str(source), "target_dir": str(target),
         "build_dir": str(directory / "build"),
@@ -326,8 +335,9 @@ def start(args):
         "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
         "profile": profile,
         "suites": [suite for group in groups.values() for suite in group],
-        "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
-        "cargo": subprocess.check_output(["cargo", "-V"], text=True).strip(),
+        "rustc_executable": compiler,
+        "rustc": subprocess.check_output([compiler, "-Vv"], cwd=source, env=environment, text=True),
+        "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, env=environment, text=True).strip(),
     })
     with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
         process = subprocess.Popen([sys.executable, "-B", str(runner), "_worker", "--run-dir", str(directory)],
