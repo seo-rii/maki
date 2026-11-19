@@ -252,6 +252,32 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(os.readlink(source / "suite-link"), "suite")
         self.assertFalse((source / "local").exists())
 
+    def test_clean_revision_refuses_head_change_during_worktree_check(self):
+        def git(*args):
+            return subprocess.check_output(
+                ["git", "-C", self.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                 "-c", "commit.gpgsign=false", *args], text=True).strip()
+
+        git("init", "-q")
+        marker = self.root / "version"
+        marker.write_text("first")
+        git("add", "version")
+        git("commit", "-qm", "first")
+        marker.write_text("second")
+        git("commit", "-qam", "second")
+        snapshot = self.runner.qualification_source()
+        check = snapshot.tracked_changes
+
+        def move_head_after_check(*, repo):
+            dirty = check(repo=repo)
+            self.assertFalse(dirty)
+            git("reset", "--soft", "HEAD^")
+            return dirty
+
+        with mock.patch.object(snapshot, "tracked_changes", side_effect=move_head_after_check):
+            with self.assertRaisesRegex(ValueError, "HEAD changed"):
+                snapshot.clean_revision(self.root)
+
     @staticmethod
     def fake_freeze_source(_repo, revision, archive, source):
         archive.write_bytes(b"frozen source")

@@ -12,10 +12,13 @@ except ModuleNotFoundError:
 
 
 def clean_revision(repo):
+    head = ["git", "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}"]
+    revision = subprocess.check_output(head, cwd=repo, text=True).strip()
     if tracked_changes(repo=repo):
         raise ValueError("Commit tracked changes before qualifying this revision.")
-    return subprocess.check_output(["git", "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}"],
-                                   cwd=repo, text=True).strip()
+    if subprocess.check_output(head, cwd=repo, text=True).strip() != revision:
+        raise ValueError("HEAD changed while checking tracked changes. Retry qualification.")
+    return revision
 
 
 def extract_revision(repo, revision, archive, source):
