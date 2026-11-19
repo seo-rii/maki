@@ -81,6 +81,20 @@ class DocumentationLinks(unittest.TestCase):
                    "[one](#install) [two](#release) [separate item](#help)\n")
         self.assertEqual(broken_links(self.root), ["README.md:7: #help (missing anchor)"])
 
+    def test_lazy_continuations_keep_paragraph_links_and_definitions(self):
+        self.write("README.md", "- [Release\nnotes](missing.md)\n\n"
+                   "> prose\n[ref]: ignored.md\n\n[go][ref]\n\n"
+                   "- Item\n===\n\n[not a heading](#item)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: missing.md", "README.md:7: [go][ref] (undefined reference)",
+            "README.md:12: #item (missing anchor)"])
+
+    def test_ordered_list_interrupts_a_paragraph_only_when_it_starts_at_one(self):
+        self.write("README.md", "Paragraph\n2. ## Fake\n\n"
+                   "Paragraph\n1. ## Real\n2. ## Second\n\n"
+                   "[a](#fake) [b](#real) [c](#second)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:8: #fake (missing anchor)"])
+
     def test_unquoted_and_entity_encoded_html_anchor_values(self):
         self.write("README.md", "<a name=install></a> <A ID='a&amp;b' name=another></A>\n"
                    "<span title=\"<a id=pretend>\">example</span>\n\n"

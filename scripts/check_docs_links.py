@@ -93,6 +93,35 @@ class SourceLine(NamedTuple):
     content: str
     container_changed: bool
     raw_html: bool
+    lazy: bool = False
+
+
+def html_block_end(content, in_paragraph):
+    """Return the closing string, an empty string for a blank line, or None."""
+    stripped = content.lstrip(" ")
+    if len(content) - len(stripped) > 3 or not stripped.startswith("<"):
+        return None
+    raw = RAW_ELEMENT.match(stripped)
+    if raw:
+        return f"</{raw[1].lower()}>"
+    if stripped.startswith("<!--"):
+        return "-->"
+    if stripped.startswith("<?"):
+        return "?>"
+    if stripped.startswith("<![CDATA["):
+        return "]]>"
+    if re.match(r"<![A-Z]", stripped):
+        return ">"
+    if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip())):
+        return ""
+    return None
+
+
+def opening_fence(content):
+    match = FENCE.fullmatch(content)
+    if match and not (match[1][0] == "`" and "`" in match[2]):
+        return match[1]
+    return None
 
 
 def document_lines(text):
@@ -108,6 +137,7 @@ def document_lines(text):
         columns = line.expandtabs(4)
         pos = 0
         changed = False
+        lazy = False
         for index, indent in enumerate(containers):
             if indent is None:
                 quote = QUOTE_MARKER.match(columns, pos)
@@ -120,6 +150,15 @@ def document_lines(text):
             elif not columns[pos:].strip():
                 pos = len(columns)
                 continue
+            rest = columns[pos:]
+            if (in_paragraph and rest.strip() and not QUOTE_MARKER.match(rest)
+                    and not BLOCK_LIST_MARKER.match(rest) and not ATX_HEADING.match(rest)
+                    and not THEMATIC_BREAK.fullmatch(rest) and not opening_fence(rest)
+                    and html_block_end(rest, True) is None):
+                # A paragraph can continue without repeating list indentation
+                # or a quote marker. Such a line cannot be a setext underline.
+                lazy = True
+                break
             del containers[index:]
             changed = True
             in_paragraph = False
@@ -143,7 +182,7 @@ def document_lines(text):
             continue
 
         before_markers = pos
-        while pos < len(columns):
+        while not lazy and pos < len(columns):
             quote = QUOTE_MARKER.match(columns, pos)
             if quote:
                 containers.append(None)
@@ -155,6 +194,10 @@ def document_lines(text):
             if not item:
                 break
             marker_end = item.start(1)
+            marker = columns[pos:marker_end].strip()
+            if in_paragraph and not changed and pos == before_markers:
+                if item.end() == len(columns) or (marker[0].isdigit() and int(marker[:-1]) != 1):
+                    break
             padding = item.end(1) - marker_end
             # Five or more spaces introduce indented item content. An empty
             # item still needs one column after its marker on the next line.
@@ -175,37 +218,21 @@ def document_lines(text):
                 column += 4 - column % 4 if line[offset] == "\t" else 1
                 offset += 1
             content = " " * (column - pos) + line[offset:]
-        stripped = content.lstrip(" ")
-        if len(content) - len(stripped) <= 3 and stripped.startswith("<"):
-            raw = RAW_ELEMENT.match(stripped)
-            if raw:
-                html_end = f"</{raw[1].lower()}>"
-            elif stripped.startswith("<!--"):
-                html_end = "-->"
-            elif stripped.startswith("<?"):
-                html_end = "?>"
-            elif stripped.startswith("<![CDATA["):
-                html_end = "]]>"
-            elif re.match(r"<![A-Z]", stripped):
-                html_end = ">"
-            elif BLOCK_ELEMENT.match(stripped) or (
-                    not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip())):
-                html_end = ""
-            if html_end is not None:
-                in_paragraph = False
-                yield SourceLine(number, content, changed, True)
-                if html_end and html_end in stripped.lower():
-                    html_end = None
-                continue
-        match = FENCE.fullmatch(content)
-        if match and not (match[1][0] == "`" and "`" in match[2]):
-            block = match[1]
+        html_end = html_block_end(content, in_paragraph)
+        if html_end is not None:
+            in_paragraph = False
+            yield SourceLine(number, content, changed, True)
+            if html_end and html_end in content.lower():
+                html_end = None
+            continue
+        block = opening_fence(content)
+        if block:
             in_paragraph = False
             continue
-        yield SourceLine(number, content, changed, False)
+        yield SourceLine(number, content, changed, False, lazy)
         in_paragraph = bool(content.strip() and not ATX_HEADING.match(content)
                             and not THEMATIC_BREAK.match(content)
-                            and not (in_paragraph and SETEXT_UNDERLINE.match(content)))
+                            and not (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content)))
 
 
 def closing_bracket(text, start):
@@ -398,7 +425,7 @@ def reference_definitions(text):
     previous_number = None
     index = 0
     while index < len(lines):
-        number, content, opens_container, _ = lines[index]
+        number, content, opens_container, _, lazy = lines[index]
         if previous_number != number - 1 or opens_container:
             in_paragraph = False
         previous_number = number
@@ -417,7 +444,7 @@ def reference_definitions(text):
             not content.strip()
             or ATX_HEADING.match(content)
             or THEMATIC_BREAK.match(content)
-            or (in_paragraph and SETEXT_UNDERLINE.match(content))
+            or (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content))
         )
         index += 1
     return definitions
@@ -495,9 +522,9 @@ def inline_lines(text, definition_lines):
         for (number, line), start, found in zip(paragraph, starts, per_line):
             yield number, line, masked[start:start + len(line)], found
 
-    for number, content, changed, raw_html in document_lines(text):
+    for number, content, changed, raw_html, lazy in document_lines(text):
         single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
-                      or SETEXT_UNDERLINE.match(content) or content.lstrip().startswith("|"))
+                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
         if (not content.strip() or raw_html or number in definition_lines or single or changed
                 or (paragraph and number != paragraph[-1][0] + 1)):
             yield from masked_lines()
@@ -695,7 +722,7 @@ def document_anchors(text):
     headings = []
     paragraph = []
     raw_blocks = []
-    for number, line, changed, raw_html in document_lines(text):
+    for number, line, changed, raw_html, lazy in document_lines(text):
         if changed:
             paragraph = []
         if raw_html:
@@ -710,7 +737,7 @@ def document_anchors(text):
             headings.append(ATX_CLOSING.sub("", atx.group(2) or ""))
             paragraph = []
             continue
-        if paragraph and paragraph[-1][0] == number - 1 and SETEXT_UNDERLINE.match(line):
+        if not lazy and paragraph and paragraph[-1][0] == number - 1 and SETEXT_UNDERLINE.match(line):
             headings.append("\n".join(content for _, content in paragraph))
             paragraph = []
             continue
