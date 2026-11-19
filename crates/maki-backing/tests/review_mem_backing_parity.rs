@@ -80,3 +80,45 @@ fn empty_positional_io_past_eof_is_a_no_op() {
     assert_eq!(file.len().unwrap(), 0);
     file.read_at(32, &mut []).unwrap();
 }
+
+#[test]
+fn short_allocation_preserves_concurrent_longer_writes() {
+    use std::sync::Barrier;
+
+    let backing = MemBacking::new();
+    let reserving = backing.open("shared", true).unwrap();
+    let writing = backing.open("shared", false).unwrap();
+    let start = Barrier::new(3);
+    let finish = Barrier::new(3);
+    const ROUNDS: usize = 8192;
+    let mut lost = 0;
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            for _ in 0..ROUNDS {
+                start.wait();
+                reserving.allocate_range(0, 4).unwrap();
+                finish.wait();
+            }
+        });
+        threads.spawn(|| {
+            for _ in 0..ROUNDS {
+                start.wait();
+                writing.write_at(8, b"written").unwrap();
+                finish.wait();
+            }
+        });
+        for _ in 0..ROUNDS {
+            writing.set_len(0).unwrap();
+            start.wait();
+            finish.wait();
+            let mut bytes = [0; 7];
+            if writing.read_at(8, &mut bytes).is_err() || bytes != *b"written" {
+                lost += 1;
+            }
+        }
+    });
+    assert_eq!(
+        lost, 0,
+        "a successful allocation truncated a concurrent write"
+    );
+}
