@@ -163,13 +163,9 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
-/// Open and validate an existing volume before a tool chooses creation or
-/// explicitly authorized reuse. Protected backing must be opened through its
-/// witness; trying enrollment first cannot classify its AlreadyExists error.
-/// A present format marker with incomplete contents is an error, never a reset.
-pub fn existing_volume_from_config(
-    config: &VolumeConfig,
-) -> Result<Option<Superblock>, DaemonError> {
+/// Check for volume markers without opening a writer session or contacting the witness.
+/// A marker is sufficient to require explicit authorization before benchmarking.
+pub fn volume_layout_present(config: &VolumeConfig) -> Result<bool, DaemonError> {
     config.validate()?;
     let root = Path::new(&config.backing.root);
     match std::fs::metadata(root) {
@@ -179,13 +175,22 @@ pub fn existing_volume_from_config(
                 "backing root is not a directory".into(),
             ))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     }
-    if !root.join("rollback.format").try_exists()?
-        && !root.join(maki_format::layout::SUPERBLOCK_A).try_exists()?
-        && !root.join(maki_format::layout::SUPERBLOCK_B).try_exists()?
-    {
+    Ok(root.join("rollback.format").try_exists()?
+        || root.join(maki_format::layout::SUPERBLOCK_A).try_exists()?
+        || root.join(maki_format::layout::SUPERBLOCK_B).try_exists()?)
+}
+
+/// Open and validate an existing volume before a tool chooses creation or
+/// explicitly authorized reuse. Protected backing must be opened through its
+/// witness; trying enrollment first cannot classify its AlreadyExists error.
+/// A present format marker with incomplete contents is an error, never a reset.
+pub fn existing_volume_from_config(
+    config: &VolumeConfig,
+) -> Result<Option<Superblock>, DaemonError> {
+    if !volume_layout_present(config)? {
         return Ok(None);
     }
     let backing = build_backing(config)?;
