@@ -294,7 +294,13 @@ impl Volume {
         }
         // A live overlay tombstone can hide the first stored allocation.
         // Keep searching without checkpointing or changing the volume.
-        for unit in self.store.allocated_units() {
+        // If both valid allocation maps lag behind the slot data, the normal
+        // read path can still serve an unlisted slot. Probe those last.
+        for unit in self
+            .store
+            .allocated_units()
+            .chain(self.store.unlisted_units())
+        {
             if let Some((_, data)) = self.read_ct(unit)? {
                 return Ok(Some((unit, data)));
             }

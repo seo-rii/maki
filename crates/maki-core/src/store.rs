@@ -863,7 +863,7 @@ impl SlotStore {
             if shard.alloc.set_count() == 0 {
                 continue;
             }
-            if let Some(in_shard) = (0..shard.alloc.units()).find(|u| {
+            if let Some(in_shard) = (0..addressable_units(&self.geometry, shard_idx)).find(|u| {
                 shard.alloc.get(*u)
                     && !shard
                         .discard
@@ -1384,6 +1384,7 @@ impl SlotStore {
     /// oversized headers and damaged unlisted slots exactly as a full read
     /// would.
     fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
+        self.validate_unit(unit)?;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let Some(shard) = self.shards.get(&shard_idx) else {
             return Ok(None);

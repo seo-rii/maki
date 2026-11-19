@@ -237,9 +237,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                     probed += 1;
                 }
                 let read = store.read_slot(unit);
-                if allocated
-                    && !replay_units.contains(&unit)
-                    && matches!(read, Ok(SlotRead::Ciphertext { .. }))
+                if !replay_units.contains(&unit) && matches!(read, Ok(SlotRead::Ciphertext { .. }))
                 {
                     stored_ciphertext = true;
                 }

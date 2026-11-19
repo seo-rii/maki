@@ -192,11 +192,18 @@ fn check_allocation_map(
 ) -> Result<bool, FormatError> {
     let store = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
         .with_max_len(AllocationMap::encoded_len(units));
-    match store.load::<AllocationMap>(backing)? {
+    let (map, copies) = store.load_with_copy_count::<AllocationMap>(backing)?;
+    match map {
         Some(map) if map.units() != units => report.errors.push(format!(
             "shard {shard}: allocation map covers {} units, geometry says {units}",
             map.units()
         )),
+        Some(_) if copies == 1 => {
+            report.warnings.push(format!(
+                "shard {shard}: allocation map has one valid copy; using fallback"
+            ));
+            return Ok(true);
+        }
         None if cataloged => report
             .errors
             .push(format!("shard {shard}: no valid allocation map")),

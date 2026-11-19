@@ -549,10 +549,22 @@ impl State {
 
     fn directory(&self, name: &str) -> io::Result<()> {
         if name.is_empty() || self.entries.get(name) == Some(&Entry::Directory) {
-            Ok(())
-        } else {
-            Err(missing())
+            return Ok(());
         }
+        let mut path = name;
+        while !path.is_empty() {
+            match self.entries.get(path) {
+                Some(Entry::File(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        path.to_owned(),
+                    ))
+                }
+                Some(Entry::Directory) => break,
+                None => path = path::parent(path),
+            }
+        }
+        Err(missing())
     }
 
     fn open_file(&mut self, name: &str, create: bool) -> io::Result<u64> {
@@ -866,12 +878,18 @@ impl BackingFile for CowFile {
         let mut at = offset;
         while at < end {
             let page = state.page_ref(self.id, at / PAGE)?;
-            let mut bytes = state.page(page)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
-            let start = (at % PAGE) as usize;
             let src = (at - offset) as usize;
-            bytes[start..start + count].copy_from_slice(&data[src..src + count]);
-            state.write_page(self.id, at / PAGE, &bytes)?;
+            let fragment = &data[src..src + count];
+            if page.is_none() && count == PAGE as usize {
+                state.write_page(self.id, at / PAGE, fragment)?;
+            } else {
+                // Read and authenticate mapped pages even on a full overwrite.
+                let mut bytes = state.page(page)?;
+                let start = (at % PAGE) as usize;
+                bytes[start..start + count].copy_from_slice(fragment);
+                state.write_page(self.id, at / PAGE, &bytes)?;
+            }
             at += count as u64;
         }
         Ok(())
@@ -879,12 +897,13 @@ impl BackingFile for CowFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
-        let current_len = state.files.get(&self.id).ok_or_else(missing)?.len;
-        if len == current_len {
+        let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
+        if len >= node.len {
+            node.len = len;
             return Ok(());
         }
         let tail = state.page_ref(self.id, len / PAGE)?;
-        if len < current_len && !len.is_multiple_of(PAGE) && tail.is_some() {
+        if !len.is_multiple_of(PAGE) && tail.is_some() {
             let mut bytes = state.page(tail)?;
             bytes[(len % PAGE) as usize..].fill(0);
             state.write_page(self.id, len / PAGE, &bytes)?;
@@ -992,12 +1011,17 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        Ok(state.entries.contains_key(name))
+        match state.directory(path::parent(name)) {
+            Ok(()) => Ok(state.entries.contains_key(name)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
     fn remove(&self, name: &str) -> io::Result<()> {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
+        state.directory(path::parent(name))?;
         if state.entries.get(name) == Some(&Entry::Directory) {
             return Err(input("directory removal is unsupported"));
         }
@@ -1009,6 +1033,7 @@ impl Backing for RollbackBacking {
         validate_name(to, false)?;
         let mut state = self.state.lock();
         state.check()?;
+        state.directory(path::parent(from))?;
         state.directory(path::parent(to))?;
         let entry = state.entries.get(from).ok_or_else(missing)?.clone();
         if entry == Entry::Directory || state.entries.get(to) == Some(&Entry::Directory) {
@@ -1035,7 +1060,9 @@ impl Backing for RollbackBacking {
             }
             prefix.push_str(part);
             match state.entries.get(&prefix) {
-                Some(Entry::File(_)) => return Err(input("parent is a file")),
+                Some(Entry::File(_)) => {
+                    return Err(io::Error::new(io::ErrorKind::NotADirectory, prefix))
+                }
                 Some(Entry::Directory) => (),
                 None => {
                     if state.entries.len() >= MAX_ENTRIES {
@@ -1117,7 +1144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retaining_file_length_keeps_the_arena_slot_index() {
+    fn retaining_or_extending_file_length_keeps_the_arena_slot_index() {
         let root = tempfile::tempdir().unwrap();
         let witness = tempfile::tempdir_in("/dev/shm").unwrap();
         let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
@@ -1126,6 +1153,11 @@ mod tests {
         assert!(backing.state.lock().used_slots.is_some());
         file.set_len(file.len().unwrap()).unwrap();
         assert!(backing.state.lock().used_slots.is_some());
+        file.set_len(PAGE + 1).unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+        let mut bytes = [1; 2];
+        file.read_at(PAGE - 1, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0]);
     }
 
     #[test]
