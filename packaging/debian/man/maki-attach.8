@@ -1,0 +1,41 @@
+.TH MAKI-ATTACH 8
+.SH NAME
+maki-attach \- manage the NBD, LVM and XFS attachment for a Maki volume
+.SH SYNOPSIS
+.B maki-attach
+.I action
+.B \-\-volume
+.I name
+.RB [ \-\-config
+.IR file ]
+.RB [ \-\-plan ]
+.SH DESCRIPTION
+.B attach
+connects the NBD device and mounts the configured filesystem.
+.B verify
+checks the identity of the existing attachment.
+.B grow
+requires
+.BI \-\-size-bytes " bytes"
+and a verified, mounted attachment.
+.PP
+Stop workloads before running
+.BR detach ", " recover " or " cleanup .
+Use
+.B recover
+for a disconnected backend.
+.B cleanup
+uses the attachment record to select detach or recovery.
+.B recover-failed-start
+is the systemd failed-start cleanup hook.
+.SH OPTIONS
+.TP
+.BI \-\-config " file"
+Read attachment settings from this file. The default path, when present, is
+.IR /etc/maki/attach/name.toml .
+.TP
+.B \-\-plan
+Print the planned steps. Execution requires Linux and the volume identity.
+.SH SEE ALSO
+.BR maki (8),
+.BR maki-check (8)

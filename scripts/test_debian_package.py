@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import os
 import pathlib
@@ -167,6 +168,18 @@ class DebianPackageTests(unittest.TestCase):
         control = self.work / f"{name}-control"
         subprocess.run(["dpkg-deb", "--control", package, control], check=True)
         return root, control
+
+    def test_installed_maintenance_contact_history_and_manuals(self):
+        package = self.build()
+        self.assertRegex(self.field(package, "Maintainer"), r".+ <[^@<> ]+@[^@<> ]+>$")
+        root, _ = self.extract(package)
+        docs = root / "usr/share/doc/maki"
+        changelog = gzip.decompress((docs / "changelog.Debian.gz").read_bytes())
+        self.assertIn(b"maki (0.1.0+test1)", changelog)
+        self.assertEqual(gzip.decompress((docs / "NEWS.gz").read_bytes()), (ROOT / "CHANGELOG.md").read_bytes())
+        for binary in ("maki", "maki-attach", "maki-check"):
+            page = root / "usr/share/man/man8" / f"{binary}.8.gz"
+            self.assertIn(f".TH {binary.upper()} 8".encode(), gzip.decompress(page.read_bytes()))
 
     def test_package_owns_runtime_artifacts_but_not_live_configuration(self):
         package = self.build()

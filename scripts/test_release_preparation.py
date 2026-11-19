@@ -32,6 +32,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertTrue(SCRIPT.is_file(), "a release-candidate preparation command is required")
         shutil.copyfile(SCRIPT, self.repo / "scripts/prepare_release.py")
         shutil.copytree(ROOT / "packaging", self.repo / "packaging")
+        shutil.copyfile(ROOT / "CHANGELOG.md", self.repo / "CHANGELOG.md")
         (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.0"\n')
         (self.repo / "Cargo.lock").write_text("# locked fixture\nversion = 3\n")
         self.git("init", "-q")

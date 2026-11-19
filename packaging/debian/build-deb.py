@@ -2,6 +2,8 @@
 """Build a deterministic Debian package from Maki release artifacts."""
 
 import argparse
+from email.utils import formatdate
+import gzip
 import os
 import pathlib
 import re
@@ -14,6 +16,7 @@ import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+MAINTAINER = "Maki Developers <me@seorii.page>"
 RELEASE_FILES = {
     "maki": "usr/bin/maki",
     "maki-attach": "usr/bin/maki-attach",
@@ -298,7 +301,7 @@ def shared_library_dependencies(package_root):
         source = pathlib.Path(temporary)
         write_file(
             source / "debian/control",
-            "Source: maki\nMaintainer: Maki Developers\n\nPackage: maki\nArchitecture: any\n",
+            f"Source: maki\nMaintainer: {MAINTAINER}\n\nPackage: maki\nArchitecture: any\n",
             0o644,
         )
         result = subprocess.run(
@@ -369,7 +372,15 @@ def validate(args):
     return epoch, runtimes
 
 
-def create_tree(package_root, args, runtimes):
+def install_gzip(contents, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as output:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+            compressed.write(contents)
+    destination.chmod(0o644)
+
+
+def create_tree(package_root, args, runtimes, epoch):
     for source_name, installed_name in RELEASE_FILES.items():
         install_file(
             args.release_dir / source_name,
@@ -396,6 +407,18 @@ def create_tree(package_root, args, runtimes):
             install_file(source, package_root / "usr/share/doc/maki/examples" / relative, 0o644)
     install_file(ROOT / "packaging/debian/copyright", package_root / "usr/share/doc/maki/copyright", 0o644)
 
+    docs = package_root / "usr/share/doc/maki"
+    changelog = (
+        f"maki ({args.version}) unstable; urgency=medium\n\n"
+        "  * Build Maki from the supplied release artifacts. See NEWS.gz for upstream changes.\n\n"
+        f" -- {MAINTAINER}  {formatdate(epoch)}\n"
+    )
+    install_gzip(changelog.encode("utf-8"), docs / "changelog.Debian.gz")
+    install_gzip((ROOT / "CHANGELOG.md").read_bytes(), docs / "NEWS.gz")
+    for name in ("maki", "maki-attach", "maki-check"):
+        page = ROOT / "packaging/debian/man" / f"{name}.8"
+        install_gzip(page.read_bytes(), package_root / "usr/share/man/man8" / f"{name}.8.gz")
+
     depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd", "kmod"]
     if args.shlibdeps:
         for entry in shared_library_dependencies(package_root):
@@ -409,7 +432,7 @@ Version: {args.version}
 Section: admin
 Priority: optional
 Architecture: {args.architecture}
-Maintainer: Maki Developers
+Maintainer: {MAINTAINER}
 Depends: {", ".join(depends)}
 Description: encrypted block storage daemon and recovery controller
  Maki exposes encrypted backing storage through nbdkit and provides a
@@ -506,7 +529,7 @@ def main():
         package_root = pathlib.Path(temporary) / "root"
         package_root.mkdir(mode=0o755)
         (package_root / "DEBIAN").mkdir(mode=0o755)
-        create_tree(package_root, args, runtimes)
+        create_tree(package_root, args, runtimes, epoch)
         normalize_directory_permissions(package_root)
         normalize_timestamps(package_root, epoch)
         with tempfile.TemporaryDirectory(prefix=".maki-deb-", dir=args.output.parent) as staging:
