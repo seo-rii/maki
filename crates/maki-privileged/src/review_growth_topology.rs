@@ -162,6 +162,7 @@ fn setup(partitioned: bool) -> (Fixture, TrustedState, Plan, BoundDeviceRecord, 
         vg_name: request.vg_name,
         lv_name: request.lv_name,
         lvm_identity: None,
+        fs_uuid: None,
         target_bytes: 2 << 30,
         mountpoint: request.mountpoint.clone(),
     });

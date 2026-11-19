@@ -68,6 +68,8 @@ pub struct GrowRequest {
     pub lvm_identity: Option<LvmIdentityPins>,
     /// Absolute minimum LV size; reuse the same target when retrying.
     pub target_bytes: u64,
+    /// Optional expected XFS UUID, checked before each growth operation.
+    pub fs_uuid: Option<String>,
     pub mountpoint: String,
 }
 
@@ -437,6 +439,26 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
 
 /// Online growth (SPEC §38): `lvextend` then `xfs_growfs`; no NBD resize.
 pub fn plan_grow(request: &GrowRequest) -> Plan {
+    let identity_check =
+        request
+            .fs_uuid
+            .as_ref()
+            .map(|uuid| PlannedStep::VerifyFilesystemIdentity {
+                device: format!("/dev/{}/{}", request.vg_name, request.lv_name),
+                fs_uuid: Some(uuid.clone()),
+            });
+    let mut steps = Vec::new();
+    steps.extend(identity_check.clone());
+    steps.push(PlannedStep::LvExtend {
+        nbd_device: request.nbd_device.clone(),
+        vg_name: request.vg_name.clone(),
+        lv_name: request.lv_name.clone(),
+        target_bytes: request.target_bytes,
+    });
+    steps.extend(identity_check);
+    steps.push(PlannedStep::XfsGrowfs {
+        mountpoint: request.mountpoint.clone(),
+    });
     Plan {
         description: format!(
             "grow volume {} on {}",
@@ -449,17 +471,7 @@ pub fn plan_grow(request: &GrowRequest) -> Plan {
         ),
         volume: request.volume.clone(),
         attachment: Some(request.into()),
-        steps: vec![
-            PlannedStep::LvExtend {
-                nbd_device: request.nbd_device.clone(),
-                vg_name: request.vg_name.clone(),
-                lv_name: request.lv_name.clone(),
-                target_bytes: request.target_bytes,
-            },
-            PlannedStep::XfsGrowfs {
-                mountpoint: request.mountpoint.clone(),
-            },
-        ],
+        steps,
     }
 }
 

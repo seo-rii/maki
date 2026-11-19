@@ -188,6 +188,7 @@ struct Report {
 }
 
 fn main() -> ExitCode {
+    maki_core::logging::install_default_logging();
     if std::env::args().len() == 2
         && matches!(std::env::args().nth(1).as_deref(), Some("--help" | "-h"))
     {
@@ -247,12 +248,11 @@ fn main() -> ExitCode {
         eprintln!("{error}");
         return ExitCode::from(2);
     }
-    // Protected backings must be opened through their existing witness. A
-    // create attempt would start enrollment again and refuse the stored root
-    // before the benchmark can honor its destruction authorization.
-    let existing = match maki_nbdkit::daemon::existing_volume_from_config(&config) {
-        Ok(Some(_)) => true,
-        Ok(None) => match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
+    // A refusal must not claim a remote writer or advance its fence. The actual
+    // attach below validates the backing and its witness after authorization.
+    let existing = match maki_nbdkit::daemon::volume_layout_present(&config) {
+        Ok(true) => true,
+        Ok(false) => match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
             Ok(_) => false,
             // A plain volume may have appeared after the existing-volume probe.
             Err(DaemonError::Format(FormatError::AlreadyExists(_))) => true,

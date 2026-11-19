@@ -101,6 +101,7 @@ pub fn validate_oracle_capacity(slots: u64) -> Result<(), String> {
 }
 
 struct Oracle {
+    run_id: uuid::Uuid,
     generations: Vec<AtomicU64>,
 }
 
@@ -113,7 +114,10 @@ impl Oracle {
             .try_reserve_exact(slots)
             .map_err(|_| "cannot allocate the bounded generation oracle")?;
         generations.resize_with(slots, || AtomicU64::new(0));
-        Ok(Self { generations })
+        Ok(Self {
+            run_id: uuid::Uuid::new_v4(),
+            generations,
+        })
     }
 
     fn generation(&self, slot: usize) -> u64 {
@@ -128,14 +132,14 @@ fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
     (value ^ (value >> 31)) % slots
 }
-fn data_for(offset: u64, generation: u64, size: usize) -> Vec<u8> {
+fn data_for(run_id: uuid::Uuid, offset: u64, generation: u64, size: usize) -> Vec<u8> {
     let mut bytes = vec![0; size];
-    // Keep a nonzero marker even for address zero at setup generation zero,
-    // so the benchmark does not accidentally measure zero/hole shortcuts.
-    let mut pattern = [0xa5; 24];
-    pattern[..8].copy_from_slice(&offset.to_le_bytes());
+    let mut pattern = [0; 32];
     pattern[8..16].copy_from_slice(&generation.to_le_bytes());
-    for chunk in bytes.chunks_mut(pattern.len()) {
+    pattern[16..].copy_from_slice(run_id.as_bytes());
+    for (index, chunk) in bytes.chunks_mut(pattern.len()).enumerate() {
+        let position = offset + (index * pattern.len()) as u64;
+        pattern[..8].copy_from_slice(&position.to_le_bytes());
         chunk.copy_from_slice(&pattern[..chunk.len()]);
     }
     bytes
@@ -203,7 +207,7 @@ async fn phase(
                     let _sequence = sequence;
                     let previous = oracle.generation(slot as usize);
                     let generation = if read { previous } else { previous + 1 };
-                    let expected = data_for(offset, generation, size);
+                    let expected = data_for(oracle.run_id, offset, generation, size);
                     let began = Instant::now();
                     let elapsed;
                     if read {
@@ -289,7 +293,7 @@ async fn verify_final(
             report.read_after_write_verified_slots += 1;
         }
         let offset = slot as u64 * options.io_size as u64;
-        let expected = data_for(offset, generation, options.io_size);
+        let expected = data_for(oracle.run_id, offset, generation, options.io_size);
         let actual = engine
             .read(offset, options.io_size)
             .await
@@ -362,7 +366,11 @@ pub async fn run(
         for slot in 0..slots {
             let offset = slot * options.io_size as u64;
             engine
-                .write(offset, &data_for(offset, 0, options.io_size), false)
+                .write(
+                    offset,
+                    &data_for(oracle.run_id, offset, 0, options.io_size),
+                    false,
+                )
                 .await
                 .map_err(|error| format!("setup write at offset {offset} failed: {error}"))?;
             setup.writes += 1;
