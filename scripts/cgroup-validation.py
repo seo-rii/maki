@@ -325,7 +325,7 @@ socket = "/case/control.sock"
         while (remaining := until - time.monotonic()) > 0:
             self.notify.settimeout(min(0.1, remaining))
             try:
-                if b"READY=1" in self.notify.recv(4096).splitlines():
+                if b"READY=1" in self.notify.recv(4096).splitlines() and time.monotonic() < until:
                     return
             except socket.timeout:
                 pass

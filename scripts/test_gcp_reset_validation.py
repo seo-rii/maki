@@ -297,6 +297,21 @@ class HostContracts(unittest.TestCase):
                 self.host.cut_instance(args, process)
         reset.assert_not_called()
 
+    def test_first_observed_ssh_exit_must_meet_the_deadline(self):
+        for observed_at in (4, 10, 12):
+            with self.subTest(observed_at=observed_at):
+                process = object.__new__(self.host.RemoteProcess)
+                process.child = mock.Mock(returncode=0)
+                process.poll = mock.Mock(return_value=0)
+                process._kill_owned = mock.Mock()
+                with mock.patch.object(self.host.time, "monotonic", side_effect=[0, observed_at]):
+                    if observed_at < 10:
+                        process.wait_clean(10)
+                    else:
+                        with self.assertRaisesRegex(TimeoutError, "did not exit"):
+                            process.wait_clean(10)
+                process._kill_owned.assert_called_once_with()
+
     def test_timeout_kills_and_reaps_only_owned_ssh_child(self):
         process = self.host.RemoteProcess(
             [sys.executable, "-c", "import time; time.sleep(30)"],

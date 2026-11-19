@@ -301,7 +301,7 @@ def run_nbdkit(args, runtime):
             if time.monotonic() >= until:
                 raise TimeoutError("nbdkit READY deadline")
             try:
-                if b"READY=1" in notify.recv(4096).splitlines():
+                if b"READY=1" in notify.recv(4096).splitlines() and time.monotonic() < until:
                     return child, log, socket_path
             except socket.timeout:
                 pass

@@ -522,13 +522,15 @@ class RemoteProcess:
 
     def _wait_owned(self, timeout):
         until = time.monotonic() + timeout
-        while self.poll() is None:
+        while True:
+            status = self.poll()
             remaining = until - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(self.child.args, timeout)
+            if status is not None:
+                self._kill_owned()
+                return self.child.returncode
             time.sleep(min(.05, remaining))
-        self._kill_owned()
-        return self.child.returncode
 
     def _kill_owned(self):
         if self.child is not None and self.child.returncode is None:
