@@ -186,11 +186,11 @@ fn deep_check_requires_checkpoint_state() {
         maki_format::checkpoint::CHECKPOINT_STATE_A,
         maki_format::checkpoint::CHECKPOINT_STATE_B,
     ] {
-        if backing.exists(path).unwrap() {
-            backing.remove(path).unwrap();
-        }
+        // Both paths exist, but neither contains a decodable state.
+        let file = backing.open(path, false).unwrap();
+        file.set_len(0).unwrap();
+        file.sync_data().unwrap();
     }
-    backing.sync_dir(layout::CHECKPOINT_DIR).unwrap();
 
     assert!(fast(&backing).ok());
     let report = deep(&backing);

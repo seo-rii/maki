@@ -4,7 +4,7 @@
 //! The fast checker in `maki-format` looks at the superblock, the shard
 //! catalog, allocation-map sizes and file presence. That is not enough to
 //! justify "check passed" for a volume that holds data: it says nothing
-//! about checkpoint state, the journal, or the slots themselves. The deep
+//! about checkpoint contents, the journal, or the slots themselves. The deep
 //! check reuses the *real* recovery scanner and the *real* slot reader, so
 //! anything that would refuse attach or return EIO at runtime is reported
 //! here, and nothing the runtime accepts is reported as an error.

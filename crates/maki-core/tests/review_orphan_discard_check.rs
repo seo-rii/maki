@@ -233,3 +233,46 @@ fn directory_cannot_be_adopted_or_used_as_cataloged_shard_data() {
         assert!(Volume::recover(backing.clone(), VolumeOptions::default()).is_err());
     }
 }
+
+#[test]
+fn fast_check_requires_at_least_one_checkpoint_state_file() {
+    use maki_format::checkpoint::{CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+    for discard in [false, true] {
+        let backing = MemBacking::new();
+        if discard {
+            init::create_volume_with_discard(&backing, block()).unwrap();
+        } else {
+            init::create_volume(&backing, block()).unwrap();
+        }
+        backing.remove(CHECKPOINT_STATE_A).unwrap();
+        assert!(check_volume(&backing).unwrap().ok());
+        backing.remove(CHECKPOINT_STATE_B).unwrap();
+        let report = check_volume(&backing).unwrap();
+        assert!(
+            report.errors.iter().any(|e| e.contains("checkpoint state")),
+            "{report:?}"
+        );
+        backing.create_dir_all(CHECKPOINT_STATE_B).unwrap();
+        assert!(!check_volume(&backing).unwrap().ok());
+    }
+}
+
+#[test]
+fn fast_check_reads_each_discard_copy_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let backing = CrashableBacking::new();
+    let sb = block();
+    let units = sb.geometry.units_per_shard();
+    init::create_volume_with_discard(&backing, sb).unwrap();
+    add_orphan(&backing, 0, Some(units));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = reads.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op| {
+        if matches!(op, FaultOp::Open { path, .. } if path == &layout::shard_discard_a(0) || path == &layout::shard_discard_b(0)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        None
+    })));
+    assert!(check_volume(&backing).unwrap().ok());
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+}

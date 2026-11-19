@@ -152,7 +152,8 @@ maki check /etc/maki/volumes/example.toml --deep
 ```
 
 Without `--deep` the check covers the superblock, required v2 proof records,
-shard catalog, allocation-map sizes, and file presence. `--deep` additionally
+shard catalog, allocation-map sizes, and file presence, including at least one
+checkpoint state file. `--deep` additionally
 verifies both checkpoint state copies, the key canary, and every journal
 segment as recovery would scan it, including the required horizon and its
 exact record end (or the legacy advisory-mark policy). It reports the repairs
