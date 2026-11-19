@@ -129,9 +129,7 @@ class HostContracts(unittest.TestCase):
 
     def test_optimized_interpreter_keeps_false_ack_gate(self):
         source = str(pathlib.Path(__file__).with_name("firecracker-powercut-validation.py"))
-        code = f'''import contextlib
-import importlib.util
-import io, pathlib
+        code = f'''import importlib.util, pathlib
 spec=importlib.util.spec_from_file_location("host", {source!r})
 host=importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
 host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)

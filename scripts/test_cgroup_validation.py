@@ -138,18 +138,25 @@ class OracleTests(unittest.TestCase):
         fields, = csv.reader([options[options.index("--mount") + 1]])
         self.assertEqual(fields, ["type=bind", f"src={target.case}", "dst=/case"])
 
-    def test_long_artifact_directory_supports_notifications_and_nbd_connections(self):
+    def test_start_receives_notifications_in_a_long_artifact_directory(self):
         directory = self.ledger.parent / ("long-name" * 13)
         directory.mkdir()
-        with campaign.socket.socket(campaign.socket.AF_UNIX, campaign.socket.SOCK_DGRAM) as listener, \
-                campaign.socket.socket(campaign.socket.AF_UNIX, campaign.socket.SOCK_DGRAM) as client:
+        target = campaign.Target.__new__(campaign.Target)
+        target.case, target.identifier = directory, None
+        target.create = mock.Mock()
+
+        def announce_ready(_command):
             path = directory / "ready.sock"
-            with campaign.unix_socket_path(path) as address:
-                listener.bind(address)
-            self.assertTrue(path.exists())
-            with campaign.unix_socket_path(path) as address:
+            self.assertTrue(path.is_socket())
+            with campaign.socket.socket(campaign.socket.AF_UNIX, campaign.socket.SOCK_DGRAM) as client, \
+                    campaign.unix_socket_path(path) as address:
                 client.sendto(b"READY=1", address)
-            self.assertEqual(listener.recv(32), b"READY=1")
+
+        with mock.patch.object(campaign, "run", side_effect=announce_ready):
+            try:
+                target.start()
+            finally:
+                target.notify.close()
 
     def test_ready_state_check_uses_remaining_startup_budget(self):
         target = campaign.Target.__new__(campaign.Target)

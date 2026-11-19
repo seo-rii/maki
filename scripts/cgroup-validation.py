@@ -18,11 +18,11 @@ import sys
 import time
 import uuid
 
-
 try:
     from campaign_io import save_json
 except ModuleNotFoundError:
     from scripts.campaign_io import save_json
+
 
 def ensure(condition, message):
     # Qualification gates must remain active under python -O/PYTHONOPTIMIZE.
