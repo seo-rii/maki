@@ -212,7 +212,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 Path(output.split("=", 1)[1]).write_bytes(b"frozen source")
             return subprocess.CompletedProcess(command, 0)
 
-        process = mock.Mock(pid=os.getpid())
+        process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
         with mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                 mock.patch.object(
@@ -248,6 +248,34 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(second_config["suites"], [
             "rollback_backing", "rollback_model", "rollback_protection", "rollback_process",
         ])
+
+    def test_failed_publication_reaps_worker_without_releasing_it(self):
+        args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
+        process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
+
+        def freeze(command, **_kwargs):
+            if command[:2] == ["git", "archive"]:
+                archive = next(arg for arg in command if arg.startswith("--output="))
+                Path(archive.split("=", 1)[1]).write_bytes(b"fixture")
+
+        for failed in ("controller.json", "maki-storage-latest.json"):
+            def publish(path, _value):
+                if path.name == failed:
+                    raise OSError("publication failed")
+
+            with self.subTest(failed=failed), \
+                    mock.patch.object(self.runner.Path, "home", return_value=self.root), \
+                    mock.patch.object(self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)), \
+                    mock.patch.object(self.runner.subprocess, "check_output", return_value="fixture"), \
+                    mock.patch.object(self.runner.subprocess, "run", side_effect=freeze), \
+                    mock.patch.object(self.runner.subprocess, "Popen", return_value=process), \
+                    mock.patch.object(self.runner, "save_json", side_effect=publish):
+                with self.assertRaisesRegex(OSError, "publication failed"):
+                    self.runner.start(args)
+            process.stdin.__enter__.return_value.write.assert_not_called()
+            process.stdin.__exit__.assert_called_once()
+            process.wait.assert_called_once()
+            process.reset_mock()
 
     def test_cargo_records_same_compiler_and_wrappers_used_for_suite_build(self):
         source = self.root / "source"

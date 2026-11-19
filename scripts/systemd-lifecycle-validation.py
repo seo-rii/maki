@@ -249,8 +249,15 @@ class Fixture:
             source = self.directory / name
             source.write_text(content)
             source.chmod(0o600)
-            self.ctl("link", "--runtime", str(source))
-            self.linked.append((destination, source))
+            try:
+                self.ctl("link", "--runtime", str(source))
+            finally:
+                # systemctl can create the link and then fail during reload.
+                installed = destination.is_symlink() and destination.resolve() == source.resolve()
+                if installed:
+                    self.linked.append((destination, source))
+            if not installed:
+                raise RuntimeError("systemctl did not install the expected fixture link")
         self.ctl("daemon-reload")
 
     def cleanup(self):

@@ -368,18 +368,26 @@ def start(args):
         "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, text=True).strip(),
     })
     with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
-        process = subprocess.Popen([sys.executable, "-B", str(runner), "_worker", "--run-dir", str(directory)],
-                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        process = subprocess.Popen([sys.executable, "-B", str(runner), "_published_worker", "--run-dir", str(directory)],
+                                   stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
-    controller = {"run_dir": str(directory), "pid": process.pid, "identity": process_identity(process.pid)}
-    save_json(directory / "controller.json", controller)
-    save_json(logs / "maki-storage-latest.json", controller)
+    # The worker waits for this byte before spawning any build. A publication
+    # failure or a controller crash closes the pipe without starting a campaign.
+    try:
+        with process.stdin as gate:
+            controller = {"run_dir": str(directory), "pid": process.pid, "identity": process_identity(process.pid)}
+            save_json(directory / "controller.json", controller)
+            save_json(logs / "maki-storage-latest.json", controller)
+            gate.write(b"1")
+    except BaseException:
+        process.wait()
+        raise
     print(json.dumps(controller, indent=2))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("start", "status", "cancel", "_worker"))
+    parser.add_argument("action", choices=("start", "status", "cancel", "_worker", "_published_worker"))
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--profile", choices=tuple(PROFILES), default="storage")
     parser.add_argument("--rounds", type=int, default=100)
@@ -395,6 +403,10 @@ def main():
         start(args)
         return 0
     directory = args.run_dir or Path(json.loads((Path.home() / "logs/maki-storage-latest.json").read_text())["run_dir"])
+    if args.action == "_published_worker":
+        if sys.stdin.buffer.read(1) != b"1":
+            return 1
+        return worker(directory)
     if args.action == "_worker":
         return worker(directory)
     if args.action == "cancel":

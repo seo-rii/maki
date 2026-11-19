@@ -127,7 +127,7 @@ readonly nbd_target
 
 required_commands=(
     blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
-    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sqlite3
+    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
     sync vgchange vgcreate vgremove vgs
 )
 
@@ -163,48 +163,18 @@ user_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
 [[ -n "$user_home" && -d "$user_home" ]] || die "cannot resolve the invoking user's home directory"
 log_root="${user_home}/logs"
 
-if [[ "$background" == true ]]; then
-    [[ -z "$run_dir" ]] || die "--run-dir is internal and cannot be combined with --background"
-    umask 077
-    mkdir -p "$log_root"
-    chmod 0700 "$log_root"
-    run_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    run_dir="${log_root}/maki-privileged-validation-${run_stamp}"
-    mkdir "$run_dir"
-    : >"$run_dir/run.log"
-    printf 'state=starting\n' >"$run_dir/status"
-    chmod 0600 "$run_dir/run.log" "$run_dir/status"
-    ln -sfn "$(basename "$run_dir")" "${log_root}/maki-privileged-validation.latest"
-
-    printf 'sudo authentication is required once before the background run starts.\n'
-    if ! sudo -v; then
-        printf 'state=not-started\nexit_code=1\nreason=sudo-authentication-failed\n' \
-            >"$run_dir/status"
-        exit 1
+prepare_source_snapshot() {
+    local revision
+    revision="$(git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}')" || return 1
+    if ! git -C "$REPO_ROOT" diff --quiet "$revision" --; then
+        printf 'Commit tracked changes before qualifying this revision.\n' >&2
+        return 1
     fi
-
-    child_args=(
-        --device "$device"
-        --confirm-wipe "$confirmed_device"
-        --run-dir "$run_dir"
-    )
-    [[ -z "$work_root" ]] || child_args+=(--work-root "$work_root")
-    [[ "$install_missing" == false ]] || child_args+=(--install-missing)
-    [[ "$discard" == false ]] || child_args+=(--discard)
-
-    printf 'state=running\n' >"$run_dir/status"
-    nohup "$SCRIPT_PATH" "${child_args[@]}" \
-        >"$run_dir/run.log" 2>&1 </dev/null &
-    child_pid=$!
-    printf '%s\n' "$child_pid" >"$run_dir/pid"
-    chmod 0600 "$run_dir/pid"
-
-    printf 'Started PID %s\n' "$child_pid"
-    printf 'Log:    %s/run.log\n' "$run_dir"
-    printf 'Status: %s/status\n' "$run_dir"
-    printf 'Latest: %s/maki-privileged-validation.latest\n' "$log_root"
-    exit 0
-fi
+    mkdir "$run_dir/source" || return 1
+    git -C "$REPO_ROOT" archive --format=tar "$revision" |
+        tar -xf - -C "$run_dir/source" || return 1
+    printf '%s\n' "$revision" > "$run_dir/source-revision"
+}
 
 umask 077
 if [[ -z "$run_dir" ]]; then
@@ -213,16 +183,47 @@ if [[ -z "$run_dir" ]]; then
     run_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
     run_dir="${log_root}/maki-privileged-validation-${run_stamp}"
     mkdir "$run_dir"
-    ln -sfn "$(basename "$run_dir")" "${log_root}/maki-privileged-validation.latest"
     : >"$run_dir/run.log"
-    exec > >(tee -a "$run_dir/run.log") 2>&1
-    sudo -v
+    printf 'state=starting\n' >"$run_dir/status"
+    ln -sfn "$(basename "$run_dir")" "${log_root}/maki-privileged-validation.latest"
+
+    if ! prepare_source_snapshot; then
+        printf 'state=not-started\nexit_code=1\nreason=source-snapshot-failed\n' >"$run_dir/status"
+        exit 1
+    fi
+    if [[ "$background" == true ]]; then
+        printf 'sudo authentication is required once before the background run starts.\n'
+    fi
+    if ! sudo -v; then
+        printf 'state=not-started\nexit_code=1\nreason=sudo-authentication-failed\n' \
+            >"$run_dir/status"
+        exit 1
+    fi
+
+    child_args=(--device "$device" --confirm-wipe "$confirmed_device" --run-dir "$run_dir")
+    [[ -z "$work_root" ]] || child_args+=(--work-root "$work_root")
+    [[ "$install_missing" == false ]] || child_args+=(--install-missing)
+    [[ "$discard" == false ]] || child_args+=(--discard)
+    snapshot_runner="$run_dir/source/scripts/privileged-linux-validation.sh"
+    if [[ "$background" == false ]]; then
+        exec > >(tee -a "$run_dir/run.log") 2>&1
+        exec "$snapshot_runner" "${child_args[@]}"
+    fi
+    nohup "$snapshot_runner" "${child_args[@]}" >"$run_dir/run.log" 2>&1 </dev/null &
+    child_pid=$!
+    printf '%s\n' "$child_pid" >"$run_dir/pid"
+
+    printf 'Started PID %s\n' "$child_pid"
+    printf 'Log:    %s/run.log\n' "$run_dir"
+    printf 'Status: %s/status\n' "$run_dir"
+    printf 'Latest: %s/maki-privileged-validation.latest\n' "$log_root"
+    exit 0
 fi
 
-[[ "$run_dir" == "$log_root"/maki-privileged-validation-* ]] ||
-    die "invalid run directory: $run_dir"
-mkdir -p "$run_dir"
-chmod 0700 "$run_dir"
+[[ "$background" == false ]] || die "--run-dir is internal and cannot be combined with --background"
+[[ "$run_dir" == "$log_root"/maki-privileged-validation-* &&
+   "$SCRIPT_PATH" == "$(readlink -f "$run_dir/source/scripts/privileged-linux-validation.sh")" ]] ||
+    die "worker must run from its private source snapshot"
 status_path="$run_dir/status"
 printf 'state=running\npid=%s\n' "$$" >"$status_path"
 
@@ -241,6 +242,7 @@ nbd_connection_id=""
 helper_cleanup_needed=false
 mount_active=false
 vg_created=false
+lv_created=false
 pv_created=false
 cleanup_safe=true
 volume_name="privval-$(id -u)-$$"
@@ -306,7 +308,7 @@ disconnect_test_nbd() {
 }
 
 cleanup() {
-    local cleanup_rc=0
+    local cleanup_rc=0 previous_connection_id
     set +e
 
     # The helper's trusted record, not the raw connection identifier, owns this
@@ -346,18 +348,32 @@ cleanup() {
 
     if [[ "$vg_created" == true || "$pv_created" == true ]]; then
         if ! test_nbd_action check >/dev/null 2>&1; then
+            previous_connection_id="$nbd_connection_id"
             log "cleanup: connecting our backend on $device to remove disposable LVM metadata"
             if [[ -z "$nbdkit_pid" ]] || ! kill -0 "$nbdkit_pid" 2>/dev/null || ! connect_test_nbd; then
                 log "cleanup warning: could not reconnect $device for LVM cleanup"
+                # A failed fresh connect can nevertheless have attached our
+                # identifier. No LVM operation has used this connection yet.
+                if [[ -z "$previous_connection_id" && -n "$nbd_connection_id" ]]; then
+                    disconnect_test_nbd || true
+                fi
                 cleanup_safe=false
                 cleanup_rc=1
             fi
         fi
 
         if [[ "$cleanup_safe" == true ]]; then
-            if [[ "$vg_created" == true ]]; then
+            if [[ "$lv_created" == true ]]; then
                 test_nbd_action activate-vg --vg "$vg_name" >/dev/null 2>&1 || true
-                test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name" >/dev/null 2>&1 || true
+                if test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name" >/dev/null 2>&1; then
+                    lv_created=false
+                else
+                    log "cleanup warning: preserving lower layers after LV removal failed"
+                    cleanup_safe=false
+                    cleanup_rc=1
+                fi
+            fi
+            if [[ "$vg_created" == true && "$cleanup_safe" == true ]]; then
                 if test_nbd_action remove-vg --vg "$vg_name" >/dev/null 2>&1; then
                     vg_created=false
                 else
@@ -366,7 +382,7 @@ cleanup() {
                     cleanup_rc=1
                 fi
             fi
-            if [[ "$pv_created" == true ]]; then
+            if [[ "$pv_created" == true && "$cleanup_safe" == true ]]; then
                 if test_nbd_action remove-pv >/dev/null 2>&1; then
                     pv_created=false
                 else
@@ -382,7 +398,7 @@ cleanup() {
         fi
     fi
 
-    if ! disconnect_test_nbd; then
+    if [[ "$cleanup_safe" == true ]] && ! disconnect_test_nbd; then
         cleanup_safe=false
         cleanup_rc=1
     fi
@@ -529,7 +545,7 @@ trap 'exit 129' HUP
 
 log "Maki privileged Linux validation"
 log "repository: $REPO_ROOT"
-log "revision: $(git -C "$REPO_ROOT" rev-parse HEAD)"
+log "revision: $(<"$run_dir/source-revision")"
 log "device: $device"
 log "kernel: $(uname -srvm)"
 log "run artifacts: $run_dir"
@@ -588,15 +604,18 @@ pass "required native tools available"
 log "building release binaries and nbdkit plugin"
 # Bind this run to its own build outputs, even when Cargo configuration or
 # environment variables select a shared directory or a cross-compilation target.
-native_target="$(rustc -vV | sed -n 's/^host: //p')"
+native_target="$(cd "$REPO_ROOT" && rustc -vV | sed -n 's/^host: //p')"
 [[ "$native_target" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "cannot determine native Rust target"
 readonly native_target
 readonly build_target_dir="$run_dir/target"
 log "native build target: $native_target ($build_target_dir)"
-CARGO_BUILD_BUILD_DIR="$run_dir/build" \
-cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release --locked \
-    --target-dir "$build_target_dir" --target "$native_target" \
-    -p maki -p maki-attach -p maki-nbdkit
+(
+    cd "$REPO_ROOT"
+    CARGO_BUILD_BUILD_DIR="$run_dir/build" \
+    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release --locked \
+        --target-dir "$build_target_dir" --target "$native_target" \
+        -p maki -p maki-attach -p maki-nbdkit
+)
 readonly maki_bin="$build_target_dir/$native_target/release/maki"
 readonly attach_bin="$build_target_dir/$native_target/release/maki-attach"
 readonly plugin_path="$build_target_dir/$native_target/release/libmaki_nbdkit.so"
@@ -604,6 +623,8 @@ readonly plugin_path="$build_target_dir/$native_target/release/libmaki_nbdkit.so
     die "release artifacts are incomplete"
 nm -D --defined-only "$plugin_path" | grep -Eq '[[:space:]]T[[:space:]]plugin_init$' ||
     die "plugin_init is not exported by $plugin_path"
+(cd "$build_target_dir/$native_target/release" &&
+    sha256sum maki maki-attach libmaki_nbdkit.so) >"$run_dir/artifact-sha256"
 pass "release binaries and plugin_init export"
 
 choose_work_root() {
@@ -862,6 +883,7 @@ sudo -n pvcreate --yes --force "$device"
 pv_created=true
 sudo -n vgcreate "$vg_name" "$device"
 vg_created=true
+lv_created=true
 sudo -n lvcreate --yes -L "$LV_SIZE" -n "$lv_name" "$vg_name"
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
@@ -958,8 +980,16 @@ fio --name=maki-xfs-verify --filename="$mountpoint/work/fio.dat" --ioengine=psyn
     --output-format=json >"$run_dir/fio-xfs.json"
 pass "unprivileged fio verification through XFS"
 
+verify_sqlite_result() {
+    local -a rows
+    mapfile -t rows < "$1" || return 1
+    [[ ${#rows[@]} == 3 && "${rows[0]}" == wal && "${rows[2]}" == ok &&
+       "${rows[1]}" =~ ^0\|([0-9]+)\|([0-9]+)$ ]] &&
+        [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
+}
+
 log "running a safe SQLite WAL/integrity smoke test"
-sqlite3 "$mountpoint/work/smoke.db" >"$run_dir/sqlite.txt" <<'SQL'
+sqlite3 -batch -bail -noheader -separator '|' "$mountpoint/work/smoke.db" >"$run_dir/sqlite.txt" <<'SQL'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
 BEGIN IMMEDIATE;
@@ -974,7 +1004,7 @@ COMMIT;
 PRAGMA wal_checkpoint(FULL);
 PRAGMA integrity_check;
 SQL
-grep -qx 'ok' "$run_dir/sqlite.txt" || die "SQLite integrity_check did not return ok"
+verify_sqlite_result "$run_dir/sqlite.txt" || die "SQLite WAL mode, FULL checkpoint or integrity check failed"
 sync -f "$mountpoint/work"
 pass "SQLite FULL-synchronous WAL checkpoint and integrity_check"
 
@@ -1032,6 +1062,7 @@ log "removing the disposable LVM metadata"
 connect_test_nbd
 test_nbd_action activate-vg --vg "$vg_name"
 test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name"
+lv_created=false
 test_nbd_action remove-vg --vg "$vg_name"
 vg_created=false
 test_nbd_action remove-pv

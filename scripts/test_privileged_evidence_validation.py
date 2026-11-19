@@ -1,0 +1,99 @@
+"""Exercise source and SQLite evidence without privileged host operations."""
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+
+SCRIPT = Path(__file__).with_name("privileged-linux-validation.sh").read_text()
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("bash"), "Linux shell")
+class PrivilegedEvidence(unittest.TestCase):
+    def test_wal_checkpoint_requires_mode_all_frames_and_integrity(self):
+        check = SCRIPT[SCRIPT.index("verify_sqlite_result() {"):SCRIPT.index('log "running a safe SQLite')]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "database"
+            writer = sqlite3.connect(path, timeout=0.01)
+            reader = sqlite3.connect(path)
+            try:
+                mode = writer.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                writer.execute("CREATE TABLE t(x)")
+                writer.execute("INSERT INTO t VALUES(1)")
+                writer.commit()
+                reader.execute("BEGIN")
+                reader.execute("SELECT * FROM t").fetchall()
+                writer.execute("INSERT INTO t VALUES(2)")
+                writer.commit()
+                busy = writer.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+                integrity = writer.execute("PRAGMA integrity_check").fetchone()[0]
+                reader.rollback()
+                done = writer.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+            finally:
+                reader.close()
+                writer.close()
+            self.assertEqual(busy[0], 1)
+            self.assertNotEqual(busy[1], busy[2])
+            for journal, fields, ok in [(mode, done, True), (mode, busy, False),
+                                        ("delete", done, False), (mode, (0, 3, 2), False)]:
+                report = Path(directory) / "sqlite.txt"
+                report.write_text(f"{journal}\n{'|'.join(map(str, fields))}\n{integrity}\n")
+                result = subprocess.run(["bash", "-c", check + '\nverify_sqlite_result "$1"',
+                                         "bash", str(report)], check=False)
+                self.assertEqual(result.returncode == 0, ok, (journal, fields))
+
+    def test_foreground_and_background_workers_use_the_captured_commit(self):
+        launcher = SCRIPT[SCRIPT.index("prepare_source_snapshot() {"):
+                          SCRIPT.index('[[ "$background" == false ]] || die "--run-dir')]
+        setup = """set -euo pipefail
+run_dir=""
+device=/dev/nbd0
+confirmed_device="$device"
+install_missing=false
+discard=false
+work_root=""
+sudo() { echo later-edit > "$REPO_ROOT/version"; }
+"""
+        for mode in ["false", "true"]:
+            with self.subTest(background=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = root / "repo"
+                repo.mkdir()
+                def git(*arguments):
+                    return subprocess.check_output(["git", "-C", str(repo), *arguments], text=True).strip()
+                git("init", "-q")
+                (repo / "scripts").mkdir()
+                worker = repo / "scripts/privileged-linux-validation.sh"
+                worker.write_text('#!/bin/sh\ncd "$(dirname "$0")/.."\n'
+                                  'test ! -e extra && cp version ../result.tmp && mv ../result.tmp ../worker-result\n')
+                worker.chmod(0o755)
+                (repo / "version").write_text("qualified\n")
+                git("add", ".")
+                git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                    "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+                (repo / "extra").touch()
+                logs = root / "logs"
+                result = subprocess.run(["bash", "-c", setup + launcher], capture_output=True,
+                                        text=True, timeout=15, env=dict(os.environ, REPO_ROOT=str(repo),
+                                        background=mode, log_root=str(logs)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                live = logs / "maki-privileged-validation.latest"
+                output = live / "worker-result"
+                deadline = time.monotonic() + 5
+                while not output.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(output.read_text(), "qualified\n")
+                self.assertEqual((repo / "version").read_text(), "later-edit\n")
+                second = root / "other-logs"
+                rejected = subprocess.run(["bash", "-c", setup + launcher], capture_output=True,
+                                          text=True, timeout=10, env=dict(os.environ, REPO_ROOT=str(repo),
+                                          background=mode, log_root=str(second)))
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("source-snapshot-failed", (second / "maki-privileged-validation.latest/status").read_text())
+
+                self.assertEqual((live / "source-revision").read_text().strip(), git("rev-parse", "HEAD"))

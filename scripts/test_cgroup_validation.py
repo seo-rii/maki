@@ -83,6 +83,28 @@ class OracleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "durable data mismatch"):
             campaign.verify(client, self.ledger)
 
+    def test_campaign_requires_every_planned_ack_in_order(self):
+        client = Client()
+        for epoch in range(2):
+            for mode, writes in campaign.epoch_writes(epoch):
+                campaign.durable_write(client, self.ledger, writes, mode)
+        self.assertEqual(campaign.verify(client, self.ledger, 2), 136)
+        rows = self.ledger.read_text().splitlines(keepends=True)
+        for incomplete in (rows[1:], rows[:-1], rows[:136], [rows[1], *rows[1:]]):
+            self.ledger.write_text("".join(incomplete))
+            with self.assertRaises(ValueError):
+                campaign.verify(client, self.ledger, 2)
+
+    def test_remove_container_even_when_log_collection_fails(self):
+        target = campaign.Target.__new__(campaign.Target)
+        target.notify, target.identifier = None, "owned-container"
+        target.state = mock.Mock(return_value={"Running": False})
+        with mock.patch.object(campaign, "run", side_effect=[OSError("logs unavailable"), None]) as run:
+            with self.assertRaisesRegex(OSError, "logs unavailable"):
+                target.remove()
+        run.assert_called_with(["docker", "rm", "owned-container"])
+        self.assertIsNone(target.identifier)
+
     def test_empty_or_truncated_oracle_cannot_pass(self):
         self.ledger.write_text("")
         with self.assertRaises(ValueError):

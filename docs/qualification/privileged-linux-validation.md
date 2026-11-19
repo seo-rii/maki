@@ -15,6 +15,13 @@ does not unload kernel modules and never targets a physical disk.
 
 ## Scope
 
+Each foreground or background run exports the committed revision into its private
+run directory before requesting sudo credentials. The worker and the Cargo build
+use this source snapshot. Commit tracked changes before starting a run. The
+snapshot excludes untracked files. `source-revision` records its commit ID, and
+`artifact-sha256` records the hashes of the three binaries used in the run.
+
+
 The automated run checks:
 
 - release builds and the nbdkit `plugin_init` export;

@@ -49,10 +49,25 @@ def durable_write(client, ledger, writes, mode):
             os.fsync(stream.fileno())
 
 
-def verify(client, ledger):
+def epoch_writes(epoch):
+    flush = [(i * 4096, hashlib.sha256(f"{epoch}:{i}".encode()).digest() * 128)
+             for i in range(128)]
+    fua = [((128 + i) * 4096, bytes([(epoch + i + 1) % 256]) * 4096) for i in range(8)]
+    return (("flush", flush), ("fua", fua))
+
+
+def verify(client, ledger, expected_rounds=None):
     latest = {}
-    for line in ledger.read_text(encoding="utf-8").splitlines():
-        record = json.loads(line)
+    records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    if expected_rounds is not None:
+        expected = ({"offset": offset, "length": len(data), "barrier": mode,
+                     "sha256": hashlib.sha256(data).hexdigest()}
+                    for epoch in range(expected_rounds)
+                    for mode, writes in epoch_writes(epoch) for offset, data in writes)
+        for recorded, planned in zip(records, expected, strict=True):
+            if recorded != planned:
+                raise ValueError("durable ACK ledger differs from the planned workload")
+    for record in records:
         offset, length = record["offset"], record["length"]
         if offset < 0 or offset % 4096 or length != 4096:
             raise ValueError("oracle accepts aligned, non-overlapping 4 KiB units only")
@@ -126,7 +141,7 @@ def client_main(args):
     client = Nbd(args.socket)
     try:
         if args.mode == "verify":
-            print(json.dumps({"verified_units": verify(client, args.ledger)}))
+            print(json.dumps({"verified_units": verify(client, args.ledger, args.rounds)}))
         elif args.mode == "pressure":
             # Distinct non-durable writes cannot overwrite the durable oracle.
             # 64 MiB of pending ciphertext deliberately exceeds a 32 MiB cgroup.
@@ -141,12 +156,8 @@ def client_main(args):
             print(json.dumps({"pressure_bytes_written": 64 << 20}))
         else:
             for epoch in range(args.start_epoch, args.start_epoch + args.rounds):
-                writes = [(index * 4096, hashlib.sha256(f"{epoch}:{index}".encode()).digest() * 128)
-                          for index in range(128)]
-                durable_write(client, args.ledger, writes, "flush")
-                writes = [((128 + index) * 4096, bytes([(epoch + index + 1) % 256]) * 4096)
-                          for index in range(8)]
-                durable_write(client, args.ledger, writes, "fua")
+                for mode, writes in epoch_writes(epoch):
+                    durable_write(client, args.ledger, writes, mode)
             # No barrier for the tail: its survival is not claimed or required.
             client.write(1 << 20, b"T" * 4096)
             print(json.dumps({"flush_acks": args.rounds, "fua_acks": args.rounds * 8}))
@@ -287,6 +298,8 @@ socket = "/case/control.sock"
         record = {"exit_code": result.returncode, "stdout": result.stdout[-2000:], "stderr": result.stderr[-2000:]}
         if check:
             ensure(result.stdout.strip(), "client returned no verification evidence")
+        if mode == "verify":
+            ensure(json.loads(result.stdout)["verified_units"] == 136, "incomplete recovery readback")
         return record
 
     def kill(self):
@@ -309,13 +322,15 @@ socket = "/case/control.sock"
         if self.state()["Running"]:
             self.kill()
         # Logs are inspected/saved only after the container process has exited.
-        output = run(["docker", "logs", "--tail", "60", self.identifier])
-        (self.directory / f"container-{self.serial}.log").write_text(output.stdout + output.stderr)
-        run(["docker", "rm", self.identifier])
-        self.identifier = None
+        try:
+            output = run(["docker", "logs", "--tail", "60", self.identifier])
+            (self.directory / f"container-{self.serial}.log").write_text(output.stdout + output.stderr)
+        finally:
+            run(["docker", "rm", self.identifier])
+            self.identifier = None
 
 
-def constrained_recovery(target, memory="32m"):
+def constrained_recovery(target, memory="32m", rounds=1):
     """Report availability at the requested cap without relaxing durability."""
     try:
         try:
@@ -331,7 +346,7 @@ def constrained_recovery(target, memory="32m"):
             require_oom(state)
             return {"ready": False, "outcome": "startup-oom", "termination": state}
         else:
-            result = {"ready": True, "outcome": "verified", "verification": target.client("verify"),
+            result = {"ready": True, "outcome": "verified", "verification": target.client("verify", rounds=rounds),
                       "resources": target.stats()}
             target.kill()
             return result
@@ -399,9 +414,9 @@ def campaign(args):
                     # A safe recovery result is separate from availability at
                     # the original cap. Preserve both outcomes explicitly.
                     memory = f"{args.recovery_memory_mib}m"
-                    record[f"recovery_at_{memory}"] = constrained_recovery(target, memory=memory)
+                    record[f"recovery_at_{memory}"] = constrained_recovery(target, memory=memory, rounds=args.rounds)
                 target.start()
-                record["recovery"] = target.client("verify")
+                record["recovery"] = target.client("verify", rounds=args.rounds + int(scenario == "freeze-resume"))
                 record["recovery_resources"] = target.stats()
                 target.kill()
                 target.remove()
@@ -430,8 +445,9 @@ def main():
     parser.add_argument("--ledger", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("write", "verify", "pressure"), help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not 1 <= args.rounds <= 64:
-        parser.error("--rounds must be 1..64")
+    max_rounds = 65 if args.client and args.mode == "verify" else 64
+    if not 1 <= args.rounds <= max_rounds:
+        parser.error(f"--rounds must be 1..{max_rounds}")
     if not 32 <= args.recovery_memory_mib <= 4096:
         parser.error("--recovery-memory-mib must be 32..4096")
     if args.client:
