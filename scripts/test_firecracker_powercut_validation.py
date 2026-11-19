@@ -1,5 +1,7 @@
 """Host-oracle and guest-barrier contracts, without KVM or device operations."""
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import subprocess
@@ -34,6 +36,21 @@ class HostContracts(unittest.TestCase):
             self.host.decode_frame(self.frame(event="ack"), "b" * 32, 1)
         with self.assertRaisesRegex(ValueError, "identity"):
             self.host.decode_frame(self.frame(event="ack"), "a" * 32, 2)
+
+    def test_guest_mount_failure_reaches_host_before_ready(self):
+        guest = load("fc_mount_failure", "firecracker-guest-agent.py")
+        agent = guest.Agent()
+        with mock.patch.object(guest, "mount_guest", side_effect=OSError("data mount failed")), \
+                contextlib.redirect_stdout(io.StringIO()) as console:
+            try:
+                agent.startup()
+            except OSError as error:
+                agent.failure(error)
+        process = self.host.SerialProcess.__new__(self.host.SerialProcess)
+        process.token, process.boot = "a" * 32, 0
+        process.buffer = bytearray(console.getvalue().encode())
+        with self.assertRaisesRegex(RuntimeError, "data mount failed"):
+            process.expect("ready", 120)
 
     def test_truncated_or_oversized_control_frames_are_rejected(self):
         for raw in (b"MAKI_FC_V1 {", b"MAKI_FC_V1 " + b"x" * 65536):
@@ -112,7 +129,9 @@ class HostContracts(unittest.TestCase):
 
     def test_optimized_interpreter_keeps_false_ack_gate(self):
         source = str(pathlib.Path(__file__).with_name("firecracker-powercut-validation.py"))
-        code = f'''import importlib.util, pathlib
+        code = f'''import contextlib
+import importlib.util
+import io, pathlib
 spec=importlib.util.spec_from_file_location("host", {source!r})
 host=importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
 host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)
