@@ -210,3 +210,27 @@ fn sparse_punch_visits_reservations_including_unwritten_pages() {
     assert_eq!(bytes, [0, 8]);
     assert_eq!(backing.free_bytes().unwrap(), Some(4096));
 }
+
+#[test]
+fn locking_requires_and_creates_a_file_in_the_rollback_namespace() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
+    assert_eq!(
+        backing.try_lock("sub/lock").err().unwrap().kind(),
+        io::ErrorKind::NotFound
+    );
+    backing.create_dir_all("sub").unwrap();
+    assert_eq!(
+        backing.try_lock("sub").err().unwrap().kind(),
+        io::ErrorKind::IsADirectory
+    );
+    let lock = backing.try_lock("sub/lock").unwrap();
+    assert_eq!(backing.list("sub").unwrap(), ["lock"]);
+    assert_eq!(backing.open("sub/lock", false).unwrap().len().unwrap(), 0);
+    assert_eq!(
+        backing.try_lock("sub/lock").err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(lock);
+    backing.try_lock("sub/lock").unwrap();
+}

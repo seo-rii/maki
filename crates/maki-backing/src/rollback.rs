@@ -1091,6 +1091,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retaining_file_length_keeps_the_arena_slot_index() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
+        let file = backing.open("pages", true).unwrap();
+        file.write_at(0, b"x").unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+        file.set_len(file.len().unwrap()).unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+    }
+
+    #[test]
     fn manifest_and_page_domains_have_fixed_vectors() {
         let manifest = Manifest {
             format: 1,
