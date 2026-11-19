@@ -119,6 +119,21 @@ impl BackingFile for MemFile {
         Ok(())
     }
 
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| bad_offset("allocation overflow"))?;
+        let end = usize::try_from(end).map_err(bad_offset)?;
+        let mut data = self.data.lock();
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        Ok(())
+    }
+
     fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
         if len == 0 {
             return Ok(());
