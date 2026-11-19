@@ -37,6 +37,16 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "#hashtag guide\n====\n\n[section](#hashtag-guide)\n")
         self.assertEqual(broken_links(self.root), [])
 
+    def test_multiline_code_in_a_heading_keeps_its_rendered_spaces(self):
+        self.write("guide.md", "`hello\nworld`\n===\n\n"
+                   "Two `hello   \n   world` words\n===\n\n"
+                   "Normal   \nbreak\n===\n\n"
+                   "With <i></i>  \ntag\n===\n")
+        self.write("README.md", "[code](guide.md#hello-world) [missing](guide.md#helloworld)\n"
+                   "[padding](guide.md#two-hello----world-words) [normal](guide.md#normalbreak)\n"
+                   "[tag](guide.md#with-tag)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#helloworld (missing anchor)"])
+
     def test_table_cells_cannot_hide_a_link_in_another_cell_or_row(self):
         self.write("README.md", "| Token | Link | Token |\n| --- | --- | --- |\n"
                    "| ` | [one](missing.md) | ` |\n\n"

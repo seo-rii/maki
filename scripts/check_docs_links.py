@@ -737,8 +737,8 @@ def inline_text(raw, labels=frozenset()):
                 out.extend((tick, True) for tick in opening)
                 index += len(opening)
                 continue
-            content = raw[index + len(opening):closing.start()]
-            if len(content) > 1 and content[0] == content[-1] == " " and content.strip():
+            content = raw[index + len(opening):closing.start()].replace("\n", " ")
+            if len(content) > 1 and content[0] == content[-1] == " " and content.strip(" "):
                 content = content[1:-1]
             out.extend((code, True) for code in content)
             index = closing.end()
@@ -766,6 +766,13 @@ def inline_text(raw, labels=frozenset()):
             if tag:
                 index = tag.end()
                 continue
+        if char == "\n":
+            # Spaces before a prose line break are absent from rendered text.
+            # Inside a code span they were already consumed as literal text.
+            before_break = index
+            while before_break and raw[before_break - 1] in " \t":
+                out.pop()
+                before_break -= 1
         out.append((char, False))
         index += 1
     return out
@@ -886,7 +893,7 @@ def document_anchors(text):
             continue
         if paragraph and paragraph[-1][0] != number - 1:
             paragraph = []
-        paragraph.append((number, line.strip()))
+        paragraph.append((number, line.lstrip(" \t")))
 
     anchors = set()
     occurrences = {}
