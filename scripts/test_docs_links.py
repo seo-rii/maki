@@ -28,6 +28,18 @@ class DocumentationLinks(unittest.TestCase):
             )
         return path
 
+    def test_plain_markdown_links_address_source_lines(self):
+        self.write("guide.md", "# Guide\n\nLast line")
+        self.write("README.md", "[one](guide.md?plain=1#L3) [range](guide.md?a=b&plain=1#L1-L3)\n"
+                   "[next](guide.md?plain=1#L4) [backwards](guide.md?plain=1#L3-L2)\n"
+                   "[rendered](guide.md?plain=0#guide) [wrong view](guide.md?plain=0#L1)\n"
+                   "[heading in source](guide.md?plain=1#guide) [empty](guide.md?plain=1)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: guide.md?plain=1#L4 (missing line)",
+            "README.md:2: guide.md?plain=1#L3-L2 (missing line)",
+            "README.md:3: guide.md?plain=0#L1 (missing anchor)",
+        ])
+
     def test_rooted_links_and_external_scheme_case(self):
         self.write("GUIDE.MD", "# Welcome\n")
         self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"

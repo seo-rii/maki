@@ -21,7 +21,8 @@ and indented code blocks are not distinguished from list-item content.
 
 A fragment, in-page (`#anchor`) or on another Markdown file (`other.md#anchor`),
 must name exactly a heading slug as GitHub computes it, or an explicit
-`<a id="...">`/`<a name="...">` anchor of that document. Fragments on other
+`<a id="...">`/`<a name="...">` anchor of that document. In GitHub source view
+(`?plain=1`), line references address a source line or a range of lines. Fragments on other
 targets (source files, directories) and on omitted archive targets are not
 checked.
 
@@ -886,6 +887,7 @@ def broken_links(root):
         if inventory.exists() else {}
     )
     anchor_cache = {}
+    line_counts = {}
     candidates = candidate_files(root)
     published = {root}
     symlinks = {}
@@ -927,7 +929,7 @@ def broken_links(root):
         if not target or target.startswith("//") or URI_SCHEME.match(target):
             return None
         file_part, _, fragment = target.partition("#")
-        file_part = file_part.partition("?")[0]
+        file_part, _, query = file_part.partition("?")
         decoded = urllib.parse.unquote(file_part)
         if file_part.startswith("/"):
             target_path = root / decoded.lstrip("/")
@@ -939,13 +941,19 @@ def broken_links(root):
                 return None
             return target
         fragment = urllib.parse.unquote(fragment)
-        if (
-            fragment
-            and resolved.is_file()
-            and target_path.suffix.lower() == ".md"
-            and fragment not in anchors_of(resolved)
-        ):
-            return f"{target} (missing anchor)"
+        if fragment and resolved.is_file() and target_path.suffix.lower() == ".md":
+            span = re.fullmatch(r"L([1-9][0-9]*)(?:-L([1-9][0-9]*))?", fragment)
+            if span and ("plain", "1") in urllib.parse.parse_qsl(query):
+                if resolved not in line_counts:
+                    with resolved.open("rb") as source:
+                        line_counts[resolved] = sum(1 for _ in source)
+                count = line_counts[resolved]
+                first, last = span[1], span[2] or span[1]
+                if len(first) <= len(last) <= len(str(count)) and int(first) <= int(last) <= count:
+                    return None
+                return f"{target} (missing line)"
+            if fragment not in anchors_of(resolved):
+                return f"{target} (missing anchor)"
         return None
 
     broken = []
