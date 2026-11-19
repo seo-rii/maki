@@ -105,17 +105,27 @@ impl AbStore {
 
     /// Best valid copy, if any. `Err` only for hard I/O failures.
     pub fn load<T: AbRecord>(&self, backing: &dyn Backing) -> Result<Option<T>, FormatError> {
+        Ok(self.load_with_copy_count::<T>(backing)?.0)
+    }
+
+    /// Select the best record and count its valid copies in the same read.
+    pub(crate) fn load_with_copy_count<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+    ) -> Result<(Option<T>, usize), FormatError> {
         let a = self.read_side::<T>(backing, &self.a)?;
         let b = self.read_side::<T>(backing, &self.b)?;
         Ok(match (a, b) {
-            (Some(a), Some(b)) => Some(if a.generation() >= b.generation() {
-                a
-            } else {
-                b
-            }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+            (Some(a), Some(b)) => (
+                Some(if a.generation() >= b.generation() {
+                    a
+                } else {
+                    b
+                }),
+                2,
+            ),
+            (Some(record), None) | (None, Some(record)) => (Some(record), 1),
+            (None, None) => (None, 0),
         })
     }
 

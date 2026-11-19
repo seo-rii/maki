@@ -72,13 +72,17 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             Ok(_) => has_checkpoint_file = true,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) if matches!(e.kind(), ErrorKind::IsADirectory | ErrorKind::InvalidInput) => {
-                report.errors.push(format!("invalid checkpoint state file {path}: {e}"));
+                report
+                    .errors
+                    .push(format!("invalid checkpoint state file {path}: {e}"));
             }
             Err(e) => return Err(e.into()),
         }
     }
     if !has_checkpoint_file {
-        report.errors.push("no checkpoint state file is present".into());
+        report
+            .errors
+            .push("no checkpoint state file is present".into());
     }
 
     // Valid sizes follow from the geometry; longer copies are never read
@@ -220,8 +224,8 @@ fn check_discard_map(
         layout::shard_discard_b(shard),
     )
     .with_max_len(AllocationMap::encoded_len(units));
-    let sides = discard_ab.side_generations::<AllocationMap>(backing)?;
-    let Some(map) = discard_ab.load::<AllocationMap>(backing)? else {
+    let (record, copies) = discard_ab.load_with_copy_count::<AllocationMap>(backing)?;
+    let Some(map) = record else {
         report
             .errors
             .push(format!("shard {shard}: no valid discard map"));
@@ -234,7 +238,7 @@ fn check_discard_map(
         ));
         return Ok(false);
     }
-    if matches!(sides, (Some(_), None) | (None, Some(_))) {
+    if copies == 1 {
         report.warnings.push(format!(
             "shard {shard}: discard map has one valid copy; using fallback"
         ));
