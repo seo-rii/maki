@@ -140,6 +140,10 @@ fn main() -> ExitCode {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(config::default_path(&volume)));
     if verb == "verify" {
+        if let Err(error) = config::check_volume_name(&volume) {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
         // Workload gates use only the root-controlled config. An argument
         // cannot replace its filesystem pin or any stored attachment identity.
         if let Err(error) = config::check_abs_path("config", &config_path.to_string_lossy()) {
