@@ -65,7 +65,7 @@ implicit base standard when neither flag is set. Conflicting flags are
 rejected. These meanings follow the
 [AAELF32 header contract](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst#elf-header).
 
-For Debian `riscv64`, all artifacts must declare the LP64D (double-float)
+For Debian `riscv64` and `loong64`, all artifacts must declare the LP64D (double-float)
 calling convention in their ELF flags.
 
 Both shared libraries and PIE executables use ELF type `ET_DYN`. For the
