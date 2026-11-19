@@ -234,3 +234,34 @@ fn locking_requires_and_creates_a_file_in_the_rollback_namespace() {
     drop(lock);
     backing.try_lock("sub/lock").unwrap();
 }
+
+#[test]
+fn namespace_lookups_distinguish_files_from_missing_ancestors() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
+    backing.create_dir_all("dir").unwrap();
+    backing.open("dir/file", true).unwrap();
+    assert_eq!(
+        backing.list("dir/file").unwrap_err().kind(),
+        io::ErrorKind::NotADirectory
+    );
+    for path in ["dir/file/child", "dir/file/missing/child"] {
+        for error in [
+            backing.exists(path).unwrap_err(),
+            backing.list(path).unwrap_err(),
+            backing.open(path, false).err().unwrap(),
+            backing.open(path, true).err().unwrap(),
+            backing.remove(path).unwrap_err(),
+            backing.rename(path, "dir/target").unwrap_err(),
+            backing.create_dir_all(path).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{path}");
+        }
+    }
+    assert!(!backing.exists("dir/missing/child").unwrap());
+    assert_eq!(
+        backing.list("dir/missing/child").unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(backing.exists("dir/file").unwrap());
+}

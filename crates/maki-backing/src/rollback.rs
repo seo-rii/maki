@@ -549,10 +549,22 @@ impl State {
 
     fn directory(&self, name: &str) -> io::Result<()> {
         if name.is_empty() || self.entries.get(name) == Some(&Entry::Directory) {
-            Ok(())
-        } else {
-            Err(missing())
+            return Ok(());
         }
+        let mut path = name;
+        while !path.is_empty() {
+            match self.entries.get(path) {
+                Some(Entry::File(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        path.to_owned(),
+                    ))
+                }
+                Some(Entry::Directory) => break,
+                None => path = path::parent(path),
+            }
+        }
+        Err(missing())
     }
 
     fn open_file(&mut self, name: &str, create: bool) -> io::Result<u64> {
@@ -992,12 +1004,17 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        Ok(state.entries.contains_key(name))
+        match state.directory(path::parent(name)) {
+            Ok(()) => Ok(state.entries.contains_key(name)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
     fn remove(&self, name: &str) -> io::Result<()> {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
+        state.directory(path::parent(name))?;
         if state.entries.get(name) == Some(&Entry::Directory) {
             return Err(input("directory removal is unsupported"));
         }
@@ -1009,6 +1026,7 @@ impl Backing for RollbackBacking {
         validate_name(to, false)?;
         let mut state = self.state.lock();
         state.check()?;
+        state.directory(path::parent(from))?;
         state.directory(path::parent(to))?;
         let entry = state.entries.get(from).ok_or_else(missing)?.clone();
         if entry == Entry::Directory || state.entries.get(to) == Some(&Entry::Directory) {
@@ -1035,7 +1053,9 @@ impl Backing for RollbackBacking {
             }
             prefix.push_str(part);
             match state.entries.get(&prefix) {
-                Some(Entry::File(_)) => return Err(input("parent is a file")),
+                Some(Entry::File(_)) => {
+                    return Err(io::Error::new(io::ErrorKind::NotADirectory, prefix))
+                }
                 Some(Entry::Directory) => (),
                 None => {
                     if state.entries.len() >= MAX_ENTRIES {
