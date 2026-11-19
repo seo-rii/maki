@@ -159,9 +159,11 @@ class Agent:
     def startup(self):
         mount_guest()
         arguments = dict(part.split("=", 1) for part in pathlib.Path("/proc/cmdline").read_text().split()
-                         if part.startswith(("maki_token=", "maki_boot=")))
+                         if part.startswith(("maki_token=", "maki_boot=", "maki_ready_timeout=")))
         self.token, self.boot = arguments["maki_token"], int(arguments["maki_boot"])
         ensure(re.fullmatch("[0-9a-f]{32}", self.token) is not None and 0 <= self.boot <= 64, "boot identity")
+        ready_timeout = float(arguments.get("maki_ready_timeout", "90"))
+        ensure(1 <= ready_timeout <= 600, "invalid READY timeout")
         self.serial = os.open("/dev/ttyS0", os.O_RDWR | os.O_NOCTTY)
         tty.setraw(self.serial, when=termios.TCSANOW)
         ensure(len(pathlib.Path("/opt/maki/key").read_bytes()) == 32, "AES key must contain 32 bytes")
@@ -186,7 +188,7 @@ class Agent:
             self.daemon = subprocess.Popen(["nbdkit", "--foreground", "--threads", "4", "-U", "/run/maki/nbd.sock",
                                             "/opt/maki/libmaki_nbdkit.so", "config=" + str(config)],
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
-        until = time.monotonic() + 90
+        until = time.monotonic() + ready_timeout
         try:
             while True:
                 if self.daemon.poll() is not None:

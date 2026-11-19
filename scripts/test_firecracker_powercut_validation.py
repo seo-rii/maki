@@ -78,9 +78,10 @@ class HostContracts(unittest.TestCase):
 
     def test_every_boot_uses_same_data_image_with_explicit_flush_semantics(self):
         args = types.SimpleNamespace(kernel=self.path / "kernel", rootfs=self.path / "root",
-                                     data=self.path / "data", vcpus=2, memory_mib=512)
+                                     data=self.path / "data", vcpus=2, memory_mib=512, timeout=450)
         for boot in (0, 1):
             config = self.host.make_config(args, boot, "a" * 32)
+            self.assertIn("maki_ready_timeout=450", config["boot-source"]["boot_args"])
             root, data = config["drives"]
             self.assertTrue(root["is_read_only"])
             self.assertFalse(data["is_read_only"])

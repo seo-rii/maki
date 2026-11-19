@@ -106,7 +106,7 @@ def make_config(args, boot, token):
         "boot-source": {"kernel_image_path": str(args.kernel), "boot_args":
                         "console=ttyS0 root=/dev/vda ro rootfstype=ext4 reboot=k panic=1 "
                         "pci=off quiet loglevel=0 init=/opt/maki/firecracker-guest-agent.py "
-                        f"maki_token={token} maki_boot={boot}"},
+                        f"maki_token={token} maki_boot={boot} maki_ready_timeout={args.timeout}"},
         "drives": [
             {"drive_id": "rootfs", "path_on_host": str(args.rootfs), "is_root_device": True,
              "is_read_only": True, "cache_type": "Writeback", "io_engine": "Sync"},
