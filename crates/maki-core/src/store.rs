@@ -431,27 +431,27 @@ impl SlotStore {
                 layout::shard_alloc_b(shard_idx),
                 &geometry,
             );
-            let (side_a, side_b) = alloc_ab.side_generations::<AllocationMap>(backing.as_ref())?;
-            let (alloc, dirty_alloc, map_stored) =
-                match alloc_ab.load::<AllocationMap>(backing.as_ref())? {
-                    // Even a cataloged shard's valid copies may be cache-only
-                    // after sync failure and a plain restart (K-01). Defer
-                    // persistence until reservation or checkpoint, then
-                    // establish both copies before accepting a new record.
-                    Some(alloc) => (alloc, false, false),
-                    // A shard the catalog never committed may have died before
-                    // its (empty) map was stored: start it empty.
-                    None if adopted.contains(&shard_idx) => {
-                        (AllocationMap::new(geometry.units_per_shard()), true, false)
-                    }
-                    // SPEC §27: a cataloged shard with no valid copy refuses
-                    // attach rather than guess (offline repair territory).
-                    None => {
-                        return Err(CoreError::Corrupt(format!(
-                            "shard {shard_idx}: no valid allocation map copy"
-                        )))
-                    }
-                };
+            let (alloc, valid_copies) =
+                alloc_ab.load_with_copy_count::<AllocationMap>(backing.as_ref())?;
+            let (alloc, dirty_alloc, map_stored) = match alloc {
+                // Even a cataloged shard's valid copies may be cache-only
+                // after sync failure and a plain restart (K-01). Defer
+                // persistence until reservation or checkpoint, then
+                // establish both copies before accepting a new record.
+                Some(alloc) => (alloc, false, false),
+                // A shard the catalog never committed may have died before
+                // its (empty) map was stored: start it empty.
+                None if adopted.contains(&shard_idx) => {
+                    (AllocationMap::new(geometry.units_per_shard()), true, false)
+                }
+                // SPEC §27: a cataloged shard with no valid copy refuses
+                // attach rather than guess (offline repair territory).
+                None => {
+                    return Err(CoreError::Corrupt(format!(
+                        "shard {shard_idx}: no valid allocation map copy"
+                    )))
+                }
+            };
             if alloc.units() != geometry.units_per_shard() {
                 return Err(CoreError::Corrupt(format!(
                     "shard {shard_idx}: allocation map size mismatch"
@@ -575,7 +575,7 @@ impl SlotStore {
             // the shard's headers and repair the map in memory (persisted
             // by the next allocation persist). Healthy shards (both copies
             // valid) skip this.
-            if side_a.is_none() || side_b.is_none() {
+            if valid_copies < 2 {
                 let found = probe_shard(&geometry, &shard, shard_idx, in_device, progress)?;
                 if !found.is_empty() {
                     tracing::warn!(
