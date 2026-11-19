@@ -54,6 +54,7 @@ PT_DYNAMIC, PT_INTERP = 2, 3
 PT_MIPS_ABIFLAGS = 0x70000003
 DT_NULL, DT_FLAGS_1 = 0, 0x6FFFFFFB
 DF_1_PIE = 0x08000000
+EF_PPC64_ABI = 0x3
 EF_RISCV_FLOAT_ABI_MASK, EF_RISCV_FLOAT_ABI_DOUBLE = 0x6, 0x4
 EF_LARCH_ABI_MODIFIER_MASK, EF_LARCH_ABI_DOUBLE_FLOAT = 0x7, 0x3
 EF_ARM_EABIMASK, EF_ARM_EABI_VER5 = 0xFF000000, 0x05000000
@@ -211,6 +212,8 @@ def validate_release_files(args):
             fail(f"{source_name} must use the double-float LP64D ABI for riscv64")
         if args.architecture == "loong64" and e_flags & EF_LARCH_ABI_MODIFIER_MASK != EF_LARCH_ABI_DOUBLE_FLOAT:
             fail(f"{source_name} must use the double-float LP64D ABI for loong64")
+        if args.architecture == "ppc64el" and e_flags & EF_PPC64_ABI not in (0, 2):
+            fail(f"{source_name} must be ABI-neutral or use ELFv2 for ppc64el")
         if args.architecture in ("armel", "armhf"):
             # Both Debian ports use ARM EABI5, but their floating-point
             # procedure-call standards differ despite identical ELF identity.

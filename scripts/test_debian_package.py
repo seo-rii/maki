@@ -397,6 +397,21 @@ class DebianPackageTests(unittest.TestCase):
                     self.assertIn(name, error)
                     self.assertIn("LP64D", error)
 
+    def test_ppc64el_rejects_incompatible_abi_markers_on_every_artifact(self):
+        # 0 is ABI-neutral; 2 denotes ELFv2. Higher flag bits are independent.
+        for flags in (0, 2, 0x12):
+            self.write_release_files(0x15, e_flags=flags)
+            self.build(f"ppc64el-{flags}.deb", architecture="ppc64el")
+        for name in RELEASE_NAMES:
+            for flags in (1, 3):
+                with self.subTest(artifact=name, flags=flags):
+                    self.write_release_files(0x15, e_flags=2)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(0x15, kind, e_flags=flags))
+                    error = self.build_failure("bad-ppc.deb", architecture="ppc64el")
+                    self.assertIn(name, error)
+                    self.assertIn("ELFv2", error)
+
     def test_loong64_requires_lp64d_for_every_artifact(self):
         machine = 0x102
         self.write_release_files(machine, e_flags=0x43)

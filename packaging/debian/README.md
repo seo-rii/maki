@@ -71,6 +71,9 @@ rejected. These meanings follow the
 For Debian `riscv64` and `loong64`, all artifacts must declare the LP64D (double-float)
 calling convention in their ELF flags.
 
+For Debian `ppc64el`, a PowerPC64 ABI marker must be ELFv2 or unspecified
+(ABI-neutral). The builder rejects ELFv1 and the reserved ABI value.
+
 For `mips64el`, the builder reads the version-zero MIPS ABI flags program
 header. It accepts the double-precision hardware calling convention and
 ABI-independent code. Missing flags or incompatible conventions fail validation.
