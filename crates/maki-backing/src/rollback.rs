@@ -897,12 +897,13 @@ impl BackingFile for CowFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
-        let current_len = state.files.get(&self.id).ok_or_else(missing)?.len;
-        if len == current_len {
+        let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
+        if len >= node.len {
+            node.len = len;
             return Ok(());
         }
         let tail = state.page_ref(self.id, len / PAGE)?;
-        if len < current_len && !len.is_multiple_of(PAGE) && tail.is_some() {
+        if !len.is_multiple_of(PAGE) && tail.is_some() {
             let mut bytes = state.page(tail)?;
             bytes[(len % PAGE) as usize..].fill(0);
             state.write_page(self.id, len / PAGE, &bytes)?;
@@ -1143,7 +1144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retaining_file_length_keeps_the_arena_slot_index() {
+    fn retaining_or_extending_file_length_keeps_the_arena_slot_index() {
         let root = tempfile::tempdir().unwrap();
         let witness = tempfile::tempdir_in("/dev/shm").unwrap();
         let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
@@ -1152,6 +1153,11 @@ mod tests {
         assert!(backing.state.lock().used_slots.is_some());
         file.set_len(file.len().unwrap()).unwrap();
         assert!(backing.state.lock().used_slots.is_some());
+        file.set_len(PAGE + 1).unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+        let mut bytes = [1; 2];
+        file.read_at(PAGE - 1, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0]);
     }
 
     #[test]
