@@ -116,7 +116,7 @@ def inspect_loader(path, elf_class, endian, architecture):
         if len(header) < (64 if is_64 else 52):
             fail(f"{path.name} has a truncated ELF header")
         entry_point = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header, 24)[0]
-        interpreter, pie = False, False
+        interpreter, pie = None, False
         mips_abi_seen = False
         program_offset = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header,
                                             32 if is_64 else 28)[0]
@@ -136,9 +136,16 @@ def inspect_loader(path, elf_class, endian, architecture):
             if len(program) != program_size:
                 fail(f"{path.name} has a truncated ELF program-header entry")
             fields = struct.unpack(program_format, program)
-            if fields[0] == PT_INTERP:
-                interpreter = True
             offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
+            if fields[0] == PT_INTERP:
+                # Linux binfmt_elf caps this record at PATH_MAX including NUL.
+                if interpreter is not None or not 2 <= size <= 4096 or offset + size > file_size:
+                    fail(f"{path.name} has an invalid PT_INTERP segment")
+                handle.seek(offset)
+                raw = handle.read(size)
+                if len(raw) != size or not raw.startswith(b"/") or not raw.endswith(b"\0") or b"\0" in raw[:-1]:
+                    fail(f"{path.name} PT_INTERP must contain one complete absolute interpreter path")
+                interpreter = os.fsdecode(raw[:-1])
             if fields[0] == PT_MIPS_ABIFLAGS and architecture == "mips64el":
                 # Elf_MIPS_ABIFlags_v0 is a 24-byte loader record, also
                 # available in stripped binaries. Byte 7 holds the FP ABI.
@@ -197,6 +204,7 @@ def validate_release_files(args):
             "identity to ELF_ARCHITECTURES before packaging for it"
         )
     machine, elf_class, endian = expected
+    interpreters = {}
     for source_name in RELEASE_FILES:
         path = args.release_dir / source_name
         if not path.is_file() or path.is_symlink():
@@ -237,6 +245,47 @@ def validate_release_files(args):
             fail(f"{source_name} must be an ELF executable (ET_EXEC or PIE), found type {e_type}")
         else:
             validate_executable(path, e_type, entry_point, interpreter, pie)
+            if interpreter:
+                interpreters.setdefault(interpreter, source_name)
+    return interpreters
+
+
+def interpreter_dependencies(interpreters, architecture):
+    """PT_INTERP has no DT_NEEDED entry for dpkg-shlibdeps to resolve."""
+    if not interpreters:
+        return set()
+    owners = {}
+    for runtime in ("libc6", "musl"):
+        listing = subprocess.run(["dpkg-query", "-L", f"{runtime}:{architecture}"],
+                                 capture_output=True, text=True)
+        if listing.returncode == 0:
+            for line in listing.stdout.splitlines():
+                path = pathlib.Path(line)
+                if path.is_absolute() and re.fullmatch(r"ld[\w.-]*\.so(?:\.\d+)*", path.name):
+                    owners[path] = runtime
+
+    # Different distro releases record opposite sides of the merged-/usr
+    # symlinks. Only translate the distribution's top-level library dirs:
+    # resolving arbitrary aliases would accept a build-host-only symlink.
+    merged = {}
+    for directory in ("/lib", "/lib32", "/lib64", "/libx32"):
+        old = pathlib.Path(directory)
+        new = pathlib.Path("/usr" + directory)
+        if old.is_symlink() and old.resolve() == new:
+            merged[old] = new
+            merged[new] = old
+
+    dependencies = set()
+    for spelling, source in interpreters.items():
+        path = pathlib.Path(spelling)
+        owner = owners.get(path)
+        for prefix, alias in merged.items():
+            if owner is None and path.is_relative_to(prefix):
+                owner = owners.get(alias / path.relative_to(prefix))
+        if owner is None or not path.is_file() or not os.access(path, os.X_OK):
+            fail(f"{source} interpreter {spelling!r} is not a packaged runtime loader for {architecture}")
+        dependencies.add(owner)
+    return dependencies
 
 
 def shared_library_dependencies(package_root):
@@ -295,7 +344,7 @@ def validate(args):
         fail(version.stderr.strip() or "invalid Debian version")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.architecture):
         fail(f"invalid Debian architecture: {args.architecture}")
-    validate_release_files(args)
+    interpreters = validate_release_files(args)
     if args.shlibdeps and shutil.which("dpkg-shlibdeps") is None:
         fail(
             "computing native library dependencies requires dpkg-shlibdeps "
@@ -314,10 +363,11 @@ def validate(args):
         fail("SOURCE_DATE_EPOCH must be an integer")
     if epoch < 0:
         fail("SOURCE_DATE_EPOCH must not be negative")
-    return epoch
+    runtimes = interpreter_dependencies(interpreters, args.architecture) if args.shlibdeps else set()
+    return epoch, runtimes
 
 
-def create_tree(package_root, args):
+def create_tree(package_root, args, runtimes):
     for source_name, installed_name in RELEASE_FILES.items():
         install_file(
             args.release_dir / source_name,
@@ -349,6 +399,9 @@ def create_tree(package_root, args):
         for entry in shared_library_dependencies(package_root):
             if entry not in depends:
                 depends.append(entry)
+        for runtime in sorted(runtimes):
+            if not any(entry.split()[0] == runtime for entry in depends):
+                depends.append(runtime)
     control = f"""Package: maki
 Version: {args.version}
 Section: admin
@@ -445,13 +498,13 @@ def normalize_directory_permissions(root):
 
 def main():
     args = parse_args()
-    epoch = validate(args)
+    epoch, runtimes = validate(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="maki-deb-") as temporary:
         package_root = pathlib.Path(temporary) / "root"
         package_root.mkdir(mode=0o755)
         (package_root / "DEBIAN").mkdir(mode=0o755)
-        create_tree(package_root, args)
+        create_tree(package_root, args, runtimes)
         normalize_directory_permissions(package_root)
         normalize_timestamps(package_root, epoch)
         with tempfile.TemporaryDirectory(prefix=".maki-deb-", dir=args.output.parent) as staging:

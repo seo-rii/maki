@@ -92,6 +92,13 @@ checks use program headers and work without section headers; they do not
 load or execute the artifact. PIE remains allowed for the CLI binaries.
 This checks artifact kind, not the plugin API or runtime compatibility.
 
+For dynamically linked programs, the default native dependency scan also
+checks the actual `PT_INTERP` path against the target architecture's installed
+Debian glibc or musl package and adds its owner to `Depends`. A private loader
+path can work on a build host and still prevent the packaged executable from
+starting elsewhere. Standard merged-`/usr` aliases are recognized. Static
+executables, including static PIE, have no interpreter dependency.
+
 The builder then computes the native library dependencies of the binaries
 with `dpkg-shlibdeps` (package `dpkg-dev`) and appends them to `Depends`, for
 example `libc6 (>= 2.39), libgcc-s1 (>= 4.2)`. The scan is on by default and

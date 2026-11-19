@@ -551,6 +551,38 @@ class DebianPackageTests(unittest.TestCase):
                     (self.release / name).write_bytes(elf_with_segments(EM_X86_64, **markers))
                 self.build("pie-cli.deb")
 
+    def test_interpreter_segment_must_hold_one_complete_absolute_path(self):
+        good = b"/lib64/ld-linux-x86-64.so.2\0"
+        for records in ([good, good], [b"ld.so\0"], [good[:-1]], [good + b"extra\0"], [b""]):
+            with self.subTest(records=records):
+                (self.release / "maki").write_bytes(elf_with_segments(
+                    EM_X86_64, extra_segments=[(3, record) for record in records]))
+                self.assertIn("PT_INTERP", self.build_failure("bad-interpreter.deb"))
+
+    @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
+                         "native Debian build tools required")
+    def test_native_package_requires_the_declared_elf_interpreter_on_the_target(self):
+        architecture = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
+        source = self.work / "fixture.c"
+        source.write_text("int main(void) { return 0; }\n")
+        for name in RELEASE_NAMES:
+            options = ["-shared", "-fPIC"] if name.endswith(".so") else []
+            subprocess.run(["cc", *options, str(source), "-o", self.release / name], check=True)
+        good, command = self.builder_command("native.deb", "1", architecture)
+        subprocess.run(command, check=True, capture_output=True)
+        self.assertTrue(good.is_file())
+
+        private = self.work / "ld-private.so.2"
+        for installed in (False, True):
+            with self.subTest(private_loader_exists=installed):
+                if installed:
+                    private.symlink_to("/bin/true")
+                subprocess.run(["cc", str(source), f"-Wl,--dynamic-linker,{private}",
+                                "-o", self.release / "maki-check"], check=True)
+                error = self.build_failure("build-host-only.deb", architecture=architecture, opt_out=False)
+                self.assertIn("maki-check", error)
+                self.assertIn("interpreter", error)
+
     @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
                          "native C compiler and dpkg-shlibdeps required")
     def test_native_shared_library_cli_is_rejected_before_packaging(self):
