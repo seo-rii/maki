@@ -59,8 +59,10 @@ class CycleBoundaryContracts(unittest.TestCase):
 
     def cli_error(self, argv):
         # Run the original argparse and validation; stop before any VM lookup.
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(
-                pathlib.Path, "resolve", side_effect=ReachedFilesystemSetup):
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(pathlib.Path, "read_text", return_value="12345678-1234-1234-1234-123456789abc"), \
+                mock.patch.object(pathlib.Path, "resolve", side_effect=ReachedFilesystemSetup), \
+                contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
             try:
                 self.guest.main()
             except ReachedFilesystemSetup:

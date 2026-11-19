@@ -148,6 +148,43 @@ class OracleTests(unittest.TestCase):
                 target.start()
         self.assertAlmostEqual(target.state.call_args.kwargs["timeout"], 29.9)
 
+    def test_oom_observation_uses_remaining_budget_and_retains_first_exit(self):
+        target = campaign.Target.__new__(campaign.Target)
+        stopped = {"Running": False, "OOMKilled": True, "ExitCode": 137}
+        now = 0.0
+
+        def state(timeout):
+            nonlocal now
+            now += 2
+            return {"Running": True} if now == 2 else stopped
+
+        def sleep(seconds):
+            nonlocal now
+            now += seconds
+
+        target.state = mock.Mock(side_effect=state)
+        with mock.patch.object(campaign.time, "monotonic", side_effect=lambda: now), \
+                mock.patch.object(campaign.time, "sleep", side_effect=sleep):
+            self.assertIs(target.wait_for_oom(), stopped)
+        self.assertEqual(target.state.call_count, 2)
+        self.assertEqual(target.state.call_args_list[0].kwargs["timeout"], 10)
+        self.assertAlmostEqual(target.state.call_args_list[1].kwargs["timeout"], 7.9)
+
+    def test_oom_first_observed_after_the_deadline_fails(self):
+        target = campaign.Target.__new__(campaign.Target)
+        now = 0
+
+        def delayed_state(timeout=45):
+            nonlocal now
+            now += 30
+            return {"Running": False, "OOMKilled": True, "ExitCode": 137}
+
+        target.state = mock.Mock(side_effect=delayed_state)
+        with mock.patch.object(campaign.time, "monotonic", side_effect=lambda: now), \
+                self.assertRaisesRegex(TimeoutError, "OOM"):
+            target.wait_for_oom()
+        target.state.assert_called_once_with(timeout=10)
+
     def test_cleanup_tolerates_a_concurrent_exit_and_preserves_a_live_container(self):
         target = campaign.Target.__new__(campaign.Target)
         target.directory, target.serial, target.notify = self.ledger.parent, 1, None

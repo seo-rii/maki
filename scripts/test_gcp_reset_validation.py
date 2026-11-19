@@ -1,6 +1,7 @@
 """Whole-GCE-reset host oracle and native guest durability contracts."""
 import argparse
 import importlib.util
+import io
 import json
 import pathlib
 import signal
@@ -682,6 +683,24 @@ class GuestContracts(unittest.TestCase):
     def setUp(self):
         self.guest = load("gcp_reset_guest", "gcp-reset-guest.py")
         self.host = load("gcp_reset_host_guest_test", "gcp-reset-validation.py")
+
+    def test_missing_config_emits_an_identified_error_before_ready(self):
+        token = "a" * 32
+        boot_id = "12345678-1234-1234-1234-123456789abc"
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "missing-config.toml"
+            argv = ["guest", "--token", token, "--cycle", "1", "--device-name", "data",
+                    "--config", str(config)]
+            output = io.BytesIO()
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(pathlib.Path, "read_text", return_value=boot_id), \
+                    mock.patch.object(sys, "stdout", buffer=output), \
+                    self.assertRaises(FileNotFoundError):
+                self.guest.main()
+        [line] = output.getvalue().splitlines()
+        event = self.host.decode_frame(line, token, 1)
+        self.assertEqual((event["boot_id"], event["event"]), (boot_id, "error"))
+        self.assertIn(config.name, event["message"])
 
     def test_failed_flush_or_any_individual_fua_does_not_ack(self):
         for mode in ("flush", "fua"):

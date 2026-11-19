@@ -102,7 +102,7 @@ def fixture_units(volume, directory, helper):
              if line.startswith("ExecStopPost=")]
     if hooks != ["ExecStopPost=/usr/bin/maki-attach recover-failed-start --volume %i"]:
         raise ValueError("unexpected failed-start hook contract")
-    attach += hooks[0].replace("/usr/bin/maki-attach", unit_argument(helper)).replace("%i", volume) + "\n"
+    attach += hooks[0].replace("%i", volume).replace("/usr/bin/maki-attach", unit_argument(helper)) + "\n"
     recovery = packaged_unit_section("maki-recover@.service", volume)
     recovery += ("JobTimeoutSec=12\n\n[Service]\nType=oneshot\nTimeoutStartSec=3\n"
                  f"ExecStart={actor_command} cleanup-recover\n")

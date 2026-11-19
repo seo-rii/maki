@@ -332,19 +332,8 @@ def main():
     # A verify-only boot reads the preceding write generation; boot 64 reads 63.
     mode_for_cycle(args.cycle - 1 if args.verify_only else args.cycle)
     ensure(1 <= args.ready_timeout <= 900, "invalid READY timeout")
-    config = pathlib.Path(args.config).resolve(strict=True)
-    plugin = pathlib.Path(args.plugin).resolve(strict=True)
-    ensure(config.is_file() and plugin.is_file(), "config and plugin must be regular files")
-    mount = pathlib.Path("/mnt/maki-data").resolve(strict=True)
-    ensure(config.is_relative_to(mount), "qualification config must be on the persistent data mount")
-    provider, backing = configured_backing(config)
-    args.config = str(config)
-    fs_uuid = validate_disk(mount, config, backing, args.device_name)
-    witness = shutdown_witness(mount / "graceful-stop.jsonl")
     boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     ensure(BOOT_ID.fullmatch(boot_id) is not None, "invalid boot identity")
-    os.umask(0o077)
-    runtime = pathlib.Path(tempfile.mkdtemp(prefix="maki-gcp-reset-", dir="/run"))
     child = log = client = None
 
     def emit(event, **fields):
@@ -356,6 +345,17 @@ def main():
         sys.stdout.buffer.flush()
 
     try:
+        config = pathlib.Path(args.config).resolve(strict=True)
+        plugin = pathlib.Path(args.plugin).resolve(strict=True)
+        ensure(config.is_file() and plugin.is_file(), "config and plugin must be regular files")
+        mount = pathlib.Path("/mnt/maki-data").resolve(strict=True)
+        ensure(config.is_relative_to(mount), "qualification config must be on the persistent data mount")
+        provider, backing = configured_backing(config)
+        args.config = str(config)
+        fs_uuid = validate_disk(mount, config, backing, args.device_name)
+        witness = shutdown_witness(mount / "graceful-stop.jsonl")
+        os.umask(0o077)
+        runtime = pathlib.Path(tempfile.mkdtemp(prefix="maki-gcp-reset-", dir="/run"))
         child, log, socket_path = run_nbdkit(args, runtime)
         client = Nbd(socket_path)
         features = capabilities(client, args.profile)
