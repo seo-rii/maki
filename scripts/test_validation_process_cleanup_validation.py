@@ -94,6 +94,24 @@ class ProcessCleanupTests(unittest.TestCase):
                 self.assertEqual(len(diagnostics), 8192)
                 self.assertTrue(diagnostics.endswith(b"[stderr truncated]\n"))
 
+    def test_diagnostics_capture_high_numbered_pipe(self):
+        import fcntl
+        import resource
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
+            self.skipTest("needs a pipe descriptor above the select() limit")
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as original, os.fdopen(write_fd, "wb") as writer:
+            high_fd = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 1024)
+            with os.fdopen(high_fd, "rb") as pipe, tempfile.TemporaryFile() as log:
+                writer.write(b"campaign diagnostics")
+                writer.close()
+                module, _ = self.runners["gcp"]
+                module.DiagnosticLog(pipe, log, 8192).finish()
+                log.seek(0)
+                self.assertEqual(log.read(), b"campaign diagnostics")
+
     def test_bug155_close_terminates_descendant_after_early_leader_exit(self):
         for name in self.runners:
             with self.subTest(runner=name):

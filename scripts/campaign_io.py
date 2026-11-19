@@ -3,7 +3,7 @@
 import json
 import os
 from pathlib import Path
-import select
+import selectors
 import tempfile
 import threading
 
@@ -42,25 +42,27 @@ class DiagnosticLog:
         remaining = self.limit
         marker = b"\n[stderr truncated]\n"
         try:
-            while True:
-                stopping = self.stopped.is_set()
-                if not select.select([self.pipe], [], [], 0 if stopping else 0.1)[0]:
-                    if stopping:
+            with selectors.DefaultSelector() as readable:
+                readable.register(self.pipe, selectors.EVENT_READ)
+                while True:
+                    stopping = self.stopped.is_set()
+                    if not readable.select(0 if stopping else 0.1):
+                        if stopping:
+                            break
+                        continue
+                    data = os.read(self.pipe.fileno(), 65536)
+                    if not data:
                         break
-                    continue
-                data = os.read(self.pipe.fileno(), 65536)
-                if not data:
-                    break
-                if remaining >= 0:
-                    self.log.write(data[:remaining])
-                    remaining -= len(data)
-                    if remaining < 0:
-                        self.log.seek(self.limit - len(marker))
-                        self.log.write(marker)
-                if stopping and remaining < 0:
-                    break
+                    if remaining >= 0:
+                        self.log.write(data[:remaining])
+                        remaining -= len(data)
+                        if remaining < 0:
+                            self.log.seek(self.limit - len(marker))
+                            self.log.write(marker)
+                    if stopping and remaining < 0:
+                        break
             self.log.flush()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.error = error
         finally:
             self.pipe.close()
