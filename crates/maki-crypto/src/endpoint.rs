@@ -12,7 +12,7 @@
 //! - between passes: full-jitter backoff; retries into an endpoint are gated
 //!   by that endpoint's own retry budget, whose minimum probe rate keeps a
 //!   recovery path alive even at zero budget (§32);
-//! - `max_attempts: None` = the `stall` availability policy (§35);
+//! - `stall` retries without an attempt limit or deadline (§35);
 //!   `max_operation_time` is an absolute wall-clock deadline for
 //!   `bounded-error`: it bounds backoff *and* cancels an in-flight RPC
 //!   (review M-010);
@@ -53,8 +53,8 @@ pub struct DispatchConfig {
     pub global_max_inflight_bytes: u64,
     pub per_endpoint_max_inflight: u32,
     pub per_endpoint_max_bytes: u64,
-    /// `None` = stall (retry forever, bounded memory and frequency);
-    /// `Some(n)` = bounded-error after n passes (SPEC §35).
+    /// Optional pass limit for callers that explicitly bound attempts. The
+    /// daemon uses the operation deadline for its bounded-error policy.
     pub max_attempts: Option<u32>,
     /// Absolute wall-clock budget for one operation (SPEC §35
     /// `bounded-error`): backoff never sleeps past it and an in-flight RPC
@@ -937,7 +937,7 @@ impl EndpointSet {
                 "request exceeds global or endpoint admission capacity".into(),
             ));
         }
-        let mut calls_made = 0u32;
+        let mut attempted = false;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
         // The previous actual RPC survives retry-pass boundaries. A newly
@@ -976,7 +976,7 @@ impl EndpointSet {
             let mut excluded = contract_failed.clone();
             loop {
                 let admission = match self
-                    .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
+                    .admit_endpoint(&excluded, bytes, deadline, !attempted)
                     .await
                 {
                     Ok(Some(admission)) => admission,
@@ -993,7 +993,7 @@ impl EndpointSet {
                     continue;
                 };
                 excluded.push(endpoint.clone());
-                if calls_made > 0 {
+                if attempted {
                     // Another attempt. A request that may already have
                     // reached a provider is never re-sent unless retry-safe;
                     // one every earlier attempt proved unsent may go out.
@@ -1028,7 +1028,7 @@ impl EndpointSet {
                     tried.push(endpoint.clone());
                 }
                 last_endpoint = Some(endpoint.clone());
-                calls_made += 1;
+                attempted = true;
                 match self
                     .call_with_deadline(&endpoint, context, &request, deadline, caps)
                     .await
@@ -1152,7 +1152,7 @@ impl EndpointSet {
                 delay = delay.min(dl.saturating_sub(self.clock.now()));
             }
             self.clock.sleep(delay).await;
-            pass += 1;
+            pass = pass.saturating_add(1);
         }
     }
 }

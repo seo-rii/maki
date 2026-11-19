@@ -935,25 +935,15 @@ async fn dispatch_endpoint_set(
     let budget = &config.crypto.retry_budget;
     let breaker = &config.crypto.circuit_breaker;
     let limits = &config.limits;
-    let (max_attempts, max_operation_time) = match config.crypto.availability_policy {
-        maki_format::config::AvailabilityPolicy::Stall => (None, None),
-        maki_format::config::AvailabilityPolicy::BoundedError => {
-            // The absolute deadline is the contract (SPEC 35); the pass
-            // bound is a belt-and-braces cap derived from it.
-            let op_time = config
+    let max_operation_time = match config.crypto.availability_policy {
+        maki_format::config::AvailabilityPolicy::Stall => None,
+        maki_format::config::AvailabilityPolicy::BoundedError => Some(
+            config
                 .crypto
                 .max_operation_time
                 .map(|d| d.0)
-                .unwrap_or(std::time::Duration::from_secs(30));
-            let initial = retry
-                .initial_delay
-                .0
-                .max(std::time::Duration::from_millis(1));
-            (
-                Some((op_time.as_millis() / initial.as_millis()).clamp(1, 1000) as u32),
-                Some(op_time),
-            )
-        }
+                .unwrap_or(std::time::Duration::from_secs(30)),
+        ),
     };
     let dispatch = DispatchConfig {
         retry: maki_crypto::retry::RetryPolicy {
@@ -976,7 +966,7 @@ async fn dispatch_endpoint_set(
         global_max_inflight_bytes: limits.max_crypto_inflight_bytes.0,
         per_endpoint_max_inflight: limits.max_inflight_per_endpoint,
         per_endpoint_max_bytes: limits.max_inflight_bytes_per_endpoint.0,
-        max_attempts,
+        max_attempts: None,
         max_operation_time,
         retry_safe: config.crypto.capabilities.retry_safe,
         validation_interval: breaker.open_initial.0,

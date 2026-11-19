@@ -20,7 +20,7 @@ fn attach_plan_prints_ordered_steps_without_executing() {
     assert!(text.contains("# attach volume v1"), "{text}");
     assert!(text.contains("modprobe nbd"), "{text}");
     assert!(
-        text.contains("nbd-client -unix /run/maki/v1/nbd.sock nbd<auto>"),
+        text.contains("nbd-client -unix /run/maki/v1/nbd.sock 'nbd<auto>'"),
         "{text}"
     );
     assert!(text.contains("/srv/v1"), "{text}");
@@ -372,4 +372,44 @@ fn plan_reads_a_config_with_a_non_utf8_filename() {
         .output()
         .unwrap();
     assert_eq!(invalid_name.status.code(), Some(2));
+}
+
+#[test]
+fn plans_preserve_command_arguments_with_spaces_and_apostrophes() {
+    let mountpoint = "/srv/DB one's";
+    for verb in ["attach", "detach", "grow"] {
+        let mut args = vec![
+            verb,
+            "--volume",
+            "audit",
+            "--nbd-device",
+            "/dev/nbd1",
+            "--socket",
+            "/run/DB socket",
+            "--mountpoint",
+            mountpoint,
+            "--plan",
+        ];
+        if verb == "grow" {
+            args.extend(["--size-bytes", "4096"]);
+        }
+        let out = run(&args);
+        assert!(out.status.success(), "{:?}", out.stderr);
+        let plan = String::from_utf8(out.stdout).unwrap();
+        let quoted_mount = r"'/srv/DB one'\''s'";
+        match verb {
+            "attach" => {
+                assert!(plan.contains("nbd-client -unix '/run/DB socket' nbd1 -b 4096 -identifier '<generated-connection-uuid>'"), "{plan}");
+                assert!(
+                    plan.contains(&format!("/dev/vg_maki_audit/data {quoted_mount}")),
+                    "{plan}"
+                );
+            }
+            "detach" => assert!(plan.contains(&format!("umount {quoted_mount}")), "{plan}"),
+            _ => assert!(
+                plan.contains(&format!("xfs_growfs {quoted_mount}")),
+                "{plan}"
+            ),
+        }
+    }
 }

@@ -118,9 +118,19 @@ impl AttachConfig {
                 "nbd_socket must end with a socket filename".into(),
             ));
         }
+        #[cfg(target_os = "linux")]
+        check_mountpoint_name_lengths(&request.mountpoint)?;
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
         // the VG and LV with a hyphen and doubles every hyphen in either name.
         let vg = &request.vg_name;
+        #[cfg(target_os = "linux")]
+        if std::fs::metadata(std::path::Path::new("/dev").join(vg))
+            .is_ok_and(|entry| !entry.is_dir())
+        {
+            return Err(ConfigError::Invalid(
+                "vg_name conflicts with a non-directory entry under /dev".into(),
+            ));
+        }
         let lv = &request.lv_name;
         let hyphens = vg.bytes().chain(lv.bytes()).filter(|&b| b == b'-').count();
         if vg.len() + lv.len() + 1 + hyphens > 127 {
@@ -290,6 +300,41 @@ pub fn check_argument(name: &str, value: &str) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(format!(
             "{name} contains control characters"
         )));
+    }
+    Ok(())
+}
+
+/// Check each component against the filesystem that will contain it. When
+/// a directory has not been created yet, inherit its parent's known limit.
+#[cfg(target_os = "linux")]
+fn check_mountpoint_name_lengths(mountpoint: &str) -> Result<(), ConfigError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    let mut parent = PathBuf::from("/");
+    let mut limit = None;
+    for name in Path::new(mountpoint).components().skip(1) {
+        let directory = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| ConfigError::Invalid("invalid mountpoint".into()))?;
+        // SAFETY: directory is a valid, NUL-terminated path for this call.
+        let result = unsafe {
+            // A -1 result with errno unchanged means an indeterminate limit.
+            *libc::__errno_location() = 0;
+            libc::pathconf(directory.as_ptr(), libc::_PC_NAME_MAX)
+        };
+        if let Ok(current) = usize::try_from(result) {
+            limit = Some(current);
+        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            // Some filesystems do not specify a fixed maximum.
+            limit = None;
+        }
+        if limit.is_some_and(|max| name.as_os_str().as_bytes().len() > max) {
+            return Err(ConfigError::Invalid(
+                "mountpoint component exceeds the filesystem name length limit".into(),
+            ));
+        }
+        parent.push(name);
     }
     Ok(())
 }

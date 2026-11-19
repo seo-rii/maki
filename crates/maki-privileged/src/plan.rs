@@ -174,6 +174,19 @@ impl PlannedStep {
     }
 }
 
+/// Render one argument in command-shaped plan output, preserving simple paths.
+fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b))
+    {
+        word.into()
+    } else {
+        format!("'{}'", word.replace(char::from(39), "'\\''")).into()
+    }
+}
+
 impl fmt::Display for PlannedStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -184,11 +197,12 @@ impl fmt::Display for PlannedStep {
                 block_size,
             } => write!(
                 f,
-                "nbd-client -unix {socket} {} -b {block_size}",
-                device.strip_prefix("/dev/").unwrap_or(device)
+                "nbd-client -unix {} {} -b {block_size} -identifier '<generated-connection-uuid>'",
+                shell_word(socket),
+                shell_word(device.strip_prefix("/dev/").unwrap_or(device))
             ),
             PlannedStep::SetBlockSize { device, block_size } => {
-                write!(f, "blockdev --setbsz {block_size} {device}")
+                write!(f, "blockdev --setbsz {block_size} {}", shell_word(device))
             }
             PlannedStep::LvmActivate { vg_name } => write!(f,
                 "preflight all PVs of {vg_name}; activate by verified VG UUID with verified devices and complete mode"),
@@ -199,7 +213,7 @@ impl fmt::Display for PlannedStep {
                 fs_uuid.as_deref().unwrap_or("unpinned")
             ),
             PlannedStep::MountXfs { device, mountpoint } => {
-                write!(f, "mount -t xfs -o {MOUNT_OPTIONS} {device} {mountpoint}")
+                write!(f, "mount -t xfs -o {MOUNT_OPTIONS} {} {}", shell_word(device), shell_word(mountpoint))
             }
             PlannedStep::VerifyMountDevice {
                 mountpoint,
@@ -225,11 +239,11 @@ impl fmt::Display for PlannedStep {
                 "verify mount identity at {mountpoint} (volume {volume_uuid}, fs uuid {}, nbd {nbd_device})",
                 fs_uuid.as_deref().unwrap_or("unpinned")
             ),
-            PlannedStep::Umount { mountpoint } => write!(f, "umount {mountpoint}"),
+            PlannedStep::Umount { mountpoint } => write!(f, "umount {}", shell_word(mountpoint)),
             PlannedStep::NbdDisconnect { device } => write!(
                 f,
                 "nbd-client -d {}",
-                device.strip_prefix("/dev/").unwrap_or(device)
+                shell_word(device.strip_prefix("/dev/").unwrap_or(device))
             ),
             PlannedStep::LvExtend {
                 vg_name,
@@ -237,7 +251,7 @@ impl fmt::Display for PlannedStep {
                 target_bytes,
                 ..
             } => write!(f, "lvextend -L {target_bytes}b {vg_name}/{lv_name}"),
-            PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {mountpoint}"),
+            PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {}", shell_word(mountpoint)),
         }
     }
 }

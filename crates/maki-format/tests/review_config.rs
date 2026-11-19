@@ -338,6 +338,17 @@ fn endpoint_ports_preserve_valid_ipv4_ipv6_and_default_ports() {
 }
 
 #[test]
+fn remote_http_rejects_invalid_hosts_at_volume_validation() {
+    for host in ["[127.0.0.1]", "[localhost]", "192.168.1.999", "host name"] {
+        let raw = base().replace("https://crypto.internal", &format!("https://{host}"));
+        assert!(err(&raw).contains("invalid host"), "{host}");
+    }
+    for host in ["crypto.internal", "127.0.0.1", "[2001:db8::1]"] {
+        ok(&base().replace("https://crypto.internal", &format!("https://{host}")));
+    }
+}
+
+#[test]
 fn endpoint_ports_reject_invalid_syntax_and_overflow() {
     for scheme in ["http", "https", "ws", "wss"] {
         for host in ["localhost", "127.0.0.1", "[::1]"] {
@@ -722,6 +733,37 @@ fn control_and_nbd_sockets_must_differ() {
     .validate()
     .unwrap();
     parse(&local()).validate().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn socket_aliases_use_the_actual_parent_directory_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("other/sub")).unwrap();
+    std::os::unix::fs::symlink(root.join("other/sub"), root.join("link")).unwrap();
+    let check = |control: &str, nbd: &str| {
+        let raw = format!(
+            "{}[control]\nsocket = {:?}\n[nbd]\nsocket = {:?}\n",
+            local(),
+            root.join(control),
+            root.join(nbd)
+        );
+        parse(&raw).validate()
+    };
+    // systemd creates per-volume runtime directories on first start. An
+    // alias of an existing ancestor already identifies the same future file.
+    let check_runtime_paths = || {
+        assert!(check("link/new/volume/a.sock", "other/sub/new/volume/a.sock").is_err());
+        assert!(check("link/new/volume/a.sock", "other/sub/new/volume/b.sock").is_ok());
+    };
+    check_runtime_paths();
+    std::fs::create_dir_all(root.join("other/sub/new/volume")).unwrap();
+    check_runtime_paths();
+    assert!(check("other/sub/../shared.sock", "other/shared.sock").is_err());
+    assert!(check("link/../shared.sock", "other/shared.sock").is_err());
+    assert!(check("link/../shared.sock", "shared.sock").is_ok());
+    assert!(check("link/a.sock", "other/sub/b.sock").is_ok());
 }
 
 // ---------- transport limits carry ciphertext (BUG-092) ----------

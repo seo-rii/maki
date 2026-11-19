@@ -1592,6 +1592,26 @@ fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
 
+fn same_socket_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    // Resolve the deepest existing ancestor. systemd may not have created
+    // the per-volume directory yet, even when its parent is a known alias.
+    // Let the filesystem interpret ".." after symlinks in the existing path.
+    let resolve = |path: &std::path::Path| {
+        for ancestor in path.ancestors() {
+            match std::fs::canonicalize(ancestor) {
+                Ok(existing) => return Some(existing.join(path.strip_prefix(ancestor).ok()?)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => break,
+            }
+        }
+        None
+    };
+    resolve(left).is_some_and(|left| resolve(right).as_ref() == Some(&left))
+}
+
 /// Scheme and host of an endpoint URL. Rejects userinfo (credentials in a
 /// URL) and anything that does not look like `scheme://host[:port][/...]`.
 /// An explicit nonempty port must be a decimal number that fits in `u16`.
@@ -1641,6 +1661,16 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             "endpoint url {} has no host",
             redacted_url(url)
         )));
+    }
+    // The transport URL grammar requires brackets to contain an IPv6
+    // address and applies the URL host parser to DNS names and IPv4.
+    let valid_host = if authority.starts_with('[') {
+        host.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        url::Host::parse(host).is_ok()
+    };
+    if !valid_host {
+        return Err(invalid("endpoint url has an invalid host"));
     }
     // An empty port means the scheme's default, as in the transport URL
     // parsers. Do not silently accept a nonnumeric or out-of-range port
@@ -2205,10 +2235,7 @@ impl VolumeConfig {
             .socket
             .clone()
             .unwrap_or_else(|| format!("/run/maki/{}/nbd.sock", self.volume.name));
-        if std::path::Path::new(&control_socket)
-            .components()
-            .eq(std::path::Path::new(&nbd_socket).components())
-        {
+        if same_socket_path(control_socket.as_ref(), nbd_socket.as_ref()) {
             return Err(invalid(format!(
                 "control.socket {control_socket:?} must differ from nbd.socket {nbd_socket:?}"
             )));

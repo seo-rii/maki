@@ -632,6 +632,20 @@ mod mount_root_hygiene {
 fn pinned_nbd_devices_must_be_canonical() {
     assert_eq!(nbd_index("/dev/nbd0"), Some(0));
     assert_eq!(nbd_index("/dev/nbd15"), Some(15));
+    assert_eq!(nbd_index("/dev/nbd1048575"), Some(1048575));
+    for device in ["/dev/nbd1048576", "/dev/nbd4294967295"] {
+        assert_eq!(nbd_index(device), None);
+        assert!(AttachConfig::default()
+            .into_request(
+                "audit",
+                AttachOverrides {
+                    nbd_device: Some(device.into()),
+                    ..Default::default()
+                },
+                false
+            )
+            .is_err());
+    }
     for device in [
         "/dev/nbd01",
         "/dev/nbd+1",
@@ -713,4 +727,55 @@ fn attach_checks_device_block_size_before_planning() {
             "{size}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_checks_mount_components_in_bytes_against_the_host_filesystem() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = std::env::temp_dir();
+    let path = std::ffi::CString::new(base.as_os_str().as_bytes()).unwrap();
+    let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
+    if limit < 1 {
+        return;
+    }
+    let limit = usize::try_from(limit).unwrap();
+    for (length, ok) in [(limit, true), (limit + 1, false)] {
+        let name = "é".repeat(length / 2) + &"a".repeat(length % 2);
+        let mount = base.join("maki-uncreated-mount-parent").join(name);
+        let result = AttachConfig::default().into_request(
+            "audit",
+            AttachOverrides {
+                mountpoint: Some(mount.to_str().unwrap().to_owned()),
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(result.is_ok(), ok, "{result:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_refuses_volume_groups_that_name_device_nodes() {
+    let request = |vg: &str| {
+        AttachConfig::default().into_request(
+            "audit",
+            AttachOverrides {
+                vg_name: Some(vg.into()),
+                ..Default::default()
+            },
+            false,
+        )
+    };
+    for vg in ["null", "zero"] {
+        assert!(request(vg).unwrap_err().to_string().contains("vg_name"));
+    }
+    if std::path::Path::new("/dev/shm").is_dir() {
+        assert!(
+            request("shm").is_ok(),
+            "existing directories can be active VGs"
+        );
+    }
+    assert!(request("vg_maki_new_group").is_ok());
 }
