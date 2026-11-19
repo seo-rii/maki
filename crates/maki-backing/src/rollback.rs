@@ -745,28 +745,33 @@ impl State {
     fn page(&mut self, page: Option<PageRef>) -> io::Result<Vec<u8>> {
         let mut bytes = vec![0; PAGE as usize];
         if let Some(page) = page {
-            if let Err(error) = self.arena.read_at(page.slot * PAGE, &mut bytes) {
-                // No mutation or uncertain commit happened here. An ordinary
-                // I/O failure refuses this operation; the next one checks the
-                // witness and authenticates the page again. Missing, short or
-                // invalid referenced evidence still stops every handle, even
-                // if the original bytes are later restored.
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::InvalidData
-                ) {
-                    self.poisoned = true;
-                }
-                return Err(error);
-            }
-            if page_digest(&self.committed.identity, &bytes) != page.hash {
-                self.poisoned = true;
-                return Err(invalid("rollback arena page authentication failed"));
-            }
+            self.read_page(&page, &mut bytes)?;
         }
         Ok(bytes)
+    }
+
+    fn read_page(&mut self, page: &PageRef, bytes: &mut [u8]) -> io::Result<()> {
+        if let Err(error) = self.arena.read_at(page.slot * PAGE, bytes) {
+            // No mutation or uncertain commit happened here. An ordinary
+            // I/O failure refuses this operation; the next one checks the
+            // witness and authenticates the page again. Missing, short or
+            // invalid referenced evidence still stops every handle, even
+            // if the original bytes are later restored.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::InvalidData
+            ) {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
+        if page_digest(&self.committed.identity, bytes) != page.hash {
+            self.poisoned = true;
+            return Err(invalid("rollback arena page authentication failed"));
+        }
+        Ok(())
     }
 
     /// A slot neither the committed manifest nor the working view uses.
@@ -845,6 +850,9 @@ impl BackingFile for CowFile {
                 "read beyond rollback file",
             ));
         }
+        // Authenticate into private scratch before exposing any bytes from
+        // this page. A hole-only read never needs to allocate it.
+        let mut bytes = Vec::new();
         let mut at = offset;
         while at < end {
             let dest = (at - offset) as usize;
@@ -862,7 +870,8 @@ impl BackingFile for CowFile {
                 buf[dest..(page_start - offset) as usize].fill(0);
                 at = page_start;
             }
-            let bytes = state.page(Some(page))?;
+            bytes.resize(PAGE as usize, 0);
+            state.read_page(&page, &mut bytes)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let start = (at % PAGE) as usize;
             let dest = (at - offset) as usize;
