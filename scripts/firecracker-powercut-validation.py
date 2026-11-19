@@ -178,6 +178,8 @@ class SerialProcess:
                 del self.buffer[:newline + 1]
                 frame = decode_frame(line, self.token, self.boot)
                 if frame is not None:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("guest serial event deadline")
                     return frame
                 continue
             if len(self.buffer) > MAX_FRAME:

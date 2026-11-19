@@ -63,6 +63,29 @@ class ProcessCleanupTests(unittest.TestCase):
             os.waitid(os.P_PID, process.child.pid, os.WEXITED | os.WNOWAIT)
         return module, process, exited
 
+    def test_event_received_after_deadline_is_rejected(self):
+        token = "a" * 32
+        for name, (module, runner) in self.runners.items():
+            for observed in (4, 10, 12):
+                with self.subTest(name=name, observed=observed):
+                    process = runner.__new__(runner)
+                    process.token, process.boot, process.cycle = token, 0, 0
+                    process.buffer, process.total = bytearray(), 0
+                    process.selector = mock.Mock()
+                    process.child = mock.Mock()
+                    process.serial = process.stdout_log = mock.Mock()
+                    frame = {"event": "ready", "token": token, "boot": 0, "cycle": 0,
+                             "boot_id": "00112233-4455-6677-8899-aabbccddeeff"}
+                    wire = module.PREFIX + json.dumps(frame).encode() + b"\n"
+                    times = [0, 0, observed]
+                    with mock.patch.object(module.time, "monotonic", side_effect=times), \
+                            mock.patch.object(module.os, "read", return_value=wire):
+                        if observed < 10:
+                            self.assertEqual(process.expect("ready", 10), frame)
+                        else:
+                            with self.assertRaises(TimeoutError):
+                                process.expect("ready", 10)
+
     def test_campaign_save_failure_preserves_the_previous_complete_report(self):
         for name, (module, _) in self.runners.items():
             with self.subTest(name=name):

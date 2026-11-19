@@ -464,6 +464,8 @@ class RemoteProcess:
                 del self.buffer[:newline + 1]
                 frame = decode_frame(line, self.token, self.cycle)
                 if frame is not None:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("guest SSH event deadline")
                     return frame
                 continue
             if len(self.buffer) > MAX_FRAME:
