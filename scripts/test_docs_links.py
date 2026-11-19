@@ -110,6 +110,18 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:9: missing-real.md", "README.md:11: #code-title (missing anchor)",
             "README.md:16: #script-text (missing anchor)"])
 
+    def test_raw_html_blocks_end_at_any_type_one_closing_tag(self):
+        self.write("README.md", "<pre>\n[example](hidden.md)\n</STYLE>\n"
+                   "[real](missing.md)\n\n<script>sample('</textarea>')\n"
+                   "# Visible\n\n[anchor](#visible) [real](absent.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:4: missing.md", "README.md:9: absent.md"])
+
+    def test_github_html_block_tags_interrupt_paragraphs(self):
+        self.write("README.md", "Text\n<source src=demo>\n[example](hidden.md)\n\n"
+                   "Text\n<search>\n[real](missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: missing.md"])
+
     @unittest.skipUnless(os.name == "posix", "Unix byte filenames")
     def test_byte_filename_keeps_other_diagnostics(self):
         name = os.fsdecode(b"notes-\xff.md")

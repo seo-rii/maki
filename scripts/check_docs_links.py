@@ -53,13 +53,14 @@ HTML_ATTR = re.compile(r"""([A-Za-z_:][\w.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'
 HTML_OPEN = rf"<(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?P<attrs>(?:\s+{HTML_ATTR.pattern})*)\s*/?>"
 HTML_CLOSE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")
 HTML_TAG = re.compile(rf"(?:{HTML_OPEN}|{HTML_CLOSE.pattern})", re.ASCII)
-# CommonMark HTML blocks ending at the matching close tag or at a blank line.
+# CommonMark type 1 HTML blocks end at any of the four closing tags.
 RAW_ELEMENT = re.compile(r"<(pre|script|style|textarea)(?=\s|>|$)", re.IGNORECASE)
+RAW_ELEMENT_ENDS = ("</pre>", "</script>", "</style>", "</textarea>")
 BLOCK_ELEMENT = re.compile(
     r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
     r"h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|"
-    r"optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|"
+    r"optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|"
     r"tr|track|ul)(?=\s|/?>|$)", re.IGNORECASE)
 HTML_TOKENS = re.compile(
     r"<!--.*?(?:-->|$)|<!\[CDATA\[.*?(?:\]\]>|$)|<\?.*?(?:\?>|$)|"
@@ -97,23 +98,22 @@ class SourceLine(NamedTuple):
 
 
 def html_block_end(content, in_paragraph):
-    """Return the closing string, an empty string for a blank line, or None."""
+    """Return closing strings, an empty tuple for a blank line, or None."""
     stripped = content.lstrip(" ")
     if len(content) - len(stripped) > 3 or not stripped.startswith("<"):
         return None
-    raw = RAW_ELEMENT.match(stripped)
-    if raw:
-        return f"</{raw[1].lower()}>"
+    if RAW_ELEMENT.match(stripped):
+        return RAW_ELEMENT_ENDS
     if stripped.startswith("<!--"):
-        return "-->"
+        return ("-->",)
     if stripped.startswith("<?"):
-        return "?>"
+        return ("?>",)
     if stripped.startswith("<![CDATA["):
-        return "]]>"
+        return ("]]>",)
     if re.match(r"<![A-Z]", stripped):
-        return ">"
+        return (">",)
     if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip())):
-        return ""
+        return ()
     return None
 
 
@@ -167,12 +167,7 @@ def document_lines(text):
             break
 
         content = columns[pos:]
-        if html_end is not None:
-            if html_end or content.strip():
-                yield SourceLine(number, content, changed, True)
-                if html_end and html_end in content.lower():
-                    html_end = None
-                continue
+        if html_end == () and not content.strip():
             html_end = None
         if block is not None:
             close = FENCE.fullmatch(content)
@@ -182,7 +177,7 @@ def document_lines(text):
             continue
 
         before_markers = pos
-        while not lazy and pos < len(columns):
+        while html_end is None and not lazy and pos < len(columns):
             quote = QUOTE_MARKER.match(columns, pos)
             if quote:
                 containers.append(None)
@@ -218,11 +213,13 @@ def document_lines(text):
                 column += 4 - column % 4 if line[offset] == "\t" else 1
                 offset += 1
             content = " " * (column - pos) + line[offset:]
-        html_end = html_block_end(content, in_paragraph)
+        if html_end is None:
+            html_end = html_block_end(content, in_paragraph)
         if html_end is not None:
             in_paragraph = False
             yield SourceLine(number, content, changed, True)
-            if html_end and html_end in content.lower():
+            lowered = content.lower()
+            if any(end in lowered for end in html_end):
                 html_end = None
             continue
         block = opening_fence(content)
