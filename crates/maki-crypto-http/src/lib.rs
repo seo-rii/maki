@@ -1422,9 +1422,8 @@ impl HttpCryptoProvider {
             capabilities,
             timeout: http.timeout.map(|d| d.0).unwrap_or(Duration::from_secs(10)),
             max_response_bytes: http
-                .max_response_bytes
-                .map(|b| b.0 as usize)
-                .unwrap_or(maki_format::config::DEFAULT_HTTP_MAX_RESPONSE_BYTES as usize),
+                .response_byte_limit()
+                .map_err(|e| fatal(e.to_string()))?,
             tls,
         })
     }

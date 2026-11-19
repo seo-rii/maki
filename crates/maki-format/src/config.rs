@@ -412,6 +412,48 @@ pub struct GrpcSection {
     pub metadata: BTreeMap<String, HeaderValue>,
 }
 
+fn checked_wire_limit(
+    value: Option<ByteSize>,
+    default: u64,
+    field: &str,
+) -> Result<usize, ConfigError> {
+    let bytes = value.map_or(default, |size| size.0);
+    if bytes == 0 {
+        return Err(invalid(format!("{field} must be positive")));
+    }
+    usize::try_from(bytes).map_err(|_| invalid(format!("{field} exceeds the platform byte limit")))
+}
+
+impl HttpSection {
+    pub fn response_byte_limit(&self) -> Result<usize, ConfigError> {
+        checked_wire_limit(
+            self.max_response_bytes,
+            DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+            "[crypto.http] max_response_bytes",
+        )
+    }
+}
+
+impl TransportSection {
+    pub fn frame_byte_limit(&self) -> Result<usize, ConfigError> {
+        checked_wire_limit(
+            self.max_frame_bytes,
+            DEFAULT_WS_MAX_FRAME_BYTES,
+            "[crypto.websocket] max_frame_bytes",
+        )
+    }
+}
+
+impl GrpcSection {
+    pub fn message_byte_limit(&self) -> Result<usize, ConfigError> {
+        checked_wire_limit(
+            self.max_message_bytes,
+            DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+            "[crypto.grpc] max_message_bytes",
+        )
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
@@ -2317,15 +2359,7 @@ impl VolumeConfig {
                         return Err(invalid("[crypto.http] timeout must be positive"));
                     }
                 }
-                if let Some(b) = &http.max_response_bytes {
-                    if b.0 == 0 {
-                        return Err(invalid("[crypto.http] max_response_bytes must be positive"));
-                    }
-                }
-                let limit = http
-                    .max_response_bytes
-                    .map(|b| b.0)
-                    .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES);
+                let limit = http.response_byte_limit()? as u64;
                 for (name, op, is_encrypt) in
                     [("encrypt", encrypt, true), ("decrypt", decrypt, false)]
                 {
@@ -2355,15 +2389,7 @@ impl VolumeConfig {
                 if ws.timeout.is_some_and(|t| t.0.is_zero()) {
                     return Err(invalid("[crypto.websocket] timeout must be positive"));
                 }
-                let frame = ws
-                    .max_frame_bytes
-                    .map(|b| b.0)
-                    .unwrap_or(DEFAULT_WS_MAX_FRAME_BYTES);
-                if frame == 0 {
-                    return Err(invalid(
-                        "[crypto.websocket] max_frame_bytes must be positive",
-                    ));
-                }
+                let frame = ws.frame_byte_limit()? as u64;
                 let encoded = self.websocket_frame_bound()?;
                 if encoded > frame {
                     return Err(invalid(format!(
@@ -2416,13 +2442,7 @@ impl VolumeConfig {
                         validate_credential(c)?;
                     }
                 }
-                let message = grpc
-                    .max_message_bytes
-                    .map(|b| b.0)
-                    .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_BYTES);
-                if message == 0 {
-                    return Err(invalid("[crypto.grpc] max_message_bytes must be positive"));
-                }
+                let message = grpc.message_byte_limit()? as u64;
                 let wire = self.grpc_message_bound()?;
                 if wire > message {
                     return Err(invalid(format!(

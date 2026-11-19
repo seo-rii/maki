@@ -238,29 +238,12 @@ fn main() -> ExitCode {
     // A refusal must not claim a remote writer or advance its fence. The actual
     // attach below validates the backing and its witness after authorization.
     let existing = match maki_nbdkit::daemon::volume_layout_present(&config) {
-        Ok(true) => true,
-        Ok(false) => match maki_nbdkit::daemon::create_volume_from_config_str(&raw) {
-            Ok(_) => false,
-            // A plain volume may have appeared after the existing-volume probe.
-            Err(DaemonError::Format(FormatError::AlreadyExists(_))) => true,
-            Err(error) => {
-                eprintln!("error: cannot create the volume: {error}");
-                return ExitCode::FAILURE;
-            }
-        },
+        Ok(present) => present,
         Err(error) => {
             eprintln!("error: cannot open the existing volume: {error}");
             return ExitCode::FAILURE;
         }
     };
-    if existing && !options.destroy_data {
-        eprintln!(
-            "error: {} names an existing volume; the benchmark overwrites its \
-             data. Pass --destroy-data to run it anyway.",
-            options.config_path
-        );
-        return ExitCode::from(2);
-    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -271,12 +254,36 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let engine = match runtime.block_on(maki_nbdkit::daemon::attach_from_config(&config)) {
-        Ok(engine) => engine,
-        Err(error) => {
-            eprintln!("attach failed: {error}");
-            return ExitCode::FAILURE;
+    let created = if existing {
+        None
+    } else {
+        match runtime.block_on(maki_nbdkit::daemon::create_and_attach_from_config_str(&raw)) {
+            Ok(engine) => Some(engine),
+            // A plain volume may have appeared after the existing-volume probe.
+            Err(DaemonError::Format(FormatError::AlreadyExists(_))) => None,
+            Err(error) => {
+                eprintln!("error: cannot create and attach the volume: {error}");
+                return ExitCode::FAILURE;
+            }
         }
+    };
+    let engine = match created {
+        Some(engine) => engine,
+        None if !options.destroy_data => {
+            eprintln!(
+                "error: {} names an existing volume; the benchmark overwrites its \
+                 data. Pass --destroy-data to run it anyway.",
+                options.config_path
+            );
+            return ExitCode::from(2);
+        }
+        None => match runtime.block_on(maki_nbdkit::daemon::attach_from_config(&config)) {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("attach failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     let slots = engine.size() / io_size as u64;
     // Recovered volumes keep their on-disk geometry even when a copied

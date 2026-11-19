@@ -111,6 +111,33 @@ impl AttachConfig {
         require_uuid: bool,
     ) -> Result<AttachRequest, ConfigError> {
         check_volume_name(volume)?;
+        let request = self.into_existing_request(volume, overrides, require_uuid)?;
+        // LVM reserves these names and fragments for its internal LVs.
+        let lv = request.lv_name.as_str();
+        if lv.starts_with("snapshot")
+            || lv.starts_with("pvmove")
+            || [
+                "_cdata", "_cmeta", "_corig", "_cpool", "_cvol", "_imeta", "_iorig", "_mimage",
+                "_mlog", "_pmspare", "_rimage", "_rmeta", "_tdata", "_tmeta", "_vdata", "_vorigin",
+                "_wcorig",
+            ]
+            .iter()
+            .any(|reserved| lv.contains(reserved))
+        {
+            return Err(ConfigError::Invalid("lv_name is reserved by LVM".into()));
+        }
+        Ok(request)
+    }
+
+    /// Resolve a lifecycle operation for an existing attachment. Keep older
+    /// instance aliases reachable until their trusted devices are detached.
+    pub fn into_existing_request(
+        self,
+        volume: &str,
+        overrides: AttachOverrides,
+        require_uuid: bool,
+    ) -> Result<AttachRequest, ConfigError> {
+        check_instance_name(volume)?;
         let nbd_device = overrides
             .nbd_device
             .or(self.nbd_device)
@@ -279,6 +306,17 @@ pub fn check_abs_path(name: &str, value: &str) -> Result<(), ConfigError> {
 }
 
 pub fn check_volume_name(value: &str) -> Result<(), ConfigError> {
+    // Match the format's MAX_VOLUME_NAME_BYTES without coupling the privileged helper to it.
+    if value.len() > 64 {
+        return Err(ConfigError::Invalid(
+            "volume name must be at most 64 ASCII bytes".into(),
+        ));
+    }
+    check_instance_name(value)
+}
+
+/// Validate the syntax used for stored instance aliases and cleanup paths.
+pub fn check_instance_name(value: &str) -> Result<(), ConfigError> {
     check_argument("volume", value)?;
     if !value
         .chars()
