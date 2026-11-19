@@ -20,8 +20,14 @@ import subprocess
 import time
 import uuid
 
+try:
+    from campaign_io import DiagnosticLog, save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import DiagnosticLog, save_json
+
 PREFIX = b"MAKI_FC_V1 "
 MAX_FRAME = 16384
+MAX_OUTPUT = 8 << 20
 
 
 def expected_records(cycle):
@@ -122,9 +128,11 @@ class SerialProcess:
         os.chmod(directory / "stderr.log", 0o600)
         self.selector = selectors.DefaultSelector()
         self.child = None
+        self.diagnostics_reader = None
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                          stderr=self.stderr, start_new_session=True, bufsize=0)
+                                          stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+            self.diagnostics_reader = DiagnosticLog(self.child.stderr, self.stderr, MAX_OUTPUT)
             self.selector.register(self.child.stdout, selectors.EVENT_READ)
         except BaseException:
             self.close()
@@ -178,7 +186,7 @@ class SerialProcess:
             if not chunk:
                 raise RuntimeError("Firecracker exited or closed serial before expected event")
             self.total += len(chunk)
-            if self.total > (8 << 20):
+            if self.total > MAX_OUTPUT:
                 raise ValueError("serial output limit exceeded")
             self.serial.write(chunk)
             self.buffer.extend(chunk)
@@ -221,7 +229,13 @@ class SerialProcess:
             self.child.stdout.close()
         self.selector.close()
         self.serial.close()
-        self.stderr.close()
+        try:
+            if self.diagnostics_reader is not None:
+                self.diagnostics_reader.finish()
+            elif self.child is not None:
+                self.child.stderr.close()
+        finally:
+            self.stderr.close()
 
     def diagnostics(self):
         if self.child is None or self.child.returncode is None:
@@ -234,13 +248,6 @@ class SerialProcess:
                 stream.seek(max(0, os.fstat(stream.fileno()).st_size - 4096))
                 parts.append(name + ": " + stream.read(4096).decode(errors="replace"))
         return "\n".join(parts)
-
-
-def save_json(path, value):
-    with open(path, "w", encoding="utf-8") as stream:
-        os.chmod(path, 0o600)
-        json.dump(value, stream, indent=2)
-        stream.write("\n")
 
 
 def campaign(args):

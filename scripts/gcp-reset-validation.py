@@ -22,6 +22,11 @@ import subprocess
 import time
 import uuid
 
+try:
+    from campaign_io import DiagnosticLog, save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import DiagnosticLog, save_json
+
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
 MAX_FRAME = 16384
@@ -178,15 +183,6 @@ def load_ledger(ledger, profile="v2"):
 
 def verify_readbacks(expected, actual):
     validate_records(actual, expected)
-
-
-def save_json(path, value):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def bounded_run(command, timeout):
@@ -419,10 +415,12 @@ class RemoteProcess:
         os.chmod(directory / "stderr.log", 0o600)
         self.selector = selectors.DefaultSelector()
         self.child = None
+        self.diagnostics_reader = None
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                          stdout=subprocess.PIPE, stderr=self.stderr_log,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           start_new_session=True, bufsize=0)
+            self.diagnostics_reader = DiagnosticLog(self.child.stderr, self.stderr_log, MAX_OUTPUT)
             self.selector.register(self.child.stdout, selectors.EVENT_READ)
         except BaseException:
             self.close()
@@ -521,7 +519,13 @@ class RemoteProcess:
             self.child.stdout.close()
         self.selector.close()
         self.stdout_log.close()
-        self.stderr_log.close()
+        try:
+            if self.diagnostics_reader is not None:
+                self.diagnostics_reader.finish()
+            elif self.child is not None:
+                self.child.stderr.close()
+        finally:
+            self.stderr_log.close()
 
 
 def cut_instance(args, process, baseline=None):

@@ -1,5 +1,6 @@
 """Owned launcher cleanup, using local processes without cloud or KVM calls."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import select
@@ -61,6 +62,37 @@ class ProcessCleanupTests(unittest.TestCase):
             # safe group cleanup. The controller itself must do the same.
             os.waitid(os.P_PID, process.child.pid, os.WEXITED | os.WNOWAIT)
         return module, process, exited
+
+    def test_campaign_save_failure_preserves_the_previous_complete_report(self):
+        for name, (module, _) in self.runners.items():
+            with self.subTest(name=name):
+                folder = self.root / name
+                folder.mkdir()
+                path = folder / "results.json"
+                module.save_json(path, {"boots": [1]})
+                def fail_after_prefix(value, stream, **options):
+                    stream.write('{"partial":')
+                    raise OSError("no space left on device")
+                with mock.patch.object(json, "dump", side_effect=fail_after_prefix):
+                    with self.assertRaisesRegex(OSError, "no space"):
+                        module.save_json(path, {"boots": [1, 2]})
+                self.assertEqual(json.loads(path.read_text()), {"boots": [1]})
+                self.assertEqual(list(folder.iterdir()), [path])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_stderr_is_bounded_and_cannot_block_control_stdout(self):
+        for name, (module, runner) in self.runners.items():
+            with self.subTest(name=name), mock.patch.object(module, "MAX_OUTPUT", 8192):
+                folder = self.root / name
+                # Write more than fits in either the stderr pipe or the diagnostic log.
+                program = ("import os; data=b'x'*4096; "
+                           "[os.write(2,data) for _ in range(128)]; print('finished',flush=True)")
+                with runner([sys.executable, "-c", program], folder, "a" * 32, 0) as process:
+                    self.assertTrue(select.select([process.child.stdout], [], [], 5)[0])
+                    self.assertEqual(process.child.stdout.readline(), b"finished\n")
+                diagnostics = (folder / "stderr.log").read_bytes()
+                self.assertEqual(len(diagnostics), 8192)
+                self.assertTrue(diagnostics.endswith(b"[stderr truncated]\n"))
 
     def test_bug155_close_terminates_descendant_after_early_leader_exit(self):
         for name in self.runners:
