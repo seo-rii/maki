@@ -2,11 +2,14 @@
 //! verification of a volume's metadata (SPEC §43; deep slot checks are
 //! exercised further by recovery in Phase 3).
 
+use std::io::ErrorKind;
+
 use maki_backing::Backing;
 
 use crate::ab::AbStore;
 use crate::allocation::AllocationMap;
 use crate::catalog::ShardCatalog;
+use crate::checkpoint::{CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use crate::durable_proof::DurableProofStore;
 use crate::error::FormatError;
 use crate::layout;
@@ -60,6 +63,23 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         "superblock: volume {} generation {} slot_size {}",
         superblock.volume_uuid, superblock.generation, superblock.geometry.slot_size
     ));
+
+    // Recovery requires at least one checkpoint state file. The deep check
+    // handles decoding and comparing its contents.
+    let mut has_checkpoint_file = false;
+    for path in [CHECKPOINT_STATE_A, CHECKPOINT_STATE_B] {
+        match backing.open(path, false) {
+            Ok(_) => has_checkpoint_file = true,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if matches!(e.kind(), ErrorKind::IsADirectory | ErrorKind::InvalidInput) => {
+                report.errors.push(format!("invalid checkpoint state file {path}: {e}"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !has_checkpoint_file {
+        report.errors.push("no checkpoint state file is present".into());
+    }
 
     // Valid sizes follow from the geometry; longer copies are never read
     // (R5-025).
@@ -171,7 +191,6 @@ fn check_data_file(
     shard: u64,
     report: &mut CheckReport,
 ) -> Result<bool, FormatError> {
-    use std::io::ErrorKind;
     match backing.open(&layout::shard_data(shard), false) {
         Ok(_) => Ok(true),
         Err(error) => {
