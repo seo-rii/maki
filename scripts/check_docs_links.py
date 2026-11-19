@@ -28,6 +28,7 @@ checked.
 Usage: python3 -B scripts/check_docs_links.py [repository-root]
 """
 
+from bisect import bisect_right
 import hashlib
 import html
 import json
@@ -39,29 +40,41 @@ import subprocess
 import sys
 import unicodedata
 import urllib.parse
+from typing import NamedTuple
 
-SKIP_PREFIXES = ("http://", "https://", "mailto:")
+SKIP_PREFIXES = ("http://", "https://", "mailto:", "//")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 # Lines that cannot continue a paragraph into a setext heading: indented
 # code, block quotes, ATX headings, tables, HTML blocks and list items.
 NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:[>#|<]|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
-HTML_ANCHOR = re.compile(
-    r"<a\s(?:[^>]*?\s)?(?:id|name)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", re.IGNORECASE
-)
-HTML_TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
+HTML_ATTR = re.compile(r"""([A-Za-z_:][\w.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?""", re.ASCII)
+HTML_OPEN = rf"<(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?P<attrs>(?:\s+{HTML_ATTR.pattern})*)\s*/?>"
+HTML_CLOSE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")
+HTML_TAG = re.compile(rf"(?:{HTML_OPEN}|{HTML_CLOSE.pattern})", re.ASCII)
+# CommonMark type 1 HTML blocks end at any of the four closing tags.
+RAW_ELEMENT = re.compile(r"<(pre|script|style|textarea)(?=\s|>|$)", re.IGNORECASE)
+RAW_ELEMENT_ENDS = ("</pre>", "</script>", "</style>", "</textarea>")
+BLOCK_ELEMENT = re.compile(
+    r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
+    r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
+    r"h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|"
+    r"optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|"
+    r"tr|track|ul)(?=\s|/?>|$)", re.IGNORECASE)
+HTML_TOKENS = re.compile(
+    r"<!--.*?(?:-->|$)|<!\[CDATA\[.*?(?:\]\]>|$)|<\?.*?(?:\?>|$)|"
+    r"<(?P<raw>script|style|textarea)(?=[\s>]).*?(?:</(?P=raw)>|$)|"
+    rf"{HTML_OPEN}", re.IGNORECASE | re.DOTALL | re.ASCII)
 AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 BACKTICKS = re.compile(r"`+")
 ASCII_PUNCTUATION = frozenset(string.punctuation)
 # A link label: at most 999 characters, no unescaped brackets.
 LINK_LABEL = re.compile(r"\[((?:[^\\\[\]]|\\.){0,999})\]")
-# Block-quote markers, then at most one list-item marker, before a block.
+# Container margins are consumed in nesting order before classifying a block.
 QUOTE_MARKER = re.compile(r" {0,3}>[ \t]?")
 BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])( +|$)")
-LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)")
-CONTAINER_PREFIX = re.compile(rf"^((?:{QUOTE_MARKER.pattern})*)({LIST_MARKER.pattern})?")
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
@@ -76,16 +89,55 @@ def candidate_markdown(root):
     return sorted(root / name for name in names)
 
 
-def unfenced_lines(text):
-    """Yield source lines outside fenced code and HTML comment blocks."""
+class SourceLine(NamedTuple):
+    number: int
+    content: str
+    container_changed: bool
+    raw_html: bool
+    lazy: bool = False
+
+
+def html_block_end(content, in_paragraph):
+    """Return closing strings, an empty tuple for a blank line, or None."""
+    stripped = content.lstrip(" ")
+    if len(content) - len(stripped) > 3 or not stripped.startswith("<"):
+        return None
+    if RAW_ELEMENT.match(stripped):
+        return RAW_ELEMENT_ENDS
+    if stripped.startswith("<!--"):
+        return ("-->",)
+    if stripped.startswith("<?"):
+        return ("?>",)
+    if stripped.startswith("<![CDATA["):
+        return ("]]>",)
+    if re.match(r"<![A-Z]", stripped):
+        return (">",)
+    if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip())):
+        return ()
+    return None
+
+
+def opening_fence(content):
+    match = FENCE.fullmatch(content)
+    if match and not (match[1][0] == "`" and "`" in match[2]):
+        return match[1]
+    return None
+
+
+def document_lines(text):
+    """Strip container margins and distinguish Markdown from literal blocks."""
     # Each open container is a block quote (None) or a list item's continuation
     # indentation in columns. Preserve their order for lists inside quotes and
     # quotes inside lists. A literal block cannot continue beyond its container.
     containers = []
     block = None
+    html_end = None
+    in_paragraph = False
     for number, line in enumerate(text.splitlines(), start=1):
         columns = line.expandtabs(4)
         pos = 0
+        changed = False
+        lazy = False
         for index, indent in enumerate(containers):
             if indent is None:
                 quote = QUOTE_MARKER.match(columns, pos)
@@ -98,15 +150,25 @@ def unfenced_lines(text):
             elif not columns[pos:].strip():
                 pos = len(columns)
                 continue
+            rest = columns[pos:]
+            if (in_paragraph and rest.strip() and not QUOTE_MARKER.match(rest)
+                    and not BLOCK_LIST_MARKER.match(rest) and not ATX_HEADING.match(rest)
+                    and not THEMATIC_BREAK.fullmatch(rest) and not opening_fence(rest)
+                    and html_block_end(rest, True) is None):
+                # A paragraph can continue without repeating list indentation
+                # or a quote marker. Such a line cannot be a setext underline.
+                lazy = True
+                break
             del containers[index:]
+            changed = True
+            in_paragraph = False
+            html_end = None
             block = None
             break
 
         content = columns[pos:]
-        if block == "<!--":
-            if "-->" in content:
-                block = None
-            continue
+        if html_end == () and not content.strip():
+            html_end = None
         if block is not None:
             close = FENCE.fullmatch(content)
             if (close and close[1][0] == block[0] and len(close[1]) >= len(block)
@@ -114,16 +176,23 @@ def unfenced_lines(text):
                 block = None
             continue
 
-        while pos < len(columns):
+        before_markers = pos
+        while html_end is None and not lazy and pos < len(columns):
             quote = QUOTE_MARKER.match(columns, pos)
             if quote:
                 containers.append(None)
                 pos = quote.end()
                 continue
+            if THEMATIC_BREAK.fullmatch(columns[pos:]):
+                break
             item = BLOCK_LIST_MARKER.match(columns, pos)
             if not item:
                 break
             marker_end = item.start(1)
+            marker = columns[pos:marker_end].strip()
+            if in_paragraph and not changed and pos == before_markers:
+                if item.end() == len(columns) or (marker[0].isdigit() and int(marker[:-1]) != 1):
+                    break
             padding = item.end(1) - marker_end
             # Five or more spaces introduce indented item content. An empty
             # item still needs one column after its marker on the next line.
@@ -131,16 +200,36 @@ def unfenced_lines(text):
             containers.append(marker_end - pos + width)
             pos = marker_end + width
 
+        changed = changed or pos != before_markers
+        if changed:
+            in_paragraph = False
         content = columns[pos:]
-        if re.match(r" {0,3}<!--", content):
-            if "-->" not in content:
-                block = "<!--"
+        # Only the container margin uses expanded tab stops. Keep literal tabs
+        # in the body (e.g. code spans and link labels).
+        if "\t" in line:
+            column = 0
+            offset = 0
+            while column < pos and offset < len(line):
+                column += 4 - column % 4 if line[offset] == "\t" else 1
+                offset += 1
+            content = " " * (column - pos) + line[offset:]
+        if html_end is None:
+            html_end = html_block_end(content, in_paragraph)
+        if html_end is not None:
+            in_paragraph = False
+            yield SourceLine(number, content, changed, True)
+            lowered = content.lower()
+            if any(end in lowered for end in html_end):
+                html_end = None
             continue
-        match = FENCE.fullmatch(content)
-        if match and not (match[1][0] == "`" and "`" in match[2]):
-            block = match[1]
+        block = opening_fence(content)
+        if block:
+            in_paragraph = False
             continue
-        yield number, line
+        yield SourceLine(number, content, changed, False, lazy)
+        in_paragraph = bool(content.strip() and not ATX_HEADING.match(content)
+                            and not THEMATIC_BREAK.match(content)
+                            and not (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content)))
 
 
 def closing_bracket(text, start):
@@ -200,7 +289,7 @@ def link_destination(text, start):
                 continue
             if text[index] == ">":
                 return text[start + 1:index], index + 1
-            if text[index] == "<":
+            if text[index] in "<\n":
                 return None
             index += 1
         return None
@@ -228,7 +317,7 @@ def link_destination(text, start):
 def inline_destination(line, opening):
     """Parse the destination and optional title after a link label's `(`."""
     start = opening + 1
-    while line[start:start + 1] in (" ", "\t"):
+    while line[start:start + 1] in (" ", "\t", "\n"):
         start += 1
     if line[start:start + 1] == ")":
         return "", start + 1
@@ -237,38 +326,17 @@ def inline_destination(line, opening):
         return None
     destination, end = parsed
     tail = end
-    while line[tail:tail + 1] in (" ", "\t"):
+    while line[tail:tail + 1] in (" ", "\t", "\n"):
         tail += 1
     if tail > end and line[tail:tail + 1] in ('"', "'", "("):
         tail = link_title_end(line, tail)
         if tail == -1:
             return None
-        while line[tail:tail + 1] in (" ", "\t"):
+        while line[tail:tail + 1] in (" ", "\t", "\n"):
             tail += 1
     if line[tail:tail + 1] == ")":
         return destination, tail + 1
     return None
-
-
-def inline_destinations(line, masked, depth):
-    """Find link and image targets on this line, carrying open labels within the paragraph."""
-    targets = []
-    index = 0
-    while index < len(masked):
-        char = masked[index]
-        index += 1
-        if char == "\\":
-            index += 1
-        elif char == "[":
-            depth += 1
-        elif char == "]" and depth:
-            depth -= 1
-            if masked[index:index + 1] == "(":
-                parsed = inline_destination(line, index)
-                if parsed is not None:
-                    destination, index = parsed
-                    targets.append(unescape(destination))
-    return targets, depth
 
 
 def link_title_end(text, start):
@@ -298,10 +366,10 @@ def title_only(text):
 def continuation(lines, index, number):
     """Line `index` without block-quote markers if it directly follows line
     `number`, else None."""
-    if index >= len(lines) or lines[index][0] != number + 1:
+    if (index >= len(lines) or lines[index].number != number + 1
+            or lines[index].container_changed):
         return None
-    line = lines[index][1]
-    return line[CONTAINER_PREFIX.match(line).end(1):]
+    return lines[index].content
 
 
 def parse_definition(content, lines, index):
@@ -348,24 +416,18 @@ def reference_definitions(text):
     after it; a title must end on the line it starts on. `[^label]:` starts
     a footnote, not a link.
     """
-    lines = list(unfenced_lines(text))
+    lines = [line for line in document_lines(text) if not line.raw_html]
     definitions = []
     in_paragraph = False
     previous_number = None
-    previous_quoted = False
     index = 0
     while index < len(lines):
-        number, line = lines[index]
-        if previous_number != number - 1:
-            in_paragraph = False  # a fenced block ended the paragraph
-        prefix = CONTAINER_PREFIX.match(line)
-        quoted = bool(prefix.group(1))
-        opens_container = bool(prefix.group(2)) or (quoted and not previous_quoted)
-        block = line[prefix.end(1):]
-        content = line[prefix.end():]
-        previous_number, previous_quoted = number, quoted
+        number, content, opens_container, _, lazy = lines[index]
+        if previous_number != number - 1 or opens_container:
+            in_paragraph = False
+        previous_number = number
         definition = None
-        if not in_paragraph or opens_container:
+        if not in_paragraph:
             definition = parse_definition(content, lines, index)
         if definition is not None:
             consumed, destination_line, label, destination = definition
@@ -377,16 +439,16 @@ def reference_definitions(text):
             continue
         in_paragraph = not (
             not content.strip()
-            or ATX_HEADING.match(block)
-            or THEMATIC_BREAK.match(block)
-            or (in_paragraph and SETEXT_UNDERLINE.match(block))
+            or ATX_HEADING.match(content)
+            or THEMATIC_BREAK.match(content)
+            or (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content))
         )
         index += 1
     return definitions
 
 
-def mask_inline_literals(line):
-    """Mask code spans and link destinations/titles while preserving offsets and link delimiters."""
+def mask_inline_literals(line, targets):
+    """Mask literals and record link destinations with their offsets in this paragraph."""
     out = []
     depth = 0
     index = 0
@@ -412,6 +474,10 @@ def mask_inline_literals(line):
                 if parsed is not None:
                     # Backticks in a destination or title do not start code.
                     end = parsed[1]
+                    target_start = index + 2
+                    while line[target_start:target_start + 1] in (" ", "\t", "\n"):
+                        target_start += 1
+                    targets.append((target_start, unescape(parsed[0])))
                     out.append("](" + " " * (end - index - 3) + ")")
                     index = end
                     continue
@@ -437,34 +503,34 @@ def mask_inline_literals(line):
 def inline_lines(text, definition_lines):
     """Mask code spans across soft line breaks within the same paragraph."""
     paragraph = []
-    quote_depth = 0
-
     def masked_lines():
-        masked = mask_inline_literals("\n".join(line for _, line in paragraph))
+        if not paragraph:
+            return
+        targets = []
+        masked = mask_inline_literals("\n".join(line for _, line in paragraph), targets)
+        starts = []
         start = 0
-        depth = 0
-        for number, line in paragraph:
-            view = masked[start:start + len(line)]
-            targets, depth = inline_destinations(line, view, depth)
-            yield number, line, view, targets
+        for _, line in paragraph:
+            starts.append(start)
             start += len(line) + 1
+        per_line = [[] for _ in paragraph]
+        for offset, destination in targets:
+            per_line[bisect_right(starts, offset) - 1].append(destination)
+        for (number, line), start, found in zip(paragraph, starts, per_line):
+            yield number, line, masked[start:start + len(line)], found
 
-    for number, line in unfenced_lines(text):
-        prefix = CONTAINER_PREFIX.match(line)
-        depth = prefix[1].count(">")
-        content = line[prefix.end():]
+    for number, content, changed, raw_html, lazy in document_lines(text):
         single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
-                      or SETEXT_UNDERLINE.match(content) or content.lstrip().startswith("|"))
-        if (not content.strip() or number in definition_lines or single or prefix[2]
-                or depth != quote_depth or (paragraph and number != paragraph[-1][0] + 1)):
+                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
+        if (not content.strip() or raw_html or number in definition_lines or single or changed
+                or (paragraph and number != paragraph[-1][0] + 1)):
             yield from masked_lines()
             paragraph.clear()
-        if content.strip() and number not in definition_lines:
-            paragraph.append((number, line))
+        if content.strip() and not raw_html and number not in definition_lines:
+            paragraph.append((number, content))
             if single:
                 yield from masked_lines()
                 paragraph.clear()
-        quote_depth = depth
     yield from masked_lines()
 
 
@@ -652,15 +718,15 @@ def document_anchors(text):
     }
     headings = []
     paragraph = []
-    previous_quote_depth = 0
-    for number, line in unfenced_lines(text):
-        quote = CONTAINER_PREFIX.match(line)[1]
-        depth = quote.count(">")
-        if depth != previous_quote_depth:
+    raw_blocks = []
+    for number, line, changed, raw_html, lazy in document_lines(text):
+        if changed:
             paragraph = []
-        previous_quote_depth = depth
-        line = line[len(quote):]
-        if number in definition_lines:
+        if raw_html:
+            if not raw_blocks or changed or raw_blocks[-1][-1][0] != number - 1:
+                raw_blocks.append([])
+            raw_blocks[-1].append((number, line))
+        if raw_html or number in definition_lines:
             paragraph = []
             continue
         atx = ATX_HEADING.match(line)
@@ -668,7 +734,7 @@ def document_anchors(text):
             headings.append(ATX_CLOSING.sub("", atx.group(2) or ""))
             paragraph = []
             continue
-        if paragraph and paragraph[-1][0] == number - 1 and SETEXT_UNDERLINE.match(line):
+        if not lazy and paragraph and paragraph[-1][0] == number - 1 and SETEXT_UNDERLINE.match(line):
             headings.append("\n".join(content for _, content in paragraph))
             paragraph = []
             continue
@@ -689,9 +755,24 @@ def document_anchors(text):
             slug = f"{base}-{occurrences[base]}"
         occurrences[slug] = 0
         anchors.add(slug)
+
+    def collect_html(source):
+        # Skip literal HTML text and comments before looking at real start
+        # tags. A quoted attribute can itself contain markup-shaped text.
+        for token in HTML_TOKENS.finditer(source):
+            if (token["tag"] or "").lower() != "a":
+                continue
+            for attribute in HTML_ATTR.finditer(token["attrs"]):
+                value = attribute[2]
+                if value is not None and attribute[1].lower() in ("id", "name"):
+                    if value[0] in ("'", '"'):
+                        value = value[1:-1]
+                    anchors.add(html.unescape(value))
+
+    for lines in raw_blocks:
+        collect_html("\n".join(line for _, line in lines))
     for _, _, masked, _ in inline_lines(text, definition_lines):
-        for match in HTML_ANCHOR.finditer(masked):
-            anchors.add(match.group(1) if match.group(1) is not None else match.group(2))
+        collect_html(masked)
     return anchors
 
 

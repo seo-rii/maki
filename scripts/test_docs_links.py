@@ -63,6 +63,65 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.Md", "[broken](absent)\n", tracked=False)
         self.assertEqual(broken_links(self.root), ["README.Md:1: absent"])
 
+    def test_multiline_destinations_use_their_source_lines(self):
+        self.write("README.md", "[a](\n  missing.md\n) ![b](also-missing.md)\n\n"
+                   "> [nested](\n> <missing file.md>\n> )\n\n"
+                   "[no](\n\nafter-blank.md)\n\n[broken](<spans\nlines.md>)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: missing.md", "README.md:3: also-missing.md",
+            "README.md:6: missing file.md"])
+
+    def test_network_path_references_are_external(self):
+        self.write("README.md", "[manual](//docs.example.org/manual#topic)\n"
+                   "[other]: //cdn.example.org/sample\n\n[local](/missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: /missing.md"])
+
+    def test_headings_inside_nested_list_and_quote_containers(self):
+        self.write("README.md", "- ## Install\n- > Release\n  > =======\n- Help\n- -----\n\n"
+                   "[one](#install) [two](#release) [separate item](#help)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: #help (missing anchor)"])
+
+    def test_lazy_continuations_keep_paragraph_links_and_definitions(self):
+        self.write("README.md", "- [Release\nnotes](missing.md)\n\n"
+                   "> prose\n[ref]: ignored.md\n\n[go][ref]\n\n"
+                   "- Item\n===\n\n[not a heading](#item)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: missing.md", "README.md:7: [go][ref] (undefined reference)",
+            "README.md:12: #item (missing anchor)"])
+
+    def test_ordered_list_interrupts_a_paragraph_only_when_it_starts_at_one(self):
+        self.write("README.md", "Paragraph\n2. ## Fake\n\n"
+                   "Paragraph\n1. ## Real\n2. ## Second\n\n"
+                   "[a](#fake) [b](#real) [c](#second)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:8: #fake (missing anchor)"])
+
+    def test_unquoted_and_entity_encoded_html_anchor_values(self):
+        self.write("README.md", "<a name=install></a> <A ID='a&amp;b' name=another></A>\n"
+                   "<span title=\"<a id=pretend>\">example</span>\n\n"
+                   "[a](#install) [b](#a%26b) [c](#another) [d](#pretend)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: #pretend (missing anchor)"])
+
+    def test_raw_html_blocks_keep_html_anchors_and_hide_markdown_examples(self):
+        self.write("README.md", "<pre>\n\n[code](missing.md)\n# Code title\n</PRE>\n"
+                   "- <div>\n  <a name=actual></a>\n  [example](hidden.md)\n"
+                   "- [real](missing-real.md)\n\n[ok](#actual) [absent](#code-title)\n"
+                   "<script>\n<a name=script-text>\n</script>\n\n[script](#script-text)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:9: missing-real.md", "README.md:11: #code-title (missing anchor)",
+            "README.md:16: #script-text (missing anchor)"])
+
+    def test_raw_html_blocks_end_at_any_type_one_closing_tag(self):
+        self.write("README.md", "<pre>\n[example](hidden.md)\n</STYLE>\n"
+                   "[real](missing.md)\n\n<script>sample('</textarea>')\n"
+                   "# Visible\n\n[anchor](#visible) [real](absent.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:4: missing.md", "README.md:9: absent.md"])
+
+    def test_github_html_block_tags_interrupt_paragraphs(self):
+        self.write("README.md", "Text\n<source src=demo>\n[example](hidden.md)\n\n"
+                   "Text\n<search>\n[real](missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: missing.md"])
+
     @unittest.skipUnless(os.name == "posix", "Unix byte filenames")
     def test_byte_filename_keeps_other_diagnostics(self):
         name = os.fsdecode(b"notes-\xff.md")
