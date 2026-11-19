@@ -73,6 +73,14 @@ class DocumentationLinks(unittest.TestCase):
                     "README.md:2: local/guide.md", "README.md:2: manual/absent.md",
                 ])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX byte filenames")
+    def test_percent_encoded_filenames_keep_the_original_bytes(self):
+        self.write(os.fsdecode(b"notes\xff.txt"), "notes")
+        self.write("notes�.txt", "replacement")
+        self.write("README.md", "[bytes](notes%FF.txt) [utf8](notes%EF%BF%BD.txt) "
+                   "[missing](notes%FE.txt)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: notes%FE.txt"])
+
     def test_rooted_links_and_external_scheme_case(self):
         self.write("GUIDE.MD", "# Welcome\n")
         self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"

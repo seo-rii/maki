@@ -936,7 +936,10 @@ def broken_links(root):
             return None
         file_part, _, fragment = target.partition("#")
         file_part, _, query = file_part.partition("?")
-        decoded = urllib.parse.unquote(file_part)
+        try:
+            decoded = os.fsdecode(urllib.parse.unquote_to_bytes(file_part))
+        except UnicodeDecodeError:
+            return target  # these bytes cannot name a file on this platform
         if file_part.startswith("/"):
             target_path = root / decoded.lstrip("/")
         else:
