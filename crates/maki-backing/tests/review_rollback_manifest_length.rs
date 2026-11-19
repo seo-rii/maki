@@ -201,3 +201,20 @@ fn sparse_reads_do_not_allocate_zero_pages() {
     assert_eq!(PAGE_ALLOCS.with(Cell::get), before);
     assert!(out.iter().all(|byte| *byte == 0));
 }
+
+#[test]
+fn aligned_writes_to_fresh_pages_do_not_allocate_a_scratch_page_per_page() {
+    let root = tempfile::tempdir().unwrap();
+    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 32 * PAGE).unwrap();
+    let file = backing.open("fresh", true).unwrap();
+    let data: Vec<u8> = (0..32 * PAGE).map(|offset| (offset % 251) as u8).collect();
+    file.allocate_range(0, data.len() as u64).unwrap();
+    let before = PAGE_ALLOCS.with(Cell::get);
+    file.write_at(0, &data).unwrap();
+    assert_eq!(PAGE_ALLOCS.with(Cell::get), before);
+    file.sync_data().unwrap();
+    let mut read = vec![0; data.len()];
+    file.read_at(0, &mut read).unwrap();
+    assert_eq!(read, data);
+}

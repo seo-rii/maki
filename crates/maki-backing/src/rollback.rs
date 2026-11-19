@@ -878,12 +878,18 @@ impl BackingFile for CowFile {
         let mut at = offset;
         while at < end {
             let page = state.page_ref(self.id, at / PAGE)?;
-            let mut bytes = state.page(page)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
-            let start = (at % PAGE) as usize;
             let src = (at - offset) as usize;
-            bytes[start..start + count].copy_from_slice(&data[src..src + count]);
-            state.write_page(self.id, at / PAGE, &bytes)?;
+            let fragment = &data[src..src + count];
+            if page.is_none() && count == PAGE as usize {
+                state.write_page(self.id, at / PAGE, fragment)?;
+            } else {
+                // Read and authenticate mapped pages even on a full overwrite.
+                let mut bytes = state.page(page)?;
+                let start = (at % PAGE) as usize;
+                bytes[start..start + count].copy_from_slice(fragment);
+                state.write_page(self.id, at / PAGE, &bytes)?;
+            }
             at += count as u64;
         }
         Ok(())
