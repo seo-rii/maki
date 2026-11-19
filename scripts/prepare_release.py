@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -31,8 +30,8 @@ def run(command, *, cwd=None, env=None):
     return result.stdout.strip()
 
 
-def git_command(*args):
-    return ["git", "--no-replace-objects", "-C", str(ROOT), *args]
+def git_command(*args, repo=None):
+    return ["git", "--no-replace-objects", "-C", str(ROOT if repo is None else repo), *args]
 
 
 def git(*args):
@@ -44,12 +43,12 @@ def digest(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def archive_source(destination, commit, prefix, epoch):
+def archive_source(destination, commit, prefix, epoch, *, repo=None):
     # Read the committed blobs directly. git archive applies checkout-local
     # attributes such as export-ignore and export-subst to the same tree.
-    listing = subprocess.check_output(git_command("ls-tree", "-rz", "-t", commit))
+    listing = subprocess.check_output(git_command("ls-tree", "-rz", "-t", commit, repo=repo))
     with tarfile.open(destination, "w", pax_headers={"comment": commit}) as archive, \
-            subprocess.Popen(git_command("cat-file", "--batch"),
+            subprocess.Popen(git_command("cat-file", "--batch", repo=repo),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as blobs:
         directory = tarfile.TarInfo(prefix)
         directory.type = tarfile.DIRTYPE
@@ -66,16 +65,23 @@ def archive_source(destination, commit, prefix, epoch):
                 member.mode = 0o755
                 archive.addfile(member)
                 continue
-            if mode not in (b"100644", b"100755"):
+            if mode not in (b"100644", b"100755", b"120000"):
                 fail(f"unsupported source archive entry: {member.name}")
             blobs.stdin.write(oid + b"\n")
             blobs.stdin.flush()
             header = blobs.stdout.readline().split()
             if len(header) != 3 or header[:2] != [oid, b"blob"]:
                 fail(f"cannot read committed blob for {member.name}")
-            member.size = int(header[2])
-            member.mode = 0o755 if mode == b"100755" else 0o644
-            archive.addfile(member, blobs.stdout)
+            size = int(header[2])
+            if mode == b"120000":
+                member.type = tarfile.SYMTYPE
+                member.mode = 0o777
+                member.linkname = os.fsdecode(blobs.stdout.read(size))
+                archive.addfile(member)
+            else:
+                member.size = size
+                member.mode = 0o755 if mode == b"100755" else 0o644
+                archive.addfile(member, blobs.stdout)
             if blobs.stdout.read(1) != b"\n":
                 fail(f"incomplete committed blob for {member.name}")
         blobs.stdin.close()
@@ -84,6 +90,8 @@ def archive_source(destination, commit, prefix, epoch):
 
 
 def candidate_source_version():
+    import tomllib
+
     # Capture only a committed source tree. Untracked files are excluded by
     # the selected Git tree, and staged/unstaged tracked changes must not be mistaken
     # for source included in this candidate.
