@@ -361,14 +361,12 @@ def worker(directory):
 
 
 def freeze_source(repo, revision, archive, source):
-    # Only start needs the archive writer. The detached worker is a standalone copy.
+    # The detached worker is a standalone copy; only the launcher needs this module.
     try:
-        from prepare_release import archive_source, git_command
+        from qualification_source import extract_revision
     except ModuleNotFoundError:
-        from scripts.prepare_release import archive_source, git_command
-    epoch = int(subprocess.check_output(git_command("show", "-s", "--format=%ct", revision, repo=repo)))
-    archive_source(archive, revision, ".", epoch, repo=repo)
-    subprocess.run(["tar", "--no-same-owner", "-xpf", str(archive), "-C", str(source)], check=True)
+        from scripts.qualification_source import extract_revision
+    extract_revision(repo, revision, archive, source)
 
 
 def start(args):

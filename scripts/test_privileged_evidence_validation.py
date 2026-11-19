@@ -68,14 +68,18 @@ sudo() { echo later-edit > "$REPO_ROOT/version"; }
                     return subprocess.check_output(["git", "-C", str(repo), *arguments], text=True).strip()
                 git("init", "-q")
                 (repo / "scripts").mkdir()
+                for name in ("qualification_source.py", "prepare_release.py"):
+                    shutil.copyfile(Path(__file__).with_name(name), repo / "scripts" / name)
                 worker = repo / "scripts/privileged-linux-validation.sh"
                 worker.write_text('#!/bin/sh\ncd "$(dirname "$0")/.."\n'
                                   'test ! -e extra && cp version ../result.tmp && mv ../result.tmp ../worker-result\n')
                 worker.chmod(0o755)
-                (repo / "version").write_text("qualified\n")
+                (repo / "version").write_text("qualified $Format:%H$\n")
+                (repo / "fixture-data").write_text("required\n")
                 git("add", ".")
                 git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
                     "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+                (repo / ".git/info/attributes").write_text("version export-subst\nfixture-data export-ignore\n")
                 (repo / "extra").touch()
                 logs = root / "logs"
                 result = subprocess.run(["bash", "-c", setup + launcher], capture_output=True,
@@ -87,7 +91,9 @@ sudo() { echo later-edit > "$REPO_ROOT/version"; }
                 deadline = time.monotonic() + 5
                 while not output.exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
-                self.assertEqual(output.read_text(), "qualified\n")
+                self.assertEqual(output.read_text(), "qualified $Format:%H$\n")
+                self.assertEqual((live / "source/fixture-data").read_text(), "required\n")
+                self.assertEqual((live / "source").stat().st_mode & 0o777, 0o700)
                 self.assertEqual((repo / "version").read_text(), "later-edit\n")
                 second = root / "other-logs"
                 rejected = subprocess.run(["bash", "-c", setup + launcher], capture_output=True,
