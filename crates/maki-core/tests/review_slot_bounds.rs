@@ -6,6 +6,7 @@ use maki_backing::{Backing, FileBacking, MemBacking};
 use maki_core::error::CoreError;
 use maki_core::store::{SlotRead, SlotStore};
 use maki_core::volume::{Volume, VolumeOptions};
+use maki_format::{ab::AbStore, allocation::AllocationMap};
 use maki_format::{geometry::Geometry, init, layout, superblock::Superblock};
 
 fn store(
@@ -226,4 +227,26 @@ fn ciphertext_and_sequence_reads_reject_out_of_range_units() {
             ));
         }
     }
+}
+
+#[test]
+fn first_allocated_unit_ignores_unused_tail_of_last_shard() {
+    let (backing, geometry, mut store, _dir) = store(false, 6);
+    store.reserve_slot(5).unwrap();
+    drop(store);
+    for (shard, bit) in [(0, None), (1, Some(3))] {
+        let copies = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard));
+        let mut map = AllocationMap::new(geometry.units_per_shard());
+        if let Some(bit) = bit {
+            map.set(bit, true);
+        }
+        copies.store(backing.as_ref(), &mut map).unwrap();
+        copies.store(backing.as_ref(), &mut map).unwrap();
+    }
+
+    let mut store = SlotStore::open(backing, geometry).unwrap();
+    assert_eq!(store.first_allocated_unit(), None);
+    assert_eq!(store.allocated_units().next(), None);
+    store.mark_allocated(5).unwrap();
+    assert_eq!(store.first_allocated_unit(), Some(5));
 }

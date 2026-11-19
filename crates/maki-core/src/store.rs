@@ -863,7 +863,7 @@ impl SlotStore {
             if shard.alloc.set_count() == 0 {
                 continue;
             }
-            if let Some(in_shard) = (0..shard.alloc.units()).find(|u| {
+            if let Some(in_shard) = (0..addressable_units(&self.geometry, shard_idx)).find(|u| {
                 shard.alloc.get(*u)
                     && !shard
                         .discard
