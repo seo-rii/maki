@@ -59,6 +59,11 @@ class DocumentationLinks(unittest.TestCase):
                 self.assertEqual(broken_links(self.root),
                                  [f"README.md:{len(content.splitlines())}: gone.md"])
 
+    def test_network_path_references_are_external(self):
+        self.write("README.md", "[manual](//docs.example.org/manual#topic)\n"
+                   "[other]: //cdn.example.org/sample\n\n[local](/missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: /missing.md"])
+
     def test_mixed_case_markdown_extensions(self):
         self.write("README.Md", "[broken](absent)\n", tracked=False)
         self.assertEqual(broken_links(self.root), ["README.Md:1: absent"])

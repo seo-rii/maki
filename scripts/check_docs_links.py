@@ -40,7 +40,7 @@ import sys
 import unicodedata
 import urllib.parse
 
-SKIP_PREFIXES = ("http://", "https://", "mailto:")
+SKIP_PREFIXES = ("http://", "https://", "mailto:", "//")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
