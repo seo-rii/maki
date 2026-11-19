@@ -16,8 +16,7 @@ when its label is unused or repeated. A full or collapsed reference
 (`[text][label]`, `[label][]`) whose label no definition of the same document
 matches (case-insensitively, whitespace collapsed) is reported: GitHub renders
 it as literal bracketed text. An undefined shortcut (`[label]`) is ordinary
-text and is not reported. Multi-line titles and full reference labels are not parsed,
-and indented code blocks are not distinguished from list-item content.
+text and is not reported. Multi-line titles and full reference labels are not parsed.
 
 A fragment, in-page (`#anchor`) or on another Markdown file (`other.md#anchor`),
 must name exactly a heading slug as GitHub computes it, or an explicit
@@ -48,10 +47,7 @@ ENTITY = re.compile(r"&(?:#[xX][0-9A-Fa-f]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]+
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
-# Lines that cannot continue a paragraph into a setext heading: indented
-# code, block quotes, ATX headings, tables and list items. document_lines()
-# already classifies raw HTML blocks, leaving inline tags and autolinks here.
-NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:>|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
+CODE_INDENT = re.compile(r"^(?: {4}| {0,3}\t)")
 HTML_ATTR = re.compile(r"""([A-Za-z_:][\w.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?""", re.ASCII)
 HTML_OPEN = rf"<(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?P<attrs>(?:\s+{HTML_ATTR.pattern})*)\s*/?>"
 HTML_CLOSE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")
@@ -234,6 +230,10 @@ def document_lines(text):
         if block:
             in_paragraph = False
             continue
+        # Indented code can start after a block boundary, but cannot
+        # interrupt an open paragraph, including one inside a container.
+        if not in_paragraph and CODE_INDENT.match(content):
+            continue
         yield SourceLine(number, content, changed, False, lazy)
         in_paragraph = bool(content.strip() and not ATX_HEADING.match(content)
                             and not THEMATIC_BREAK.match(content)
@@ -259,7 +259,7 @@ def block_lines(text):
         if line.container_changed or not index or line.number != lines[index - 1].number + 1:
             width = 0
             after_table = False
-        indented = re.match(r"^(?: {4}| {0,3}\t)", value)
+        indented = CODE_INDENT.match(value)
         if (width or after_table) and (not value.strip() or indented):
             # A blank ends the table. Four columns start a literal code block,
             # including when the first such line follows a table row directly.
@@ -888,7 +888,7 @@ def document_anchors(text):
             headings.append("\n".join(content for _, content in paragraph))
             paragraph = []
             continue
-        if not line.strip() or NOT_PARAGRAPH.match(line):
+        if not line.strip() or THEMATIC_BREAK.fullmatch(line):
             paragraph = []
             continue
         if paragraph and paragraph[-1][0] != number - 1:
