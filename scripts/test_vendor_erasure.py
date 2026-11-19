@@ -158,6 +158,24 @@ class VendorErasureContract(unittest.TestCase):
         (self.root / "Cargo.toml").write_text("[patch.crates-io]\n")
         self.assertTrue(check(self.root, self.metadata))
 
+    def test_public_fixture_roots_require_a_provenance_entry_for_each_file(self):
+        vendor = self.root / "vendor"
+        records = {}
+        for directory in ("test-ca", "rustls/src/testdata", "fuzz/corpus/message", "rustls-provider-test/tests"):
+            path = vendor / directory / "new.bin"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"new public fixture")
+            rel = path.relative_to(vendor).as_posix()
+            records[rel] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            self.assertIn(f"rustls: public test fixture missing from provenance: {rel}",
+                          check(self.root, self.metadata))
+        (vendor / "test-ca-provenance.json").write_text(json.dumps({"files": records}))
+        # rustls/src/testdata is also covered by the package's source inventory.
+        patches = json.loads((vendor / "patches.json").read_text())
+        patches["packages"]["rustls"]["files"]["src/testdata/new.bin"] = records["rustls/src/testdata/new.bin"]["sha256"]
+        (vendor / "patches.json").write_text(json.dumps(patches))
+        self.assertEqual(check(self.root, self.metadata), [])
+
     def test_public_test_fixture_changes_are_rejected(self):
         path = self.root / "vendor/test-ca"
         path.mkdir()
