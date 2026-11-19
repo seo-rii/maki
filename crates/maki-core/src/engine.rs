@@ -1051,8 +1051,12 @@ impl Engine {
             let mut cached = HashMap::new();
             let mut cts = Vec::new();
             let mut seqs = HashMap::new();
+            let cache = inner
+                .cache
+                .as_ref()
+                .filter(|cache| cache.can_hold(unit_size));
             for unit in first..=last {
-                match &inner.cache {
+                match cache {
                     Some(cache) if !inner.cache_verify_on_hit => {
                         match volume.current_sequence(unit)? {
                             None => continue,
@@ -1093,12 +1097,6 @@ impl Engine {
         .await??;
         let mut plain = self.decrypt_units(cts).await?;
 
-        if let Some(cache) = &self.inner.cache {
-            for (unit, buf) in plain.iter() {
-                cache.put(*unit, seqs[unit], buf.duplicate());
-            }
-        }
-
         let mut out = SecretBuffer::zeroed(len);
         let mut cursor = 0usize;
         for unit in first..=last {
@@ -1108,6 +1106,9 @@ impl Engine {
             let dst = &mut out.expose_mut()[cursor..cursor + (to - from)];
             if let Some(buf) = plain.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);
+                if let Some(cache) = &self.inner.cache {
+                    cache.put(unit, seqs[&unit], buf);
+                }
             } else if let Some(buf) = cached.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);
             }

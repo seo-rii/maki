@@ -288,12 +288,13 @@ fn probe_shard(
     geometry: &Geometry,
     shard: &Shard,
     shard_idx: u64,
+    in_device: u64,
     progress: &crate::recovery::RecoveryProgress<'_>,
 ) -> Result<Vec<u64>, CoreError> {
     let len = shard.data.len()?;
     let per_shard = geometry.units_per_shard();
     let mut out = Vec::new();
-    for in_shard in 0..shard.alloc.units() {
+    for in_shard in 0..in_device {
         if in_shard > 0 && in_shard.is_multiple_of(256) {
             progress();
         }
@@ -545,8 +546,6 @@ impl SlotStore {
                     layout::shard_discard_b(shard_idx),
                     &geometry,
                 );
-                let (discard_a, discard_b) =
-                    discard_ab.side_generations::<AllocationMap>(backing.as_ref())?;
                 let discard = discard_ab
                     .load::<AllocationMap>(backing.as_ref())?
                     .ok_or_else(|| {
@@ -562,7 +561,6 @@ impl SlotStore {
                 // Both sides may decode yet diverge after an interrupted
                 // two-copy publication. Always rewrite the selected logical
                 // state into both copies before journal reclamation/punching.
-                let _ = (discard_a, discard_b);
                 shard.dirty_discard = true;
             }
             // With one copy invalid or absent the loaded copy may be the
@@ -571,7 +569,7 @@ impl SlotStore {
             // by the next allocation persist). Healthy shards (both copies
             // valid) skip this.
             if side_a.is_none() || side_b.is_none() {
-                let found = probe_shard(&geometry, &shard, shard_idx, progress)?;
+                let found = probe_shard(&geometry, &shard, shard_idx, in_device, progress)?;
                 if !found.is_empty() {
                     tracing::warn!(
                         shard = shard_idx,
@@ -816,14 +814,14 @@ impl SlotStore {
         let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
-            (0..shard.alloc.units()).filter_map(move |in_shard| {
-                (shard_idx * per_shard + in_shard < units
-                    && shard.alloc.get(in_shard)
+            let base = shard_idx * per_shard;
+            (0..per_shard.min(units - base)).filter_map(move |in_shard| {
+                (shard.alloc.get(in_shard)
                     && !shard
                         .discard
                         .as_ref()
                         .is_some_and(|discard| discard.get(in_shard)))
-                .then_some(shard_idx * per_shard + in_shard)
+                .then_some(base + in_shard)
             })
         })
     }
@@ -839,15 +837,14 @@ impl SlotStore {
         let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
-            (0..shard.alloc.units()).filter_map(move |in_shard| {
-                let unit = shard_idx * per_shard + in_shard;
-                (unit < units
-                    && !shard.alloc.get(in_shard)
+            let base = shard_idx * per_shard;
+            (0..per_shard.min(units - base)).filter_map(move |in_shard| {
+                (!shard.alloc.get(in_shard)
                     && !shard
                         .discard
                         .as_ref()
                         .is_some_and(|discard| discard.get(in_shard)))
-                .then_some(unit)
+                .then_some(base + in_shard)
             })
         })
     }

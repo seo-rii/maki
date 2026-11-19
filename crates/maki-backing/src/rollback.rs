@@ -104,6 +104,13 @@ struct Manifest {
 }
 
 impl Manifest {
+    fn reserved_pages(&self) -> u64 {
+        self.files
+            .values()
+            .map(|file| file.reserved.len() as u64)
+            .sum()
+    }
+
     fn encode(&self) -> io::Result<Vec<u8>> {
         let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
         if bytes.len() as u64 + 8 > manifest_bound(self.capacity) {
@@ -199,6 +206,9 @@ struct State {
     _disk_lock: Box<dyn VolumeLock>,
     committed: Manifest,
     manifest_slot: usize,
+    // Every working reservation is published before reserve() returns. A
+    // shrink/punch only releases committed capacity after its own sync.
+    reserved_pages: u64,
     entries: BTreeMap<String, Entry>,
     files: BTreeMap<u64, Node>,
     handles: BTreeMap<u64, usize>,
@@ -476,6 +486,7 @@ impl RollbackBacking {
         Self {
             state: Arc::new(Mutex::new(State {
                 committed_slots: slots_of(manifest.files.values()),
+                reserved_pages: manifest.reserved_pages(),
                 used_slots: None,
                 free_hint: 0,
                 entries: manifest.entries.clone(),
@@ -544,6 +555,7 @@ impl State {
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     fn coordinates(&self) -> BTreeSet<(u64, u64)> {
         self.committed
             .files
@@ -618,6 +630,7 @@ impl State {
             self.poisoned = true;
             return Err(error);
         }
+        self.reserved_pages = candidate.reserved_pages();
         self.committed = candidate;
         self.manifest_slot = slot;
         self.files.retain(|id, _| retain.contains(id));
@@ -651,17 +664,17 @@ impl State {
             return Ok(());
         }
         self.reclaim_closed_files()?;
-        let mut coordinates = self.coordinates();
-        coordinates.extend(range.clone().map(|index| (id, index)));
-        if coordinates.len() as u64 > self.committed.capacity / PAGE {
+        let durable = self.committed.files.get(&id);
+        let additional = range
+            .clone()
+            .filter(|index| !durable.is_some_and(|file| file.reserved.contains(index)))
+            .count() as u64;
+        if additional > self.committed.capacity / PAGE - self.reserved_pages {
             return Err(no_space());
         }
         let mut candidate = self.committed.clone();
         let durable = candidate.files.entry(id).or_default();
-        let changed = range
-            .clone()
-            .any(|index| !durable.reserved.contains(&index));
-        if changed {
+        if additional != 0 {
             durable.reserved.extend(range.clone());
             // Allocation itself may persist EOF, but never unsynced bytes.
             durable.len = durable.len.max(end);
@@ -1052,9 +1065,7 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.reclaim_closed_files()?;
-        Ok(Some(
-            state.committed.capacity - state.coordinates().len() as u64 * PAGE,
-        ))
+        Ok(Some(state.committed.capacity - state.reserved_pages * PAGE))
     }
 }
 

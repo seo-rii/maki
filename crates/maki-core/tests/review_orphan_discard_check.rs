@@ -161,3 +161,40 @@ fn orphan_discard_io_error_remains_inconclusive() {
         matches!(check_volume(&backing), Err(FormatError::Io(error)) if error.raw_os_error() == Some(24))
     );
 }
+
+#[test]
+fn opening_partial_shards_reads_only_logical_headers_and_each_discard_copy_once() {
+    use maki_core::store::SlotStore;
+
+    let open_bytes = |logical_units: u64, discard, missing_alloc| {
+        let backing = Arc::new(CrashableBacking::new());
+        let mut sb = block();
+        sb.geometry = Geometry::compute(512, 1024, 512, 1032, 1024 * logical_units, 8192).unwrap();
+        let geometry = sb.geometry.clone();
+        if discard {
+            init::create_volume_with_discard(backing.as_ref(), sb).unwrap();
+        } else {
+            init::create_volume(backing.as_ref(), sb).unwrap();
+        }
+        let mut store = SlotStore::open(backing.clone(), geometry.clone()).unwrap();
+        store.reserve_slot(0).unwrap();
+        drop(store);
+        if missing_alloc {
+            backing.remove(&layout::shard_alloc_b(0)).unwrap();
+        }
+        let before = backing.read_bytes();
+        SlotStore::open(backing.clone(), geometry).unwrap();
+        backing.read_bytes() - before
+    };
+
+    // Same physical data file and metadata sizes; only seven additional
+    // addressable headers separate a full shard from its one-unit tail.
+    assert_eq!(
+        open_bytes(8, false, true) - open_bytes(1, false, true),
+        7 * 64
+    );
+    assert_eq!(
+        open_bytes(1, true, false) - open_bytes(1, false, false),
+        2 * AllocationMap::encoded_len(8)
+    );
+}

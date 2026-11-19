@@ -126,33 +126,41 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     // to an older catalog copy. Recovery adopts it and serves its slots
     // (S-01); one beyond the geometry is never read. Only the canonical
     // spelling is a shard file, exactly as recovery parses it.
-    if backing.exists(layout::DATA_DIR)? {
-        for name in backing.list(layout::DATA_DIR)? {
-            let Some(idx) = layout::parse_shard_data(&name) else {
-                continue;
-            };
-            if catalog.contains(idx) {
-                continue;
-            }
-            let warning = if idx < geometry.num_shards() {
-                let adoptable = envelope.metadata_version != SUPERBLOCK_VERSION_V3
-                    || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
-                format!(
-                    "shard data file {name} (index {idx}) is not in the catalog; {}",
-                    if adoptable {
-                        "recovery adopts it"
-                    } else {
-                        "invalid discard metadata prevents recovery from adopting it"
-                    }
-                )
-            } else {
-                format!(
-                    "shard data file {name} (index {idx}) lies beyond the volume \
-                     geometry and is ignored"
-                )
-            };
-            report.warnings.push(warning);
+    let entries = match backing.list(layout::DATA_DIR) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report
+                .errors
+                .push("required data directory is missing".into());
+            return Ok(report);
         }
+        Err(error) => return Err(error.into()),
+    };
+    for name in entries {
+        let Some(idx) = layout::parse_shard_data(&name) else {
+            continue;
+        };
+        if catalog.contains(idx) {
+            continue;
+        }
+        let warning = if idx < geometry.num_shards() {
+            let adoptable = envelope.metadata_version != SUPERBLOCK_VERSION_V3
+                || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
+            format!(
+                "shard data file {name} (index {idx}) is not in the catalog; {}",
+                if adoptable {
+                    "recovery adopts it"
+                } else {
+                    "invalid discard metadata prevents recovery from adopting it"
+                }
+            )
+        } else {
+            format!(
+                "shard data file {name} (index {idx}) lies beyond the volume \
+                     geometry and is ignored"
+            )
+        };
+        report.warnings.push(warning);
     }
 
     Ok(report)
