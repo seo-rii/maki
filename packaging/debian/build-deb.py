@@ -342,6 +342,7 @@ def create_tree(package_root, args):
         if source.is_file():
             relative = source.relative_to(ROOT / "packaging/examples")
             install_file(source, package_root / "usr/share/doc/maki/examples" / relative, 0o644)
+    install_file(ROOT / "packaging/debian/copyright", package_root / "usr/share/doc/maki/copyright", 0o644)
 
     depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd", "kmod"]
     if args.shlibdeps:

@@ -219,6 +219,18 @@ class DebianPackageTests(unittest.TestCase):
 
     # --- R4-003: removal must not orphan a live attachment -----------------
 
+    def test_installs_the_project_and_dependency_copyright_notice(self):
+        root, _ = self.extract(self.build())
+        notice = root / "usr/share/doc/maki/copyright"
+        self.assertTrue(notice.is_file())
+        self.assertFalse(notice.is_symlink())
+        self.assertEqual(stat.S_IMODE(notice.stat().st_mode), 0o644)
+        self.assertEqual(notice.read_bytes(), (ROOT / "packaging/debian/copyright").read_bytes())
+        text = notice.read_text(encoding="utf-8")
+        self.assertIn("https://github.com/seo-rii/maki", text)
+        self.assertIn("/usr/share/common-licenses/Apache-2.0", text)
+        self.assertIn((ROOT / "vendor/bytes/LICENSE").read_text().strip(), text)
+
     def test_prerm_refuses_removal_while_a_volume_is_attached(self):
         package = self.build()
         _, control = self.extract(package, "prerm-record")

@@ -29,7 +29,14 @@ complete history before building. Existing packages made with the old
 [explicitly reviewed one-time downgrade migration](../../docs/releasing.md#migrating-legacy-source-build-packages).
 
 The package installs the daemon, helper, checker, plugin, service templates,
-sysusers/tmpfiles rules, and examples. It deliberately owns no file below
+sysusers/tmpfiles rules, examples and a plain UTF-8 copyright notice at
+`/usr/share/doc/maki/copyright`. When changing dependencies, release crate
+features or supported targets, run `python3 packaging/debian/update-copyright.py`
+and review the updated notices alongside the dependency changes. This
+maintenance step uses Cargo; assembling the package uses the checked-in notice.
+Review additional notices from toolchain components or custom linked inputs
+for the actual release as described in [the release handoff](../../docs/releasing.md#qualification-and-publication-handoff).
+The package deliberately owns no file below
 `/etc/maki`, does not enable a volume, and does not start or restart a service
 during install or upgrade. Stop and detach the workload with the old package,
 install the new package, update root-controlled configuration if required, and
