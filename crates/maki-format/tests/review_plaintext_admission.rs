@@ -124,7 +124,8 @@ fn budget_matches_all_requests_in_small_geometries() {
 #[test]
 fn the_largest_power_of_two_wire_request_does_not_wrap_the_charge() {
     let mut cfg = config(4096, 512, 1 << 31, 1 << 32);
-    cfg.limits.max_plaintext_bytes.0 = u64::from(u32::MAX >> 1);
+    cfg.limits.max_plaintext_bytes.0 =
+        u64::from(u32::MAX >> 1).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
     cfg.limits.max_ciphertext_bytes.0 = cfg.limits.max_plaintext_bytes.0;
     cfg.backing.journal_max_bytes.0 = 64 << 30;
     let error = cfg.validate().unwrap_err().to_string();

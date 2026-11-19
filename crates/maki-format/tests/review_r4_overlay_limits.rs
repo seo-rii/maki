@@ -87,7 +87,9 @@ fn the_overlay_bound_does_not_constrain_the_admission_budget() {
     // The admission budget may be far larger than the overlay bound: the
     // largest single request, not the budget, is what must fit.
     let mut cfg = config("");
-    cfg.limits.max_plaintext_bytes.0 = (u32::MAX >> 1) as u64;
-    cfg.limits.max_ciphertext_bytes.0 = (u32::MAX >> 1) as u64;
+    cfg.limits.max_plaintext_bytes.0 =
+        u64::from(u32::MAX >> 1).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+    cfg.limits.max_ciphertext_bytes.0 =
+        u64::from(u32::MAX >> 1).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
     cfg.validate().unwrap();
 }

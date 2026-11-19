@@ -378,7 +378,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         let max_pending_items = config.max_pending_items.max(1);
         let (tx, rx) = mpsc::channel::<Group<I, O>>(max_pending_items as usize);
         let inflight = Arc::new(tokio::sync::Semaphore::new(
-            config.max_inflight_batches.max(1) as usize,
+            (config.max_inflight_batches.max(1) as usize).min(tokio::sync::Semaphore::MAX_PERMITS),
         ));
         let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
         let max_admit_logical_bytes = config.max_bytes;

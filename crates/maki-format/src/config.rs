@@ -1808,12 +1808,17 @@ impl VolumeConfig {
             if value == 0 {
                 return Err(invalid(format!("{name} must be positive")));
             }
-            // Match DualSemaphore's supported byte capacity. A larger TOML
-            // budget would be silently truncated before runtime admission.
-            if name.contains("_bytes") && value > (u32::MAX as u64 >> 1) {
+            // Keep both budgets representable by Tokio on this target. Byte
+            // budgets also retain DualSemaphore's per-acquire ceiling.
+            let max_permits = tokio::sync::Semaphore::MAX_PERMITS as u64;
+            let capacity = if name.contains("_bytes") {
+                max_permits.min(u64::from(u32::MAX >> 1))
+            } else {
+                max_permits
+            };
+            if value > capacity {
                 return Err(invalid(format!(
-                    "{name} ({value}) exceeds the admission capacity of {} bytes",
-                    u32::MAX as u64 >> 1
+                    "{name} ({value}) exceeds the admission capacity of {capacity}"
                 )));
             }
         }

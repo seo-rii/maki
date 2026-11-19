@@ -74,7 +74,7 @@ fn ciphertext_budgets_cover_the_largest_logically_allowed_batch() {
 
 #[test]
 fn configured_byte_limits_cannot_exceed_runtime_semaphore_capacity() {
-    let supported = (u32::MAX >> 1) as u64;
+    let supported = u64::from(u32::MAX >> 1).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
     let mut cfg = config(1, 4096, 4384);
     cfg.limits.max_plaintext_bytes.0 = supported;
     cfg.limits.max_ciphertext_bytes.0 = supported;
