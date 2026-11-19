@@ -73,7 +73,8 @@ fn handler_with_canary_key(seed: u8, canary_seed: u8, unavailable: Arc<AtomicBoo
         )
     })
 }
-fn config(root: &str, urls: &[String]) -> String {
+fn config(root: &std::path::Path, urls: &[String]) -> String {
+    let root = serde_json::to_string(root).unwrap();
     let endpoints: String = urls
         .iter()
         .enumerate()
@@ -137,12 +138,24 @@ type = "json"
 data_path = "/data"
 encoding = "base64"
 [backing]
-root = "{root}"
+root = {root}
 journal_emergency_reserve_bytes = "0B"
 [cache]
 mode = "off"
 "#
     )
+}
+
+#[test]
+fn config_preserves_native_path_characters() {
+    for root in [
+        r"C:\Users\runner\AppData\Local\Temp\volume",
+        r#"/tmp/a "quoted" path"#,
+    ] {
+        let parsed =
+            maki_format::config::parse_config(&config(std::path::Path::new(root), &[])).unwrap();
+        assert_eq!(parsed.backing.root, root);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -151,10 +164,7 @@ async fn different_real_volume_keys_are_rejected_before_serving_io() {
     let b = TestServer::start(handler(0x22, Arc::new(AtomicBool::new(false)))).await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("volume");
-    let raw = config(
-        &root.to_string_lossy().replace('\\', "/"),
-        &[a.url(), b.url()],
-    );
+    let raw = config(&root, &[a.url(), b.url()]);
     let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
     let sb = maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     assert!(!sb.volume_uuid.is_nil());
@@ -172,10 +182,7 @@ async fn matching_real_volume_keys_keep_failover_reads_intact() {
     let b = TestServer::start(handler(0x11, Arc::new(AtomicBool::new(false)))).await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("volume");
-    let raw = config(
-        &root.to_string_lossy().replace('\\', "/"),
-        &[a.url(), b.url()],
-    );
+    let raw = config(&root, &[a.url(), b.url()]);
     let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     let (engine, _, endpoints) = maki_nbdkit::daemon::attach_from_config_with_stats(&config)
@@ -203,10 +210,7 @@ async fn every_endpoint_must_match_the_reserved_canary_key() {
     .await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("volume");
-    let raw = config(
-        &root.to_string_lossy().replace('\\', "/"),
-        &[a.url(), b.url()],
-    );
+    let raw = config(&root, &[a.url(), b.url()]);
     let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     let result = maki_nbdkit::daemon::attach_from_config(&config).await;
@@ -244,10 +248,7 @@ async fn endpoint_validation_uses_real_identity_under_the_volume_lock() {
         });
         servers.push(TestServer::start(observed).await);
     }
-    let raw = config(
-        &root.to_string_lossy().replace('\\', "/"),
-        &servers.iter().map(|s| s.url()).collect::<Vec<_>>(),
-    );
+    let raw = config(&root, &servers.iter().map(|s| s.url()).collect::<Vec<_>>());
     let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     let engine = maki_nbdkit::daemon::attach_from_config(&config)
@@ -264,10 +265,7 @@ async fn recovered_quarantined_endpoint_must_match_the_canary() {
     let b = TestServer::start(handler_with_canary_key(0x11, 0x22, unavailable.clone())).await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("volume");
-    let raw = config(
-        &root.to_string_lossy().replace('\\', "/"),
-        &[a.url(), b.url()],
-    );
+    let raw = config(&root, &[a.url(), b.url()]);
     let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     let (engine, _, endpoints) = maki_nbdkit::daemon::attach_from_config_with_stats(&config)
@@ -309,7 +307,7 @@ async fn bounded_error_retries_a_transient_failure_while_time_remains() {
     }))
     .await;
     let dir = tempfile::tempdir().unwrap();
-    let raw = config(dir.path().join("vol").to_str().unwrap(), &[server.url()])
+    let raw = config(&dir.path().join("vol"), &[server.url()])
         .replace(r#"initial_delay = "1ms""#, r#"initial_delay = "1100ms""#)
         .replace(r#"max_delay = "20ms""#, r#"max_delay = "1100ms""#);
     let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
