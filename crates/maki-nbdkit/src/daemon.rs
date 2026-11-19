@@ -1126,6 +1126,21 @@ pub(crate) async fn attach_from_config_with_progress(
 > {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
+    attach_hardened(config, progress, None).await
+}
+
+async fn attach_hardened(
+    config: &VolumeConfig,
+    progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+    prepared_local: Option<Arc<dyn CryptoProvider>>,
+) -> Result<
+    (
+        Engine,
+        Option<Arc<maki_crypto::scheduler::SchedulerStats>>,
+        Option<Arc<EndpointSet>>,
+    ),
+    DaemonError,
+> {
     // Every cataloged shard keeps a descriptor (BUG-124). A refusal leaves
     // the inherited limit; an open that then fails reports EMFILE.
     if let Err(e) = maki_backing::raise_open_file_limit() {
@@ -1146,7 +1161,10 @@ pub(crate) async fn attach_from_config_with_progress(
         .map_err(AttachError::from)?,
     );
     validate_recovered_geometry(config, &volume)?;
-    let (provider, endpoints) = build_provider_for_volume(config, Some(&volume)).await?;
+    let (provider, endpoints) = match prepared_local {
+        Some(provider) => (provider, None),
+        None => build_provider_for_volume(config, Some(&volume)).await?,
+    };
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
             provider,
@@ -1216,17 +1234,37 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
 /// `maki volume create`: initialize the on-disk layout for a configured
 /// volume.
 pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
-    create_volume_from_config(raw, false)
+    create_volume_from_config(&parse_and_validate(raw)?, false)
 }
 
 /// Initialize a new v3 volume with discard support. Existing volumes are
 /// refused by the format initializer; this never upgrades an attached volume.
 pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
-    create_volume_from_config(raw, true)
+    create_volume_from_config(&parse_and_validate(raw)?, true)
 }
 
-fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, DaemonError> {
+/// Create a new volume and attach in one invocation. Load a local provider
+/// before publishing the layout, so a missing credential leaves creation
+/// retryable. Remote providers still verify against the recovered volume.
+pub async fn create_and_attach_from_config_str(raw: &str) -> Result<Engine, DaemonError> {
     let config = parse_and_validate(raw)?;
+    crate::security::apply(&config)?;
+    let prepared_local = if matches!(
+        config.crypto.provider.as_str(),
+        "local-aes-gcm-siv" | "local-aes-xts"
+    ) {
+        Some(build_provider(&config).await?)
+    } else {
+        None
+    };
+    create_volume_from_config(&config, false)?;
+    Ok(attach_hardened(&config, None, prepared_local).await?.0)
+}
+
+fn create_volume_from_config(
+    config: &VolumeConfig,
+    discard: bool,
+) -> Result<Superblock, DaemonError> {
     let backing: Arc<dyn Backing> = match &config.backing.rollback_protection {
         Some(rollback) => {
             #[cfg(target_os = "linux")]
@@ -1252,9 +1290,9 @@ fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, Dae
                 ));
             }
         }
-        None => build_backing(&config)?,
+        None => build_backing(config)?,
     };
-    initialize_volume(&config, backing.as_ref(), discard)
+    initialize_volume(config, backing.as_ref(), discard)
 }
 
 /// Finish initial registration only after an explicitly approved, never-active

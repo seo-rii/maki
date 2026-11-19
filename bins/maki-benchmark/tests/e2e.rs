@@ -53,6 +53,15 @@ journal_emergency_reserve_bytes = "0B"
     )
     .unwrap();
 
+    // Refusing unavailable local credentials must leave a first run retryable.
+    let failed = Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))
+        .args([&config_path, "1", "4096"])
+        .env_remove("MAKI_CREDENTIAL_E2E_BENCH_KEY")
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(!std::path::Path::new(&root).exists());
+
     // First run creates the volume and pushes 64 writes + flush + 64 reads.
     let out = run(&config_path);
     assert!(
