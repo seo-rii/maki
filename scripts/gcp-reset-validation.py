@@ -92,7 +92,8 @@ def require_unique_boot(seen, current):
 def validate_ready(ready, expected_fs_uuid, profile="v2"):
     if (not isinstance(ready, dict) or ready.get("event") != "ready"
             or ready.get("provider") != "local-aes-gcm-siv"
-            or ready.get("can_flush") is not True or ready.get("can_fua") is not True):
+            or ready.get("can_flush") is not True or ready.get("can_fua") is not True
+            or ready.get("native_fua") is not True):
         raise ValueError("guest did not prove native provider FLUSH and FUA support")
     if ready.get("can_trim") is not (profile == "v3-discard"):
         raise ValueError("guest TRIM capability does not match the qualification profile")
