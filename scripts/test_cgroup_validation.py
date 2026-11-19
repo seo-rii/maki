@@ -70,7 +70,7 @@ class OracleTests(unittest.TestCase):
 
     def test_resumed_epoch_requires_fresh_contents_for_every_durable_unit(self):
         client = Client()
-        args = argparse.Namespace(mode="write", rounds=1, start_epoch=0, socket=None, ledger=self.ledger)
+        args = argparse.Namespace(mode="write", rounds=1, start_epoch=0, socket=None, connected_fd=None, ledger=self.ledger)
         with mock.patch.object(campaign, "Nbd", return_value=client), contextlib.redirect_stdout(io.StringIO()):
             campaign.client_main(args)
             before = client.data.copy()
@@ -94,6 +94,81 @@ class OracleTests(unittest.TestCase):
             self.ledger.write_text("".join(incomplete))
             with self.assertRaises(ValueError):
                 campaign.verify(client, self.ledger, 2)
+
+    def test_freeze_observation_requires_a_connected_client(self):
+        target = campaign.Target.__new__(campaign.Target)
+        target.ledger, target.identifier = self.ledger, "owned"
+        self.ledger.write_bytes(b"unchanged")
+        # A child that merely starts/exits without connecting must not qualify.
+        target.client_command = mock.Mock(return_value=[campaign.sys.executable, "-c", "pass"])
+        with mock.patch.object(campaign, "run") as docker:
+            with self.assertRaisesRegex(AssertionError, "did not connect"):
+                target.freeze_and_resume(self.ledger.parent, 1)
+        docker.assert_called_once_with(["docker", "pause", "owned"])
+
+    def test_connection_signal_follows_the_kernel_connection_and_precedes_negotiation(self):
+        path = self.ledger.parent / "nbd.sock"
+        receiver, sender = campaign.socket.socketpair()
+        with campaign.socket.socket(campaign.socket.AF_UNIX) as listener, receiver, sender:
+            listener.bind(str(path))
+            listener.listen(1)
+            listener.settimeout(1)
+            receiver.settimeout(1)
+            library = mock.Mock()
+            library.nbd_create.return_value = 1
+            library.nbd_can_fua.return_value = library.nbd_can_flush.return_value = 1
+
+            def negotiate(_handle, descriptor):
+                with listener.accept()[0]:
+                    self.assertEqual(receiver.recv(1), b"C")
+                campaign.os.close(descriptor)  # model ownership taken by libnbd
+                return 0
+
+            library.nbd_connect_socket.side_effect = negotiate
+            with mock.patch.object(campaign.ctypes, "CDLL", return_value=library):
+                campaign.Nbd(path, sender.detach()).close()
+            library.nbd_connect_unix.assert_not_called()
+
+    def test_ready_state_check_uses_remaining_startup_budget(self):
+        target = campaign.Target.__new__(campaign.Target)
+        target.identifier, target.case = None, self.ledger.parent
+        target.create = mock.Mock()
+        target.state = mock.Mock(side_effect=campaign.subprocess.TimeoutExpired("inspect", 29.9))
+        now = [0.0]
+
+        def receive(_size):
+            now[0] += 0.1
+            raise campaign.socket.timeout()
+
+        with mock.patch.object(campaign.socket, "socket") as notification, \
+                mock.patch.object(campaign.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(campaign, "run"):
+            notification.return_value.recv.side_effect = receive
+            with self.assertRaisesRegex(TimeoutError, "did not announce READY"):
+                target.start()
+        self.assertAlmostEqual(target.state.call_args.kwargs["timeout"], 29.9)
+
+    def test_cleanup_tolerates_a_concurrent_exit_and_preserves_a_live_container(self):
+        target = campaign.Target.__new__(campaign.Target)
+        target.directory, target.serial, target.notify = self.ledger.parent, 1, None
+        for still_running in (True, False):
+            with self.subTest(still_running=still_running):
+                target.identifier = "owned"
+                target.state = mock.Mock(side_effect=[{"Running": True}, {"Running": still_running}])
+                def docker(command):
+                    if command[1] == "kill":
+                        raise RuntimeError("container exited")
+                    return mock.Mock(stdout="", stderr="")
+                with mock.patch.object(campaign, "run", side_effect=docker) as run:
+                    if still_running:
+                        with self.assertRaisesRegex(RuntimeError, "container exited"):
+                            target.remove()
+                        self.assertEqual(target.identifier, "owned")
+                        self.assertEqual(run.call_count, 1)
+                    else:
+                        target.remove()
+                        self.assertIsNone(target.identifier)
+                        run.assert_called_with(["docker", "rm", "owned"])
 
     def test_remove_container_even_when_log_collection_fails(self):
         target = campaign.Target.__new__(campaign.Target)
