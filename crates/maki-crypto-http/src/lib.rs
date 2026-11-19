@@ -1203,11 +1203,22 @@ impl HttpCryptoProvider {
             .http
             .as_ref()
             .ok_or_else(|| fatal("missing [crypto.http] section"))?;
+        let encrypt_cfg = http
+            .encrypt
+            .as_ref()
+            .ok_or_else(|| fatal("missing [crypto.http.encrypt]"))?;
+        let decrypt_cfg = http
+            .decrypt
+            .as_ref()
+            .ok_or_else(|| fatal("missing [crypto.http.decrypt]"))?;
+        for op in [encrypt_cfg, decrypt_cfg] {
+            maki_format::config::check_http_header_names(op.headers.keys().map(String::as_str))
+                .map_err(|e| fatal(e.to_string()))?;
+        }
+
         let build_op = |operation: &str,
                         op_cfg: &maki_format::config::HttpOpConfig|
          -> Result<OpSpec, CryptoError> {
-            maki_format::config::check_http_header_names(op_cfg.headers.keys().map(String::as_str))
-                .map_err(|e| fatal(e.to_string()))?;
             let mut headers = PendingHeaders::default();
             for (name, value) in &op_cfg.headers {
                 let mut resolved = match value {
@@ -1324,18 +1335,8 @@ impl HttpCryptoProvider {
             })
         };
 
-        let encrypt = build_op(
-            "encrypt",
-            http.encrypt
-                .as_ref()
-                .ok_or_else(|| fatal("missing [crypto.http.encrypt]"))?,
-        )?;
-        let decrypt = build_op(
-            "decrypt",
-            http.decrypt
-                .as_ref()
-                .ok_or_else(|| fatal("missing [crypto.http.decrypt]"))?,
-        )?;
+        let encrypt = build_op("encrypt", encrypt_cfg)?;
+        let decrypt = build_op("decrypt", decrypt_cfg)?;
 
         let caps_cfg = &config.crypto.capabilities;
         let capability = |s: &str| match s {

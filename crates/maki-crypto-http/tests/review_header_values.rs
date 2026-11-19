@@ -83,13 +83,16 @@ fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
 
 #[test]
 fn case_equivalent_headers_are_rejected_before_credential_lookup() {
-    let text = include_str!("../../../packaging/examples/postgres-prod.toml").replace(
-        "[crypto.http.encrypt.headers]",
-        "[crypto.http.encrypt.headers]\nauthorization = \"duplicate\"",
-    );
-    let config = parse_config(&text).unwrap();
-    assert!(config.validate().is_err());
-    let keys = Counting(AtomicUsize::new(0));
-    assert!(HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys).is_err());
-    assert_eq!(keys.0.load(Ordering::SeqCst), 0);
+    for op in ["encrypt", "decrypt"] {
+        let table = format!("[crypto.http.{op}.headers]");
+        let text = include_str!("../../../packaging/examples/postgres-prod.toml")
+            .replace(&table, &format!("{table}\nauthorization = \"duplicate\""));
+        let config = parse_config(&text).unwrap();
+        assert!(config.validate().is_err());
+        let keys = Counting(AtomicUsize::new(0));
+        assert!(
+            HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys).is_err()
+        );
+        assert_eq!(keys.0.load(Ordering::SeqCst), 0, "{op}");
+    }
 }
