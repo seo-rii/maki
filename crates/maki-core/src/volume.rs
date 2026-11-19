@@ -695,6 +695,37 @@ mod discard_tests {
     use super::{Volume, VolumeOptions};
 
     #[test]
+    fn reopened_reclamation_finishes_at_the_end_of_a_partial_shard() {
+        let backing = Arc::new(CrashableBacking::new());
+        create_volume_with_discard(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(0xdec1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "trim-tail".into(),
+                key_identity: "key".into(),
+                geometry: Geometry::compute(512, 512, 512, 520, 512, 8 << 20).unwrap(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        volume.write_ct(0, &[0x41; 520], true).unwrap();
+        volume.checkpoint().unwrap();
+        volume.discard_ct(0, true).unwrap();
+        volume.checkpoint().unwrap();
+        drop(volume);
+
+        let mut reopened = Volume::recover(backing, VolumeOptions::default()).unwrap();
+        assert!(reopened.has_pending_reclamation());
+        reopened.checkpoint().unwrap();
+        assert!(!reopened.has_pending_reclamation());
+        assert!(reopened.read_ct(0).unwrap().is_none());
+    }
+
+    #[test]
     fn zero_trim_registered_during_checkpoint_preserves_its_durable_write() {
         let backing = Arc::new(CrashableBacking::new());
         create_volume_with_discard(

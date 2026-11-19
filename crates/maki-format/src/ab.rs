@@ -41,7 +41,7 @@ pub struct AbStore {
     b: String,
     /// A tighter bound than the record type's `MAX_ENCODED_LEN` when the
     /// valid size follows from context (a shard's geometry), applied to every
-    /// read through this store (R5-025).
+    /// read and write through this store (R5-025).
     max_len: Option<u64>,
 }
 
@@ -54,7 +54,7 @@ impl AbStore {
         }
     }
 
-    /// Treat a copy longer than `max_len` as invalid without reading it.
+    /// Reject an encoded record longer than `max_len` on reads and writes.
     pub fn with_max_len(mut self, max_len: u64) -> Self {
         self.max_len = Some(max_len);
         self
@@ -65,13 +65,12 @@ impl AbStore {
             .map_or(T::MAX_ENCODED_LEN, |max| max.min(T::MAX_ENCODED_LEN))
     }
 
-    /// One side and its exact validated bytes: `Ok(None)` for an absent or
-    /// invalid copy, `Err` for a hard I/O failure.
-    fn read_copy<T: AbRecord>(
+    /// Missing, torn or over-long copies are invalid. Other I/O errors are inconclusive.
+    fn read_bytes<T: AbRecord>(
         &self,
         backing: &dyn Backing,
         path: &str,
-    ) -> Result<Option<(T, Vec<u8>)>, FormatError> {
+    ) -> Result<Option<Vec<u8>>, FormatError> {
         let file = match backing.open(path, false) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -91,7 +90,7 @@ impl AbStore {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(FormatError::Io(e)),
         }
-        Ok(T::decode(&buf).ok().map(|record| (record, buf)))
+        Ok(Some(buf))
     }
 
     fn read_side<T: AbRecord>(
@@ -99,7 +98,9 @@ impl AbStore {
         backing: &dyn Backing,
         path: &str,
     ) -> Result<Option<T>, FormatError> {
-        Ok(self.read_copy(backing, path)?.map(|(record, _)| record))
+        Ok(self
+            .read_bytes::<T>(backing, path)?
+            .and_then(|bytes| T::decode(&bytes).ok()))
     }
 
     /// Best valid copy, if any. `Err` only for hard I/O failures.
@@ -116,46 +117,6 @@ impl AbStore {
             (None, Some(b)) => Some(b),
             (None, None) => None,
         })
-    }
-
-    /// Raw generation of one side, read type-agnostically (so a foreign or
-    /// newer-version record still ranks) but bounded by `max_len` — the caller
-    /// record type's `MAX_ENCODED_LEN` — so the generation probe cannot be
-    /// forced to read a large corrupt file that `read_copy::<T>` would already
-    /// reject on the typed path (FUP-012).
-    fn raw_generation(
-        &self,
-        backing: &dyn Backing,
-        path: &str,
-        max_len: u64,
-    ) -> Result<Option<u64>, FormatError> {
-        let file = match backing.open(path, false) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(FormatError::Io(e)),
-        };
-        let len = file.len()?;
-        if len == 0 || len > max_len {
-            return Ok(None);
-        }
-        let mut buf = vec![0u8; len as usize];
-        match file.read_at(0, &mut buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(FormatError::Io(e)),
-        }
-        Ok(RawGeneration::decode(&buf).ok().map(|r| r.generation))
-    }
-
-    fn generations<T: AbRecord>(
-        &self,
-        backing: &dyn Backing,
-    ) -> Result<(Option<u64>, Option<u64>), FormatError> {
-        let max = self.bound::<T>();
-        Ok((
-            self.raw_generation(backing, &self.a, max)?,
-            self.raw_generation(backing, &self.b, max)?,
-        ))
     }
 
     fn target_for(&self, ga: Option<u64>, gb: Option<u64>) -> &str {
@@ -195,7 +156,14 @@ impl AbStore {
         &self,
         backing: &dyn Backing,
     ) -> Result<(Option<u64>, Option<u64>), FormatError> {
-        self.generations::<T>(backing)
+        let generation = |path: &str| -> Result<_, FormatError> {
+            Ok(self
+                .read_bytes::<T>(backing, path)?
+                .as_deref()
+                .and_then(|bytes| RawGeneration::decode(bytes).ok())
+                .map(|raw| raw.generation))
+        };
+        Ok((generation(&self.a)?, generation(&self.b)?))
     }
 
     /// The side the *next* store will overwrite: a side that does not hold
@@ -227,18 +195,51 @@ impl AbStore {
         backing: &dyn Backing,
         record: &mut T,
     ) -> Result<(), FormatError> {
-        let (ga, gb) = self.generations::<T>(backing)?;
-        let max_existing = ga.into_iter().chain(gb).max().unwrap_or(0);
-        let a = self.read_copy::<T>(backing, &self.a)?;
-        let b = self.read_copy::<T>(backing, &self.b)?;
-        let ta = a.as_ref().map(|(record, _)| record.generation());
-        let tb = b.as_ref().map(|(record, _)| record.generation());
+        let a = self.read_bytes::<T>(backing, &self.a)?;
+        let b = self.read_bytes::<T>(backing, &self.b)?;
+        let max_existing = [a.as_deref(), b.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|bytes| RawGeneration::decode(bytes).ok())
+            .map(|raw| raw.generation)
+            .max()
+            .unwrap_or(0);
+        let typed_generation = |bytes: &[u8]| T::decode(bytes).ok().map(|r| r.generation());
+        let ta = a.as_deref().and_then(typed_generation);
+        let tb = b.as_deref().and_then(typed_generation);
         let target = self.target_for(ta, tb);
         let preserved = if target == self.a {
-            b.map(|(_, bytes)| (self.b.as_str(), bytes))
+            tb.and(b).map(|bytes| (self.b.as_str(), bytes))
         } else {
-            a.map(|(_, bytes)| (self.a.as_str(), bytes))
+            ta.and(a).map(|bytes| (self.a.as_str(), bytes))
         };
+
+        // Checked increment: a corrupt existing generation near u64::MAX (or a
+        // genuinely exhausted sequence) must fail closed, not wrap to 0 — a
+        // wrapped generation would silently lose to every existing copy and
+        // could never be selected (MAKI-027).
+        let next = max_existing
+            .max(record.generation())
+            .checked_add(1)
+            .ok_or_else(|| {
+                FormatError::Invalid(
+                    "A/B record generation space exhausted (near u64::MAX); refusing to store"
+                        .to_string(),
+                )
+            })?;
+        let original_generation = record.generation();
+        record.set_generation(next);
+        let bytes = record.encode();
+        // Preserve the caller's generation on validation or preservation failure.
+        record.set_generation(original_generation);
+        if bytes.is_empty() || bytes.len() as u64 > self.bound::<T>() {
+            return Err(FormatError::Invalid(format!(
+                "A/B record length {} is outside the store's 1..={} byte bound",
+                bytes.len(),
+                self.bound::<T>()
+            )));
+        }
+
         if let Some((preserved, bytes)) = preserved {
             // A failed sync can leave this newer generation readable but
             // volatile. Retrying (even after restarting the process) must
@@ -257,21 +258,7 @@ impl AbStore {
             backing.sync_dir(maki_backing::path::parent(preserved))?;
         }
 
-        // Checked increment: a corrupt existing generation near u64::MAX (or a
-        // genuinely exhausted sequence) must fail closed, not wrap to 0 — a
-        // wrapped generation would silently lose to every existing copy and
-        // could never be selected (MAKI-027).
-        let next = max_existing
-            .max(record.generation())
-            .checked_add(1)
-            .ok_or_else(|| {
-                FormatError::Invalid(
-                    "A/B record generation space exhausted (near u64::MAX); refusing to store"
-                        .to_string(),
-                )
-            })?;
         record.set_generation(next);
-        let bytes = record.encode();
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;
         file.write_at(0, &bytes)?;

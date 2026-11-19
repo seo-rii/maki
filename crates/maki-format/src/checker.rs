@@ -114,11 +114,7 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         // allocation map says. Report it as an error, matching recovery,
         // rather than a benign warning that lets `maki check` pass on a
         // volume `maki attach` would reject.
-        if !backing.exists(&layout::shard_data(shard))? {
-            report.errors.push(format!(
-                "shard {shard}: cataloged but its data file is missing; recovery would refuse to attach"
-            ));
-        }
+        check_data_file(backing, shard, &mut report)?;
     }
 
     // A shard data file the loaded catalog copy does not list results from a
@@ -144,6 +140,9 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             continue;
         }
         let warning = if idx < geometry.num_shards() {
+            if !check_data_file(backing, idx, &mut report)? {
+                continue;
+            }
             let adoptable = envelope.metadata_version != SUPERBLOCK_VERSION_V3
                 || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
             format!(
@@ -164,6 +163,29 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     }
 
     Ok(report)
+}
+
+/// Recovery opens each cataloged or adoptable shard as a data file.
+fn check_data_file(
+    backing: &dyn Backing,
+    shard: u64,
+    report: &mut CheckReport,
+) -> Result<bool, FormatError> {
+    use std::io::ErrorKind;
+    match backing.open(&layout::shard_data(shard), false) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let reason = match error.kind() {
+                ErrorKind::NotFound => "data file is missing",
+                ErrorKind::IsADirectory | ErrorKind::InvalidInput => "invalid data file",
+                _ => return Err(error.into()),
+            };
+            report
+                .errors
+                .push(format!("shard {shard}: {reason}: {error}"));
+            Ok(false)
+        }
+    }
 }
 
 /// V3 adoption needs the same discard evidence as a cataloged shard. Keep

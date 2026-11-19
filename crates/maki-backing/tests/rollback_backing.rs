@@ -158,3 +158,55 @@ fn witness_must_be_independent_and_existing_authority_is_never_reenrolled() {
     assert!(RollbackBacking::open(root.path(), &absent).is_err());
     assert!(!absent.exists());
 }
+
+#[test]
+fn full_page_punch_releases_a_short_final_page_only_after_sync() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
+    let file = backing.open("short", true).unwrap();
+    file.write_at(0, b"x").unwrap();
+    file.sync_data().unwrap();
+    file.read_at(u64::MAX, &mut []).unwrap();
+    assert_eq!(
+        file.read_at(1, &mut [0]).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+
+    // A partial punch preserves its reservation even if all visible bytes are zero.
+    file.punch_hole(0, 1).unwrap();
+    file.sync_data().unwrap();
+    assert_eq!(backing.free_bytes().unwrap(), Some(0));
+    file.punch_hole(0, 4096).unwrap();
+    assert_eq!(backing.free_bytes().unwrap(), Some(0));
+    file.sync_data().unwrap();
+    assert_eq!(file.len().unwrap(), 1);
+    let mut byte = [1];
+    file.read_at(0, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    assert_eq!(backing.free_bytes().unwrap(), Some(4096));
+    backing
+        .open("next", true)
+        .unwrap()
+        .allocate_range(0, 1)
+        .unwrap();
+}
+
+#[test]
+fn sparse_punch_visits_reservations_including_unwritten_pages() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 3 * 4096).unwrap();
+    let file = backing.open("sparse", true).unwrap();
+    let far = 1 << 30;
+    file.write_at(0, &[5, 6]).unwrap();
+    file.allocate_range(far / 2, 4096).unwrap();
+    file.write_at(far, &[7, 8]).unwrap();
+    file.sync_data().unwrap();
+    file.punch_hole(1, far).unwrap();
+    file.sync_data().unwrap();
+    let mut bytes = [0; 2];
+    file.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, [5, 0]);
+    file.read_at(far, &mut bytes).unwrap();
+    assert_eq!(bytes, [0, 8]);
+    assert_eq!(backing.free_bytes().unwrap(), Some(4096));
+}

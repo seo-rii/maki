@@ -492,6 +492,12 @@ impl Backing for FileBacking {
             .write(!self.read_only)
             .create(create)
             .open(&p)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backing entry is not a regular file",
+            ));
+        }
         Ok(Arc::new(RealFile { file }))
     }
 

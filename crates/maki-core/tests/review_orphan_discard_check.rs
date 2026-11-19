@@ -198,3 +198,38 @@ fn opening_partial_shards_reads_only_logical_headers_and_each_discard_copy_once(
         2 * AllocationMap::encoded_len(8)
     );
 }
+
+#[test]
+fn directory_cannot_be_adopted_or_used_as_cataloged_shard_data() {
+    let backing = Arc::new(MemBacking::new());
+    let sb = block();
+    let units = sb.geometry.units_per_shard();
+    init::create_volume(backing.as_ref(), sb).unwrap();
+    backing.create_dir_all(&layout::shard_data(0)).unwrap();
+
+    for cataloged in [false, true] {
+        if cataloged {
+            let mut catalog = maki_format::catalog::ShardCatalog::new();
+            catalog.insert(0);
+            AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B)
+                .store(backing.as_ref(), &mut catalog)
+                .unwrap();
+            AbStore::new(layout::shard_alloc_a(0), layout::shard_alloc_b(0))
+                .store(backing.as_ref(), &mut AllocationMap::new(units))
+                .unwrap();
+        }
+        let report = check_volume(backing.as_ref()).unwrap();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("invalid data file")),
+            "{report:?}"
+        );
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|w| w.contains("recovery adopts it")));
+        assert!(Volume::recover(backing.clone(), VolumeOptions::default()).is_err());
+    }
+}

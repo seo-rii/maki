@@ -787,6 +787,9 @@ impl BackingFile for CowFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
+        if buf.is_empty() {
+            return Ok(());
+        }
         let len = state.files.get(&self.id).ok_or_else(missing)?.len;
         let end = offset
             .checked_add(buf.len() as u64)
@@ -858,23 +861,37 @@ impl BackingFile for CowFile {
         let file_len = state.files.get(&self.id).ok_or_else(missing)?.len;
         let end = offset
             .checked_add(len)
-            .ok_or_else(|| input("hole range overflow"))?
-            .min(file_len);
-        let mut at = offset;
-        while at < end {
-            let count = (PAGE - at % PAGE).min(end - at);
-            if at.is_multiple_of(PAGE) && count == PAGE {
+            .ok_or_else(|| input("hole range overflow"))?;
+        let visible_end = end.min(file_len);
+        if offset >= visible_end {
+            return Ok(());
+        }
+
+        // Every mapped page has a reservation, including reserved zero pages.
+        // Visit only existing reservations, even for a very large sparse range.
+        let mut next = offset / PAGE;
+        let limit = visible_end.div_ceil(PAGE);
+        while let Some(index) = state.files[&self.id]
+            .reserved
+            .range(next..limit)
+            .next()
+            .copied()
+        {
+            let page_start = index * PAGE;
+            if offset <= page_start && index < end / PAGE {
+                // A whole-page request also releases a short final page.
                 let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
-                node.pages.remove(&(at / PAGE));
-                node.reserved.remove(&(at / PAGE));
-                // A dropped page may free its slot.
+                node.pages.remove(&index);
+                node.reserved.remove(&index);
                 state.used_slots = None;
-            } else if let Some(page) = state.page_ref(self.id, at / PAGE)? {
+            } else if let Some(page) = state.page_ref(self.id, index)? {
                 let mut bytes = state.page(Some(page))?;
-                bytes[(at % PAGE) as usize..(at % PAGE + count) as usize].fill(0);
-                state.write_page(self.id, at / PAGE, &bytes)?;
+                let from = offset.saturating_sub(page_start) as usize;
+                let to = (visible_end - page_start).min(PAGE) as usize;
+                bytes[from..to].fill(0);
+                state.write_page(self.id, index, &bytes)?;
             }
-            at += count;
+            next = index + 1;
         }
         Ok(())
     }
