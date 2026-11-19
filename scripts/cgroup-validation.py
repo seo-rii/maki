@@ -388,14 +388,21 @@ def constrained_recovery(target, memory="32m", rounds=1):
     try:
         try:
             target.start(memory=memory)
-        except TimeoutError:
-            result = {"ready": False, "outcome": "startup-timeout", "deadline_seconds": 30,
-                      "resources": target.stats(), "state_before_cleanup": target.state()}
-            if target.state()["Running"]:
-                result["cleanup_termination"] = target.kill()
-            return result
-        except RuntimeError:
+        except (TimeoutError, RuntimeError) as error:
             state = target.state()
+            if isinstance(error, TimeoutError) and state["Running"]:
+                try:
+                    resources = target.stats()
+                    termination = target.kill()
+                except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired):
+                    # The process can OOM between inspect and reading /proc or killing it.
+                    state = target.state()
+                    if state["Running"]:
+                        raise
+                else:
+                    return {"ready": False, "outcome": "startup-timeout", "deadline_seconds": 30,
+                            "resources": resources, "state_before_cleanup": state,
+                            "cleanup_termination": termination}
             require_oom(state)
             return {"ready": False, "outcome": "startup-oom", "termination": state}
         else:
@@ -410,14 +417,15 @@ def constrained_recovery(target, memory="32m", rounds=1):
 def campaign(args):
     os.umask(0o077)
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
-    details = json.loads(run(["docker", "info", "--format", "{{json .}}"]).stdout)
-    ensure(details["CgroupVersion"] == "2", "cgroup v2 is required")
-    for feature in ("MemoryLimit", "SwapLimit", "CpuCfsQuota", "PidsLimit"):
-        ensure(details[feature], f"Docker lacks {feature}")
-    image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip()
-    report = {"image": image_id, "kernel": os.uname().release, "docker": details["ServerVersion"],
-              "cgroup": 2, "provider": "local-aes-gcm-siv", "cases": [], "passed": False}
+    report = {"requested_image": args.image, "provider": "local-aes-gcm-siv", "cases": [], "passed": False}
     try:
+        details = json.loads(run(["docker", "info", "--format", "{{json .}}"]).stdout)
+        ensure(details["CgroupVersion"] == "2", "cgroup v2 is required")
+        for feature in ("MemoryLimit", "SwapLimit", "CpuCfsQuota", "PidsLimit"):
+            ensure(details[feature], f"Docker lacks {feature}")
+        report.update(kernel=os.uname().release, docker=details["ServerVersion"], cgroup=2)
+        image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip()
+        report["image"] = image_id
         for scenario in ("cpu-memory-kill", "freeze-resume", "memory-oom"):
             directory = args.output / scenario
             directory.mkdir(mode=0o700)
@@ -468,6 +476,9 @@ def campaign(args):
             finally:
                 target.remove()
         report["passed"] = True
+    except BaseException as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+        raise
     finally:
         (args.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
 

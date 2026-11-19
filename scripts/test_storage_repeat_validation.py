@@ -209,20 +209,45 @@ class BackgroundStorageTests(unittest.TestCase):
                 self.assertEqual(report["passed_tests"], 0)
                 self.assertIn("preparation deadline", report["error"])
 
-    def test_each_started_campaign_uses_its_own_build_directories(self):
-        def completed(command, **_kwargs):
-            if command[:2] == ["git", "archive"]:
-                output = next(value for value in command if value.startswith("--output="))
-                Path(output.split("=", 1)[1]).write_bytes(b"frozen source")
-            return subprocess.CompletedProcess(command, 0)
+    def test_frozen_source_uses_original_committed_bytes_and_mode(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        source = self.root / "source"
+        source.mkdir()
 
+        def git(*arguments):
+            return subprocess.check_output(["git", *arguments], cwd=repo, text=True).strip()
+
+        git("init", "-q")
+        (repo / "suite").write_bytes(b"$Format:%H$\n")
+        (repo / "suite").chmod(0o755)
+        (repo / "suite-link").symlink_to("suite")
+        (repo / "expected").write_bytes(b"published fixture")
+        git("add", ".")
+        git("-c", "user.email=fixture@example.invalid", "-c", "user.name=Fixture", "commit", "-qm", "fixture")
+        (repo / ".git/info/attributes").write_text("suite export-subst\nexpected export-ignore\n")
+        (repo / "local").write_text("untracked")
+        (repo / "expected").write_text("local edit")
+        self.runner.freeze_source(repo, git("rev-parse", "HEAD"), self.root / "source.tar", source)
+        self.assertEqual((source / "expected").read_bytes(), b"published fixture")
+        self.assertEqual((source / "suite").read_bytes(), b"$Format:%H$\n")
+        self.assertEqual((source / "suite").stat().st_mode & 0o111, 0o111)
+        self.assertEqual(os.readlink(source / "suite-link"), "suite")
+        self.assertFalse((source / "local").exists())
+
+    @staticmethod
+    def fake_freeze_source(_repo, _revision, archive, _source):
+        archive.write_bytes(b"frozen source")
+
+    def test_each_started_campaign_uses_its_own_build_directories(self):
         process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
         with mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                 mock.patch.object(
                     self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)
                 ), \
-                mock.patch.object(self.runner.subprocess, "run", side_effect=completed), \
+                mock.patch.object(self.runner.subprocess, "run"), \
+                mock.patch.object(self.runner, "freeze_source", side_effect=self.fake_freeze_source), \
                 mock.patch.object(
                     self.runner.subprocess,
                     "check_output",
@@ -257,11 +282,6 @@ class BackgroundStorageTests(unittest.TestCase):
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
         process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
 
-        def freeze(command, **_kwargs):
-            if command[:2] == ["git", "archive"]:
-                archive = next(arg for arg in command if arg.startswith("--output="))
-                Path(archive.split("=", 1)[1]).write_bytes(b"fixture")
-
         for failed in ("controller.json", "maki-storage-latest.json"):
             def publish(path, _value):
                 if path.name == failed:
@@ -271,7 +291,8 @@ class BackgroundStorageTests(unittest.TestCase):
                     mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                     mock.patch.object(self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)), \
                     mock.patch.object(self.runner.subprocess, "check_output", return_value="fixture"), \
-                    mock.patch.object(self.runner.subprocess, "run", side_effect=freeze), \
+                    mock.patch.object(self.runner.subprocess, "run"), \
+                    mock.patch.object(self.runner, "freeze_source", side_effect=self.fake_freeze_source), \
                     mock.patch.object(self.runner.subprocess, "Popen", return_value=process), \
                     mock.patch.object(self.runner, "save_json", side_effect=publish):
                 with self.assertRaisesRegex(OSError, "publication failed"):

@@ -79,14 +79,17 @@ def record_ack(ledger, event, cycle):
         os.close(parent)
 
 
-def load_ledger(ledger):
+def load_ledger(ledger, expected_cycles):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ledger")
     raw = ledger.read_text(encoding="utf-8")
     if not raw or not raw.endswith("\n"):
         raise ValueError("empty or truncated ACK ledger")
     latest = None
-    for cycle, line in enumerate(raw.splitlines()):
+    lines = raw.splitlines()
+    if len(lines) != expected_cycles:
+        raise ValueError(f"ACK count {len(lines)} does not match {expected_cycles} completed cycles")
+    for cycle, line in enumerate(lines):
         event = json.loads(line)
         validate_ack(event, cycle)
         latest = event["records"]
@@ -287,7 +290,7 @@ def campaign(args):
                     fs_uuid = ready["fs_uuid"]
                     entry["ready"] = ready
                     if boot:
-                        expected = load_ledger(ledger)
+                        expected = load_ledger(ledger, expected_cycles=boot)
                         command = f"verify-{boot}"
                         process.send({"command": command, "op": "verify",
                                       "offsets": [r["offset"] for r in expected]})

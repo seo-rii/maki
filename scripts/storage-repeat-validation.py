@@ -360,12 +360,23 @@ def worker(directory):
     return exit_code
 
 
+def freeze_source(repo, revision, archive, source):
+    # Only start needs the archive writer. The detached worker is a standalone copy.
+    try:
+        from prepare_release import archive_source, git_command
+    except ModuleNotFoundError:
+        from scripts.prepare_release import archive_source, git_command
+    epoch = int(subprocess.check_output(git_command("show", "-s", "--format=%ct", revision, repo=repo)))
+    archive_source(archive, revision, ".", epoch, repo=repo)
+    subprocess.run(["tar", "--no-same-owner", "-xpf", str(archive), "-C", str(source)], check=True)
+
+
 def start(args):
     profile = getattr(args, "profile", "storage")
     groups = suite_groups({"profile": profile})
     repo = Path(__file__).resolve().parents[1]
-    subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    subprocess.run(["git", "--no-replace-objects", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
+    revision = subprocess.check_output(["git", "--no-replace-objects", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     logs = Path.home() / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
     logs.chmod(0o700)
@@ -379,8 +390,7 @@ def start(args):
     target = directory / "target"
     target.mkdir(mode=0o700)
     archive = directory / "source.tar"
-    subprocess.run(["git", "archive", "--format=tar", f"--output={archive}", revision], cwd=repo, check=True)
-    subprocess.run(["tar", "-xf", str(archive), "-C", str(source)], check=True)
+    freeze_source(repo, revision, archive, source)
     runner = directory / "runner.py"
     shutil.copyfile(__file__, runner)
     runner.chmod(0o400)

@@ -349,6 +349,19 @@ class HostContracts(unittest.TestCase):
                 self.assertIn("ValueError", result["error"])
                 self.assertFalse((args.output / "host-acks.jsonl").exists())
 
+    def test_explicit_guest_error_is_terminal_during_startup(self):
+        args = types.SimpleNamespace(timeout=10)
+        failed = self.frame(event="error", message="native startup failed") + b"\n"
+        ready = self.frame(event="ready") + b"\n"
+        commands = [[sys.executable, "-c", f"import sys; sys.stdout.buffer.write({frame!r})"]
+                    for frame in (failed, ready)]
+        with mock.patch.object(self.host, "ssh_command", side_effect=commands) as launch, \
+                mock.patch.object(self.host.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "native startup failed"):
+                process, _ = self.host.launch_guest(args, self.token, 1, False, self.path, "data")
+                process.close()
+        self.assertEqual(launch.call_count, 1)
+
     def test_slow_guest_readiness_keeps_the_established_session(self):
         args = types.SimpleNamespace(timeout=180, connect_timeout=10)
         guest = mock.Mock()

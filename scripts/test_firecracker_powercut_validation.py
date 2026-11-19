@@ -59,13 +59,23 @@ class HostContracts(unittest.TestCase):
             self.host.record_ack(self.ledger, self.ack(), 0)
             self.assertGreaterEqual(sync.call_count, 1)
         self.host.record_ack(self.ledger, self.ack(1), 1)
-        self.assertEqual(self.host.load_ledger(self.ledger), self.host.expected_records(1))
+        self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=2), self.host.expected_records(1))
 
     def test_empty_truncated_or_duplicate_ledger_cannot_qualify(self):
         for text in ("", "{", json.dumps(self.ack()) + "\n" + json.dumps(self.ack()) + "\n"):
             self.ledger.write_text(text)
             with self.assertRaises(ValueError):
-                self.host.load_ledger(self.ledger)
+                self.host.load_ledger(self.ledger, expected_cycles=2)
+
+    def test_each_verification_boot_requires_exactly_its_preceding_ack_rows(self):
+        self.host.record_ack(self.ledger, self.ack(0), 0)
+        with self.assertRaisesRegex(ValueError, "ACK.*count"):
+            self.host.load_ledger(self.ledger, expected_cycles=2)
+        self.host.record_ack(self.ledger, self.ack(1), 1)
+        with self.assertRaisesRegex(ValueError, "ACK.*count"):
+            self.host.load_ledger(self.ledger, expected_cycles=1)
+        self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=2),
+                         self.host.expected_records(1))
 
     def test_missing_wrong_or_duplicate_readback_is_failure(self):
         expected = self.host.expected_records(0)
