@@ -1592,6 +1592,24 @@ fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
 
+fn same_socket_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    // Resolve existing parents even before either socket is bound. Resolving
+    // through the filesystem preserves the meaning of ".." after a symlink.
+    let resolve = |path: &std::path::Path| {
+        std::fs::canonicalize(path).ok().or_else(|| {
+            Some(
+                std::fs::canonicalize(path.parent()?)
+                    .ok()?
+                    .join(path.file_name()?),
+            )
+        })
+    };
+    resolve(left).is_some_and(|left| resolve(right).as_ref() == Some(&left))
+}
+
 /// Scheme and host of an endpoint URL. Rejects userinfo (credentials in a
 /// URL) and anything that does not look like `scheme://host[:port][/...]`.
 /// An explicit nonempty port must be a decimal number that fits in `u16`.
@@ -2215,10 +2233,7 @@ impl VolumeConfig {
             .socket
             .clone()
             .unwrap_or_else(|| format!("/run/maki/{}/nbd.sock", self.volume.name));
-        if std::path::Path::new(&control_socket)
-            .components()
-            .eq(std::path::Path::new(&nbd_socket).components())
-        {
+        if same_socket_path(control_socket.as_ref(), nbd_socket.as_ref()) {
             return Err(invalid(format!(
                 "control.socket {control_socket:?} must differ from nbd.socket {nbd_socket:?}"
             )));

@@ -735,6 +735,28 @@ fn control_and_nbd_sockets_must_differ() {
     parse(&local()).validate().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn socket_aliases_use_the_actual_parent_directory_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("other/sub")).unwrap();
+    std::os::unix::fs::symlink(root.join("other/sub"), root.join("link")).unwrap();
+    let check = |control: &str, nbd: &str| {
+        let raw = format!(
+            "{}[control]\nsocket = {:?}\n[nbd]\nsocket = {:?}\n",
+            local(),
+            root.join(control),
+            root.join(nbd)
+        );
+        parse(&raw).validate()
+    };
+    assert!(check("other/sub/../shared.sock", "other/shared.sock").is_err());
+    assert!(check("link/../shared.sock", "other/shared.sock").is_err());
+    assert!(check("link/../shared.sock", "shared.sock").is_ok());
+    assert!(check("link/a.sock", "other/sub/b.sock").is_ok());
+}
+
 // ---------- transport limits carry ciphertext (BUG-092) ----------
 
 /// The default 128-item batch of 4096-byte units is 512 KiB of plaintext but
