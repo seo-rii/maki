@@ -212,6 +212,9 @@ struct State {
     entries: BTreeMap<String, Entry>,
     files: BTreeMap<u64, Node>,
     handles: BTreeMap<u64, usize>,
+    // Identities with neither a working nor a committed name. They become
+    // reclaimable at last close. Unlink or replacement can invalidate this set.
+    unlinked_files: Option<BTreeSet<u64>>,
     next_id: u64,
     locks: BTreeSet<String>,
     poisoned: bool,
@@ -499,6 +502,7 @@ impl RollbackBacking {
                 witness,
                 _disk_lock: disk_lock,
                 handles: BTreeMap::new(),
+                unlinked_files: None,
                 locks: BTreeSet::new(),
                 poisoned: false,
             })),
@@ -608,24 +612,16 @@ impl State {
     }
 
     fn reclaim_closed_files(&mut self) -> io::Result<()> {
-        let mut retained: BTreeSet<u64> = self
-            .committed
-            .entries
-            .values()
-            .chain(self.entries.values())
-            .filter_map(|entry| match entry {
-                Entry::File(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
-        retained.extend(self.handles.keys());
-        if self
-            .committed
-            .files
-            .keys()
-            .chain(self.files.keys())
-            .any(|id| !retained.contains(id))
-        {
+        let unlinked = self.unlinked_files.get_or_insert_with(|| {
+            let mut ids: BTreeSet<_> = self.files.keys().copied().collect();
+            for entry in self.committed.entries.values().chain(self.entries.values()) {
+                if let Entry::File(id) = entry {
+                    ids.remove(id);
+                }
+            }
+            ids
+        });
+        if unlinked.iter().any(|id| !self.handles.contains_key(id)) {
             // Last-close cannot report commit errors. Defer reclamation until
             // the next space query, reservation or identity-limited creation,
             // where errors can propagate.
@@ -654,7 +650,13 @@ impl State {
                 _ => None,
             })
             .collect();
-        retain.extend(self.handles.keys());
+        let mut unlinked = BTreeSet::new();
+        for id in self.handles.keys() {
+            if retain.insert(*id) {
+                // Only this handle keeps the identity in the new manifest.
+                unlinked.insert(*id);
+            }
+        }
         candidate.files.retain(|id, _| retain.contains(id));
         candidate.validate()?;
         let bytes = candidate.encode()?;
@@ -672,6 +674,7 @@ impl State {
             self.poisoned = true;
             return Err(error);
         }
+        self.unlinked_files = Some(unlinked);
         self.reserved_pages = candidate.reserved_pages();
         self.committed = candidate;
         self.manifest_slot = slot;
@@ -742,28 +745,31 @@ impl State {
     fn page(&mut self, page: Option<PageRef>) -> io::Result<Vec<u8>> {
         let mut bytes = vec![0; PAGE as usize];
         if let Some(page) = page {
-            if let Err(error) = self.arena.read_at(page.slot * PAGE, &mut bytes) {
-                // No mutation or uncertain commit happened here. An ordinary
-                // I/O failure refuses this operation; the next one checks the
-                // witness and authenticates the page again. Missing, short or
-                // invalid referenced evidence still stops every handle, even
-                // if the original bytes are later restored.
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::InvalidData
-                ) {
-                    self.poisoned = true;
-                }
-                return Err(error);
-            }
-            if page_digest(&self.committed.identity, &bytes) != page.hash {
-                self.poisoned = true;
-                return Err(invalid("rollback arena page authentication failed"));
-            }
+            self.read_page(&page, &mut bytes)?;
         }
         Ok(bytes)
+    }
+
+    fn read_page(&mut self, page: &PageRef, bytes: &mut [u8]) -> io::Result<()> {
+        if let Err(error) = self.arena.read_at(page.slot * PAGE, bytes) {
+            // No mutation or uncertain commit happened here. An ordinary
+            // I/O failure refuses this operation; the next one checks the
+            // witness and authenticates the page again. Missing, short or
+            // invalid referenced evidence still stops every handle, even
+            // if the original bytes are later restored.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+            ) {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
+        if page_digest(&self.committed.identity, bytes) != page.hash {
+            self.poisoned = true;
+            return Err(invalid("rollback arena page authentication failed"));
+        }
+        Ok(())
     }
 
     /// A slot neither the committed manifest nor the working view uses.
@@ -842,6 +848,9 @@ impl BackingFile for CowFile {
                 "read beyond rollback file",
             ));
         }
+        // Authenticate into private scratch before exposing any bytes from
+        // this page. A hole-only read never needs to allocate it.
+        let mut bytes = Vec::new();
         let mut at = offset;
         while at < end {
             let dest = (at - offset) as usize;
@@ -859,7 +868,8 @@ impl BackingFile for CowFile {
                 buf[dest..(page_start - offset) as usize].fill(0);
                 at = page_start;
             }
-            let bytes = state.page(Some(page))?;
+            bytes.resize(PAGE as usize, 0);
+            state.read_page(&page, &mut bytes)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let start = (at % PAGE) as usize;
             let dest = (at - offset) as usize;
@@ -1026,6 +1036,7 @@ impl Backing for RollbackBacking {
             return Err(input("directory removal is unsupported"));
         }
         state.entries.remove(name).ok_or_else(missing)?;
+        state.unlinked_files = None;
         Ok(())
     }
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -1046,7 +1057,9 @@ impl Backing for RollbackBacking {
             ));
         }
         state.entries.remove(from);
-        state.entries.insert(to.to_owned(), entry);
+        if state.entries.insert(to.to_owned(), entry).is_some() {
+            state.unlinked_files = None;
+        }
         Ok(())
     }
     fn create_dir_all(&self, name: &str) -> io::Result<()> {
@@ -1079,11 +1092,17 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.directory(dir)?;
+        let mut prefix = dir.to_owned();
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        let start = std::ops::Bound::Included(prefix.as_str());
         Ok(state
             .entries
-            .keys()
-            .filter(|name| path::parent(name) == dir)
-            .map(|name| path::file_name(name).to_owned())
+            .range::<str, _>((start, std::ops::Bound::Unbounded))
+            .map_while(|(name, _)| name.strip_prefix(&prefix))
+            .filter(|child| !child.contains('/'))
+            .map(str::to_owned)
             .collect())
     }
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
@@ -1142,6 +1161,21 @@ impl Backing for RollbackBacking {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_only_returns_direct_children_of_the_exact_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+        backing.create_dir_all("data/nested").unwrap();
+        backing.create_dir_all("database").unwrap();
+        backing.open("data/a", true).unwrap();
+        backing.open("data/nested/hidden", true).unwrap();
+        backing.open("database/other", true).unwrap();
+        assert_eq!(backing.list("").unwrap(), ["data", "database"]);
+        assert_eq!(backing.list("data").unwrap(), ["a", "nested"]);
+        assert_eq!(backing.list("data/nested").unwrap(), ["hidden"]);
+    }
 
     #[test]
     fn retaining_or_extending_file_length_keeps_the_arena_slot_index() {

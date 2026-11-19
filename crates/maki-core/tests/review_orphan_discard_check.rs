@@ -5,6 +5,7 @@ use std::io;
 use std::sync::Arc;
 
 use maki_backing::{Backing, MemBacking};
+use maki_core::check::deep_check;
 use maki_core::volume::{Volume, VolumeOptions};
 use maki_format::ab::AbStore;
 use maki_format::allocation::AllocationMap;
@@ -230,8 +231,31 @@ fn directory_cannot_be_adopted_or_used_as_cataloged_shard_data() {
             .warnings
             .iter()
             .any(|w| w.contains("recovery adopts it")));
+        let deep = deep_check(backing.clone(), 4096).unwrap();
+        assert!(
+            deep.errors
+                .iter()
+                .any(|e| e.contains("shard 0: invalid data file")),
+            "{deep:?}"
+        );
         assert!(Volume::recover(backing.clone(), VolumeOptions::default()).is_err());
     }
+}
+
+#[test]
+fn deep_check_preserves_the_missing_data_directory_diagnostic() {
+    let root = tempfile::tempdir().unwrap();
+    let backing = Arc::new(maki_backing::FileBacking::new(root.path()).unwrap());
+    init::create_volume(backing.as_ref(), block()).unwrap();
+    std::fs::remove_dir(root.path().join(layout::DATA_DIR)).unwrap();
+    let report = deep_check(backing, 4096).unwrap();
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("data directory is missing")),
+        "{report:?}"
+    );
 }
 
 #[test]
