@@ -759,9 +759,7 @@ impl State {
             // if the original bytes are later restored.
             if matches!(
                 error.kind(),
-                io::ErrorKind::NotFound
-                    | io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::InvalidData
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
             ) {
                 self.poisoned = true;
             }
@@ -1094,11 +1092,17 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.directory(dir)?;
+        let mut prefix = dir.to_owned();
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        let start = std::ops::Bound::Included(prefix.as_str());
         Ok(state
             .entries
-            .keys()
-            .filter(|name| path::parent(name) == dir)
-            .map(|name| path::file_name(name).to_owned())
+            .range::<str, _>((start, std::ops::Bound::Unbounded))
+            .map_while(|(name, _)| name.strip_prefix(&prefix))
+            .filter(|child| !child.contains('/'))
+            .map(str::to_owned)
             .collect())
     }
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
@@ -1157,6 +1161,21 @@ impl Backing for RollbackBacking {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_only_returns_direct_children_of_the_exact_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+        backing.create_dir_all("data/nested").unwrap();
+        backing.create_dir_all("database").unwrap();
+        backing.open("data/a", true).unwrap();
+        backing.open("data/nested/hidden", true).unwrap();
+        backing.open("database/other", true).unwrap();
+        assert_eq!(backing.list("").unwrap(), ["data", "database"]);
+        assert_eq!(backing.list("data").unwrap(), ["a", "nested"]);
+        assert_eq!(backing.list("data/nested").unwrap(), ["hidden"]);
+    }
 
     #[test]
     fn retaining_or_extending_file_length_keeps_the_arena_slot_index() {
