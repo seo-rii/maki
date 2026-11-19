@@ -461,6 +461,7 @@ async fn remote_websocket_provider(
             "remote-websocket requires at least one [[crypto.websocket.endpoint]]".to_string(),
         ));
     }
+    let max_frame_bytes = ws.frame_byte_limit()?;
     let tls = ws
         .tls
         .as_ref()
@@ -491,10 +492,7 @@ async fn remote_websocket_provider(
                     .timeout
                     .map(|d| d.0)
                     .unwrap_or(std::time::Duration::from_secs(10)),
-                max_frame_bytes: ws
-                    .max_frame_bytes
-                    .map(|b| b.0 as usize)
-                    .unwrap_or(maki_format::config::DEFAULT_WS_MAX_FRAME_BYTES as usize),
+                max_frame_bytes,
                 tls: tls.clone(),
             },
         )?;
@@ -559,10 +557,7 @@ async fn remote_grpc_provider(
             .timeout
             .map(|d| d.0)
             .unwrap_or(std::time::Duration::from_secs(10)),
-        max_message_bytes: grpc
-            .max_message_bytes
-            .map(|b| b.0 as usize)
-            .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
+        max_message_bytes: grpc.message_byte_limit()?,
     };
     for (name, value) in &grpc.metadata {
         template.metadata.push((
