@@ -276,7 +276,7 @@ def run_nbdkit(args, runtime):
     notify.settimeout(0.2)
     environment = dict(os.environ, PATH=SYSTEM_PATH, NOTIFY_SOCKET=str(notify_path))
     log = open(log_path, "xb")
-    child = subprocess.Popen([args.nbdkit, "--foreground", "--threads", "4", "-U",
+    child = subprocess.Popen([args.nbdkit, "--exit-with-parent", "--threads", "4", "-U",
                               str(socket_path), args.plugin, "config=" + args.config],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                              env=environment, start_new_session=True)
