@@ -217,31 +217,18 @@ fn main() -> ExitCode {
         }
     };
     // Validate the workload before creating or recovering any backing state.
-    let block = config.volume.device_block_size as usize;
     let io_size = options.io_size;
-    if io_size == 0
-        || io_size as u64 > config.nbd.maximum_io.0
-        || io_size as u64 > config.volume.max_virtual_size.0
-        || !io_size.is_multiple_of(block)
-    {
-        eprintln!(
-            "io-size {io_size} must be a positive multiple of {block} no larger than \
-             nbd.maximum_io ({}) or the device ({} bytes)",
-            config.nbd.maximum_io.0, config.volume.max_virtual_size.0
-        );
-        return ExitCode::from(2);
-    }
     let working_set_bytes = options.working_set.unwrap_or_else(|| {
-        options
-            .ops
-            .min(config.volume.max_virtual_size.0 / io_size as u64)
-            * io_size as u64
+        let slots = config
+            .volume
+            .max_virtual_size
+            .0
+            .checked_div(io_size as u64)
+            .unwrap_or(0);
+        options.ops.min(slots) * io_size as u64
     });
-    if working_set_bytes == 0
-        || working_set_bytes > config.volume.max_virtual_size.0
-        || !working_set_bytes.is_multiple_of(io_size as u64)
-    {
-        eprintln!("working-set must be a positive multiple of io-size no larger than the volume");
+    if let Err(error) = config.validate_fixed_io_working_set(io_size as u64, working_set_bytes) {
+        eprintln!("{error}");
         return ExitCode::from(2);
     }
     if let Err(error) = workload::validate_oracle_capacity(working_set_bytes / io_size as u64) {

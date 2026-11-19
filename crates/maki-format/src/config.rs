@@ -1206,7 +1206,6 @@ impl VolumeConfig {
         }
         self.geometry()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        self.validate_journal_bounds()?;
         self.validate_settings()?;
         // Name conflicts first: they say more than a per-credential error
         // about the same name.
@@ -1397,10 +1396,6 @@ fn is_absolute_path(path: &str) -> bool {
 }
 
 impl VolumeConfig {
-    /// Cross-field checks for the journal bound settings the engine enforces
-    /// (review M-004/M-013): every bound must be positive, and the hard
-    /// journal limit must leave room for at least one sealed segment plus
-    /// the active one, or the limit could never be honoured.
     /// The preferred I/O size advertised to NBD: `nbd.preferred_io` when
     /// set, otherwise the crypto unit (SPEC §13), never below
     /// `nbd.minimum_io`.
@@ -1410,7 +1405,102 @@ impl VolumeConfig {
             .unwrap_or_else(|| self.volume.crypto_unit_size.max(self.nbd.minimum_io))
     }
 
-    fn validate_journal_bounds(&self) -> Result<(), ConfigError> {
+    /// Check the largest request cost for a fixed-size workload whose offsets
+    /// are multiples of the request size, including direct engine workloads
+    /// with finer alignment than the exported NBD device.
+    pub fn validate_fixed_io_working_set(
+        &self,
+        io_size: u64,
+        working_set: u64,
+    ) -> Result<(), ConfigError> {
+        let block = u64::from(self.volume.device_block_size);
+        if block == 0
+            || self.volume.crypto_unit_size == 0
+            || io_size == 0
+            || io_size > self.nbd.maximum_io.0.min(u64::from(u32::MAX))
+            || io_size > self.volume.max_virtual_size.0
+            || !io_size.is_multiple_of(block)
+        {
+            return Err(invalid(format!("io-size {io_size} must be a positive multiple of {block} no larger than the configured device and maximum request size")));
+        }
+        if working_set == 0
+            || working_set > self.volume.max_virtual_size.0
+            || !working_set.is_multiple_of(io_size)
+        {
+            return Err(invalid(
+                "working-set must be a positive multiple of io-size no larger than the volume",
+            ));
+        }
+        self.validate_request_bounds(io_size, io_size, working_set)
+    }
+
+    fn validate_request_bounds(
+        &self,
+        request_len: u64,
+        minimum: u64,
+        span: u64,
+    ) -> Result<(), ConfigError> {
+        // The engine charges every touched crypto unit in full (F07). Adding
+        // one unit to the byte length undercounts a sub-unit request that
+        // crosses a unit boundary (BUG-084). Consider only permitted offsets
+        // and requests that fit the working range. Shorter requests cannot
+        // cost more: each can be extended to this length within the export.
+        let unit = u64::from(self.volume.crypto_unit_size);
+        // Units need not be powers of two. Offset phases repeat after
+        // unit/gcd(unit, minimum) steps; validated geometry bounds this to
+        // 32768 (16 MiB / 512), without allocating or scanning the export.
+        let (mut gcd, mut remainder) = (unit, minimum);
+        while remainder != 0 {
+            (gcd, remainder) = (remainder, gcd % remainder);
+        }
+        let offset_count = (unit / gcd).min((span - request_len) / minimum + 1);
+        let maximal_units = (0..offset_count)
+            .map(|step| {
+                let offset = step * minimum;
+                (offset + request_len - 1) / unit - offset / unit + 1
+            })
+            .max()
+            .unwrap(); // A validated nonempty export always permits offset 0.
+                       // The offsets above span at most one phase cycle and maximum_io
+                       // fits u32; their sum and full-unit charge are representable in u64.
+        let maximal_request = maximal_units * unit;
+        if self.limits.max_plaintext_bytes.0 < maximal_request {
+            return Err(invalid(format!(
+                "limits.max_plaintext_bytes {} must be at least {maximal_request}: one maximal \
+                 request can touch {maximal_units} crypto units of {unit} bytes each \
+                 (offset alignment {minimum}, I/O size {request_len}, span {span})",
+                self.limits.max_plaintext_bytes.0
+            )));
+        }
+        // After an inline checkpoint the overlay must fit both the latest and
+        // the durable copy of each unit in the largest request.
+        let l = &self.limits;
+        let overlay_needed = maximal_units
+            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
+            .saturating_mul(2);
+        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
+            return Err(invalid(format!(
+                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
+                 largest request ({maximal_units} units of {} ciphertext bytes) so it can \
+                 always be admitted after an inline checkpoint, or 0 to disable the bound",
+                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
+            )));
+        }
+        if l.max_overlay_entries != 0 && l.max_overlay_entries < maximal_units {
+            return Err(invalid(format!(
+                "limits.max_overlay_entries {} must be at least {maximal_units} (the largest \
+                 request in crypto units) or 0 to disable the bound",
+                l.max_overlay_entries
+            )));
+        }
+        self.validate_journal_bounds(maximal_units)
+    }
+
+    /// Cross-field checks for the journal bound settings the engine enforces
+    /// (review M-004/M-013): every bound must be positive, and the hard
+    /// journal limit must leave room for at least one sealed segment plus
+    /// the active one, or the limit could never be honoured.
+    fn validate_journal_bounds(&self, units_per_request: u64) -> Result<(), ConfigError> {
         let seg = self.backing.journal_segment_size.0;
         let max = self.backing.journal_max_bytes.0;
         if seg < 4096 {
@@ -1436,13 +1526,6 @@ impl VolumeConfig {
         let progress_overflow = || {
             ConfigError::Invalid("journal progress bound exceeds u64 byte accounting range".into())
         };
-        let units_per_request = self
-            .nbd
-            .maximum_io
-            .0
-            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
-            .checked_add(1)
-            .ok_or_else(progress_overflow)?;
         let needed = crate::journal::minimum_journal_limit(seg, record, units_per_request)
             .ok_or_else(progress_overflow)?;
         if max < needed {
@@ -1808,12 +1891,17 @@ impl VolumeConfig {
             if value == 0 {
                 return Err(invalid(format!("{name} must be positive")));
             }
-            // Match DualSemaphore's supported byte capacity. A larger TOML
-            // budget would be silently truncated before runtime admission.
-            if name.contains("_bytes") && value > (u32::MAX as u64 >> 1) {
+            // Keep both budgets representable by Tokio on this target. Byte
+            // budgets also retain DualSemaphore's per-acquire ceiling.
+            let max_permits = tokio::sync::Semaphore::MAX_PERMITS as u64;
+            let capacity = if name.contains("_bytes") {
+                max_permits.min(u64::from(u32::MAX >> 1))
+            } else {
+                max_permits
+            };
+            if value > capacity {
                 return Err(invalid(format!(
-                    "{name} ({value}) exceeds the admission capacity of {} bytes",
-                    u32::MAX as u64 >> 1
+                    "{name} ({value}) exceeds the admission capacity of {capacity}"
                 )));
             }
         }
@@ -2023,71 +2111,11 @@ impl VolumeConfig {
                 self.volume.max_virtual_size.0, n.minimum_io
             )));
         }
-        // The engine charges every touched crypto unit in full (F07). Adding
-        // one unit to the byte length undercounts a sub-unit request that
-        // crosses a unit boundary (BUG-084). Consider only offsets permitted
-        // by NBD and requests that fit the export. Shorter requests cannot
-        // cost more: each can be extended to this length within the export.
-        let unit = u64::from(self.volume.crypto_unit_size);
-        let minimum = u64::from(n.minimum_io);
-        let request_len = n.maximum_io.0.min(self.volume.max_virtual_size.0);
-        // Units need not be powers of two. Offset phases repeat after
-        // unit/gcd(unit, minimum) steps; validated geometry bounds this to
-        // 32768 (16 MiB / 512), without allocating or scanning the export.
-        let (mut gcd, mut remainder) = (unit, minimum);
-        while remainder != 0 {
-            (gcd, remainder) = (remainder, gcd % remainder);
-        }
-        let offset_count =
-            (unit / gcd).min((self.volume.max_virtual_size.0 - request_len) / minimum + 1);
-        let maximal_units = (0..offset_count)
-            .map(|step| {
-                let offset = step * minimum;
-                (offset + request_len - 1) / unit - offset / unit + 1
-            })
-            .max()
-            .unwrap(); // A validated nonempty export always permits offset 0.
-                       // The offsets above span at most one phase cycle and maximum_io
-                       // fits u32; their sum and full-unit charge are representable in u64.
-        let maximal_request = maximal_units * unit;
-        if self.limits.max_plaintext_bytes.0 < maximal_request {
-            return Err(invalid(format!(
-                "limits.max_plaintext_bytes {} must be at least {maximal_request}: one maximal \
-                 NBD request can touch {maximal_units} crypto units of {unit} bytes each \
-                 (minimum_io {minimum}, maximum_io {}, export size {})",
-                self.limits.max_plaintext_bytes.0, n.maximum_io.0, self.volume.max_virtual_size.0
-            )));
-        }
-        // Progress guarantee for the overlay bound (R4-005): after an inline
-        // checkpoint the overlay is empty, and the largest single request
-        // (nbd.maximum_io plus one unit of misalignment, as ciphertext) is
-        // charged twice (latest plus durable copy), so it must fit twice.
-        // Checked after nbd.maximum_io itself so an unrepresentable maximum
-        // is reported as such.
-        let l = &self.limits;
-        let overlay_units = n
-            .maximum_io
-            .0
-            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
-            + 1;
-        let overlay_needed = overlay_units
-            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
-            .saturating_mul(2);
-        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
-            return Err(invalid(format!(
-                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
-                 largest request ({overlay_units} units of {} ciphertext bytes) so it can \
-                 always be admitted after an inline checkpoint, or 0 to disable the bound",
-                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
-            )));
-        }
-        if l.max_overlay_entries != 0 && l.max_overlay_entries < overlay_units {
-            return Err(invalid(format!(
-                "limits.max_overlay_entries {} must be at least {overlay_units} (the largest \
-                 request in crypto units) or 0 to disable the bound",
-                l.max_overlay_entries
-            )));
-        }
+        self.validate_request_bounds(
+            n.maximum_io.0.min(self.volume.max_virtual_size.0),
+            u64::from(n.minimum_io),
+            self.volume.max_virtual_size.0,
+        )?;
 
         // Socket paths are resolved by nbdkit and the helper against *their*
         // working directories: only an absolute path names one place.

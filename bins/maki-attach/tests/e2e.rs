@@ -163,6 +163,19 @@ fn cleanup_plan_describes_idempotent_record_driven_storage_cleanup() {
 }
 
 #[test]
+fn verify_rejects_invalid_volume_names_before_planning_or_execution() {
+    for args in [
+        vec!["verify", "--volume", "demo.one", "--plan"],
+        vec!["verify", "--volume", "demo.one"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("volume name"));
+    }
+}
+
+#[test]
 fn verify_plan_describes_the_workload_gate_without_claiming_live_evidence() {
     let out = run(&["verify", "--volume", "v1", "--plan"]);
     assert!(

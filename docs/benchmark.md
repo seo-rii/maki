@@ -43,7 +43,9 @@ maki-benchmark --json --concurrency 32 --access random --read-percent 70 \
 | `--flush-every N` | Drain each cohort of N measured operations, then FLUSH; requires N > 0. Phased reads do not issue FLUSH. The last cohort always has a final FLUSH. |
 
 I/O size must fit the device and configured maximum request size and be a
-multiple of its device block size. `ops` must be in 1–1,000,000,000. Unknown,
+multiple of its device block size. Before opening a volume, the benchmark checks
+that a request at any slot in the working set fits the plaintext, overlay, and
+journal budgets, including slots that span crypto-unit boundaries. `ops` must be in 1–1,000,000,000. Unknown,
 duplicate, missing, malformed and out-of-range workload arguments fail before
 backing creation.
 

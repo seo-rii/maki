@@ -9,6 +9,7 @@ authors.workspace = true
 http = "1"
 maki-backing.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["sync"] }
 serde.workspace = true
 toml.workspace = true
 crc32fast.workspace = true
