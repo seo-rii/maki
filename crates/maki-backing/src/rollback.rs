@@ -212,6 +212,9 @@ struct State {
     entries: BTreeMap<String, Entry>,
     files: BTreeMap<u64, Node>,
     handles: BTreeMap<u64, usize>,
+    // Identities with neither a working nor a committed name. They become
+    // reclaimable at last close. Unlink or replacement can invalidate this set.
+    unlinked_files: Option<BTreeSet<u64>>,
     next_id: u64,
     locks: BTreeSet<String>,
     poisoned: bool,
@@ -499,6 +502,7 @@ impl RollbackBacking {
                 witness,
                 _disk_lock: disk_lock,
                 handles: BTreeMap::new(),
+                unlinked_files: None,
                 locks: BTreeSet::new(),
                 poisoned: false,
             })),
@@ -608,24 +612,16 @@ impl State {
     }
 
     fn reclaim_closed_files(&mut self) -> io::Result<()> {
-        let mut retained: BTreeSet<u64> = self
-            .committed
-            .entries
-            .values()
-            .chain(self.entries.values())
-            .filter_map(|entry| match entry {
-                Entry::File(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
-        retained.extend(self.handles.keys());
-        if self
-            .committed
-            .files
-            .keys()
-            .chain(self.files.keys())
-            .any(|id| !retained.contains(id))
-        {
+        let unlinked = self.unlinked_files.get_or_insert_with(|| {
+            let mut ids: BTreeSet<_> = self.files.keys().copied().collect();
+            for entry in self.committed.entries.values().chain(self.entries.values()) {
+                if let Entry::File(id) = entry {
+                    ids.remove(id);
+                }
+            }
+            ids
+        });
+        if unlinked.iter().any(|id| !self.handles.contains_key(id)) {
             // Last-close cannot report commit errors. Defer reclamation until
             // the next space query, reservation or identity-limited creation,
             // where errors can propagate.
@@ -654,7 +650,13 @@ impl State {
                 _ => None,
             })
             .collect();
-        retain.extend(self.handles.keys());
+        let mut unlinked = BTreeSet::new();
+        for id in self.handles.keys() {
+            if retain.insert(*id) {
+                // Only this handle keeps the identity in the new manifest.
+                unlinked.insert(*id);
+            }
+        }
         candidate.files.retain(|id, _| retain.contains(id));
         candidate.validate()?;
         let bytes = candidate.encode()?;
@@ -672,6 +674,7 @@ impl State {
             self.poisoned = true;
             return Err(error);
         }
+        self.unlinked_files = Some(unlinked);
         self.reserved_pages = candidate.reserved_pages();
         self.committed = candidate;
         self.manifest_slot = slot;
@@ -1026,6 +1029,7 @@ impl Backing for RollbackBacking {
             return Err(input("directory removal is unsupported"));
         }
         state.entries.remove(name).ok_or_else(missing)?;
+        state.unlinked_files = None;
         Ok(())
     }
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -1046,7 +1050,9 @@ impl Backing for RollbackBacking {
             ));
         }
         state.entries.remove(from);
-        state.entries.insert(to.to_owned(), entry);
+        if state.entries.insert(to.to_owned(), entry).is_some() {
+            state.unlinked_files = None;
+        }
         Ok(())
     }
     fn create_dir_all(&self, name: &str) -> io::Result<()> {
