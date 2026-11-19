@@ -249,6 +249,7 @@ fn main() -> ExitCode {
                 vg_name: request.vg_name.clone(),
                 lv_name: request.lv_name.clone(),
                 lvm_identity: request.lvm_identity.clone(),
+                fs_uuid: request.fs_uuid.clone(),
                 target_bytes: target,
                 mountpoint: request.mountpoint.clone(),
             })

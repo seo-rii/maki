@@ -183,6 +183,7 @@ fn plans_contain_no_credential_material() {
             vg_name: "vg_maki_postgres".into(),
             lv_name: "data".into(),
             lvm_identity: None,
+            fs_uuid: None,
             target_bytes: 10 << 30,
             mountpoint: "/srv/postgres".into(),
         })
@@ -224,6 +225,7 @@ fn grow_plan_is_lvextend_then_xfs_growfs() {
         vg_name: "vg".into(),
         lv_name: "data".into(),
         lvm_identity: None,
+        fs_uuid: None,
         target_bytes: 1 << 30,
         mountpoint: "/srv/postgres".into(),
     });
