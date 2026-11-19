@@ -179,6 +179,33 @@ fn plans_enforce_the_volume_format_name_limit() {
 }
 
 #[test]
+fn mapper_name_must_fit_after_escaping_both_lvm_names() {
+    for (vg, lv, valid) in [
+        ("v".repeat(63), "l".repeat(63), true),
+        ("v".repeat(64), "l".repeat(63), false),
+        (
+            format!("v{}", "-".repeat(31)),
+            format!("l{}", "-".repeat(31)),
+            true,
+        ),
+        (
+            format!("v{}", "-".repeat(31)),
+            format!("l{}", "-".repeat(32)),
+            false,
+        ),
+    ] {
+        let out = run(&[
+            "attach", "--volume", "v1", "--vg", &vg, "--lv", &lv, "--plan",
+        ]);
+        assert_eq!(out.status.success(), valid, "{vg}/{lv}");
+        if !valid {
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("127"));
+        }
+    }
+}
+
+#[test]
 fn attach_plans_reject_internal_lvm_names_only_for_the_selected_lv() {
     for name in [
         "snapshot",

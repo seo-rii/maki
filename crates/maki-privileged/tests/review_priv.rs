@@ -655,6 +655,28 @@ fn pinned_nbd_devices_must_be_canonical() {
     }
 }
 
+#[test]
+fn attach_socket_must_end_in_a_filename() {
+    for (path, valid) in [
+        ("/run/nbd.sock", true),
+        ("/", false),
+        ("/run/nbd.sock/", false),
+        ("/run/nbd.sock/.", false),
+        ("/run/nbd.sock/..", false),
+    ] {
+        let cfg = AttachConfig {
+            nbd_socket: Some(path.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.into_request("pg", AttachOverrides::default(), false)
+                .is_ok(),
+            valid,
+            "{path}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn attach_checks_the_socket_path_byte_limit() {

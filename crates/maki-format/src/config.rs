@@ -2173,6 +2173,14 @@ impl VolumeConfig {
                         "{name} {socket:?} must be an absolute path"
                     )));
                 }
+                // Path::file_name normalizes trailing slashes and "/.", but a
+                // socket cannot bind to a path that requires a directory.
+                if matches!(
+                    socket.rsplit(std::path::is_separator).next(),
+                    Some("" | "." | "..")
+                ) {
+                    return Err(invalid(format!("{name} must end with a socket filename")));
+                }
                 #[cfg(unix)]
                 if socket.contains('\0')
                     || std::os::unix::net::SocketAddr::from_pathname(socket).is_err()

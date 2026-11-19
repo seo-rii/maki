@@ -862,6 +862,23 @@ fn websocket_and_grpc_timeouts_must_be_positive() {
     }
 }
 
+#[test]
+fn unix_socket_paths_must_end_in_a_filename() {
+    for section in ["nbd", "control"] {
+        for (path, valid) in [
+            ("/run/demo.sock", true),
+            ("/run/./demo.sock", true),
+            ("/", false),
+            ("/run/demo.sock/", false),
+            ("/run/demo.sock/.", false),
+            ("/run/demo.sock/..", false),
+        ] {
+            let cfg = parse(&format!("{}[{section}]\nsocket = {path:?}\n", local()));
+            assert_eq!(cfg.validate().is_ok(), valid, "{section}: {path}");
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn unix_socket_path_lengths_are_checked_in_bytes() {
