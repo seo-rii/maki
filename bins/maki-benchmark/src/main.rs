@@ -188,6 +188,7 @@ struct Report {
 }
 
 fn main() -> ExitCode {
+    maki_core::logging::install_default_logging();
     if std::env::args().len() == 2
         && matches!(std::env::args().nth(1).as_deref(), Some("--help" | "-h"))
     {
