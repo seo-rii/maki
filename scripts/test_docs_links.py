@@ -41,6 +41,22 @@ class DocumentationLinks(unittest.TestCase):
         self.assertEqual(broken_links(self.root),
                          ["README.md:8: #draft (missing anchor)", "README.md:9: missing.md"])
 
+    def test_block_comments_end_with_their_list_or_quote_container(self):
+        cases = {
+            "list": "- <!-- draft\n\n[real](gone.md)\n",
+            "sibling": "- <!-- draft\n- [real](gone.md)\n",
+            "quoted list": "> 1. <!-- draft\n>    [draft](hidden.md)\n> [real](gone.md)\n",
+            "list of quotes": "- > <!-- draft\n  > [draft](hidden.md)\n  [real](gone.md)\n",
+            "nested list": "- outer\n  - <!-- draft\n    [draft](hidden.md)\n  [real](gone.md)\n",
+            "inline close": "- > <!-- [draft](hidden.md) -->\n  > [real](gone.md)\n",
+            "closing line": "- > <!-- draft\n  > --> [draft](hidden.md)\n  > [real](gone.md)\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                self.write("README.md", content)
+                self.assertEqual(broken_links(self.root),
+                                 [f"README.md:{len(content.splitlines())}: gone.md"])
+
     def test_mixed_case_markdown_extensions(self):
         self.write("README.Md", "[broken](absent)\n", tracked=False)
         self.assertEqual(broken_links(self.root), ["README.Md:1: absent"])

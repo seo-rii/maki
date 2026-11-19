@@ -59,6 +59,7 @@ ASCII_PUNCTUATION = frozenset(string.punctuation)
 LINK_LABEL = re.compile(r"\[((?:[^\\\[\]]|\\.){0,999})\]")
 # Block-quote markers, then at most one list-item marker, before a block.
 QUOTE_MARKER = re.compile(r" {0,3}>[ \t]?")
+BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])( +|$)")
 LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)")
 CONTAINER_PREFIX = re.compile(rf"^((?:{QUOTE_MARKER.pattern})*)({LIST_MARKER.pattern})?")
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
@@ -76,56 +77,68 @@ def candidate_markdown(root):
 
 
 def unfenced_lines(text):
-    """Yield (line number, line) for every line outside fenced code blocks."""
-    fence = None
-    list_indents = []
-    last_depth = 0
-    comment_depth = None
+    """Yield source lines outside fenced code and HTML comment blocks."""
+    # Each open container is a block quote (None) or a list item's continuation
+    # indentation in columns. Preserve their order for lists inside quotes and
+    # quotes inside lists. A literal block cannot continue beyond its container.
+    containers = []
+    block = None
     for number, line in enumerate(text.splitlines(), start=1):
-        # CommonMark counts block indentation in columns, with four-column tab stops.
         columns = line.expandtabs(4)
-        if fence is not None:
-            marker, quote_depth, list_indent = fence
-            pos = 0
-            for _ in range(quote_depth):
+        pos = 0
+        for index, indent in enumerate(containers):
+            if indent is None:
                 quote = QUOTE_MARKER.match(columns, pos)
-                if quote is None:
-                    break
-                pos = quote.end()
-            else:
-                content = columns[pos:]
-                if not content.strip() or content.startswith(" " * list_indent):
-                    close = FENCE.fullmatch(content[list_indent:])
-                    if (close and close[1][0] == marker[0] and len(close[1]) >= len(marker)
-                            and not close[2].strip(" \t")):
-                        fence = None
+                if quote:
+                    pos = quote.end()
                     continue
-            # A fence inside a quote or list item ends with its container.
-            fence = None
-        prefix = CONTAINER_PREFIX.match(columns)
-        depth = prefix[1].count(">")
-        body = columns[prefix.end(1):]
-        if comment_depth is not None and depth < comment_depth:
-            comment_depth = None
-        # A block comment includes its closing line. Its contents cannot open a fence.
-        if comment_depth is not None or re.match(r" {0,3}<!--", columns[prefix.end():]):
-            comment_depth = None if "-->" in columns[prefix.end():] else depth
+            elif columns.startswith(" " * indent, pos):
+                pos += indent
+                continue
+            elif not columns[pos:].strip():
+                pos = len(columns)
+                continue
+            del containers[index:]
+            block = None
+            break
+
+        content = columns[pos:]
+        if block == "<!--":
+            if "-->" in content:
+                block = None
             continue
-        if last_depth != depth:
-            list_indents.clear()
-        last_depth = depth
-        indent = len(body) - len(body.lstrip(" "))
-        if body.strip():
-            while list_indents and list_indents[-1] > indent:
-                list_indents.pop()
-        list_indent = list_indents[-1] if list_indents else 0
-        item = LIST_MARKER.match(body, list_indent)
-        if item:
-            list_indent = item.end()
-            list_indents.append(list_indent)
-        match = FENCE.fullmatch(body[list_indent:])
+        if block is not None:
+            close = FENCE.fullmatch(content)
+            if (close and close[1][0] == block[0] and len(close[1]) >= len(block)
+                    and not close[2].strip(" \t")):
+                block = None
+            continue
+
+        while pos < len(columns):
+            quote = QUOTE_MARKER.match(columns, pos)
+            if quote:
+                containers.append(None)
+                pos = quote.end()
+                continue
+            item = BLOCK_LIST_MARKER.match(columns, pos)
+            if not item:
+                break
+            marker_end = item.start(1)
+            padding = item.end(1) - marker_end
+            # Five or more spaces introduce indented item content. An empty
+            # item still needs one column after its marker on the next line.
+            width = padding if 1 <= padding <= 4 and item.end() < len(columns) else 1
+            containers.append(marker_end - pos + width)
+            pos = marker_end + width
+
+        content = columns[pos:]
+        if re.match(r" {0,3}<!--", content):
+            if "-->" not in content:
+                block = "<!--"
+            continue
+        match = FENCE.fullmatch(content)
         if match and not (match[1][0] == "`" and "`" in match[2]):
-            fence = match[1], depth, list_indent
+            block = match[1]
             continue
         yield number, line
 
