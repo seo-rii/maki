@@ -209,6 +209,12 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
         self.assertIn(f"After={units['target']} {units['attach']} {units['daemon']}", recovery)
         self.assertIn("StartLimitBurst=3", recovery)
 
+    def test_instance_substitution_preserves_literal_helper_path(self):
+        volume = "mkci_fixture"
+        units = fixture.fixture_units(volume, Path("/tmp/private"), Path("/tmp/%images/helper"))
+        self.assertIn('ExecStopPost="/tmp/%%images/helper" recover-failed-start --volume mkci_fixture',
+                      units[fixture.names(volume)["attach"]].splitlines())
+
     def test_unexpected_hook_or_external_dependency_is_refused(self):
         read_text = Path.read_text
         for replacement in ("OnFailure=foreign.service\n", "ExecStopPost=/bin/false\n"):
