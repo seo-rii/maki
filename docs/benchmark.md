@@ -122,8 +122,10 @@ and sweeps the complete initialized working set.
   allocator overhead and the at-most-256 sequencing locks.
 - `observed_peak_active_callbacks`, `observed_peak_plaintext_bytes`,
   `observed_peak_overlay_bytes` and `observed_peak_journal_pending_bytes` come
-  from nonblocking engine snapshots sampled every 1ms. Short peaks can fall
-  between samples; snapshots can use the latest observation while the volume
+  from nonblocking engine snapshots. The monitor samples at most once per
+  millisecond, skips missed samples when delayed, and takes a final snapshot
+  on shutdown. Short peaks can fall between samples. Snapshots can use the
+  latest observation while the volume
   lock is busy. `monitor_samples` and `monitor_interval_ms` describe that
   sampling cost.
 - `process_peak_rss_bytes` reads Linux `/proc/self/status` `VmHWM`, the
