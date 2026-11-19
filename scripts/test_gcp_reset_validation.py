@@ -36,10 +36,10 @@ class HostContracts(unittest.TestCase):
 
     def ack(self, cycle=0):
         return {
-            "event": "ack", "command": f"write-{cycle}", "cycle": cycle,
+            "event": "ack", "token": self.token, "command": f"write-{cycle}", "cycle": cycle,
             "mode": "flush" if cycle % 2 == 0 else "fua",
             "boot_id": self.boot_id,
-            "records": self.host.expected_records(cycle),
+            "records": self.host.expected_records(cycle, "a" * 32),
         }
 
     def test_noise_stale_identity_truncation_and_oversize_are_rejected(self):
@@ -85,16 +85,16 @@ class HostContracts(unittest.TestCase):
             ack = self.ack()
             ack[field] = value
             with self.assertRaises(ValueError):
-                self.host.record_ack(self.ledger, ack, 0)
+                self.host.record_ack(self.ledger, ack, 0, token=self.token)
             self.assertFalse(self.ledger.exists())
 
     def test_correct_ack_fsyncs_file_and_parent_and_loads_latest(self):
         with mock.patch.object(self.host.os, "fsync", wraps=self.host.os.fsync) as sync:
-            self.host.record_ack(self.ledger, self.ack(), 0)
+            self.host.record_ack(self.ledger, self.ack(), 0, token=self.token)
             self.assertGreaterEqual(sync.call_count, 2)
         next_ack = self.ack(1)
         next_ack["boot_id"] = "87654321-4321-4321-4321-cba987654321"
-        self.host.record_ack(self.ledger, next_ack, 1)
+        self.host.record_ack(self.ledger, next_ack, 1, token=self.token)
         self.assertEqual(self.host.load_ledger(self.ledger), next_ack)
 
     def test_empty_truncated_duplicate_or_tampered_ledger_fails_closed(self):
@@ -108,6 +108,15 @@ class HostContracts(unittest.TestCase):
         self.ledger.write_text(json.dumps(value) + "\n")
         with self.assertRaises(ValueError):
             self.host.load_ledger(self.ledger)
+
+    def test_historical_ledger_can_be_read_but_cannot_qualify_a_new_campaign(self):
+        archived = self.ack()
+        del archived["token"]
+        archived["records"] = self.host.expected_records(0)
+        self.ledger.write_text(json.dumps(archived) + "\n")
+        self.assertEqual(self.host.load_ledger(self.ledger), archived)
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.host.load_ledger(self.ledger, token=self.token)
 
     def test_missing_wrong_duplicate_or_guest_supplied_expectation_is_failure(self):
         expected = self.host.expected_records(0)
@@ -123,12 +132,14 @@ class HostContracts(unittest.TestCase):
             gcloud="gcloud", project="test-project", zone="asia-northeast3-a",
             instance="maki-reset-test", guest_agent="/opt/maki/gcp-reset-guest.py",
             guest_config="/mnt/maki-data/config.toml", guest_plugin="/opt/maki/libmaki_nbdkit.so",
-            guest_maki="/opt/maki/maki", data_disk="maki-reset-data", connect_timeout=9,
+            guest_maki="/opt/maki/maki", data_disk="maki-reset-data", connect_timeout=9, timeout=300,
         )
-        ssh = self.host.ssh_command(args, self.token, 3, verify_only=False)
+        ssh = self.host.ssh_command(args, self.token, 3, verify_only=False, device_name="custom-device")
         rendered = " ".join(ssh)
         self.assertIn("compute ssh maki-reset-test", rendered)
         self.assertIn("--cycle 3", rendered)
+        self.assertIn("--ready-timeout 300", rendered)
+        self.assertIn("--device-name custom-device", rendered)
         self.assertIn("sudo -n", rendered)
         self.assertNotIn(" stop ", f" {rendered} ")
         self.assertNotIn(" reboot ", f" {rendered} ")
@@ -203,7 +214,7 @@ class HostContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "TRIM"):
             self.host.validate_ready(invalid, None, "v3-discard")
 
-        expected = self.host.expected_discard_manifest(0)
+        expected = self.host.expected_discard_manifest(0, self.token)
         self.assertEqual(expected["trim"], [
             {"offset": 0, "length": 4096},
             {"offset": 4096, "length": 4096},
@@ -213,17 +224,17 @@ class HostContracts(unittest.TestCase):
         final = {row["offset"]: row for row in expected["final"]}
         self.assertEqual(final[4096]["sha256"], self.host.ZERO_SHA256)
         self.assertEqual(final[0], expected["rewrite"])
-        event = {"event": "ack", "command": "discard-0", "cycle": 0,
+        event = {"event": "ack", "token": self.token, "command": "discard-0", "cycle": 0,
                  "mode": "flush", "profile": "v3-discard", "boot_id": self.boot_id,
                  "manifest": expected}
-        self.host.validate_ack(event, 0, "v3-discard")
+        self.host.validate_ack(event, 0, "v3-discard", self.token)
         for field in ("write", "trim", "rewrite", "final"):
             invalid = json.loads(json.dumps(event))
             invalid["manifest"][field] = []
             with self.assertRaises(ValueError):
-                self.host.validate_ack(invalid, 0, "v3-discard")
+                self.host.validate_ack(invalid, 0, "v3-discard", self.token)
 
-        self.host.record_ack(self.ledger, event, 0, "v3-discard")
+        self.host.record_ack(self.ledger, event, 0, "v3-discard", token=self.token)
         self.assertEqual(self.host.load_ledger(self.ledger, "v3-discard"), event)
 
     def test_discard_profile_is_explicitly_forwarded_to_guest(self):
@@ -231,9 +242,9 @@ class HostContracts(unittest.TestCase):
             gcloud="gcloud", project="test-project", zone="asia-northeast3-a",
             instance="maki-reset-test", guest_agent="/opt/maki/gcp-reset-guest.py",
             guest_config="/mnt/maki-data/config.toml", guest_plugin="/opt/maki/libmaki_nbdkit.so",
-            connect_timeout=9, profile="v3-discard",
+            connect_timeout=9, timeout=300, profile="v3-discard",
         )
-        command = self.host.ssh_command(args, self.token, 0, False)
+        command = self.host.ssh_command(args, self.token, 0, False, "data")
         self.assertIn("--profile v3-discard", command[command.index("--command") + 1])
 
     def test_reset_requires_running_same_resources_after_exit_zero(self):
@@ -250,7 +261,7 @@ class HostContracts(unittest.TestCase):
         args = types.SimpleNamespace(
             gcloud="gcloud", project="test-project", zone="asia-northeast3-a",
             instance="maki-reset-test", guest_maki="/opt/maki/maki",
-            guest_config="/mnt/maki-data/config.toml", connect_timeout=9,
+            guest_config="/mnt/maki-data/config.toml", connect_timeout=9, timeout=300,
         )
         command = self.host.offline_check_command(args)
         rendered = " ".join(command)
@@ -315,7 +326,7 @@ class HostContracts(unittest.TestCase):
                 process.expect = mock.Mock(side_effect=ValueError("fixture ACK failure"))
                 ready = dict(event="ready", boot_id=self.boot_id,
                              provider="local-aes-gcm-siv", can_flush=True, can_fua=True, can_trim=False,
-                             fs_uuid="00112233-4455-6677-8899-aabbccddeeff",
+                             fs_uuid="00112233-4455-6677-8899-aabbccddeeff", data_device="data",
                              witness_service="active", graceful_stop_witness="absent")
                 current = dict(baseline)
                 if failure == "boot":
@@ -349,7 +360,7 @@ class HostContracts(unittest.TestCase):
         with mock.patch.object(self.host, "ssh_command", return_value=["gcloud"]), \
                 mock.patch.object(self.host, "RemoteProcess", return_value=guest), \
                 mock.patch.object(self.host.time, "monotonic", side_effect=[100, 100, 105]):
-            session, _ = self.host.launch_guest(args, self.token, 0, False, self.path)
+            session, _ = self.host.launch_guest(args, self.token, 0, False, self.path, "data")
         self.assertIs(session, guest)
         guest.close.assert_not_called()
 
@@ -364,7 +375,7 @@ class HostContracts(unittest.TestCase):
             with mock.patch.object(self.host, "RemoteProcess", side_effect=[first, second]):
                 with mock.patch.object(self.host.time, "sleep"):
                     process, actual = self.host.launch_guest(
-                        args, self.token, 1, False, self.path / "retry")
+                        args, self.token, 1, False, self.path / "retry", "data")
         self.assertIs(process, second)
         self.assertEqual(actual, ready)
         first.close.assert_called_once_with()
@@ -374,7 +385,7 @@ class HostContracts(unittest.TestCase):
         code = f'''import importlib.util, pathlib
 spec=importlib.util.spec_from_file_location("host", {source!r})
 host=importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
-host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)
+host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0, token={"a"*32!r})
 '''
         result = subprocess.run([sys.executable, "-O", "-c", code], capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
@@ -667,13 +678,13 @@ class GuestContracts(unittest.TestCase):
             else:
                 client.write.side_effect = RuntimeError("FUA failed")
             with self.assertRaises(RuntimeError):
-                self.guest.barrier(client, int(mode == "fua"), mode)
+                self.guest.barrier(client, int(mode == "fua"), mode, "a" * 32)
 
     def test_payload_manifest_matches_independent_host_oracle(self):
         for cycle, mode in ((0, "flush"), (1, "fua")):
             client = mock.Mock()
-            records = self.guest.barrier(client, cycle, mode)
-            self.assertEqual(records, self.host.expected_records(cycle))
+            records = self.guest.barrier(client, cycle, mode, "a" * 32)
+            self.assertEqual(records, self.host.expected_records(cycle, "a" * 32))
             self.assertEqual(client.write.call_count, 16)
             for call in client.write.call_args_list:
                 self.assertEqual(call.kwargs["fua"], mode == "fua")
@@ -697,8 +708,8 @@ class GuestContracts(unittest.TestCase):
     def test_discard_manifest_matches_host_oracle_and_barriers_every_operation(self):
         for cycle, mode in ((0, "flush"), (1, "fua")):
             client = mock.Mock()
-            manifest = self.guest.discard_barrier(client, cycle, mode)
-            self.assertEqual(manifest, self.host.expected_discard_manifest(cycle))
+            manifest = self.guest.discard_barrier(client, cycle, mode, "a" * 32)
+            self.assertEqual(manifest, self.host.expected_discard_manifest(cycle, "a" * 32))
             self.assertEqual(client.write.call_count, 17)
             self.assertEqual(client.trim.call_args_list, [
                 mock.call(0, 4096, fua=mode == "fua"),
@@ -716,17 +727,17 @@ class GuestContracts(unittest.TestCase):
             client = mock.Mock()
             getattr(client, method).side_effect = [None] * (failure_call - 1) + [RuntimeError("failed")]
             with self.assertRaises(RuntimeError):
-                self.guest.discard_barrier(client, 0, "flush")
+                self.guest.discard_barrier(client, 0, "flush", "a" * 32)
 
     def test_discard_readback_reports_rewrite_and_persistent_zero(self):
         events = []
         client = mock.Mock()
-        expected = self.host.expected_discard_manifest(1)["final"]
+        expected = self.host.expected_discard_manifest(1, "a" * 32)["final"]
         blocks = {row["offset"]: bytes(4096) if row["offset"] == 4096
-                  else self.guest.discard_final_block(1, row["offset"])
+                  else self.guest.discard_final_block(1, row["offset"], "a" * 32)
                   for row in expected}
         client.read.side_effect = blocks.__getitem__
-        args = argparse.Namespace(cycle=2, verify_only=True, profile="v3-discard")
+        args = argparse.Namespace(token="a" * 32, cycle=2, verify_only=True, profile="v3-discard")
         self.guest.execute_cycle(args, client,
                                  lambda event, **fields: events.append((event, fields)))
         self.assertEqual(events[0][0], "readback")
@@ -751,20 +762,20 @@ class GuestContracts(unittest.TestCase):
     def test_later_cycle_reads_previous_generation_before_new_writes(self):
         events = []
         client = mock.Mock()
-        client.read.side_effect = lambda offset: self.guest.payload(1, self.guest.index_for_offset(offset))
-        args = argparse.Namespace(cycle=2, verify_only=False)
+        client.read.side_effect = lambda offset: self.guest.payload(1, self.guest.index_for_offset(offset), "a" * 32)
+        args = argparse.Namespace(token="a" * 32, cycle=2, verify_only=False)
         with mock.patch.object(self.guest, "barrier", return_value=[]) as barrier:
             with mock.patch.object(self.guest, "wait_for_reset"):
                 self.guest.execute_cycle(args, client, lambda event, **fields: events.append((event, fields)))
         self.assertEqual(events[0][0], "readback")
         self.assertEqual(events[0][1]["generation"], 1)
         self.assertEqual(len(events[0][1]["records"]), 16)
-        barrier.assert_called_once_with(client, 2, "flush")
+        barrier.assert_called_once_with(client, 2, "flush", "a" * 32)
         self.assertEqual(events[-1][0], "ack")
 
     def test_ack_is_emitted_then_guest_waits_for_external_reset(self):
         events = []
-        args = argparse.Namespace(cycle=0, verify_only=False)
+        args = argparse.Namespace(token="a" * 32, cycle=0, verify_only=False)
         with mock.patch.object(self.guest, "barrier", return_value=[]) as barrier:
             with mock.patch.object(self.guest, "wait_for_reset", side_effect=RuntimeError("still alive")) as wait:
                 with self.assertRaisesRegex(RuntimeError, "still alive"):
@@ -777,8 +788,8 @@ class GuestContracts(unittest.TestCase):
     def test_verify_only_reads_previous_generation_and_returns_without_ack(self):
         events = []
         client = mock.Mock()
-        client.read.side_effect = lambda offset: self.guest.payload(2, self.guest.index_for_offset(offset))
-        args = argparse.Namespace(cycle=3, verify_only=True)
+        client.read.side_effect = lambda offset: self.guest.payload(2, self.guest.index_for_offset(offset), "a" * 32)
+        args = argparse.Namespace(token="a" * 32, cycle=3, verify_only=True)
         self.guest.execute_cycle(args, client, lambda event, **fields: events.append((event, fields)))
         self.assertEqual([event for event, _ in events], ["readback", "verified"])
 

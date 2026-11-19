@@ -22,6 +22,11 @@ import subprocess
 import time
 import uuid
 
+try:
+    from campaign_io import DiagnosticLog, save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import DiagnosticLog, save_json
+
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
 MAX_FRAME = 16384
@@ -36,20 +41,22 @@ def mode_for_cycle(cycle):
     return "flush" if cycle % 2 == 0 else "fua"
 
 
-def expected_records(cycle):
+def expected_records(cycle, token=None):
     mode_for_cycle(cycle)
+    prefix = "maki-gcp-reset-v1" if token is None else f"maki-gcp-reset-v2:{token}"
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        block = hashlib.sha256(f"maki-gcp-reset-v1:{cycle}:{index}".encode()).digest() * 128
+        block = hashlib.sha256(f"{prefix}:{cycle}:{index}".encode()).digest() * 128
         records.append({"offset": offset, "length": 4096,
                         "sha256": hashlib.sha256(block).hexdigest()})
     return records
 
 
-def expected_discard_manifest(cycle):
-    writes = expected_records(cycle)
-    rewrite_block = hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{cycle}".encode()).digest() * 128
+def expected_discard_manifest(cycle, token=None):
+    writes = expected_records(cycle, token)
+    prefix = "maki-gcp-reset-v3-rewrite" if token is None else f"maki-gcp-reset-v3-rewrite:{token}"
+    rewrite_block = hashlib.sha256(f"{prefix}:{cycle}".encode()).digest() * 128
     rewrite = {"offset": 0, "length": 4096,
                "sha256": hashlib.sha256(rewrite_block).hexdigest()}
     final = [dict(row) for row in writes]
@@ -124,9 +131,12 @@ def validate_records(records, expected):
         raise ValueError("record manifest mismatch, missing, reordered, or duplicated")
 
 
-def validate_ack(event, cycle, profile="v2"):
+def validate_ack(event, cycle, profile="v2", token=None):
     if not isinstance(event, dict):
         raise ValueError("ACK must be an object")
+    if event.get("token") != token or (token is not None and (
+            not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token))):
+        raise ValueError("ACK campaign identity mismatch")
     validate_boot_id(event.get("boot_id"))
     command = f"discard-{cycle}" if profile == "v3-discard" else f"write-{cycle}"
     if (event.get("event") != "ack" or event.get("command") != command
@@ -134,17 +144,19 @@ def validate_ack(event, cycle, profile="v2"):
             or event.get("mode") != mode_for_cycle(cycle)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
     if profile == "v3-discard":
-        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle):
+        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle, token):
             raise ValueError("discard manifest mismatch, missing, reordered, or duplicated")
     else:
-        validate_records(event.get("records"), expected_records(cycle))
+        validate_records(event.get("records"), expected_records(cycle, token))
 
 
-def record_ack(ledger, event, cycle, profile="v2"):
-    validate_ack(event, cycle, profile)
+def record_ack(ledger, event, cycle, profile="v2", *, token):
+    if token is None:
+        raise ValueError("new ACKs require a campaign token")
+    validate_ack(event, cycle, profile, token)
     keys = ("event", "command", "cycle", "mode", "boot_id", "profile", "manifest") \
         if profile == "v3-discard" else ("event", "command", "cycle", "mode", "boot_id", "records")
-    record = {key: event[key] for key in keys}
+    record = {key: event[key] for key in (*keys, "token")}
     descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
@@ -157,7 +169,7 @@ def record_ack(ledger, event, cycle, profile="v2"):
         os.close(parent)
 
 
-def load_ledger(ledger, profile="v2"):
+def load_ledger(ledger, profile="v2", *, token=None):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ACK ledger")
     raw = ledger.read_text(encoding="utf-8")
@@ -170,7 +182,10 @@ def load_ledger(ledger, profile="v2"):
             event = json.loads(line)
         except json.JSONDecodeError as error:
             raise ValueError("invalid ACK ledger") from error
-        validate_ack(event, cycle, profile)
+        # Older archived ledgers have neither a token nor run-specific payloads.
+        if cycle == 0 and token is None and isinstance(event, dict):
+            token = event.get("token")
+        validate_ack(event, cycle, profile, token)
         require_unique_boot(seen_boots, event["boot_id"])
         latest = event
     return latest
@@ -178,15 +193,6 @@ def load_ledger(ledger, profile="v2"):
 
 def verify_readbacks(expected, actual):
     validate_records(actual, expected)
-
-
-def save_json(path, value):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def bounded_run(command, timeout):
@@ -370,10 +376,11 @@ def reset_and_wait(args, command, baseline):
     return result
 
 
-def ssh_command(args, token, cycle, verify_only):
+def ssh_command(args, token, cycle, verify_only, device_name):
     guest = ["sudo", "-n", getattr(args, "guest_python", "python3"), args.guest_agent,
              "--token", token, "--cycle", str(cycle), "--config", args.guest_config,
-             "--plugin", args.guest_plugin]
+             "--plugin", args.guest_plugin, "--device-name", device_name,
+             "--ready-timeout", str(args.timeout)]
     profile = getattr(args, "profile", "v2")
     if profile != "v2":
         guest.extend(["--profile", profile])
@@ -419,10 +426,12 @@ class RemoteProcess:
         os.chmod(directory / "stderr.log", 0o600)
         self.selector = selectors.DefaultSelector()
         self.child = None
+        self.diagnostics_reader = None
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                          stdout=subprocess.PIPE, stderr=self.stderr_log,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           start_new_session=True, bufsize=0)
+            self.diagnostics_reader = DiagnosticLog(self.child.stderr, self.stderr_log, MAX_OUTPUT)
             self.selector.register(self.child.stdout, selectors.EVENT_READ)
         except BaseException:
             self.close()
@@ -521,7 +530,13 @@ class RemoteProcess:
             self.child.stdout.close()
         self.selector.close()
         self.stdout_log.close()
-        self.stderr_log.close()
+        try:
+            if self.diagnostics_reader is not None:
+                self.diagnostics_reader.finish()
+            elif self.child is not None:
+                self.child.stderr.close()
+        finally:
+            self.stderr_log.close()
 
 
 def cut_instance(args, process, baseline=None):
@@ -536,7 +551,7 @@ def cut_instance(args, process, baseline=None):
             "post_reset_status": None if running is None else running["status"]}
 
 
-def launch_guest(args, token, cycle, verify_only, output):
+def launch_guest(args, token, cycle, verify_only, output, device_name):
     until = time.monotonic() + args.timeout
     attempt = 0
     errors = []
@@ -544,7 +559,7 @@ def launch_guest(args, token, cycle, verify_only, output):
         remaining = until - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("instance did not accept a guest qualification SSH session: " + "; ".join(errors[-3:]))
-        process = RemoteProcess(ssh_command(args, token, cycle, verify_only),
+        process = RemoteProcess(ssh_command(args, token, cycle, verify_only, device_name),
                                 output / f"attempt-{attempt}", token, cycle)
         try:
             # SSH enforces ConnectTimeout itself; recovery after connection can
@@ -590,20 +605,22 @@ def campaign(args):
             entry = {"cycle": cycle, "verify_only": verify_only}
             result["boots"].append(entry)
             process, ready = launch_guest(args, token, cycle, verify_only,
-                                          args.output / f"cycle-{cycle}")
+                                          args.output / f"cycle-{cycle}", baseline["attachment_device_name"])
             try:
                 entry["ready"] = ready
                 current_boot = ready["boot_id"]
                 require_unique_boot(seen_boots, current_boot)
                 fs_uuid = validate_ready(ready, fs_uuid, args.profile)
+                if ready.get("data_device") != baseline["attachment_device_name"]:
+                    raise ValueError("guest backing device differs from GCE attachment")
                 current_resources = resource_identity(args, args.timeout)
                 validate_resource_identity(baseline, current_resources)
                 if cycle:
                     readback = process.expect("readback", args.timeout)
                     if readback.get("generation") != cycle - 1:
                         raise ValueError("guest read back the wrong generation")
-                    expected = (expected_discard_manifest(cycle - 1)["final"]
-                                if args.profile == "v3-discard" else expected_records(cycle - 1))
+                    expected = (expected_discard_manifest(cycle - 1, token)["final"]
+                                if args.profile == "v3-discard" else expected_records(cycle - 1, token))
                     actual = readback.get("manifest") if args.profile == "v3-discard" else readback.get("records")
                     verify_readbacks(expected, actual)
                     verified = process.expect("verified", args.timeout)
@@ -617,14 +634,14 @@ def campaign(args):
                     ack = process.expect("ack", args.timeout)
                     if ack["boot_id"] != current_boot:
                         raise ValueError("ACK boot identity changed")
-                    record_ack(ledger, ack, cycle, args.profile)
+                    record_ack(ledger, ack, cycle, args.profile, token=token)
                     entry["acked_units"] = 16
                     entry["mode"] = mode_for_cycle(cycle)
                     entry["reset_ssh_status"] = cut_instance(args, process, baseline)
             finally:
                 process.close()
             save_json(args.output / "results.json", result)
-        latest = load_ledger(ledger, args.profile)
+        latest = load_ledger(ledger, args.profile, token=token)
         if latest["cycle"] != args.cycles - 1:
             raise ValueError("ACK ledger did not cover every reset cycle")
         result["offline_deep_check"] = run_offline_check(args, args.timeout)

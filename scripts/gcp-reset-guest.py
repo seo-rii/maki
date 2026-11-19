@@ -16,6 +16,7 @@ import pathlib
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,30 +50,30 @@ def index_for_offset(offset):
     return offsets.index(offset)
 
 
-def payload(cycle, index):
+def payload(cycle, index, token):
     mode_for_cycle(cycle)
     offset_for_index(index)
-    return hashlib.sha256(f"maki-gcp-reset-v1:{cycle}:{index}".encode()).digest() * 128
+    return hashlib.sha256(f"maki-gcp-reset-v2:{token}:{cycle}:{index}".encode()).digest() * 128
 
 
-def rewrite_payload(cycle):
+def rewrite_payload(cycle, token):
     mode_for_cycle(cycle)
-    return hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{cycle}".encode()).digest() * 128
+    return hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{token}:{cycle}".encode()).digest() * 128
 
 
-def discard_final_block(cycle, offset):
+def discard_final_block(cycle, offset, token):
     index = index_for_offset(offset)
     if offset == 0:
-        return rewrite_payload(cycle)
+        return rewrite_payload(cycle, token)
     if offset == 4096:
         return bytes(4096)
-    return payload(cycle, index)
+    return payload(cycle, index, token)
 
 
-def manifest(cycle, blocks=None):
+def manifest(cycle, blocks):
     rows = []
     for index in range(16):
-        block = payload(cycle, index) if blocks is None else blocks[index]
+        block = blocks[index]
         ensure(isinstance(block, bytes) and len(block) == 4096, "invalid read block")
         rows.append({"offset": offset_for_index(index), "length": 4096,
                      "sha256": hashlib.sha256(block).hexdigest()})
@@ -134,11 +135,11 @@ class Nbd:
             self.handle = None
 
 
-def barrier(client, cycle, mode):
+def barrier(client, cycle, mode, token):
     ensure(mode == mode_for_cycle(cycle), "wrong durability barrier")
     records = []
     for index in range(16):
-        block = payload(cycle, index)
+        block = payload(cycle, index, token)
         offset = offset_for_index(index)
         client.write(offset, block, fua=mode == "fua")
         records.append({"offset": offset, "length": 4096,
@@ -148,21 +149,21 @@ def barrier(client, cycle, mode):
     return records
 
 
-def discard_barrier(client, cycle, mode):
+def discard_barrier(client, cycle, mode, token):
     ensure(mode == mode_for_cycle(cycle), "wrong durability barrier")
-    writes = barrier(client, cycle, mode)
+    writes = barrier(client, cycle, mode, token)
     trims = [{"offset": 0, "length": 4096}, {"offset": 4096, "length": 4096}]
     for row in trims:
         client.trim(row["offset"], row["length"], fua=mode == "fua")
     if mode == "flush":
         client.flush()
-    block = rewrite_payload(cycle)
+    block = rewrite_payload(cycle, token)
     client.write(0, block, fua=mode == "fua")
     if mode == "flush":
         client.flush()
     rewrite = {"offset": 0, "length": 4096,
                "sha256": hashlib.sha256(block).hexdigest()}
-    final = manifest(cycle, [discard_final_block(cycle, offset_for_index(index))
+    final = manifest(cycle, [discard_final_block(cycle, offset_for_index(index), token)
                              for index in range(16)])
     return {"write": writes, "trim": trims, "rewrite": rewrite, "final": final}
 
@@ -173,7 +174,7 @@ def capabilities(client, profile="v2"):
             "can_trim": client.can_trim}
 
 
-def configured_provider(path):
+def configured_backing(path):
     """Validate the campaign's provider before launching its data plane."""
     try:
         with path.open("rb") as stream:
@@ -188,7 +189,11 @@ def configured_provider(path):
     provider = crypto.get("provider") if isinstance(crypto, dict) else None
     ensure(provider == "local-aes-gcm-siv",
            'qualification requires crypto.provider = "local-aes-gcm-siv"')
-    return provider
+    backing = config.get("backing")
+    root = backing.get("root") if isinstance(backing, dict) else None
+    ensure(isinstance(root, str) and pathlib.Path(root).is_absolute(),
+           "qualification requires an absolute backing.root")
+    return provider, pathlib.Path(root).resolve(strict=True)
 
 
 def run_output(command, timeout=10):
@@ -205,6 +210,26 @@ def filesystem_uuid(path):
     value = run_output(["findmnt", "-n", "-o", "UUID", "--target", str(path)])
     ensure(BOOT_ID.fullmatch(value) is not None, "persistent filesystem UUID unavailable")
     return value
+
+
+def validate_disk(mount, config, backing, device_name):
+    """Bind the mounted filesystem to the exact GCE attachment before opening NBD."""
+    ensure(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,126}", device_name) is not None,
+           "invalid GCE attachment device name")
+    disk = (pathlib.Path("/dev/disk/by-id") / ("google-" + device_name)).stat()
+    ensure(stat.S_ISBLK(disk.st_mode), "GCE attachment is not a block device")
+    mounted = mount.stat().st_dev
+    ensure(backing.is_dir() and config.stat().st_dev == mounted and backing.stat().st_dev == mounted,
+           "config and backing.root must reside on the qualified filesystem")
+    if mounted != disk.st_rdev:
+        # A mounted partition must be an immediate child of the pinned disk.
+        dev = pathlib.Path("/sys/dev/block") / f"{os.major(mounted)}:{os.minor(mounted)}"
+        entry = dev.resolve(strict=True)
+        ensure((entry / "partition").is_file()
+               and (entry.parent / "dev").read_text().strip()
+               == f"{os.major(disk.st_rdev)}:{os.minor(disk.st_rdev)}",
+               "mounted filesystem does not belong to the GCE attachment")
+    return filesystem_uuid(mount)
 
 
 def shutdown_witness(path):
@@ -233,11 +258,11 @@ def execute_cycle(args, client, emit):
         return
     mode = mode_for_cycle(args.cycle)
     if profile == "v3-discard":
-        result = discard_barrier(client, args.cycle, mode)
+        result = discard_barrier(client, args.cycle, mode, args.token)
         emit("ack", command=f"discard-{args.cycle}", mode=mode,
              profile=profile, manifest=result)
     else:
-        records = barrier(client, args.cycle, mode)
+        records = barrier(client, args.cycle, mode, args.token)
         emit("ack", command=f"write-{args.cycle}", mode=mode, records=records)
     wait_for_reset()
 
@@ -295,6 +320,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token", required=True)
     parser.add_argument("--cycle", type=int, required=True)
+    parser.add_argument("--device-name", required=True)
     parser.add_argument("--config", default="/mnt/maki-data/config.toml")
     parser.add_argument("--plugin", default="/opt/maki/libmaki_nbdkit.so")
     parser.add_argument("--nbdkit", default="nbdkit")
@@ -305,15 +331,15 @@ def main():
     ensure(re.fullmatch(r"[0-9a-f]{32}", args.token) is not None, "invalid token")
     # A verify-only boot reads the preceding write generation; boot 64 reads 63.
     mode_for_cycle(args.cycle - 1 if args.verify_only else args.cycle)
-    ensure(1 <= args.ready_timeout <= 300, "invalid READY timeout")
+    ensure(1 <= args.ready_timeout <= 900, "invalid READY timeout")
     config = pathlib.Path(args.config).resolve(strict=True)
     plugin = pathlib.Path(args.plugin).resolve(strict=True)
     ensure(config.is_file() and plugin.is_file(), "config and plugin must be regular files")
     mount = pathlib.Path("/mnt/maki-data").resolve(strict=True)
-    ensure(config == mount / "config.toml", "qualification config must be on the persistent data mount")
-    provider = configured_provider(config)
+    ensure(config.is_relative_to(mount), "qualification config must be on the persistent data mount")
+    provider, backing = configured_backing(config)
     args.config = str(config)
-    fs_uuid = filesystem_uuid(mount)
+    fs_uuid = validate_disk(mount, config, backing, args.device_name)
     witness = shutdown_witness(mount / "graceful-stop.jsonl")
     boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     ensure(BOOT_ID.fullmatch(boot_id) is not None, "invalid boot identity")
@@ -334,7 +360,7 @@ def main():
         client = Nbd(socket_path)
         features = capabilities(client, args.profile)
         emit("ready", provider=provider, config=str(config),
-             kernel=os.uname().release, fs_uuid=fs_uuid, **features, **witness)
+             kernel=os.uname().release, fs_uuid=fs_uuid, data_device=args.device_name, **features, **witness)
         execute_cycle(args, client, emit)
     except BaseException as error:
         try:
