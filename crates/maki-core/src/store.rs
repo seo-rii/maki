@@ -282,6 +282,12 @@ fn probe_header(
         .map_or(Probe::Damaged, Probe::Header))
 }
 
+/// Only these slots belong to the export; the on-disk maps use full shard geometry.
+fn addressable_units(geometry: &Geometry, shard: u64) -> u64 {
+    let per_shard = geometry.units_per_shard();
+    per_shard.min(geometry.num_units().saturating_sub(shard * per_shard))
+}
+
 /// Units of `shard` whose bit is clear but whose slot holds a header for
 /// them. One header read per cleared slot.
 fn probe_shard(
@@ -465,11 +471,7 @@ impl SlotStore {
             // Positions below this name a unit of the device; a partial last
             // shard's positions past the device's last unit never hold data
             // (R5-027).
-            let in_device = alloc.units().min(
-                geometry
-                    .num_units()
-                    .saturating_sub(shard_idx * geometry.units_per_shard()),
-            );
+            let in_device = addressable_units(&geometry, shard_idx);
             // Creation finished ⇔ the shard was ever checkpointed into: the
             // catalog names it (its commit follows the synced full-size
             // file), or an allocation copy lists a slot (a checkpoint wrote
@@ -811,11 +813,10 @@ impl SlotStore {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();
         shards.sort_unstable();
         let per_shard = self.geometry.units_per_shard();
-        let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
             let base = shard_idx * per_shard;
-            (0..per_shard.min(units - base)).filter_map(move |in_shard| {
+            (0..addressable_units(&self.geometry, shard_idx)).filter_map(move |in_shard| {
                 (shard.alloc.get(in_shard)
                     && !shard
                         .discard
@@ -834,11 +835,10 @@ impl SlotStore {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();
         shards.sort_unstable();
         let per_shard = self.geometry.units_per_shard();
-        let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
             let base = shard_idx * per_shard;
-            (0..per_shard.min(units - base)).filter_map(move |in_shard| {
+            (0..addressable_units(&self.geometry, shard_idx)).filter_map(move |in_shard| {
                 (!shard.alloc.get(in_shard)
                     && !shard
                         .discard
@@ -1220,8 +1220,8 @@ impl SlotStore {
             .discard
             .as_ref()
             .expect("reclaim cursor requires v3 map");
-        let map_units = map.units();
-        let end = start.saturating_add(4096).min(map_units);
+        let logical_end = addressable_units(&self.geometry, idx);
+        let end = start.saturating_add(4096).min(logical_end);
         let result = if shard.dirty_discard {
             Err(CoreError::Durability(
                 "reclamation requires durable discard metadata".into(),
@@ -1242,7 +1242,7 @@ impl SlotStore {
                     .map_or(failed, |old| old.min(failed)),
             );
         }
-        self.reclaim_cursor = if end < map_units {
+        self.reclaim_cursor = if end < logical_end {
             Some((idx, end))
         } else {
             self.catalog
