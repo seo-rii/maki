@@ -384,8 +384,13 @@ impl SlotStore {
         geometry: Geometry,
         progress: &crate::recovery::RecoveryProgress<'_>,
     ) -> Result<Self, CoreError> {
-        let discard_enabled =
-            load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
+        let envelope = load_volume_superblock(backing.as_ref())?;
+        if geometry != envelope.superblock.geometry {
+            return Err(CoreError::Invalid(
+                "slot store geometry differs from the volume superblock".into(),
+            ));
+        }
+        let discard_enabled = envelope.metadata_version == SUPERBLOCK_VERSION_V3;
         let catalog_ab = catalog_store(&geometry);
         let mut catalog = catalog_ab
             .load::<ShardCatalog>(backing.as_ref())?
