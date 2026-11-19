@@ -28,6 +28,30 @@ class DocumentationLinks(unittest.TestCase):
             )
         return path
 
+    def test_markdown_line_endings_and_bom(self):
+        self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
+        self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#phantom (missing anchor)"])
+
+    def test_hashtag_can_begin_a_setext_heading(self):
+        self.write("README.md", "#hashtag guide\n====\n\n[section](#hashtag-guide)\n")
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_table_cells_cannot_hide_a_link_in_another_cell_or_row(self):
+        self.write("README.md", "| Token | Link | Token |\n| --- | --- | --- |\n"
+                   "| ` | [one](missing.md) | ` |\n\n"
+                   "Name | Link\n--- | ---\nfirst ` | [two](also-missing.md)\n"
+                   "last ` | `[code](ignored.md)` | [extra](dropped.md)\n"
+                   "escaped \\| pipe | [three](gone.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing.md", "README.md:7: also-missing.md", "README.md:9: gone.md",
+        ])
+
+    def test_inline_pipe_in_prose_does_not_start_a_table(self):
+        self.write("README.md", "A | B\njust `code\n[example](ignored.md)`\n"
+                   "and [real](missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: missing.md"])
+
     def test_plain_markdown_links_address_source_lines(self):
         self.write("guide.md", "# Guide\n\nLast line")
         self.write("README.md", "[one](guide.md?plain=1#L3) [range](guide.md?a=b&plain=1#L1-L3)\n"

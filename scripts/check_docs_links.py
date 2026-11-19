@@ -51,7 +51,7 @@ SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 # Lines that cannot continue a paragraph into a setext heading: indented
 # code, block quotes, ATX headings, tables and list items. document_lines()
 # already classifies raw HTML blocks, leaving inline tags and autolinks here.
-NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:[>#|]|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
+NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:>|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
 HTML_ATTR = re.compile(r"""([A-Za-z_:][\w.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?""", re.ASCII)
 HTML_OPEN = rf"<(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?P<attrs>(?:\s+{HTML_ATTR.pattern})*)\s*/?>"
 HTML_CLOSE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")
@@ -139,7 +139,7 @@ def document_lines(text):
     block = None
     html_end = None
     in_paragraph = False
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(re.split(r"\r\n|[\r\n]", text.removeprefix("\ufeff")), start=1):
         columns = line.expandtabs(4)
         pos = 0
         changed = False
@@ -236,6 +236,45 @@ def document_lines(text):
         in_paragraph = bool(content.strip() and not ATX_HEADING.match(content)
                             and not THEMATIC_BREAK.match(content)
                             and not (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content)))
+
+
+def table_cells(line):
+    cells = re.split(r"(?<!\\)\|", line.strip(" \t"))
+    if cells and not cells[0]:
+        cells.pop(0)
+    if cells and not cells[-1]:
+        cells.pop()
+    return [cell.strip(" \t").replace(r"\|", "|") for cell in cells]
+
+
+def block_lines(text):
+    """Pair each source line with its rendered cells when it belongs to a GFM table."""
+    lines = list(document_lines(text))
+    width = 0
+    for index, line in enumerate(lines):
+        value = line.content
+        if (line.container_changed or not index or line.number != lines[index - 1].number + 1
+                or line.raw_html or not value.strip() or value.startswith("    ")
+                or ATX_HEADING.match(value) or THEMATIC_BREAK.fullmatch(value)):
+            width = 0
+        if width:
+            yield line, table_cells(value)[:width]
+            continue
+        if (not line.raw_html and value.strip() and not value.startswith("    ")
+                and not ATX_HEADING.match(value) and not THEMATIC_BREAK.fullmatch(value)
+                and index + 1 < len(lines)):
+            divider = lines[index + 1]
+            if (divider.number == line.number + 1 and not divider.container_changed
+                    and not divider.raw_html and re.fullmatch(r" {0,3}[:| -]+", divider.content)
+                    and ("|" in divider.content or ":" in divider.content)):
+                cells = table_cells(value)
+                markers = table_cells(divider.content)
+                if cells and len(cells) == len(markers) and all(
+                        re.fullmatch(r":?-+:?", marker) for marker in markers):
+                    width = len(cells)
+                    yield line, cells
+                    continue
+        yield line, None
 
 
 def closing_bracket(text, start):
@@ -431,7 +470,7 @@ def reference_definitions(text):
     after it; a title must end on the line it starts on. `[^label]:` starts
     a footnote, not a link.
     """
-    lines = [line for line in document_lines(text) if not line.raw_html]
+    lines = [line for line, cells in block_lines(text) if not line.raw_html and cells is None]
     definitions = []
     in_paragraph = False
     previous_number = None
@@ -556,9 +595,17 @@ def scan_inline_paragraph(line, labels):
 def inline_paragraphs(text, definition_lines):
     """Group inline content across soft breaks within the same paragraph."""
     paragraph = []
-    for number, content, changed, raw_html, lazy in document_lines(text):
+    for source, cells in block_lines(text):
+        number, content, changed, raw_html, lazy = source
+        if cells is not None:
+            if paragraph:
+                yield paragraph
+                paragraph = []
+            for cell in cells:
+                yield [(number, cell)]
+            continue
         single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
-                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
+                      or (not lazy and SETEXT_UNDERLINE.match(content)))
         if (not content.strip() or raw_html or number in definition_lines or single or changed
                 or (paragraph and number != paragraph[-1][0] + 1)):
             if paragraph:
@@ -801,7 +848,11 @@ def document_anchors(text):
     headings = []
     paragraph = []
     raw_blocks = []
-    for number, line, changed, raw_html, lazy in document_lines(text):
+    for source, cells in block_lines(text):
+        number, line, changed, raw_html, lazy = source
+        if cells is not None:
+            paragraph = []
+            continue
         if changed:
             paragraph = []
         if raw_html:
