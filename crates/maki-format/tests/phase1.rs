@@ -814,3 +814,20 @@ fn invalid_public_superblocks_leave_the_root_available_for_retry() {
         }
     }
 }
+
+#[test]
+fn empty_volume_needs_data_directory_to_pass_fast_check() {
+    let root = tempfile::tempdir().unwrap();
+    let backing = maki_backing::FileBacking::new(root.path()).unwrap();
+    maki_format::init::create_volume(&backing, sb()).unwrap();
+    assert!(maki_format::checker::check_volume(&backing).unwrap().ok());
+    std::fs::remove_dir(root.path().join(maki_format::layout::DATA_DIR)).unwrap();
+    let report = maki_format::checker::check_volume(&backing).unwrap();
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("data directory")),
+        "{report:?}"
+    );
+}
