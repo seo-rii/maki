@@ -282,7 +282,9 @@ def interpreter_dependencies(interpreters, architecture):
         for prefix, alias in merged.items():
             if owner is None and path.is_relative_to(prefix):
                 owner = owners.get(alias / path.relative_to(prefix))
-        if owner is None or not path.is_file() or not os.access(path, os.X_OK):
+        # The kernel opens the original spelling. A directory-only suffix on
+        # a valid loader is an error even though pathlib normalizes it away.
+        if owner is None or not os.path.isfile(spelling) or not os.access(spelling, os.X_OK):
             fail(f"{source} interpreter {spelling!r} is not a packaged runtime loader for {architecture}")
         dependencies.add(owner)
     return dependencies

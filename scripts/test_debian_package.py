@@ -1,6 +1,7 @@
 import hashlib
 import os
 import pathlib
+import re
 import shutil
 import stat
 import struct
@@ -571,6 +572,16 @@ class DebianPackageTests(unittest.TestCase):
         good, command = self.builder_command("native.deb", "1", architecture)
         subprocess.run(command, check=True, capture_output=True)
         self.assertTrue(good.is_file())
+
+        headers = subprocess.check_output(["readelf", "-lW", self.release / "maki"], text=True,
+                                          env={**os.environ, "LC_ALL": "C"})
+        loader = re.search(r"\[Requesting program interpreter: (.+?)\]", headers)[1]
+        for suffix in ("/", "/."):
+            with self.subTest(directory_only_suffix=suffix):
+                subprocess.run(["cc", str(source), f"-Wl,--dynamic-linker,{loader}{suffix}",
+                                "-o", self.release / "maki-check"], check=True)
+                error = self.build_failure("directory-interpreter.deb", architecture=architecture, opt_out=False)
+                self.assertIn("interpreter", error)
 
         private = self.work / "ld-private.so.2"
         for installed in (False, True):
