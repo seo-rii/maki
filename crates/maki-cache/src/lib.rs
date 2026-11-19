@@ -160,6 +160,12 @@ impl VersionedLruCache {
         inner.bytes += len;
     }
 
+    /// A read can skip its cache-only header probe when an entire unit
+    /// cannot fit. Insertion rechecks the limit after concurrent resizing.
+    pub fn can_hold(&self, bytes: u64) -> bool {
+        bytes != 0 && bytes <= self.inner.lock().max_bytes
+    }
+
     /// Plaintext for `(unit, current_write_sequence)`, or None. A version
     /// mismatch (stale entry) evicts and misses; TTL expiry evicts and
     /// misses. TTL is evaluated on lookup, not by a background timer. The
