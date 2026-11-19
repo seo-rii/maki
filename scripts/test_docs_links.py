@@ -50,6 +50,8 @@ class DocumentationLinks(unittest.TestCase):
             "nested list": "- outer\n  - <!-- draft\n    [draft](hidden.md)\n  [real](gone.md)\n",
             "inline close": "- > <!-- [draft](hidden.md) -->\n  > [real](gone.md)\n",
             "closing line": "- > <!-- draft\n  > --> [draft](hidden.md)\n  > [real](gone.md)\n",
+            "fenced sibling block": "-   <!-- note -->\n\n    ```markdown\n\n"
+                                    "    [example](hidden.md)\n    ```\n\n[real](gone.md)\n",
         }
         for name, content in cases.items():
             with self.subTest(name=name):
