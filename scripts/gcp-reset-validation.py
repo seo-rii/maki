@@ -415,6 +415,10 @@ def run_offline_check(args, timeout):
             "stderr": result.stderr.decode(errors="replace")}
 
 
+class SSHClosedError(RuntimeError):
+    """The transport ended before the guest produced a complete event."""
+
+
 class RemoteProcess:
     def __init__(self, command, directory, token, cycle):
         directory.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -462,7 +466,7 @@ class RemoteProcess:
             chunk = os.read(self.child.stdout.fileno(), 4096)
             if not chunk:
                 status = self.poll()
-                raise RuntimeError(f"guest SSH closed before expected event: {status}")
+                raise SSHClosedError(f"guest SSH closed before expected event: {status}")
             self.total += len(chunk)
             if self.total > MAX_OUTPUT:
                 raise ValueError("SSH output limit exceeded")
@@ -566,7 +570,7 @@ def launch_guest(args, token, cycle, verify_only, output, device_name):
             # legitimately consume the remaining guest startup budget.
             ready = process.expect("ready", max(0, until - time.monotonic()))
             return process, ready
-        except (RuntimeError, TimeoutError) as error:
+        except (SSHClosedError, TimeoutError) as error:
             errors.append(str(error))
             process.close()
             attempt += 1
