@@ -210,7 +210,12 @@ fn main() -> ExitCode {
         init_sentinel: args.iter().any(|a| a == "--init-sentinel"),
     };
     let require_uuid = verb == "attach" && !plan_only;
-    let request = match attach_config.into_request(&volume, overrides, require_uuid) {
+    let request = if verb == "attach" {
+        attach_config.into_request(&volume, overrides, require_uuid)
+    } else {
+        attach_config.into_existing_request(&volume, overrides, require_uuid)
+    };
+    let request = match request {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");

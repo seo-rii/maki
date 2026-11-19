@@ -163,6 +163,53 @@ fn cleanup_plan_describes_idempotent_record_driven_storage_cleanup() {
 }
 
 #[test]
+fn plans_enforce_the_volume_format_name_limit() {
+    assert!(run(&["cleanup", "--volume", &"a".repeat(65), "--plan"])
+        .status
+        .success());
+    for command in ["attach", "verify"] {
+        assert!(run(&[command, "--volume", &"a".repeat(64), "--plan"])
+            .status
+            .success());
+        let out = run(&[command, "--volume", &"a".repeat(65), "--plan"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("64"));
+    }
+}
+
+#[test]
+fn attach_plans_reject_internal_lvm_names_only_for_the_selected_lv() {
+    for name in [
+        "snapshot",
+        "pvmove1",
+        "data_tmeta",
+        "disk_rimage_0",
+        "pool_cvol",
+    ] {
+        let out = run(&["attach", "--volume", "v1", "--lv", name, "--plan"]);
+        assert_eq!(out.status.code(), Some(2), "{name}");
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("lv_name"));
+    }
+    let out = run(&[
+        "attach",
+        "--volume",
+        "v1",
+        "--vg",
+        "pool_tmeta",
+        "--lv",
+        "daily_snapshot",
+        "--plan",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn verify_rejects_invalid_volume_names_before_planning_or_execution() {
     for args in [
         vec!["verify", "--volume", "demo.one", "--plan"],

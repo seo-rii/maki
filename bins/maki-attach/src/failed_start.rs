@@ -56,7 +56,7 @@ fn running_start_job(jobs: &str, unit: &str) -> bool {
 }
 
 pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
-    maki_privileged::config::check_volume_name(volume).map_err(|error| error.to_string())?;
+    maki_privileged::config::check_instance_name(volume).map_err(|error| error.to_string())?;
     let result = std::env::var("SERVICE_RESULT").ok();
     let code = std::env::var("EXIT_CODE").ok();
     let status = std::env::var("EXIT_STATUS").ok();
