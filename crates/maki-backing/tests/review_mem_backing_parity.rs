@@ -71,3 +71,12 @@ fn zero_length_allocation_is_a_no_op_on_every_backing() {
         );
     }
 }
+
+#[test]
+fn empty_positional_io_past_eof_is_a_no_op() {
+    let backing = MemBacking::new();
+    let file = backing.open("empty", true).unwrap();
+    file.write_at(16, &[]).unwrap();
+    assert_eq!(file.len().unwrap(), 0);
+    file.read_at(32, &mut []).unwrap();
+}

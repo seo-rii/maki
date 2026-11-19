@@ -78,6 +78,9 @@ pub struct MemFile {
 
 impl BackingFile for MemFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         let data = self.data.lock();
         let start = usize::try_from(offset).map_err(bad_offset)?;
         let end = start
@@ -94,6 +97,9 @@ impl BackingFile for MemFile {
     }
 
     fn write_at(&self, offset: u64, src: &[u8]) -> io::Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
         let mut data = self.data.lock();
         let start = usize::try_from(offset).map_err(bad_offset)?;
         let end = start
