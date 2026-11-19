@@ -231,6 +231,25 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                     self.assertNotEqual(fixture.actor(directory, "cleanup-recover"), 0)
                     self.assertTrue((directory / "resource").exists())
 
+    def test_install_remembers_link_created_before_systemctl_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = fixture.Fixture(root, Path("/tmp/helper"), "normal-stop")
+            runtime = root / "runtime"
+            runtime.mkdir()
+
+            def partially_link(_verb, _runtime, filename):
+                source = Path(filename)
+                (runtime / source.name).symlink_to(source)
+                raise TimeoutError("reload timed out")
+
+            with patch.object(fixture, "Path", return_value=runtime), patch.object(case, "ctl", partially_link):
+                with self.assertRaises(TimeoutError):
+                    case.install()
+            self.assertEqual(len(case.linked), 1)
+            destination, source = case.linked[0]
+            self.assertEqual(destination.resolve(), source.resolve())
+
     def test_cleanup_disables_hooks_and_removes_only_its_recorded_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
