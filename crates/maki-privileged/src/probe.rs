@@ -187,7 +187,9 @@ pub fn nbd_index(device: &str) -> Option<u32> {
     {
         return None;
     }
-    rest.parse::<u32>().ok()
+    // nbd_genl_connect limits the index to MINORMASK >> part_shift. Even
+    // with partitions disabled a Linux block device has only 20 minor bits.
+    rest.parse::<u32>().ok().filter(|&index| index < (1 << 20))
 }
 
 /// Choose the lowest-numbered device that is not connected.

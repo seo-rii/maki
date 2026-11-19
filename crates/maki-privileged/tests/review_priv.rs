@@ -632,6 +632,20 @@ mod mount_root_hygiene {
 fn pinned_nbd_devices_must_be_canonical() {
     assert_eq!(nbd_index("/dev/nbd0"), Some(0));
     assert_eq!(nbd_index("/dev/nbd15"), Some(15));
+    assert_eq!(nbd_index("/dev/nbd1048575"), Some(1048575));
+    for device in ["/dev/nbd1048576", "/dev/nbd4294967295"] {
+        assert_eq!(nbd_index(device), None);
+        assert!(AttachConfig::default()
+            .into_request(
+                "audit",
+                AttachOverrides {
+                    nbd_device: Some(device.into()),
+                    ..Default::default()
+                },
+                false
+            )
+            .is_err());
+    }
     for device in [
         "/dev/nbd01",
         "/dev/nbd+1",
