@@ -12,7 +12,7 @@ directory:
 set -euo pipefail
 maki_version="$(python3 -B scripts/prepare_release.py --print-version)"
 cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
-SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+SOURCE_DATE_EPOCH="$(git show --no-show-signature -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
   --release-dir target/release \
   --version "$maki_version" \
@@ -36,6 +36,10 @@ and review the updated notices alongside the dependency changes. This
 maintenance step uses Cargo; assembling the package uses the checked-in notice.
 Review additional notices from toolchain components or custom linked inputs
 for the actual release as described in [the release handoff](../../docs/releasing.md#qualification-and-publication-handoff).
+The package installs section 8 manual pages for all three commands.
+The package version and upstream release notes are available under
+`/usr/share/doc/maki` in `changelog.Debian.gz` and `NEWS.gz`.
+
 The package deliberately owns no file below
 `/etc/maki`, does not enable a volume, and does not start or restart a service
 during install or upgrade. Stop and detach the workload with the old package,

@@ -32,6 +32,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertTrue(SCRIPT.is_file(), "a release-candidate preparation command is required")
         shutil.copyfile(SCRIPT, self.repo / "scripts/prepare_release.py")
         shutil.copytree(ROOT / "packaging", self.repo / "packaging")
+        shutil.copyfile(ROOT / "CHANGELOG.md", self.repo / "CHANGELOG.md")
         (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.0"\n')
         (self.repo / "Cargo.lock").write_text("# locked fixture\nversion = 3\n")
         self.git("init", "-q")
@@ -303,6 +304,45 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertFalse(self.cargo_trace.exists())
         self.git("fetch", "--quiet", "--unshallow")
         self.assertEqual(self.print_version().stdout.strip(), complete_version)
+
+    def test_unchanged_hint_preserves_the_index_but_does_not_hide_local_edits(self):
+        self.git("update-index", "--assume-unchanged", "Cargo.toml")
+        self.print_version()
+        with (self.repo / "Cargo.toml").open("a") as source:
+            source.write("# worktree edit\n")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "h Cargo.toml")
+
+    def test_present_skipped_file_is_checked_but_absent_sparse_file_is_supported(self):
+        self.git("update-index", "--split-index")
+        self.git("update-index", "--skip-worktree", "Cargo.lock", "Cargo.toml")
+        self.git("update-index", "--assume-unchanged", "Cargo.toml")
+        (self.repo / "Cargo.lock").unlink()
+        self.print_version()
+        with (self.repo / "Cargo.toml").open("a") as source:
+            source.write("# worktree edit\n")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "s Cargo.toml")
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "signed commit fixture requires SSH signing")
+    def test_signature_display_does_not_change_the_source_timestamp(self):
+        from scripts.qualification_source import extract_revision
+        key = self.work / "fixture-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        self.git("config", "gpg.format", "ssh")
+        self.git("config", "user.signingkey", str(key))
+        self.git("commit", "-qS", "--allow-empty", "-m", "test: signed fixture")
+        allowed = self.work / "allowed-signers"
+        allowed.write_text("fixture@example.invalid " + key.with_suffix(".pub").read_text())
+        self.git("config", "gpg.ssh.allowedSignersFile", str(allowed))
+        self.git("config", "log.showSignature", "true")
+        commit = self.git("rev-parse", "HEAD")
+        directory, _ = self.prepare()
+        self.assertEqual(json.loads((directory / "manifest.json").read_text())["source"]["commit"], commit)
+        source = self.work / "qualification"
+        source.mkdir()
+        extract_revision(self.repo, commit, self.work / "qualification.tar", source)
+        self.assertEqual((source / "Cargo.toml").read_bytes(), (self.repo / "Cargo.toml").read_bytes())
 
     def test_tracked_worktree_changes_are_refused_before_building(self):
         with (self.repo / "Cargo.toml").open("a") as handle:

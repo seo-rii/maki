@@ -6,13 +6,13 @@ import sys
 import tempfile
 
 try:
-    from prepare_release import archive_source, git_command
+    from prepare_release import archive_source, commit_epoch
 except ModuleNotFoundError:
-    from scripts.prepare_release import archive_source, git_command
+    from scripts.prepare_release import archive_source, commit_epoch
 
 
 def extract_revision(repo, revision, archive, source):
-    epoch = int(subprocess.check_output(git_command("show", "-s", "--format=%ct", revision, repo=repo)))
+    epoch = commit_epoch(revision, repo=repo)
     archive_source(archive, revision, ".", epoch, repo=repo)
     # The archive root is 0755; retain the private destination's original mode.
     subprocess.run(["tar", "--no-same-owner", "--no-overwrite-dir", "-xpf", str(archive),

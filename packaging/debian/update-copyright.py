@@ -36,6 +36,24 @@ def cargo(*args):
     return subprocess.check_output(["cargo", *args, "--locked"], text=True, cwd=ROOT)
 
 
+def notice_files(source, license_file, *, tracked):
+    if tracked:
+        # Path patches share the working tree with local notes and build
+        # products. Only tracked files can accompany the source release.
+        names = subprocess.check_output(["git", "ls-files", "-z", "--", "."], cwd=source)
+        candidates = {source / os.fsdecode(name) for name in names.split(b"\0") if name}
+    else:
+        candidates = (Path(directory) / name for directory, _, names in os.walk(source)
+                      for name in names if NOTICE.fullmatch(name))
+    notices = {path for path in candidates if NOTICE.fullmatch(path.name)}
+    if license_file:
+        declared = source / license_file
+        if tracked and declared not in candidates:
+            raise ValueError(f"declared license file is not tracked: {declared}")
+        notices.add(declared)
+    return notices
+
+
 def render():
     selection = [arg for package in PACKAGES for arg in ("-p", package)]
     platforms = [arg for target in TARGETS for arg in ("--target", target)]
@@ -49,13 +67,8 @@ def render():
         if (name, "v" + version) not in versions or package["id"] in metadata["workspace_members"]:
             continue
         source = Path(package["manifest_path"]).parent
-        files = set()
-        for directory, _, filenames in os.walk(source):
-            for filename in filenames:
-                if NOTICE.fullmatch(filename):
-                    files.add(Path(directory) / filename)
-        if package["license_file"]:
-            files.add(source / package["license_file"])
+        files = notice_files(source, package["license_file"],
+                             tracked=package["source"] is None and source.is_relative_to(ROOT))
         if not files:
             raise ValueError(f"Review the license notice for {name} {version}")
         for path in sorted(files):
