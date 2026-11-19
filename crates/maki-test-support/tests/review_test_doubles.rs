@@ -271,6 +271,34 @@ fn manual_clock_wakes_due_sleepers_in_deadline_then_registration_order() {
     }
 }
 
+#[test]
+fn concurrent_sets_only_reach_the_requested_deadline() {
+    const THREADS: usize = 8;
+    const ROUNDS: u64 = 256;
+    let clock = ManualClock::new();
+    let barrier = std::sync::Barrier::new(THREADS + 1);
+    let mut greatest_overshoot = Duration::ZERO;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for round in 1..=ROUNDS {
+                    barrier.wait();
+                    clock.set(Duration::from_secs(round));
+                    barrier.wait();
+                }
+            });
+        }
+        for round in 1..=ROUNDS {
+            barrier.wait();
+            barrier.wait();
+            let target = Duration::from_secs(round);
+            greatest_overshoot = greatest_overshoot.max(clock.now().saturating_sub(target));
+        }
+    });
+    assert_eq!(greatest_overshoot, Duration::ZERO);
+    assert_eq!(clock.now(), Duration::from_secs(ROUNDS));
+}
+
 // ---------- FakeCryptoProvider: no framing check without integrity ----------
 
 fn damaged_ciphertexts(original: &CiphertextUnit) -> Vec<(&'static str, CiphertextUnit)> {

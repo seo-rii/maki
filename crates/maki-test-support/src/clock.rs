@@ -36,10 +36,21 @@ impl ManualClock {
     }
 
     pub fn advance(&self, d: Duration) {
+        self.update_time(|now| now + d);
+    }
+
+    pub fn set(&self, t: Duration) {
+        self.update_time(|now| now.max(t));
+    }
+
+    fn update_time(&self, next: impl FnOnce(Duration) -> Duration) {
         let wakers: Vec<Waker> = {
             let mut inner = self.inner.lock();
-            inner.now += d;
-            let now = inner.now;
+            let now = next(inner.now);
+            if now == inner.now {
+                return;
+            }
+            inner.now = now;
             inner
                 .sleepers
                 .range_mut(..=(now, u64::MAX))
@@ -48,13 +59,6 @@ impl ManualClock {
         };
         for w in wakers {
             w.wake();
-        }
-    }
-
-    pub fn set(&self, t: Duration) {
-        let cur = self.inner.lock().now;
-        if t > cur {
-            self.advance(t - cur);
         }
     }
 
