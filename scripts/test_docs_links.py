@@ -98,6 +98,27 @@ class DocumentationLinks(unittest.TestCase):
         subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},component"], check=True)
         self.assertEqual(broken_links(self.root), [])
 
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_every_link_in_a_document_symlink_chain_must_be_publishable(self):
+        self.write("docs/guide.md", "# Guide\n")
+        self.write("README.md", "[file](alias.md#guide) [directory](via-dir.md) [ok](good.md#guide)\n")
+        self.write(".gitignore", "/local-file\n/local-dir\n")
+        for name, target in (("alias.md", "local-file"), ("local-file", "docs/guide.md"),
+                             ("via-dir.md", "local-dir/guide.md"), ("local-dir", "docs"),
+                             ("good.md", "published-dir/guide.md"), ("published-dir", "docs")):
+            (self.root / name).symlink_to(target)
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "add", "--all"], check=True)
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "fixture links"], check=True)
+        with tempfile.TemporaryDirectory() as directory:
+            clone = Path(directory) / "clone"
+            subprocess.run(["git", "clone", "--quiet", str(self.root), str(clone)], check=True)
+            expected = ["README.md:1: alias.md#guide", "README.md:1: via-dir.md",
+                        "alias.md: invalid Markdown symlink target", "via-dir.md: invalid Markdown symlink target"]
+            self.assertEqual(broken_links(clone), expected)
+            self.assertEqual(broken_links(self.root), expected)
+
     def test_inner_links_deactivate_outer_links_but_images_remain_linkable(self):
         self.write("guide.md", "# Guide\n")
         self.write("README.md", "[[inner](guide.md)](literal.md)\n\n"

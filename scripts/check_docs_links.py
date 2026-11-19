@@ -866,7 +866,7 @@ def omitted_archive_reference(root, document, content, target, packages):
     try:
         requested = pathlib.Path(os.path.abspath(target)).relative_to(archive_root).as_posix()
         resolved = target.resolve().relative_to(archive_root.resolve()).as_posix()
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return False
     # Inventories list files, not directories. A missing directory containing
     # published files is lost packaged content, not an omitted source path.
@@ -888,15 +888,39 @@ def broken_links(root):
     anchor_cache = {}
     candidates = candidate_files(root)
     published = {root}
+    symlinks = {}
     for candidate in candidates:
         published.add(candidate)
         published.update(parent for parent in candidate.parents if parent.is_relative_to(root))
+        if candidate.is_symlink():
+            symlinks[candidate] = candidate.readlink()
+
+    def published_target(path):
+        if not path.is_relative_to(root) or pathlib.Path(os.path.abspath(path)) not in published:
+            return None
+        if not path.exists():
+            return None  # also catches dangling links and cycles
+        # A local alias may resolve to a tracked file through an ignored
+        # intermediate link. Follow the path using only checkout candidates.
+        pending = list(reversed(path.relative_to(root).parts))
+        current = root
+        while pending:
+            part = pending.pop()
+            current = current.parent if part == ".." else current / part
+            if current not in published:
+                return None
+            if current in symlinks:
+                target = symlinks[current]
+                if target.is_absolute():
+                    return None  # an absolute link cannot move with the checkout
+                pending.extend(reversed(target.parts))
+                current = current.parent
+        return current
 
     def anchors_of(document):
-        key = document.resolve()
-        if key not in anchor_cache:
-            anchor_cache[key] = document_anchors(key.read_bytes().decode("utf-8"))
-        return anchor_cache[key]
+        if document not in anchor_cache:
+            anchor_cache[document] = document_anchors(document.read_bytes().decode("utf-8"))
+        return anchor_cache[document]
 
     def target_problem(path, content, target):
         """Why `target`, linked from `path`, is broken, or None."""
@@ -909,17 +933,17 @@ def broken_links(root):
             target_path = root / decoded.lstrip("/")
         else:
             target_path = path.parent / decoded if decoded else path
-        if (pathlib.Path(os.path.abspath(target_path)) not in published or not target_path.exists()
-                or target_path.resolve() not in published):
+        resolved = published_target(target_path)
+        if resolved is None:
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
             return target
         fragment = urllib.parse.unquote(fragment)
         if (
             fragment
-            and target_path.is_file()
+            and resolved.is_file()
             and target_path.suffix.lower() == ".md"
-            and fragment not in anchors_of(target_path)
+            and fragment not in anchors_of(resolved)
         ):
             return f"{target} (missing anchor)"
         return None
@@ -927,7 +951,7 @@ def broken_links(root):
     broken = []
     for path in sorted(path for path in candidates if path.name.lower().endswith(".md")):
         relative = path.relative_to(root).as_posix()
-        if path.is_symlink() and (not path.is_file() or path.resolve() not in published):
+        if path.is_symlink() and (not path.is_file() or published_target(path) is None):
             broken.append(f"{relative}: invalid Markdown symlink target")
             continue
         try:
