@@ -122,3 +122,52 @@ journal_emergency_reserve_bytes = "0B"
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn invalid_remote_tls_leaves_new_volume_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, "no certificate here\n").unwrap();
+    let ca = ca.to_string_lossy().replace('\\', "/");
+    let file = dir.path().join("volume.toml");
+    for (transport, url, fields) in [
+        (
+            "http",
+            "https://127.0.0.1:9",
+            "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.decrypt]\npath = \"/decrypt\"",
+        ),
+        ("websocket", "wss://127.0.0.1:9", ""),
+        ("grpc", "https://127.0.0.1:9", ""),
+    ] {
+        let root = dir.path().join(transport);
+        let path = root.to_string_lossy().replace('\\', "/");
+        let config = format!(r#"
+config_schema_version = 1
+[volume]
+name = "benchvol"
+max_virtual_size = "1MiB"
+[crypto]
+provider = "remote-{transport}"
+crypto_compatibility_id = "bench-v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[[crypto.{transport}.endpoint]]
+name = "test"
+url = "{url}"
+[crypto.{transport}.tls]
+ca_file = "{ca}"
+{fields}
+[backing]
+root = "{path}"
+"#);
+        std::fs::write(&file, config).unwrap();
+        for _ in 0..2 {
+            let out = run(file.to_str().unwrap());
+            let message = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{transport}: {message}");
+            assert!(message.to_lowercase().contains("certificate"), "{transport}: {message}");
+            assert!(!root.exists(), "{transport} published a volume before loading its CA");
+        }
+    }
+}

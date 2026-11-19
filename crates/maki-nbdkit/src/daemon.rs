@@ -238,42 +238,52 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
 pub async fn build_provider_with_endpoints(
     config: &VolumeConfig,
 ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
-    build_provider_for_volume(config, None).await
+    prepare_provider(config).await?.verify(config, None).await
 }
 
-async fn build_provider_for_volume(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
+enum PreparedProvider {
+    Local(Arc<dyn CryptoProvider>),
+    Remote(Vec<NamedEndpoint>),
+}
+
+impl PreparedProvider {
+    async fn verify(
+        self,
+        config: &VolumeConfig,
+        volume: Option<&Arc<Volume>>,
+    ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
+        let set = match self {
+            Self::Local(provider) => return Ok((provider, None)),
+            Self::Remote(endpoints) => dispatch_endpoint_set(config, endpoints, volume).await?,
+        };
+        // Expand before entering the dispatcher, so retry and admission account
+        // for the actual provider payload and reuse one prepared prefix per call.
+        let provider = apply_random_prefix(
+            set.clone(),
+            config.volume.crypto_unit_size,
+            config.crypto.random_prefix_bytes,
+            &config.crypto.effective_compatibility_id(),
+        )
+        .await?;
+        Ok((provider, Some(set)))
+    }
+}
+
+async fn prepare_provider(config: &VolumeConfig) -> Result<PreparedProvider, DaemonError> {
     // Public callers can supply an unvalidated configuration. Refuse name
     // collisions before the name-only credential router loads any secret.
     config.validate_credential_sources()?;
     let unit = config.provider_plaintext_size()?;
     let compat = config.crypto.crypto_compatibility_id.as_str();
-    let volume_compat = config.crypto.effective_compatibility_id();
-    let set = match config.crypto.provider.as_str() {
+    let provider: Arc<dyn CryptoProvider> = match config.crypto.provider.as_str() {
         #[cfg(feature = "fake-provider")]
-        "fake" => {
-            return Ok((
-                apply_random_prefix(
-                    Arc::new(
-                        maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat),
-                    ),
-                    config.volume.crypto_unit_size,
-                    config.crypto.random_prefix_bytes,
-                    &volume_compat,
-                )
-                .await?,
-                None,
-            ))
-        }
+        "fake" => Arc::new(maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat)),
         "local-aes-gcm-siv" | "local-aes-xts" => {
             let cred = config.crypto.key.as_ref().ok_or_else(|| {
                 DaemonError::Unsupported("local provider requires [crypto].key".to_string())
             })?;
             let (source, name) = resolve_key_source(cred)?;
-            let provider: Arc<dyn CryptoProvider> = if config.crypto.provider == "local-aes-gcm-siv"
-            {
+            if config.crypto.provider == "local-aes-gcm-siv" {
                 Arc::new(AesGcmSivProvider::new(
                     source.as_ref(),
                     &name,
@@ -282,33 +292,22 @@ async fn build_provider_for_volume(
                 )?)
             } else {
                 Arc::new(AesXtsProvider::new(source.as_ref(), &name, unit, compat)?)
-            };
-            return Ok((
-                apply_random_prefix(
-                    provider,
-                    config.volume.crypto_unit_size,
-                    config.crypto.random_prefix_bytes,
-                    &volume_compat,
-                )
-                .await?,
-                None,
-            ));
+            }
         }
-        "remote-http" => remote_http_provider(config, volume).await?,
-        "remote-websocket" => remote_websocket_provider(config, volume).await?,
-        "remote-grpc" => remote_grpc_provider(config, volume).await?,
+        "remote-http" => return Ok(PreparedProvider::Remote(http_endpoints(config)?)),
+        "remote-websocket" => return Ok(PreparedProvider::Remote(websocket_endpoints(config)?)),
+        "remote-grpc" => return Ok(PreparedProvider::Remote(grpc_endpoints(config)?)),
         other => return Err(DaemonError::Unsupported(format!("provider {other:?}"))),
     };
-    // Expand before entering the dispatcher, so retry and admission account
-    // for the actual provider payload and reuse one prepared prefix per call.
-    let provider = apply_random_prefix(
-        set.clone(),
-        config.volume.crypto_unit_size,
-        config.crypto.random_prefix_bytes,
-        &volume_compat,
-    )
-    .await?;
-    Ok((provider, Some(set)))
+    Ok(PreparedProvider::Local(
+        apply_random_prefix(
+            provider,
+            config.volume.crypto_unit_size,
+            config.crypto.random_prefix_bytes,
+            &config.crypto.effective_compatibility_id(),
+        )
+        .await?,
+    ))
 }
 
 async fn apply_random_prefix(
@@ -402,13 +401,8 @@ impl RoutedKeySource {
     }
 }
 
-/// Assemble the multi-endpoint HTTP provider: per-endpoint transports,
-/// cross-endpoint interchangeability check (SPEC §34), and the dispatcher
-/// (retry/budget/breaker/failover) from configuration.
-async fn remote_http_provider(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<Arc<EndpointSet>, DaemonError> {
+/// Construct the HTTP transports and resolve their local configuration.
+fn http_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonError> {
     let http = config
         .crypto
         .http
@@ -419,7 +413,7 @@ async fn remote_http_provider(
             "remote-http requires at least one [[crypto.http.endpoint]]".to_string(),
         ));
     }
-    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &http.endpoint {
         let provider = maki_crypto_http::HttpCryptoProvider::from_config(
             config,
@@ -428,7 +422,7 @@ async fn remote_http_provider(
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints, volume).await
+    Ok(endpoints)
 }
 
 fn read_tls_file(
@@ -446,11 +440,8 @@ fn read_tls_file(
     .transpose()
 }
 
-/// Per-endpoint verified WS/WSS transports through the shared dispatcher.
-async fn remote_websocket_provider(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<Arc<EndpointSet>, DaemonError> {
+/// Construct the WS/WSS transports and verify their TLS configuration.
+fn websocket_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonError> {
     let ws = config
         .crypto
         .websocket
@@ -482,7 +473,7 @@ async fn remote_websocket_provider(
             })
         })
         .transpose()?;
-    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &ws.endpoint {
         let provider = maki_crypto_websocket::WsCryptoProvider::new_checked(
             maki_crypto_websocket::WsProviderSpec {
@@ -498,16 +489,13 @@ async fn remote_websocket_provider(
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints, volume).await
+    Ok(endpoints)
 }
 
 /// `remote-grpc`: fixed reference contract
 /// (`packaging/examples/maki-crypto.proto`) at configurable method paths,
 /// with credential-resolved ASCII metadata and verified HTTPS/mTLS support.
-async fn remote_grpc_provider(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<Arc<EndpointSet>, DaemonError> {
+fn grpc_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonError> {
     let grpc = config
         .crypto
         .grpc
@@ -565,7 +553,7 @@ async fn remote_grpc_provider(
             resolve_metadata_value(&RoutedKeySource::from_config(config), value)?,
         ));
     }
-    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &grpc.endpoint {
         let mut spec = template.clone();
         spec.url = endpoint.url.clone();
@@ -583,7 +571,7 @@ async fn remote_grpc_provider(
         };
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints, volume).await
+    Ok(endpoints)
 }
 
 /// Declared `[crypto.capabilities]` as `CryptoCapabilities` (the same
@@ -1122,7 +1110,7 @@ pub(crate) async fn attach_from_config_with_progress(
 async fn attach_hardened(
     config: &VolumeConfig,
     progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
-    prepared_local: Option<Arc<dyn CryptoProvider>>,
+    prepared: Option<PreparedProvider>,
 ) -> Result<
     (
         Engine,
@@ -1151,10 +1139,11 @@ async fn attach_hardened(
         .map_err(AttachError::from)?,
     );
     validate_recovered_geometry(config, &volume)?;
-    let (provider, endpoints) = match prepared_local {
-        Some(provider) => (provider, None),
-        None => build_provider_for_volume(config, Some(&volume)).await?,
+    let prepared = match prepared {
+        Some(provider) => provider,
+        None => prepare_provider(config).await?,
     };
+    let (provider, endpoints) = prepared.verify(config, Some(&volume)).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
             provider,
@@ -1233,22 +1222,14 @@ pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superbloc
     create_volume_from_config(&parse_and_validate(raw)?, true)
 }
 
-/// Create a new volume and attach in one invocation. Load a local provider
-/// before publishing the layout, so a missing credential leaves creation
-/// retryable. Remote providers still verify against the recovered volume.
+/// Resolve credentials and construct transports before publishing the layout.
+/// Remote endpoint self-tests then use the recovered volume's identity.
 pub async fn create_and_attach_from_config_str(raw: &str) -> Result<Engine, DaemonError> {
     let config = parse_and_validate(raw)?;
     crate::security::apply(&config)?;
-    let prepared_local = if matches!(
-        config.crypto.provider.as_str(),
-        "local-aes-gcm-siv" | "local-aes-xts"
-    ) {
-        Some(build_provider(&config).await?)
-    } else {
-        None
-    };
+    let prepared = prepare_provider(&config).await?;
     create_volume_from_config(&config, false)?;
-    Ok(attach_hardened(&config, None, prepared_local).await?.0)
+    Ok(attach_hardened(&config, None, Some(prepared)).await?.0)
 }
 
 fn create_volume_from_config(
