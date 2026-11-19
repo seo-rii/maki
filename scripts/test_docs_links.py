@@ -98,6 +98,21 @@ class DocumentationLinks(unittest.TestCase):
         subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},component"], check=True)
         self.assertEqual(broken_links(self.root), [])
 
+    def test_inner_links_deactivate_outer_links_but_images_remain_linkable(self):
+        self.write("guide.md", "# Guide\n")
+        self.write("README.md", "[[inner](guide.md)](literal.md)\n\n"
+                   "[![badge](missing.png)](outer.md)\n\n"
+                   "[[inner][guide]](literal2.md)\n\n[guide]: guide.md\n\n"
+                   "[![alt [inner](alt-text)](absent.png)](outside.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing.png", "README.md:3: outer.md",
+            "README.md:9: absent.png"])
+
+    def test_inline_html_attributes_do_not_create_links_or_references(self):
+        self.write("README.md", 'See <a id="here" title="[x](example) [y][unused]">here</a> '
+                   '[anchor](#here) [real](missing).\n')
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing"])
+
     def test_absolute_uri_schemes_are_external(self):
         self.write("README.md", "[mirror](FTP://example.org/pub/) [phone](tel:+1234)\n\n"
                    "[ref]: urn:example:manual\n\n[local](file.txt)\n")

@@ -450,10 +450,13 @@ def reference_definitions(text):
     return definitions
 
 
-def mask_inline_literals(line, targets):
+def scan_inline_paragraph(line, labels):
     """Mask literals and record link destinations with their offsets in this paragraph."""
     out = []
-    depth = 0
+    targets = []
+    html_tags = []
+    brackets = []
+    last_link = -1
     index = 0
     while index < len(line):
         char = line[index]
@@ -468,14 +471,40 @@ def mask_inline_literals(line, targets):
             out.append(line[index:index + 2])
             index += 2
             continue
+        if char == "<":
+            tag = HTML_TAG.match(line, index)
+            if tag:
+                html_tags.append(tag.group())
+                out.append(" " * len(tag.group()))
+                index = tag.end()
+                continue
+        if line.startswith("![", index):
+            brackets.append((index + 1, (len(targets), len(html_tags))))
+            out.append("![")
+            index += 2
+            continue
         if char == "[":
-            depth += 1
-        elif char == "]" and depth:
-            depth -= 1
-            if line[index + 1:index + 2] == "(":
-                parsed = inline_destination(line, index + 1)
+            brackets.append((index, None))
+        elif char == "]" and brackets:
+            opening, image_scope = brackets.pop()
+            if image_scope is None and opening < last_link:
+                out.append(char)
+                index += 1
+                continue
+            parsed = (inline_destination(line, index + 1)
+                      if line[index + 1:index + 2] == "(" else None)
+            reference = LINK_LABEL.match(line, index + 1)
+            label = reference[1] if reference and reference[1] else line[opening + 1:index]
+            if parsed is not None or label_key(label) in labels:
+                if image_scope is None:
+                    last_link = opening
+                else:
+                    # An image description renders as alt text. Links and
+                    # HTML tags within it do not create separate targets.
+                    target_count, html_count = image_scope
+                    del targets[target_count:]
+                    del html_tags[html_count:]
                 if parsed is not None:
-                    # Backticks in a destination or title do not start code.
                     end = parsed[1]
                     target_start = index + 2
                     while line[target_start:target_start + 1] in (" ", "\t", "\n"):
@@ -483,6 +512,10 @@ def mask_inline_literals(line, targets):
                     targets.append((target_start, unescape(parsed[0])))
                     out.append("](" + " " * (end - index - 3) + ")")
                     index = end
+                    continue
+                if reference:
+                    out.append(line[index:reference.end()])
+                    index = reference.end()
                     continue
         if char == "`":
             opening = BACKTICKS.match(line, index).group(0)
@@ -500,17 +533,32 @@ def mask_inline_literals(line, targets):
             continue
         out.append(char)
         index += 1
-    return "".join(out)
+    return "".join(out), targets, html_tags
 
 
-def inline_lines(text, definition_lines):
-    """Mask code spans across soft line breaks within the same paragraph."""
+def inline_paragraphs(text, definition_lines):
+    """Group inline content across soft breaks within the same paragraph."""
     paragraph = []
-    def masked_lines():
-        if not paragraph:
-            return
-        targets = []
-        masked = mask_inline_literals("\n".join(line for _, line in paragraph), targets)
+    for number, content, changed, raw_html, lazy in document_lines(text):
+        single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
+                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
+        if (not content.strip() or raw_html or number in definition_lines or single or changed
+                or (paragraph and number != paragraph[-1][0] + 1)):
+            if paragraph:
+                yield paragraph
+                paragraph = []
+        if content.strip() and not raw_html and number not in definition_lines:
+            paragraph.append((number, content))
+            if single:
+                yield paragraph
+                paragraph = []
+    if paragraph:
+        yield paragraph
+
+
+def inline_lines(text, definition_lines, labels):
+    for paragraph in inline_paragraphs(text, definition_lines):
+        masked, targets, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
         starts = []
         start = 0
         for _, line in paragraph:
@@ -521,20 +569,6 @@ def inline_lines(text, definition_lines):
             per_line[bisect_right(starts, offset) - 1].append(destination)
         for (number, line), start, found in zip(paragraph, starts, per_line):
             yield number, line, masked[start:start + len(line)], found
-
-    for number, content, changed, raw_html, lazy in document_lines(text):
-        single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
-                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
-        if (not content.strip() or raw_html or number in definition_lines or single or changed
-                or (paragraph and number != paragraph[-1][0] + 1)):
-            yield from masked_lines()
-            paragraph.clear()
-        if content.strip() and not raw_html and number not in definition_lines:
-            paragraph.append((number, content))
-            if single:
-                yield from masked_lines()
-                paragraph.clear()
-    yield from masked_lines()
 
 
 def undefined_references(line, masked, labels):
@@ -774,8 +808,10 @@ def document_anchors(text):
 
     for lines in raw_blocks:
         collect_html("\n".join(line for _, line in lines))
-    for _, _, masked, _ in inline_lines(text, definition_lines):
-        collect_html(masked)
+    for paragraph in inline_paragraphs(text, definition_lines):
+        _, _, tags = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        for tag in tags:
+            collect_html(tag)
     return anchors
 
 
@@ -868,7 +904,7 @@ def broken_links(root):
             for _, _, number, _, destination in definitions
         ]
         definition_lines = {n for first, last, *_ in definitions for n in range(first, last + 1)}
-        for number, line, masked, targets in inline_lines(text, definition_lines):
+        for number, line, masked, targets in inline_lines(text, definition_lines, labels):
             problems.extend(
                 (number, target_problem(path, content, destination))
                 for destination in targets
