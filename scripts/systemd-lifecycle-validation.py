@@ -260,11 +260,18 @@ class Fixture:
         raise AssertionError(f"timed out: {label}")
 
     def install(self):
+        # Keep the units as executed alongside the case evidence. Only runtime
+        # copies are rewritten to disable automatic transitions during cleanup.
+        runtime_units = self.directory / "runtime-units"
+        runtime_units.mkdir(mode=0o700)
         for name, content in self.files.items():
             destination = Path("/run/systemd/system") / name
             if destination.exists() or destination.is_symlink():
                 raise RuntimeError("generated fixture instance already exists")
-            source = self.directory / name
+            evidence = self.directory / name
+            evidence.write_text(content)
+            evidence.chmod(0o600)
+            source = runtime_units / name
             source.write_text(content)
             source.chmod(0o600)
             try:

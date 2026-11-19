@@ -298,6 +298,30 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                     self.assertNotEqual(fixture.actor(directory, "cleanup-recover"), 0)
                     self.assertTrue((directory / "resource").exists())
 
+    def test_cleanup_preserves_the_units_as_executed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = fixture.Fixture(root, Path("/tmp/helper"), "normal-stop")
+            runtime = root / "systemd"
+            runtime.mkdir()
+
+            def systemctl(action, *args, **_kwargs):
+                if action == "link":
+                    source = Path(args[-1])
+                    (runtime / source.name).symlink_to(source)
+                return subprocess.CompletedProcess([], 0, "ActiveState=inactive", "")
+
+            with patch.object(fixture, "Path", return_value=runtime), patch.object(case, "ctl", systemctl):
+                case.install()
+                for installed, source in case.linked:
+                    self.assertEqual(installed.read_text(), case.files[installed.name])
+                case.cleanup()
+            for name, original in case.files.items():
+                self.assertEqual((case.directory / name).read_text(), original)
+                self.assertFalse((runtime / name).is_symlink())
+            rewritten = case.directory / "runtime-units" / case.units["attach"]
+            self.assertNotIn("ExecStop=", rewritten.read_text())
+
     def test_install_remembers_link_created_before_systemctl_error(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
