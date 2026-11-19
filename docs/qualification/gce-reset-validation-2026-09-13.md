@@ -29,7 +29,7 @@ Related: [qualification tiers](../testing.md),
 | Boot disk | Separate 30 GiB balanced Persistent Disk, deleted with the instance |
 | Data disk | Separate 20 GiB balanced Persistent Disk, attached as `maki-data`; ext4 mounted at `/mnt/maki-data` through `/dev/disk/by-id/google-maki-data` |
 | Maki | Normal release CLI/native plugin, real `local-aes-gcm-siv`, disposable 32-byte key; 128 MiB logical volume and eight 16 MiB logical ranges |
-| Client | libnbd through Python `ctypes`; native FLUSH and FUA both required before READY |
+| Client | libnbd through Python `ctypes`; negotiated FLUSH and FUA before READY |
 | Reset controller | Independent host process invoking `gcloud compute instances reset`; private ACK ledger fsynced on the controller before each reset |
 
 The CLI SHA-256 was
@@ -58,7 +58,10 @@ instance ID, data disk ID and self-link, attachment URL and device name, and
 filesystem UUID. The [guest agent](../../scripts/gcp-reset-guest.py) starts the
 real nbdkit plugin and waits for its startup READY notification. It then opens
 the Unix NBD endpoint with libnbd and refuses to proceed unless FLUSH and FUA
-are both available.
+are both available. For the historical run, the wire negotiation recorded
+FUA support. Current runs additionally load nbdkit's log filter and require
+its connection record to report the plugin's native FUA mode before READY.
+This distinguishes native FUA from nbdkit's flush-based emulation.
 
 Each generation changes sixteen 4 KiB units: two offsets in each of eight
 16 MiB logical ranges. Even generations issue all writes and then one FLUSH.

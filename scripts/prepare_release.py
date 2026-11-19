@@ -98,25 +98,27 @@ def commit_epoch(commit, *, repo=None):
     ))
 
 
-def tracked_changes():
-    command = git_command("status", "--porcelain", "--untracked-files=no")
+def tracked_changes(*, repo=None):
+    repo = ROOT if repo is None else repo
+    command = git_command("status", "--porcelain", "--untracked-files=no", repo=repo)
     if subprocess.check_output(command):
         return True
-    entries = subprocess.check_output(git_command("ls-files", "-v", "-z")).split(b"\0")
+    entries = subprocess.check_output(git_command("ls-files", "-v", "-z", repo=repo)).split(b"\0")
     assumed = [entry[2:] for entry in entries if entry[:1].islower()]
     present_skipped = [entry[2:] for entry in entries if entry[:1].upper() == b"S"
-                       and os.path.lexists(ROOT / os.fsdecode(entry[2:]))]
+                       and os.path.lexists(repo / os.fsdecode(entry[2:]))]
     if not assumed and not present_skipped:
         return False
     # Refresh the flagged paths through Git's normal stat/filter checks,
     # without changing the user's index flags or sparse-checkout selection.
     with tempfile.TemporaryDirectory() as directory:
         index = pathlib.Path(directory) / "index"
-        shutil.copyfile(git("rev-parse", "--path-format=absolute", "--git-path", "index"), index)
+        index_path = run(git_command("rev-parse", "--path-format=absolute", "--git-path", "index", repo=repo))
+        shutil.copyfile(index_path, index)
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         for flag, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", present_skipped)):
             if paths:
-                subprocess.run(git_command("update-index", flag, "-z", "--stdin"),
+                subprocess.run(git_command("update-index", flag, "-z", "--stdin", repo=repo),
                                input=b"\0".join(paths) + b"\0", env=env, check=True)
         return bool(subprocess.check_output(command, env=env))
 

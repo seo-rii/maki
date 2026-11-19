@@ -48,6 +48,7 @@ class GuestProviderContracts(unittest.TestCase):
         self.plugin.write_bytes(b"not-loaded-by-this-test")
         self.runtime = self.path / "runtime"
         self.runtime.mkdir()
+        (self.runtime / "connections.log").write_text('00:00:00 connection=1 Connect export="" fua=2\n')
         previous_umask = os.umask(0o077)
         self.addCleanup(os.umask, previous_umask)
 

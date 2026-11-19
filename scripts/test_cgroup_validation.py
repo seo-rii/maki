@@ -163,6 +163,27 @@ class OracleTests(unittest.TestCase):
             finally:
                 target.notify.close()
 
+    def test_ready_packet_must_be_received_before_the_startup_deadline(self):
+        target = self.unstarted_target()
+        target.identifier, target.case = None, self.ledger.parent
+        target.create = mock.Mock()
+        for elapsed in (4, 30, 31):
+            now = [0]
+
+            def receive(_size):
+                now[0] = elapsed
+                return b"READY=1"
+
+            with self.subTest(elapsed=elapsed), mock.patch.object(campaign.socket, "socket") as packet, \
+                    mock.patch.object(campaign.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(campaign, "run"):
+                packet.return_value.recv.side_effect = receive
+                if elapsed < 30:
+                    target.start()
+                else:
+                    with self.assertRaisesRegex(TimeoutError, "did not announce READY"):
+                        target.start()
+
     def test_ready_state_check_uses_remaining_startup_budget(self):
         target = self.unstarted_target()
         target.identifier, target.case = None, self.ledger.parent

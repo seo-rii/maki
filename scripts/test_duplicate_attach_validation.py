@@ -30,7 +30,7 @@ class DuplicateAttachQualification(unittest.TestCase):
         cls.stop = script[start:script.index("\n}\n", start) + 3]
         start = script.index("cleanup() {\n")
         cls.cleanup = script[start:script.index("\n}\n", start) + 3]
-        start = script.index('duplicate_socket="$work_dir/duplicate.sock"\n')
+        start = script.index('duplicate_socket="$runtime_dir/duplicate.sock"\n')
         marker = 'pass "duplicate volume attach fails closed"'
         cls.duplicate = script[start:script.index(marker, start) + len(marker)]
 
@@ -62,6 +62,10 @@ lock_error = "maki-nbdkit: startup failed: adapter error (errno 5): VOLUME_ALREA
 if mode == "locked" and config["nbd"]["socket"] != listener:
     print("nbd.socket does not match the unique native pathname listener", file=sys.stderr)
     sys.exit(1)
+if mode == "locked":
+    for path in (listener, config["control"]["socket"]):
+        with socket.socket(socket.AF_UNIX) as endpoint:
+            endpoint.bind(path)
 if mode in ("live", "live-with-lock"):
     endpoint = socket.socket(socket.AF_UNIX)
     endpoint.bind(listener)
@@ -104,6 +108,7 @@ sys.exit(0 if mode == "successful-exit" else 42 if mode == "other-status" else 1
             (run / "duplicate-nbdkit.log").write_text(LOCK_ERROR + "\n")
         environment = dict(os.environ, PATH=str(self.binary) + os.pathsep + os.environ["PATH"],
                            work_dir=str(work), run_dir=str(run), volume_name="duplicate-proof",
+                           runtime_dir=str(case), control_runtime_dir=str(case),
                            socket_path=str(case / "original.sock"),
                            control_socket_path=str(case / "original-control.sock"),
                            plugin_path=str(case / "not-loaded.so"),
@@ -162,6 +167,9 @@ duplicate_pid=""
 
     def test_duplicate_configuration_preserves_quoted_unicode_paths(self):
         self.assert_lock_configuration(directory_name='운영 "archive" \\root')
+
+    def test_long_work_root_reaches_the_volume_lock_check(self):
+        self.assert_lock_configuration(directory_name="work-" * 30)
 
     def test_exact_volume_lock_failure_control(self):
         result, _, _ = self.run_case("forced-lock")

@@ -107,7 +107,7 @@ class Nbd:
         trim = self.lib.nbd_can_trim(self.handle)
         self.check(trim)
         self.can_trim = trim == 1
-        ensure(self.can_fua, "native FUA unavailable")
+        ensure(self.can_fua, "FUA unavailable on the NBD connection")
         ensure(self.can_flush, "FLUSH unavailable")
 
     def check(self, result):
@@ -267,6 +267,18 @@ def execute_cycle(args, client, emit):
     wait_for_reset()
 
 
+def require_native_fua(runtime):
+    # The NBD handshake advertises one FUA bit for both emulated and native
+    # operation. The log filter records the plugin's nbdkit capability value
+    # during negotiation, before this client can finish connecting.
+    with (runtime / "connections.log").open() as log:
+        for line in log:
+            if re.search(r' connection=\d+ Connect export="" ', line):
+                ensure("fua=2" in line.split(), "plugin does not provide native FUA")
+                return
+    raise ValueError("no nbdkit connection record for native FUA")
+
+
 def run_nbdkit(args, runtime):
     socket_path = runtime / "nbd.sock"
     notify_path = runtime / "notify.sock"
@@ -276,8 +288,9 @@ def run_nbdkit(args, runtime):
     notify.settimeout(0.2)
     environment = dict(os.environ, PATH=SYSTEM_PATH, NOTIFY_SOCKET=str(notify_path))
     log = open(log_path, "xb")
-    child = subprocess.Popen([args.nbdkit, "--foreground", "--threads", "4", "-U",
-                              str(socket_path), args.plugin, "config=" + args.config],
+    child = subprocess.Popen([args.nbdkit, "--exit-with-parent", "--threads", "4", "-U",
+                              str(socket_path), "--filter=log", args.plugin, "config=" + args.config,
+                              "logfile=" + str(runtime / "connections.log")],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                              env=environment, start_new_session=True)
     until = time.monotonic() + args.ready_timeout
@@ -288,7 +301,7 @@ def run_nbdkit(args, runtime):
             if time.monotonic() >= until:
                 raise TimeoutError("nbdkit READY deadline")
             try:
-                if b"READY=1" in notify.recv(4096).splitlines():
+                if b"READY=1" in notify.recv(4096).splitlines() and time.monotonic() < until:
                     return child, log, socket_path
             except socket.timeout:
                 pass
@@ -359,7 +372,8 @@ def main():
         child, log, socket_path = run_nbdkit(args, runtime)
         client = Nbd(socket_path)
         features = capabilities(client, args.profile)
-        emit("ready", provider=provider, config=str(config),
+        require_native_fua(runtime)
+        emit("ready", provider=provider, config=str(config), native_fua=True,
              kernel=os.uname().release, fs_uuid=fs_uuid, data_device=args.device_name, **features, **witness)
         execute_cycle(args, client, emit)
     except BaseException as error:

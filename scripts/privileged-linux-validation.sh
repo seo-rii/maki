@@ -165,13 +165,8 @@ log_root="${user_home}/logs"
 
 prepare_source_snapshot() {
     local revision
-    revision="$(git --no-replace-objects -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}')" || return 1
-    if ! git --no-replace-objects -C "$REPO_ROOT" diff --quiet "$revision" --; then
-        printf 'Commit tracked changes before qualifying this revision.\n' >&2
-        return 1
-    fi
     mkdir "$run_dir/source" || return 1
-    python3 -B "$REPO_ROOT/scripts/qualification_source.py" "$revision" "$run_dir/source" || return 1
+    revision="$(python3 -B "$REPO_ROOT/scripts/qualification_source.py" --clean-head "$run_dir/source")" || return 1
     printf '%s\n' "$revision" > "$run_dir/source-revision"
 }
 
@@ -306,6 +301,17 @@ disconnect_test_nbd() {
     return 1
 }
 
+remove_stale_test_socket() {
+    local path="$1"
+    if [[ -S "$path" && ! -L "$path" ]]; then
+        log "cleanup: deleting stale test socket $path"
+        unlink "$path"
+    elif [[ -e "$path" || -L "$path" ]]; then
+        log "cleanup warning: refusing unexpected runtime entry $path"
+        return 1
+    fi
+}
+
 cleanup() {
     local cleanup_rc=0 previous_connection_id
     set +e
@@ -424,13 +430,8 @@ cleanup() {
     nbdkit_pid=""
 
     if [[ "$cleanup_safe" == true && -n "$runtime_dir" && "$runtime_dir" == /run/maki/privval-* ]]; then
-        if [[ -S "$socket_path" && "$socket_path" == "$runtime_dir/nbd.sock" ]]; then
-            log "cleanup: deleting stale test socket $socket_path"
-            unlink "$socket_path" || cleanup_rc=1
-        elif [[ -e "$socket_path" ]]; then
-            log "cleanup warning: refusing unexpected runtime entry $socket_path"
-            cleanup_rc=1
-        fi
+        remove_stale_test_socket "$runtime_dir/nbd.sock" || cleanup_rc=1
+        remove_stale_test_socket "$runtime_dir/duplicate.sock" || cleanup_rc=1
         if ! sudo -n rmdir "$runtime_dir"; then
             log "cleanup warning: could not remove test runtime directory $runtime_dir"
             cleanup_rc=1
@@ -444,13 +445,8 @@ cleanup() {
     fi
 
     if [[ "$cleanup_safe" == true && -n "$control_runtime_dir" && "$control_runtime_dir" == /run/maki-control/privval-* ]]; then
-        if [[ -S "$control_socket_path" && "$control_socket_path" == "$control_runtime_dir/control.sock" ]]; then
-            log "cleanup: deleting stale test control socket $control_socket_path"
-            unlink "$control_socket_path" || cleanup_rc=1
-        elif [[ -e "$control_socket_path" ]]; then
-            log "cleanup warning: refusing unexpected control runtime entry $control_socket_path"
-            cleanup_rc=1
-        fi
+        remove_stale_test_socket "$control_runtime_dir/control.sock" || cleanup_rc=1
+        remove_stale_test_socket "$control_runtime_dir/duplicate-control.sock" || cleanup_rc=1
         if ! sudo -n rmdir "$control_runtime_dir"; then
             log "cleanup warning: could not remove test control runtime directory $control_runtime_dir"
             cleanup_rc=1
@@ -789,9 +785,9 @@ grep -Eq '(^|[[:space:]])connect: Permission denied' "$run_dir/unrelated-user-so
     die "unrelated user was not refused with EACCES on the NBD socket: $(cat "$run_dir/unrelated-user-socket.txt")"
 pass "unrelated user is denied by the runtime-directory boundary"
 
-duplicate_socket="$work_dir/duplicate.sock"
+duplicate_socket="$runtime_dir/duplicate.sock"
 duplicate_config_path="$run_dir/duplicate-volume.toml"
-write_validation_config "$duplicate_config_path" "$duplicate_socket" "$work_dir/duplicate-control.sock"
+write_validation_config "$duplicate_config_path" "$duplicate_socket" "$control_runtime_dir/duplicate-control.sock"
 "${nbdkit_launcher[@]}" nbdkit --foreground -U "$duplicate_socket" "$plugin_path" \
     config="$duplicate_config_path" >"$run_dir/duplicate-nbdkit.log" 2>&1 &
 duplicate_pid=$!

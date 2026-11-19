@@ -128,7 +128,7 @@ class CycleBoundaryContracts(unittest.TestCase):
                                    boot_id=f"00000000-0000-0000-0000-{cycle + 1:012x}", **fields))
 
             emit("ready", data_device=device_name, provider="local-aes-gcm-siv", can_flush=True,
-                 can_fua=True, can_trim=profile == "v3-discard",
+                 can_fua=True, native_fua=True, can_trim=profile == "v3-discard",
                  fs_uuid="10000000-0000-0000-0000-000000000001",
                  witness_service="active", graceful_stop_witness="absent")
             before = (client.writes, client.trims, client.flushes)

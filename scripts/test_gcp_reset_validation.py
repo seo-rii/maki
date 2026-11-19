@@ -192,12 +192,12 @@ class HostContracts(unittest.TestCase):
 
     def test_ready_requires_native_provider_capabilities_and_stable_fs_uuid(self):
         ready = {"event": "ready", "provider": "local-aes-gcm-siv", "can_flush": True,
-                 "can_fua": True, "can_trim": False, "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
+                 "can_fua": True, "native_fua": True, "can_trim": False, "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
                  "witness_service": "active", "graceful_stop_witness": "absent"}
         self.host.validate_ready(ready, None)
         self.host.validate_ready(ready, ready["fs_uuid"])
         for field, value in (("provider", "wrong"), ("can_flush", False),
-                             ("can_fua", False), ("can_trim", True), ("can_trim", None), ("fs_uuid", "changed"),
+                             ("can_fua", False), ("native_fua", None), ("native_fua", False), ("can_trim", True), ("can_trim", None), ("fs_uuid", "changed"),
                              ("witness_service", "inactive"),
                              ("graceful_stop_witness", "present")):
             invalid = dict(ready)
@@ -207,7 +207,7 @@ class HostContracts(unittest.TestCase):
 
     def test_discard_profile_requires_trim_and_an_independent_complete_manifest(self):
         ready = {"event": "ready", "provider": "local-aes-gcm-siv", "can_flush": True,
-                 "can_fua": True, "can_trim": True,
+                 "can_fua": True, "native_fua": True, "can_trim": True,
                  "fs_uuid": "00112233-4455-6677-8899-aabbccddeeff",
                  "witness_service": "active", "graceful_stop_witness": "absent"}
         self.host.validate_ready(ready, None, "v3-discard")
@@ -297,6 +297,21 @@ class HostContracts(unittest.TestCase):
                 self.host.cut_instance(args, process)
         reset.assert_not_called()
 
+    def test_first_observed_ssh_exit_must_meet_the_deadline(self):
+        for observed_at in (4, 10, 12):
+            with self.subTest(observed_at=observed_at):
+                process = object.__new__(self.host.RemoteProcess)
+                process.child = mock.Mock(returncode=0)
+                process.poll = mock.Mock(return_value=0)
+                process._kill_owned = mock.Mock()
+                with mock.patch.object(self.host.time, "monotonic", side_effect=[0, observed_at]):
+                    if observed_at < 10:
+                        process.wait_clean(10)
+                    else:
+                        with self.assertRaisesRegex(TimeoutError, "did not exit"):
+                            process.wait_clean(10)
+                process._kill_owned.assert_called_once_with()
+
     def test_timeout_kills_and_reaps_only_owned_ssh_child(self):
         process = self.host.RemoteProcess(
             [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -326,7 +341,7 @@ class HostContracts(unittest.TestCase):
                 self.addCleanup(process.close)
                 process.expect = mock.Mock(side_effect=ValueError("fixture ACK failure"))
                 ready = dict(event="ready", boot_id=self.boot_id,
-                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True, can_trim=False,
+                             provider="local-aes-gcm-siv", can_flush=True, can_fua=True, native_fua=True, can_trim=False,
                              fs_uuid="00112233-4455-6677-8899-aabbccddeeff", data_device="data",
                              witness_service="active", graceful_stop_witness="absent")
                 current = dict(baseline)
@@ -727,6 +742,35 @@ class GuestContracts(unittest.TestCase):
             for call in client.write.call_args_list:
                 self.assertEqual(call.kwargs["fua"], mode == "fua")
             self.assertEqual(client.flush.call_count, int(mode == "flush"))
+
+    def test_guest_launch_uses_parent_lifetime_and_server_capability_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = pathlib.Path(directory)
+            args = types.SimpleNamespace(nbdkit="nbdkit", plugin="maki.so", config="case.toml", ready_timeout=2)
+            with mock.patch.object(self.guest.subprocess, "Popen") as launch, \
+                    mock.patch.object(self.guest.socket, "socket") as notify:
+                launch.return_value.poll.return_value = None
+                notify.return_value.recv.return_value = b"READY=1"
+                _, log, _ = self.guest.run_nbdkit(args, runtime)
+                log.close()
+            command, = launch.call_args.args
+            self.assertEqual(command[0], "nbdkit")
+            self.assertIn("--exit-with-parent", command)
+            self.assertEqual(command[command.index("maki.so") - 1], "--filter=log")
+            self.assertIn("logfile=" + str(runtime / "connections.log"), command)
+
+    def test_native_fua_requires_the_default_export_plugin_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = pathlib.Path(directory)
+            log = runtime / "connections.log"
+            for record in ('Connect export="" fua=0', 'Connect export="" fua=1',
+                           'Write id=1 fua=2', 'Connect export="other" fua=2', ''):
+                with self.subTest(record=record):
+                    log.write_text(f"2026-01-01 00:00:00 connection=1 {record}\n")
+                    with self.assertRaisesRegex(ValueError, "native FUA"):
+                        self.guest.require_native_fua(runtime)
+            log.write_text('2026-01-01 00:00:00 connection=1 Connect export="" flush=1 fua=2 trim=1\n')
+            self.guest.require_native_fua(runtime)
 
     def test_ready_capabilities_are_taken_from_real_libnbd_client(self):
         client = object.__new__(self.guest.Nbd)
