@@ -904,7 +904,7 @@ def broken_links(root):
             symlinks[candidate] = candidate.readlink()
 
     def published_target(path):
-        if not path.is_relative_to(root) or pathlib.Path(os.path.abspath(path)) not in published:
+        if not path.is_relative_to(root):
             return None
         if not path.exists():
             return None  # also catches dangling links and cycles

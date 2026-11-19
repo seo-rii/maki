@@ -51,6 +51,28 @@ class DocumentationLinks(unittest.TestCase):
                    "[url](#httpsexampleorg) [key](#enter-key) [absent](#hidden)\n")
         self.assertEqual(broken_links(self.root), ["README.md:10: #hidden (missing anchor)"])
 
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_direct_links_through_a_tracked_directory_alias(self):
+        self.write("docs/guide.md", "# Setup\n")
+        self.write(".gitignore", "/local/\n")
+        self.write("README.md", "[valid](manual/guide.md#setup) [broken](manual/guide.md#absent)\n"
+                   "[ignored](local/guide.md) [missing](manual/absent.md)\n")
+        (self.root / "manual").symlink_to("docs", target_is_directory=True)
+        (self.root / "local").mkdir()
+        (self.root / "local/guide.md").symlink_to("../docs/guide.md")
+        git = ["git", "-C", self.root]
+        subprocess.run([*git, "add", "manual"], check=True)
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "tracked directory alias"], check=True)
+        with tempfile.TemporaryDirectory() as temp:
+            clone = Path(temp) / "clone"
+            subprocess.run(["git", "clone", "--quiet", self.root, clone], check=True)
+            for checkout in [self.root, clone]:
+                self.assertEqual(broken_links(checkout), [
+                    "README.md:1: manual/guide.md#absent (missing anchor)",
+                    "README.md:2: local/guide.md", "README.md:2: manual/absent.md",
+                ])
+
     def test_rooted_links_and_external_scheme_case(self):
         self.write("GUIDE.MD", "# Welcome\n")
         self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"
