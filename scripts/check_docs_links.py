@@ -253,21 +253,31 @@ def block_lines(text):
     """Pair each source line with its rendered cells when it belongs to a GFM table."""
     lines = list(document_lines(text))
     width = 0
+    after_table = False
     for index, line in enumerate(lines):
         value = line.content
-        if (line.container_changed or not index or line.number != lines[index - 1].number + 1
-                or line.raw_html or not value.strip() or value.startswith("    ")
-                or ATX_HEADING.match(value) or THEMATIC_BREAK.fullmatch(value)):
+        if line.container_changed or not index or line.number != lines[index - 1].number + 1:
+            width = 0
+            after_table = False
+        indented = re.match(r"^(?: {4}| {0,3}\t)", value)
+        if (width or after_table) and (not value.strip() or indented):
+            # A blank ends the table. Four columns start a literal code block,
+            # including when the first such line follows a table row directly.
+            width = 0
+            after_table = True
+            continue
+        after_table = False
+        if line.raw_html or ATX_HEADING.match(value) or THEMATIC_BREAK.fullmatch(value):
             width = 0
         if width:
             yield line, table_cells(value)[:width]
             continue
-        if (not line.raw_html and value.strip() and not value.startswith("    ")
+        if (not line.raw_html and value.strip() and not indented
                 and not ATX_HEADING.match(value) and not THEMATIC_BREAK.fullmatch(value)
                 and index + 1 < len(lines)):
             divider = lines[index + 1]
             if (divider.number == line.number + 1 and not divider.container_changed
-                    and not divider.raw_html and re.fullmatch(r" {0,3}[:| -]+", divider.content)
+                    and not divider.raw_html and re.fullmatch(r" {0,3}[:|\-][:| \t-]*", divider.content)
                     and ("|" in divider.content or ":" in divider.content)):
                 cells = table_cells(value)
                 markers = table_cells(divider.content)

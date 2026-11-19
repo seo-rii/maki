@@ -47,6 +47,12 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:3: missing.md", "README.md:7: also-missing.md", "README.md:9: gone.md",
         ])
 
+    def test_indented_code_after_a_table_is_literal(self):
+        self.write("README.md", "A | B\n---\t|\t---\nrow | [one](missing.md) | [dropped](ignored.md)\n"
+                   "    [code](ignored.md)\n\n\t[more code](ignored.md)\n"
+                   "next [link](another.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:3: missing.md", "README.md:7: another.md"])
+
     def test_inline_pipe_in_prose_does_not_start_a_table(self):
         self.write("README.md", "A | B\njust `code\n[example](ignored.md)`\n"
                    "and [real](missing.md)\n")
