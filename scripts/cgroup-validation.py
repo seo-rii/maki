@@ -19,6 +19,11 @@ import time
 import uuid
 
 
+try:
+    from campaign_io import save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import save_json
+
 def ensure(condition, message):
     # Qualification gates must remain active under python -O/PYTHONOPTIMIZE.
     if not condition:
@@ -469,11 +474,11 @@ def campaign(args):
         image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip()
         report["image"] = image_id
         for scenario in ("cpu-memory-kill", "freeze-resume", "memory-oom"):
+            record = {"scenario": scenario, "passed": False}
+            report["cases"].append(record)
             directory = args.output / scenario
             directory.mkdir(mode=0o700)
             target = Target(image_id, directory)
-            record = {"scenario": scenario}
-            report["cases"].append(record)
             try:
                 target.start(memory="96m", cpus="0.25" if scenario == "cpu-memory-kill" else "1")
                 record["workload"] = target.client("write", rounds=args.rounds)
@@ -509,16 +514,17 @@ def campaign(args):
                 # Offline format/CRC check complements authenticated NBD readback.
                 check = target.one_shot(["/opt/maki/maki", "check", "/case/config.toml", "--deep"])
                 record["deep_check"] = {"exit_code": check.returncode, "stdout": check.stdout[-2000:]}
-                record["passed"] = True
-                print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
             finally:
                 target.remove()
+            record["passed"] = True
+            save_json(args.output / "results.json", report)
+            print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
         report["passed"] = True
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
-        (args.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+        save_json(args.output / "results.json", report)
 
 
 def main():

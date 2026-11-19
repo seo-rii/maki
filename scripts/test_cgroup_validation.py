@@ -306,6 +306,32 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
             campaign.require_pressure({"completed": 0, "attempted": 0})
         campaign.require_pressure({"completed": 3, "attempted": 4})
 
+    def test_completed_case_is_published_before_the_next_case_starts(self):
+        output = self.ledger.parent / "campaign"
+        info = mock.Mock(stdout=campaign.json.dumps(dict(CgroupVersion="2", MemoryLimit=True,
+                         SwapLimit=True, CpuCfsQuota=True, PidsLimit=True, ServerVersion="fixture")))
+        target = mock.Mock()
+        target.client.return_value = target.kill.return_value = {}
+        target.stats.return_value = {"cpu.stat": "nr_throttled 1"}
+        target.one_shot.return_value = mock.Mock(returncode=0, stdout="ok")
+
+        def create(_image, directory):
+            if directory.name == "cpu-memory-kill":
+                return target
+            saved = campaign.json.loads((output / "results.json").read_text())
+            self.assertFalse(saved["passed"])
+            first, = saved["cases"]
+            self.assertTrue(first["passed"])
+            self.assertEqual(first["scenario"], "cpu-memory-kill")
+            raise RuntimeError("second case failed")
+
+        with mock.patch.object(campaign, "run", side_effect=[info, mock.Mock(stdout="image")]), \
+                mock.patch.object(campaign, "Target", side_effect=create):
+            with self.assertRaisesRegex(RuntimeError, "second case failed"):
+                campaign.campaign(argparse.Namespace(output=output, image="fixture", rounds=1))
+        final = campaign.json.loads((output / "results.json").read_text())
+        self.assertEqual([c["passed"] for c in final["cases"]], [True, False])
+
     def test_initial_docker_failure_leaves_a_failed_campaign_report(self):
         for step in ("info", "image"):
             with self.subTest(step=step):
