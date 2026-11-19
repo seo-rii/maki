@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -442,6 +443,27 @@ class ReleasePreparationTests(unittest.TestCase):
         output, result = self.prepare(succeeds=False)
         self.assertIn("fixture build failed", result.stderr)
         self.assertFalse(output.exists())
+
+    def test_concurrently_reserved_empty_output_is_preserved(self):
+        from scripts import prepare_release
+        output = self.work / "candidate"
+        output.mkdir()
+        reserved_inode = output.stat().st_ino
+        exists = pathlib.Path.exists
+
+        # Both callers can observe an absent destination before one creates it.
+        # The filesystem already contains that caller's empty directory at rename.
+        def observed_exists(path):
+            return path != output and exists(path)
+
+        with mock.patch.object(prepare_release, "ROOT", self.repo), \
+                mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(pathlib.Path, "exists", observed_exists):
+            with self.assertRaisesRegex(SystemExit, "output already exists"):
+                prepare_release.prepare(output)
+        self.assertTrue(self.cargo_trace.exists())
+        self.assertEqual(output.stat().st_ino, reserved_inode)
+        self.assertEqual(list(output.iterdir()), [])
 
     def test_failed_native_dependency_scan_leaves_no_candidate(self):
         shlibdeps = self.tools / "dpkg-shlibdeps"

@@ -24,6 +24,19 @@ RELEASE_FILES = {
     "libmaki_nbdkit.so": "usr/lib/maki/maki-nbdkit.so",
 }
 SHARED_OBJECTS = {"libmaki_nbdkit.so"}
+SYSTEMD_UNITS = (
+    "maki@.service",
+    "maki-attach@.service",
+    "maki-recover@.service",
+    "maki-workload@.target",
+)
+EXAMPLE_FILES = (
+    "attach.toml",
+    "maki-crypto.proto",
+    "maki-workload.service.d/10-maki.conf",
+    "maki@.service.d/20-memory-budget.conf",
+    "postgres-prod.toml",
+)
 
 # ELF identity a Debian architecture's binaries must carry:
 # (e_machine, ELF class, byte order). The builder refuses an artifact that
@@ -388,9 +401,8 @@ def create_tree(package_root, args, runtimes, epoch):
             0o755,
         )
 
-    for source in sorted((ROOT / "packaging/systemd").iterdir()):
-        if source.is_file():
-            install_file(source, package_root / "usr/lib/systemd/system" / source.name, 0o644)
+    for unit in SYSTEMD_UNITS:
+        install_file(ROOT / "packaging/systemd" / unit, package_root / "usr/lib/systemd/system" / unit, 0o644)
     install_file(
         ROOT / "packaging/sysusers.d/maki.conf",
         package_root / "usr/lib/sysusers.d/maki.conf",
@@ -401,10 +413,9 @@ def create_tree(package_root, args, runtimes, epoch):
         package_root / "usr/lib/tmpfiles.d/maki.conf",
         0o644,
     )
-    for source in sorted((ROOT / "packaging/examples").rglob("*")):
-        if source.is_file():
-            relative = source.relative_to(ROOT / "packaging/examples")
-            install_file(source, package_root / "usr/share/doc/maki/examples" / relative, 0o644)
+    for example in EXAMPLE_FILES:
+        install_file(ROOT / "packaging/examples" / example,
+                     package_root / "usr/share/doc/maki/examples" / example, 0o644)
     install_file(ROOT / "packaging/debian/copyright", package_root / "usr/share/doc/maki/copyright", 0o644)
 
     docs = package_root / "usr/share/doc/maki"

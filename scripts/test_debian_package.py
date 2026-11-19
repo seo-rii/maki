@@ -87,6 +87,7 @@ class DebianPackageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.work = pathlib.Path(self.temp.name)
+        self.builder = BUILDER
         self.release = self.work / "release"
         self.release.mkdir()
         self.write_release_files()
@@ -106,7 +107,7 @@ class DebianPackageTests(unittest.TestCase):
         output = self.work / name
         return output, [
             "python3",
-            str(BUILDER),
+            str(self.builder),
             "--release-dir",
             str(self.release),
             "--version",
@@ -169,6 +170,23 @@ class DebianPackageTests(unittest.TestCase):
         control = self.work / f"{name}-control"
         subprocess.run(["dpkg-deb", "--control", package, control], check=True)
         return root, control
+
+    def test_checkout_extras_do_not_change_the_packaged_units_or_examples(self):
+        checkout = self.work / "checkout"
+        shutil.copytree(ROOT / "packaging", checkout / "packaging")
+        shutil.copyfile(ROOT / "CHANGELOG.md", checkout / "CHANGELOG.md")
+        self.builder = checkout / "packaging/debian/build-deb.py"
+        clean = self.build("clean.deb")
+        (checkout / "packaging/systemd/maki@.service~").write_text("editor backup")
+        examples = checkout / "packaging/examples"
+        (examples / "maki@.service.d/local.conf").write_text("local example")
+        with_extras = self.build("extras.deb")
+        self.assertEqual(hashlib.sha256(clean.read_bytes()).digest(),
+                         hashlib.sha256(with_extras.read_bytes()).digest())
+        root, _ = self.extract(with_extras)
+        drop_in = pathlib.Path("maki@.service.d/20-memory-budget.conf")
+        self.assertEqual((root / "usr/share/doc/maki/examples" / drop_in).read_bytes(),
+                         (examples / drop_in).read_bytes())
 
     def test_vendored_license_inventory_uses_tracked_paths(self):
         repo = self.work / "checkout"
