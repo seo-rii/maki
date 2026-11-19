@@ -1691,6 +1691,21 @@ fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Check field names before resolving credentials or constructing the request.
+pub fn check_http_header_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let field = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid("invalid HTTP header name"))?;
+        if !seen.insert(field) {
+            return Err(invalid("duplicate HTTP header name"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
     if !["POST", "PUT"].contains(&op.method.to_ascii_uppercase().as_str()) {
         return Err(invalid(format!(
@@ -1705,12 +1720,8 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
             "[crypto.http.{name}] path must start with a slash"
         )));
     }
-    for (header, value) in &op.headers {
-        if http::HeaderName::from_bytes(header.as_bytes()).is_err() {
-            return Err(invalid(format!(
-                "[crypto.http.{name}] invalid HTTP header name"
-            )));
-        }
+    check_http_header_names(op.headers.keys().map(String::as_str))?;
+    for value in op.headers.values() {
         if let HeaderValue::Credential(c) = value {
             validate_credential(c)?;
         }

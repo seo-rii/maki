@@ -819,6 +819,12 @@ fn classify_status(
 
 impl HttpCryptoProvider {
     pub fn new(spec: HttpProviderSpec) -> Result<Self, CryptoError> {
+        for op in [&spec.encrypt, &spec.decrypt] {
+            maki_format::config::check_http_header_names(
+                op.headers.iter().map(|(k, _)| k.as_str()),
+            )
+            .map_err(|e| fatal(e.to_string()))?;
+        }
         // Public callers can bypass config validation or override its URL.
         // Refuse malformed endpoints before constructing a usable provider,
         // rather than failing the first encryption request (BUG-165).
@@ -1200,16 +1206,10 @@ impl HttpCryptoProvider {
         let build_op = |operation: &str,
                         op_cfg: &maki_format::config::HttpOpConfig|
          -> Result<OpSpec, CryptoError> {
+            maki_format::config::check_http_header_names(op_cfg.headers.keys().map(String::as_str))
+                .map_err(|e| fatal(e.to_string()))?;
             let mut headers = PendingHeaders::default();
             for (name, value) in &op_cfg.headers {
-                // An invalid name would fail every request at send time as
-                // a (retryable) builder error; refuse it now, before any
-                // credential is loaded for it (R5-021).
-                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                    return Err(fatal(format!(
-                        "header name {name:?} is not a valid HTTP header"
-                    )));
-                }
                 let mut resolved = match value {
                     HeaderValue::Literal(v) => Zeroizing::new(v.clone()),
                     HeaderValue::Credential(cred) => {
