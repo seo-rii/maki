@@ -832,8 +832,22 @@ impl BackingFile for CowFile {
         }
         let mut at = offset;
         while at < end {
-            let page = state.page_ref(self.id, at / PAGE)?;
-            let bytes = state.page(page)?;
+            let dest = (at - offset) as usize;
+            let Some((&index, page)) = state.files[&self.id]
+                .pages
+                .range(at / PAGE..=(end - 1) / PAGE)
+                .next()
+            else {
+                buf[dest..].fill(0);
+                break;
+            };
+            let page = page.clone();
+            let page_start = index * PAGE;
+            if at < page_start {
+                buf[dest..(page_start - offset) as usize].fill(0);
+                at = page_start;
+            }
+            let bytes = state.page(Some(page))?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let start = (at % PAGE) as usize;
             let dest = (at - offset) as usize;
