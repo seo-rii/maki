@@ -375,12 +375,14 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         call: LaneCall<I, O>,
         resend_safe: ResendSafe,
     ) -> Self {
-        let max_pending_items = config.max_pending_items.max(1);
-        let (tx, rx) = mpsc::channel::<Group<I, O>>(max_pending_items as usize);
+        let admission = DualSemaphore::new(config.max_pending_items.max(1), max_pending_bytes);
+        // Tokio's channel also uses a semaphore, so its capacity must agree
+        // with the effective admission limit, including on 32-bit targets.
+        let (tx, rx) = mpsc::channel::<Group<I, O>>(admission.max_items());
         let inflight = Arc::new(tokio::sync::Semaphore::new(
             (config.max_inflight_batches.max(1) as usize).min(tokio::sync::Semaphore::MAX_PERMITS),
         ));
-        let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
+        let max_admit_items = config.max_items.min(admission.max_items()).max(1);
         let max_admit_logical_bytes = config.max_bytes;
         tokio::spawn(run_lane(
             rx,
@@ -394,7 +396,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         Self {
             tx,
             clock,
-            admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
+            admission,
             max_admit_items,
             max_admit_logical_bytes,
         }
