@@ -36,7 +36,8 @@ def git_command(*args):
 
 
 def git(*args):
-    return run(git_command(*args))
+    # Legacy grafts change rev-list ancestry even with --no-replace-objects.
+    return run(git_command(*args), env={**os.environ, "GIT_GRAFT_FILE": os.devnull})
 
 
 def digest(path):

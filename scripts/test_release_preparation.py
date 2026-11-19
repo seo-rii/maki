@@ -276,6 +276,16 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assert_version_order("0.1.0", next_candidate)
         self.assert_version_order(next_candidate, "0.1.1")
 
+    def test_candidate_version_ignores_checkout_local_grafts(self):
+        self.git("commit", "--allow-empty", "-qm", "test: second commit")
+        head = self.git("rev-parse", "HEAD")
+        expected = f"0.1.0~rc+rev2.git{head[:12]}"
+        self.assertEqual(self.print_version().stdout.strip(), expected)
+        (self.repo / ".git/info/grafts").write_text(head + "\n")
+        self.assertEqual(self.print_version().stdout.strip(), expected)
+        output, _ = self.prepare()
+        self.assertEqual(json.loads((output / "manifest.json").read_text())["package"]["version"], expected)
+
     def test_shallow_history_is_refused_before_output_or_building(self):
         self.git("commit", "--allow-empty", "-qm", "test: complete history has two commits")
         complete_version = self.print_version().stdout.strip()

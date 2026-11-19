@@ -58,6 +58,9 @@ package it unless its machine, class and byte order match the requested
 and the binaries are executables. A wrong artifact used to produce a
 "valid" package for the wrong CPU (R4-007).
 
+Every file must carry the generic System V or GNU/Linux ELF OS ABI. A FreeBSD
+executable can otherwise have the same CPU, word size, and byte order as Linux.
+
 For `armel` and `armhf`, the builder also requires EABI version 5 and checks
 the ARM floating-point procedure-call flags in every artifact. `armhf`
 requires the hard-float flag; `armel` accepts the soft-float flag or the
@@ -67,6 +70,10 @@ rejected. These meanings follow the
 
 For Debian `riscv64` and `loong64`, all artifacts must declare the LP64D (double-float)
 calling convention in their ELF flags.
+
+For `mips64el`, the builder reads the version-zero MIPS ABI flags program
+header. It accepts the double-precision hardware calling convention and
+ABI-independent code. Missing flags or incompatible conventions fail validation.
 
 Both shared libraries and PIE executables use ELF type `ET_DYN`. For the
 plugin, the builder also rejects a `PT_INTERP` program header or the

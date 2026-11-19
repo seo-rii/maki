@@ -40,11 +40,12 @@ def elf_stub(machine, e_type, elf_class=64, endian="little", e_flags=0):
     return ident + header
 
 
-def elf_with_segments(machine, elf_class=64, endian="little", *, interpreter=False, flags_1=None):
+def elf_with_segments(machine, elf_class=64, endian="little", *, interpreter=False, flags_1=None,
+                      extra_segments=(), e_type=ET_DYN):
     """ET_DYN fixture with program headers, deliberately without section headers."""
     order = "<" if endian == "little" else ">"
-    header = bytearray(elf_stub(machine, ET_DYN, elf_class, endian))
-    segments = []
+    header = bytearray(elf_stub(machine, e_type, elf_class, endian))
+    segments = list(extra_segments)
     if interpreter:
         segments.append((3, b"/fixture/ld.so\0"))  # PT_INTERP
     if flags_1 is not None:
@@ -338,6 +339,49 @@ class DebianPackageTests(unittest.TestCase):
         self.build_failure("i386-as-amd64.deb", architecture="amd64")
         i386 = self.build("i386.deb", architecture="i386")
         self.assertEqual(self.field(i386, "Architecture"), "i386")
+
+    def test_foreign_os_abi_is_rejected_for_each_release_file(self):
+        for name in RELEASE_NAMES:
+            with self.subTest(name=name):
+                self.write_release_files()
+                path = self.release / name
+                image = bytearray(path.read_bytes())
+                image[7] = 9  # ELFOSABI_FREEBSD
+                path.write_bytes(image)
+                error = self.build_failure("freebsd.deb")
+                self.assertIn(name, error)
+                self.assertIn("OS ABI", error)
+        self.write_release_files()
+        for path in self.release.iterdir():
+            image = bytearray(path.read_bytes())
+            image[7] = 3  # ELFOSABI_GNU
+            path.write_bytes(image)
+        self.build("gnu.deb")
+
+    def test_mips64el_checks_the_float_abi_in_each_program_header_table(self):
+        def flags(fp_abi, version=0):
+            return struct.pack("<H6B4I", version, 64, 2, 2, 2, 0, fp_abi, 0, 0, 0, 0)
+
+        def image(name, *records):
+            return elf_with_segments(8, extra_segments=[(0x70000003, record) for record in records],
+                                     e_type=ET_DYN if name.endswith(".so") else ET_EXEC)
+
+        for name in RELEASE_NAMES:
+            (self.release / name).write_bytes(image(name, flags(1)))
+        self.build("hard.deb", architecture="mips64el")
+        (self.release / "maki").write_bytes(image("maki", flags(0)))
+        self.build("abi-independent.deb", architecture="mips64el")
+        for name in RELEASE_NAMES:
+            with self.subTest(name=name):
+                (self.release / name).write_bytes(image(name, flags(3)))
+                error = self.build_failure("soft.deb", architecture="mips64el")
+                self.assertIn(name, error)
+                self.assertIn("mips64el", error)
+                (self.release / name).write_bytes(image(name, flags(1)))
+        for records in ([], [flags(1)[:-1]], [flags(1, version=1)], [flags(1), flags(1)]):
+            with self.subTest(records=records):
+                (self.release / "maki").write_bytes(image("maki", *records))
+                self.assertIn("mips64el", self.build_failure("invalid.deb", architecture="mips64el"))
 
     def test_riscv64_requires_lp64d_for_every_artifact(self):
         machine = 0xF3

@@ -51,6 +51,7 @@ ELF_MACHINE_NAMES = {
 }
 ET_REL, ET_EXEC, ET_DYN = 1, 2, 3
 PT_DYNAMIC, PT_INTERP = 2, 3
+PT_MIPS_ABIFLAGS = 0x70000003
 DT_NULL, DT_FLAGS_1 = 0, 0x6FFFFFFB
 DF_1_PIE = 0x08000000
 EF_RISCV_FLOAT_ABI_MASK, EF_RISCV_FLOAT_ABI_DOUBLE = 0x6, 0x4
@@ -87,6 +88,8 @@ def inspect_elf(path):
         header = handle.read(64)
     if len(header) < 52 or header[:4] != b"\x7fELF":
         fail(f"{path.name} is not an ELF image")
+    if header[7] not in (0, 3):  # ELFOSABI_SYSV and ELFOSABI_GNU
+        fail(f"{path.name} declares ELF OS ABI {header[7]}, incompatible with Debian Linux")
     elf_class = {1: 32, 2: 64}.get(header[4])
     endian = {1: "little", 2: "big"}.get(header[5])
     if elf_class is None or endian is None:
@@ -99,7 +102,7 @@ def inspect_elf(path):
     return e_type, e_machine, elf_class, endian, e_flags
 
 
-def inspect_loader(path, elf_class, endian):
+def inspect_loader(path, elf_class, endian, architecture):
     """Read entry point and PIE markers from bounded loader metadata."""
     order = "<" if endian == "little" else ">"
     is_64 = elf_class == 64
@@ -113,14 +116,13 @@ def inspect_loader(path, elf_class, endian):
             fail(f"{path.name} has a truncated ELF header")
         entry_point = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header, 24)[0]
         interpreter, pie = False, False
+        mips_abi_seen = False
         program_offset = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header,
                                             32 if is_64 else 28)[0]
         entry_size, count = struct.unpack_from(f"{order}HH", header, 54 if is_64 else 42)
-        if count == 0:
-            return entry_point, interpreter, pie
         if count == 0xFFFF:
             fail(f"{path.name} uses an unsupported extended ELF program-header count")
-        if entry_size < program_size:
+        if count and entry_size < program_size:
             fail(f"{path.name} has truncated ELF program-header entries")
         file_size = os.fstat(handle.fileno()).st_size
         if program_offset + count * entry_size > file_size:
@@ -135,9 +137,19 @@ def inspect_loader(path, elf_class, endian):
             fields = struct.unpack(program_format, program)
             if fields[0] == PT_INTERP:
                 interpreter = True
+            offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
+            if fields[0] == PT_MIPS_ABIFLAGS and architecture == "mips64el":
+                # Elf_MIPS_ABIFlags_v0 is a 24-byte loader record, also
+                # available in stripped binaries. Byte 7 holds the FP ABI.
+                if mips_abi_seen or size != 24 or offset + size > file_size:
+                    fail(f"{path.name} has invalid mips64el ABI flags")
+                handle.seek(offset)
+                abi = handle.read(24)
+                if len(abi) != 24 or abi[:2] != b"\0\0" or abi[7] not in (0, 1):
+                    fail(f"{path.name} must use a double-float compatible ABI for mips64el")
+                mips_abi_seen = True
             if fields[0] != PT_DYNAMIC:
                 continue
-            offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
             if offset + size > file_size or size % dynamic_size:
                 fail(f"{path.name} has a truncated ELF dynamic table")
             handle.seek(offset)
@@ -150,19 +162,19 @@ def inspect_loader(path, elf_class, endian):
                     break
                 if tag == DT_FLAGS_1 and value & DF_1_PIE:
                     pie = True
+        if architecture == "mips64el" and not mips_abi_seen:
+            fail(f"{path.name} is missing mips64el ABI flags")
         return entry_point, interpreter, pie
 
 
-def validate_shared_object(path, elf_class, endian):
+def validate_shared_object(path, interpreter, pie):
     """A plugin must not carry the loader markers of an executable."""
-    _, interpreter, pie = inspect_loader(path, elf_class, endian)
     if interpreter or pie:
         marker = "PT_INTERP" if interpreter else "DF_1_PIE"
         fail(f"{path.name} must be an ELF shared object, not a PIE executable ({marker})")
 
 
-def validate_executable(path, e_type, elf_class, endian):
-    entry_point, interpreter, pie = inspect_loader(path, elf_class, endian)
+def validate_executable(path, e_type, entry_point, interpreter, pie):
     if entry_point == 0:
         fail(f"{path.name} must have a nonzero ELF executable entry point")
     # Older dynamic PIEs may only carry PT_INTERP. Static PIEs have no
@@ -213,14 +225,15 @@ def validate_release_files(args):
                 actual_abi = "hard-float" if hard_float else "soft-float"
                 fail(f"{source_name} uses the ARM {actual_abi} ABI but the "
                      f"package architecture is {args.architecture}")
+        entry_point, interpreter, pie = inspect_loader(path, file_class, file_endian, args.architecture)
         if source_name in SHARED_OBJECTS:
             if e_type != ET_DYN:
                 fail(f"{source_name} must be an ELF shared object (ET_DYN), found type {e_type}")
-            validate_shared_object(path, file_class, file_endian)
+            validate_shared_object(path, interpreter, pie)
         elif e_type not in (ET_EXEC, ET_DYN):
             fail(f"{source_name} must be an ELF executable (ET_EXEC or PIE), found type {e_type}")
         else:
-            validate_executable(path, e_type, file_class, file_endian)
+            validate_executable(path, e_type, entry_point, interpreter, pie)
 
 
 def shared_library_dependencies(package_root):
