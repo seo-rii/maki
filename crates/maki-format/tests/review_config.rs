@@ -338,6 +338,17 @@ fn endpoint_ports_preserve_valid_ipv4_ipv6_and_default_ports() {
 }
 
 #[test]
+fn remote_http_rejects_invalid_hosts_at_volume_validation() {
+    for host in ["[127.0.0.1]", "[localhost]", "192.168.1.999", "host name"] {
+        let raw = base().replace("https://crypto.internal", &format!("https://{host}"));
+        assert!(err(&raw).contains("invalid host"), "{host}");
+    }
+    for host in ["crypto.internal", "127.0.0.1", "[2001:db8::1]"] {
+        ok(&base().replace("https://crypto.internal", &format!("https://{host}")));
+    }
+}
+
+#[test]
 fn endpoint_ports_reject_invalid_syntax_and_overflow() {
     for scheme in ["http", "https", "ws", "wss"] {
         for host in ["localhost", "127.0.0.1", "[::1]"] {

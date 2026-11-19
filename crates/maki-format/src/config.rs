@@ -1642,6 +1642,16 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             redacted_url(url)
         )));
     }
+    // The transport URL grammar requires brackets to contain an IPv6
+    // address and applies the URL host parser to DNS names and IPv4.
+    let valid_host = if authority.starts_with('[') {
+        host.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        url::Host::parse(host).is_ok()
+    };
+    if !valid_host {
+        return Err(invalid("endpoint url has an invalid host"));
+    }
     // An empty port means the scheme's default, as in the transport URL
     // parsers. Do not silently accept a nonnumeric or out-of-range port
     // and defer a permanent configuration error until the first request.

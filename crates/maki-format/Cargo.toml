@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 http = "1"
+url = "2"
 maki-backing.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["sync"] }
