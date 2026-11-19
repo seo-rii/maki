@@ -245,7 +245,7 @@ class BackgroundStorageTests(unittest.TestCase):
         (repo / ".git/info/attributes").write_text("suite export-subst\nexpected export-ignore\n")
         (repo / "local").write_text("untracked")
         (repo / "expected").write_text("local edit")
-        self.runner.freeze_source(repo, git("rev-parse", "HEAD"), self.root / "source.tar", source)
+        self.runner.qualification_source().extract_revision(repo, git("rev-parse", "HEAD"), self.root / "source.tar", source)
         self.assertEqual((source / "expected").read_bytes(), b"published fixture")
         self.assertEqual((source / "suite").read_bytes(), b"$Format:%H$\n")
         self.assertEqual((source / "suite").stat().st_mode & 0o111, 0o111)
@@ -266,12 +266,10 @@ class BackgroundStorageTests(unittest.TestCase):
                     self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)
                 ), \
                 mock.patch.object(self.runner.subprocess, "run"), \
-                mock.patch.object(self.runner, "freeze_source", side_effect=self.fake_freeze_source), \
-                mock.patch.object(
-                    self.runner.subprocess,
-                    "check_output",
-                    side_effect=["revision-one\n", "cargo fixture\n", "revision-two\n", "cargo fixture\n"],
-                ) as probes, \
+                mock.patch.object(self.runner.qualification_source(), "extract_revision", side_effect=self.fake_freeze_source), \
+                mock.patch.object(self.runner.qualification_source(), "clean_revision",
+                                  side_effect=["revision-one", "revision-two"]), \
+                mock.patch.object(self.runner.subprocess, "check_output", return_value="cargo fixture\n") as probes, \
                 mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
             self.runner.start(args)
             first = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
@@ -286,7 +284,7 @@ class BackgroundStorageTests(unittest.TestCase):
         for index, config in enumerate((first_config, second_config)):
             source = Path(config["source"])
             self.assertEqual((source.parent / "runner.py").read_text(), f"# runner at {config['revision']}\n")
-            self.assertEqual(probes.call_args_list[index * 2 + 1], mock.call(["cargo", "-V"], cwd=source, text=True))
+            self.assertEqual(probes.call_args_list[index], mock.call(["cargo", "-V"], cwd=source, text=True))
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
         self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
         self.assertEqual(Path(second_config["build_dir"]), Path(second["run_dir"]) / "build")
@@ -310,9 +308,10 @@ class BackgroundStorageTests(unittest.TestCase):
             with self.subTest(failed=failed), \
                     mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                     mock.patch.object(self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)), \
+                    mock.patch.object(self.runner.qualification_source(), "clean_revision", return_value="revision"), \
                     mock.patch.object(self.runner.subprocess, "check_output", return_value="fixture"), \
                     mock.patch.object(self.runner.subprocess, "run"), \
-                    mock.patch.object(self.runner, "freeze_source", side_effect=self.fake_freeze_source), \
+                    mock.patch.object(self.runner.qualification_source(), "extract_revision", side_effect=self.fake_freeze_source), \
                     mock.patch.object(self.runner.subprocess, "Popen", return_value=process), \
                     mock.patch.object(self.runner, "save_json", side_effect=publish):
                 with self.assertRaisesRegex(OSError, "publication failed"):

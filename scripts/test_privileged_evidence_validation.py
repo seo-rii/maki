@@ -95,6 +95,9 @@ sudo() { echo later-edit > "$REPO_ROOT/version"; }
                 self.assertEqual((live / "source/fixture-data").read_text(), "required\n")
                 self.assertEqual((live / "source").stat().st_mode & 0o777, 0o700)
                 self.assertEqual((repo / "version").read_text(), "later-edit\n")
+                # The shared clean-revision check also covers files omitted
+                # from the default working-tree status.
+                git("update-index", "--assume-unchanged", "version")
                 second = root / "other-logs"
                 rejected = subprocess.run(["bash", "-c", setup + launcher], capture_output=True,
                                           text=True, timeout=10, env=dict(os.environ, REPO_ROOT=str(repo),

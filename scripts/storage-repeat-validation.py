@@ -360,21 +360,21 @@ def worker(directory):
     return exit_code
 
 
-def freeze_source(repo, revision, archive, source):
+def qualification_source():
     # The detached worker is a standalone copy; only the launcher needs this module.
     try:
-        from qualification_source import extract_revision
+        import qualification_source as snapshot
     except ModuleNotFoundError:
-        from scripts.qualification_source import extract_revision
-    extract_revision(repo, revision, archive, source)
+        from scripts import qualification_source as snapshot
+    return snapshot
 
 
 def start(args):
     profile = getattr(args, "profile", "storage")
     groups = suite_groups({"profile": profile})
     repo = Path(__file__).resolve().parents[1]
-    subprocess.run(["git", "--no-replace-objects", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
-    revision = subprocess.check_output(["git", "--no-replace-objects", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    snapshot = qualification_source()
+    revision = snapshot.clean_revision(repo)
     logs = Path.home() / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
     logs.chmod(0o700)
@@ -388,7 +388,7 @@ def start(args):
     target = directory / "target"
     target.mkdir(mode=0o700)
     archive = directory / "source.tar"
-    freeze_source(repo, revision, archive, source)
+    snapshot.extract_revision(repo, revision, archive, source)
     runner = directory / "runner.py"
     shutil.copyfile(source / "scripts/storage-repeat-validation.py", runner)
     runner.chmod(0o400)

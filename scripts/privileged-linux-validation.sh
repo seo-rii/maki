@@ -165,13 +165,8 @@ log_root="${user_home}/logs"
 
 prepare_source_snapshot() {
     local revision
-    revision="$(git --no-replace-objects -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}')" || return 1
-    if ! git --no-replace-objects -C "$REPO_ROOT" diff --quiet "$revision" --; then
-        printf 'Commit tracked changes before qualifying this revision.\n' >&2
-        return 1
-    fi
     mkdir "$run_dir/source" || return 1
-    python3 -B "$REPO_ROOT/scripts/qualification_source.py" "$revision" "$run_dir/source" || return 1
+    revision="$(python3 -B "$REPO_ROOT/scripts/qualification_source.py" --clean-head "$run_dir/source")" || return 1
     printf '%s\n' "$revision" > "$run_dir/source-revision"
 }
 
