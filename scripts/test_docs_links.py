@@ -1,6 +1,7 @@
 """Project links remain checked without rewriting preserved crate documents."""
 
 import hashlib
+import os
 import json
 from pathlib import Path
 import subprocess
@@ -26,6 +27,31 @@ class DocumentationLinks(unittest.TestCase):
                 ["git", "-C", str(self.root), "add", "--", name], check=True
             )
         return path
+
+    def test_rooted_links_and_external_scheme_case(self):
+        self.write("GUIDE.MD", "# Welcome\n")
+        self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"
+                   "[absent](/not-a-repository-path)\n")
+        self.assertEqual(broken_links(self.root), ["docs/sub/page.md:2: /not-a-repository-path"])
+
+    def test_comments_and_quoted_headings(self):
+        self.write("README.md", "<!--\n# Draft\n```\n[example](hidden)\n-->\n"
+                   "> ## Backup\n\n[visible](#backup) [invisible](#draft)\n"
+                   "text <!-- [scratch](hidden) --> [real](missing.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:8: #draft (missing anchor)", "README.md:9: missing.md"])
+
+    def test_mixed_case_markdown_extensions(self):
+        self.write("README.Md", "[broken](absent)\n", tracked=False)
+        self.assertEqual(broken_links(self.root), ["README.Md:1: absent"])
+
+    @unittest.skipUnless(os.name == "posix", "Unix byte filenames")
+    def test_byte_filename_keeps_other_diagnostics(self):
+        name = os.fsdecode(b"notes-\xff.md")
+        self.write(name, "[broken](gone)\n")
+        self.write("a.md", "[broken](also-gone)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["a.md:1: also-gone", f"{name}:1: gone"])
 
     def archive(self, document="README.md", content="[Contributing](CONTRIBUTING.md)\n",
                 extra_files=None):

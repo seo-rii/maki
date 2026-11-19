@@ -67,11 +67,11 @@ THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 def candidate_markdown(root):
     listing = subprocess.run(
         ["git", "-C", str(root), "ls-files", "--cached", "--others",
-         "--exclude-standard", "-z", "--", "*.md", "**/*.md"],
+         "--exclude-standard", "-z", "--", ":(icase)*.md"],
         capture_output=True,
         check=True,
     )
-    names = {name for name in listing.stdout.decode("utf-8").split("\0") if name}
+    names = {name for name in os.fsdecode(listing.stdout).split("\0") if name}
     return sorted(root / name for name in names)
 
 
@@ -80,6 +80,7 @@ def unfenced_lines(text):
     fence = None
     list_indents = []
     last_depth = 0
+    comment_depth = None
     for number, line in enumerate(text.splitlines(), start=1):
         # CommonMark counts block indentation in columns, with four-column tab stops.
         columns = line.expandtabs(4)
@@ -104,6 +105,12 @@ def unfenced_lines(text):
         prefix = CONTAINER_PREFIX.match(columns)
         depth = prefix[1].count(">")
         body = columns[prefix.end(1):]
+        if comment_depth is not None and depth < comment_depth:
+            comment_depth = None
+        # A block comment includes its closing line. Its contents cannot open a fence.
+        if comment_depth is not None or re.match(r" {0,3}<!--", columns[prefix.end():]):
+            comment_depth = None if "-->" in columns[prefix.end():] else depth
+            continue
         if last_depth != depth:
             list_indents.clear()
         last_depth = depth
@@ -372,6 +379,13 @@ def mask_inline_literals(line):
     index = 0
     while index < len(line):
         char = line[index]
+        if line.startswith("<!--", index):
+            end = line.find("-->", index + 4)
+            if end != -1:
+                end += 3
+                out.append(" " * (end - index))
+                index = end
+                continue
         if char == "\\":
             out.append(line[index:index + 2])
             index += 2
@@ -547,6 +561,11 @@ def inline_text(raw, labels=frozenset()):
                         out.extend(inline_text(raw[opening + 1:close], labels))
                     index = reference.end() if reference else close + 1
                     continue
+        if raw.startswith("<!--", index):
+            end = raw.find("-->", index + 4)
+            if end != -1:
+                index = end + 3
+                continue
         if char == "<":
             autolink = AUTOLINK.match(raw, index)
             if autolink:
@@ -620,7 +639,14 @@ def document_anchors(text):
     }
     headings = []
     paragraph = []
+    previous_quote_depth = 0
     for number, line in unfenced_lines(text):
+        quote = CONTAINER_PREFIX.match(line)[1]
+        depth = quote.count(">")
+        if depth != previous_quote_depth:
+            paragraph = []
+        previous_quote_depth = depth
+        line = line[len(quote):]
         if number in definition_lines:
             paragraph = []
             continue
@@ -697,11 +723,15 @@ def broken_links(root):
 
     def target_problem(path, content, target):
         """Why `target`, linked from `path`, is broken, or None."""
-        if not target or target.startswith(SKIP_PREFIXES):
+        if not target or target.lower().startswith(SKIP_PREFIXES):
             return None
         file_part, _, fragment = target.partition("#")
         file_part = file_part.partition("?")[0]
-        target_path = path.parent / urllib.parse.unquote(file_part) if file_part else path
+        decoded = urllib.parse.unquote(file_part)
+        if file_part.startswith("/"):
+            target_path = root / decoded.lstrip("/")
+        else:
+            target_path = path.parent / decoded if decoded else path
         if not target_path.exists():
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
