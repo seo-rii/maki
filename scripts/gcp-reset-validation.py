@@ -591,15 +591,16 @@ def campaign(args):
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     token = uuid.uuid4().hex
     ledger = args.output / "host-acks.jsonl"
-    baseline = resource_identity(args, args.timeout)
-    validate_resource_identity(baseline, baseline)
     result = {"passed": False, "fault_scope": "whole GCE instance reset",
               "instance": args.instance, "project": args.project, "zone": args.zone,
-              "data_disk": args.data_disk, "resource_identity": baseline,
+              "data_disk": args.data_disk, "resource_identity": None,
               "cycles": args.cycles, "profile": args.profile, "token": token, "boots": []}
     seen_boots = set()
     fs_uuid = None
     try:
+        baseline = resource_identity(args, args.timeout)
+        result["resource_identity"] = baseline
+        validate_resource_identity(baseline, baseline)
         for cycle in range(args.cycles + 1):
             verify_only = cycle == args.cycles
             entry = {"cycle": cycle, "verify_only": verify_only}
