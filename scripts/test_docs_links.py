@@ -76,6 +76,82 @@ class DocumentationLinks(unittest.TestCase):
                    "[other]: //cdn.example.org/sample\n\n[local](/missing.md)\n")
         self.assertEqual(broken_links(self.root), ["README.md:4: /missing.md"])
 
+    def test_only_publishable_files_and_directories_are_link_targets(self):
+        self.write(".gitignore", "ignored/\n")
+        self.write("ignored/notes.txt", "local", tracked=False)
+        self.write("draft/file.txt", "new", tracked=False)
+        sibling = tempfile.NamedTemporaryFile(dir=self.root.parent)
+        self.addCleanup(sibling.close)
+        outside = Path(sibling.name)
+        self.write("README.md", "[root](/) [draft](draft) [new](draft/file.txt)\n"
+                   f"[ignored](ignored/notes.txt) [dir](ignored/) [external](../{outside.name})\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: ignored/notes.txt", "README.md:2: ignored/", f"README.md:2: ../{outside.name}"])
+
+    def test_a_tracked_submodule_directory_is_publishable(self):
+        self.write("README.md", "[component](component)\n")
+        (self.root / "component").mkdir()
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "fixture commit"], check=True)
+        oid = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},component"], check=True)
+        self.assertEqual(broken_links(self.root), [])
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_every_link_in_a_document_symlink_chain_must_be_publishable(self):
+        self.write("docs/guide.md", "# Guide\n")
+        self.write("README.md", "[file](alias.md#guide) [directory](via-dir.md) [ok](good.md#guide)\n")
+        self.write(".gitignore", "/local-file\n/local-dir\n")
+        for name, target in (("alias.md", "local-file"), ("local-file", "docs/guide.md"),
+                             ("via-dir.md", "local-dir/guide.md"), ("local-dir", "docs"),
+                             ("good.md", "published-dir/guide.md"), ("published-dir", "docs")):
+            (self.root / name).symlink_to(target)
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "add", "--all"], check=True)
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "fixture links"], check=True)
+        with tempfile.TemporaryDirectory() as directory:
+            clone = Path(directory) / "clone"
+            subprocess.run(["git", "clone", "--quiet", str(self.root), str(clone)], check=True)
+            expected = ["README.md:1: alias.md#guide", "README.md:1: via-dir.md",
+                        "alias.md: invalid Markdown symlink target", "via-dir.md: invalid Markdown symlink target"]
+            self.assertEqual(broken_links(clone), expected)
+            self.assertEqual(broken_links(self.root), expected)
+
+    def test_inner_links_deactivate_outer_links_but_images_remain_linkable(self):
+        self.write("guide.md", "# Guide\n")
+        self.write("README.md", "[[inner](guide.md)](literal.md)\n\n"
+                   "[![badge](missing.png)](outer.md)\n\n"
+                   "[[inner][guide]](literal2.md)\n\n[guide]: guide.md\n\n"
+                   "[![alt [inner](alt-text)](absent.png)](outside.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing.png", "README.md:3: outer.md",
+            "README.md:9: absent.png"])
+
+    def test_inline_html_attributes_do_not_create_links_or_references(self):
+        self.write("README.md", 'See <a id="here" title="[x](example) [y][unused]">here</a> '
+                   '[anchor](#here) [real](missing).\n')
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing"])
+
+    def test_unmatched_underscores_are_literal_in_heading_slugs(self):
+        self.write("README.md", "# _draft\n# build_\n# _both_\n# __before_\n\n"
+                   "[a](#_draft) [b](#build_) [c](#both) [d](#_before)\n")
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_absolute_uri_schemes_are_external(self):
+        self.write("README.md", "[mirror](FTP://example.org/pub/) [phone](tel:+1234)\n\n"
+                   "[ref]: urn:example:manual\n\n[local](file.txt)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:5: file.txt"])
+
+    def test_only_complete_markdown_entities_change_a_link_destination(self):
+        self.write("copy&copy.txt", "")
+        self.write("copy©.txt", "")
+        self.write("README.md", "[literal](copy&copy.txt) [entity](copy&copy;.txt)\n\n"
+                   "[ref]: copy&copy.txt\n")
+        (self.root / "copy©.txt").unlink()
+        self.assertEqual(broken_links(self.root), ["README.md:1: copy©.txt"])
+
     def test_headings_inside_nested_list_and_quote_containers(self):
         self.write("README.md", "- ## Install\n- > Release\n  > =======\n- Help\n- -----\n\n"
                    "[one](#install) [two](#release) [separate item](#help)\n")

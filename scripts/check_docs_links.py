@@ -42,7 +42,8 @@ import unicodedata
 import urllib.parse
 from typing import NamedTuple
 
-SKIP_PREFIXES = ("http://", "https://", "mailto:", "//")
+URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+ENTITY = re.compile(r"&(?:#[xX][0-9A-Fa-f]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]+);")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
@@ -78,15 +79,18 @@ BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])( +|$)")
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
-def candidate_markdown(root):
-    listing = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--cached", "--others",
-         "--exclude-standard", "-z", "--", ":(icase)*.md"],
-        capture_output=True,
-        check=True,
-    )
-    names = {name for name in os.fsdecode(listing.stdout).split("\0") if name}
-    return sorted(root / name for name in names)
+def candidate_files(root):
+    git = ["git", "-C", str(root), "ls-files", "-z"]
+    tracked = subprocess.check_output([*git, "--stage"])
+    untracked = subprocess.check_output([*git, "--others", "--exclude-standard"])
+    candidates = {root / os.fsdecode(name) for name in untracked.split(b"\0") if name}
+    for entry in tracked.split(b"\0"):
+        if entry:
+            metadata, name = entry.split(b"\t", 1)
+            path = root / os.fsdecode(name)
+            if metadata.startswith(b"160000 ") or path.is_file() or path.is_symlink():
+                candidates.add(path)
+    return candidates
 
 
 class SourceLine(NamedTuple):
@@ -261,6 +265,15 @@ def valid_label(label):
     return bool(label.strip(" \t\r\n"))
 
 
+def markdown_entities(text):
+    def decode(match):
+        entity = match.group()
+        if entity[1] == "#":
+            return html.unescape(entity)
+        return html.entities.html5.get(entity[1:], entity)
+    return ENTITY.sub(decode, text)
+
+
 def unescape(raw):
     """Resolve backslash escapes of ASCII punctuation and entity references."""
     parts = []
@@ -268,14 +281,14 @@ def unescape(raw):
     index = 0
     while index < len(raw):
         if raw[index] == "\\" and raw[index + 1:index + 2] in ASCII_PUNCTUATION:
-            parts.append(html.unescape("".join(plain)))
+            parts.append(markdown_entities("".join(plain)))
             plain = []
             parts.append(raw[index + 1])
             index += 2
             continue
         plain.append(raw[index])
         index += 1
-    parts.append(html.unescape("".join(plain)))
+    parts.append(markdown_entities("".join(plain)))
     return "".join(parts)
 
 
@@ -447,10 +460,13 @@ def reference_definitions(text):
     return definitions
 
 
-def mask_inline_literals(line, targets):
+def scan_inline_paragraph(line, labels):
     """Mask literals and record link destinations with their offsets in this paragraph."""
     out = []
-    depth = 0
+    targets = []
+    html_tags = []
+    brackets = []
+    last_link = -1
     index = 0
     while index < len(line):
         char = line[index]
@@ -465,14 +481,40 @@ def mask_inline_literals(line, targets):
             out.append(line[index:index + 2])
             index += 2
             continue
+        if char == "<":
+            tag = HTML_TAG.match(line, index)
+            if tag:
+                html_tags.append(tag.group())
+                out.append(" " * len(tag.group()))
+                index = tag.end()
+                continue
+        if line.startswith("![", index):
+            brackets.append((index + 1, (len(targets), len(html_tags))))
+            out.append("![")
+            index += 2
+            continue
         if char == "[":
-            depth += 1
-        elif char == "]" and depth:
-            depth -= 1
-            if line[index + 1:index + 2] == "(":
-                parsed = inline_destination(line, index + 1)
+            brackets.append((index, None))
+        elif char == "]" and brackets:
+            opening, image_scope = brackets.pop()
+            if image_scope is None and opening < last_link:
+                out.append(char)
+                index += 1
+                continue
+            parsed = (inline_destination(line, index + 1)
+                      if line[index + 1:index + 2] == "(" else None)
+            reference = LINK_LABEL.match(line, index + 1)
+            label = reference[1] if reference and reference[1] else line[opening + 1:index]
+            if parsed is not None or label_key(label) in labels:
+                if image_scope is None:
+                    last_link = opening
+                else:
+                    # An image description renders as alt text. Links and
+                    # HTML tags within it do not create separate targets.
+                    target_count, html_count = image_scope
+                    del targets[target_count:]
+                    del html_tags[html_count:]
                 if parsed is not None:
-                    # Backticks in a destination or title do not start code.
                     end = parsed[1]
                     target_start = index + 2
                     while line[target_start:target_start + 1] in (" ", "\t", "\n"):
@@ -480,6 +522,10 @@ def mask_inline_literals(line, targets):
                     targets.append((target_start, unescape(parsed[0])))
                     out.append("](" + " " * (end - index - 3) + ")")
                     index = end
+                    continue
+                if reference:
+                    out.append(line[index:reference.end()])
+                    index = reference.end()
                     continue
         if char == "`":
             opening = BACKTICKS.match(line, index).group(0)
@@ -497,17 +543,32 @@ def mask_inline_literals(line, targets):
             continue
         out.append(char)
         index += 1
-    return "".join(out)
+    return "".join(out), targets, html_tags
 
 
-def inline_lines(text, definition_lines):
-    """Mask code spans across soft line breaks within the same paragraph."""
+def inline_paragraphs(text, definition_lines):
+    """Group inline content across soft breaks within the same paragraph."""
     paragraph = []
-    def masked_lines():
-        if not paragraph:
-            return
-        targets = []
-        masked = mask_inline_literals("\n".join(line for _, line in paragraph), targets)
+    for number, content, changed, raw_html, lazy in document_lines(text):
+        single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
+                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
+        if (not content.strip() or raw_html or number in definition_lines or single or changed
+                or (paragraph and number != paragraph[-1][0] + 1)):
+            if paragraph:
+                yield paragraph
+                paragraph = []
+        if content.strip() and not raw_html and number not in definition_lines:
+            paragraph.append((number, content))
+            if single:
+                yield paragraph
+                paragraph = []
+    if paragraph:
+        yield paragraph
+
+
+def inline_lines(text, definition_lines, labels):
+    for paragraph in inline_paragraphs(text, definition_lines):
+        masked, targets, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
         starts = []
         start = 0
         for _, line in paragraph:
@@ -518,20 +579,6 @@ def inline_lines(text, definition_lines):
             per_line[bisect_right(starts, offset) - 1].append(destination)
         for (number, line), start, found in zip(paragraph, starts, per_line):
             yield number, line, masked[start:start + len(line)], found
-
-    for number, content, changed, raw_html, lazy in document_lines(text):
-        single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
-                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
-        if (not content.strip() or raw_html or number in definition_lines or single or changed
-                or (paragraph and number != paragraph[-1][0] + 1)):
-            yield from masked_lines()
-            paragraph.clear()
-        if content.strip() and not raw_html and number not in definition_lines:
-            paragraph.append((number, content))
-            if single:
-                yield from masked_lines()
-                paragraph.clear()
-    yield from masked_lines()
 
 
 def undefined_references(line, masked, labels):
@@ -660,38 +707,66 @@ def inline_text(raw, labels=frozenset()):
     return out
 
 
+def emphasis_underscores(pairs):
+    """Find only underscores consumed by paired GFM emphasis delimiters."""
+    def punctuation(char):
+        return char in ASCII_PUNCTUATION or unicodedata.category(char).startswith("P")
+
+    openers = []
+    consumed = set()
+    index = 0
+    while index < len(pairs):
+        if pairs[index] != ("_", False):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(pairs) and pairs[end] == ("_", False):
+            end += 1
+        before = pairs[index - 1][0] if index else " "
+        after = pairs[end][0] if end < len(pairs) else " "
+        left = not after.isspace() and (not punctuation(after) or before.isspace() or punctuation(before))
+        right = not before.isspace() and (not punctuation(before) or after.isspace() or punctuation(after))
+        can_open = left and (not right or punctuation(before))
+        can_close = right and (not left or punctuation(after))
+        remaining = index
+        if can_close:
+            for pos in range(len(openers) - 1, -1, -1):
+                first, last, length, closes = openers[pos]
+                if ((can_open or closes) and (length + end - index) % 3 == 0
+                        and length % 3 != 0):
+                    continue
+                count = min(last - first, end - remaining)
+                consumed.update(range(last - count, last))
+                consumed.update(range(remaining, remaining + count))
+                remaining += count
+                del openers[pos:]
+                if first < last - count:
+                    openers.append((first, last - count, length, closes))
+                if remaining == end:
+                    break
+        if can_open and remaining < end:
+            openers.append((remaining, end, end - index, can_close))
+        index = end
+    return consumed
+
+
 def heading_text(raw, labels=frozenset()):
     """The text GitHub renders for a heading's inline content."""
     pairs = inline_text(raw, labels)
-    kept = []
-    index = 0
-    while index < len(pairs):
-        char, literal = pairs[index]
-        if char == "_" and not literal:
-            # A run of `_` delimits emphasis unless it sits inside a word
-            # (snake_case); escaped and code underscores are literal.
-            end = index
-            while end < len(pairs) and pairs[end] == ("_", False):
-                end += 1
-            before = pairs[index - 1][0] if index else " "
-            after = pairs[end][0] if end < len(pairs) else " "
-            if before.isalnum() and after.isalnum():
-                kept.extend(pairs[index:end])
-            index = end
-            continue
-        kept.append((char, literal))
-        index += 1
+    delimiters = emphasis_underscores(pairs)
     # Entity references are decoded outside code spans and escapes only.
     rendered = []
     plain = []
-    for char, literal in kept:
+    for index, (char, literal) in enumerate(pairs):
+        if index in delimiters:
+            continue
         if literal:
-            rendered.append(html.unescape("".join(plain)))
+            rendered.append(markdown_entities("".join(plain)))
             plain = []
             rendered.append(char)
         else:
             plain.append(char)
-    rendered.append(html.unescape("".join(plain)))
+    rendered.append(markdown_entities("".join(plain)))
     return "".join(rendered).strip()
 
 
@@ -771,8 +846,10 @@ def document_anchors(text):
 
     for lines in raw_blocks:
         collect_html("\n".join(line for _, line in lines))
-    for _, _, masked, _ in inline_lines(text, definition_lines):
-        collect_html(masked)
+    for paragraph in inline_paragraphs(text, definition_lines):
+        _, _, tags = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        for tag in tags:
+            collect_html(tag)
     return anchors
 
 
@@ -789,7 +866,7 @@ def omitted_archive_reference(root, document, content, target, packages):
     try:
         requested = pathlib.Path(os.path.abspath(target)).relative_to(archive_root).as_posix()
         resolved = target.resolve().relative_to(archive_root.resolve()).as_posix()
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return False
     # Inventories list files, not directories. A missing directory containing
     # published files is lost packaged content, not an omitted source path.
@@ -802,22 +879,52 @@ def omitted_archive_reference(root, document, content, target, packages):
 
 
 def broken_links(root):
+    root = root.resolve()
     inventory = root / "vendor/upstream.json"
     packages = (
         json.loads(inventory.read_text(encoding="utf-8"))["packages"]
         if inventory.exists() else {}
     )
     anchor_cache = {}
+    candidates = candidate_files(root)
+    published = {root}
+    symlinks = {}
+    for candidate in candidates:
+        published.add(candidate)
+        published.update(parent for parent in candidate.parents if parent.is_relative_to(root))
+        if candidate.is_symlink():
+            symlinks[candidate] = candidate.readlink()
+
+    def published_target(path):
+        if not path.is_relative_to(root) or pathlib.Path(os.path.abspath(path)) not in published:
+            return None
+        if not path.exists():
+            return None  # also catches dangling links and cycles
+        # A local alias may resolve to a tracked file through an ignored
+        # intermediate link. Follow the path using only checkout candidates.
+        pending = list(reversed(path.relative_to(root).parts))
+        current = root
+        while pending:
+            part = pending.pop()
+            current = current.parent if part == ".." else current / part
+            if current not in published:
+                return None
+            if current in symlinks:
+                target = symlinks[current]
+                if target.is_absolute():
+                    return None  # an absolute link cannot move with the checkout
+                pending.extend(reversed(target.parts))
+                current = current.parent
+        return current
 
     def anchors_of(document):
-        key = document.resolve()
-        if key not in anchor_cache:
-            anchor_cache[key] = document_anchors(key.read_bytes().decode("utf-8"))
-        return anchor_cache[key]
+        if document not in anchor_cache:
+            anchor_cache[document] = document_anchors(document.read_bytes().decode("utf-8"))
+        return anchor_cache[document]
 
     def target_problem(path, content, target):
         """Why `target`, linked from `path`, is broken, or None."""
-        if not target or target.lower().startswith(SKIP_PREFIXES):
+        if not target or target.startswith("//") or URI_SCHEME.match(target):
             return None
         file_part, _, fragment = target.partition("#")
         file_part = file_part.partition("?")[0]
@@ -826,24 +933,25 @@ def broken_links(root):
             target_path = root / decoded.lstrip("/")
         else:
             target_path = path.parent / decoded if decoded else path
-        if not target_path.exists():
+        resolved = published_target(target_path)
+        if resolved is None:
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
             return target
         fragment = urllib.parse.unquote(fragment)
         if (
             fragment
-            and target_path.is_file()
+            and resolved.is_file()
             and target_path.suffix.lower() == ".md"
-            and fragment not in anchors_of(target_path)
+            and fragment not in anchors_of(resolved)
         ):
             return f"{target} (missing anchor)"
         return None
 
     broken = []
-    for path in candidate_markdown(root):
+    for path in sorted(path for path in candidates if path.name.lower().endswith(".md")):
         relative = path.relative_to(root).as_posix()
-        if path.is_symlink() and not path.is_file():
+        if path.is_symlink() and (not path.is_file() or published_target(path) is None):
             broken.append(f"{relative}: invalid Markdown symlink target")
             continue
         try:
@@ -858,7 +966,7 @@ def broken_links(root):
             for _, _, number, _, destination in definitions
         ]
         definition_lines = {n for first, last, *_ in definitions for n in range(first, last + 1)}
-        for number, line, masked, targets in inline_lines(text, definition_lines):
+        for number, line, masked, targets in inline_lines(text, definition_lines, labels):
             problems.extend(
                 (number, target_problem(path, content, destination))
                 for destination in targets
