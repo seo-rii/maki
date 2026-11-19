@@ -112,6 +112,12 @@ impl AttachConfig {
     ) -> Result<AttachRequest, ConfigError> {
         check_volume_name(volume)?;
         let request = self.into_existing_request(volume, overrides, require_uuid)?;
+        // The canonical absolute path check also accepts the filesystem root.
+        if request.nbd_socket == "/" {
+            return Err(ConfigError::Invalid(
+                "nbd_socket must end with a socket filename".into(),
+            ));
+        }
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
         // the VG and LV with a hyphen and doubles every hyphen in either name.
         let vg = &request.vg_name;
