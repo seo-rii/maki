@@ -163,7 +163,7 @@ fn orphan_discard_io_error_remains_inconclusive() {
 }
 
 #[test]
-fn opening_partial_shards_reads_only_logical_headers() {
+fn opening_partial_shards_reads_only_logical_headers_and_each_discard_copy_once() {
     use maki_core::store::SlotStore;
 
     let open_bytes = |logical_units, discard, missing_alloc| {
@@ -192,5 +192,9 @@ fn opening_partial_shards_reads_only_logical_headers() {
     assert_eq!(
         open_bytes(8, false, true) - open_bytes(1, false, true),
         7 * 64
+    );
+    assert_eq!(
+        open_bytes(1, true, false) - open_bytes(1, false, false),
+        2 * AllocationMap::encoded_len(8)
     );
 }

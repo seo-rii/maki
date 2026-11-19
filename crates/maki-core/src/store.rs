@@ -546,8 +546,6 @@ impl SlotStore {
                     layout::shard_discard_b(shard_idx),
                     &geometry,
                 );
-                let (discard_a, discard_b) =
-                    discard_ab.side_generations::<AllocationMap>(backing.as_ref())?;
                 let discard = discard_ab
                     .load::<AllocationMap>(backing.as_ref())?
                     .ok_or_else(|| {
@@ -563,7 +561,6 @@ impl SlotStore {
                 // Both sides may decode yet diverge after an interrupted
                 // two-copy publication. Always rewrite the selected logical
                 // state into both copies before journal reclamation/punching.
-                let _ = (discard_a, discard_b);
                 shard.dirty_discard = true;
             }
             // With one copy invalid or absent the loaded copy may be the
