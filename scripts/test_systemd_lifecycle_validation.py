@@ -316,6 +316,49 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             results = fixture.json.loads((output / "results.json").read_text())
             self.assertEqual([row["case"] for row in results], ["first"])
 
+    def test_cli_retries_partial_cleanup_before_discarding_fixture(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output = root / "evidence"
+                helper = root / "helper"
+                helper.touch(mode=0o700)
+                case = fixture.Fixture(root, helper, "normal-stop")
+                for name in (case.units["attach"], case.units["recovery"]):
+                    source = case.directory / name
+                    source.write_text(case.files[name])
+                    link = root / name
+                    link.symlink_to(source)
+                    case.linked.append((link, source))
+                last = case.linked[-1][0]
+                attempts = []
+                unlink = Path.unlink
+
+                def fail_unlink(path, *args, **kwargs):
+                    if path == last:
+                        attempts.append(path)
+                        if persistent or len(attempts) == 1:
+                            raise PermissionError("unit link busy")
+                    return unlink(path, *args, **kwargs)
+
+                with (patch.object(fixture.sys, "argv", ["validation", "--disposable-host",
+                                  "--helper-binary", str(helper), "--output", str(output)]),
+                      patch.object(fixture.sys, "platform", "linux"),
+                      patch.object(fixture.os, "geteuid", return_value=0, create=True),
+                      patch.object(fixture, "CASES", ("normal-stop",)),
+                      patch.object(fixture, "Fixture", return_value=case),
+                      patch.object(case, "install"), patch.object(case, "verify"),
+                      patch.object(case, "ctl", return_value=subprocess.CompletedProcess(
+                          [], 0, "ActiveState=inactive", "")) as ctl,
+                      patch.object(Path, "unlink", fail_unlink)):
+                    self.assertEqual(fixture.main(), 1)
+                result, = fixture.json.loads((output / "results.json").read_text())
+                self.assertEqual(result["cleanup_error"], "unit link busy")
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(last.is_symlink(), persistent)
+                self.assertEqual(result.get("cleanup_retry_error"), "unit link busy" if persistent else None)
+                self.assertEqual(sum(call.args[0] == "stop" for call in ctl.call_args_list), 1)
+
     def test_cleanup_disables_hooks_and_removes_only_its_recorded_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
