@@ -294,3 +294,30 @@ async fn recovered_quarantined_endpoint_must_match_the_canary() {
     .await
     .expect("recovered wrong-key endpoint must be rejected");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_error_retries_a_transient_failure_while_time_remains() {
+    let fail_once = Arc::new(AtomicBool::new(false));
+    let armed = fail_once.clone();
+    let healthy = handler(7, Arc::new(AtomicBool::new(false)));
+    let server = TestServer::start(Arc::new(move |request| {
+        if armed.swap(false, Ordering::SeqCst) {
+            ResponseSpec::status(503)
+        } else {
+            healthy(request)
+        }
+    }))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let raw = config(dir.path().join("vol").to_str().unwrap(), &[server.url()])
+        .replace(r#"initial_delay = "1ms""#, r#"initial_delay = "1100ms""#)
+        .replace(r#"max_delay = "20ms""#, r#"max_delay = "1100ms""#);
+    let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
+    maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+    let (engine, _, endpoints) = maki_nbdkit::daemon::attach_from_config_with_stats(&config)
+        .await
+        .unwrap();
+    fail_once.store(true, Ordering::SeqCst);
+    engine.write(0, &[0x77; 512], true).await.unwrap();
+    assert_eq!(endpoints.unwrap().metrics().retries_total(), 1);
+}
