@@ -388,11 +388,20 @@ pub async fn run(
     let monitored_engine = engine.clone();
     let monitored = observations.clone();
     let monitor = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        let start = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval_at(start, Duration::from_millis(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_sample_ms = None;
         tokio::pin!(stopped);
         loop {
             tokio::select! {
-                _ = interval.tick() => observe(&monitored_engine,&monitored),
+                _ = interval.tick() => {
+                    // Tokio can still deliver catch-up ticks for short delays.
+                    let sample_ms = start.elapsed().as_millis();
+                    if last_sample_ms.replace(sample_ms) != Some(sample_ms) {
+                        observe(&monitored_engine, &monitored);
+                    }
+                }
                 _ = &mut stopped => break,
             }
         }
