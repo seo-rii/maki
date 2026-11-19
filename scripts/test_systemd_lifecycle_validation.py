@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SCRIPT = Path(__file__).with_name("systemd-lifecycle-validation.py")
@@ -250,6 +250,72 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             destination, source = case.linked[0]
             self.assertEqual(destination.resolve(), source.resolve())
 
+    def test_cleanup_retries_after_a_partial_unlink_and_failed_final_reload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = fixture.Fixture(root, Path("/tmp/helper"), "normal-stop")
+            for name in (case.units["attach"], case.units["recovery"]):
+                source = case.directory / name
+                source.write_text(case.files[name])
+                link = root / name
+                link.symlink_to(source)
+                case.linked.append((link, source))
+            remaining = case.linked[1]
+            unlink = Path.unlink
+
+            def fail_second(link):
+                if link == remaining[0]:
+                    raise PermissionError("interrupted unlink")
+                unlink(link)
+
+            ctl = Mock(return_value=subprocess.CompletedProcess([], 0, "ActiveState=inactive", ""))
+            with patch.object(case, "ctl", ctl), patch.object(Path, "unlink", fail_second):
+                with self.assertRaisesRegex(PermissionError, "interrupted"):
+                    case.cleanup()
+            self.assertEqual(case.linked, [remaining])
+
+            def fail_reload(*args, **kwargs):
+                if not case.linked:
+                    raise RuntimeError("reload failed")
+                return ctl.return_value
+
+            with patch.object(case, "ctl", fail_reload):
+                with self.assertRaisesRegex(RuntimeError, "reload failed"):
+                    case.cleanup()
+            self.assertFalse(remaining[0].is_symlink())
+            ctl.reset_mock()
+            with patch.object(case, "ctl", ctl):
+                case.cleanup()
+                case.cleanup()
+            ctl.assert_called_once_with("daemon-reload")
+
+    def test_failed_report_replacement_preserves_completed_case(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "evidence"
+            helper = root / "helper"
+            helper.touch(mode=0o700)
+            replacement = fixture.os.replace
+            case = Mock(volume="fixture")
+            case.events.return_value = []
+
+            def publish(source, destination):
+                if destination.exists():
+                    raise OSError("publication failed")
+                replacement(source, destination)
+
+            with patch.object(fixture.sys, "argv", ["validation", "--disposable-host", "--helper-binary", str(helper),
+                                                    "--output", str(output)]), \
+                    patch.object(fixture.os, "geteuid", return_value=0, create=True), \
+                    patch.object(fixture.sys, "platform", "linux"), \
+                    patch.object(fixture, "CASES", ("first", "second")), \
+                    patch.object(fixture, "Fixture", return_value=case), \
+                    patch.object(fixture.os, "replace", publish):
+                with self.assertRaisesRegex(OSError, "publication failed"):
+                    fixture.main()
+            results = fixture.json.loads((output / "results.json").read_text())
+            self.assertEqual([row["case"] for row in results], ["first"])
+
     def test_cleanup_disables_hooks_and_removes_only_its_recorded_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -270,12 +336,14 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                 commands.append(arguments)
                 return subprocess.CompletedProcess(arguments, 0, "ActiveState=inactive\n", "")
 
+            owned = case.linked.copy()
             with patch.object(case, "ctl", control):
                 case.cleanup()
             self.assertEqual(unrelated.read_text(), "preserve")
-            expected = tuple(destination.name for destination, _ in case.linked)
+            expected = tuple(destination.name for destination, _ in owned)
             self.assertIn(("stop", *expected), commands)
-            for destination, source in case.linked:
+            self.assertFalse(case.linked)
+            for destination, source in owned:
                 self.assertFalse(destination.exists())
                 text = source.read_text()
                 self.assertNotIn("OnFailure=", text)
