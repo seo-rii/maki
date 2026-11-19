@@ -65,6 +65,11 @@ def record(event):
 
 def command(arguments, **kwargs):
     arguments = list(arguments)
+    if arguments[0] == "vgs":
+        assert (root / "locked").exists(), "VG observation outside attach lock"
+        assert arguments == ["vgs", "--noheadings", "-o", "lv_count", "maki_validation_1000_42"]
+        return subprocess.CompletedProcess(arguments, int(os.environ.get("VGS_RESULT", "0")),
+                                           stdout=os.environ.get("LV_COUNT", "1"))
     if arguments[0] in ("vgchange", "lvremove", "vgremove", "pvremove"):
         assert (root / "locked").exists(), "LVM mutation outside attach lock"
         record(["lvm", *arguments])
@@ -263,6 +268,21 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
                 lvm = [call[1] for call in calls if call[0] == "lvm"]
                 self.assertEqual(lvm[-1], removal)
                 self.assertFalse(any(call[0] in ("disconnect", "stop") for call in calls), calls)
+
+    def test_cleanup_after_failed_lvcreate_can_release_a_proven_empty_vg(self):
+        for output, status, empty in (("  0", 0, True), ("0", 5, False), ("", 0, False)):
+            with self.subTest(output=output, status=status):
+                self.calls.write_text("")
+                self.sysfs.joinpath("pid").unlink(missing_ok=True)
+                self.sysfs.joinpath("backend").unlink(missing_ok=True)
+                result, calls = self.run_case(attempt=False, full_cleanup=True,
+                    before=(f"export FAIL_REMOVAL=lvremove VGS_RESULT={status} LV_COUNT='{output}'\n"
+                            "lv_created=true\nvg_created=true\npv_created=true"))
+                self.assertEqual(result.returncode == 0, empty, result.stderr)
+                removals = [call[1] for call in calls if call[0] == "lvm"]
+                self.assertEqual(removals, ["vgchange", "lvremove"] +
+                                 (["vgremove", "pvremove"] if empty else []))
+                self.assertEqual(any(call[0] == "disconnect" for call in calls), empty)
 
     def test_cleanup_refuses_foreign_backend_before_lvm_or_disconnect(self):
         self.device_state("foreign")
