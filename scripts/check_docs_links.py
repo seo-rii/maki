@@ -43,6 +43,7 @@ import urllib.parse
 from typing import NamedTuple
 
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+ENTITY = re.compile(r"&(?:#[xX][0-9A-Fa-f]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]+);")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
@@ -264,6 +265,15 @@ def valid_label(label):
     return bool(label.strip(" \t\r\n"))
 
 
+def markdown_entities(text):
+    def decode(match):
+        entity = match.group()
+        if entity[1] == "#":
+            return html.unescape(entity)
+        return html.entities.html5.get(entity[1:], entity)
+    return ENTITY.sub(decode, text)
+
+
 def unescape(raw):
     """Resolve backslash escapes of ASCII punctuation and entity references."""
     parts = []
@@ -271,14 +281,14 @@ def unescape(raw):
     index = 0
     while index < len(raw):
         if raw[index] == "\\" and raw[index + 1:index + 2] in ASCII_PUNCTUATION:
-            parts.append(html.unescape("".join(plain)))
+            parts.append(markdown_entities("".join(plain)))
             plain = []
             parts.append(raw[index + 1])
             index += 2
             continue
         plain.append(raw[index])
         index += 1
-    parts.append(html.unescape("".join(plain)))
+    parts.append(markdown_entities("".join(plain)))
     return "".join(parts)
 
 
@@ -697,38 +707,66 @@ def inline_text(raw, labels=frozenset()):
     return out
 
 
+def emphasis_underscores(pairs):
+    """Find only underscores consumed by paired GFM emphasis delimiters."""
+    def punctuation(char):
+        return char in ASCII_PUNCTUATION or unicodedata.category(char).startswith("P")
+
+    openers = []
+    consumed = set()
+    index = 0
+    while index < len(pairs):
+        if pairs[index] != ("_", False):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(pairs) and pairs[end] == ("_", False):
+            end += 1
+        before = pairs[index - 1][0] if index else " "
+        after = pairs[end][0] if end < len(pairs) else " "
+        left = not after.isspace() and (not punctuation(after) or before.isspace() or punctuation(before))
+        right = not before.isspace() and (not punctuation(before) or after.isspace() or punctuation(after))
+        can_open = left and (not right or punctuation(before))
+        can_close = right and (not left or punctuation(after))
+        remaining = index
+        if can_close:
+            for pos in range(len(openers) - 1, -1, -1):
+                first, last, length, closes = openers[pos]
+                if ((can_open or closes) and (length + end - index) % 3 == 0
+                        and length % 3 != 0):
+                    continue
+                count = min(last - first, end - remaining)
+                consumed.update(range(last - count, last))
+                consumed.update(range(remaining, remaining + count))
+                remaining += count
+                del openers[pos:]
+                if first < last - count:
+                    openers.append((first, last - count, length, closes))
+                if remaining == end:
+                    break
+        if can_open and remaining < end:
+            openers.append((remaining, end, end - index, can_close))
+        index = end
+    return consumed
+
+
 def heading_text(raw, labels=frozenset()):
     """The text GitHub renders for a heading's inline content."""
     pairs = inline_text(raw, labels)
-    kept = []
-    index = 0
-    while index < len(pairs):
-        char, literal = pairs[index]
-        if char == "_" and not literal:
-            # A run of `_` delimits emphasis unless it sits inside a word
-            # (snake_case); escaped and code underscores are literal.
-            end = index
-            while end < len(pairs) and pairs[end] == ("_", False):
-                end += 1
-            before = pairs[index - 1][0] if index else " "
-            after = pairs[end][0] if end < len(pairs) else " "
-            if before.isalnum() and after.isalnum():
-                kept.extend(pairs[index:end])
-            index = end
-            continue
-        kept.append((char, literal))
-        index += 1
+    delimiters = emphasis_underscores(pairs)
     # Entity references are decoded outside code spans and escapes only.
     rendered = []
     plain = []
-    for char, literal in kept:
+    for index, (char, literal) in enumerate(pairs):
+        if index in delimiters:
+            continue
         if literal:
-            rendered.append(html.unescape("".join(plain)))
+            rendered.append(markdown_entities("".join(plain)))
             plain = []
             rendered.append(char)
         else:
             plain.append(char)
-    rendered.append(html.unescape("".join(plain)))
+    rendered.append(markdown_entities("".join(plain)))
     return "".join(rendered).strip()
 
 

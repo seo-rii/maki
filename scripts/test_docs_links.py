@@ -113,10 +113,23 @@ class DocumentationLinks(unittest.TestCase):
                    '[anchor](#here) [real](missing).\n')
         self.assertEqual(broken_links(self.root), ["README.md:1: missing"])
 
+    def test_unmatched_underscores_are_literal_in_heading_slugs(self):
+        self.write("README.md", "# _draft\n# build_\n# _both_\n# __before_\n\n"
+                   "[a](#_draft) [b](#build_) [c](#both) [d](#_before)\n")
+        self.assertEqual(broken_links(self.root), [])
+
     def test_absolute_uri_schemes_are_external(self):
         self.write("README.md", "[mirror](FTP://example.org/pub/) [phone](tel:+1234)\n\n"
                    "[ref]: urn:example:manual\n\n[local](file.txt)\n")
         self.assertEqual(broken_links(self.root), ["README.md:5: file.txt"])
+
+    def test_only_complete_markdown_entities_change_a_link_destination(self):
+        self.write("copy&copy.txt", "")
+        self.write("copy©.txt", "")
+        self.write("README.md", "[literal](copy&copy.txt) [entity](copy&copy;.txt)\n\n"
+                   "[ref]: copy&copy.txt\n")
+        (self.root / "copy©.txt").unlink()
+        self.assertEqual(broken_links(self.root), ["README.md:1: copy©.txt"])
 
     def test_headings_inside_nested_list_and_quote_containers(self):
         self.write("README.md", "- ## Install\n- > Release\n  > =======\n- Help\n- -----\n\n"
