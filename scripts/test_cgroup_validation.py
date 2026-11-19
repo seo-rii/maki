@@ -43,6 +43,11 @@ class OracleTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.ledger = pathlib.Path(self.directory.name) / "ack.jsonl"
 
+    def unstarted_target(self):
+        directory = pathlib.Path(tempfile.mkdtemp(dir=self.directory.name))
+        with mock.patch.object(campaign.Target, "one_shot"):
+            return campaign.Target("fixture-image", directory)
+
     def test_failed_flush_never_records_durable_writes(self):
         with self.assertRaises(RuntimeError):
             campaign.durable_write(Client("flush"), self.ledger, [(0, b"a" * 4096)], "flush")
@@ -97,7 +102,7 @@ class OracleTests(unittest.TestCase):
                 campaign.verify(client, self.ledger, 2)
 
     def test_freeze_observation_requires_a_connected_client(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.ledger, target.identifier = self.ledger, "owned"
         self.ledger.write_bytes(b"unchanged")
         # A child that merely starts/exits without connecting must not qualify.
@@ -131,7 +136,7 @@ class OracleTests(unittest.TestCase):
             library.nbd_connect_unix.assert_not_called()
 
     def test_mount_argument_keeps_quoted_source_in_one_csv_field(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.token = "fixture"
         target.case = self.ledger.parent / 'qual,"quoted"'
         options = target.options("32m", "1")
@@ -141,7 +146,7 @@ class OracleTests(unittest.TestCase):
     def test_start_receives_notifications_in_a_long_artifact_directory(self):
         directory = self.ledger.parent / ("long-name" * 13)
         directory.mkdir()
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.case, target.identifier = directory, None
         target.create = mock.Mock()
 
@@ -159,7 +164,7 @@ class OracleTests(unittest.TestCase):
                 target.notify.close()
 
     def test_ready_state_check_uses_remaining_startup_budget(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.identifier, target.case = None, self.ledger.parent
         target.create = mock.Mock()
         target.state = mock.Mock(side_effect=campaign.subprocess.TimeoutExpired("inspect", 29.9))
@@ -178,7 +183,7 @@ class OracleTests(unittest.TestCase):
         self.assertAlmostEqual(target.state.call_args.kwargs["timeout"], 29.9)
 
     def test_oom_observation_uses_remaining_budget_and_retains_first_exit(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         stopped = {"Running": False, "OOMKilled": True, "ExitCode": 137}
         now = 0.0
 
@@ -200,7 +205,7 @@ class OracleTests(unittest.TestCase):
         self.assertAlmostEqual(target.state.call_args_list[1].kwargs["timeout"], 7.9)
 
     def test_oom_first_observed_after_the_deadline_fails(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         now = 0
 
         def delayed_state(timeout=45):
@@ -215,7 +220,7 @@ class OracleTests(unittest.TestCase):
         target.state.assert_called_once_with(timeout=10)
 
     def test_cleanup_tolerates_a_concurrent_exit_and_preserves_a_live_container(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.directory, target.serial, target.notify = self.ledger.parent, 1, None
         for still_running in (True, False):
             with self.subTest(still_running=still_running):
@@ -237,7 +242,7 @@ class OracleTests(unittest.TestCase):
                         run.assert_called_with(["docker", "rm", "owned"])
 
     def test_remove_container_even_when_log_collection_fails(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.notify, target.identifier = None, "owned-container"
         target.state = mock.Mock(return_value={"Running": False})
         with mock.patch.object(campaign, "run", side_effect=[OSError("logs unavailable"), None]) as run:
@@ -259,20 +264,94 @@ class OracleTests(unittest.TestCase):
             campaign.require_oom({"Running": False, "ExitCode": 137, "OOMKilled": False})
         campaign.require_oom({"Running": False, "ExitCode": 137, "OOMKilled": True})
 
-    def test_failed_create_without_a_container_preserves_the_create_error(self):
-        target = campaign.Target.__new__(campaign.Target)
-        target.identifier = target.notify = None
-        target.serial, target.image, target.token = 0, "missing", "fixture"
-        target.options = mock.Mock(return_value=[])
-        with mock.patch.object(campaign, "run", side_effect=[RuntimeError("image missing"),
-                                                            mock.Mock(stdout="")]) as run:
-            with self.assertRaisesRegex(RuntimeError, "image missing"):
-                target.one_shot(["true"])
+    def test_failed_constrained_create_preserves_the_original_error(self):
+        for creation in (RuntimeError("image missing"), campaign.subprocess.TimeoutExpired("docker create", 45)):
+            with self.subTest(creation=creation):
+                target = self.unstarted_target()
+                with mock.patch.object(campaign, "run", side_effect=[creation, mock.Mock(stdout="")]) as run:
+                    with self.assertRaises(type(creation)) as raised:
+                        campaign.constrained_recovery(target)
+                self.assertIs(raised.exception, creation)
+                self.assertEqual([call.args[0][1] for call in run.call_args_list], ["create", "ps"])
+                self.assertIsNone(target.identifier)
+                self.assertIsNone(target.pending_identifier)
+                self.assertIsNone(target.notify)
+
+    def test_timed_out_create_cleans_up_only_the_named_owned_container(self):
+        for created in (False, True):
+            with self.subTest(created=created):
+                target = self.unstarted_target()
+                name = f"maki-fault-{target.token}-1"
+                timeout = campaign.subprocess.TimeoutExpired("docker create", 45)
+                def docker(command, **_options):
+                    action = command[1]
+                    if action == "create":
+                        raise timeout
+                    if action == "ps":
+                        self.assertIn("label=maki.failure-validation=" + target.token, command)
+                        return mock.Mock(stdout="other\n" + (name + "\n" if created else ""))
+                    self.assertEqual(command[-1], name)
+                    if action == "inspect":
+                        return mock.Mock(stdout='{"Running":false}')
+                    return mock.Mock(stdout="", stderr="")
+                with mock.patch.object(campaign, "run", side_effect=docker) as run:
+                    with self.assertRaises(campaign.subprocess.TimeoutExpired) as raised:
+                        target.one_shot(["true"])
+                self.assertIs(raised.exception, timeout)
+                self.assertEqual([call.args[0][1] for call in run.call_args_list],
+                                 ["create", "ps"] + (["inspect", "logs", "rm"] if created else []))
+                self.assertIsNone(target.identifier)
+                self.assertIsNone(target.pending_identifier)
+
+    def test_failed_create_and_ownership_lookup_are_both_reported_and_cleanup_can_retry(self):
+        target = self.unstarted_target()
+        error = RuntimeError("image missing")
+        with mock.patch.object(campaign, "run", side_effect=[error, RuntimeError("Docker unavailable")]):
+            with self.assertRaisesRegex(RuntimeError, "image missing.*Docker unavailable") as raised:
+                campaign.constrained_recovery(target)
+        self.assertIs(raised.exception.__cause__, error)
+        name = f"maki-fault-{target.token}-1"
+        self.assertEqual(target.pending_identifier, name)
         self.assertIsNone(target.identifier)
-        self.assertEqual([call.args[0][1] for call in run.call_args_list], ["create", "ps"])
+        with mock.patch.object(campaign, "run", side_effect=[mock.Mock(stdout=name),
+                               mock.Mock(stdout='{"Running":false}'), mock.Mock(stdout="", stderr=""), None]) as run:
+            target.remove()
+        run.assert_called_with(["docker", "rm", name])
+        self.assertIsNone(target.identifier)
+        self.assertIsNone(target.pending_identifier)
+
+    def test_campaign_persists_primary_and_cleanup_failures(self):
+        output = self.ledger.parent / "results"
+        name = None
+
+        def docker(command, **_options):
+            nonlocal name
+            action = command[1]
+            if action == "info":
+                return mock.Mock(stdout=campaign.json.dumps(dict(CgroupVersion="2", MemoryLimit=True,
+                                 SwapLimit=True, CpuCfsQuota=True, PidsLimit=True, ServerVersion="fixture")))
+            if action == "image":
+                return mock.Mock(stdout="image")
+            if action == "create":
+                name = command[command.index("--name") + 1]
+                raise campaign.subprocess.TimeoutExpired("docker create", 45)
+            if action == "ps":
+                return mock.Mock(stdout=name)
+            self.assertEqual(action, "inspect")
+            raise RuntimeError("inspect unavailable")
+
+        with mock.patch.object(campaign, "run", side_effect=docker):
+            with self.assertRaisesRegex(RuntimeError, "inspect unavailable"):
+                campaign.campaign(argparse.Namespace(output=output, image="fixture"))
+        report = campaign.json.loads((output / "results.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertIn("TimeoutExpired", report["error"])
+        self.assertIn("docker create", report["error"])
+        self.assertIn(name, report["error"])
+        self.assertIn("inspect unavailable", report["error"])
 
     def test_container_cli_timeout_still_cleans_exact_created_container(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.identifier, target.serial, target.image = None, 0, "test-image"
         target.token = "unique-test"
         target.options = mock.Mock(return_value=[])
@@ -405,7 +484,7 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target.remove.assert_called_once_with()
 
     def test_startup_metrics_use_the_current_container_before_ready(self):
-        target = campaign.Target.__new__(campaign.Target)
+        target = self.unstarted_target()
         target.cgroup = pathlib.Path("/stale-previous-container")
         target.state = mock.Mock(return_value={"Pid": 1234})
 

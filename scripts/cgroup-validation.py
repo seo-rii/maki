@@ -206,6 +206,22 @@ def run(command, *, timeout=45, check=True):
     return result
 
 
+@contextmanager
+def remove_after(target):
+    try:
+        yield
+    except BaseException as error:
+        name = target.pending_identifier or target.identifier
+        try:
+            target.remove()
+        except Exception as cleanup_error:
+            raise RuntimeError(f"{type(error).__name__}: {error}; "
+                               f"cleanup for {name} failed: {cleanup_error}") from error
+        raise
+    else:
+        target.remove()
+
+
 class Target:
     def __init__(self, image, directory):
         self.image = image
@@ -214,6 +230,7 @@ class Target:
         self.case.mkdir(mode=0o700)
         self.ledger = directory / "host-acks.jsonl"
         self.identifier = None
+        self.pending_identifier = None
         self.serial = 0
         self.token = uuid.uuid4().hex
         self.notify = None
@@ -245,12 +262,10 @@ socket = "/case/control.sock"
         self.one_shot(["/opt/maki/maki", "volume", "create", "/case/config.toml"])
 
     def one_shot(self, command):
-        try:
+        # Killing the Docker CLI does not terminate its container.
+        with remove_after(self):
             self.create("192m", "1", command)
             return run(["docker", "start", "--attach", self.identifier], timeout=120)
-        finally:
-            # Killing the Docker CLI does not terminate its container.
-            self.remove()
 
     def options(self, memory, cpus):
         # --mount uses CSV, including for a single argv element.
@@ -282,24 +297,19 @@ socket = "/case/control.sock"
         raise TimeoutError("container OOM was not observed within 10 seconds")
 
     def create(self, memory, cpus, command, extra=()):
-        ensure(self.identifier is None, "previous owned container has not been removed")
+        ensure(self.identifier is None and self.pending_identifier is None,
+               "previous owned container has not been removed")
         self.serial += 1
-        # Preserve an identity even if the create CLI times out before returning its ID.
-        self.identifier = f"maki-fault-{self.token}-{self.serial}"
-        try:
-            run(["docker", "create", "--name", self.identifier, *self.options(memory, cpus),
-                 *extra, self.image, *command])
-        except RuntimeError:
-            # A failed create can leave no object. Only try to remove an owned
-            # container when Docker actually lists it, preserving the create error.
-            owned = run(["docker", "ps", "--all", "--filter", "label=maki.failure-validation=" + self.token,
-                         "--format", "{{.Names}}"])
-            if self.identifier not in owned.stdout.splitlines():
-                self.identifier = None
-            raise
+        # Docker may have created the container even if its CLI did not return success.
+        self.pending_identifier = f"maki-fault-{self.token}-{self.serial}"
+        run(["docker", "create", "--name", self.pending_identifier, *self.options(memory, cpus),
+             *extra, self.image, *command])
+        self.identifier = self.pending_identifier
+        self.pending_identifier = None
 
     def start(self, memory="192m", cpus="1"):
-        ensure(self.identifier is None, "previous owned container has not been removed")
+        ensure(self.identifier is None and self.pending_identifier is None,
+               "previous owned container has not been removed")
         for name in ("nbd.sock", "ready.sock"):
             (self.case / name).unlink(missing_ok=True)
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -407,6 +417,13 @@ socket = "/case/control.sock"
         if self.notify is not None:
             self.notify.close()
             self.notify = None
+        if self.pending_identifier is not None:
+            # Only act on the reserved name if Docker also confirms this campaign's label.
+            owned = run(["docker", "ps", "--all", "--filter", "label=maki.failure-validation=" + self.token,
+                         "--format", "{{.Names}}"])
+            if self.pending_identifier in owned.stdout.splitlines():
+                self.identifier = self.pending_identifier
+            self.pending_identifier = None
         if self.identifier is None:
             return
         state = self.state()
@@ -432,10 +449,12 @@ socket = "/case/control.sock"
 
 def constrained_recovery(target, memory="32m", rounds=1):
     """Report availability at the requested cap without relaxing durability."""
-    try:
+    with remove_after(target):
         try:
             target.start(memory=memory)
         except (TimeoutError, RuntimeError) as error:
+            if target.identifier is None:
+                raise
             state = target.state()
             if isinstance(error, TimeoutError) and state["Running"]:
                 try:
@@ -457,8 +476,6 @@ def constrained_recovery(target, memory="32m", rounds=1):
                       "resources": target.stats()}
             target.kill()
             return result
-    finally:
-        target.remove()
 
 
 def campaign(args):
@@ -479,7 +496,7 @@ def campaign(args):
             directory = args.output / scenario
             directory.mkdir(mode=0o700)
             target = Target(image_id, directory)
-            try:
+            with remove_after(target):
                 target.start(memory="96m", cpus="0.25" if scenario == "cpu-memory-kill" else "1")
                 record["workload"] = target.client("write", rounds=args.rounds)
                 record["resources"] = target.stats()
@@ -514,8 +531,6 @@ def campaign(args):
                 # Offline format/CRC check complements authenticated NBD readback.
                 check = target.one_shot(["/opt/maki/maki", "check", "/case/config.toml", "--deep"])
                 record["deep_check"] = {"exit_code": check.returncode, "stdout": check.stdout[-2000:]}
-            finally:
-                target.remove()
             record["passed"] = True
             save_json(args.output / "results.json", report)
             print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
