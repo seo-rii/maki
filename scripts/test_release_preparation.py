@@ -196,6 +196,18 @@ class ReleasePreparationTests(unittest.TestCase):
                 archives.append(manifest["source"]["sha256"])
         self.assertEqual(archives[0], archives[1])
 
+    def test_source_archive_uses_original_git_objects_with_local_replacements(self):
+        (self.repo / "notes.txt").write_text("committed contents\n")
+        (self.repo / "other.txt").write_text("different contents\n")
+        self.git("add", "notes.txt", "other.txt")
+        self.git("commit", "-qm", "test: add release notes")
+        self.git("replace", self.git("rev-parse", "HEAD:notes.txt"), self.git("rev-parse", "HEAD:other.txt"))
+
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        with tarfile.open(output / manifest["source"]["filename"]) as archive:
+            self.assertEqual(archive.extractfile("maki-0.1.0/notes.txt").read(), b"committed contents\n")
+
     def test_print_version_needs_no_build_tools_or_output_directory(self):
         # Only Git is needed: neither dpkg nor the selected compiler is usable.
         (self.tools / "git").symlink_to(shutil.which("git"))

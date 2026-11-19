@@ -31,8 +31,12 @@ def run(command, *, cwd=None, env=None):
     return result.stdout.strip()
 
 
+def git_command(*args):
+    return ["git", "--no-replace-objects", "-C", str(ROOT), *args]
+
+
 def git(*args):
-    return run(["git", "-C", str(ROOT), *args])
+    return run(git_command(*args))
 
 
 def digest(path):
@@ -43,9 +47,9 @@ def digest(path):
 def archive_source(destination, commit, prefix, epoch):
     # Read the committed blobs directly. git archive applies checkout-local
     # attributes such as export-ignore and export-subst to the same tree.
-    listing = subprocess.check_output(["git", "-C", str(ROOT), "ls-tree", "-rz", "-t", commit])
+    listing = subprocess.check_output(git_command("ls-tree", "-rz", "-t", commit))
     with tarfile.open(destination, "w", pax_headers={"comment": commit}) as archive, \
-            subprocess.Popen(["git", "-C", str(ROOT), "cat-file", "--batch"],
+            subprocess.Popen(git_command("cat-file", "--batch"),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as blobs:
         directory = tarfile.TarInfo(prefix)
         directory.type = tarfile.DIRTYPE
