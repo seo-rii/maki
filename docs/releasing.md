@@ -56,7 +56,8 @@ hermetic.
 For workspace version `0.1.0`, the package version is
 `0.1.0~rc+rev<count>.git<12-character-commit>`. The count is
 `git rev-list --count <commit>`: all commits reachable from the selected source,
-including merged ancestry. A descendant has a strictly larger count than its
+including merged ancestry. Local graft files and replacement refs are ignored.
+A descendant has a strictly larger count than its
 ancestor, so Debian orders it as an upgrade for the same workspace version even
 when its hash or commit timestamp sorts earlier. The numeric revision precedes
 the hash, so revision 10 also sorts above revision 9.
