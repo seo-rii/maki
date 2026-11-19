@@ -2,6 +2,8 @@
 """Prepare a local Debian release candidate from committed HEAD; never publish it."""
 
 import argparse
+import ctypes
+import errno
 import gzip
 import hashlib
 import json
@@ -140,6 +142,24 @@ def candidate_source_version():
     return commit, workspace_version, f"{workspace_version}~rc+rev{revision}.git{commit[:12]}"
 
 
+def publish_bundle(bundle, output):
+    # The Debian builder runs on Linux. RENAME_NOREPLACE makes the existence
+    # check part of the rename, including when the destination is an empty dir.
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError:
+        fail("candidate publication requires renameat2 with RENAME_NOREPLACE")
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                          ctypes.c_char_p, ctypes.c_uint)
+    at_fdcwd, rename_noreplace = -100, 1
+    if renameat2(at_fdcwd, os.fsencode(bundle), at_fdcwd, os.fsencode(output), rename_noreplace) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            fail(f"output already exists: {output}")
+        raise OSError(error, os.strerror(error), output)
+
+
 def prepare(output):
     if output.exists() or output.is_symlink():
         fail(f"output already exists: {output}")
@@ -247,10 +267,7 @@ def prepare(output):
         (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         checksums = "".join(f"{digest(path)}  {path.name}\n" for path in sorted(bundle.iterdir()))
         (bundle / "SHA256SUMS").write_text(checksums)
-        # A second check protects an output created while the build ran.
-        if output.exists() or output.is_symlink():
-            fail(f"output already exists: {output}")
-        bundle.rename(output)
+        publish_bundle(bundle, output)
     print(output)
 
 
