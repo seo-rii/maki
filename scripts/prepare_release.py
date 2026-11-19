@@ -31,8 +31,12 @@ def run(command, *, cwd=None, env=None):
     return result.stdout.strip()
 
 
+def git_command(*args):
+    return ["git", "--no-replace-objects", "-C", str(ROOT), *args]
+
+
 def git(*args):
-    return run(["git", "-C", str(ROOT), *args])
+    return run(git_command(*args))
 
 
 def digest(path):
@@ -40,9 +44,48 @@ def digest(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def archive_source(destination, commit, prefix, epoch):
+    # Read the committed blobs directly. git archive applies checkout-local
+    # attributes such as export-ignore and export-subst to the same tree.
+    listing = subprocess.check_output(git_command("ls-tree", "-rz", "-t", commit))
+    with tarfile.open(destination, "w", pax_headers={"comment": commit}) as archive, \
+            subprocess.Popen(git_command("cat-file", "--batch"),
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE) as blobs:
+        directory = tarfile.TarInfo(prefix)
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        directory.mtime = epoch
+        archive.addfile(directory)
+        for entry in listing.rstrip(b"\0").split(b"\0"):
+            metadata, name = entry.split(b"\t", 1)
+            mode, _, oid = metadata.split()
+            member = tarfile.TarInfo(f"{prefix}/{os.fsdecode(name)}")
+            member.mtime = epoch
+            if mode == b"040000":
+                member.type = tarfile.DIRTYPE
+                member.mode = 0o755
+                archive.addfile(member)
+                continue
+            if mode not in (b"100644", b"100755"):
+                fail(f"unsupported source archive entry: {member.name}")
+            blobs.stdin.write(oid + b"\n")
+            blobs.stdin.flush()
+            header = blobs.stdout.readline().split()
+            if len(header) != 3 or header[:2] != [oid, b"blob"]:
+                fail(f"cannot read committed blob for {member.name}")
+            member.size = int(header[2])
+            member.mode = 0o755 if mode == b"100755" else 0o644
+            archive.addfile(member, blobs.stdout)
+            if blobs.stdout.read(1) != b"\n":
+                fail(f"incomplete committed blob for {member.name}")
+        blobs.stdin.close()
+        if blobs.wait():
+            fail("git cat-file failed while preparing the source archive")
+
+
 def candidate_source_version():
     # Capture only a committed source tree. Untracked files are excluded by
-    # git archive, and staged/unstaged tracked changes must not be mistaken
+    # the selected Git tree, and staged/unstaged tracked changes must not be mistaken
     # for source included in this candidate.
     if git("status", "--porcelain", "--untracked-files=no"):
         fail("tracked changes must be committed before preparing a candidate")
@@ -94,11 +137,7 @@ def prepare(output):
         source_name = f"maki-{version}-source.tar.gz"
         source_archive = bundle / source_name
         archive_tar = work / "source.tar"
-        subprocess.run(
-            ["git", "-C", str(ROOT), "archive", "--format=tar", f"--prefix=maki-{workspace_version}/",
-             f"--output={archive_tar}", commit],
-            check=True,
-        )
+        archive_source(archive_tar, commit, f"maki-{workspace_version}", epoch)
         with archive_tar.open("rb") as source, source_archive.open("wb") as target:
             with gzip.GzipFile(fileobj=target, filename="", mode="wb", mtime=epoch) as compressed:
                 shutil.copyfileobj(source, compressed)

@@ -353,6 +353,20 @@ class DebianPackageTests(unittest.TestCase):
                     self.assertIn(name, error)
                     self.assertIn("LP64D", error)
 
+    def test_loong64_requires_lp64d_for_every_artifact(self):
+        machine = 0x102
+        self.write_release_files(machine, e_flags=0x43)
+        self.build("lp64d.deb", architecture="loong64")
+        for name in RELEASE_NAMES:
+            for flags in (0x40, 0x41, 0x42):
+                with self.subTest(artifact=name, flags=flags):
+                    self.write_release_files(machine, e_flags=0x43)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(machine, kind, e_flags=flags))
+                    error = self.build_failure("invalid.deb", architecture="loong64")
+                    self.assertIn(name, error)
+                    self.assertIn("LP64D", error)
+
     def test_arm_packages_accept_matching_float_abi(self):
         # AAELF32: absent float flags imply the base PCS, just like FLOAT_SOFT.
         for architecture, flags in (("armhf", 0x05000400),
