@@ -164,16 +164,21 @@ pub struct JournalRecord {
 }
 
 pub fn encode_record(rec: &JournalRecord) -> Vec<u8> {
+    encode_record_parts(rec.sequence, rec.unit_index, &rec.payload)
+}
+
+/// Encode an append directly from the caller's ciphertext slice.
+pub fn encode_record_parts(sequence: u64, unit_index: u64, payload: &[u8]) -> Vec<u8> {
     let mut header = Writer::new();
     header
         .bytes(RECORD_MAGIC)
-        .u64(rec.sequence)
-        .u64(rec.unit_index)
-        .u32(rec.payload.len() as u32)
-        .u32(crc32fast::hash(&rec.payload));
+        .u64(sequence)
+        .u64(unit_index)
+        .u32(payload.len() as u32)
+        .u32(crc32fast::hash(payload));
     let mut out = header.finish_with_crc();
     debug_assert_eq!(out.len(), RECORD_HEADER_SIZE);
-    out.extend_from_slice(&rec.payload);
+    out.extend_from_slice(payload);
     out
 }
 

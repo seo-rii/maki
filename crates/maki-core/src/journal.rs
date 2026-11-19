@@ -54,8 +54,7 @@ use uuid::Uuid;
 use maki_backing::{Backing, BackingFile};
 use maki_format::durable_proof::{DurableProof, DurableProofStore};
 use maki_format::journal::{
-    checked_append_footprint, encode_record, DurableMark, JournalRecord, SegmentHeader,
-    SEGMENT_HEADER_SIZE,
+    checked_append_footprint, encode_record_parts, DurableMark, SegmentHeader, SEGMENT_HEADER_SIZE,
 };
 use maki_format::layout;
 
@@ -507,12 +506,7 @@ impl JournalWriter {
         if needs_roll {
             self.roll()?;
         }
-        let record = JournalRecord {
-            sequence,
-            unit_index,
-            payload: payload.to_vec(),
-        };
-        let bytes = encode_record(&record);
+        let bytes = encode_record_parts(sequence, unit_index, payload);
         let active = self.active.as_mut().expect("active segment after roll");
         if active.needs_tail_cleanup {
             // A shorter retry cannot overwrite the whole failed prefix.
