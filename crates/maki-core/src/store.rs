@@ -398,7 +398,14 @@ impl SlotStore {
 
         let mut catalog_dirty = false;
         let mut orphans: Vec<u64> = Vec::new();
-        for name in backing.list(layout::DATA_DIR)? {
+        let data_entries = backing.list(layout::DATA_DIR).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => CoreError::Corrupt(format!(
+                "required {} directory is missing",
+                layout::DATA_DIR
+            )),
+            _ => CoreError::Io(e),
+        })?;
+        for name in data_entries {
             if let Some(idx) = layout::parse_shard_data(&name) {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {
                     orphans.push(idx);
@@ -457,14 +464,16 @@ impl SlotStore {
                     "shard {shard_idx}: allocation map size mismatch"
                 )));
             }
-            // Only an absent file is damage. Every cataloged shard stays
-            // open, so a large volume can meet the descriptor limit here:
-            // EMFILE and other open failures keep their errno (BUG-124).
+            // A missing or invalid shard path is a structural error, as in
+            // the fast checker. Resource and device failures retain their errno.
             let data = backing
                 .open(&layout::shard_data(shard_idx), false)
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::NotFound => {
                         CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                    }
+                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::InvalidInput => {
+                        CoreError::Corrupt(format!("shard {shard_idx}: invalid data file: {e}"))
                     }
                     _ => CoreError::Io(e),
                 })?;
