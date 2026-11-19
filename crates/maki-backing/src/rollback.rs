@@ -880,6 +880,9 @@ impl BackingFile for CowFile {
         let mut state = self.state.lock();
         state.check()?;
         let current_len = state.files.get(&self.id).ok_or_else(missing)?.len;
+        if len == current_len {
+            return Ok(());
+        }
         let tail = state.page_ref(self.id, len / PAGE)?;
         if len < current_len && !len.is_multiple_of(PAGE) && tail.is_some() {
             let mut bytes = state.page(tail)?;
