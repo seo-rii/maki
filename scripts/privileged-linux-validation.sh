@@ -968,8 +968,16 @@ fio --name=maki-xfs-verify --filename="$mountpoint/work/fio.dat" --ioengine=psyn
     --output-format=json >"$run_dir/fio-xfs.json"
 pass "unprivileged fio verification through XFS"
 
+verify_sqlite_result() {
+    local -a rows
+    mapfile -t rows < "$1" || return 1
+    [[ ${#rows[@]} == 3 && "${rows[0]}" == wal && "${rows[2]}" == ok &&
+       "${rows[1]}" =~ ^0\|([0-9]+)\|([0-9]+)$ ]] &&
+        [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
+}
+
 log "running a safe SQLite WAL/integrity smoke test"
-sqlite3 "$mountpoint/work/smoke.db" >"$run_dir/sqlite.txt" <<'SQL'
+sqlite3 -batch -bail -noheader -separator '|' "$mountpoint/work/smoke.db" >"$run_dir/sqlite.txt" <<'SQL'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
 BEGIN IMMEDIATE;
@@ -984,7 +992,7 @@ COMMIT;
 PRAGMA wal_checkpoint(FULL);
 PRAGMA integrity_check;
 SQL
-grep -qx 'ok' "$run_dir/sqlite.txt" || die "SQLite integrity_check did not return ok"
+verify_sqlite_result "$run_dir/sqlite.txt" || die "SQLite WAL mode, FULL checkpoint or integrity check failed"
 sync -f "$mountpoint/work"
 pass "SQLite FULL-synchronous WAL checkpoint and integrity_check"
 
