@@ -483,6 +483,11 @@ def scan_inline_paragraph(line, labels):
             index += 2
             continue
         if char == "<":
+            autolink = AUTOLINK.match(line, index)
+            if autolink:
+                out.append(" " * len(autolink.group()))
+                index = autolink.end()
+                continue
             tag = HTML_TAG.match(line, index)
             if tag:
                 html_tags.append(tag.group())

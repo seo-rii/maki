@@ -40,6 +40,11 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:3: guide.md?plain=0#L1 (missing anchor)",
         ])
 
+    def test_uri_autolinks_hide_link_shapes_inside_the_url(self):
+        self.write("README.md", "See <https://example.org/[a](example.pdf)/[b][unused]> "
+                   "and [guide](missing.md).\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
+
     def test_rooted_links_and_external_scheme_case(self):
         self.write("GUIDE.MD", "# Welcome\n")
         self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"
