@@ -49,8 +49,9 @@ ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 # Lines that cannot continue a paragraph into a setext heading: indented
-# code, block quotes, ATX headings, tables, HTML blocks and list items.
-NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:[>#|<]|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
+# code, block quotes, ATX headings, tables and list items. document_lines()
+# already classifies raw HTML blocks, leaving inline tags and autolinks here.
+NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:[>#|]|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
 HTML_ATTR = re.compile(r"""([A-Za-z_:][\w.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?""", re.ASCII)
 HTML_OPEN = rf"<(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?P<attrs>(?:\s+{HTML_ATTR.pattern})*)\s*/?>"
 HTML_CLOSE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")

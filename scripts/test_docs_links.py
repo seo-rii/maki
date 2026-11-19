@@ -45,6 +45,12 @@ class DocumentationLinks(unittest.TestCase):
                    "and [guide](missing.md).\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
 
+    def test_inline_markup_can_start_a_setext_heading(self):
+        self.write("README.md", "<https://example.org>\n===\n\n<kbd>Enter</kbd> key\n---\n\n"
+                   "<div>Hidden</div>\n===\n\n"
+                   "[url](#httpsexampleorg) [key](#enter-key) [absent](#hidden)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:10: #hidden (missing anchor)"])
+
     def test_rooted_links_and_external_scheme_case(self):
         self.write("GUIDE.MD", "# Welcome\n")
         self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"
