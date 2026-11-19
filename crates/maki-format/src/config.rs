@@ -1405,6 +1405,35 @@ impl VolumeConfig {
             .unwrap_or_else(|| self.volume.crypto_unit_size.max(self.nbd.minimum_io))
     }
 
+    /// Check the largest request cost for a fixed-size workload whose offsets
+    /// are multiples of the request size, including direct engine workloads
+    /// with finer alignment than the exported NBD device.
+    pub fn validate_fixed_io_working_set(
+        &self,
+        io_size: u64,
+        working_set: u64,
+    ) -> Result<(), ConfigError> {
+        let block = u64::from(self.volume.device_block_size);
+        if block == 0
+            || self.volume.crypto_unit_size == 0
+            || io_size == 0
+            || io_size > self.nbd.maximum_io.0.min(u64::from(u32::MAX))
+            || io_size > self.volume.max_virtual_size.0
+            || !io_size.is_multiple_of(block)
+        {
+            return Err(invalid(format!("io-size {io_size} must be a positive multiple of {block} no larger than the configured device and maximum request size")));
+        }
+        if working_set == 0
+            || working_set > self.volume.max_virtual_size.0
+            || !working_set.is_multiple_of(io_size)
+        {
+            return Err(invalid(
+                "working-set must be a positive multiple of io-size no larger than the volume",
+            ));
+        }
+        self.validate_request_bounds(io_size, io_size, working_set)
+    }
+
     fn validate_request_bounds(
         &self,
         request_len: u64,
