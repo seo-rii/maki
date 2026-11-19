@@ -6,6 +6,7 @@ An existing local image built with cgroup-validation.Dockerfile is required.
 The host needs Docker, libnbd.so.0, and Python 3. No Python packages are needed.
 """
 import argparse
+from contextlib import contextmanager
 import ctypes
 import hashlib
 import json
@@ -16,6 +17,11 @@ import subprocess
 import sys
 import time
 import uuid
+
+try:
+    from campaign_io import save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import save_json
 
 
 def ensure(condition, message):
@@ -92,6 +98,18 @@ def require_pressure(progress):
            "workload-triggered OOM requires completed pressure I/O")
 
 
+@contextmanager
+def unix_socket_path(path):
+    # Linux resolves this short path through the calling process's open directory.
+    # Both the socket inode and the Docker bind mount stay in the artifact directory.
+    path = pathlib.Path(path)
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        yield f"/proc/self/fd/{directory}/{path.name}"
+    finally:
+        os.close(directory)
+
+
 class Nbd:
     """Small libnbd synchronous client, always run in a deadline-bound child."""
     def __init__(self, path, connected_fd=None):
@@ -115,17 +133,18 @@ class Nbd:
         if not self.handle:
             raise RuntimeError("libnbd handle allocation failed")
         try:
-            if connected_fd is None:
-                self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(path)))
-            else:
-                # Queue the connection on the frozen server's socket before
-                # telling the controller to start its observation interval.
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.connect(os.fsencode(path))
-                    os.write(connected_fd, b"C")
-                    os.close(connected_fd)
-                    self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
-                    client.detach()  # libnbd owns the descriptor on success
+            with unix_socket_path(path) as address:
+                if connected_fd is None:
+                    self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(address)))
+                else:
+                    # Queue the connection on the frozen server's socket before
+                    # telling the controller to start its observation interval.
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(os.fsencode(address))
+                        os.write(connected_fd, b"C")
+                        os.close(connected_fd)
+                        self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
+                        client.detach()  # libnbd owns the descriptor on success
             ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA required")
             ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
         except BaseException:
@@ -187,6 +206,22 @@ def run(command, *, timeout=45, check=True):
     return result
 
 
+@contextmanager
+def remove_after(target):
+    try:
+        yield
+    except BaseException as error:
+        name = target.pending_identifier or target.identifier
+        try:
+            target.remove()
+        except Exception as cleanup_error:
+            raise RuntimeError(f"{type(error).__name__}: {error}; "
+                               f"cleanup for {name} failed: {cleanup_error}") from error
+        raise
+    else:
+        target.remove()
+
+
 class Target:
     def __init__(self, image, directory):
         self.image = image
@@ -195,6 +230,7 @@ class Target:
         self.case.mkdir(mode=0o700)
         self.ledger = directory / "host-acks.jsonl"
         self.identifier = None
+        self.pending_identifier = None
         self.serial = 0
         self.token = uuid.uuid4().hex
         self.notify = None
@@ -226,19 +262,19 @@ socket = "/case/control.sock"
         self.one_shot(["/opt/maki/maki", "volume", "create", "/case/config.toml"])
 
     def one_shot(self, command):
-        try:
+        # Killing the Docker CLI does not terminate its container.
+        with remove_after(self):
             self.create("192m", "1", command)
             return run(["docker", "start", "--attach", self.identifier], timeout=120)
-        finally:
-            # Killing the Docker CLI does not terminate its container.
-            self.remove()
 
     def options(self, memory, cpus):
+        # --mount uses CSV, including for a single argv element.
+        source = str(self.case).replace('"', '""')
         return ["--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--pids-limit", "64", "--memory", memory, "--memory-swap", memory,
                 "--cpus", cpus, "--label", "maki.failure-validation=" + self.token,
-                "--mount", f"type=bind,src={self.case},dst=/case"]
+                "--mount", f'type=bind,"src={source}",dst=/case']
 
     def state(self, timeout=45):
         return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier],
@@ -261,19 +297,24 @@ socket = "/case/control.sock"
         raise TimeoutError("container OOM was not observed within 10 seconds")
 
     def create(self, memory, cpus, command, extra=()):
-        ensure(self.identifier is None, "previous owned container has not been removed")
+        ensure(self.identifier is None and self.pending_identifier is None,
+               "previous owned container has not been removed")
         self.serial += 1
-        # Preserve an identity even if the create CLI times out before returning its ID.
-        self.identifier = f"maki-fault-{self.token}-{self.serial}"
-        run(["docker", "create", "--name", self.identifier, *self.options(memory, cpus),
+        # Docker may have created the container even if its CLI did not return success.
+        self.pending_identifier = f"maki-fault-{self.token}-{self.serial}"
+        run(["docker", "create", "--name", self.pending_identifier, *self.options(memory, cpus),
              *extra, self.image, *command])
+        self.identifier = self.pending_identifier
+        self.pending_identifier = None
 
     def start(self, memory="192m", cpus="1"):
-        ensure(self.identifier is None, "previous owned container has not been removed")
+        ensure(self.identifier is None and self.pending_identifier is None,
+               "previous owned container has not been removed")
         for name in ("nbd.sock", "ready.sock"):
             (self.case / name).unlink(missing_ok=True)
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.notify.bind(str(self.case / "ready.sock"))
+        with unix_socket_path(self.case / "ready.sock") as address:
+            self.notify.bind(address)
         # Maki is PID 1: no shell, init, sidecar or stress helper is the OOM victim.
         self.create(memory, cpus, [
             "nbdkit", "--foreground", "--threads", "4", "-U", "/case/nbd.sock",
@@ -376,6 +417,13 @@ socket = "/case/control.sock"
         if self.notify is not None:
             self.notify.close()
             self.notify = None
+        if self.pending_identifier is not None:
+            # Only act on the reserved name if Docker also confirms this campaign's label.
+            owned = run(["docker", "ps", "--all", "--filter", "label=maki.failure-validation=" + self.token,
+                         "--format", "{{.Names}}"])
+            if self.pending_identifier in owned.stdout.splitlines():
+                self.identifier = self.pending_identifier
+            self.pending_identifier = None
         if self.identifier is None:
             return
         state = self.state()
@@ -401,10 +449,12 @@ socket = "/case/control.sock"
 
 def constrained_recovery(target, memory="32m", rounds=1):
     """Report availability at the requested cap without relaxing durability."""
-    try:
+    with remove_after(target):
         try:
             target.start(memory=memory)
         except (TimeoutError, RuntimeError) as error:
+            if target.identifier is None:
+                raise
             state = target.state()
             if isinstance(error, TimeoutError) and state["Running"]:
                 try:
@@ -426,8 +476,6 @@ def constrained_recovery(target, memory="32m", rounds=1):
                       "resources": target.stats()}
             target.kill()
             return result
-    finally:
-        target.remove()
 
 
 def campaign(args):
@@ -443,12 +491,12 @@ def campaign(args):
         image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip()
         report["image"] = image_id
         for scenario in ("cpu-memory-kill", "freeze-resume", "memory-oom"):
+            record = {"scenario": scenario, "passed": False}
+            report["cases"].append(record)
             directory = args.output / scenario
             directory.mkdir(mode=0o700)
             target = Target(image_id, directory)
-            record = {"scenario": scenario}
-            report["cases"].append(record)
-            try:
+            with remove_after(target):
                 target.start(memory="96m", cpus="0.25" if scenario == "cpu-memory-kill" else "1")
                 record["workload"] = target.client("write", rounds=args.rounds)
                 record["resources"] = target.stats()
@@ -483,16 +531,15 @@ def campaign(args):
                 # Offline format/CRC check complements authenticated NBD readback.
                 check = target.one_shot(["/opt/maki/maki", "check", "/case/config.toml", "--deep"])
                 record["deep_check"] = {"exit_code": check.returncode, "stdout": check.stdout[-2000:]}
-                record["passed"] = True
-                print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
-            finally:
-                target.remove()
+            record["passed"] = True
+            save_json(args.output / "results.json", report)
+            print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
         report["passed"] = True
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
-        (args.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+        save_json(args.output / "results.json", report)
 
 
 def main():

@@ -70,6 +70,24 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                 case.state("daemon")
             self.assertEqual(budgets, [18, 8, 20])
 
+    def test_fixture_construction_failure_preserves_completed_case_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            helper = root / "helper"
+            helper.touch(mode=0o700)
+            output = root / "results"
+            first = Mock(volume="mkci_first", events=Mock(return_value=[]))
+            with (patch.object(fixture.sys, "argv", ["fixture", "--disposable-host", "--helper-binary",
+                                                     str(helper), "--output", str(output)]),
+                  patch.object(fixture.os, "geteuid", return_value=0, create=True),
+                  patch.object(fixture.sys, "platform", "linux"),
+                  patch.object(fixture, "CASES", ("first", "second")),
+                  patch.object(fixture, "Fixture", side_effect=[first, ValueError("unit contract changed")])):
+                self.assertEqual(fixture.main(), 1)
+            previous, failed = fixture.json.loads((output / "results.json").read_text())
+            self.assertEqual(previous["status"], "passed")
+            self.assertEqual(failed, {"case": "second", "status": "failed", "error": "unit contract changed"})
+
     def test_corrupt_events_are_reported_even_if_verification_already_failed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

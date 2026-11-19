@@ -457,8 +457,16 @@ def main():
     output.mkdir(mode=0o700)
     results = []
     for mode in CASES:
-        fixture = Fixture(output, helper, mode)
-        result = {"case": mode, "volume": fixture.volume, "status": "failed"}
+        result = {"case": mode, "status": "failed"}
+        results.append(result)
+        try:
+            fixture = Fixture(output, helper, mode)
+        except Exception as error:
+            result["error"] = str(error)
+            save_json(output / "results.json", results)
+            print(f"FAIL {mode}: {error}", flush=True)
+            return 1
+        result["volume"] = fixture.volume
         try:
             fixture.install()
             fixture.verify(mode)
@@ -487,7 +495,6 @@ def main():
             except (OSError, ValueError) as error:
                 result["status"] = "failed"
                 result["events_error"] = str(error)
-            results.append(result)
             save_json(output / "results.json", results)
         print(f"{result['status'].upper()} {mode}", flush=True)
         if result["status"] != "passed":

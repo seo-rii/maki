@@ -306,17 +306,25 @@ def resource_identity(args, timeout):
     attachments = instance.get("disks")
     if not isinstance(attachments, list):
         raise ValueError("instance disk attachments missing")
-    matches = [attachment for attachment in attachments
-               if isinstance(attachment, dict) and attachment.get("boot") is False
-               and (attachment.get("deviceName") == args.data_disk
-                    or (isinstance(attachment.get("source"), str)
-                        and attachment["source"].rsplit("/", 1)[-1] == args.data_disk))]
+    matches = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or attachment.get("boot") is not False:
+            continue
+        try:
+            source = canonical_disk_reference(attachment.get("source"))
+        except ValueError:
+            # Local SSDs and regional disks do not have a zonal persistent-disk URL.
+            continue
+        if source == expected_disk:
+            matches.append(attachment)
     if len(matches) != 1:
         raise ValueError("expected one attached persistent data disk")
     attachment = matches[0]
-    attached_disk = canonical_disk_reference(attachment.get("source"))
-    if attached_disk != expected_disk:
-        raise ValueError("attached data disk does not match requested project, zone and name")
+    device_name = attachment.get("deviceName")
+    if sum(isinstance(other, dict) and other.get("deviceName") == device_name
+           for other in attachments) != 1:
+        raise ValueError("ambiguous attachment device name")
+    attached_disk = expected_disk
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("resource identity deadline")
@@ -456,6 +464,8 @@ class RemoteProcess:
                 del self.buffer[:newline + 1]
                 frame = decode_frame(line, self.token, self.cycle)
                 if frame is not None:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("guest SSH event deadline")
                     return frame
                 continue
             if len(self.buffer) > MAX_FRAME:

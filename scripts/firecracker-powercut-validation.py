@@ -42,6 +42,11 @@ def expected_records(cycle):
 def decode_frame(line, token, boot):
     if len(line) > MAX_FRAME:
         raise ValueError("oversized serial line")
+    # Before /proc and the serial device are available PID 1 reports setup
+    # failures on its inherited console and stays alive for host diagnostics.
+    setup_error = b"MAKI guest setup failed: "
+    if line.startswith(setup_error):
+        raise RuntimeError("guest setup failed: " + line[len(setup_error):2048].decode(errors="replace"))
     if not line.startswith(PREFIX):
         return None
     value = json.loads(line[len(PREFIX):])
@@ -178,6 +183,8 @@ class SerialProcess:
                 del self.buffer[:newline + 1]
                 frame = decode_frame(line, self.token, self.boot)
                 if frame is not None:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("guest serial event deadline")
                     return frame
                 continue
             if len(self.buffer) > MAX_FRAME:
