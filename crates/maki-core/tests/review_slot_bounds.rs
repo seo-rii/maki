@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use maki_backing::{Backing, FileBacking, MemBacking};
 use maki_core::error::CoreError;
 use maki_core::store::{SlotRead, SlotStore};
+use maki_core::volume::{Volume, VolumeOptions};
 use maki_format::{geometry::Geometry, init, layout, superblock::Superblock};
 
 fn store(
@@ -204,4 +205,25 @@ fn reservation_rejects_out_of_range_units_without_mutation() {
 #[test]
 fn filesystem_reservation_rejects_out_of_range_units_without_mutation() {
     out_of_range_reservation(true);
+}
+
+#[test]
+fn ciphertext_and_sequence_reads_reject_out_of_range_units() {
+    for units in [6, 8] {
+        let (backing, _, mut store, _dir) = store(false, units);
+        // Create the final shard too, so the partial-shard case checks the
+        // out-of-device tail of an existing file.
+        store.reserve_slot(units - 1).unwrap();
+        drop(store);
+        let volume = Volume::recover(backing, VolumeOptions::default()).unwrap();
+        assert_eq!(volume.read_ct(units - 1).unwrap(), None);
+        assert_eq!(volume.current_sequence(units - 1).unwrap(), None);
+        for unit in [units, u64::MAX] {
+            assert!(matches!(volume.read_ct(unit), Err(CoreError::Corrupt(_))));
+            assert!(matches!(
+                volume.current_sequence(unit),
+                Err(CoreError::Corrupt(_))
+            ));
+        }
+    }
 }
