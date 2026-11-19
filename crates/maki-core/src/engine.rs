@@ -1194,6 +1194,10 @@ impl Engine {
             let mut rmw_cts = Vec::new();
             let mut need_rmw = Vec::new();
             let mut cached = HashMap::new();
+            let cache = inner
+                .cache
+                .as_ref()
+                .filter(|cache| cache.can_hold(unit_size));
             for unit in first..=last {
                 let unit_start = unit * unit_size;
                 let full =
@@ -1202,7 +1206,7 @@ impl Engine {
                     continue;
                 }
                 need_rmw.push(unit);
-                if let Some(cache) = &inner.cache {
+                if let Some(cache) = cache {
                     if !inner.cache_verify_on_hit {
                         match volume.current_sequence(unit)? {
                             None => continue,
@@ -1218,9 +1222,7 @@ impl Engine {
                 if let Some((seq, ct)) = volume.read_ct(unit)? {
                     // With `verify_on_hit` the payload was just read and
                     // CRC-checked; the cache only saves the decryption.
-                    let hit = inner
-                        .cache
-                        .as_ref()
+                    let hit = cache
                         .filter(|_| inner.cache_verify_on_hit)
                         .and_then(|cache| cache.get(unit, seq));
                     if let Some(buf) = hit {
