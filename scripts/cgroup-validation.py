@@ -6,6 +6,7 @@ An existing local image built with cgroup-validation.Dockerfile is required.
 The host needs Docker, libnbd.so.0, and Python 3. No Python packages are needed.
 """
 import argparse
+from contextlib import contextmanager
 import ctypes
 import hashlib
 import json
@@ -92,6 +93,18 @@ def require_pressure(progress):
            "workload-triggered OOM requires completed pressure I/O")
 
 
+@contextmanager
+def unix_socket_path(path):
+    # Linux resolves this short path through the calling process's open directory.
+    # Both the socket inode and the Docker bind mount stay in the artifact directory.
+    path = pathlib.Path(path)
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        yield f"/proc/self/fd/{directory}/{path.name}"
+    finally:
+        os.close(directory)
+
+
 class Nbd:
     """Small libnbd synchronous client, always run in a deadline-bound child."""
     def __init__(self, path, connected_fd=None):
@@ -115,17 +128,18 @@ class Nbd:
         if not self.handle:
             raise RuntimeError("libnbd handle allocation failed")
         try:
-            if connected_fd is None:
-                self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(path)))
-            else:
-                # Queue the connection on the frozen server's socket before
-                # telling the controller to start its observation interval.
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.connect(os.fsencode(path))
-                    os.write(connected_fd, b"C")
-                    os.close(connected_fd)
-                    self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
-                    client.detach()  # libnbd owns the descriptor on success
+            with unix_socket_path(path) as address:
+                if connected_fd is None:
+                    self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(address)))
+                else:
+                    # Queue the connection on the frozen server's socket before
+                    # telling the controller to start its observation interval.
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(os.fsencode(address))
+                        os.write(connected_fd, b"C")
+                        os.close(connected_fd)
+                        self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
+                        client.detach()  # libnbd owns the descriptor on success
             ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA required")
             ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
         except BaseException:
@@ -234,11 +248,13 @@ socket = "/case/control.sock"
             self.remove()
 
     def options(self, memory, cpus):
+        # --mount uses CSV, including for a single argv element.
+        source = str(self.case).replace('"', '""')
         return ["--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--pids-limit", "64", "--memory", memory, "--memory-swap", memory,
                 "--cpus", cpus, "--label", "maki.failure-validation=" + self.token,
-                "--mount", f"type=bind,src={self.case},dst=/case"]
+                "--mount", f'type=bind,"src={source}",dst=/case']
 
     def state(self, timeout=45):
         return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier],
@@ -273,7 +289,8 @@ socket = "/case/control.sock"
         for name in ("nbd.sock", "ready.sock"):
             (self.case / name).unlink(missing_ok=True)
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.notify.bind(str(self.case / "ready.sock"))
+        with unix_socket_path(self.case / "ready.sock") as address:
+            self.notify.bind(address)
         # Maki is PID 1: no shell, init, sidecar or stress helper is the OOM victim.
         self.create(memory, cpus, [
             "nbdkit", "--foreground", "--threads", "4", "-U", "/case/nbd.sock",

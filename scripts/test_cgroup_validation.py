@@ -1,6 +1,7 @@
 """The fault campaign's oracle must not manufacture durability evidence."""
 import argparse
 import contextlib
+import csv
 import importlib.util
 import io
 import pathlib
@@ -128,6 +129,27 @@ class OracleTests(unittest.TestCase):
             with mock.patch.object(campaign.ctypes, "CDLL", return_value=library):
                 campaign.Nbd(path, sender.detach()).close()
             library.nbd_connect_unix.assert_not_called()
+
+    def test_mount_argument_keeps_quoted_source_in_one_csv_field(self):
+        target = campaign.Target.__new__(campaign.Target)
+        target.token = "fixture"
+        target.case = self.ledger.parent / 'qual,"quoted"'
+        options = target.options("32m", "1")
+        fields, = csv.reader([options[options.index("--mount") + 1]])
+        self.assertEqual(fields, ["type=bind", f"src={target.case}", "dst=/case"])
+
+    def test_long_artifact_directory_supports_notifications_and_nbd_connections(self):
+        directory = self.ledger.parent / ("long-name" * 13)
+        directory.mkdir()
+        with campaign.socket.socket(campaign.socket.AF_UNIX, campaign.socket.SOCK_DGRAM) as listener, \
+                campaign.socket.socket(campaign.socket.AF_UNIX, campaign.socket.SOCK_DGRAM) as client:
+            path = directory / "ready.sock"
+            with campaign.unix_socket_path(path) as address:
+                listener.bind(address)
+            self.assertTrue(path.exists())
+            with campaign.unix_socket_path(path) as address:
+                client.sendto(b"READY=1", address)
+            self.assertEqual(listener.recv(32), b"READY=1")
 
     def test_ready_state_check_uses_remaining_startup_budget(self):
         target = campaign.Target.__new__(campaign.Target)
