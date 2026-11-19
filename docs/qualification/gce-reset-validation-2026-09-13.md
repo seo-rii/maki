@@ -160,7 +160,11 @@ The harness has no third-party Python dependencies. Prepare an explicitly
 authorized disposable GCE instance with a separate persistent data disk, mount
 that disk at `/mnt/maki-data`, install the pinned Maki binaries and guest agent,
 and create the configuration, key, volume, and shutdown witness. Run the
-controller outside the workload VM. `--output` must name a new private
+controller outside the workload VM. Use matching controller and guest scripts. The
+controller passes the GCE attachment device name and READY timeout on each boot.
+The guest verifies the backing directory and the selected config file under
+`/mnt/maki-data` against the mounted disk or its partition. Each campaign uses
+its own data patterns, including the rewrite in the discard profile. `--output` must name a new private
 directory.
 
 ```bash
