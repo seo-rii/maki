@@ -281,8 +281,17 @@ socket = "/case/control.sock"
         self.serial += 1
         # Preserve an identity even if the create CLI times out before returning its ID.
         self.identifier = f"maki-fault-{self.token}-{self.serial}"
-        run(["docker", "create", "--name", self.identifier, *self.options(memory, cpus),
-             *extra, self.image, *command])
+        try:
+            run(["docker", "create", "--name", self.identifier, *self.options(memory, cpus),
+                 *extra, self.image, *command])
+        except RuntimeError:
+            # A failed create can leave no object. Only try to remove an owned
+            # container when Docker actually lists it, preserving the create error.
+            owned = run(["docker", "ps", "--all", "--filter", "label=maki.failure-validation=" + self.token,
+                         "--format", "{{.Names}}"])
+            if self.identifier not in owned.stdout.splitlines():
+                self.identifier = None
+            raise
 
     def start(self, memory="192m", cpus="1"):
         ensure(self.identifier is None, "previous owned container has not been removed")

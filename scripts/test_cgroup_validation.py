@@ -252,6 +252,18 @@ class OracleTests(unittest.TestCase):
             campaign.require_oom({"Running": False, "ExitCode": 137, "OOMKilled": False})
         campaign.require_oom({"Running": False, "ExitCode": 137, "OOMKilled": True})
 
+    def test_failed_create_without_a_container_preserves_the_create_error(self):
+        target = campaign.Target.__new__(campaign.Target)
+        target.identifier = target.notify = None
+        target.serial, target.image, target.token = 0, "missing", "fixture"
+        target.options = mock.Mock(return_value=[])
+        with mock.patch.object(campaign, "run", side_effect=[RuntimeError("image missing"),
+                                                            mock.Mock(stdout="")]) as run:
+            with self.assertRaisesRegex(RuntimeError, "image missing"):
+                target.one_shot(["true"])
+        self.assertIsNone(target.identifier)
+        self.assertEqual([call.args[0][1] for call in run.call_args_list], ["create", "ps"])
+
     def test_container_cli_timeout_still_cleans_exact_created_container(self):
         target = campaign.Target.__new__(campaign.Target)
         target.identifier, target.serial, target.image = None, 0, "test-image"
