@@ -571,7 +571,7 @@ fn defaults_still_validate() {
 
 #[test]
 fn journal_hard_limit_must_leave_room_for_a_reclaim_and_the_largest_request() {
-    // 4 KiB units, 1 MiB requests: a request journals 257 records of
+    // 4 KiB units, 1 MiB aligned requests: a request journals 256 records of
     // 32 + 4384 bytes; two 1 MiB segments alone are not enough.
     let too_small = base().replace(
         "[backing]\nroot = \"/x\"\n",
