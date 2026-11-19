@@ -166,7 +166,7 @@ fn orphan_discard_io_error_remains_inconclusive() {
 fn opening_partial_shards_reads_only_logical_headers_and_each_discard_copy_once() {
     use maki_core::store::SlotStore;
 
-    let open_bytes = |logical_units, discard, missing_alloc| {
+    let open_bytes = |logical_units: u64, discard, missing_alloc| {
         let backing = Arc::new(CrashableBacking::new());
         let mut sb = block();
         sb.geometry = Geometry::compute(512, 1024, 512, 1032, 1024 * logical_units, 8192).unwrap();
