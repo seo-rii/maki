@@ -90,13 +90,38 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
             fail("git cat-file failed while preparing the source archive")
 
 
+def commit_epoch(commit, *, repo=None):
+    return int(subprocess.check_output(
+        git_command("show", "--no-show-signature", "-s", "--format=%ct", commit, repo=repo)
+    ))
+
+
+def tracked_changes():
+    command = git_command("status", "--porcelain", "--untracked-files=no")
+    if subprocess.check_output(command):
+        return True
+    entries = subprocess.check_output(git_command("ls-files", "-v", "-z")).split(b"\0")
+    assumed = [entry[2:] for entry in entries if entry[:1].islower()]
+    if not assumed:
+        return False
+    # Refresh the flagged paths through Git's normal stat/filter checks,
+    # without changing the user's index flags or sparse-checkout selection.
+    with tempfile.TemporaryDirectory() as directory:
+        index = pathlib.Path(directory) / "index"
+        shutil.copyfile(git("rev-parse", "--path-format=absolute", "--git-path", "index"), index)
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        subprocess.run(git_command("update-index", "--no-assume-unchanged", "-z", "--stdin"),
+                       input=b"\0".join(assumed) + b"\0", env=env, check=True)
+        return bool(subprocess.check_output(command, env=env))
+
+
 def candidate_source_version():
     import tomllib
 
     # Capture only a committed source tree. Untracked files are excluded by
     # the selected Git tree, and staged/unstaged tracked changes must not be mistaken
     # for source included in this candidate.
-    if git("status", "--porcelain", "--untracked-files=no"):
+    if tracked_changes():
         fail("tracked changes must be committed before preparing a candidate")
     if git("rev-parse", "--is-shallow-repository") != "false":
         fail("candidate versions require complete Git history; fetch --unshallow before retrying")
@@ -116,7 +141,7 @@ def prepare(output):
         fail(f"output already exists: {output}")
     commit, workspace_version, version = candidate_source_version()
     tree = git("rev-parse", f"{commit}^{{tree}}")
-    epoch = int(git("show", "-s", "--format=%ct", commit))
+    epoch = commit_epoch(commit)
     architecture = run(["dpkg", "--print-architecture"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", architecture):
         fail("dpkg returned an invalid native architecture")
