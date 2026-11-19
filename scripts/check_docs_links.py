@@ -51,7 +51,7 @@ SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 # Lines that cannot continue a paragraph into a setext heading: indented
 # code, block quotes, ATX headings, tables and list items. document_lines()
 # already classifies raw HTML blocks, leaving inline tags and autolinks here.
-NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:[>#|]|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
+NOT_PARAGRAPH = re.compile(r"^(?: {4}|\t| {0,3}(?:>|[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)))")
 HTML_ATTR = re.compile(r"""([A-Za-z_:][\w.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?""", re.ASCII)
 HTML_OPEN = rf"<(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?P<attrs>(?:\s+{HTML_ATTR.pattern})*)\s*/?>"
 HTML_CLOSE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*\s*>")
@@ -65,6 +65,8 @@ BLOCK_ELEMENT = re.compile(
     r"h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|"
     r"optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|"
     r"tr|track|ul)(?=\s|/?>|$)", re.IGNORECASE)
+INLINE_SPECIAL = re.compile(r"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<![A-Z]+(?:\s+[^>]*)?>", re.DOTALL)
+HTML_ATTRIBUTE_ENTITY = re.compile(r"&(?:#[xX][0-9a-fA-F]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]*;?)")
 HTML_TOKENS = re.compile(
     r"<!--.*?(?:-->|$)|<!\[CDATA\[.*?(?:\]\]>|$)|<\?.*?(?:\?>|$)|"
     r"<(?P<raw>script|style|textarea)(?=[\s>]).*?(?:</(?P=raw)>|$)|"
@@ -139,7 +141,7 @@ def document_lines(text):
     block = None
     html_end = None
     in_paragraph = False
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(re.split(r"\r\n|[\r\n]", text.removeprefix("\ufeff")), start=1):
         columns = line.expandtabs(4)
         pos = 0
         changed = False
@@ -238,6 +240,55 @@ def document_lines(text):
                             and not (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content)))
 
 
+def table_cells(line):
+    cells = re.split(r"(?<!\\)\|", line.strip(" \t"))
+    if cells and not cells[0]:
+        cells.pop(0)
+    if cells and not cells[-1]:
+        cells.pop()
+    return [cell.strip(" \t").replace(r"\|", "|") for cell in cells]
+
+
+def block_lines(text):
+    """Pair each source line with its rendered cells when it belongs to a GFM table."""
+    lines = list(document_lines(text))
+    width = 0
+    after_table = False
+    for index, line in enumerate(lines):
+        value = line.content
+        if line.container_changed or not index or line.number != lines[index - 1].number + 1:
+            width = 0
+            after_table = False
+        indented = re.match(r"^(?: {4}| {0,3}\t)", value)
+        if (width or after_table) and (not value.strip() or indented):
+            # A blank ends the table. Four columns start a literal code block,
+            # including when the first such line follows a table row directly.
+            width = 0
+            after_table = True
+            continue
+        after_table = False
+        if line.raw_html or ATX_HEADING.match(value) or THEMATIC_BREAK.fullmatch(value):
+            width = 0
+        if width:
+            yield line, table_cells(value)[:width]
+            continue
+        if (not line.raw_html and value.strip() and not indented
+                and not ATX_HEADING.match(value) and not THEMATIC_BREAK.fullmatch(value)
+                and index + 1 < len(lines)):
+            divider = lines[index + 1]
+            if (divider.number == line.number + 1 and not divider.container_changed
+                    and not divider.raw_html and re.fullmatch(r" {0,3}[:|\-][:| \t-]*", divider.content)
+                    and ("|" in divider.content or ":" in divider.content)):
+                cells = table_cells(value)
+                markers = table_cells(divider.content)
+                if cells and len(cells) == len(markers) and all(
+                        re.fullmatch(r":?-+:?", marker) for marker in markers):
+                    width = len(cells)
+                    yield line, cells
+                    continue
+        yield line, None
+
+
 def closing_bracket(text, start):
     """Index of the `]` matching the `[` at `start`, or -1."""
     depth = 0
@@ -274,6 +325,19 @@ def markdown_entities(text):
             return html.unescape(entity)
         return html.entities.html5.get(entity[1:], entity)
     return ENTITY.sub(decode, text)
+
+
+def html_attribute_value(value):
+    def decode(match):
+        token = match.group()[1:]
+        if token.startswith("#"):
+            return html.unescape(match.group())
+        if not token.endswith(";") and value[match.end():match.end() + 1] == "=":
+            return match.group()
+        # An unrecognised suffix of ASCII letters or digits prevents a
+        # semicolonless named reference from being consumed in an attribute.
+        return html.entities.html5.get(token, match.group())
+    return HTML_ATTRIBUTE_ENTITY.sub(decode, value)
 
 
 def unescape(raw):
@@ -431,7 +495,7 @@ def reference_definitions(text):
     after it; a title must end on the line it starts on. `[^label]:` starts
     a footnote, not a link.
     """
-    lines = [line for line in document_lines(text) if not line.raw_html]
+    lines = [line for line, cells in block_lines(text) if not line.raw_html and cells is None]
     definitions = []
     in_paragraph = False
     previous_number = None
@@ -467,23 +531,22 @@ def scan_inline_paragraph(line, labels):
     out = []
     targets = []
     html_tags = []
+    link_spans = {}
     brackets = []
     last_link = -1
     index = 0
     while index < len(line):
         char = line[index]
-        if line.startswith("<!--", index):
-            end = line.find("-->", index + 4)
-            if end != -1:
-                end += 3
-                out.append(" " * (end - index))
-                index = end
-                continue
         if char == "\\":
             out.append(line[index:index + 2])
             index += 2
             continue
         if char == "<":
+            special = INLINE_SPECIAL.match(line, index)
+            if special:
+                out.append(" " * len(special.group()))
+                index = special.end()
+                continue
             autolink = AUTOLINK.match(line, index)
             if autolink:
                 out.append(" " * len(autolink.group()))
@@ -513,6 +576,8 @@ def scan_inline_paragraph(line, labels):
             reference = LINK_LABEL.match(line, index + 1)
             label = reference[1] if reference and reference[1] else line[opening + 1:index]
             if parsed is not None or label_key(label) in labels:
+                end = parsed[1] if parsed else reference.end() if reference else index + 1
+                link_spans[opening] = (index, end, image_scope is not None)
                 if image_scope is None:
                     last_link = opening
                 else:
@@ -550,15 +615,23 @@ def scan_inline_paragraph(line, labels):
             continue
         out.append(char)
         index += 1
-    return "".join(out), targets, html_tags
+    return "".join(out), targets, html_tags, link_spans
 
 
 def inline_paragraphs(text, definition_lines):
     """Group inline content across soft breaks within the same paragraph."""
     paragraph = []
-    for number, content, changed, raw_html, lazy in document_lines(text):
+    for source, cells in block_lines(text):
+        number, content, changed, raw_html, lazy = source
+        if cells is not None:
+            if paragraph:
+                yield paragraph
+                paragraph = []
+            for cell in cells:
+                yield [(number, cell)]
+            continue
         single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
-                      or (not lazy and SETEXT_UNDERLINE.match(content)) or content.lstrip().startswith("|"))
+                      or (not lazy and SETEXT_UNDERLINE.match(content)))
         if (not content.strip() or raw_html or number in definition_lines or single or changed
                 or (paragraph and number != paragraph[-1][0] + 1)):
             if paragraph:
@@ -575,7 +648,7 @@ def inline_paragraphs(text, definition_lines):
 
 def inline_lines(text, definition_lines, labels):
     for paragraph in inline_paragraphs(text, definition_lines):
-        masked, targets, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        masked, targets, _, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
         starts = []
         start = 0
         for _, line in paragraph:
@@ -643,6 +716,8 @@ def inline_text(raw, labels=frozenset()):
     never emphasis delimiters or entity references. `labels` holds the
     document's defined reference labels: a reference to one renders as a link.
     """
+    _, _, _, links = scan_inline_paragraph(raw, labels)
+    ends = {close: end for close, end, image in links.values() if not image}
     out = []
     index = 0
     while index < len(raw):
@@ -668,38 +743,20 @@ def inline_text(raw, labels=frozenset()):
             out.extend((code, True) for code in content)
             index = closing.end()
             continue
-        if char == "[" or (char == "!" and raw[index + 1:index + 2] == "["):
-            opening = index if char == "[" else index + 1
-            close = closing_bracket(raw, opening)
-            if close != -1 and raw[close + 1:close + 2] == "(":
-                parsed = inline_destination(raw, close + 1)
-                if parsed is not None:
-                    # A link contributes its text; an image's alt text is an
-                    # attribute, not part of the heading's text.
-                    if char == "[":
-                        out.extend(inline_text(raw[opening + 1:close], labels))
-                    index = parsed[1]
-                    continue
-            if close != -1 and labels:
-                # A full reference uses its own label; a collapsed (`[]`)
-                # or shortcut reference uses its text. An undefined full
-                # label leaves the brackets literal (CommonMark).
-                reference = LINK_LABEL.match(raw, close + 1)
-                if reference and reference.group(1):
-                    label = reference.group(1)
-                else:
-                    label = raw[opening + 1:close]
-                if label_key(label) in labels:
-                    if char == "[":
-                        out.extend(inline_text(raw[opening + 1:close], labels))
-                    index = reference.end() if reference else close + 1
-                    continue
-        if raw.startswith("<!--", index):
-            end = raw.find("-->", index + 4)
-            if end != -1:
-                index = end + 3
-                continue
+        if char == "!" and index + 1 in links and links[index + 1][2]:
+            index = links[index + 1][1]
+            continue
+        if index in links:
+            index += 1
+            continue
+        if index in ends:
+            index = ends[index]
+            continue
         if char == "<":
+            special = INLINE_SPECIAL.match(raw, index)
+            if special:
+                index = special.end()
+                continue
             autolink = AUTOLINK.match(raw, index)
             if autolink:
                 out.extend((link, True) for link in autolink.group(1))
@@ -801,7 +858,11 @@ def document_anchors(text):
     headings = []
     paragraph = []
     raw_blocks = []
-    for number, line, changed, raw_html, lazy in document_lines(text):
+    for source, cells in block_lines(text):
+        number, line, changed, raw_html, lazy = source
+        if cells is not None:
+            paragraph = []
+            continue
         if changed:
             paragraph = []
         if raw_html:
@@ -844,17 +905,22 @@ def document_anchors(text):
         for token in HTML_TOKENS.finditer(source):
             if (token["tag"] or "").lower() != "a":
                 continue
+            seen = set()
             for attribute in HTML_ATTR.finditer(token["attrs"]):
+                name = attribute[1].lower()
+                if name in seen or name not in ("id", "name"):
+                    continue
+                seen.add(name)
                 value = attribute[2]
-                if value is not None and attribute[1].lower() in ("id", "name"):
+                if value is not None:
                     if value[0] in ("'", '"'):
                         value = value[1:-1]
-                    anchors.add(html.unescape(value))
+                    anchors.add(html_attribute_value(value))
 
     for lines in raw_blocks:
         collect_html("\n".join(line for _, line in lines))
     for paragraph in inline_paragraphs(text, definition_lines):
-        _, _, tags = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        _, _, tags, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
         for tag in tags:
             collect_html(tag)
     return anchors
