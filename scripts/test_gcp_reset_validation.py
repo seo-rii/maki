@@ -526,6 +526,12 @@ class ResourceIdentityContracts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.identity(instance)
 
+    def test_unrelated_device_alias_can_equal_the_requested_resource_name(self):
+        self.instance["disks"][0]["deviceName"] = "mounted-data"
+        self.instance["disks"].append({"boot": False, "deviceName": self.args.data_disk,
+                                      "source": self.disk_url.replace("expected-disk", "other-disk")})
+        self.assertEqual(self.identity()["attachment_device_name"], "mounted-data")
+
     def test_boot_attachment_cannot_be_the_data_disk(self):
         self.instance["disks"][0]["boot"] = True
         with self.assertRaises(ValueError):
