@@ -381,7 +381,9 @@ async fn repeated_benchmark_rejects_prior_run_data() {
 fn payload_distinguishes_every_crypto_unit_in_a_large_request() {
     let bytes = data_for(uuid::Uuid::new_v4(), 0, 1, 16 * 1024);
     let units = bytes
-        .chunks_exact(4096)
+        .as_chunks::<4096>()
+        .0
+        .iter()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(units.len(), 4);
 }
