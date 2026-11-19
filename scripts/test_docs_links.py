@@ -52,6 +52,25 @@ class DocumentationLinks(unittest.TestCase):
                    "and [real](missing.md)\n")
         self.assertEqual(broken_links(self.root), ["README.md:4: missing.md"])
 
+    def test_heading_links_use_the_rendered_label(self):
+        self.write("ok.md", "# Guide\n")
+        self.write("README.md", "# [Handling `]`](ok.md)\n\n"
+                   "# [How [install](ok.md)](obsolete.md)\n\n"
+                   "[one](#handling-) [two](#how-installobsoletemd) [wrong](#handling-okmd)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:5: #handling-okmd (missing anchor)"])
+
+    def test_html_attribute_entities_and_duplicate_names(self):
+        self.write("README.md", '<a name="sign&copyx"></a>\n<a id="first" ID="second"></a>\n'
+                   '<a name="a&copy="></a>\n<a name="a&copy!"></a>\n\n'
+                   '[one](#sign%26copyx) [two](#first) [three](#a%26copy=) [four](#a%C2%A9!) '
+                   '[absent](#second)\n')
+        self.assertEqual(broken_links(self.root), ["README.md:6: #second (missing anchor)"])
+
+    def test_inline_processing_instructions_and_cdata_mask_their_contents(self):
+        self.write("README.md", "Here <?example [fake](inside.md)?> and <![CDATA[ [x](other.md) ]]> "
+                   "followed by [real](missing.md).\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
+
     def test_plain_markdown_links_address_source_lines(self):
         self.write("guide.md", "# Guide\n\nLast line")
         self.write("README.md", "[one](guide.md?plain=1#L3) [range](guide.md?a=b&plain=1#L1-L3)\n"
