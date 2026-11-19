@@ -76,6 +76,33 @@ class DocumentationLinks(unittest.TestCase):
                    "[other]: //cdn.example.org/sample\n\n[local](/missing.md)\n")
         self.assertEqual(broken_links(self.root), ["README.md:4: /missing.md"])
 
+    def test_only_publishable_files_and_directories_are_link_targets(self):
+        self.write(".gitignore", "ignored/\n")
+        self.write("ignored/notes.txt", "local", tracked=False)
+        self.write("draft/file.txt", "new", tracked=False)
+        sibling = tempfile.NamedTemporaryFile(dir=self.root.parent)
+        self.addCleanup(sibling.close)
+        outside = Path(sibling.name)
+        self.write("README.md", "[root](/) [draft](draft) [new](draft/file.txt)\n"
+                   f"[ignored](ignored/notes.txt) [dir](ignored/) [external](../{outside.name})\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: ignored/notes.txt", "README.md:2: ignored/", f"README.md:2: ../{outside.name}"])
+
+    def test_a_tracked_submodule_directory_is_publishable(self):
+        self.write("README.md", "[component](component)\n")
+        (self.root / "component").mkdir()
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "fixture commit"], check=True)
+        oid = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},component"], check=True)
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_absolute_uri_schemes_are_external(self):
+        self.write("README.md", "[mirror](FTP://example.org/pub/) [phone](tel:+1234)\n\n"
+                   "[ref]: urn:example:manual\n\n[local](file.txt)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:5: file.txt"])
+
     def test_headings_inside_nested_list_and_quote_containers(self):
         self.write("README.md", "- ## Install\n- > Release\n  > =======\n- Help\n- -----\n\n"
                    "[one](#install) [two](#release) [separate item](#help)\n")

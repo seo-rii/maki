@@ -42,7 +42,7 @@ import unicodedata
 import urllib.parse
 from typing import NamedTuple
 
-SKIP_PREFIXES = ("http://", "https://", "mailto:", "//")
+URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 ATX_CLOSING = re.compile(r"(?:^|[ \t]+)#+$")
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
@@ -78,15 +78,18 @@ BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])( +|$)")
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
-def candidate_markdown(root):
-    listing = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--cached", "--others",
-         "--exclude-standard", "-z", "--", ":(icase)*.md"],
-        capture_output=True,
-        check=True,
-    )
-    names = {name for name in os.fsdecode(listing.stdout).split("\0") if name}
-    return sorted(root / name for name in names)
+def candidate_files(root):
+    git = ["git", "-C", str(root), "ls-files", "-z"]
+    tracked = subprocess.check_output([*git, "--stage"])
+    untracked = subprocess.check_output([*git, "--others", "--exclude-standard"])
+    candidates = {root / os.fsdecode(name) for name in untracked.split(b"\0") if name}
+    for entry in tracked.split(b"\0"):
+        if entry:
+            metadata, name = entry.split(b"\t", 1)
+            path = root / os.fsdecode(name)
+            if metadata.startswith(b"160000 ") or path.is_file() or path.is_symlink():
+                candidates.add(path)
+    return candidates
 
 
 class SourceLine(NamedTuple):
@@ -802,12 +805,18 @@ def omitted_archive_reference(root, document, content, target, packages):
 
 
 def broken_links(root):
+    root = root.resolve()
     inventory = root / "vendor/upstream.json"
     packages = (
         json.loads(inventory.read_text(encoding="utf-8"))["packages"]
         if inventory.exists() else {}
     )
     anchor_cache = {}
+    candidates = candidate_files(root)
+    published = {root}
+    for candidate in candidates:
+        published.add(candidate)
+        published.update(parent for parent in candidate.parents if parent.is_relative_to(root))
 
     def anchors_of(document):
         key = document.resolve()
@@ -817,7 +826,7 @@ def broken_links(root):
 
     def target_problem(path, content, target):
         """Why `target`, linked from `path`, is broken, or None."""
-        if not target or target.lower().startswith(SKIP_PREFIXES):
+        if not target or target.startswith("//") or URI_SCHEME.match(target):
             return None
         file_part, _, fragment = target.partition("#")
         file_part = file_part.partition("?")[0]
@@ -826,7 +835,8 @@ def broken_links(root):
             target_path = root / decoded.lstrip("/")
         else:
             target_path = path.parent / decoded if decoded else path
-        if not target_path.exists():
+        if (pathlib.Path(os.path.abspath(target_path)) not in published or not target_path.exists()
+                or target_path.resolve() not in published):
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
             return target
@@ -841,9 +851,9 @@ def broken_links(root):
         return None
 
     broken = []
-    for path in candidate_markdown(root):
+    for path in sorted(path for path in candidates if path.name.lower().endswith(".md")):
         relative = path.relative_to(root).as_posix()
-        if path.is_symlink() and not path.is_file():
+        if path.is_symlink() and (not path.is_file() or path.resolve() not in published):
             broken.append(f"{relative}: invalid Markdown symlink target")
             continue
         try:
