@@ -728,3 +728,29 @@ fn attach_checks_device_block_size_before_planning() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_checks_mount_components_in_bytes_against_the_host_filesystem() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = std::env::temp_dir();
+    let path = std::ffi::CString::new(base.as_os_str().as_bytes()).unwrap();
+    let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
+    if limit < 1 {
+        return;
+    }
+    let limit = usize::try_from(limit).unwrap();
+    for (length, ok) in [(limit, true), (limit + 1, false)] {
+        let name = "é".repeat(length / 2) + &"a".repeat(length % 2);
+        let mount = base.join("maki-uncreated-mount-parent").join(name);
+        let result = AttachConfig::default().into_request(
+            "audit",
+            AttachOverrides {
+                mountpoint: Some(mount.to_str().unwrap().to_owned()),
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(result.is_ok(), ok, "{result:?}");
+    }
+}
