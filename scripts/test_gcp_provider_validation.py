@@ -110,7 +110,9 @@ class GuestProviderContracts(unittest.TestCase):
         launch.assert_not_called()
         client.read.assert_not_called()
         client.write.assert_not_called()
-        self.assertEqual(events, [])
+        self.assertEqual([event["event"] for event in events], ["error"])
+        self.assertEqual(events[0]["message"], f"ValueError: {error}")
+        self.assertNotIn("provider", events[0])
         return error
 
     def test_expected_provider_runs_both_profiles_and_reports_validated_identity(self):
