@@ -390,7 +390,7 @@ def start(args):
     archive = directory / "source.tar"
     freeze_source(repo, revision, archive, source)
     runner = directory / "runner.py"
-    shutil.copyfile(__file__, runner)
+    shutil.copyfile(source / "scripts/storage-repeat-validation.py", runner)
     runner.chmod(0o400)
     save_json(directory / "config.json", {
         "revision": revision, "source": str(source), "target_dir": str(target),

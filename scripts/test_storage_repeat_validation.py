@@ -253,8 +253,10 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertFalse((source / "local").exists())
 
     @staticmethod
-    def fake_freeze_source(_repo, _revision, archive, _source):
+    def fake_freeze_source(_repo, revision, archive, source):
         archive.write_bytes(b"frozen source")
+        (source / "scripts").mkdir()
+        (source / "scripts/storage-repeat-validation.py").write_text(f"# runner at {revision}\n")
 
     def test_each_started_campaign_uses_its_own_build_directories(self):
         process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
@@ -283,6 +285,7 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
         for index, config in enumerate((first_config, second_config)):
             source = Path(config["source"])
+            self.assertEqual((source.parent / "runner.py").read_text(), f"# runner at {config['revision']}\n")
             self.assertEqual(probes.call_args_list[index * 2 + 1], mock.call(["cargo", "-V"], cwd=source, text=True))
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
         self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
