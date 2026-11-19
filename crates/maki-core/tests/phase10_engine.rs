@@ -371,3 +371,39 @@ async fn stats_expose_required_metrics_inputs() {
     let ck = engine.checkpoint().await.unwrap();
     assert_eq!(engine.stats().await.checkpoint_sequence, ck);
 }
+
+#[tokio::test]
+async fn partial_writes_skip_caches_that_cannot_hold_a_unit() {
+    async fn measure(cache: Option<EngineCacheConfig>, resize: bool) -> (u64, u64) {
+        let backing = Arc::new(CrashableBacking::new());
+        let engine =
+            engine_with_cache(&backing, Arc::new(FakeCryptoProvider::new(UNIT)), cache).await;
+        engine
+            .write(0, &vec![1; UNIT as usize], true)
+            .await
+            .unwrap();
+        engine.checkpoint().await.unwrap();
+        if resize {
+            engine.resize_cache(0);
+        }
+        let before = backing.read_bytes();
+        let misses = engine.stats().await.cache_misses;
+        engine.write(512, &[7; 512], false).await.unwrap();
+        let cost = (
+            backing.read_bytes() - before,
+            engine.stats().await.cache_misses - misses,
+        );
+        assert_eq!(engine.read(0, 512).await.unwrap(), [1; 512]);
+        assert_eq!(engine.read(512, 512).await.unwrap(), [7; 512]);
+        cost
+    }
+
+    let baseline = measure(None, false).await;
+    for verify_on_hit in [false, true] {
+        let mut cfg = read_cache().unwrap();
+        cfg.verify_on_hit = verify_on_hit;
+        assert_eq!(measure(Some(cfg.clone()), true).await, baseline);
+        cfg.max_bytes = u64::from(UNIT) - 1;
+        assert_eq!(measure(Some(cfg), false).await, baseline);
+    }
+}
