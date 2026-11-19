@@ -87,7 +87,6 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
 
     // Valid sizes follow from the geometry; longer copies are never read
     // (R5-025).
-    let map_len = AllocationMap::encoded_len(superblock.geometry.units_per_shard());
     let cat_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B).with_max_len(
         ShardCatalog::max_encoded_len(superblock.geometry.num_shards()),
     );
@@ -110,22 +109,13 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
                 .push(format!("catalog shard {shard} out of range"));
             continue;
         }
-        let alloc_ab = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
-            .with_max_len(map_len);
-        match alloc_ab.load::<AllocationMap>(backing)? {
-            None => report
-                .errors
-                .push(format!("shard {shard}: no valid allocation map")),
-            Some(map) => {
-                if map.units() != geometry.units_per_shard() {
-                    report.errors.push(format!(
-                        "shard {shard}: allocation map covers {} units, geometry says {}",
-                        map.units(),
-                        geometry.units_per_shard()
-                    ));
-                }
-            }
-        }
+        check_allocation_map(
+            backing,
+            shard,
+            geometry.units_per_shard(),
+            true,
+            &mut report,
+        )?;
         if envelope.metadata_version == SUPERBLOCK_VERSION_V3 {
             check_discard_map(backing, shard, geometry.units_per_shard(), &mut report)?;
         }
@@ -167,14 +157,16 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             if !check_data_file(backing, idx, &mut report)? {
                 continue;
             }
-            let adoptable = envelope.metadata_version != SUPERBLOCK_VERSION_V3
+            let allocation_ok =
+                check_allocation_map(backing, idx, geometry.units_per_shard(), false, &mut report)?;
+            let discard_ok = envelope.metadata_version != SUPERBLOCK_VERSION_V3
                 || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
             format!(
                 "shard data file {name} (index {idx}) is not in the catalog; {}",
-                if adoptable {
-                    "recovery adopts it"
-                } else {
-                    "invalid discard metadata prevents recovery from adopting it"
+                match (allocation_ok, discard_ok) {
+                    (false, _) => "invalid allocation metadata prevents recovery from adopting it",
+                    (_, false) => "invalid discard metadata prevents recovery from adopting it",
+                    (true, true) => "recovery adopts it",
                 }
             )
         } else {
@@ -187,6 +179,30 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     }
 
     Ok(report)
+}
+
+/// Recovery can start an uncataloged shard with an empty map if neither side
+/// decodes. Any map it actually selects must match the stored geometry.
+fn check_allocation_map(
+    backing: &dyn Backing,
+    shard: u64,
+    units: u64,
+    cataloged: bool,
+    report: &mut CheckReport,
+) -> Result<bool, FormatError> {
+    let store = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
+        .with_max_len(AllocationMap::encoded_len(units));
+    match store.load::<AllocationMap>(backing)? {
+        Some(map) if map.units() != units => report.errors.push(format!(
+            "shard {shard}: allocation map covers {} units, geometry says {units}",
+            map.units()
+        )),
+        None if cataloged => report
+            .errors
+            .push(format!("shard {shard}: no valid allocation map")),
+        _ => return Ok(true),
+    }
+    Ok(false)
 }
 
 /// Recovery opens each cataloged or adoptable shard as a data file.

@@ -276,3 +276,96 @@ fn fast_check_reads_each_discard_copy_once() {
     assert!(check_volume(&backing).unwrap().ok());
     assert_eq!(reads.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+fn orphan_with_a_stored_allocation_map_must_match_the_geometry() {
+    for discard in [false, true] {
+        for map_units in [None, Some(4), Some(8)] {
+            let backing = Arc::new(MemBacking::new());
+            let sb = block();
+            let units = sb.geometry.units_per_shard();
+            assert_eq!(units, 8);
+            if discard {
+                init::create_volume_with_discard(backing.as_ref(), sb).unwrap();
+            } else {
+                init::create_volume(backing.as_ref(), sb).unwrap();
+            }
+            add_orphan(backing.as_ref(), 0, discard.then_some(units));
+            if let Some(map_units) = map_units {
+                AbStore::new(layout::shard_alloc_a(0), layout::shard_alloc_b(0))
+                    .store(backing.as_ref(), &mut AllocationMap::new(map_units))
+                    .unwrap();
+            }
+            let report = check_volume(backing.as_ref()).unwrap();
+            let recoverable = map_units.is_none_or(|size| size == units);
+            assert_eq!(
+                Volume::recover(backing, VolumeOptions::default()).is_ok(),
+                recoverable
+            );
+            assert_eq!(report.ok(), recoverable, "{report:?}");
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("recovery adopts it")),
+                recoverable
+            );
+            if !recoverable {
+                assert!(
+                    report
+                        .errors
+                        .iter()
+                        .any(|e| e.contains("allocation map covers 4 units")),
+                    "{report:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn slot_store_refuses_geometry_that_differs_from_the_superblock() {
+    use maki_core::store::SlotStore;
+    let backing = Arc::new(MemBacking::new());
+    let sb = block();
+    let geometry = sb.geometry.clone();
+    init::create_volume(backing.as_ref(), sb).unwrap();
+    let stale_geometry = Geometry::compute(512, 1024, 512, 2048, 16384, 8192).unwrap();
+    assert_ne!(stale_geometry.slot_size, geometry.slot_size);
+    assert!(matches!(
+        SlotStore::open(backing.clone(), stale_geometry),
+        Err(maki_core::CoreError::Invalid(_))
+    ));
+    SlotStore::open(backing, geometry).unwrap();
+}
+
+#[test]
+fn healthy_slot_store_reads_each_allocation_copy_once() {
+    use maki_core::store::SlotStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let backing = Arc::new(CrashableBacking::new());
+    let sb = block();
+    let geometry = sb.geometry.clone();
+    init::create_volume(backing.as_ref(), sb).unwrap();
+    let mut store = SlotStore::open(backing.clone(), geometry.clone()).unwrap();
+    store.reserve_slot(0).unwrap();
+    drop(store);
+
+    let reads = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let counters = reads.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op| {
+        if let FaultOp::Open { path, .. } = op {
+            for (side, name) in [layout::shard_alloc_a(0), layout::shard_alloc_b(0)]
+                .iter()
+                .enumerate()
+            {
+                if path == name {
+                    counters[side].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        None
+    })));
+    SlotStore::open(backing, geometry).unwrap();
+    assert_eq!(reads.each_ref().map(|n| n.load(Ordering::Relaxed)), [1, 1]);
+}

@@ -109,7 +109,7 @@ impl AbStore {
     }
 
     /// Select the best record and count its valid copies in the same read.
-    pub(crate) fn load_with_copy_count<T: AbRecord>(
+    pub fn load_with_copy_count<T: AbRecord>(
         &self,
         backing: &dyn Backing,
     ) -> Result<(Option<T>, usize), FormatError> {
