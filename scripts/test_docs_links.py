@@ -37,6 +37,32 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "#hashtag guide\n====\n\n[section](#hashtag-guide)\n")
         self.assertEqual(broken_links(self.root), [])
 
+    def test_multiline_code_in_a_heading_keeps_its_rendered_spaces(self):
+        self.write("guide.md", "`hello\nworld`\n===\n\n"
+                   "Two `hello   \n   world` words\n===\n\n"
+                   "Normal   \nbreak\n===\n\n"
+                   "With <i></i>  \ntag\n===\n")
+        self.write("README.md", "[code](guide.md#hello-world) [missing](guide.md#helloworld)\n"
+                   "[padding](guide.md#two-hello----world-words) [normal](guide.md#normalbreak)\n"
+                   "[tag](guide.md#with-tag)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#helloworld (missing anchor)"])
+
+    def test_indented_continuations_in_setext_headings(self):
+        self.write("guide.md", "First `hello\n    world` second\n===\n\n"
+                   "Alpha `begin\n\tmiddle\nend`\n===\n\n"
+                   "> Quote `a\n>     b`\n> ===\n\n"
+                   "- Item `a\n      b`\n  ===\n")
+        self.write("README.md", "[first](guide.md#first-hello-world-second)\n"
+                   "[middle](guide.md#alpha-begin-middle-end) [tail](guide.md#end)\n"
+                   "[quoted](guide.md#quote-a-b) [listed](guide.md#item-a-b)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:2: guide.md#end (missing anchor)"])
+
+    def test_indented_code_after_block_boundary_is_literal(self):
+        self.write("guide.md", "Before\n***\n    [code](missing.md)\n    Code heading\n===\n\n"
+                   "After\n\n\t[example](absent.md)\nReal title\n---\n")
+        self.write("README.md", "[real](guide.md#real-title) [literal](guide.md#code-heading)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#code-heading (missing anchor)"])
+
     def test_table_cells_cannot_hide_a_link_in_another_cell_or_row(self):
         self.write("README.md", "| Token | Link | Token |\n| --- | --- | --- |\n"
                    "| ` | [one](missing.md) | ` |\n\n"
