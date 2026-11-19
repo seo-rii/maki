@@ -28,6 +28,59 @@ class DocumentationLinks(unittest.TestCase):
             )
         return path
 
+    def test_plain_markdown_links_address_source_lines(self):
+        self.write("guide.md", "# Guide\n\nLast line")
+        self.write("README.md", "[one](guide.md?plain=1#L3) [range](guide.md?a=b&plain=1#L1-L3)\n"
+                   "[next](guide.md?plain=1#L4) [backwards](guide.md?plain=1#L3-L2)\n"
+                   "[rendered](guide.md?plain=0#guide) [wrong view](guide.md?plain=0#L1)\n"
+                   "[heading in source](guide.md?plain=1#guide) [empty](guide.md?plain=1)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: guide.md?plain=1#L4 (missing line)",
+            "README.md:2: guide.md?plain=1#L3-L2 (missing line)",
+            "README.md:3: guide.md?plain=0#L1 (missing anchor)",
+        ])
+
+    def test_uri_autolinks_hide_link_shapes_inside_the_url(self):
+        self.write("README.md", "See <https://example.org/[a](example.pdf)/[b][unused]> "
+                   "and [guide](missing.md).\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
+
+    def test_inline_markup_can_start_a_setext_heading(self):
+        self.write("README.md", "<https://example.org>\n===\n\n<kbd>Enter</kbd> key\n---\n\n"
+                   "<div>Hidden</div>\n===\n\n"
+                   "[url](#httpsexampleorg) [key](#enter-key) [absent](#hidden)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:10: #hidden (missing anchor)"])
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_direct_links_through_a_tracked_directory_alias(self):
+        self.write("docs/guide.md", "# Setup\n")
+        self.write(".gitignore", "/local/\n")
+        self.write("README.md", "[valid](manual/guide.md#setup) [broken](manual/guide.md#absent)\n"
+                   "[ignored](local/guide.md) [missing](manual/absent.md)\n")
+        (self.root / "manual").symlink_to("docs", target_is_directory=True)
+        (self.root / "local").mkdir()
+        (self.root / "local/guide.md").symlink_to("../docs/guide.md")
+        git = ["git", "-C", self.root]
+        subprocess.run([*git, "add", "manual"], check=True)
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "tracked directory alias"], check=True)
+        with tempfile.TemporaryDirectory() as temp:
+            clone = Path(temp) / "clone"
+            subprocess.run(["git", "clone", "--quiet", self.root, clone], check=True)
+            for checkout in [self.root, clone]:
+                self.assertEqual(broken_links(checkout), [
+                    "README.md:1: manual/guide.md#absent (missing anchor)",
+                    "README.md:2: local/guide.md", "README.md:2: manual/absent.md",
+                ])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte filenames")
+    def test_percent_encoded_filenames_keep_the_original_bytes(self):
+        self.write(os.fsdecode(b"notes\xff.txt"), "notes")
+        self.write("notes�.txt", "replacement")
+        self.write("README.md", "[bytes](notes%FF.txt) [utf8](notes%EF%BF%BD.txt) "
+                   "[missing](notes%FE.txt)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: notes%FE.txt"])
+
     def test_rooted_links_and_external_scheme_case(self):
         self.write("GUIDE.MD", "# Welcome\n")
         self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"
