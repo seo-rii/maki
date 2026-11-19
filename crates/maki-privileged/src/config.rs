@@ -123,6 +123,14 @@ impl AttachConfig {
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
         // the VG and LV with a hyphen and doubles every hyphen in either name.
         let vg = &request.vg_name;
+        #[cfg(target_os = "linux")]
+        if std::fs::metadata(std::path::Path::new("/dev").join(vg))
+            .is_ok_and(|entry| !entry.is_dir())
+        {
+            return Err(ConfigError::Invalid(
+                "vg_name conflicts with a non-directory entry under /dev".into(),
+            ));
+        }
         let lv = &request.lv_name;
         let hyphens = vg.bytes().chain(lv.bytes()).filter(|&b| b == b'-').count();
         if vg.len() + lv.len() + 1 + hyphens > 127 {

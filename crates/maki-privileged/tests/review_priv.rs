@@ -754,3 +754,28 @@ fn attach_checks_mount_components_in_bytes_against_the_host_filesystem() {
         assert_eq!(result.is_ok(), ok, "{result:?}");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_refuses_volume_groups_that_name_device_nodes() {
+    let request = |vg: &str| {
+        AttachConfig::default().into_request(
+            "audit",
+            AttachOverrides {
+                vg_name: Some(vg.into()),
+                ..Default::default()
+            },
+            false,
+        )
+    };
+    for vg in ["null", "zero"] {
+        assert!(request(vg).unwrap_err().to_string().contains("vg_name"));
+    }
+    if std::path::Path::new("/dev/shm").is_dir() {
+        assert!(
+            request("shm").is_ok(),
+            "existing directories can be active VGs"
+        );
+    }
+    assert!(request("vg_maki_new_group").is_ok());
+}
