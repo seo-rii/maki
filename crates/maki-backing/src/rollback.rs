@@ -555,6 +555,36 @@ impl State {
         }
     }
 
+    fn open_file(&mut self, name: &str, create: bool) -> io::Result<u64> {
+        self.directory(path::parent(name))?;
+        let id = match self.entries.get(name) {
+            Some(Entry::File(id)) => *id,
+            Some(Entry::Directory) => {
+                return Err(io::Error::new(io::ErrorKind::IsADirectory, name))
+            }
+            None if create => {
+                if self.entries.len() >= MAX_ENTRIES {
+                    return Err(no_space());
+                }
+                if self.files.len() >= MAX_ENTRIES {
+                    self.reclaim_closed_files()?;
+                }
+                if self.files.len() >= MAX_ENTRIES {
+                    return Err(no_space());
+                }
+                let id = self.next_id;
+                self.next_id = id
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("file identity exhausted"))?;
+                self.files.insert(id, Node::default());
+                self.entries.insert(name.to_owned(), Entry::File(id));
+                id
+            }
+            None => return Err(missing()),
+        };
+        Ok(id)
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     fn coordinates(&self) -> BTreeSet<(u64, u64)> {
         self.committed
@@ -934,30 +964,7 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        state.directory(path::parent(name))?;
-        let id = match state.entries.get(name) {
-            Some(Entry::File(id)) => *id,
-            Some(Entry::Directory) => return Err(input("cannot open a directory as a file")),
-            None if create => {
-                if state.entries.len() >= MAX_ENTRIES {
-                    return Err(no_space());
-                }
-                if state.files.len() >= MAX_ENTRIES {
-                    state.reclaim_closed_files()?;
-                }
-                if state.files.len() >= MAX_ENTRIES {
-                    return Err(no_space());
-                }
-                let id = state.next_id;
-                state.next_id = id
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("file identity exhausted"))?;
-                state.files.insert(id, Node::default());
-                state.entries.insert(name.to_owned(), Entry::File(id));
-                id
-            }
-            None => return Err(missing()),
-        };
+        let id = state.open_file(name, create)?;
         *state.handles.entry(id).or_default() += 1;
         Ok(Arc::new(CowFile {
             state: self.state.clone(),
@@ -1067,12 +1074,14 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        if !state.locks.insert(name.to_owned()) {
+        if state.locks.contains(name) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "volume already attached",
             ));
         }
+        state.open_file(name, true)?;
+        state.locks.insert(name.to_owned());
         Ok(Box::new(CowLock {
             state: self.state.clone(),
             path: name.to_owned(),
