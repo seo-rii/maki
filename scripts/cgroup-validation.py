@@ -244,6 +244,22 @@ socket = "/case/control.sock"
         return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier],
                               timeout=timeout).stdout)
 
+    def wait_for_oom(self):
+        until = time.monotonic() + 10
+        while (remaining := until - time.monotonic()) > 0:
+            try:
+                state = self.state(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                break
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            if not state["Running"]:
+                require_oom(state)
+                return state
+            time.sleep(min(0.1, remaining))
+        raise TimeoutError("container OOM was not observed within 10 seconds")
+
     def create(self, memory, cpus, command, extra=()):
         ensure(self.identifier is None, "previous owned container has not been removed")
         self.serial += 1
@@ -452,11 +468,7 @@ def campaign(args):
                     record["pressure_client"] = target.client("pressure", check=False)
                     record["pressure_progress"] = json.loads(target.ledger.with_name("pressure-progress.json").read_text())
                     require_pressure(record["pressure_progress"])
-                    until = time.monotonic() + 10
-                    while target.state()["Running"] and time.monotonic() < until:
-                        time.sleep(0.1)
-                    record["termination"] = target.state()
-                    require_oom(record["termination"])
+                    record["termination"] = target.wait_for_oom()
                 target.remove()
                 if scenario == "memory-oom":
                     # A safe recovery result is separate from availability at
