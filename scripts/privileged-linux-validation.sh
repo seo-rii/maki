@@ -241,6 +241,7 @@ nbd_connection_id=""
 helper_cleanup_needed=false
 mount_active=false
 vg_created=false
+lv_created=false
 pv_created=false
 cleanup_safe=true
 volume_name="privval-$(id -u)-$$"
@@ -355,9 +356,17 @@ cleanup() {
         fi
 
         if [[ "$cleanup_safe" == true ]]; then
-            if [[ "$vg_created" == true ]]; then
+            if [[ "$lv_created" == true ]]; then
                 test_nbd_action activate-vg --vg "$vg_name" >/dev/null 2>&1 || true
-                test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name" >/dev/null 2>&1 || true
+                if test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name" >/dev/null 2>&1; then
+                    lv_created=false
+                else
+                    log "cleanup warning: preserving lower layers after LV removal failed"
+                    cleanup_safe=false
+                    cleanup_rc=1
+                fi
+            fi
+            if [[ "$vg_created" == true && "$cleanup_safe" == true ]]; then
                 if test_nbd_action remove-vg --vg "$vg_name" >/dev/null 2>&1; then
                     vg_created=false
                 else
@@ -366,7 +375,7 @@ cleanup() {
                     cleanup_rc=1
                 fi
             fi
-            if [[ "$pv_created" == true ]]; then
+            if [[ "$pv_created" == true && "$cleanup_safe" == true ]]; then
                 if test_nbd_action remove-pv >/dev/null 2>&1; then
                     pv_created=false
                 else
@@ -382,7 +391,7 @@ cleanup() {
         fi
     fi
 
-    if ! disconnect_test_nbd; then
+    if [[ "$cleanup_safe" == true ]] && ! disconnect_test_nbd; then
         cleanup_safe=false
         cleanup_rc=1
     fi
@@ -862,6 +871,7 @@ sudo -n pvcreate --yes --force "$device"
 pv_created=true
 sudo -n vgcreate "$vg_name" "$device"
 vg_created=true
+lv_created=true
 sudo -n lvcreate --yes -L "$LV_SIZE" -n "$lv_name" "$vg_name"
 # The invoking user deliberately opens the log file.
 # shellcheck disable=SC2024
@@ -1032,6 +1042,7 @@ log "removing the disposable LVM metadata"
 connect_test_nbd
 test_nbd_action activate-vg --vg "$vg_name"
 test_nbd_action remove-lv --vg "$vg_name" --lv "$lv_name"
+lv_created=false
 test_nbd_action remove-vg --vg "$vg_name"
 vg_created=false
 test_nbd_action remove-pv

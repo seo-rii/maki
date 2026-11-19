@@ -68,6 +68,8 @@ def command(arguments, **kwargs):
     if arguments[0] in ("vgchange", "lvremove", "vgremove", "pvremove"):
         assert (root / "locked").exists(), "LVM mutation outside attach lock"
         record(["lvm", *arguments])
+        if os.environ.get("FAIL_REMOVAL") == arguments[0]:
+            return subprocess.CompletedProcess(arguments, 5)
         if os.environ.get("REPLACE_AFTER_LVM") == arguments[0]:
             (sysfs / "backend").write_text("foreign\\n")
         return subprocess.CompletedProcess(arguments, 0)
@@ -149,6 +151,7 @@ lv_name=data
 mount_active=false
 mountpoint=""
 vg_created=false
+lv_created=false
 pv_created=false
 cleanup_safe=true
 nbdkit_pid=fixture
@@ -239,7 +242,7 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
 
     def test_cleanup_reconnects_and_removes_only_owned_lvm(self):
         result, calls = self.run_case(attempt=False, full_cleanup=True,
-                                      before="vg_created=true\npv_created=true")
+                                      before="lv_created=true\nvg_created=true\npv_created=true")
         self.assertEqual(result.returncode, 0, result.stderr)
         connects = [call[1] for call in calls if call[0] == "connect"]
         self.assertEqual(len(connects), 1)
@@ -248,17 +251,30 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
         self.assertEqual([call for call in calls if call[0] == "disconnect"],
                          [["disconnect", connects[0]]])
 
+    def test_failed_lvm_removal_preserves_the_lower_storage_layers(self):
+        for removal in ("lvremove", "vgremove", "pvremove"):
+            with self.subTest(removal=removal):
+                self.calls.write_text("")
+                self.sysfs.joinpath("pid").unlink(missing_ok=True)
+                self.sysfs.joinpath("backend").unlink(missing_ok=True)
+                result, calls = self.run_case(attempt=False, full_cleanup=True,
+                    before=f"export FAIL_REMOVAL={removal}\nlv_created=true\nvg_created=true\npv_created=true")
+                self.assertNotEqual(result.returncode, 0)
+                lvm = [call[1] for call in calls if call[0] == "lvm"]
+                self.assertEqual(lvm[-1], removal)
+                self.assertFalse(any(call[0] in ("disconnect", "stop") for call in calls), calls)
+
     def test_cleanup_refuses_foreign_backend_before_lvm_or_disconnect(self):
         self.device_state("foreign")
         result, calls = self.run_case(attempt=False, full_cleanup=True,
-                                      before="vg_created=true\npv_created=true")
+                                      before="lv_created=true\nvg_created=true\npv_created=true")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any(call[0] in ("connect", "disconnect", "lvm", "stop")
                              for call in calls), calls)
 
     def test_cleanup_reconnect_partial_failure_disconnects_own_backend(self):
         result, calls = self.run_case("failed-own", attempt=False, full_cleanup=True,
-                                      before="vg_created=true\npv_created=true")
+                                      before="lv_created=true\nvg_created=true\npv_created=true")
         self.assertNotEqual(result.returncode, 0)
         identifier = next(call[1] for call in calls if call[0] == "connect")
         self.assertEqual([call for call in calls if call[0] == "disconnect"],
