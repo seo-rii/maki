@@ -235,6 +235,42 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
             campaign.require_pressure({"completed": 0, "attempted": 0})
         campaign.require_pressure({"completed": 3, "attempted": 4})
 
+    def test_initial_docker_failure_leaves_a_failed_campaign_report(self):
+        for step in ("info", "image"):
+            with self.subTest(step=step):
+                output = self.ledger.parent / step
+                info = mock.Mock(stdout=campaign.json.dumps(dict(
+                    CgroupVersion="2", MemoryLimit=True, SwapLimit=True, CpuCfsQuota=True,
+                    PidsLimit=True, ServerVersion="fixture")))
+                failure = RuntimeError(f"{step} unavailable")
+                commands = [failure] if step == "info" else [info, failure]
+                with mock.patch.object(campaign, "run", side_effect=commands):
+                    with self.assertRaisesRegex(RuntimeError, str(failure)):
+                        campaign.campaign(argparse.Namespace(output=output, image="fixture"))
+                report = campaign.json.loads((output / "results.json").read_text())
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["cases"], [])
+                self.assertIn(str(failure), report["error"])
+
+    def test_constrained_oom_at_deadline_or_during_final_stats(self):
+        stopped = {"Running": False, "OOMKilled": True, "ExitCode": 137, "Pid": 0}
+        for timing in ("deadline", "stats", "kill"):
+            with self.subTest(timing=timing):
+                target = mock.Mock()
+                target.start.side_effect = TimeoutError("no READY")
+                target.state.side_effect = [stopped] if timing == "deadline" else [
+                    {"Running": True}, stopped]
+                if timing == "stats":
+                    target.stats.side_effect = FileNotFoundError("PID has exited")
+                if timing == "kill":
+                    target.kill.side_effect = RuntimeError("container already exited")
+                result = campaign.constrained_recovery(target)
+                self.assertEqual(result["outcome"], "startup-oom")
+                self.assertEqual(result["termination"], stopped)
+                if timing == "deadline":
+                    target.stats.assert_not_called()
+                target.remove.assert_called_once_with()
+
     def test_constrained_startup_timeout_is_recorded_as_unavailable(self):
         target = mock.Mock()
         target.start.side_effect = TimeoutError("no READY")
