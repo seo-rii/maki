@@ -217,8 +217,13 @@ class Fixture:
         self.files = fixture_units(self.volume, self.directory, helper)
         self.linked = []
         self.reload_pending = False
+        self.wait_deadline = None
 
     def ctl(self, *arguments, check=True, timeout=20):
+        if self.wait_deadline is not None:
+            timeout = min(timeout, self.wait_deadline - time.monotonic())
+            if timeout <= 0:
+                raise AssertionError("timed out waiting for unit state")
         result = subprocess.run([SYSTEMCTL, "--no-ask-password", *arguments],
                                 capture_output=True, text=True, timeout=timeout)
         if check and result.returncode:
@@ -240,11 +245,18 @@ class Fixture:
         return sum(record["event"] == name for record in self.events())
 
     def wait(self, condition, label, timeout=18):
-        until = time.monotonic() + timeout
-        while time.monotonic() < until:
-            if condition():
-                return
-            time.sleep(0.1)
+        self.wait_deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < self.wait_deadline:
+                ready = condition()
+                remaining = self.wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if ready:
+                    return
+                time.sleep(min(0.1, remaining))
+        finally:
+            self.wait_deadline = None
         raise AssertionError(f"timed out: {label}")
 
     def install(self):
@@ -470,7 +482,11 @@ def main():
                         fixture.cleanup()
                     except Exception as retry_error:
                         result["cleanup_retry_error"] = str(retry_error)
-            result["events"] = fixture.events()
+            try:
+                result["events"] = fixture.events()
+            except (OSError, ValueError) as error:
+                result["status"] = "failed"
+                result["events_error"] = str(error)
             results.append(result)
             save_json(output / "results.json", results)
         print(f"{result['status'].upper()} {mode}", flush=True)

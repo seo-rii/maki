@@ -51,6 +51,49 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                     "workload-stop", "cleanup-stop", "cleanup-refused",
                 ), "inactive", states={"attach": "failed", "daemon": "active"}, resource=True)
 
+    def test_wait_rejects_a_late_success_and_bounds_each_systemctl_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "normal-stop")
+            now = [0.0]
+            budgets = []
+
+            def slow_show(command, **kwargs):
+                budgets.append(kwargs["timeout"])
+                now[0] += 10
+                return subprocess.CompletedProcess(command, 0, "ActiveState=active", "")
+
+            with patch.object(fixture.time, "monotonic", side_effect=lambda: now[0]), \
+                    patch.object(subprocess, "run", side_effect=slow_show):
+                with self.assertRaisesRegex(AssertionError, "timed out"):
+                    case.wait(lambda: all(case.state(unit) == "active" for unit in ("target", "workload")),
+                              "both units active", timeout=18)
+                case.state("daemon")
+            self.assertEqual(budgets, [18, 8, 20])
+
+    def test_corrupt_events_are_reported_even_if_verification_already_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            helper = root / "helper"
+            helper.touch(mode=0o700)
+
+            def install(case):
+                (case.directory / "events.jsonl").write_text('{"event":\n')
+
+            with (patch.object(fixture.sys, "argv", ["fixture", "--disposable-host", "--helper-binary",
+                                                      str(helper), "--output", str(output)]),
+                  patch.object(fixture.os, "geteuid", return_value=0, create=True),
+                  patch.object(fixture.sys, "platform", "linux"),
+                  patch.object(fixture, "CASES", ("normal-stop",)),
+                  patch.object(fixture.Fixture, "install", install),
+                  patch.object(fixture.Fixture, "verify", side_effect=RuntimeError("verification failed")),
+                  patch.object(fixture.Fixture, "diagnostics")):
+                self.assertEqual(fixture.main(), 1)
+            result, = fixture.json.loads((output / "results.json").read_text())
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["error"], "verification failed")
+            self.assertIn("Expecting value", result["events_error"])
+
     def test_normal_stop_requires_cleanup_before_daemon_stop(self):
         prefix = ("daemon-start", "attach-start", "attach-ready", "workload-start",
                   "workload-stop", "cleanup-stop")
