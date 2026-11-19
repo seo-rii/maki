@@ -209,6 +209,19 @@ class CycleBoundaryContracts(unittest.TestCase):
                 with self.subTest(profile=profile, cycles=cycles):
                     self.run_local_campaign(cycles, profile)
 
+    def test_initial_resource_failure_leaves_private_error_report(self):
+        args = self.campaign_args(2, "v2")
+        with mock.patch.object(self.host, "resource_identity", side_effect=RuntimeError("describe failed")):
+            with self.assertRaisesRegex(RuntimeError, "describe failed"):
+                self.host.campaign(args)
+        report = args.output / "results.json"
+        result = json.loads(report.read_text())
+        self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(result["passed"])
+        self.assertIsNone(result["resource_identity"])
+        self.assertIn("describe failed", result["error"])
+        self.assertEqual(result["boots"], [])
+
     def test_campaign_65_is_rejected_before_resource_lookup(self):
         for profile in ("v2", "v3-discard"):
             with self.subTest(profile=profile):

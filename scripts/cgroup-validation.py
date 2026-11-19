@@ -94,12 +94,13 @@ def require_pressure(progress):
 
 class Nbd:
     """Small libnbd synchronous client, always run in a deadline-bound child."""
-    def __init__(self, path):
+    def __init__(self, path, connected_fd=None):
         self.lib = ctypes.CDLL("libnbd.so.0")
         signatures = {
             "create": (ctypes.c_void_p, []),
             "get_error": (ctypes.c_char_p, []),
             "connect_unix": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_char_p]),
+            "connect_socket": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_int]),
             "can_fua": (ctypes.c_int, [ctypes.c_void_p]),
             "can_flush": (ctypes.c_int, [ctypes.c_void_p]),
             "pwrite": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint64, ctypes.c_uint32]),
@@ -113,9 +114,23 @@ class Nbd:
         self.handle = self.lib.nbd_create()
         if not self.handle:
             raise RuntimeError("libnbd handle allocation failed")
-        self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(path)))
-        ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA required")
-        ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
+        try:
+            if connected_fd is None:
+                self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(path)))
+            else:
+                # Queue the connection on the frozen server's socket before
+                # telling the controller to start its observation interval.
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(os.fsencode(path))
+                    os.write(connected_fd, b"C")
+                    os.close(connected_fd)
+                    self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
+                    client.detach()  # libnbd owns the descriptor on success
+            ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA required")
+            ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
+        except BaseException:
+            self.close()
+            raise
 
     def check(self, result):
         if result < 0:
@@ -138,7 +153,7 @@ class Nbd:
 
 
 def client_main(args):
-    client = Nbd(args.socket)
+    client = Nbd(args.socket, args.connected_fd)
     try:
         if args.mode == "verify":
             print(json.dumps({"verified_units": verify(client, args.ledger, args.rounds)}))
@@ -225,8 +240,9 @@ socket = "/case/control.sock"
                 "--cpus", cpus, "--label", "maki.failure-validation=" + self.token,
                 "--mount", f"type=bind,src={self.case},dst=/case"]
 
-    def state(self):
-        return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier]).stdout)
+    def state(self, timeout=45):
+        return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier],
+                              timeout=timeout).stdout)
 
     def create(self, memory, cpus, command, extra=()):
         ensure(self.identifier is None, "previous owned container has not been removed")
@@ -242,7 +258,6 @@ socket = "/case/control.sock"
             (self.case / name).unlink(missing_ok=True)
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.notify.bind(str(self.case / "ready.sock"))
-        self.notify.settimeout(0.1)
         # Maki is PID 1: no shell, init, sidecar or stress helper is the OOM victim.
         self.create(memory, cpus, [
             "nbdkit", "--foreground", "--threads", "4", "-U", "/case/nbd.sock",
@@ -250,13 +265,21 @@ socket = "/case/control.sock"
         ], extra=["--env", "NOTIFY_SOCKET=/case/ready.sock"])
         run(["docker", "start", self.identifier])
         until = time.monotonic() + 30
-        while time.monotonic() < until:
+        while (remaining := until - time.monotonic()) > 0:
+            self.notify.settimeout(min(0.1, remaining))
             try:
                 if b"READY=1" in self.notify.recv(4096).splitlines():
                     return
             except socket.timeout:
                 pass
-            if not self.state()["Running"]:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                state = self.state(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                break
+            if not state["Running"]:
                 raise RuntimeError("native startup failed before READY")
         raise TimeoutError("native startup did not announce READY")
 
@@ -302,6 +325,29 @@ socket = "/case/control.sock"
             ensure(json.loads(result.stdout)["verified_units"] == 136, "incomplete recovery readback")
         return record
 
+    def freeze_and_resume(self, directory, start_epoch):
+        before = self.ledger.read_bytes()
+        run(["docker", "pause", self.identifier])
+        receiver, sender = socket.socketpair()
+        with receiver, sender, (directory / "paused-client.log").open("w") as stream:
+            command = self.client_command("write", start_epoch=start_epoch)
+            descriptor = sender.fileno()
+            child = subprocess.Popen([*command, "--connected-fd", str(descriptor)],
+                                     pass_fds=(descriptor,), stdout=stream, stderr=subprocess.STDOUT)
+            sender.close()
+            try:
+                receiver.settimeout(30)
+                ensure(receiver.recv(1) == b"C", "client did not connect to the paused server")
+                time.sleep(0.5)
+                ensure(child.poll() is None, "paused server unexpectedly completed client")
+                ensure(self.ledger.read_bytes() == before, "paused server produced a durable ACK")
+                run(["docker", "unpause", self.identifier])
+                ensure(child.wait(timeout=120) == 0, "resumed client failed")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
     def kill(self):
         run(["docker", "kill", "--signal", "KILL", self.identifier])
         run(["docker", "wait", self.identifier])
@@ -317,10 +363,17 @@ socket = "/case/control.sock"
         if self.identifier is None:
             return
         state = self.state()
-        if state.get("Paused"):
-            run(["docker", "unpause", self.identifier])
-        if self.state()["Running"]:
-            self.kill()
+        if state["Running"]:
+            try:
+                if state.get("Paused"):
+                    run(["docker", "unpause", self.identifier])
+                run(["docker", "kill", "--signal", "KILL", self.identifier])
+                run(["docker", "wait", self.identifier])
+            except (RuntimeError, subprocess.TimeoutExpired):
+                # The container can exit between inspect and unpause/kill.
+                # Only continue cleanup once Docker confirms it has stopped.
+                if self.state()["Running"]:
+                    raise
         # Logs are inspected/saved only after the container process has exited.
         try:
             output = run(["docker", "logs", "--tail", "60", self.identifier])
@@ -380,21 +433,8 @@ def campaign(args):
                     ensure(int(cpu["nr_throttled"]) > 0, "no observed CPU throttling")
                     record["termination"] = target.kill()
                 elif scenario == "freeze-resume":
-                    before = target.ledger.read_bytes()
-                    run(["docker", "pause", target.identifier])
-                    with (directory / "paused-client.log").open("w") as stream:
-                        command = target.client_command("write", start_epoch=args.rounds)
-                        child = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT)
-                        try:
-                            time.sleep(0.5)
-                            ensure(child.poll() is None, "paused server unexpectedly completed client")
-                            ensure(target.ledger.read_bytes() == before, "paused server produced a durable ACK")
-                            run(["docker", "unpause", target.identifier])
-                            ensure(child.wait(timeout=120) == 0, "resumed client failed")
-                        finally:
-                            if child.poll() is None:
-                                child.kill()
-                                child.wait(timeout=5)
+                    target.freeze_and_resume(directory, args.rounds)
+                    record["connected_while_paused"] = True
                     record["pause_seconds"] = 0.5
                     record["termination"] = target.kill()
                 else:
@@ -442,6 +482,7 @@ def main():
     parser.add_argument("--start-epoch", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--socket", help=argparse.SUPPRESS)
+    parser.add_argument("--connected-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--ledger", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("write", "verify", "pressure"), help=argparse.SUPPRESS)
     args = parser.parse_args()

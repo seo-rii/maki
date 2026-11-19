@@ -43,6 +43,8 @@ class BackgroundStorageTests(unittest.TestCase):
                 for name in selected:
                     executable = self.root / (name + "-build")
                     executable.write_bytes(b"frozen fixture")
+                    events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(executable),
+                                              "library_path": "/fixture/lib"}))
                     events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
                                               "executable": str(executable)}))
                 log.write_text("\n".join(events))
@@ -52,7 +54,7 @@ class BackgroundStorageTests(unittest.TestCase):
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target"),
                   "profile": "rollback"}
-        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version")), \
+        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
                 mock.patch.object(self.runner, "run_child", side_effect=child):
             binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
         self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
@@ -91,6 +93,8 @@ class BackgroundStorageTests(unittest.TestCase):
                 for name in groups[package]:
                     artifact = self.root / (name + "-built")
                     artifact.write_bytes(b"fixture binary")
+                    events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(artifact),
+                                              "library_path": "/fixture/lib"}))
                     events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
                                               "executable": str(artifact)}))
                 log.write_text("\n".join(events))
@@ -101,7 +105,7 @@ class BackgroundStorageTests(unittest.TestCase):
             return result
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target")}
-        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version")), \
+        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
                 mock.patch.object(self.runner, "suite_groups", return_value=groups), \
                 mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]), \
                 mock.patch.object(self.runner, "run_child", side_effect=child):
@@ -277,6 +281,29 @@ class BackgroundStorageTests(unittest.TestCase):
             process.wait.assert_called_once()
             process.reset_mock()
 
+    def test_frozen_dynamically_linked_test_runs_with_cargos_runtime_libraries(self):
+        source = self.root / "source"
+        (source / "tests").mkdir(parents=True)
+        (source / "Cargo.toml").write_text(
+            '[package]\nname="fixture"\nversion="0.0.0"\nedition="2021"\n')
+        (source / "Cargo.lock").write_text('version=3\n[[package]]\nname="fixture"\nversion="0.0.0"\n')
+        (source / "tests/campaign.rs").write_text("#[test] fn passes() {}\n")
+        directory = self.root / "run with spaces"
+        directory.mkdir()
+        self.runner.save_json(directory / "config.json", {
+            "source": str(source), "target_dir": str(directory / "target"), "revision": "fixture",
+            "rounds": 1, "max_seconds": 60, "suite_timeout": 20,
+        })
+        environment = dict(os.environ, RUSTFLAGS="-C prefer-dynamic")
+        environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        environment.pop("LD_LIBRARY_PATH", None)
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(self.runner, "suite_groups", return_value={"fixture": ("campaign",)}):
+            self.assertEqual(self.runner.worker(directory), 0)
+        manifest = json.loads((directory / "binaries.json").read_text())
+        self.assertTrue(manifest["campaign"]["library_path"])
+        self.assertEqual(json.loads((directory / "status.json").read_text())["passed_tests"], 1)
+
     def test_cargo_records_same_compiler_and_wrappers_used_for_suite_build(self):
         source = self.root / "source"
         (source / "tests").mkdir(parents=True)
@@ -367,6 +394,8 @@ class BackgroundStorageTests(unittest.TestCase):
                     for name in groups[package]:
                         artifact = directory / (name + "-built")
                         artifact.write_bytes(b"fixture binary")
+                        events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(artifact),
+                                                  "library_path": "/fixture/lib"}))
                         events.append(json.dumps({"reason": "compiler-artifact",
                                                   "target": {"name": name},
                                                   "executable": str(artifact)}))
@@ -376,7 +405,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 return {"exit_code": 0, "reason": "exited"}
 
             with mock.patch.dict(os.environ, inherited), \
-                    mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version")), \
+                    mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
                     mock.patch.object(self.runner, "run_child", side_effect=child):
                 self.runner.prepare(directory, config, time.monotonic() + 30)
                 self.assertEqual(os.environ["CARGO_BUILD_BUILD_DIR"], inherited["CARGO_BUILD_BUILD_DIR"])
@@ -533,7 +562,7 @@ class BackgroundStorageTests(unittest.TestCase):
                             (directory / "STOP").touch()
                     return result
 
-                def child(_command, _cwd, log, _stop, _timeout):
+                def child(_command, _cwd, log, _stop, _timeout, env=None):
                     log.write_text("test result: ok. 1 passed; 0 failed; 0 ignored; "
                                    "0 measured; 0 filtered out;\n")
                     return {"exit_code": 0, "reason": "exited", "seconds": 0}
@@ -591,7 +620,7 @@ class BackgroundStorageTests(unittest.TestCase):
                         published.append(json.loads(source.read_text())["state"])
                     original_replace(source, target)
 
-                def child(_command, _cwd, log, _stop, _timeout):
+                def child(_command, _cwd, log, _stop, _timeout, env=None):
                     log.write_text("test result: ok. 1 passed; 0 failed; 0 ignored; "
                                    "0 measured; 0 filtered out;\n")
                     return {"exit_code": 0, "reason": "exited", "seconds": 0}

@@ -18,6 +18,11 @@ import sys
 import time
 import uuid
 
+try:
+    from campaign_io import save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import save_json
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -211,6 +216,7 @@ class Fixture:
         self.units = names(self.volume)
         self.files = fixture_units(self.volume, self.directory, helper)
         self.linked = []
+        self.reload_pending = False
 
     def ctl(self, *arguments, check=True, timeout=20):
         result = subprocess.run([SYSTEMCTL, "--no-ask-password", *arguments],
@@ -261,8 +267,20 @@ class Fixture:
         self.ctl("daemon-reload")
 
     def cleanup(self):
-        if not self.linked:
-            return
+        if self.linked and not self.reload_pending:
+            self.stop_units()
+            self.reload_pending = True
+        while self.linked:
+            destination, source = self.linked[0]
+            if not destination.is_symlink() or destination.resolve() != source.resolve():
+                raise RuntimeError("fixture link identity changed; refusing removal")
+            destination.unlink()
+            self.linked.pop(0)
+        if self.reload_pending:
+            self.ctl("daemon-reload")
+            self.reload_pending = False
+
+    def stop_units(self):
         # Remove automatic transitions before stopping these exact instances.
         # Otherwise a still-running failure scenario could restart itself while
         # the test removes its files. Nothing outside this owned list is touched.
@@ -279,11 +297,6 @@ class Fixture:
         if remaining:
             raise RuntimeError(f"fixture units did not stop: {remaining}; {result.stderr[-1000:]}")
         self.ctl("reset-failed", *installed, check=False)
-        for destination, source in self.linked:
-            if not destination.is_symlink() or destination.resolve() != source.resolve():
-                raise RuntimeError("fixture link identity changed; refusing removal")
-            destination.unlink()
-        self.ctl("daemon-reload")
 
     def diagnostics(self):
         status = self.ctl("show", "--property=ActiveState", "--property=Result",
@@ -451,9 +464,15 @@ def main():
             except Exception as error:
                 result["status"] = "failed"
                 result["cleanup_error"] = str(error)
+                if fixture.reload_pending:
+                    # Stopping succeeded. Retry the remaining links and final reload once.
+                    try:
+                        fixture.cleanup()
+                    except Exception as retry_error:
+                        result["cleanup_retry_error"] = str(retry_error)
             result["events"] = fixture.events()
             results.append(result)
-            (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            save_json(output / "results.json", results)
         print(f"{result['status'].upper()} {mode}", flush=True)
         if result["status"] != "passed":
             return 1

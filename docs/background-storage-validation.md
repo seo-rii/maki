@@ -77,9 +77,11 @@ The snapshot is compiled offline with `Cargo.lock` and at most two build jobs.
 Both Cargo output and intermediate directories are private to that campaign,
 overriding inherited environment and Cargo configuration paths so a
 different source snapshot cannot supply cached test binaries. Missing cached
-dependencies fail the run. Executables are copied into the private directory;
-`binaries.json` records their hashes and enumerated test counts. Do not edit the
-snapshot, copied runner or binaries of a running job.
+dependencies fail the run. Executables are copied into the private directory.
+`binaries.json` records each hash, enumerated test count and the dynamic library
+search path Cargo selected for that suite. The supervisor uses the same search
+path for enumeration and every round. Do not edit the snapshot, copied runner
+or binaries of a running job.
 
 `status.json` records the current suite, completed rounds, passed test invocations,
 errors and final exit code. `results.jsonl` records successful suite invocations.
