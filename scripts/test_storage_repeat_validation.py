@@ -209,6 +209,23 @@ class BackgroundStorageTests(unittest.TestCase):
                 self.assertEqual(report["passed_tests"], 0)
                 self.assertIn("preparation deadline", report["error"])
 
+    def test_cancel_only_marks_a_valid_live_campaign(self):
+        directory = self.root / "run"
+        directory.mkdir()
+        command = [sys.executable, "-B", self.runner.__file__, "cancel", "--run-dir", str(directory)]
+        result = subprocess.run(command, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((directory / "STOP").exists())
+        controller = {"pid": os.getpid(), "identity": self.runner.process_identity(os.getpid()),
+                      "run_dir": str(self.root)}
+        self.runner.save_json(directory / "controller.json", controller)
+        self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        self.assertFalse((directory / "STOP").exists())
+        controller["run_dir"] = str(directory)
+        self.runner.save_json(directory / "controller.json", controller)
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        self.assertTrue((directory / "STOP").is_file())
+
     def test_frozen_source_uses_original_committed_bytes_and_mode(self):
         repo = self.root / "repo"
         repo.mkdir()

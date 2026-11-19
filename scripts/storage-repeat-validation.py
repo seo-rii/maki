@@ -444,12 +444,15 @@ def main():
         return worker(directory)
     if args.action == "_worker":
         return worker(directory)
-    if args.action == "cancel":
-        (directory / "STOP").touch(mode=0o600)
     controller = json.loads((directory / "controller.json").read_text())
     status_path = directory / "status.json"
     status = json.loads(status_path.read_text()) if status_path.exists() else {"state": "starting"}
     status.update(run_dir=str(directory), controller_alive=alive(controller))
+    if args.action == "cancel":
+        if Path(controller["run_dir"]).resolve() != directory.resolve():
+            parser.error("controller does not belong to this campaign directory")
+        if status["state"] not in TERMINAL and status["controller_alive"]:
+            (directory / "STOP").touch(mode=0o600)
     if status["state"] not in TERMINAL and not status["controller_alive"]:
         status.update(state="interrupted", detail="controller exited without a terminal report; this is not a pass")
     print(json.dumps(status, indent=2))
