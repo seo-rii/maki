@@ -819,6 +819,12 @@ fn classify_status(
 
 impl HttpCryptoProvider {
     pub fn new(spec: HttpProviderSpec) -> Result<Self, CryptoError> {
+        for op in [&spec.encrypt, &spec.decrypt] {
+            maki_format::config::check_http_header_names(
+                op.headers.iter().map(|(k, _)| k.as_str()),
+            )
+            .map_err(|e| fatal(e.to_string()))?;
+        }
         // Public callers can bypass config validation or override its URL.
         // Refuse malformed endpoints before constructing a usable provider,
         // rather than failing the first encryption request (BUG-165).
@@ -1197,19 +1203,24 @@ impl HttpCryptoProvider {
             .http
             .as_ref()
             .ok_or_else(|| fatal("missing [crypto.http] section"))?;
+        let encrypt_cfg = http
+            .encrypt
+            .as_ref()
+            .ok_or_else(|| fatal("missing [crypto.http.encrypt]"))?;
+        let decrypt_cfg = http
+            .decrypt
+            .as_ref()
+            .ok_or_else(|| fatal("missing [crypto.http.decrypt]"))?;
+        for op in [encrypt_cfg, decrypt_cfg] {
+            maki_format::config::check_http_header_names(op.headers.keys().map(String::as_str))
+                .map_err(|e| fatal(e.to_string()))?;
+        }
+
         let build_op = |operation: &str,
                         op_cfg: &maki_format::config::HttpOpConfig|
          -> Result<OpSpec, CryptoError> {
             let mut headers = PendingHeaders::default();
             for (name, value) in &op_cfg.headers {
-                // An invalid name would fail every request at send time as
-                // a (retryable) builder error; refuse it now, before any
-                // credential is loaded for it (R5-021).
-                if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                    return Err(fatal(format!(
-                        "header name {name:?} is not a valid HTTP header"
-                    )));
-                }
                 let mut resolved = match value {
                     HeaderValue::Literal(v) => Zeroizing::new(v.clone()),
                     HeaderValue::Credential(cred) => {
@@ -1324,18 +1335,8 @@ impl HttpCryptoProvider {
             })
         };
 
-        let encrypt = build_op(
-            "encrypt",
-            http.encrypt
-                .as_ref()
-                .ok_or_else(|| fatal("missing [crypto.http.encrypt]"))?,
-        )?;
-        let decrypt = build_op(
-            "decrypt",
-            http.decrypt
-                .as_ref()
-                .ok_or_else(|| fatal("missing [crypto.http.decrypt]"))?,
-        )?;
+        let encrypt = build_op("encrypt", encrypt_cfg)?;
+        let decrypt = build_op("decrypt", decrypt_cfg)?;
 
         let caps_cfg = &config.crypto.capabilities;
         let capability = |s: &str| match s {

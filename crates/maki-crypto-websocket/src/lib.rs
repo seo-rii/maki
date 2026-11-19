@@ -330,7 +330,11 @@ fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError
 }
 
 impl WsCryptoProvider {
-    pub fn new(spec: WsProviderSpec) -> Self {
+    pub fn new(mut spec: WsProviderSpec) -> Self {
+        // The handshake library compares ws/wss literally. Preserve the path and query.
+        if let Some(end) = spec.url.find("://") {
+            spec.url[..end].make_ascii_lowercase();
+        }
         // Preserve deferred default-root loading: a WSS connection without
         // explicit TLS options reloads native roots on every new connection.
         let tls_connector = if spec.tls.is_some() {
@@ -350,19 +354,11 @@ impl WsCryptoProvider {
 
     /// Construct a provider after validating its TLS configuration.
     pub fn new_checked(spec: WsProviderSpec) -> Result<Self, CryptoError> {
-        let tls_connector = if spec.tls.is_some() {
-            Self::build_tls_connector(&spec).map_err(CryptoError::ProviderFatal)?
-        } else {
-            None
-        };
-        Ok(Self {
-            spec,
-            tls_connector: Ok(tls_connector),
-            connection: AsyncMutex::new(None),
-            next_id: AtomicU64::new(1),
-            generation: AtomicU64::new(0),
-            dead_generation: Arc::new(AtomicU64::new(0)),
-        })
+        let provider = Self::new(spec);
+        if let Err(message) = &provider.tls_connector {
+            return Err(CryptoError::ProviderFatal(message.clone()));
+        }
+        Ok(provider)
     }
 
     fn build_tls_connector(spec: &WsProviderSpec) -> Result<Option<Connector>, String> {
