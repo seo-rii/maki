@@ -313,6 +313,17 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
         self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "h Cargo.toml")
 
+    def test_present_skipped_file_is_checked_but_absent_sparse_file_is_supported(self):
+        self.git("update-index", "--split-index")
+        self.git("update-index", "--skip-worktree", "Cargo.lock", "Cargo.toml")
+        self.git("update-index", "--assume-unchanged", "Cargo.toml")
+        (self.repo / "Cargo.lock").unlink()
+        self.print_version()
+        with (self.repo / "Cargo.toml").open("a") as source:
+            source.write("# worktree edit\n")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "s Cargo.toml")
+
     @unittest.skipUnless(shutil.which("ssh-keygen"), "signed commit fixture requires SSH signing")
     def test_signature_display_does_not_change_the_source_timestamp(self):
         from scripts.qualification_source import extract_revision
