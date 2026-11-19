@@ -50,8 +50,9 @@ backing creation.
 Mixed workloads initialize the complete working set and FLUSH it before
 measurement; `setup.writes`, `setup.flushes` and `setup.elapsed_seconds` report
 that cost separately. Each address starts at generation zero; every successful
-measured write advances its generation and repeats the address and generation
-throughout the payload. Reads compare against the latest successful write, so
+measured write advances its generation. Each 32-byte payload segment carries
+its absolute byte position, the generation and a fresh per-run identifier.
+Repeating the address seed reproduces the access pattern across runs. Reads compare against the latest successful write, so
 returning an earlier value at the correct address fails verification.
 Reads and writes sharing an address execute in submission order. A busy address
 delays submission until its preceding operation finishes, so hot addresses can

@@ -363,3 +363,25 @@ fn oracle_capacity_has_an_explicit_byte_bound() {
     let oracle = Oracle::new(512).unwrap();
     assert_eq!(oracle.generations.len(), 512);
 }
+
+#[tokio::test]
+async fn repeated_benchmark_rejects_prior_run_data() {
+    let (engine, _) = faulty_fixture(None).await;
+    let mut options = options();
+    options.ops = 1;
+    run(engine.clone(), &options, 4096).await.unwrap();
+    let error = run(engine, &options, 4096)
+        .await
+        .err()
+        .expect("old write passed verification");
+    assert!(error.contains("read verification failed"), "{error}");
+}
+
+#[test]
+fn payload_distinguishes_every_crypto_unit_in_a_large_request() {
+    let bytes = data_for(uuid::Uuid::new_v4(), 0, 1, 16 * 1024);
+    let units = bytes
+        .chunks_exact(4096)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(units.len(), 4);
+}
