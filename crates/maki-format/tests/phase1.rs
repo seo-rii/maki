@@ -792,3 +792,25 @@ fn create_volume_initializes_durable_layout() {
     // double-create refuses
     assert!(maki_format::init::create_volume(&backing, sb()).is_err());
 }
+
+#[test]
+fn invalid_public_superblocks_leave_the_root_available_for_retry() {
+    for create in [
+        maki_format::init::create_volume,
+        maki_format::init::create_volume_with_discard,
+    ] {
+        for invalid in 0..3 {
+            let backing = maki_backing::MemBacking::new();
+            let mut block = sb();
+            match invalid {
+                0 => block.format_version += 1,
+                1 => block.geometry.slot_size += 1,
+                _ => block.provider_type = "x".repeat(maki_format::superblock::MAX_STR + 1),
+            }
+            assert!(create(&backing, block).is_err());
+            assert!(backing.list("").unwrap().is_empty());
+            create(&backing, sb()).unwrap();
+            assert!(maki_format::checker::check_volume(&backing).unwrap().ok());
+        }
+    }
+}
