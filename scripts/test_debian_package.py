@@ -3,6 +3,7 @@ import hashlib
 import os
 import pathlib
 import re
+import runpy
 import shutil
 import stat
 import struct
@@ -168,6 +169,22 @@ class DebianPackageTests(unittest.TestCase):
         control = self.work / f"{name}-control"
         subprocess.run(["dpkg-deb", "--control", package, control], check=True)
         return root, control
+
+    def test_vendored_license_inventory_uses_tracked_paths(self):
+        repo = self.work / "checkout"
+        source = repo / "vendor" / "example"
+        source.mkdir(parents=True)
+        script = repo / "packaging/debian/update-copyright.py"
+        script.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / "packaging/debian/update-copyright.py", script)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (source / "LICENSE").write_text("published")
+        subprocess.run(["git", "-C", source, "add", "LICENSE"], check=True)
+        (source / "LICENSE.bak").write_text("local backup")
+        inventory = runpy.run_path(str(script))["notice_files"]
+        self.assertEqual(inventory(source, "LICENSE", tracked=True), {source / "LICENSE"})
+        with self.assertRaisesRegex(ValueError, "not tracked"):
+            inventory(source, "LICENSE.bak", tracked=True)
 
     def test_installed_maintenance_contact_history_and_manuals(self):
         package = self.build()
