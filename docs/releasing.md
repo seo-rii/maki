@@ -24,7 +24,9 @@ The target must also provide the versioned `nbd-client >= 3.27.0` dependency.
 Prepare candidates after committing the intended changes. The command refuses
 staged or unstaged tracked changes and exports only `HEAD`; untracked files,
 local credentials and existing `target/` artifacts do not enter the source
-archive. It builds in an isolated temporary directory with `--release
+archive. The source archive uses committed file bytes and executable modes,
+including files that local Git archive attributes would omit or transform.
+It builds in an isolated temporary directory with `--release
 --locked --target <rustc host>` and always enables the package builder's
 [ELF and native dependency validation](../packaging/debian/README.md#artifact-validation).
 Source links are rejected during extraction. No cross-compilation or

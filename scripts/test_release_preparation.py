@@ -174,6 +174,28 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertNotEqual(pathlib.Path(invocation["cwd"]), self.repo)
         self.assertEqual(invocation["epoch"], self.git("show", "-s", "--format=%ct", "HEAD"))
 
+    def test_source_bytes_and_modes_are_independent_of_archive_attributes(self):
+        contents = b"#!/bin/sh\n# revision: $Format:%H$\n"
+        note = self.repo / "release notes"
+        note.write_bytes(contents)
+        note.chmod(0o755)
+        self.git("add", note.name)
+        self.git("commit", "-qm", "test: include release notes")
+        attrs = self.repo / ".git/info/attributes"
+        archives = []
+        for setting in ("export-ignore", "export-subst"):
+            with self.subTest(setting=setting):
+                attrs.write_text(f'"release notes" {setting}\n')
+                output, _ = self.prepare(setting)
+                manifest = json.loads((output / "manifest.json").read_text())
+                archive = output / manifest["source"]["filename"]
+                with tarfile.open(archive) as tar:
+                    member = tar.getmember("maki-0.1.0/release notes")
+                    self.assertEqual(tar.extractfile(member).read(), contents)
+                    self.assertEqual(member.mode, 0o755)
+                archives.append(manifest["source"]["sha256"])
+        self.assertEqual(archives[0], archives[1])
+
     def test_print_version_needs_no_build_tools_or_output_directory(self):
         # Only Git is needed: neither dpkg nor the selected compiler is usable.
         (self.tools / "git").symlink_to(shutil.which("git"))
