@@ -164,6 +164,7 @@ fn main() {
     assert!(version.status.success(), "{}", String::from_utf8_lossy(&version.stderr));
     fs::write("rustc-path", compiler.as_encoded_bytes()).unwrap();
     fs::write("rustc-version", version.stdout).unwrap();
+    fs::write("rust-target", env::var("TARGET").unwrap()).unwrap();
 }
 """)
         environment = dict(environment, CARGO_TARGET_DIR=str(probe / "target"),
@@ -175,7 +176,8 @@ fn main() {
             raise TimeoutError(f"compiler probe timed out: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"compiler probe did not complete (see toolchain.log): {result}")
-        return os.fsdecode((probe / "rustc-path").read_bytes()), (probe / "rustc-version").read_text()
+        return (os.fsdecode((probe / "rustc-path").read_bytes()), (probe / "rustc-version").read_text(),
+                (probe / "rust-target").read_text())
 
 
 def prepare(directory, config, deadline):
@@ -196,15 +198,29 @@ def prepare(directory, config, deadline):
     # when the shell or Cargo configuration supplies a shared build directory.
     environment.update(CARGO_TARGET_DIR=config["target_dir"],
                        CARGO_BUILD_BUILD_DIR=str(directory / "build"), CARGO_BUILD_JOBS="2")
-    config["rustc_executable"], config["rustc"] = cargo_compiler(source, directory, environment, remaining)
+    config["rustc_executable"], config["rustc"], target = cargo_compiler(source, directory, environment, remaining)
     save_json(directory / "config.json", config)
+    # Cargo sets a package-specific loader path for each test invocation,
+    # including its sysroot and dynamic dependencies in the isolated build.
+    # Capture that path without executing the test before it has been frozen.
+    remaining(1800)
+    runner = directory / "maki-capture-test-environment"
+    runner.write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        "print(json.dumps({'reason': 'maki-test-runtime', 'executable': sys.argv[1], "
+        "'library_path': os.environ['LD_LIBRARY_PATH']}))\n")
+    runner.chmod(0o500)
+    environment["PATH"] = str(runner.parent) + os.pathsep + environment.get("PATH", os.defpath)
+    environment["CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUNNER"] = runner.name
+    library_paths = {}
     executables = {}
     suites = [suite for group in groups.values() for suite in group]
     for package, selected in groups.items():
         command = ["cargo", "test", "--offline", "--locked", "-p", package,
-                   "--no-run", "--message-format=json"]
+                   "--message-format=json"]
         for suite in selected:
             command.extend(["--test", suite])
+        command.extend(["--", "--list"])
         log = directory / ("build.log" if len(groups) == 1 else f"build-{package}.log")
         result = run_child(command, source, log, stop, remaining(1800), env=environment)
         if result["reason"] == "timeout":
@@ -216,6 +232,9 @@ def prepare(directory, config, deadline):
             if not line.startswith("{"):
                 continue
             event = json.loads(line)
+            if event.get("reason") == "maki-test-runtime":
+                library_paths[Path(event["executable"])] = event["library_path"]
+                continue
             name = event.get("target", {}).get("name")
             if (event.get("reason") == "compiler-artifact" and name in selected
                     and event.get("executable")):
@@ -227,13 +246,18 @@ def prepare(directory, config, deadline):
     manifest = {}
     for name, original in executables.items():
         remaining(30)
+        if original not in library_paths:
+            raise RuntimeError(f"Cargo did not report a runtime environment for {name}")
+        library_path = library_paths[original]
         frozen = binary_dir / name
         shutil.copyfile(original, frozen)
         frozen.chmod(0o500)
         executables[name] = frozen
-        manifest[name] = {"sha256": hashlib.sha256(frozen.read_bytes()).hexdigest()}
+        manifest[name] = {"sha256": hashlib.sha256(frozen.read_bytes()).hexdigest(),
+                          "library_path": library_path}
         result = run_child([str(frozen), "--list", "--include-ignored"], source,
-                           directory / f"list-{name}.log", stop, remaining(30))
+                           directory / f"list-{name}.log", stop, remaining(30),
+                           env=dict(os.environ, LD_LIBRARY_PATH=library_path))
         if result["reason"] == "timeout":
             raise TimeoutError(f"cannot enumerate {name}: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
@@ -276,9 +300,12 @@ def worker(directory):
                               elapsed_seconds=round(time.monotonic() - began, 1))
                 save_json(directory / "status.json", status)
                 log = directory / f"round-{round_number:04d}-{name}.log"
+                environment = os.environ.copy()
+                if name in manifest:
+                    environment["LD_LIBRARY_PATH"] = manifest[name]["library_path"]
                 result = run_child([str(binary), "--include-ignored", "--test-threads=1", "--color=never"],
                                    Path(config["source"]), log, directory / "STOP",
-                                   min(config["suite_timeout"], deadline - time.monotonic()))
+                                   min(config["suite_timeout"], deadline - time.monotonic()), env=environment)
                 status["last_result"] = {"suite": name, "round": round_number, "log": str(log), **result}
                 if result["reason"] != "exited" or result["exit_code"] != 0:
                     status["state"] = {"cancelled": "cancelled", "timeout": "incomplete"}.get(
