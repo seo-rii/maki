@@ -1,6 +1,7 @@
 import hashlib
 import os
 import pathlib
+import re
 import shutil
 import stat
 import struct
@@ -219,6 +220,18 @@ class DebianPackageTests(unittest.TestCase):
 
     # --- R4-003: removal must not orphan a live attachment -----------------
 
+    def test_installs_the_project_and_dependency_copyright_notice(self):
+        root, _ = self.extract(self.build())
+        notice = root / "usr/share/doc/maki/copyright"
+        self.assertTrue(notice.is_file())
+        self.assertFalse(notice.is_symlink())
+        self.assertEqual(stat.S_IMODE(notice.stat().st_mode), 0o644)
+        self.assertEqual(notice.read_bytes(), (ROOT / "packaging/debian/copyright").read_bytes())
+        text = notice.read_text(encoding="utf-8")
+        self.assertIn("https://github.com/seo-rii/maki", text)
+        self.assertIn("/usr/share/common-licenses/Apache-2.0", text)
+        self.assertIn((ROOT / "vendor/bytes/LICENSE").read_text().strip(), text)
+
     def test_prerm_refuses_removal_while_a_volume_is_attached(self):
         package = self.build()
         _, control = self.extract(package, "prerm-record")
@@ -397,6 +410,21 @@ class DebianPackageTests(unittest.TestCase):
                     self.assertIn(name, error)
                     self.assertIn("LP64D", error)
 
+    def test_ppc64el_rejects_incompatible_abi_markers_on_every_artifact(self):
+        # 0 is ABI-neutral; 2 denotes ELFv2. Higher flag bits are independent.
+        for flags in (0, 2, 0x12):
+            self.write_release_files(0x15, e_flags=flags)
+            self.build(f"ppc64el-{flags}.deb", architecture="ppc64el")
+        for name in RELEASE_NAMES:
+            for flags in (1, 3):
+                with self.subTest(artifact=name, flags=flags):
+                    self.write_release_files(0x15, e_flags=2)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(0x15, kind, e_flags=flags))
+                    error = self.build_failure("bad-ppc.deb", architecture="ppc64el")
+                    self.assertIn(name, error)
+                    self.assertIn("ELFv2", error)
+
     def test_loong64_requires_lp64d_for_every_artifact(self):
         machine = 0x102
         self.write_release_files(machine, e_flags=0x43)
@@ -523,6 +551,48 @@ class DebianPackageTests(unittest.TestCase):
                 for name in RELEASE_NAMES[:-1]:
                     (self.release / name).write_bytes(elf_with_segments(EM_X86_64, **markers))
                 self.build("pie-cli.deb")
+
+    def test_interpreter_segment_must_hold_one_complete_absolute_path(self):
+        good = b"/lib64/ld-linux-x86-64.so.2\0"
+        for records in ([good, good], [b"ld.so\0"], [good[:-1]], [good + b"extra\0"], [b""]):
+            with self.subTest(records=records):
+                (self.release / "maki").write_bytes(elf_with_segments(
+                    EM_X86_64, extra_segments=[(3, record) for record in records]))
+                self.assertIn("PT_INTERP", self.build_failure("bad-interpreter.deb"))
+
+    @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
+                         "native Debian build tools required")
+    def test_native_package_requires_the_declared_elf_interpreter_on_the_target(self):
+        architecture = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
+        source = self.work / "fixture.c"
+        source.write_text("int main(void) { return 0; }\n")
+        for name in RELEASE_NAMES:
+            options = ["-shared", "-fPIC"] if name.endswith(".so") else []
+            subprocess.run(["cc", *options, str(source), "-o", self.release / name], check=True)
+        good, command = self.builder_command("native.deb", "1", architecture)
+        subprocess.run(command, check=True, capture_output=True)
+        self.assertTrue(good.is_file())
+
+        headers = subprocess.check_output(["readelf", "-lW", self.release / "maki"], text=True,
+                                          env={**os.environ, "LC_ALL": "C"})
+        loader = re.search(r"\[Requesting program interpreter: (.+?)\]", headers)[1]
+        for suffix in ("/", "/."):
+            with self.subTest(directory_only_suffix=suffix):
+                subprocess.run(["cc", str(source), f"-Wl,--dynamic-linker,{loader}{suffix}",
+                                "-o", self.release / "maki-check"], check=True)
+                error = self.build_failure("directory-interpreter.deb", architecture=architecture, opt_out=False)
+                self.assertIn("interpreter", error)
+
+        private = self.work / "ld-private.so.2"
+        for installed in (False, True):
+            with self.subTest(private_loader_exists=installed):
+                if installed:
+                    private.symlink_to("/bin/true")
+                subprocess.run(["cc", str(source), f"-Wl,--dynamic-linker,{private}",
+                                "-o", self.release / "maki-check"], check=True)
+                error = self.build_failure("build-host-only.deb", architecture=architecture, opt_out=False)
+                self.assertIn("maki-check", error)
+                self.assertIn("interpreter", error)
 
     @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
                          "native C compiler and dpkg-shlibdeps required")

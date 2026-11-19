@@ -29,7 +29,14 @@ complete history before building. Existing packages made with the old
 [explicitly reviewed one-time downgrade migration](../../docs/releasing.md#migrating-legacy-source-build-packages).
 
 The package installs the daemon, helper, checker, plugin, service templates,
-sysusers/tmpfiles rules, and examples. It deliberately owns no file below
+sysusers/tmpfiles rules, examples and a plain UTF-8 copyright notice at
+`/usr/share/doc/maki/copyright`. When changing dependencies, release crate
+features or supported targets, run `python3 packaging/debian/update-copyright.py`
+and review the updated notices alongside the dependency changes. This
+maintenance step uses Cargo; assembling the package uses the checked-in notice.
+Review additional notices from toolchain components or custom linked inputs
+for the actual release as described in [the release handoff](../../docs/releasing.md#qualification-and-publication-handoff).
+The package deliberately owns no file below
 `/etc/maki`, does not enable a volume, and does not start or restart a service
 during install or upgrade. Stop and detach the workload with the old package,
 install the new package, update root-controlled configuration if required, and
@@ -71,6 +78,9 @@ rejected. These meanings follow the
 For Debian `riscv64` and `loong64`, all artifacts must declare the LP64D (double-float)
 calling convention in their ELF flags.
 
+For Debian `ppc64el`, a PowerPC64 ABI marker must be ELFv2 or unspecified
+(ABI-neutral). The builder rejects ELFv1 and the reserved ABI value.
+
 For `mips64el`, the builder reads the version-zero MIPS ABI flags program
 header. It accepts the double-precision hardware calling convention and
 ABI-independent code. Missing flags or incompatible conventions fail validation.
@@ -81,6 +91,13 @@ plugin, the builder also rejects a `PT_INTERP` program header or the
 checks use program headers and work without section headers; they do not
 load or execute the artifact. PIE remains allowed for the CLI binaries.
 This checks artifact kind, not the plugin API or runtime compatibility.
+
+For dynamically linked programs, the default native dependency scan also
+checks the actual `PT_INTERP` path against the target architecture's installed
+Debian glibc or musl package and adds its owner to `Depends`. A private loader
+path can work on a build host and still prevent the packaged executable from
+starting elsewhere. Standard merged-`/usr` aliases are recognized. Static
+executables, including static PIE, have no interpreter dependency.
 
 The builder then computes the native library dependencies of the binaries
 with `dpkg-shlibdeps` (package `dpkg-dev`) and appends them to `Depends`, for
