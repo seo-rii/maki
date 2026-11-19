@@ -1596,16 +1596,18 @@ fn same_socket_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     if left == right {
         return true;
     }
-    // Resolve existing parents even before either socket is bound. Resolving
-    // through the filesystem preserves the meaning of ".." after a symlink.
+    // Resolve the deepest existing ancestor. systemd may not have created
+    // the per-volume directory yet, even when its parent is a known alias.
+    // Let the filesystem interpret ".." after symlinks in the existing path.
     let resolve = |path: &std::path::Path| {
-        std::fs::canonicalize(path).ok().or_else(|| {
-            Some(
-                std::fs::canonicalize(path.parent()?)
-                    .ok()?
-                    .join(path.file_name()?),
-            )
-        })
+        for ancestor in path.ancestors() {
+            match std::fs::canonicalize(ancestor) {
+                Ok(existing) => return Some(existing.join(path.strip_prefix(ancestor).ok()?)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => break,
+            }
+        }
+        None
     };
     resolve(left).is_some_and(|left| resolve(right).as_ref() == Some(&left))
 }

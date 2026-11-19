@@ -751,6 +751,15 @@ fn socket_aliases_use_the_actual_parent_directory_before_binding() {
         );
         parse(&raw).validate()
     };
+    // systemd creates per-volume runtime directories on first start. An
+    // alias of an existing ancestor already identifies the same future file.
+    let check_runtime_paths = || {
+        assert!(check("link/new/volume/a.sock", "other/sub/new/volume/a.sock").is_err());
+        assert!(check("link/new/volume/a.sock", "other/sub/new/volume/b.sock").is_ok());
+    };
+    check_runtime_paths();
+    std::fs::create_dir_all(root.join("other/sub/new/volume")).unwrap();
+    check_runtime_paths();
     assert!(check("other/sub/../shared.sock", "other/shared.sock").is_err());
     assert!(check("link/../shared.sock", "other/shared.sock").is_err());
     assert!(check("link/../shared.sock", "shared.sock").is_ok());
