@@ -771,6 +771,36 @@ class DebianPackageTests(unittest.TestCase):
                     self.assertEqual(source.read_bytes(), original)
         self.assertEqual(self.field(self.build("release/maki.deb"), "Package"), "maki")
 
+    @unittest.skipUnless(shutil.which("unshare") and shutil.which("mount"), "needs Linux mount namespaces")
+    def test_output_cannot_replace_input_through_a_bind_mount(self):
+        namespace = ["unshare", "--map-root-user", "--mount", "--propagation", "private", "--"]
+        if subprocess.run([*namespace, "true"], capture_output=True).returncode:
+            self.skipTest("unprivileged mount namespace unavailable")
+        alias = self.work / "bind"
+        alias.mkdir()
+        source = self.release / "maki"
+        original = source.read_bytes()
+        _, command = self.builder_command(alias / "maki", "0.1.0", extra=["--no-shlibdeps"])
+        result = subprocess.run(
+            [*namespace, "sh", "-c", 'mount --bind "$1" "$2" || exit 77; shift 2; exec "$@"',
+             "fixture", self.release, alias, *command], capture_output=True, text=True,
+        )
+        if result.returncode == 77:
+            self.skipTest("bind mounts unavailable in this namespace")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("overwrite a release input", result.stderr)
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_safe_output_entries_can_be_replaced_or_created(self):
+        source = self.release / "maki"
+        original = source.read_bytes()
+        os.link(source, self.release / "hardlink")
+        (self.release / "symlink").symlink_to(source)
+        for name in ("release/hardlink", "release/symlink", "new/maki"):
+            with self.subTest(name=name):
+                self.assertEqual(self.field(self.build(name), "Package"), "maki")
+                self.assertEqual(source.read_bytes(), original)
+
     def test_rebuild_replaces_the_directory_entry_after_output_is_complete(self):
         output = self.work / "maki.deb"
         output.write_bytes(b"previous package")
