@@ -304,33 +304,13 @@ pub fn check_argument(name: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// A new mountpoint must resolve to a directory or be creatable. For
-/// missing components, inherit the nearest existing parent's name limit.
+/// Existing components must be directories, as required by the mount step.
+/// Missing components inherit the nearest existing parent's name limit.
 #[cfg(target_os = "linux")]
 fn check_mountpoint_path(mountpoint: &str) -> Result<(), ConfigError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-
-    match std::fs::metadata(mountpoint) {
-        Ok(meta) if meta.is_dir() => return Ok(()),
-        Ok(_) => {
-            return Err(ConfigError::Invalid(
-                "mountpoint must be a directory".into(),
-            ))
-        }
-        // A plan may run without the privileges used for execution.
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) => {}
-        Err(e) => {
-            return Err(ConfigError::Invalid(format!(
-                "cannot resolve mountpoint: {e}"
-            )))
-        }
-    }
 
     let mut parent = PathBuf::from("/");
     let mut limit = None;
@@ -355,6 +335,31 @@ fn check_mountpoint_path(mountpoint: &str) -> Result<(), ConfigError> {
             ));
         }
         parent.push(name);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ConfigError::Invalid(
+                    "mountpoint path must not contain a symlink".into(),
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(ConfigError::Invalid(
+                    "mountpoint path must contain only directories".into(),
+                ));
+            }
+            Ok(_) => {}
+            // The directory may be provisioned later, or the plan rendered by
+            // a user who cannot search this part of the path.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(e) => {
+                return Err(ConfigError::Invalid(format!(
+                    "cannot resolve mountpoint: {e}"
+                )));
+            }
+        }
     }
     Ok(())
 }

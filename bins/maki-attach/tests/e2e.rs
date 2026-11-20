@@ -47,6 +47,17 @@ fn attach_plan_checks_existing_mountpoint_paths_and_linux_path_length() {
         assert!(out.stdout.is_empty());
     }
 
+    for (name, target) in [("dangling", dir.join("absent")), ("live", dir.to_owned())] {
+        let link = dir.join(name);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        for invalid in [&link, &link.join("child")] {
+            let out = plan(invalid.to_str().unwrap());
+            assert_eq!(out.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
+            assert!(out.stdout.is_empty());
+        }
+    }
+
     // Linux accepts up to 4095 path bytes plus the terminating NUL.
     let mut path = dir.join("uncreated").to_str().unwrap().to_owned();
     let component = format!("/{}", "a".repeat(127));
