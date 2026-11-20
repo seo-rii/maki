@@ -119,7 +119,7 @@ impl AttachConfig {
             ));
         }
         #[cfg(target_os = "linux")]
-        check_mountpoint_name_lengths(&request.mountpoint)?;
+        check_mountpoint_path(&request.mountpoint)?;
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
         // the VG and LV with a hyphen and doubles every hyphen in either name.
         let vg = &request.vg_name;
@@ -304,13 +304,33 @@ pub fn check_argument(name: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Check each component against the filesystem that will contain it. When
-/// a directory has not been created yet, inherit its parent's known limit.
+/// A new mountpoint must resolve to a directory or be creatable. For
+/// missing components, inherit the nearest existing parent's name limit.
 #[cfg(target_os = "linux")]
-fn check_mountpoint_name_lengths(mountpoint: &str) -> Result<(), ConfigError> {
+fn check_mountpoint_path(mountpoint: &str) -> Result<(), ConfigError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+
+    match std::fs::metadata(mountpoint) {
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(ConfigError::Invalid(
+                "mountpoint must be a directory".into(),
+            ))
+        }
+        // A plan may run without the privileges used for execution.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) => {}
+        Err(e) => {
+            return Err(ConfigError::Invalid(format!(
+                "cannot resolve mountpoint: {e}"
+            )))
+        }
+    }
 
     let mut parent = PathBuf::from("/");
     let mut limit = None;
