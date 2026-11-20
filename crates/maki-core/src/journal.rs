@@ -230,10 +230,22 @@ impl JournalWriter {
     /// Sealed segments whose every record is at or below
     /// `checkpoint_sequence` (deletable).
     pub fn covered_segment_count(&self, checkpoint_sequence: u64) -> usize {
-        self.sealed
-            .iter()
-            .filter(|s| s.last_sequence() <= checkpoint_sequence)
-            .count()
+        let covered = |segment: &SegmentInfo| segment.last_sequence() <= checkpoint_sequence;
+        // Recovery permits discontinuities among checkpoint-covered survivors.
+        // At or above that checkpoint they form a covered prefix, followed by
+        // contiguous newer segments. A historical query can split the survivors.
+        if checkpoint_sequence < self.holes_allowed_below {
+            return self
+                .sealed
+                .iter()
+                .filter(|segment| covered(segment))
+                .count();
+        }
+        if self.sealed.first().is_some_and(covered) {
+            self.sealed.partition_point(covered)
+        } else {
+            0
+        }
     }
 
     /// Bytes appended but not yet durable (admission control input).
