@@ -11,10 +11,14 @@ directory:
 ```bash
 set -euo pipefail
 maki_version="$(python3 -B scripts/prepare_release.py --print-version)"
-cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
+maki_target_dir="$(cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+maki_host="$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --release --locked --target "$maki_host" \
+  -p maki -p maki-attach -p maki-check -p maki-nbdkit
 SOURCE_DATE_EPOCH="$(git show --no-show-signature -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
-  --release-dir target/release \
+  --release-dir "$maki_target_dir/$maki_host/release" \
   --version "$maki_version" \
   --architecture "$(dpkg --print-architecture)" \
   --output ../maki.deb
