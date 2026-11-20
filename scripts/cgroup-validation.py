@@ -483,18 +483,22 @@ def constrained_recovery(target, memory_mib=32, rounds=1):
                         raise
                 else:
                     require_memory_limits(resources, memory_mib)
-                    return {"ready": False, "outcome": "startup-timeout", "deadline_seconds": 30,
+                    return {"ready": False, "outcome": "startup-timeout", "limits_verified": True,
+                            "deadline_seconds": 30,
                             "resources": resources, "state_before_cleanup": state,
                             "cleanup_termination": termination}
             require_oom(state)
-            return {"ready": False, "outcome": "startup-oom", "termination": state}
+            # Docker can confirm OOM after the task exits, when its live
+            # cgroup limits can no longer be verified.
+            return {"ready": False, "outcome": "startup-oom", "limits_verified": False,
+                    "termination": state}
         else:
             resources = target.stats()
             require_memory_limits(resources, memory_mib)
             verification = target.client("verify", rounds=rounds)
             target.kill()
-            return {"ready": True, "outcome": "verified", "verification": verification,
-                    "resources": resources}
+            return {"ready": True, "outcome": "verified", "limits_verified": True,
+                    "verification": verification, "resources": resources}
 
 
 def campaign(args):
