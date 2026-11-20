@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 use crate::clock::Clock;
 use crate::error::CryptoError;
@@ -217,16 +217,20 @@ async fn all_replies_closed<'a, O: 'a>(replies: impl Iterator<Item = &'a mut Rep
     }
 }
 
-async fn queued_caller_closed<I, O>(batch: &mut [Group<I, O>], queued: &mut VecDeque<Group<I, O>>) {
-    std::future::poll_fn(|cx| {
-        for group in batch.iter_mut().chain(queued.iter_mut()) {
-            if group.reply.poll_closed(cx).is_ready() {
-                return std::task::Poll::Ready(());
-            }
+/// A dropped submit future wakes its lane to release cancelled groups. Close
+/// the receiver first so a concurrently running lane sees the cancellation.
+struct PendingReply<'a, O> {
+    receiver: oneshot::Receiver<Result<Vec<O>, CryptoError>>,
+    cancelled: &'a Notify,
+}
+
+impl<O> Drop for PendingReply<'_, O> {
+    fn drop(&mut self) {
+        if !self.receiver.is_terminated() {
+            self.receiver.close();
+            self.cancelled.notify_one();
         }
-        std::task::Poll::Pending
-    })
-    .await;
+    }
 }
 
 /// A provider call hands its items back with the result, so a batch whose
@@ -353,7 +357,13 @@ async fn run_retries<I: Send + 'static, O: Send + 'static>(
     }
 }
 
+struct LaneInbox<I, O> {
+    requests: mpsc::Receiver<Group<I, O>>,
+    cancelled: Arc<Notify>,
+}
+
 struct Lane<I, O> {
+    cancelled: Arc<Notify>,
     tx: mpsc::Sender<Group<I, O>>,
     clock: Arc<dyn Clock>,
     admission: DualSemaphore,
@@ -384,8 +394,12 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         ));
         let max_admit_items = config.max_items.min(admission.max_items()).max(1);
         let max_admit_logical_bytes = config.max_bytes;
+        let cancelled = Arc::new(Notify::new());
         tokio::spawn(run_lane(
-            rx,
+            LaneInbox {
+                requests: rx,
+                cancelled: cancelled.clone(),
+            },
             config,
             clock.clone(),
             stats,
@@ -394,6 +408,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
             inflight,
         ));
         Self {
+            cancelled,
             tx,
             clock,
             admission,
@@ -463,7 +478,11 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
                 "crypto batch scheduler has stopped".to_string(),
             ));
         }
-        reply_rx.await.unwrap_or_else(|_| {
+        let mut reply = PendingReply {
+            receiver: reply_rx,
+            cancelled: &self.cancelled,
+        };
+        (&mut reply.receiver).await.unwrap_or_else(|_| {
             Err(CryptoError::Retryable(
                 "crypto batch scheduler dropped the request".to_string(),
             ))
@@ -474,7 +493,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
 /// One lane's aggregation loop: form batches of whole groups, dispatch,
 /// route results back. Exits when every sender is gone.
 async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
-    mut rx: mpsc::Receiver<Group<I, O>>,
+    mut inbox: LaneInbox<I, O>,
     config: SchedulerConfig,
     clock: Arc<dyn Clock>,
     stats: Arc<SchedulerStats>,
@@ -485,12 +504,14 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
     // Groups received while a full lane waits keep their payload and queue
     // admission together. Unlike an unread mpsc tail, this FIFO can observe
     // and remove cancelled callers even while an earlier live RPC stalls.
+    // Arrivals only append. A cancellation notification can cover multiple
+    // callers, so sweep all the groups we own when consuming it.
     let mut queued = VecDeque::new();
     let mut receiver_closed = false;
     'lane: loop {
         let first = match queued.pop_front() {
             Some(g) => g,
-            None => match rx.recv().await {
+            None => match inbox.requests.recv().await {
                 Some(g) => g,
                 None => return,
             },
@@ -513,7 +534,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                 Some(group)
             } else {
                 tokio::select! {
-                    _ = queued_caller_closed(&mut batch, &mut queued) => {
+                    _ = inbox.cancelled.notified() => {
                         batch.retain(|g| !g.reply.is_closed());
                         if batch.is_empty() { continue 'lane; }
                         deadline = batch.iter().map(|g| g.enqueued_at).min()
@@ -523,7 +544,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                         units = units_of(&batch);
                         continue;
                     },
-                    g = rx.recv() => g,
+                    g = inbox.requests.recv() => g,
                     _ = clock.sleep(remaining) => None,
                 }
             };
@@ -560,13 +581,13 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         let slot = loop {
             tokio::select! {
                 biased;
-                _ = queued_caller_closed(&mut batch, &mut queued) => {
+                _ = inbox.cancelled.notified() => {
                     batch.retain(|g| !g.reply.is_closed());
                     queued.retain(|g| !g.reply.is_closed());
                     if batch.is_empty() { continue 'lane; }
                 },
                 slot = inflight.clone().acquire_owned() => break slot.expect("semaphore closed"),
-                group = rx.recv(), if !receiver_closed => {
+                group = inbox.requests.recv(), if !receiver_closed => {
                     match group {
                         Some(group) if !group.reply.is_closed() => queued.push_back(group),
                         Some(_) => {},
