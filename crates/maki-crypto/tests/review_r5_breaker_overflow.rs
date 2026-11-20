@@ -28,8 +28,7 @@ fn opening_with_a_huge_duration_saturates() {
     let clock = Arc::new(ManualClock::new());
     clock.advance(Duration::from_secs(10));
     let breaker = breaker(&clock, Duration::MAX - Duration::from_secs(5));
-    assert!(breaker.allow());
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
     clock.advance(Duration::from_secs(365 * 24 * 3600));
     assert!(!breaker.would_allow(), "still open a year later");
@@ -40,11 +39,9 @@ fn doubling_a_huge_duration_after_a_failed_probe_saturates() {
     let clock = Arc::new(ManualClock::new());
     let open = Duration::MAX / 2 + Duration::from_secs(1);
     let breaker = breaker(&clock, open);
-    assert!(breaker.allow());
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     clock.advance(open);
-    assert!(breaker.allow(), "half-open probe");
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
     assert!(!breaker.would_allow());
 }

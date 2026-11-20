@@ -544,15 +544,30 @@ impl EndpointSet {
         &self,
         deadline: Option<Duration>,
     ) -> Result<&CryptoCapabilities, CryptoError> {
+        self.until_deadline(deadline, self.common_caps()).await
+    }
+
+    /// One absolute budget covers every await. If polling was delayed, both
+    /// futures can be ready; even synchronous work in the operation's poll
+    /// can take us past the deadline after checking the timer.
+    async fn until_deadline<T>(
+        &self,
+        deadline: Option<Duration>,
+        operation: impl std::future::Future<Output = Result<T, CryptoError>>,
+    ) -> Result<T, CryptoError> {
         let Some(deadline) = deadline else {
-            return self.common_caps().await;
+            return operation.await;
         };
         let remaining = deadline.saturating_sub(self.clock.now());
         if !remaining.is_zero() {
-            let timer = self.clock.sleep(remaining);
             tokio::select! {
-                result = self.common_caps() => return result,
-                _ = timer => {}
+                biased;
+                _ = self.clock.sleep(remaining) => {},
+                result = operation => {
+                    if self.clock.now() < deadline {
+                        return result;
+                    }
+                }
             }
         }
         self.metrics
@@ -793,22 +808,8 @@ impl EndpointSet {
                 }
             }
         };
-        match deadline {
-            None => Ok(admit.await),
-            Some(deadline) => {
-                let remaining = deadline.saturating_sub(self.clock.now());
-                if remaining.is_zero() {
-                    return Err(deadline_error());
-                }
-                tokio::select! {
-                    result = admit => Ok(result),
-                    _ = self.clock.sleep(remaining) => {
-                        self.metrics.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
-                        Err(deadline_error())
-                    }
-                }
-            }
-        }
+        self.until_deadline(deadline, async { Ok(admit.await) })
+            .await
     }
 
     async fn call_endpoint(
@@ -880,23 +881,7 @@ impl EndpointSet {
         caps: &CryptoCapabilities,
     ) -> Result<Response, CryptoError> {
         let call = self.call_endpoint(endpoint, context, request, caps);
-        match deadline {
-            None => call.await,
-            Some(deadline) => {
-                let remaining = deadline.saturating_sub(self.clock.now());
-                if remaining.is_zero() {
-                    return Err(deadline_error());
-                }
-                let timer = self.clock.sleep(remaining);
-                tokio::select! {
-                    result = call => result,
-                    _ = timer => {
-                        self.metrics.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
-                        Err(deadline_error())
-                    }
-                }
-            }
-        }
+        self.until_deadline(deadline, call).await
     }
 
     async fn dispatch(

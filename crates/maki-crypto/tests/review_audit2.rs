@@ -103,17 +103,16 @@ fn half_open_admits_new_probes_as_earlier_ones_complete() {
         },
         clock.clone(),
     );
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
     clock.advance(Duration::from_millis(20));
-    assert!(breaker.allow(), "first probe");
-    breaker.on_success();
+    breaker.acquire().unwrap().on_success();
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
-    assert!(
-        breaker.would_allow() && breaker.allow(),
-        "second probe refused although the first completed: breaker wedged"
-    );
-    breaker.on_success();
+    assert!(breaker.would_allow());
+    breaker
+        .acquire()
+        .expect("second probe after completion")
+        .on_success();
     assert_eq!(breaker.state(), CircuitState::Closed);
 }
 
@@ -122,15 +121,13 @@ fn half_open_admits_new_probes_as_earlier_ones_complete() {
 fn failed_probe_reopens_and_the_next_window_admits_again() {
     let clock = Arc::new(ManualClock::new());
     let breaker = CircuitBreaker::new(breaker_cfg(1), clock.clone());
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     clock.advance(Duration::from_millis(20));
-    assert!(breaker.allow());
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
-    assert!(!breaker.allow());
+    assert!(breaker.acquire().is_none());
     clock.advance(Duration::from_millis(200));
-    assert!(breaker.allow(), "probe after the reopened window");
-    breaker.on_success();
+    breaker.acquire().unwrap().on_success();
     assert_eq!(breaker.state(), CircuitState::Closed);
 }
 
@@ -780,4 +777,38 @@ async fn followup_single_plaintext_unit_budget_works_through_scheduler() {
         result.is_ok(),
         "plaintext batch budget must account for ciphertext overhead: {result:?}"
     );
+}
+
+#[test]
+fn a_stale_verdict_cannot_close_a_new_probe_window() {
+    let clock = Arc::new(ManualClock::new());
+    let breaker = CircuitBreaker::new(breaker_cfg(1), clock.clone());
+    let old = breaker.acquire().unwrap();
+    breaker.acquire().unwrap().on_failure();
+    clock.advance(Duration::from_secs(1));
+    let probe = breaker.acquire().unwrap();
+    old.on_success();
+    assert_eq!(breaker.state(), CircuitState::HalfOpen);
+    assert!(breaker.acquire().is_none());
+    probe.on_success();
+    assert_eq!(breaker.state(), CircuitState::Closed);
+}
+
+#[test]
+#[allow(deprecated)]
+fn legacy_verdicts_are_serial_and_bound_to_their_admitted_window() {
+    let clock = Arc::new(ManualClock::new());
+    let breaker = CircuitBreaker::new(breaker_cfg(1), clock.clone());
+    assert!(breaker.allow());
+    assert!(!breaker.allow());
+    breaker.acquire().unwrap().on_failure();
+    clock.advance(Duration::from_secs(1));
+    let probe = breaker.acquire().unwrap();
+    breaker.on_success();
+    assert_eq!(breaker.state(), CircuitState::HalfOpen);
+    assert!(!breaker.allow());
+    probe.on_success();
+    assert!(breaker.allow());
+    breaker.on_failure();
+    assert_eq!(breaker.state(), CircuitState::Open);
 }

@@ -278,19 +278,18 @@ fn circuit_transitions_closed_open_half_open_closed() {
     let breaker = CircuitBreaker::new(breaker_cfg(), clock.clone());
     assert_eq!(breaker.state(), CircuitState::Closed);
     for _ in 0..3 {
-        assert!(breaker.allow());
-        breaker.on_failure();
+        breaker.acquire().unwrap().on_failure();
     }
     assert_eq!(breaker.state(), CircuitState::Open);
-    assert!(!breaker.allow(), "OPEN rejects");
+    assert!(breaker.acquire().is_none(), "OPEN rejects");
 
     clock.advance(Duration::from_millis(1100));
-    assert!(breaker.allow(), "half-open probe 1");
+    let first = breaker.acquire().expect("half-open probe 1");
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
-    assert!(breaker.allow(), "half-open probe 2");
-    assert!(!breaker.allow(), "half_open_max_requests = 2");
-    breaker.on_success();
-    breaker.on_success();
+    let second = breaker.acquire().expect("half-open probe 2");
+    assert!(breaker.acquire().is_none(), "half_open_max_requests = 2");
+    first.on_success();
+    second.on_success();
     assert_eq!(breaker.state(), CircuitState::Closed);
 }
 
@@ -299,18 +298,20 @@ fn circuit_reopen_doubles_timeout_up_to_max() {
     let clock = Arc::new(ManualClock::new());
     let breaker = CircuitBreaker::new(breaker_cfg(), clock.clone());
     for _ in 0..3 {
-        breaker.on_failure();
+        breaker.acquire().unwrap().on_failure();
     }
     assert_eq!(breaker.state(), CircuitState::Open);
     // Half-open, then fail: reopen with doubled (2s) timeout.
     clock.advance(Duration::from_millis(1100));
-    assert!(breaker.allow());
-    breaker.on_failure();
+    breaker.acquire().unwrap().on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
     clock.advance(Duration::from_millis(1100));
-    assert!(!breaker.allow(), "reopened timeout must have doubled");
+    assert!(
+        breaker.acquire().is_none(),
+        "reopened timeout must have doubled"
+    );
     clock.advance(Duration::from_millis(1000));
-    assert!(breaker.allow(), "2s elapsed, half-open again");
+    assert!(breaker.acquire().is_some(), "2s elapsed, half-open again");
 }
 
 // ---------- release permit during backoff ----------
@@ -546,22 +547,27 @@ fn breaker_cycle_storm(cycles: u64) {
     for i in 0..cycles {
         assert_eq!(breaker.state(), CircuitState::Closed, "cycle {i}: start");
         for _ in 0..breaker_cfg().failure_threshold {
-            breaker.on_failure();
+            breaker.acquire().unwrap().on_failure();
         }
         assert_eq!(breaker.state(), CircuitState::Open, "cycle {i}: trips");
-        assert!(!breaker.allow(), "cycle {i}: open must gate traffic");
+        assert!(
+            breaker.acquire().is_none(),
+            "cycle {i}: open must gate traffic"
+        );
         clock.advance(breaker_cfg().open_max + Duration::from_secs(1));
-        assert!(breaker.allow(), "cycle {i}: half-open probe allowed");
+        let mut probe = breaker.acquire().expect("half-open probe");
         if i % 4 == 3 {
-            breaker.on_failure();
+            probe.on_failure();
             assert_eq!(breaker.state(), CircuitState::Open, "cycle {i}: reopens");
-            assert!(!breaker.allow(), "cycle {i}: reopened gates again");
+            assert!(
+                breaker.acquire().is_none(),
+                "cycle {i}: reopened gates again"
+            );
             clock.advance(breaker_cfg().open_max + Duration::from_secs(1));
-            assert!(breaker.allow(), "cycle {i}: probe after reopen");
+            probe = breaker.acquire().expect("probe after reopen");
         }
-        breaker.on_success();
-        assert!(breaker.allow(), "cycle {i}: second half-open slot");
-        breaker.on_success();
+        probe.on_success();
+        breaker.acquire().unwrap().on_success();
         assert_eq!(breaker.state(), CircuitState::Closed, "cycle {i}: closes");
     }
 }
