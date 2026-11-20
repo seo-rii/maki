@@ -69,14 +69,14 @@ fn page_digest(identity: &[u8; 16], bytes: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageRef {
     slot: u64,
     hash: [u8; 32],
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Node {
     len: u64,
@@ -508,6 +508,21 @@ impl RollbackBacking {
             })),
         }
     }
+}
+
+fn directory_entries<'a>(
+    entries: &'a BTreeMap<String, Entry>,
+    dir: &str,
+) -> impl Iterator<Item = (&'a str, &'a Entry)> {
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    entries
+        .range(prefix.clone()..)
+        .map_while(move |(name, entry)| name.strip_prefix(&prefix).map(|child| (child, entry)))
+        .filter(|(child, _)| !child.contains('/'))
 }
 
 fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -> io::Result<()> {
@@ -989,11 +1004,12 @@ impl BackingFile for CowFile {
     fn sync_data(&self) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
+        let node = state.files.get(&self.id).ok_or_else(missing)?;
+        if state.committed.files.get(&self.id) == Some(node) {
+            return state.reclaim_closed_files();
+        }
         let mut candidate = state.committed.clone();
-        candidate.files.insert(
-            self.id,
-            state.files.get(&self.id).ok_or_else(missing)?.clone(),
-        );
+        candidate.files.insert(self.id, node.clone());
         state.commit(candidate)
     }
 }
@@ -1099,17 +1115,8 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.directory(dir)?;
-        let mut prefix = dir.to_owned();
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        let start = std::ops::Bound::Included(prefix.as_str());
-        Ok(state
-            .entries
-            .range::<str, _>((start, std::ops::Bound::Unbounded))
-            .map_while(|(name, _)| name.strip_prefix(&prefix))
-            .filter(|child| !child.contains('/'))
-            .map(str::to_owned)
+        Ok(directory_entries(&state.entries, dir)
+            .map(|(child, _)| child.to_owned())
             .collect())
     }
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
@@ -1117,6 +1124,14 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.directory(dir)?;
+        // Syncing a child also publishes any missing ancestors. Once the
+        // directory is durable, only changes to its immediate names matter.
+        if (dir.is_empty() || state.committed.entries.get(dir) == Some(&Entry::Directory))
+            && directory_entries(&state.entries, dir)
+                .eq(directory_entries(&state.committed.entries, dir))
+        {
+            return state.reclaim_closed_files();
+        }
         let mut candidate = state.committed.clone();
         candidate
             .entries
@@ -1168,6 +1183,45 @@ impl Backing for RollbackBacking {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_file_and_directory_barriers_leave_the_witness_generation_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 4 * PAGE).unwrap();
+        backing.create_dir_all("data/sub").unwrap();
+        let file = backing.open("data/file", true).unwrap();
+        file.write_at(0, b"first").unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("data").unwrap();
+        let generation = || backing.state.lock().committed.generation;
+        let clean = generation();
+        for _ in 0..3 {
+            file.sync_data().unwrap();
+            backing.sync_dir("data").unwrap();
+        }
+        assert_eq!(generation(), clean);
+        file.write_at(0, b"other").unwrap();
+        backing.sync_dir("data").unwrap();
+        assert_eq!(generation(), clean);
+        file.sync_data().unwrap();
+        assert_eq!(generation(), clean + 1);
+        backing.open("data/sub/pending", true).unwrap();
+        backing.sync_dir("data").unwrap();
+        assert_eq!(generation(), clean + 1);
+        backing.sync_dir("data/sub").unwrap();
+        assert_eq!(generation(), clean + 2);
+        drop((file, backing));
+        let reopened = RollbackBacking::open(root.path(), witness.path()).unwrap();
+        let mut bytes = [0; 5];
+        reopened
+            .open("data/file", false)
+            .unwrap()
+            .read_at(0, &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"other");
+        assert!(reopened.exists("data/sub/pending").unwrap());
+    }
 
     #[test]
     fn listing_only_returns_direct_children_of_the_exact_directory() {
