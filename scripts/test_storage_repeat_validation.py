@@ -322,6 +322,32 @@ class BackgroundStorageTests(unittest.TestCase):
             "rollback_backing", "rollback_model", "rollback_protection", "rollback_process",
         ])
 
+    def test_start_discards_unpublished_snapshots_on_preparation_failure(self):
+        args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
+        logs = self.root / "logs"
+        logs.mkdir()
+        latest = logs / "maki-storage-latest.json"
+        latest.write_text("previous campaign")
+        for failure in ("extract", "cargo", "launch"):
+            def extract(*args):
+                self.fake_freeze_source(*args)
+                if failure == "extract":
+                    raise OSError("extract")
+
+            with (self.subTest(failure=failure),
+                  mock.patch.object(self.runner.Path, "home", return_value=self.root),
+                  mock.patch.object(self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)),
+                  mock.patch.object(self.runner.qualification_source(), "clean_revision", return_value="revision"),
+                  mock.patch.object(self.runner.qualification_source(), "extract_revision", side_effect=extract),
+                  mock.patch.object(self.runner.subprocess, "check_output", return_value="fixture",
+                                    side_effect=OSError("cargo") if failure == "cargo" else None),
+                  mock.patch.object(self.runner.subprocess, "Popen", side_effect=OSError("launch")) as launch):
+                with self.assertRaisesRegex(OSError, failure):
+                    self.runner.start(args)
+                self.assertEqual(launch.call_count, int(failure == "launch"))
+                self.assertEqual(list(logs.iterdir()), [latest])
+                self.assertEqual(latest.read_text(), "previous campaign")
+
     def test_failed_publication_reaps_worker_without_releasing_it(self):
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
         process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
