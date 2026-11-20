@@ -423,7 +423,8 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
                          SwapLimit=True, CpuCfsQuota=True, PidsLimit=True, ServerVersion="fixture")))
         target = mock.Mock()
         target.client.return_value = target.kill.return_value = {}
-        target.stats.return_value = {"cpu.stat": "nr_throttled 1"}
+        target.stats.side_effect = [{"cpu.stat": "nr_throttled 1", "memory.max": str(96 << 20), "memory.swap.max": "0"},
+                                    {"memory.max": str(192 << 20), "memory.swap.max": "0"}]
         target.one_shot.return_value = mock.Mock(returncode=0, stdout="ok")
 
         def create(_image, directory):
@@ -483,7 +484,7 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target = mock.Mock()
         target.start.side_effect = TimeoutError("no READY")
         target.state.return_value = {"Running": True, "OOMKilled": False}
-        target.stats.return_value = {"memory.max": "33554432"}
+        target.stats.return_value = {"memory.max": "33554432", "memory.swap.max": "0"}
         result = campaign.constrained_recovery(target)
         self.assertFalse(result["ready"])
         self.assertEqual(result["outcome"], "startup-timeout")
@@ -495,10 +496,33 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target = mock.Mock()
         target.start.side_effect = TimeoutError("no READY")
         target.state.return_value = {"Running": True, "OOMKilled": False}
-        target.stats.return_value = {"memory.max": "67108864"}
-        result = campaign.constrained_recovery(target, memory="64m")
+        target.stats.return_value = {"memory.max": "67108864", "memory.swap.max": "0"}
+        result = campaign.constrained_recovery(target, memory_mib=64)
         self.assertFalse(result["ready"])
         target.start.assert_called_once_with(memory="64m")
+
+    def test_only_the_observed_memory_cap_and_disabled_swap_can_qualify_readback(self):
+        expected = {"memory.max": str(64 << 20), "memory.swap.max": "0"}
+        for field, value in (("memory.max", "max"), ("memory.max", str(192 << 20)),
+                             ("memory.swap.max", "max"), ("memory.swap.max", "unavailable"),
+                             ("memory.max", None)):
+            with self.subTest(field=field, value=value):
+                target = mock.Mock()
+                target.stats.return_value = dict(expected)
+                if value is None:
+                    del target.stats.return_value[field]
+                else:
+                    target.stats.return_value[field] = value
+                with self.assertRaisesRegex(AssertionError, field):
+                    campaign.constrained_recovery(target, memory_mib=64)
+                target.client.assert_not_called()
+                target.remove.assert_called_once_with()
+        target = mock.Mock()
+        target.stats.return_value = expected
+        result = campaign.constrained_recovery(target, memory_mib=64, rounds=7)
+        self.assertEqual(result["resources"], expected)
+        self.assertEqual(result["outcome"], "verified")
+        target.client.assert_called_once_with("verify", rounds=7)
 
     def test_unrelated_startup_failure_is_not_qualified_as_oom(self):
         target = mock.Mock()
