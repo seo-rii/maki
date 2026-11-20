@@ -21,9 +21,9 @@ import time
 import uuid
 
 try:
-    from campaign_io import DiagnosticLog, save_json
+    from campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
 except ModuleNotFoundError:
-    from scripts.campaign_io import DiagnosticLog, save_json
+    from scripts.campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
 
 PREFIX = b"MAKI_FC_V1 "
 MAX_FRAME = 16384
@@ -164,8 +164,12 @@ class SerialProcess:
             writable.register(descriptor, selectors.EVENT_WRITE)
             until = time.monotonic() + 5
             while raw:
-                if not writable.select(max(0, until - time.monotonic())):
+                check_termination()
+                remaining = until - time.monotonic()
+                if remaining <= 0:
                     raise TimeoutError("guest serial input timeout")
+                if not writable.select(min(0.1, remaining)):
+                    continue
                 try:
                     written = os.write(descriptor, raw)
                 except BlockingIOError:
@@ -177,6 +181,7 @@ class SerialProcess:
     def event(self, timeout):
         until = time.monotonic() + timeout
         while True:
+            check_termination()
             newline = self.buffer.find(b"\n")
             if newline >= 0:
                 line = bytes(self.buffer[:newline]).rstrip(b"\r")
@@ -190,8 +195,10 @@ class SerialProcess:
             if len(self.buffer) > MAX_FRAME:
                 raise ValueError("unterminated oversized serial line")
             left = until - time.monotonic()
-            if left <= 0 or not self.selector.select(left):
+            if left <= 0:
                 raise TimeoutError("guest serial event deadline")
+            if not self.selector.select(min(0.1, left)):
+                continue
             chunk = os.read(self.child.stdout.fileno(), 4096)
             if not chunk:
                 raise RuntimeError("Firecracker exited or closed serial before expected event")
@@ -281,6 +288,7 @@ def campaign(args):
     fs_uuid = None
     try:
         for boot in range(args.cycles + 1):
+            check_termination()
             config = args.output / f"boot-{boot}.json"
             save_json(config, make_config(args, boot, token))
             process = SerialProcess([str(args.firecracker), "--no-api", "--config-file", str(config)],
@@ -327,6 +335,7 @@ def campaign(args):
                 entry["diagnostics"] = process.diagnostics()
                 raise
             save_json(args.output / "results.json", result)
+        check_termination()
         result["passed"] = True
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -344,7 +353,9 @@ def main():
     parser.add_argument("--memory-mib", type=int, default=512)
     parser.add_argument("--vcpus", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=120)
-    campaign(parser.parse_args())
+    args = parser.parse_args()
+    with handle_termination():
+        campaign(args)
 
 
 if __name__ == "__main__":

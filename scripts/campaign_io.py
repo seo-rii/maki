@@ -1,11 +1,44 @@
 """Private host-side evidence I/O shared by the reset qualification controllers."""
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import selectors
+import signal
 import tempfile
 import threading
+
+
+_termination_requested = False
+
+
+class CampaignTerminated(SystemExit):
+    def __str__(self):
+        return "received SIGTERM"
+
+
+@contextmanager
+def handle_termination():
+    # An exception from the signal handler can interrupt Popen before the
+    # caller owns the child, or interrupt the final cleanup and report.
+    global _termination_requested
+
+    def request_stop(_number, _frame):
+        global _termination_requested
+        _termination_requested = True
+
+    previous = signal.signal(signal.SIGTERM, request_stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        _termination_requested = False
+
+
+def check_termination():
+    if _termination_requested:
+        raise CampaignTerminated(128 + signal.SIGTERM)
 
 
 def save_json(path, value):
