@@ -520,12 +520,25 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
                 target.client.assert_not_called()
                 target.remove.assert_called_once_with()
         target = mock.Mock()
-        target.stats.return_value = expected
+        final = {**expected, "memory.peak": str(63 << 20)}
+        target.stats.side_effect = [{**expected, "memory.peak": str(8 << 20)}, final]
         result = campaign.constrained_recovery(target, memory_mib=64, rounds=7)
-        self.assertEqual(result["resources"], expected)
+        self.assertEqual(result["resources"], final)
         self.assertEqual(result["outcome"], "verified")
         self.assertTrue(result["limits_verified"])
-        target.client.assert_called_once_with("verify", rounds=7)
+        target.assert_has_calls([mock.call.stats(), mock.call.client("verify", rounds=7),
+                                 mock.call.stats(), mock.call.kill()])
+
+    def test_limits_must_still_match_after_recovery_readback(self):
+        target = mock.Mock()
+        target.stats.side_effect = [
+            {"memory.max": str(32 << 20), "memory.swap.max": "0"},
+            {"memory.max": "max", "memory.swap.max": "0"},
+        ]
+        with self.assertRaisesRegex(AssertionError, "memory.max"):
+            campaign.constrained_recovery(target)
+        target.client.assert_called_once_with("verify", rounds=1)
+        target.remove.assert_called_once_with()
 
     def test_unrelated_startup_failure_is_not_qualified_as_oom(self):
         target = mock.Mock()

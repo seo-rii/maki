@@ -493,9 +493,10 @@ def constrained_recovery(target, memory_mib=32, rounds=1):
             return {"ready": False, "outcome": "startup-oom", "limits_verified": False,
                     "termination": state}
         else:
+            require_memory_limits(target.stats(), memory_mib)
+            verification = target.client("verify", rounds=rounds)
             resources = target.stats()
             require_memory_limits(resources, memory_mib)
-            verification = target.client("verify", rounds=rounds)
             target.kill()
             return {"ready": True, "outcome": "verified", "limits_verified": True,
                     "verification": verification, "resources": resources}
