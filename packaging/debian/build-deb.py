@@ -353,6 +353,8 @@ def write_file(path, contents, mode):
 def validate(args):
     if not args.release_dir.is_dir():
         fail(f"release directory does not exist: {args.release_dir}")
+    if args.output.name in RELEASE_FILES and args.output.parent.resolve() == args.release_dir.resolve():
+        fail(f"output would overwrite a release input: {args.output}")
     version = subprocess.run(
         ["dpkg", "--validate-version", args.version],
         capture_output=True,

@@ -748,6 +748,21 @@ class DebianPackageTests(unittest.TestCase):
         stderr = self.build_failure("invalid.deb")
         self.assertIn("maki-check", stderr)
 
+    def test_output_cannot_replace_a_required_release_input(self):
+        alias = self.work / "release-alias"
+        alias.symlink_to(self.release, target_is_directory=True)
+        for name in RELEASE_NAMES:
+            source = self.release / name
+            original = source.read_bytes()
+            for directory in (self.release, alias):
+                with self.subTest(name=name, directory=directory):
+                    _, command = self.builder_command(directory / name, "0.1.0", extra=["--no-shlibdeps"])
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("overwrite a release input", result.stderr)
+                    self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(self.field(self.build("release/maki.deb"), "Package"), "maki")
+
     def test_rebuild_replaces_the_directory_entry_after_output_is_complete(self):
         output = self.work / "maki.deb"
         output.write_bytes(b"previous package")
