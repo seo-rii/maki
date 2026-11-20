@@ -390,11 +390,11 @@ maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456 --ttl 1s
 ```
 
-The control commands use the configuration only to find the socket: they
-parse it but do not validate it, so a configuration edited for the next start
-cannot block `maki drain` on the running daemon. The packaged configuration is
-readable only by root and group `maki`; a `maki-admin` member names the socket
-instead, with `--socket` in place of the configuration:
+The control commands read the configured socket path and skip attach-time
+validation. The full file must still parse as a Maki configuration. If an edit
+prevents parsing, use `--socket` to reach the running daemon directly. The
+packaged configuration is readable only by root and group `maki`, so members
+of `maki-admin` also use this form.
 
 ```bash
 maki status --socket /run/maki-control/example/control.sock
