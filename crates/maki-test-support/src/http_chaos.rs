@@ -72,30 +72,43 @@ pub struct TestServer {
     pub addr: SocketAddr,
     pub requests: Arc<Mutex<Vec<RecordedRequest>>>,
     handler: Arc<Mutex<Handler>>,
+    listener_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.listener_task.abort();
+    }
 }
 
 impl TestServer {
     pub async fn start(handler: Handler) -> Arc<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = Arc::new(Self {
-            addr,
-            requests: Arc::new(Mutex::new(Vec::new())),
-            handler: Arc::new(Mutex::new(handler)),
-        });
-        let s2 = server.clone();
-        tokio::spawn(async move {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(Mutex::new(handler));
+        let listener_requests = Arc::clone(&requests);
+        let listener_handler = Arc::clone(&handler);
+        let listener_task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let server = s2.clone();
-                tokio::spawn(async move {
-                    let _ = server.serve_conn(stream).await;
-                });
+                tokio::select! {
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { return };
+                        connections.spawn(Self::serve_conn(
+                            stream, Arc::clone(&listener_handler), Arc::clone(&listener_requests),
+                        ));
+                    }
+                }
             }
         });
-        server
+        Arc::new(Self {
+            addr,
+            requests,
+            handler,
+            listener_task,
+        })
     }
 
     pub fn url(&self) -> String {
@@ -106,16 +119,20 @@ impl TestServer {
         *self.handler.lock() = handler;
     }
 
-    async fn serve_conn(&self, mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
+    async fn serve_conn(
+        mut stream: tokio::net::TcpStream,
+        handler: Arc<Mutex<Handler>>,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    ) -> std::io::Result<()> {
         loop {
             let request = match read_request(&mut stream).await? {
                 Some(r) => r,
                 None => return Ok(()),
             };
             let spec = {
-                let handler = self.handler.lock().clone();
+                let handler = handler.lock().clone();
                 let spec = handler(&request);
-                self.requests.lock().push(request);
+                requests.lock().push(request);
                 spec
             };
             if spec.delay > Duration::ZERO {
@@ -200,4 +217,35 @@ async fn read_request(
         headers,
         body,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn dropping_last_handle_closes_listener_and_keepalive_connections() {
+        let server = TestServer::start(Arc::new(|_| ResponseSpec::raw(Vec::new()))).await;
+        let last = Arc::clone(&server);
+        let addr = server.addr;
+        drop(server);
+        timeout(Duration::from_secs(5), async {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(client.read_u8().await.unwrap());
+            }
+            assert!(header.starts_with(b"HTTP/1.1 200"));
+            drop(last);
+            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+            while TcpStream::connect(addr).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server did not shut down");
+    }
 }
