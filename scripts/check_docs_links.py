@@ -29,6 +29,7 @@ Usage: python3 -B scripts/check_docs_links.py [repository-root]
 """
 
 from bisect import bisect_right
+import codecs
 import hashlib
 import html
 import json
@@ -967,6 +968,7 @@ def broken_links(root):
     )
     anchor_cache = {}
     line_counts = {}
+    encoding_errors = {}
     candidates = candidate_files(root)
     published = {root}
     symlinks = {}
@@ -998,10 +1000,15 @@ def broken_links(root):
                 current = current.parent
         return current
 
-    def anchors_of(document):
-        if document not in anchor_cache:
-            anchor_cache[document] = document_anchors(document.read_bytes().decode("utf-8"))
-        return anchor_cache[document]
+    def decode_document(path, content):
+        encoding = "utf-16" if content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else "utf-8"
+        try:
+            text = content.decode(encoding)
+        except UnicodeDecodeError as error:
+            encoding_errors[path] = f"{path.relative_to(root)}: invalid {encoding} at byte {error.start}"
+            return None
+        line_counts[path] = text.count("\n") + bool(text and not text.endswith("\n"))
+        return text
 
     def target_problem(path, content, target):
         """Why `target`, linked from `path`, is broken, or None."""
@@ -1027,14 +1034,19 @@ def broken_links(root):
             span = re.fullmatch(r"L([1-9][0-9]*)(?:-L([1-9][0-9]*))?", fragment)
             if span and ("plain", "1") in urllib.parse.parse_qsl(query):
                 if resolved not in line_counts:
-                    with resolved.open("rb") as source:
-                        line_counts[resolved] = sum(1 for _ in source)
+                    if decode_document(resolved, resolved.read_bytes()) is None:
+                        return None
                 count = line_counts[resolved]
                 first, last = span[1], span[2] or span[1]
                 if len(first) <= len(last) <= len(str(count)) and int(first) <= int(last) <= count:
                     return None
                 return f"{target} (missing line)"
-            if fragment not in anchors_of(resolved):
+            if resolved not in anchor_cache:
+                text = decode_document(resolved, resolved.read_bytes())
+                if text is None:
+                    return None
+                anchor_cache[resolved] = document_anchors(text)
+            if fragment not in anchor_cache[resolved]:
                 return f"{target} (missing anchor)"
         return None
 
@@ -1048,7 +1060,9 @@ def broken_links(root):
             content = path.read_bytes()
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             continue  # the indexed file was deleted or replaced by a directory
-        text = content.decode("utf-8")
+        text = decode_document(path, content)
+        if text is None:
+            continue
         definitions = reference_definitions(text)
         labels = frozenset(definition[3] for definition in definitions)
         problems = [
@@ -1070,7 +1084,7 @@ def broken_links(root):
             for number, problem in sorted(problems, key=lambda entry: entry[0])
             if problem is not None
         )
-    return broken
+    return broken + [encoding_errors[path] for path in sorted(encoding_errors)]
 
 
 def main(argv):

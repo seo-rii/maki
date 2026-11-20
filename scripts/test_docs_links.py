@@ -1,5 +1,6 @@
 """Project links remain checked without rewriting preserved crate documents."""
 
+import codecs
 import hashlib
 import os
 import json
@@ -32,6 +33,26 @@ class DocumentationLinks(unittest.TestCase):
         self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
         self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#phantom (missing anchor)"])
+
+    def test_utf16_sources_targets_and_plain_lines(self):
+        for name, bom, encoding in [("le.md", codecs.BOM_UTF16_LE, "utf-16-le"),
+                                    ("be.md", codecs.BOM_UTF16_BE, "utf-16-be")]:
+            self.write(name, "").write_bytes(bom + "# Guide\n[bad](absent.md)\n".encode(encoding))
+        self.write("README.md", "[le](le.md#guide) [be](be.md#guide) [ok](be.md?plain=1#L2) "
+                   "[bad line](le.md?plain=1#L3) [bad link](missing.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: le.md?plain=1#L3 (missing line)", "README.md:1: missing.md",
+            "be.md:2: absent.md", "le.md:2: absent.md",
+        ])
+
+    def test_malformed_document_does_not_interrupt_other_diagnostics(self):
+        self.write("invalid.md", "").write_bytes(b"\xffx")
+        self.write("odd.md", "").write_bytes(codecs.BOM_UTF16_LE + b"x")
+        self.write("README.md", "[a](invalid.md#one) [b](odd.md?plain=1#L2) [c](missing.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: missing.md", "invalid.md: invalid utf-8 at byte 0",
+            "odd.md: invalid utf-16 at byte 2",
+        ])
 
     def test_only_ascii_digits_start_ordered_list_items(self):
         self.write("guide.md", "１. Setup\n   ===\n\n١. Setup\n   ===\n\n1. Item\n   ===\n")
