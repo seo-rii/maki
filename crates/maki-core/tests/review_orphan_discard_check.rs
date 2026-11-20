@@ -393,3 +393,35 @@ fn healthy_slot_store_reads_each_allocation_copy_once() {
     SlotStore::open(backing, geometry).unwrap();
     assert_eq!(reads.each_ref().map(|n| n.load(Ordering::Relaxed)), [1, 1]);
 }
+
+#[test]
+fn both_checks_report_the_unusable_superblock_copy_without_repairing_it() {
+    for path in [layout::SUPERBLOCK_A, layout::SUPERBLOCK_B] {
+        for missing in [true, false] {
+            let backing = Arc::new(MemBacking::new());
+            init::create_volume(backing.as_ref(), block()).unwrap();
+            assert!(check_volume(backing.as_ref()).unwrap().warnings.is_empty());
+            if missing {
+                backing.remove(path).unwrap();
+            } else {
+                backing.open(path, false).unwrap().set_len(0).unwrap();
+            }
+            let fast = check_volume(backing.as_ref()).unwrap();
+            let deep = deep_check(backing.clone(), 1 << 20).unwrap();
+            for report in [fast, deep] {
+                assert!(report.ok(), "{report:?}");
+                assert!(
+                    report
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains(path) && w.contains("fallback")),
+                    "{report:?}"
+                );
+            }
+            assert_eq!(backing.exists(path).unwrap(), !missing);
+            if !missing {
+                assert_eq!(backing.open(path, false).unwrap().len().unwrap(), 0);
+            }
+        }
+    }
+}
