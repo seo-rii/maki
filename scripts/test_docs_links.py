@@ -46,6 +46,12 @@ class DocumentationLinks(unittest.TestCase):
             "be.md:2: absent.md", "le.md:2: absent.md",
         ])
 
+    def test_overlong_target_preserves_other_documents_diagnostics(self):
+        target = "x" * 512 + ".md"
+        self.write("a.md", f"[too long]({target})\n")
+        self.write("b.md", "[absent](other.md)\n")
+        self.assertEqual(broken_links(self.root), [f"a.md:1: {target}", "b.md:1: other.md"])
+
     def test_malformed_document_does_not_interrupt_other_diagnostics(self):
         self.write("docs/invalid.md", "").write_bytes(b"\xffx")
         self.write("odd.md", "").write_bytes(codecs.BOM_UTF16_LE + b"x")

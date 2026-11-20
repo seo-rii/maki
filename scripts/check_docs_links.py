@@ -30,6 +30,7 @@ Usage: python3 -B scripts/check_docs_links.py [repository-root]
 
 from bisect import bisect_right
 import codecs
+import errno
 import hashlib
 import html
 import json
@@ -981,8 +982,13 @@ def broken_links(root):
     def published_target(path):
         if not path.is_relative_to(root):
             return None
-        if not path.exists():
-            return None  # also catches dangling links and cycles
+        try:
+            if not path.exists():
+                return None  # also catches dangling links and cycles
+        except OSError as error:
+            if error.errno == errno.ENAMETOOLONG:
+                return None
+            raise
         # A local alias may resolve to a tracked file through an ignored
         # intermediate link. Follow the path using only checkout candidates.
         pending = list(reversed(path.relative_to(root).parts))
