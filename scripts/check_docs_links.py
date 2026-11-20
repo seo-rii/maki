@@ -1005,7 +1005,8 @@ def broken_links(root):
         try:
             text = content.decode(encoding)
         except UnicodeDecodeError as error:
-            encoding_errors[path] = f"{path.relative_to(root)}: invalid {encoding} at byte {error.start}"
+            relative = path.relative_to(root).as_posix()
+            encoding_errors[path] = f"{relative}: invalid {encoding} at byte {error.start}"
             return None
         line_counts[path] = text.count("\n") + bool(text and not text.endswith("\n"))
         return text

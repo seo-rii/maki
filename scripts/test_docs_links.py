@@ -46,11 +46,11 @@ class DocumentationLinks(unittest.TestCase):
         ])
 
     def test_malformed_document_does_not_interrupt_other_diagnostics(self):
-        self.write("invalid.md", "").write_bytes(b"\xffx")
+        self.write("docs/invalid.md", "").write_bytes(b"\xffx")
         self.write("odd.md", "").write_bytes(codecs.BOM_UTF16_LE + b"x")
-        self.write("README.md", "[a](invalid.md#one) [b](odd.md?plain=1#L2) [c](missing.md)\n")
+        self.write("README.md", "[a](docs/invalid.md#one) [b](odd.md?plain=1#L2) [c](missing.md)\n")
         self.assertEqual(broken_links(self.root), [
-            "README.md:1: missing.md", "invalid.md: invalid utf-8 at byte 0",
+            "README.md:1: missing.md", "docs/invalid.md: invalid utf-8 at byte 0",
             "odd.md: invalid utf-16 at byte 2",
         ])
 
