@@ -37,6 +37,37 @@ class HostContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identity"):
             self.host.decode_frame(self.frame(event="ack"), "a" * 32, 2)
 
+    def test_wire_fua_requires_a_native_default_export_in_the_server_log(self):
+        guest = load("fc_fua", "firecracker-guest-agent.py")
+        cgroup = load("cgroup_fua", "cgroup-validation.py")
+        socket = self.path / "nbd.sock"
+        connections = self.path / "connections.log"
+        for client in (guest, cgroup):
+            for fields in ('Connect export="" fua=2', 'Connect export="" fua=1',
+                           'Connect export="" fua=20', 'Connect export="other" fua=2', ''):
+                with self.subTest(client=client.__name__, fields=fields):
+                    # cgroup reuses its daemon for multiple connections.
+                    stale = 'old connection=1 Connect export="" fua=2\n' if client is cgroup else ''
+                    connections.write_text(stale)
+                    library = mock.Mock()
+                    library.nbd_create.return_value = 1
+                    library.nbd_can_fua.return_value = library.nbd_can_flush.return_value = 1
+
+                    def negotiate(_handle, _address):
+                        with connections.open("a") as log:
+                            log.write(f"new connection=2 {fields}\n")
+                        return 0
+
+                    library.nbd_connect_unix.side_effect = negotiate
+                    with mock.patch.object(client.ctypes, "CDLL", return_value=library):
+                        if fields == 'Connect export="" fua=2':
+                            handle = client.Nbd(socket)
+                            handle.lib.nbd_close(handle.handle)
+                        else:
+                            with self.assertRaisesRegex((ValueError, AssertionError), "native FUA"):
+                                client.Nbd(socket)
+                    library.nbd_close.assert_called_once_with(1)
+
     def test_guest_mount_failure_reaches_host_before_ready(self):
         guest = load("fc_mount_failure", "firecracker-guest-agent.py")
         agent = guest.Agent()

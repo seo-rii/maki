@@ -292,6 +292,8 @@ def campaign(args):
                     ready = process.expect("ready", args.timeout)
                     if not ready.get("fs_uuid") or ready.get("write_cache") != "write back":
                         raise ValueError("missing filesystem identity or guest writeback advertisement")
+                    if ready.get("native_fua") is not True:
+                        raise ValueError("guest did not confirm native FUA")
                     if fs_uuid is not None and fs_uuid != ready["fs_uuid"]:
                         raise ValueError("data filesystem changed across boot")
                     fs_uuid = ready["fs_uuid"]

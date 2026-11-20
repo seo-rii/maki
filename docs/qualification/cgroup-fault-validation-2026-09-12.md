@@ -34,7 +34,10 @@ Related: [qualification tiers](../testing.md),
 
 The [Docker runner](../../scripts/cgroup-validation.py) completed three cases.
 Each initial workload performed eight FLUSH batches of 128 distinct 4 KiB units
-and 64 FUA writes, overwriting those same units across rounds. The final latest
+and 64 FUA writes, overwriting those same units across rounds. The historical
+client checked the FUA wire capability, which allows both native and emulated
+FUA. Current runs also require the nbdkit log filter to record native FUA for
+each client connection before the workload starts. The final latest
 image contains 136 independently checked units. Unbarriered writes use other
 offsets and are excluded from the durable oracle.
 

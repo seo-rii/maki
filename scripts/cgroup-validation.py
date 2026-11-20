@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -133,6 +134,9 @@ class Nbd:
         if not self.handle:
             raise RuntimeError("libnbd handle allocation failed")
         try:
+            connections = pathlib.Path(path).with_name("connections.log")
+            # A previous client of this daemon may already have logged a negotiation.
+            log_offset = connections.stat().st_size
             with unix_socket_path(path) as address:
                 if connected_fd is None:
                     self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(address)))
@@ -145,7 +149,11 @@ class Nbd:
                         os.close(connected_fd)
                         self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
                         client.detach()  # libnbd owns the descriptor on success
-            ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA required")
+            ensure(self.lib.nbd_can_fua(self.handle) == 1, "FUA unavailable on the NBD connection")
+            with connections.open("rb") as log:
+                log.seek(log_offset)
+                connection = next((line for line in log if re.search(rb' connection=\d+ Connect export="" ', line)), b"")
+                ensure(b"fua=2" in connection.split(), "plugin does not provide native FUA")
             ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
         except BaseException:
             self.close()
@@ -310,7 +318,7 @@ socket = "/case/control.sock"
     def start(self, memory="192m", cpus="1"):
         ensure(self.identifier is None and self.pending_identifier is None,
                "previous owned container has not been removed")
-        for name in ("nbd.sock", "ready.sock"):
+        for name in ("nbd.sock", "ready.sock", "connections.log"):
             (self.case / name).unlink(missing_ok=True)
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         with unix_socket_path(self.case / "ready.sock") as address:
@@ -318,7 +326,8 @@ socket = "/case/control.sock"
         # Maki is PID 1: no shell, init, sidecar or stress helper is the OOM victim.
         self.create(memory, cpus, [
             "nbdkit", "--foreground", "--threads", "4", "-U", "/case/nbd.sock",
-            "/opt/maki/libmaki_nbdkit.so", "config=/case/config.toml",
+            "--filter=log", "/opt/maki/libmaki_nbdkit.so", "config=/case/config.toml",
+            "logfile=/case/connections.log",
         ], extra=["--env", "NOTIFY_SOCKET=/case/ready.sock"])
         run(["docker", "start", self.identifier])
         until = time.monotonic() + 30

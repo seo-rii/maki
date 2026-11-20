@@ -114,6 +114,8 @@ class OracleTests(unittest.TestCase):
 
     def test_connection_signal_follows_the_kernel_connection_and_precedes_negotiation(self):
         path = self.ledger.parent / "nbd.sock"
+        connections = path.with_name("connections.log")
+        connections.write_text('old connection=1 Connect export="" fua=1\n')
         receiver, sender = campaign.socket.socketpair()
         with campaign.socket.socket(campaign.socket.AF_UNIX) as listener, receiver, sender:
             listener.bind(str(path))
@@ -127,6 +129,8 @@ class OracleTests(unittest.TestCase):
             def negotiate(_handle, descriptor):
                 with listener.accept()[0]:
                     self.assertEqual(receiver.recv(1), b"C")
+                with connections.open("a") as log:
+                    log.write('current connection=2 Connect export="" fua=2\n')
                 campaign.os.close(descriptor)  # model ownership taken by libnbd
                 return 0
 
