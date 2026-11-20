@@ -886,19 +886,26 @@ impl BackingFile for CowFile {
             .checked_add(data.len() as u64)
             .ok_or_else(|| input("write overflow"))?;
         let mut at = offset;
+        let mut scratch = Vec::new();
         while at < end {
             let page = state.page_ref(self.id, at / PAGE)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let src = (at - offset) as usize;
             let fragment = &data[src..src + count];
-            if page.is_none() && count == PAGE as usize {
+            if let Some(page) = page {
+                // Authenticate the old mapping even before a full overwrite.
+                scratch.resize(PAGE as usize, 0);
+                state.read_page(&page, &mut scratch)?;
+            } else if count < PAGE as usize {
+                scratch.clear();
+                scratch.resize(PAGE as usize, 0);
+            }
+            if count == PAGE as usize {
                 state.write_page(self.id, at / PAGE, fragment)?;
             } else {
-                // Read and authenticate mapped pages even on a full overwrite.
-                let mut bytes = state.page(page)?;
                 let start = (at % PAGE) as usize;
-                bytes[start..start + count].copy_from_slice(fragment);
-                state.write_page(self.id, at / PAGE, &bytes)?;
+                scratch[start..start + count].copy_from_slice(fragment);
+                state.write_page(self.id, at / PAGE, &scratch)?;
             }
             at += count as u64;
         }

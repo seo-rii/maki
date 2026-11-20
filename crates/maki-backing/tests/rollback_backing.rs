@@ -11,6 +11,23 @@ fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 #[test]
+fn partial_overwrite_preserves_mapped_edges_and_zeroes_sparse_edges() {
+    const PAGE: usize = 4096;
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 8 * PAGE as u64).unwrap();
+    let file = backing.open("data", true).unwrap();
+    file.write_at(0, &[0x41; 2 * PAGE]).unwrap();
+    file.set_len(3 * PAGE as u64).unwrap();
+    file.sync_data().unwrap();
+    file.write_at(1, &[0x42; 2 * PAGE]).unwrap();
+    let mut bytes = vec![0; 3 * PAGE];
+    file.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes[0], 0x41);
+    assert!(bytes[1..=2 * PAGE].iter().all(|b| *b == 0x42));
+    assert!(bytes[2 * PAGE + 1..].iter().all(|b| *b == 0));
+}
+
+#[test]
 fn only_explicitly_synced_data_and_names_survive() {
     let (root, witness) = dirs();
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
