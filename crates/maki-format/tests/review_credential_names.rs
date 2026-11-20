@@ -75,6 +75,7 @@ fn reference(source: &str, name: &str) -> String {
         name.replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('\n', "\\n")
+            .replace('\0', "\\u0000")
     )
 }
 
@@ -87,6 +88,7 @@ fn unloadable() -> Vec<(&'static str, String)> {
         ("credential", format!("{SECRET}:key")),
         ("credential", format!("{SECRET}\u{e9}")),
         ("credential", format!("{SECRET}\n")),
+        ("file", format!("/etc/maki/{SECRET}\0dir/key")),
         ("file", format!("/etc/maki/keys/.{SECRET}")),
         ("file", format!("/etc/maki/keys/{SECRET} key")),
         ("file", format!("/etc/maki/{SECRET}/..")),

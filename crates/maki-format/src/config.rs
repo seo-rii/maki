@@ -1110,11 +1110,9 @@ impl VolumeConfig {
         // relative path would land wherever nbdkit's working directory is
         // (SPEC §8 places volumes under /var/lib/maki/<volume>).
         let root = self.backing.root.as_str();
-        if root.trim().is_empty()
-            || !(root.starts_with('/') || std::path::Path::new(root).is_absolute())
-        {
+        if !is_absolute_path(root) || root.contains('\0') {
             return Err(ConfigError::Invalid(format!(
-                "backing.root {root:?} must be an absolute path"
+                "backing.root {root:?} must be an absolute path without NUL"
             )));
         }
         if let Some(rollback) = &self.backing.rollback_protection {
@@ -1163,11 +1161,9 @@ impl VolumeConfig {
                 }
             } else {
                 let witness = rollback.witness_root.as_str();
-                if witness.trim().is_empty()
-                    || !(witness.starts_with('/') || std::path::Path::new(witness).is_absolute())
-                {
+                if !is_absolute_path(witness) || witness.contains('\0') {
                     return Err(ConfigError::Invalid(format!(
-                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path"
+                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path without NUL"
                     )));
                 }
                 let root_path = std::path::Path::new(root);
@@ -1363,8 +1359,10 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     // A `file` credential names a path. A relative one resolves against the
     // working directory of whichever process reads it, which is not the one
     // that validated it (BUG-122).
-    if c.source == "file" && !is_absolute_path(&c.name) {
-        return Err(invalid("file credential name must be an absolute path"));
+    if c.source == "file" && (!is_absolute_path(&c.name) || c.name.contains('\0')) {
+        return Err(invalid(
+            "file credential name must be an absolute path without NUL",
+        ));
     }
     // The loaders look up a `credential` name, and the file name of a
     // `file` path, in a directory and refuse any other name. `volume create`
@@ -2241,8 +2239,8 @@ impl VolumeConfig {
             )));
         }
         if let Some(group) = &self.control.group {
-            if group.trim().is_empty() {
-                return Err(invalid("control.group must not be empty"));
+            if group.trim().is_empty() || group.contains('\0') {
+                return Err(invalid("control.group must not be empty or contain NUL"));
             }
         }
 

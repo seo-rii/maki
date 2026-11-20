@@ -932,3 +932,23 @@ fn unix_socket_path_lengths_are_checked_in_bytes() {
         }
     }
 }
+
+#[test]
+fn filesystem_paths_and_control_group_must_be_representable_by_the_os() {
+    let mut config = parse(&local());
+    config.backing.root = "/var/lib/ma\0ki".into();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("backing.root"));
+    config.backing.root = "/var/lib/maki".into();
+    config.control.group = Some("maki\0group".into());
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("control.group"));
+    config.control.group = Some("maki-admin".into());
+    config.validate().unwrap();
+}
