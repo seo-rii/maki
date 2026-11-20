@@ -440,17 +440,6 @@ def create_tree(package_root, args, runtimes, epoch):
         for runtime in sorted(runtimes):
             if not any(entry.split()[0] == runtime for entry in depends):
                 depends.append(runtime)
-    control = f"""Package: maki
-Version: {args.version}
-Section: admin
-Priority: optional
-Architecture: {args.architecture}
-Maintainer: {MAINTAINER}
-Depends: {", ".join(depends)}
-Description: encrypted block storage daemon and recovery controller
- Maki exposes encrypted backing storage through nbdkit and provides a
- fail-closed privileged helper for NBD, LVM, XFS, and workload recovery.
-"""
     postinst = """#!/bin/sh
 set -e
 if [ "$1" = configure ]; then
@@ -515,10 +504,30 @@ if [ "$1" = remove ] || [ "$1" = purge ]; then
 fi
 exit 0
 """
-    write_file(package_root / "DEBIAN/control", control, 0o644)
     write_file(package_root / "DEBIAN/postinst", postinst, 0o755)
     write_file(package_root / "DEBIAN/prerm", prerm, 0o755)
     write_file(package_root / "DEBIAN/postrm", postrm, 0o755)
+
+    # dpkg-gencontrol counts the staged tree, including its root and maintainer
+    # scripts, before writing control. Each directory costs one KiB and each
+    # regular file is rounded up individually. This tree contains no hardlinks.
+    installed_size = 1 + sum(
+        1 if path.is_dir() else (path.stat().st_size + 1023) // 1024
+        for path in package_root.rglob("*")
+    )
+    control = f"""Package: maki
+Version: {args.version}
+Section: admin
+Priority: optional
+Architecture: {args.architecture}
+Installed-Size: {installed_size}
+Maintainer: {MAINTAINER}
+Depends: {", ".join(depends)}
+Description: encrypted block storage daemon and recovery controller
+ Maki exposes encrypted backing storage through nbdkit and provides a
+ fail-closed privileged helper for NBD, LVM, XFS, and workload recovery.
+"""
+    write_file(package_root / "DEBIAN/control", control, 0o644)
 
 
 def normalize_timestamps(root, epoch):

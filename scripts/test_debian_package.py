@@ -748,6 +748,14 @@ class DebianPackageTests(unittest.TestCase):
         stderr = self.build_failure("invalid.deb")
         self.assertIn("maki-check", stderr)
 
+    def test_installed_size_accounts_for_staged_files_in_kib(self):
+        package = self.build()
+        size = int(self.field(package, "Installed-Size"))
+        self.assertGreater(size, 0)
+        with (self.release / "maki").open("ab") as executable:
+            executable.write(b"x" * 2048)
+        self.assertEqual(int(self.field(self.build(), "Installed-Size")), size + 2)
+
     def test_output_cannot_replace_a_required_release_input(self):
         alias = self.work / "release-alias"
         alias.symlink_to(self.release, target_is_directory=True)
