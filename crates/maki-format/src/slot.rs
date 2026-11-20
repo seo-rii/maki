@@ -45,6 +45,11 @@ impl SlotHeader {
         let _magic = r.take(8)?;
         let unit_index = r.u64()?;
         let write_sequence = r.u64()?;
+        if write_sequence == 0 {
+            return Err(FormatError::Invalid(
+                "slot write sequence must be positive".into(),
+            ));
+        }
         let ciphertext_len = r.u32()?;
         let flags = r.u32()?;
         let ciphertext_crc = r.u32()?;

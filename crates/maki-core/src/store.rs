@@ -278,7 +278,7 @@ fn probe_header(
     }
     Ok(SlotHeader::decode(&header_bytes)
         .ok()
-        .filter(|h| h.unit_index == unit && h.write_sequence > 0)
+        .filter(|h| h.unit_index == unit)
         .map_or(Probe::Damaged, Probe::Header))
 }
 
@@ -1046,6 +1046,11 @@ impl SlotStore {
         ciphertext: &[u8],
     ) -> Result<(), CoreError> {
         self.validate_unit(unit)?;
+        if write_sequence == 0 {
+            return Err(CoreError::Corrupt(
+                "slot write sequence must be positive".into(),
+            ));
+        }
         if ciphertext.len() > self.geometry.max_ciphertext_size as usize {
             return Err(CoreError::Corrupt(format!(
                 "ciphertext {} exceeds max {}",
