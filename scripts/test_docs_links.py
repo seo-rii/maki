@@ -1,5 +1,6 @@
 """Project links remain checked without rewriting preserved crate documents."""
 
+import codecs
 import hashlib
 import os
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.check_docs_links import broken_links
 
@@ -32,6 +34,48 @@ class DocumentationLinks(unittest.TestCase):
         self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
         self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#phantom (missing anchor)"])
+
+    def test_utf16_sources_targets_and_plain_lines(self):
+        for name, bom, encoding in [("le.md", codecs.BOM_UTF16_LE, "utf-16-le"),
+                                    ("be.md", codecs.BOM_UTF16_BE, "utf-16-be")]:
+            self.write(name, "").write_bytes(bom + "# Guide\n[bad](absent.md)\n".encode(encoding))
+        self.write("README.md", "[le](le.md#guide) [be](be.md#guide) [ok](be.md?plain=1#L2) "
+                   "[bad line](le.md?plain=1#L3) [bad link](missing.md)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:1: le.md?plain=1#L3 (missing line)", "README.md:1: missing.md",
+            "be.md:2: absent.md", "le.md:2: absent.md",
+        ])
+
+    def test_malformed_document_does_not_interrupt_other_diagnostics(self):
+        self.write("docs/invalid.md", "").write_bytes(b"\xffx")
+        self.write("odd.md", "").write_bytes(codecs.BOM_UTF16_LE + b"x")
+        self.write("README.md", "[a](docs/invalid.md#one) [b](odd.md?plain=1#L2) [c](missing.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: missing.md", "docs/invalid.md: invalid utf-8 at byte 0",
+            "odd.md: invalid utf-16 at byte 2",
+        ])
+
+    def test_repeated_links_decode_a_malformed_target_once(self):
+        target = self.write("invalid.md", "")
+        target.write_bytes(b"\xffx")
+        self.write("a.md", "[one](invalid.md#x) [two](invalid.md?plain=1#L2) [three](invalid.md#y)")
+        read_bytes = Path.read_bytes
+        reads = []
+
+        def read_document(path):
+            if path == target:
+                reads.append(path)
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", read_document):
+            self.assertEqual(broken_links(self.root), ["invalid.md: invalid utf-8 at byte 0"])
+        self.assertEqual(reads, [target])
+
+    def test_only_ascii_digits_start_ordered_list_items(self):
+        self.write("guide.md", "１. Setup\n   ===\n\n١. Setup\n   ===\n\n1. Item\n   ===\n")
+        self.write("README.md", "[one](guide.md#１-setup) [two](guide.md#١-setup) "
+                   "[list](guide.md#item) [absent](guide.md#setup)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#setup (missing anchor)"])
 
     def test_hashtag_can_begin_a_setext_heading(self):
         self.write("README.md", "#hashtag guide\n====\n\n[section](#hashtag-guide)\n")
