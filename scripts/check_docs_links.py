@@ -71,7 +71,6 @@ HTML_TOKENS = re.compile(
     rf"{HTML_OPEN}", re.IGNORECASE | re.DOTALL | re.ASCII)
 AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
 BARE_LINK_START = re.compile(r"(?<![A-Za-z])(?i:https?|ftp)://|(?<![^ \t\r\n*_~(])www\.")
-BARE_LINK_DOMAIN = re.compile(r"[\w.-]+")
 BARE_LINK_TAIL = re.compile(r"[^ \t\r\n\v\f<]*")
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 BACKTICKS = re.compile(r"`+")
@@ -531,18 +530,28 @@ def reference_definitions(text):
     return definitions
 
 
+def bare_host_char(char):
+    # GFM permits symbols and combining marks in a host. ASCII punctuation
+    # and Unicode punctuation are delimiters unless the host rule allows them.
+    return (not char.isspace() and char not in ASCII_PUNCTUATION
+            and not unicodedata.category(char).startswith("P"))
+
+
 def bare_link_end(text, start):
     """End of a GFM extended URL autolink, excluding trailing prose punctuation."""
     prefix = BARE_LINK_START.match(text, start)
     if prefix is None:
         return start
     www = prefix[0] == "www."
-    host = BARE_LINK_DOMAIN.match(text, start if www else prefix.end())
-    if host is None or (not www and host[0][0] in "-._"):
+    host_start = start if www else prefix.end()
+    if host_start == len(text) or not bare_host_char(text[host_start]):
         return start
-    if any("_" in label for label in host[0].rsplit(".", 2)[-2:]):
+    host_end = host_start + 1
+    while host_end < len(text) and (text[host_end] in "._-" or bare_host_char(text[host_end])):
+        host_end += 1
+    if any("_" in label for label in text[host_start:host_end].rsplit(".", 2)[-2:]):
         return start
-    end = BARE_LINK_TAIL.match(text, host.end()).end()
+    end = BARE_LINK_TAIL.match(text, host_end).end()
     extra_closing = text.count(")", start, end) - text.count("(", start, end)
     while end > start:
         last = text[end - 1]

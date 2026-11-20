@@ -186,6 +186,17 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:6: seven.md",
         ])
 
+    def test_bare_url_unicode_hosts_follow_gfm_character_classes(self):
+        self.write("README.md",
+                   "https://🌍.example/[x](url-path.md)\n"
+                   "https://he\u0301llo.example/[x](url-path.md)\n"
+                   "https://🌍_invalid.example/[x](bad-name.md)\n"
+                   "https://—example.org/[x](bad-start.md)\n"
+                   "https://abc.example/ [x](separate.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: bad-name.md", "README.md:4: bad-start.md", "README.md:5: separate.md",
+        ])
+
     def test_inline_markup_can_start_a_setext_heading(self):
         self.write("README.md", "<https://example.org>\n===\n\n<kbd>Enter</kbd> key\n---\n\n"
                    "<div>Hidden</div>\n===\n\n"
