@@ -717,9 +717,9 @@ impl State {
         if additional > self.committed.capacity / PAGE - self.reserved_pages {
             return Err(no_space());
         }
-        let mut candidate = self.committed.clone();
-        let durable = candidate.files.entry(id).or_default();
         if additional != 0 {
+            let mut candidate = self.committed.clone();
+            let durable = candidate.files.entry(id).or_default();
             durable.reserved.extend(range.clone());
             // Allocation itself may persist EOF, but never unsynced bytes.
             durable.len = durable.len.max(end);
