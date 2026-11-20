@@ -250,12 +250,11 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
 }
 
 fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
-    if disk.list("")?.iter().any(|name| {
-        !matches!(
-            name.as_str(),
-            "remote.enroll.lock" | "remote.operation.lock"
-        )
-    }) {
+    if disk
+        .list("")?
+        .iter()
+        .any(|name| !matches!(name.as_str(), super::ENROLL_LOCK | OPERATION_LOCK))
+    {
         return Err(input("remote enrollment requires an empty backing"));
     }
     Ok(())
@@ -522,7 +521,7 @@ impl RollbackBacking {
         }
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         if inspect(rpc.as_ref())? != *expected {
             return Err(invalid("enrollment approval is stale"));
         }
@@ -564,7 +563,7 @@ impl RollbackBacking {
         }
         let disk = remote_root(root, true)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         initialize_remote_root(disk.as_ref())?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
@@ -652,7 +651,7 @@ impl RollbackBacking {
         disk.create_dir_all(&name)?;
         disk.sync_dir("")?;
         let target = scope(disk.clone(), &name)?;
-        let disk_lock = target.try_lock("rollback.lock")?;
+        let disk_lock = target.try_lock(super::LOCK)?;
         let bytes = manifest.encode()?;
         let arena = copy_generation(source.as_deref(), target.as_ref(), &manifest, &bytes)?;
         disk.sync_dir("")?;
@@ -796,7 +795,7 @@ impl RollbackBacking {
         let _source_guard = OperationGuard::acquire(source_root.as_ref())?;
         let disk = remote_root(target, true)?;
         let _target_guard = OperationGuard::acquire(disk.as_ref())?;
-        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         initialize_remote_root(disk.as_ref())?;
         disk.create_dir_all(&descriptor.namespace)?;
         disk.sync_dir("")?;

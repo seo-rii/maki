@@ -34,6 +34,8 @@ const MAX_CAPACITY: u64 = 1 << 30;
 const MAX_ENTRIES: usize = 4096;
 const MARKER: &str = "rollback.format";
 const MAGIC: &[u8] = b"MAKI-WITNESS-COW-V1\n";
+const LOCK: &str = "rollback.lock";
+const ENROLL_LOCK: &str = "remote.enroll.lock";
 const ARENA: &str = "rollback.arena";
 const MANIFESTS: [&str; 2] = ["rollback.manifest.0", "rollback.manifest.1"];
 
@@ -263,6 +265,19 @@ fn independent_paths(root: &Path, witness: &Path) -> io::Result<()> {
 }
 
 impl RollbackBacking {
+    /// Physical root entries occupied by a local or remote rollback backing.
+    /// The inner volume layout lives in the arena and owns no host pathnames.
+    pub fn owns_host_entry(name: &str, remote: bool) -> bool {
+        if remote {
+            matches!(
+                name,
+                MARKER | ENROLL_LOCK | gc::OPERATION_LOCK | enrollment::FILE
+            ) || gc::namespace_fence(name.strip_prefix(gc::TOMBSTONE).unwrap_or(name)).is_some()
+        } else {
+            matches!(name, MARKER | ARENA | LOCK) || MANIFESTS.contains(&name)
+        }
+    }
+
     /// The immutable logical-page capacity in the authenticated manifest.
     /// A revoked or uncertain session cannot supply usable format geometry.
     pub fn capacity(&self) -> io::Result<u64> {
@@ -285,10 +300,8 @@ impl RollbackBacking {
         // Creation of directories is authorized only on this explicit path.
         let witness_dir = FileBacking::new(witness)?;
         independent_paths(root, witness)?;
-        let disk_lock = disk.try_lock("rollback.lock")?;
-        if disk.list("")?.iter().any(|name| name != "rollback.lock")
-            || !witness_dir.list("")?.is_empty()
-        {
+        let disk_lock = disk.try_lock(LOCK)?;
+        if disk.list("")?.iter().any(|name| name != LOCK) || !witness_dir.list("")?.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "rollback enrollment requires empty backing and witness directories",
@@ -329,7 +342,7 @@ impl RollbackBacking {
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
-        let disk_lock = disk.try_lock("rollback.lock")?;
+        let disk_lock = disk.try_lock(LOCK)?;
         let marker = disk.open(MARKER, false)?;
         let mut magic = vec![0; MAGIC.len()];
         if marker.len()? != MAGIC.len() as u64 {

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::journal::RECORD_HEADER_SIZE;
 use maki_format::layout;
 use maki_format::superblock::Superblock;
 
@@ -45,6 +46,8 @@ pub struct Volume {
     journal: JournalWriter,
     store: SlotStore,
     overlay: Overlay,
+    /// Framed bytes appended above the published checkpoint, including pending records.
+    uncheckpointed_record_bytes: u64,
     ck_ab: AbStore,
     ck_state: CheckpointState,
     /// Checkpoint state can be durable before journal deletion/fsync and
@@ -58,6 +61,7 @@ pub struct Volume {
 pub(crate) struct PreparedCheckpoint {
     base_checkpoint: u64,
     horizon: u64,
+    durable_record_bytes: u64,
     allow_discard: bool,
     items: Vec<(u64, Arc<crate::overlay::OverlayVersion>)>,
     slots: CheckpointSlotPlan,
@@ -131,25 +135,23 @@ impl Volume {
         // returns, so attach normally receives an empty replay. Keep this
         // construction for the public/full-replay recovery contract and as
         // a defensive invariant if another recovery mode is added.
-        let mut overlay = Overlay::new();
-        for record in replay {
-            overlay.publish(record.unit_index, record.sequence, record.payload);
-        }
-        overlay.promote(durable_sequence);
-
         store.schedule_reclamation();
-
-        let volume = Self {
+        let mut volume = Self {
             backing,
             _lock: lock,
             superblock,
             journal,
             store,
-            overlay,
+            overlay: Overlay::new(),
+            uncheckpointed_record_bytes: 0,
             ck_ab: AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B),
             ck_state: checkpoint_state,
             checkpoint_cleanup_pending: false,
         };
+        for record in replay {
+            volume.publish_record(record.unit_index, record.sequence, record.payload);
+        }
+        volume.overlay.promote(durable_sequence);
         volume.sanitize();
         Ok(volume)
     }
@@ -164,6 +166,17 @@ impl Volume {
 
     pub fn checkpoint_sequence(&self) -> u64 {
         self.ck_state.checkpoint_sequence
+    }
+
+    /// Durable journal record bytes above the published checkpoint. Each
+    /// record includes its framing, including a header-only discard.
+    pub fn checkpoint_lag_bytes(&self) -> u64 {
+        self.uncheckpointed_record_bytes - self.journal.pending_bytes()
+    }
+
+    fn publish_record(&mut self, unit: u64, sequence: u64, payload: Vec<u8>) {
+        self.uncheckpointed_record_bytes += RECORD_HEADER_SIZE as u64 + payload.len() as u64;
+        self.overlay.publish(unit, sequence, payload);
     }
 
     pub fn journal_durable_sequence(&self) -> u64 {
@@ -339,7 +352,7 @@ impl Volume {
         // barrier (or recovery) would surface it anyway. Publish before the
         // FUA sync so a sync failure never leaves the live view behind the
         // on-disk journal.
-        self.overlay.publish(unit, sequence, ciphertext.to_vec());
+        self.publish_record(unit, sequence, ciphertext.to_vec());
         self.overlay.promote(self.journal.durable_sequence());
         if fua {
             let sync = self.journal.sync();
@@ -393,7 +406,7 @@ impl Volume {
         let appended = self.journal.append(unit, &[]);
         self.overlay.promote(self.journal.durable_sequence());
         let sequence = appended?;
-        self.overlay.publish(unit, sequence, Vec::new());
+        self.publish_record(unit, sequence, Vec::new());
         self.overlay.promote(self.journal.durable_sequence());
         if fua {
             let sync = self.journal.sync();
@@ -501,6 +514,7 @@ impl Volume {
         Ok(PreparedCheckpoint {
             base_checkpoint,
             horizon: durable.max(base_checkpoint),
+            durable_record_bytes: self.checkpoint_lag_bytes(),
             allow_discard,
             items,
             slots,
@@ -521,6 +535,7 @@ impl Volume {
         let PreparedCheckpoint {
             base_checkpoint,
             horizon,
+            durable_record_bytes,
             allow_discard,
             items,
             slots: _,
@@ -611,6 +626,8 @@ impl Volume {
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
+        // Newer appends may have arrived while slot writes ran unlocked.
+        self.uncheckpointed_record_bytes -= durable_record_bytes;
         self.checkpoint_cleanup_pending = true;
         // Physical reclamation. The checkpoint is published from here on: a
         // failure only leaves space unreclaimed (the discard map is durable
@@ -795,6 +812,8 @@ mod discard_tests {
         let completed = prepared.execute().unwrap();
         volume.write_ct(1, &[0x13; 1032], true).unwrap(); // durable reservation 3
         volume.discard_ct(1, false).unwrap(); // volatile latest tombstone 4
+        let header = maki_format::journal::RECORD_HEADER_SIZE as u64;
+        assert_eq!(volume.checkpoint_lag_bytes(), header + (header + 1032));
 
         backing.set_fault_hook(Some(Arc::new(move |operation| match operation {
             FaultOp::WriteAt { path, len, .. } if path.ends_with(".dat") && *len == slot_size => {
@@ -803,7 +822,12 @@ mod discard_tests {
             _ => None,
         })));
         assert_eq!(volume.finish_checkpoint(completed).unwrap(), 2);
+        assert_eq!(volume.checkpoint_lag_bytes(), header + 1032);
         backing.set_fault_hook(None);
+        volume.flush().unwrap();
+        assert_eq!(volume.checkpoint_lag_bytes(), header + 1032 + header);
+        volume.checkpoint().unwrap();
+        assert_eq!(volume.checkpoint_lag_bytes(), 0);
     }
 }
 
@@ -858,6 +882,10 @@ mod reservation_barrier_tests {
             "checkpoint published after another fsync discarded its dirty writes"
         );
         assert_eq!(volume.checkpoint_sequence(), 0);
+        assert_eq!(
+            volume.checkpoint_lag_bytes(),
+            maki_format::journal::RECORD_HEADER_SIZE as u64 + 512
+        );
         volume.checkpoint().unwrap(); // rewrite all slots from the kept journal
         drop(volume);
         backing.crash_all_lost();

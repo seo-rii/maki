@@ -101,3 +101,26 @@ fn witness_tls_names_accept_both_ip_families() {
         cfg.validate().unwrap();
     }
 }
+
+#[test]
+fn remote_rollback_sockets_respect_writer_namespaces() {
+    let mut volume = parse_config(&config(&remote())).unwrap();
+    let namespace = "remote-0000000000000001-10000000000000000000000000000000";
+    for entry in [
+        "remote.enrollment".to_string(),
+        "remote.enroll.lock".to_string(),
+        "remote.operation.lock".to_string(),
+        "rollback.format".to_string(),
+        format!("{namespace}/rollback.arena"),
+        format!(".remote-gc-{namespace}/rollback.lock"),
+    ] {
+        volume.control.socket = Some(format!("{}/{entry}", volume.backing.root));
+        assert!(volume
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+    }
+    volume.control.socket = Some(format!("{}/custom.sock", volume.backing.root));
+    volume.validate().unwrap();
+}

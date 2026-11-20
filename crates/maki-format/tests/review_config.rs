@@ -932,3 +932,127 @@ fn unix_socket_path_lengths_are_checked_in_bytes() {
         }
     }
 }
+
+#[test]
+fn filesystem_paths_and_control_group_must_be_representable_by_the_os() {
+    let mut config = parse(&local());
+    config.backing.root = "/var/lib/ma\0ki".into();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("backing.root"));
+    config.backing.root = "/var/lib/maki".into();
+    config.control.group = Some("maki\0group".into());
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("control.group"));
+    config.control.group = Some("maki-admin".into());
+    config.validate().unwrap();
+}
+
+#[test]
+fn socket_filenames_cannot_be_backing_objects_or_socket_parent_directories() {
+    let mut config = parse(&local());
+    config.backing.root = "/runtime-checks/volume".into();
+    for conflicting in [
+        "/runtime-checks",
+        "/runtime-checks/volume",
+        "/runtime-checks/volume/superblock.a",
+        "/runtime-checks/volume/volume.lock/child",
+        "/runtime-checks/volume/data",
+        "/runtime-checks/volume/checkpoint/state.a",
+        "/runtime-checks/volume/data/shard-0000002a.alloc.b",
+        "/runtime-checks/volume/journal/seg-0000000000000001/nested",
+    ] {
+        config.control.socket = Some(conflicting.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+        config.control.socket = None;
+        config.nbd.socket = Some(conflicting.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+        config.nbd.socket = None;
+    }
+    config.control.socket = Some("/runtime-checks/volume/data/custom.sock".into());
+    config.nbd.socket = Some("/runtime-checks/volume-old/socket".into());
+    config.validate().unwrap();
+    for (parent, child) in [
+        ("/run/example.sock", "/run/example.sock/nested"),
+        ("/run/example.sock/nested", "/run/example.sock"),
+    ] {
+        config.control.socket = Some(parent.into());
+        config.nbd.socket = Some(child.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+    }
+}
+
+#[test]
+fn rollback_sockets_are_compared_to_the_physical_layout() {
+    let source = format!("{}[backing.rollback_protection]\nwitness_root = \"/other-witness\"\ncapacity = \"64MiB\"\n", local());
+    let mut config = parse(&source);
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    config.backing.root = "/runtime-checks/volume".into();
+    config.validate().unwrap();
+    for file in [
+        "rollback.format",
+        "rollback.arena",
+        "rollback.manifest.0",
+        "rollback.manifest.1",
+        "rollback.lock",
+    ] {
+        config.control.socket = Some(format!("/runtime-checks/volume/{file}"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+    }
+    config.control.socket = Some("/runtime-checks/volume/data/custom.sock".into());
+    config.validate().unwrap();
+}
+
+#[test]
+fn local_witness_directory_and_anchor_files_cannot_be_socket_paths() {
+    let mut config = parse(&format!("{}[backing.rollback_protection]\nwitness_root = \"/witness-store/volume\"\ncapacity = \"64MiB\"\n", local()));
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    for path in [
+        "/witness-store",
+        "/witness-store/volume",
+        "/witness-store/volume/anchor",
+        "/witness-store/volume/anchor.next",
+        "/witness-store/volume/witness.lock/child.sock",
+    ] {
+        config.control.socket = Some(path.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+        config.control.socket = None;
+        config.nbd.socket = Some(path.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+        config.nbd.socket = None;
+    }
+    config.control.socket = Some("/witness-store/volume/anchor.sock".into());
+    config.nbd.socket = Some("/witness-store/volume-old/anchor".into());
+    config.validate().unwrap();
+}

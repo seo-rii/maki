@@ -1110,11 +1110,9 @@ impl VolumeConfig {
         // relative path would land wherever nbdkit's working directory is
         // (SPEC §8 places volumes under /var/lib/maki/<volume>).
         let root = self.backing.root.as_str();
-        if root.trim().is_empty()
-            || !(root.starts_with('/') || std::path::Path::new(root).is_absolute())
-        {
+        if !is_absolute_path(root) || root.contains('\0') {
             return Err(ConfigError::Invalid(format!(
-                "backing.root {root:?} must be an absolute path"
+                "backing.root {root:?} must be an absolute path without NUL"
             )));
         }
         if let Some(rollback) = &self.backing.rollback_protection {
@@ -1163,11 +1161,9 @@ impl VolumeConfig {
                 }
             } else {
                 let witness = rollback.witness_root.as_str();
-                if witness.trim().is_empty()
-                    || !(witness.starts_with('/') || std::path::Path::new(witness).is_absolute())
-                {
+                if !is_absolute_path(witness) || witness.contains('\0') {
                     return Err(ConfigError::Invalid(format!(
-                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path"
+                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path without NUL"
                     )));
                 }
                 let root_path = std::path::Path::new(root);
@@ -1363,8 +1359,10 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     // A `file` credential names a path. A relative one resolves against the
     // working directory of whichever process reads it, which is not the one
     // that validated it (BUG-122).
-    if c.source == "file" && !is_absolute_path(&c.name) {
-        return Err(invalid("file credential name must be an absolute path"));
+    if c.source == "file" && (!is_absolute_path(&c.name) || c.name.contains('\0')) {
+        return Err(invalid(
+            "file credential name must be an absolute path without NUL",
+        ));
     }
     // The loaders look up a `credential` name, and the file name of a
     // `file` path, in a directory and refuse any other name. `volume create`
@@ -1592,24 +1590,78 @@ fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
 
-fn same_socket_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    if left == right {
+/// Resolve existing aliases before comparing paths whose runtime directories
+/// may still need to be created. Preserve the lexical path on lookup failure.
+fn resolved_config_path(path: &std::path::Path) -> std::path::PathBuf {
+    for ancestor in path.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in path.strip_prefix(ancestor).unwrap().components() {
+                    if component == std::path::Component::ParentDir {
+                        resolved.pop();
+                    } else {
+                        resolved.push(component);
+                    }
+                }
+                return resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => break,
+        }
+    }
+    path.to_owned()
+}
+
+fn socket_conflicts_with_backing(
+    socket: &std::path::Path,
+    root: &std::path::Path,
+    rollback: Option<&RollbackProtectionSection>,
+) -> bool {
+    use crate::{checkpoint, durable_proof, layout};
+    if root.starts_with(socket) {
+        return true; // The backing needs this pathname to be a directory.
+    }
+    let Ok(relative) = socket.strip_prefix(root) else {
+        return false;
+    };
+    let mut entries = relative.iter();
+    let Some(entry) = entries.next().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if let Some(rollback) = rollback {
+        return maki_backing::RollbackBacking::owns_host_entry(entry, rollback.remote.is_some());
+    }
+    if layout::ROOT_METADATA.contains(&entry) || entry == layout::VOLUME_LOCK {
         return true;
     }
-    // Resolve the deepest existing ancestor. systemd may not have created
-    // the per-volume directory yet, even when its parent is a known alias.
-    // Let the filesystem interpret ".." after symlinks in the existing path.
-    let resolve = |path: &std::path::Path| {
-        for ancestor in path.ancestors() {
-            match std::fs::canonicalize(ancestor) {
-                Ok(existing) => return Some(existing.join(path.strip_prefix(ancestor).ok()?)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => break,
-            }
-        }
-        None
+    let Some(child) = entries.next().and_then(|s| s.to_str()) else {
+        return matches!(
+            entry,
+            layout::CHECKPOINT_DIR | layout::JOURNAL_DIR | layout::DATA_DIR
+        );
     };
-    resolve(left).is_some_and(|left| resolve(right).as_ref() == Some(&left))
+    if [
+        checkpoint::CHECKPOINT_STATE_A,
+        checkpoint::CHECKPOINT_STATE_B,
+        durable_proof::DURABLE_PROOF_A,
+        durable_proof::DURABLE_PROOF_B,
+        layout::JOURNAL_DURABLE_MARK,
+    ]
+    .iter()
+    .any(|file| relative.starts_with(file))
+    {
+        return true;
+    }
+    match entry {
+        layout::JOURNAL_DIR => layout::parse_journal_segment(child).is_some(),
+        layout::DATA_DIR => child.split_once('.').is_some_and(|(stem, suffix)| {
+            matches!(
+                suffix,
+                "dat" | "alloc.a" | "alloc.b" | "discard.a" | "discard.b"
+            ) && layout::parse_shard_data(&format!("{stem}.dat")).is_some()
+        }),
+        _ => false,
+    }
 }
 
 /// Scheme and host of an endpoint URL. Rejects userinfo (credentials in a
@@ -2235,14 +2287,44 @@ impl VolumeConfig {
             .socket
             .clone()
             .unwrap_or_else(|| format!("/run/maki/{}/nbd.sock", self.volume.name));
-        if same_socket_path(control_socket.as_ref(), nbd_socket.as_ref()) {
+        let control = resolved_config_path(control_socket.as_ref());
+        let nbd = resolved_config_path(nbd_socket.as_ref());
+        if control.starts_with(&nbd) || nbd.starts_with(&control) {
             return Err(invalid(format!(
-                "control.socket {control_socket:?} must differ from nbd.socket {nbd_socket:?}"
+                "control.socket {control_socket:?} and nbd.socket {nbd_socket:?} require separate socket filenames"
             )));
         }
+        let root = resolved_config_path(self.backing.root.as_ref());
+        let witness = self
+            .backing
+            .rollback_protection
+            .as_ref()
+            .filter(|rollback| rollback.remote.is_none())
+            .map(|rollback| resolved_config_path(rollback.witness_root.as_ref()));
+        for (name, socket) in [("control.socket", control), ("nbd.socket", nbd)] {
+            if socket_conflicts_with_backing(
+                &socket,
+                &root,
+                self.backing.rollback_protection.as_ref(),
+            ) {
+                return Err(invalid(format!(
+                    "{name} conflicts with the backing.root layout"
+                )));
+            }
+            if witness.as_ref().is_some_and(|dir| {
+                dir.starts_with(&socket)
+                    || socket
+                        .strip_prefix(dir)
+                        .is_ok_and(maki_backing::witness::FileWitness::reserves_path)
+            }) {
+                return Err(invalid(format!(
+                    "{name} conflicts with the local witness layout"
+                )));
+            }
+        }
         if let Some(group) = &self.control.group {
-            if group.trim().is_empty() {
-                return Err(invalid("control.group must not be empty"));
+            if group.trim().is_empty() || group.contains('\0') {
+                return Err(invalid("control.group must not be empty or contain NUL"));
             }
         }
 

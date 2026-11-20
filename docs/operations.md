@@ -995,6 +995,11 @@ unsuccessful outcomes; explicit journal-sync time is separate. See
 Do not add unit indexes, LBAs, request IDs, or other high-cardinality values as
 metric labels.
 
+`maki_checkpoint_lag_bytes` counts durable journal records newer than the
+published checkpoint, in bytes including record headers. Repeated writes to
+one unit count once per journal record. A TRIM tombstone counts its header.
+Unsynced records enter this gauge when they become durable.
+
 With batching enabled, `maki_crypto_deadline_exceeded_total` counts completed
 scheduler encrypt/decrypt calls that return an operation-deadline error.
 Queue admission, coalescing, batch-slot waits and RPC time share that caller's
