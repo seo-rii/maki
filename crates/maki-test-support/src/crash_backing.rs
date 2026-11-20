@@ -985,6 +985,12 @@ impl Backing for CrashableBacking {
         let mut inner = self.live("rename", from)?;
         inner.check(&FaultOp::Rename { from, to })?;
         inner.require_dir(parent(from))?;
+        if inner.dirs.contains_key(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory rename is unsupported",
+            ));
+        }
         inner.require_file_name(to)?;
         let inode = inner
             .volatile(from)

@@ -233,6 +233,7 @@ impl VersionedLruCache {
         inner.max_bytes = max_bytes;
         if max_bytes == 0 {
             inner.clear();
+            inner.map.shrink_to_fit();
         } else {
             inner.make_room(0);
         }
@@ -268,6 +269,27 @@ impl VersionedLruCache {
 #[cfg(test)]
 mod monitoring_tests {
     use super::*;
+
+    #[test]
+    fn disabling_the_cache_releases_the_empty_hash_table() {
+        let cache = VersionedLruCache::new(
+            CacheConfig {
+                max_bytes: 4096,
+                ttl: Duration::from_secs(60),
+                zeroize_on_evict: true,
+            },
+            Arc::new(maki_crypto::SystemClock::new()),
+        );
+        for unit in 0..1024 {
+            cache.put(unit, 1, SecretBuffer::from_slice(&[1]));
+        }
+        assert!(cache.inner.lock().map.capacity() >= 1024);
+        cache.set_max_bytes(0);
+        assert_eq!(cache.inner.lock().map.capacity(), 0);
+        cache.set_max_bytes(8);
+        cache.put(1, 2, SecretBuffer::from_slice(&[2]));
+        assert_eq!(cache.get(1, 2).unwrap().expose(), &[2]);
+    }
 
     #[test]
     fn observation_does_not_wait_for_cache_mutation() {

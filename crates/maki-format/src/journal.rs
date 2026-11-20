@@ -242,7 +242,15 @@ pub fn scan_segment_bounded(
 
     loop {
         if pos == buf.len() {
-            return (records, ScanOutcome::Clean);
+            let outcome = if in_durable(pos) {
+                ScanOutcome::Corrupt {
+                    at: pos,
+                    reason: "segment ends before durable prefix".to_string(),
+                }
+            } else {
+                ScanOutcome::Clean
+            };
+            return (records, outcome);
         }
         let rem = &buf[pos..];
 

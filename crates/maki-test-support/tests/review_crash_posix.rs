@@ -196,3 +196,26 @@ fn a_torn_write_splits_at_absolute_sector_boundaries() {
         "the head of the first sector never persisted without the next sector"
     );
 }
+
+#[test]
+fn directory_rename_reports_unsupported_and_preserves_the_subtree() {
+    for backing in [
+        &maki_backing::MemBacking::new() as &dyn Backing,
+        &CrashableBacking::new(),
+    ] {
+        backing.create_dir_all("old/sub").unwrap();
+        backing.open("old/sub/record", true).unwrap();
+        assert_eq!(
+            backing.rename("old", "new").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(backing.exists("old/sub/record").unwrap());
+        assert!(!backing.exists("new").unwrap());
+        assert_eq!(
+            backing.rename("absent", "new").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        backing.rename("old/sub/record", "moved").unwrap();
+        assert!(backing.exists("moved").unwrap());
+    }
+}

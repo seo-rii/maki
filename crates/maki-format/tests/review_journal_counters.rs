@@ -123,3 +123,22 @@ fn representable_successor_preserves_heuristic_and_explicit_durability_rules() {
     let (_, outcome) = scan_segment_bounded(&body, u64::MAX - 1, Some(body.len()));
     assert!(matches!(outcome, ScanOutcome::Corrupt { at: 0, .. }));
 }
+
+#[test]
+fn a_known_durable_prefix_extending_past_record_boundary_is_corrupt() {
+    let first = record(1);
+    let full = [first.clone(), record(2)].concat();
+    for (end, count) in [(0, 0), (first.len(), 1)] {
+        let (records, outcome) = scan_segment_bounded(&full[..end], 1, Some(full.len()));
+        assert_eq!(records.len(), count);
+        assert!(matches!(outcome, ScanOutcome::Corrupt { at, .. } if at == end));
+        assert_eq!(
+            scan_segment_bounded(&full[..end], 1, Some(end)).1,
+            ScanOutcome::Clean
+        );
+    }
+    assert_eq!(
+        scan_segment_bounded(&full, 1, Some(full.len())).1,
+        ScanOutcome::Clean
+    );
+}
