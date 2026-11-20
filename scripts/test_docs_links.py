@@ -33,6 +33,12 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#phantom (missing anchor)"])
 
+    def test_only_ascii_digits_start_ordered_list_items(self):
+        self.write("guide.md", "１. Setup\n   ===\n\n١. Setup\n   ===\n\n1. Item\n   ===\n")
+        self.write("README.md", "[one](guide.md#１-setup) [two](guide.md#١-setup) "
+                   "[list](guide.md#item) [absent](guide.md#setup)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#setup (missing anchor)"])
+
     def test_hashtag_can_begin_a_setext_heading(self):
         self.write("README.md", "#hashtag guide\n====\n\n[section](#hashtag-guide)\n")
         self.assertEqual(broken_links(self.root), [])

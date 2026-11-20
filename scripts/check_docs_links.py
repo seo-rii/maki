@@ -75,7 +75,7 @@ ASCII_PUNCTUATION = frozenset(string.punctuation)
 LINK_LABEL = re.compile(r"\[((?:[^\\\[\]]|\\.){0,999})\]")
 # Container margins are consumed in nesting order before classifying a block.
 QUOTE_MARKER = re.compile(r" {0,3}>[ \t]?")
-BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|\d{1,9}[.)])( +|$)")
+BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|[0-9]{1,9}[.)])( +|$)")
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
