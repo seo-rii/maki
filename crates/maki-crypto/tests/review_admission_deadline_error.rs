@@ -166,3 +166,25 @@ async fn an_admission_deadline_keeps_the_class_of_the_last_endpoint_error() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn a_late_rpc_cannot_win_against_an_already_expired_deadline() {
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    provider.set_latency(clock.clone(), DEADLINE * 2);
+    let set = Arc::new(EndpointSet::new(
+        vec![("slow".into(), provider.clone())],
+        cfg(),
+        clock.clone(),
+    ));
+    for unit in 0..32 {
+        let request = spawn_encrypt(&set, unit);
+        settle().await;
+        assert_eq!(provider.encrypt_calls(), unit as usize + 1);
+        clock.advance(DEADLINE * 3);
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("deadline"), "{error}");
+    }
+    assert_eq!(set.metrics().deadline_exceeded_total(), 32);
+    assert_eq!(set.metrics().rpc_count(), 0);
+}
