@@ -122,3 +122,20 @@ fn short_allocation_preserves_concurrent_longer_writes() {
         "a successful allocation truncated a concurrent write"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn filesystem_listing_refuses_names_that_cannot_round_trip() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let backing = maki_backing::FileBacking::new(dir.path()).unwrap();
+    let valid = "photo-�";
+    backing.open(valid, true).unwrap();
+    assert_eq!(backing.list("").unwrap(), [valid]);
+    let raw = std::ffi::OsStr::from_bytes(b"photo-\x80");
+    std::fs::write(dir.path().join(raw), b"x").unwrap();
+    assert_eq!(
+        backing.list("").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}

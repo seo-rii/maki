@@ -524,7 +524,13 @@ impl Backing for FileBacking {
         let p = self.resolve(dir, true)?;
         let mut names = Vec::new();
         for entry in fs::read_dir(p)? {
-            names.push(entry?.file_name().to_string_lossy().into_owned());
+            let name = entry?.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is not UTF-8",
+                )
+            })?;
+            names.push(name);
         }
         names.sort();
         Ok(names)
