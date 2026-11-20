@@ -1032,6 +1032,8 @@ def broken_links(root):
             return target
         fragment = urllib.parse.unquote(fragment)
         if fragment and resolved.is_file() and target_path.suffix.lower() == ".md":
+            if resolved in encoding_errors:
+                return None
             span = re.fullmatch(r"L([1-9][0-9]*)(?:-L([1-9][0-9]*))?", fragment)
             if span and ("plain", "1") in urllib.parse.parse_qsl(query):
                 if resolved not in line_counts:
@@ -1053,6 +1055,8 @@ def broken_links(root):
 
     broken = []
     for path in sorted(path for path in candidates if path.name.lower().endswith(".md")):
+        if path in encoding_errors:
+            continue
         relative = path.relative_to(root).as_posix()
         if path.is_symlink() and (not path.is_file() or published_target(path) is None):
             broken.append(f"{relative}: invalid Markdown symlink target")

@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.check_docs_links import broken_links
 
@@ -40,7 +41,7 @@ class DocumentationLinks(unittest.TestCase):
             self.write(name, "").write_bytes(bom + "# Guide\n[bad](absent.md)\n".encode(encoding))
         self.write("README.md", "[le](le.md#guide) [be](be.md#guide) [ok](be.md?plain=1#L2) "
                    "[bad line](le.md?plain=1#L3) [bad link](missing.md)\n")
-        self.assertEqual(broken_links(self.root), [
+        self.assertCountEqual(broken_links(self.root), [
             "README.md:1: le.md?plain=1#L3 (missing line)", "README.md:1: missing.md",
             "be.md:2: absent.md", "le.md:2: absent.md",
         ])
@@ -53,6 +54,22 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:1: missing.md", "docs/invalid.md: invalid utf-8 at byte 0",
             "odd.md: invalid utf-16 at byte 2",
         ])
+
+    def test_repeated_links_decode_a_malformed_target_once(self):
+        target = self.write("invalid.md", "")
+        target.write_bytes(b"\xffx")
+        self.write("a.md", "[one](invalid.md#x) [two](invalid.md?plain=1#L2) [three](invalid.md#y)")
+        read_bytes = Path.read_bytes
+        reads = []
+
+        def read_document(path):
+            if path == target:
+                reads.append(path)
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", read_document):
+            self.assertEqual(broken_links(self.root), ["invalid.md: invalid utf-8 at byte 0"])
+        self.assertEqual(reads, [target])
 
     def test_only_ascii_digits_start_ordered_list_items(self):
         self.write("guide.md", "１. Setup\n   ===\n\n١. Setup\n   ===\n\n1. Item\n   ===\n")
