@@ -118,19 +118,28 @@ impl ReferenceBlockModel {
                 detail: format!("unit outside volume of {} units", self.num_units),
             });
         }
-        let allowed = self.allowed_after_crash(unit);
-        if !allowed.iter().any(|v| v == actual) {
+        let matches_durable = match self.durable.get(&unit) {
+            Some(durable) => durable == actual,
+            None => actual.len() == self.unit_size && actual.iter().all(|&byte| byte == 0),
+        };
+        if !matches_durable
+            && !self
+                .pending
+                .get(&unit)
+                .is_some_and(|versions| versions.iter().any(|version| version == actual))
+        {
             return Err(OracleViolation {
                 unit,
                 detail: format!(
-                    "observed {} not in {} allowed value(s); observed-prefix={:02x?}",
+                    "observed {} matches no durable or pending value; observed-prefix={:02x?}",
                     summarize(actual),
-                    allowed.len(),
                     &actual[..actual.len().min(8)]
                 ),
             });
         }
-        self.durable.insert(unit, actual.to_vec());
+        if !matches_durable {
+            self.durable.insert(unit, actual.to_vec());
+        }
         self.pending.remove(&unit);
         Ok(())
     }
@@ -157,5 +166,18 @@ mod tests {
                 assert!(!model.durable.contains_key(&invalid));
             }
         }
+    }
+    #[test]
+    fn adoption_checks_borrowed_history_and_preserves_it_on_rejection() {
+        let mut model = ReferenceBlockModel::new(4, 1);
+        assert!(model.crash_adopt(0, &[0; 3]).is_err());
+        model.crash_adopt(0, &[0; 4]).unwrap();
+        model.write_fua(0, &[1; 4]);
+        for byte in [2, 2, 3] {
+            model.write(0, &[byte; 4]);
+        }
+        assert!(model.crash_adopt(0, &[0; 4]).is_err());
+        model.crash_adopt(0, &[2; 4]).unwrap();
+        assert_eq!(model.allowed_after_crash(0), vec![vec![2; 4]]);
     }
 }
