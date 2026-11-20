@@ -1024,3 +1024,35 @@ fn rollback_sockets_are_compared_to_the_physical_layout() {
     config.control.socket = Some("/runtime-checks/volume/data/custom.sock".into());
     config.validate().unwrap();
 }
+
+#[test]
+fn local_witness_directory_and_anchor_files_cannot_be_socket_paths() {
+    let mut config = parse(&format!("{}[backing.rollback_protection]\nwitness_root = \"/witness-store/volume\"\ncapacity = \"64MiB\"\n", local()));
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    for path in [
+        "/witness-store",
+        "/witness-store/volume",
+        "/witness-store/volume/anchor",
+        "/witness-store/volume/anchor.next",
+        "/witness-store/volume/witness.lock/child.sock",
+    ] {
+        config.control.socket = Some(path.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+        config.control.socket = None;
+        config.nbd.socket = Some(path.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+        config.nbd.socket = None;
+    }
+    config.control.socket = Some("/witness-store/volume/anchor.sock".into());
+    config.nbd.socket = Some("/witness-store/volume-old/anchor".into());
+    config.validate().unwrap();
+}

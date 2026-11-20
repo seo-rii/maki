@@ -2295,6 +2295,12 @@ impl VolumeConfig {
             )));
         }
         let root = resolved_config_path(self.backing.root.as_ref());
+        let witness = self
+            .backing
+            .rollback_protection
+            .as_ref()
+            .filter(|rollback| rollback.remote.is_none())
+            .map(|rollback| resolved_config_path(rollback.witness_root.as_ref()));
         for (name, socket) in [("control.socket", control), ("nbd.socket", nbd)] {
             if socket_conflicts_with_backing(
                 &socket,
@@ -2303,6 +2309,16 @@ impl VolumeConfig {
             ) {
                 return Err(invalid(format!(
                     "{name} conflicts with the backing.root layout"
+                )));
+            }
+            if witness.as_ref().is_some_and(|dir| {
+                dir.starts_with(&socket)
+                    || socket
+                        .strip_prefix(dir)
+                        .is_ok_and(maki_backing::witness::FileWitness::reserves_path)
+            }) {
+                return Err(invalid(format!(
+                    "{name} conflicts with the local witness layout"
                 )));
             }
         }
