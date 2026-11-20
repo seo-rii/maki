@@ -348,7 +348,9 @@ class Fixture:
     def verify(self, mode):
         self.ctl("start", "--no-block", self.units["target"])
         if mode == "cancel-start":
-            self.wait(lambda: self.count("attach-start") == 1, "attach started")
+            resource = self.directory / "resource"
+            self.wait(lambda: self.count("attach-start") == 1 and resource.is_file()
+                      and resource.read_bytes() == b"owned", "partial attachment created")
             self.ctl("stop", self.units["target"])
             # A cancelled start skips ExecStop. Its partial attachment is not
             # evidence that shutting down the still-healthy daemon is safe.
