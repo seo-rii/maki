@@ -96,11 +96,15 @@ pub struct NbdAdapter {
 impl NbdAdapter {
     pub fn from_engine(engine: Engine, runtime: tokio::runtime::Runtime) -> Self {
         let g = engine.geometry();
-        let block_sizes = (
-            g.device_block_size,
-            g.crypto_unit_size,
-            engine.max_request_bytes().min(u32::MAX as u64) as u32,
-        );
+        // Chunk boundaries must stay device-block aligned even when the
+        // engine limit is larger than the u32 NBD wire field.
+        let minimum = g.device_block_size;
+        let maximum = engine.max_request_bytes().min(u64::from(u32::MAX)) as u32;
+        let maximum = maximum - maximum % minimum;
+        // NBD requires a power-of-two preference. Engine limits and crypto
+        // units may otherwise be any positive multiple of the device block.
+        let preferred = 1 << g.crypto_unit_size.min(maximum).ilog2();
+        let block_sizes = (minimum, preferred, maximum);
         Self {
             runtime,
             admission: Arc::default(),

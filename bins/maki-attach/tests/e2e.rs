@@ -31,6 +31,48 @@ fn attach_plan_prints_ordered_steps_without_executing() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_plan_checks_existing_mountpoint_paths_and_linux_path_length() {
+    let plan = |path: &str| run(&["attach", "--volume", "v1", "--mountpoint", path, "--plan"]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    assert!(plan(dir.to_str().unwrap()).status.success());
+    let file = dir.join("file");
+    std::fs::write(&file, []).unwrap();
+    for invalid in [&file, &file.join("child")] {
+        let out = plan(invalid.to_str().unwrap());
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("mountpoint"));
+        assert!(out.stdout.is_empty());
+    }
+
+    for (name, target) in [("dangling", dir.join("absent")), ("live", dir.to_owned())] {
+        let link = dir.join(name);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        for invalid in [&link, &link.join("child")] {
+            let out = plan(invalid.to_str().unwrap());
+            assert_eq!(out.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
+            assert!(out.stdout.is_empty());
+        }
+    }
+
+    // Linux accepts up to 4095 path bytes plus the terminating NUL.
+    let mut path = dir.join("uncreated").to_str().unwrap().to_owned();
+    let component = format!("/{}", "a".repeat(127));
+    while path.len() + component.len() <= 4095 {
+        path.push_str(&component);
+    }
+    path.extend(std::iter::repeat_n('b', 4095 - path.len()));
+    assert!(plan(&path).status.success());
+    path.push('c');
+    let out = plan(&path);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("mountpoint"));
+    assert!(out.stdout.is_empty());
+}
+
 #[test]
 fn detach_and_grow_plans_print() {
     let out = run(&["detach", "--volume", "v2", "--plan"]);

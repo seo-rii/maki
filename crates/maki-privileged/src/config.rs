@@ -119,7 +119,7 @@ impl AttachConfig {
             ));
         }
         #[cfg(target_os = "linux")]
-        check_mountpoint_name_lengths(&request.mountpoint)?;
+        check_mountpoint_path(&request.mountpoint)?;
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
         // the VG and LV with a hyphen and doubles every hyphen in either name.
         let vg = &request.vg_name;
@@ -304,10 +304,10 @@ pub fn check_argument(name: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Check each component against the filesystem that will contain it. When
-/// a directory has not been created yet, inherit its parent's known limit.
+/// Existing components must be directories, as required by the mount step.
+/// Missing components inherit the nearest existing parent's name limit.
 #[cfg(target_os = "linux")]
-fn check_mountpoint_name_lengths(mountpoint: &str) -> Result<(), ConfigError> {
+fn check_mountpoint_path(mountpoint: &str) -> Result<(), ConfigError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -335,6 +335,31 @@ fn check_mountpoint_name_lengths(mountpoint: &str) -> Result<(), ConfigError> {
             ));
         }
         parent.push(name);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ConfigError::Invalid(
+                    "mountpoint path must not contain a symlink".into(),
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(ConfigError::Invalid(
+                    "mountpoint path must contain only directories".into(),
+                ));
+            }
+            Ok(_) => {}
+            // The directory may be provisioned later, or the plan rendered by
+            // a user who cannot search this part of the path.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(e) => {
+                return Err(ConfigError::Invalid(format!(
+                    "cannot resolve mountpoint: {e}"
+                )));
+            }
+        }
     }
     Ok(())
 }
