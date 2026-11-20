@@ -130,7 +130,9 @@ def event(directory, name, **fields):
     record = {"event": name, "monotonic_ns": time.monotonic_ns(), **fields}
     descriptor = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(descriptor, (json.dumps(record) + "\n").encode())
+        line = (json.dumps(record) + "\n").encode()
+        if os.write(descriptor, line) != len(line):
+            raise OSError("short write to systemd event log")
     finally:
         os.close(descriptor)
 
@@ -234,11 +236,13 @@ class Fixture:
         output = self.ctl("show", "--property=ActiveState", self.units[which]).stdout
         return output.strip().removeprefix("ActiveState=")
 
-    def events(self):
+    def events(self, *, final=False):
         path = self.directory / "events.jsonl"
         if not path.exists():
             return []
         text = path.read_text()
+        if final and text and not text.endswith("\n"):
+            raise ValueError("incomplete final record in systemd event log")
         return [json.loads(line) for line in text.splitlines(keepends=True) if line.endswith("\n")]
 
     def count(self, name):
@@ -498,7 +502,7 @@ def main():
                     except Exception as retry_error:
                         result["cleanup_retry_error"] = str(retry_error)
             try:
-                result["events"] = fixture.events()
+                result["events"] = fixture.events(final=True)
             except (OSError, ValueError) as error:
                 result["status"] = "failed"
                 result["events_error"] = str(error)

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -62,6 +63,47 @@ class ProcessCleanupTests(unittest.TestCase):
             # safe group cleanup. The controller itself must do the same.
             os.waitid(os.P_PID, process.child.pid, os.WEXITED | os.WNOWAIT)
         return module, process, exited
+
+    def test_sigterm_reaps_each_first_boot_process_and_publishes_failure(self):
+        launcher = self.root / "launcher"
+        marker = self.root / "child.pid"
+        launcher.write_text(f"""#!{sys.executable}
+import json, os, signal, sys, time
+from pathlib import Path
+if 'describe' in sys.argv:
+    link = 'https://www.googleapis.com/compute/v1/projects/test-abc/zones/test-zone/disks/data'
+    if 'instances' in sys.argv:
+        print(json.dumps({{'id':'123', 'disks':[{{'boot':False, 'source':link, 'deviceName':'data'}}],
+                          'status':'RUNNING'}}))
+    else:
+        print(json.dumps({{'id':'456', 'selfLink':link}}))
+else:
+    Path({str(marker)!r}).write_text(str(os.getpid()))
+    os.kill(os.getppid(), signal.SIGTERM)
+    time.sleep(5)
+""")
+        launcher.chmod(0o700)
+        images = [self.root / name for name in ("kernel", "rootfs", "data")]
+        for path in images:
+            path.touch()
+        for name, options in (
+                ("firecracker", ["--firecracker", launcher, "--kernel", images[0], "--rootfs",
+                                 images[1], "--data", images[2]]),
+                ("gcp", ["--gcloud", launcher, "--project", "test-abc", "--zone", "test-zone",
+                         "--instance", "testvm", "--data-disk", "data"])):
+            with self.subTest(name=name):
+                output = self.root / name
+                script = self.runners[name][0].__file__
+                result = subprocess.run([sys.executable, "-B", script, "--output", output, *options],
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 128 + signal.SIGTERM, result.stderr)
+                pid = int(marker.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                marker.unlink()
+                report = json.loads((output / "results.json").read_text())
+                self.assertFalse(report["passed"])
+                self.assertIn("SIGTERM", report["error"])
 
     def test_event_received_after_deadline_is_rejected(self):
         token = "a" * 32

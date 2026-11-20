@@ -53,7 +53,7 @@ def ensure(condition, message):
 
 class Nbd:
     """Synchronous libnbd ACKs; LIBNBD_CMD_FLAG_FUA=1 (not nbdkit's flag=2)."""
-    def __init__(self):
+    def __init__(self, socket_path=pathlib.Path("/run/maki/nbd.sock")):
         self.lib = ctypes.CDLL("libnbd.so.0")
         handle, pointer = ctypes.c_void_p, ctypes.c_void_p
         size, offset, flags = ctypes.c_size_t, ctypes.c_uint64, ctypes.c_uint32
@@ -70,9 +70,17 @@ class Nbd:
             function.restype, function.argtypes = result, args
         self.handle = self.lib.nbd_create()
         ensure(self.handle, "libnbd allocation failed")
-        self.check(self.lib.nbd_connect_unix(self.handle, b"/run/maki/nbd.sock"))
-        ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA unavailable")
-        ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH unavailable")
+        try:
+            self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(socket_path)))
+            ensure(self.lib.nbd_can_fua(self.handle) == 1, "FUA unavailable on the NBD connection")
+            ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH unavailable")
+            # The wire bit also accepts emulated FUA. This boot has one client in a fresh /run.
+            with socket_path.with_name("connections.log").open("rb") as log:
+                connection = next((line for line in log if re.search(rb' connection=\d+ Connect export="" ', line)), b"")
+                ensure(b"fua=2" in connection.split(), "plugin does not provide native FUA")
+        except BaseException:
+            self.lib.nbd_close(self.handle)
+            raise
 
     def check(self, result):
         if result < 0:
@@ -186,7 +194,8 @@ class Agent:
         env = dict(os.environ, PATH=SYSTEM_PATH, NOTIFY_SOCKET="/run/maki/ready.sock")
         with open("/run/maki/nbdkit.log", "xb") as log:
             self.daemon = subprocess.Popen(["nbdkit", "--foreground", "--threads", "4", "-U", "/run/maki/nbd.sock",
-                                            "/opt/maki/libmaki_nbdkit.so", "config=" + str(config)],
+                                            "--filter=log", "/opt/maki/libmaki_nbdkit.so", "config=" + str(config),
+                                            "logfile=/run/maki/connections.log"],
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
         until = time.monotonic() + ready_timeout
         try:
@@ -203,7 +212,7 @@ class Agent:
         finally:
             notify.close()
         self.client = Nbd()
-        self.emit("ready", fs_uuid=fs_uuid,
+        self.emit("ready", fs_uuid=fs_uuid, native_fua=True,
                   write_cache=pathlib.Path("/sys/block/vdb/queue/write_cache").read_text().strip(),
                   kernel=os.uname().release, nbdkit=run(["nbdkit", "--version"]),
                   provider="local-aes-gcm-siv")

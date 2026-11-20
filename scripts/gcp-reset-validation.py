@@ -23,9 +23,9 @@ import time
 import uuid
 
 try:
-    from campaign_io import DiagnosticLog, save_json
+    from campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
 except ModuleNotFoundError:
-    from scripts.campaign_io import DiagnosticLog, save_json
+    from scripts.campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
 
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
@@ -196,7 +196,8 @@ def verify_readbacks(expected, actual):
     validate_records(actual, expected)
 
 
-def bounded_run(command, timeout):
+def bounded_run(command, timeout, *, include_stdout_on_error=False):
+    check_termination()
     stdout, stderr = bytearray(), bytearray()
     total = 0
     leader_exited = False
@@ -208,6 +209,7 @@ def bounded_run(command, timeout):
             selector.register(child.stdout, selectors.EVENT_READ, stdout)
             selector.register(child.stderr, selectors.EVENT_READ, stderr)
             while True:
+                check_termination()
                 if not leader_exited:
                     # Do not reap (including via poll/communicate) before the
                     # final group signal: the retained leader pins its PGID.
@@ -251,6 +253,8 @@ def bounded_run(command, timeout):
     result = subprocess.CompletedProcess(command, child.returncode, bytes(stdout), bytes(stderr))
     if result.returncode != 0:
         detail = result.stderr[-4096:].decode(errors="replace")
+        if include_stdout_on_error:
+            detail = f"stdout: {result.stdout[-4096:].decode(errors='replace')}\nstderr: {detail}"
         raise RuntimeError(f"gcloud exited {result.returncode}: {detail}")
     return result
 
@@ -418,7 +422,7 @@ def offline_check_command(args):
 
 
 def run_offline_check(args, timeout):
-    result = bounded_run(offline_check_command(args), timeout)
+    result = bounded_run(offline_check_command(args), timeout, include_stdout_on_error=True)
     return {"returncode": result.returncode,
             "stdout": result.stdout.decode(errors="replace"),
             "stderr": result.stderr.decode(errors="replace")}
@@ -459,6 +463,7 @@ class RemoteProcess:
     def event(self, timeout):
         until = time.monotonic() + timeout
         while True:
+            check_termination()
             newline = self.buffer.find(b"\n")
             if newline >= 0:
                 line = bytes(self.buffer[:newline]).rstrip(b"\r")
@@ -472,8 +477,10 @@ class RemoteProcess:
             if len(self.buffer) > MAX_FRAME:
                 raise ValueError("unterminated oversized SSH control line")
             remaining = until - time.monotonic()
-            if remaining <= 0 or not self.selector.select(remaining):
+            if remaining <= 0:
                 raise TimeoutError("guest SSH event deadline")
+            if not self.selector.select(min(0.1, remaining)):
+                continue
             chunk = os.read(self.child.stdout.fileno(), 4096)
             if not chunk:
                 status = self.poll()
@@ -523,6 +530,7 @@ class RemoteProcess:
     def _wait_owned(self, timeout):
         until = time.monotonic() + timeout
         while True:
+            check_termination()
             status = self.poll()
             remaining = until - time.monotonic()
             if remaining <= 0:
@@ -573,6 +581,7 @@ def launch_guest(args, token, cycle, verify_only, output, device_name):
     attempt = 0
     errors = []
     while True:
+        check_termination()
         remaining = until - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("instance did not accept a guest qualification SSH session: " + "; ".join(errors[-3:]))
@@ -666,6 +675,7 @@ def campaign(args):
         final_resources = resource_identity(args, args.timeout)
         validate_resource_identity(baseline, final_resources)
         result["fs_uuid"] = fs_uuid
+        check_termination()
         result["passed"] = True
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -692,7 +702,9 @@ def main():
     parser.add_argument("--guest-config", default="/mnt/maki-data/config.toml")
     parser.add_argument("--guest-plugin", default="/opt/maki/libmaki_nbdkit.so")
     parser.add_argument("--guest-maki", default="/opt/maki/maki")
-    campaign(parser.parse_args())
+    args = parser.parse_args()
+    with handle_termination():
+        campaign(args)
 
 
 if __name__ == "__main__":

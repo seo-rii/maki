@@ -30,6 +30,18 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                   patch.object(fixture.time, "sleep")):
                 case.verify(mode)
 
+    def test_partial_event_fails_both_the_writer_and_final_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "normal-stop")
+            fixture.event(case.directory, "started")
+            write = fixture.os.write
+            with patch.object(fixture.os, "write", side_effect=lambda fd, line: write(fd, line[:11])):
+                with self.assertRaisesRegex(OSError, "short write"):
+                    fixture.event(case.directory, "finished")
+            self.assertEqual([record["event"] for record in case.events()], ["started"])
+            with self.assertRaisesRegex(ValueError, "incomplete final record"):
+                case.events(final=True)
+
     def test_failed_cleanup_trace_requires_live_daemon(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("failed-stop", (
