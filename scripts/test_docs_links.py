@@ -170,6 +170,22 @@ class DocumentationLinks(unittest.TestCase):
                    "and [guide](missing.md).\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
 
+    def test_gfm_bare_urls_hide_only_their_own_markdown(self):
+        self.write("README.md",
+                   "https://example.org/a/[label](inside.md)/[ref][unknown] [next](one.md)\n"
+                   "(*www.example.org/[label](example.pdf)*) [next](two.md)\n"
+                   "FTP://localhost/[x](example.pdf)<kbd>[next](three.md)</kbd>\n"
+                   "[https://example.org/[nested](four.md)](outer.md)\n"
+                   "prefixhttps://example.org/[plain](five.md) wordwww.example.org/[x](six.md)\n"
+                   "https://invalid_host.example/[plain](seven.md)\n"
+                   "# https://example.org/_path_/[x](file.md)\n"
+                   "[heading](#httpsexampleorg_path_xfilemd)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: one.md", "README.md:2: two.md", "README.md:3: three.md",
+            "README.md:4: four.md", "README.md:5: five.md", "README.md:5: six.md",
+            "README.md:6: seven.md",
+        ])
+
     def test_inline_markup_can_start_a_setext_heading(self):
         self.write("README.md", "<https://example.org>\n===\n\n<kbd>Enter</kbd> key\n---\n\n"
                    "<div>Hidden</div>\n===\n\n"
