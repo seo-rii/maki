@@ -75,11 +75,14 @@ impl Inner {
 
     /// Mark `unit` most recently used.
     fn touch(&mut self, unit: u64) {
-        let tick = self.next_tick();
         if let Some(entry) = self.map.get_mut(&unit) {
+            if entry.last_used == self.tick {
+                return;
+            }
             self.recency.remove(&entry.last_used);
-            entry.last_used = tick;
-            self.recency.insert(tick, unit);
+            self.tick += 1;
+            entry.last_used = self.tick;
+            self.recency.insert(self.tick, unit);
         }
     }
 
@@ -269,6 +272,31 @@ impl VersionedLruCache {
 #[cfg(test)]
 mod monitoring_tests {
     use super::*;
+
+    #[test]
+    fn repeated_hits_keep_the_most_recent_entry_in_place() {
+        let cache = VersionedLruCache::new(
+            CacheConfig {
+                max_bytes: 12,
+                ttl: Duration::from_secs(60),
+                zeroize_on_evict: true,
+            },
+            Arc::new(maki_crypto::SystemClock::new()),
+        );
+        for unit in 0..12 {
+            cache.put(unit, 1, SecretBuffer::from_slice(&[1]));
+        }
+        // Promote an older entry once, then check repeated hits and eviction.
+        assert!(cache.get(0, 1).is_some());
+        let tick = cache.inner.lock().map[&0].last_used;
+        for _ in 0..16 {
+            assert!(cache.get(0, 1).is_some());
+        }
+        assert_eq!(cache.inner.lock().map[&0].last_used, tick);
+        cache.set_max_bytes(11);
+        assert!(cache.get(1, 1).is_none());
+        assert!(cache.get(0, 1).is_some());
+    }
 
     #[test]
     fn disabling_the_cache_releases_the_empty_hash_table() {
