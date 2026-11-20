@@ -196,7 +196,7 @@ def verify_readbacks(expected, actual):
     validate_records(actual, expected)
 
 
-def bounded_run(command, timeout):
+def bounded_run(command, timeout, *, include_stdout_on_error=False):
     stdout, stderr = bytearray(), bytearray()
     total = 0
     leader_exited = False
@@ -251,6 +251,8 @@ def bounded_run(command, timeout):
     result = subprocess.CompletedProcess(command, child.returncode, bytes(stdout), bytes(stderr))
     if result.returncode != 0:
         detail = result.stderr[-4096:].decode(errors="replace")
+        if include_stdout_on_error:
+            detail = f"stdout: {result.stdout[-4096:].decode(errors='replace')}\nstderr: {detail}"
         raise RuntimeError(f"gcloud exited {result.returncode}: {detail}")
     return result
 
@@ -418,7 +420,7 @@ def offline_check_command(args):
 
 
 def run_offline_check(args, timeout):
-    result = bounded_run(offline_check_command(args), timeout)
+    result = bounded_run(offline_check_command(args), timeout, include_stdout_on_error=True)
     return {"returncode": result.returncode,
             "stdout": result.stdout.decode(errors="replace"),
             "stderr": result.stderr.decode(errors="replace")}

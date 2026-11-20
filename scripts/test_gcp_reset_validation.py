@@ -274,6 +274,19 @@ class HostContracts(unittest.TestCase):
         self.assertEqual(evidence["returncode"], 0)
         self.assertEqual(evidence["stdout"], "deep ok")
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux command supervision")
+    def test_offline_failure_preserves_bounded_check_and_transport_diagnostics(self):
+        command = [sys.executable, "-c",
+                   "import sys; print('discarded prefix' + 'x' * 4096 + 'ERROR: missing superblock'); "
+                   "print('SSH diagnostic', file=sys.stderr); sys.exit(1)"]
+        with mock.patch.object(self.host, "offline_check_command", return_value=command):
+            with self.assertRaisesRegex(RuntimeError, "gcloud exited 1") as failure:
+                self.host.run_offline_check(None, 10)
+        message = str(failure.exception)
+        self.assertIn("ERROR: missing superblock", message)
+        self.assertIn("SSH diagnostic", message)
+        self.assertNotIn("discarded prefix", message)
+
     def test_reset_finishes_before_old_ssh_is_accepted_as_dead(self):
         order = []
         process = mock.Mock()
