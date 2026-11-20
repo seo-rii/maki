@@ -91,6 +91,9 @@ impl ReferenceBlockModel {
 
     /// All values this unit may legally hold immediately after a crash.
     pub fn allowed_after_crash(&self, unit: u64) -> Vec<Vec<u8>> {
+        if unit >= self.num_units {
+            return Vec::new();
+        }
         let mut out = vec![self
             .durable
             .get(&unit)
@@ -109,6 +112,12 @@ impl ReferenceBlockModel {
     /// Check the observed post-crash content of `unit` against the allowed
     /// set, then adopt it as the new durable state.
     pub fn crash_adopt(&mut self, unit: u64, actual: &[u8]) -> Result<(), OracleViolation> {
+        if unit >= self.num_units {
+            return Err(OracleViolation {
+                unit,
+                detail: format!("unit outside volume of {} units", self.num_units),
+            });
+        }
         let allowed = self.allowed_after_crash(unit);
         if !allowed.iter().any(|v| v == actual) {
             return Err(OracleViolation {
@@ -129,4 +138,24 @@ impl ReferenceBlockModel {
 
 fn summarize(v: &[u8]) -> String {
     format!("[{} bytes, first={:?}]", v.len(), v.first())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observations_outside_the_volume_are_never_legal() {
+        for count in [0, 1] {
+            let mut model = ReferenceBlockModel::new(4, count);
+            for invalid in [count, u64::MAX] {
+                assert!(model.allowed_after_crash(invalid).is_empty());
+                assert_eq!(
+                    model.crash_adopt(invalid, &[0; 4]).unwrap_err().unit,
+                    invalid
+                );
+                assert!(!model.durable.contains_key(&invalid));
+            }
+        }
+    }
 }
