@@ -1398,6 +1398,14 @@ impl SlotStore {
     /// oversized headers and damaged unlisted slots exactly as a full read
     /// would.
     fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
+        self.slot_header_with_len(unit, |_, data| data.len())
+    }
+
+    fn slot_header_with_len(
+        &self,
+        unit: u64,
+        data_len: impl FnOnce(u64, &dyn BackingFile) -> std::io::Result<u64>,
+    ) -> Result<Option<SlotHeader>, CoreError> {
         self.validate_unit(unit)?;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let Some(shard) = self.shards.get(&shard_idx) else {
@@ -1432,7 +1440,7 @@ impl SlotStore {
         } else {
             // Bit clear: unwritten unless the slot itself says otherwise
             // (allocation copy behind the data, see module docs).
-            let len = shard.data.len()?;
+            let len = data_len(shard_idx, shard.data.as_ref())?;
             match probe_header(&self.geometry, shard, unit, in_shard, len)? {
                 Probe::Unwritten => return Ok(None),
                 Probe::Damaged => {
@@ -1462,7 +1470,38 @@ impl SlotStore {
     /// SPEC §22 read classification: header, then the payload verified
     /// against the header's CRC.
     pub fn read_slot(&self, unit: u64) -> Result<SlotRead, CoreError> {
-        let Some(header) = self.slot_header(unit)? else {
+        self.read_payload(unit, self.slot_header(unit)?)
+    }
+
+    /// The offline caller holds the volume lock. Unlisted units arrive in
+    /// shard order so one observed length covers their whole header scan.
+    pub(crate) fn checked_slots(
+        &self,
+    ) -> impl Iterator<Item = (u64, bool, Result<SlotRead, CoreError>)> + '_ {
+        let listed = self.allocated_units().map(|unit| (unit, true));
+        let unlisted = self.unlisted_units().map(|unit| (unit, false));
+        let mut previous = None;
+        listed.chain(unlisted).map(move |(unit, allocated)| {
+            let header = self.slot_header_with_len(unit, |shard, data| {
+                if let Some((last_shard, len)) = previous {
+                    if last_shard == shard {
+                        return Ok(len);
+                    }
+                }
+                let len = data.len()?;
+                previous = Some((shard, len));
+                Ok(len)
+            });
+            (
+                unit,
+                allocated,
+                header.and_then(|header| self.read_payload(unit, header)),
+            )
+        })
+    }
+
+    fn read_payload(&self, unit: u64, header: Option<SlotHeader>) -> Result<SlotRead, CoreError> {
+        let Some(header) = header else {
             return Ok(SlotRead::Zero);
         };
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);

@@ -23,6 +23,7 @@ struct ReadFailure {
 struct ReadFault {
     offset: AtomicU64,
     errno: AtomicI32,
+    shard_len_queries: AtomicU64,
 }
 
 struct ReadFailureFile {
@@ -45,6 +46,9 @@ impl BackingFile for ReadFailureFile {
         self.inner.set_len(len)
     }
     fn len(&self) -> io::Result<u64> {
+        if self.shard {
+            self.fault.shard_len_queries.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.len()
     }
     fn sync_data(&self) -> io::Result<()> {
@@ -234,4 +238,13 @@ fn validated_journal_still_classifies_actual_slot_damage_as_recoverable() {
     )
     .unwrap();
     assert_eq!(volume.read_ct(0).unwrap().unwrap().1, vec![8; 540]);
+}
+
+#[test]
+fn deep_check_reads_a_sparse_shards_length_once_for_all_unlisted_slots() {
+    let backing = fixture(false);
+    backing.fault.shard_len_queries.store(0, Ordering::Relaxed);
+    assert!(deep_check(backing.clone(), 4096).unwrap().ok());
+    // One query at store open and one for the offline unlisted-slot scan.
+    assert_eq!(backing.fault.shard_len_queries.load(Ordering::Relaxed), 2);
 }

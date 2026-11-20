@@ -228,15 +228,12 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             }
             let mut checked = 0u64;
             let mut probed = 0u64;
-            let listed = store.allocated_units().map(|unit| (unit, true));
-            let unlisted = store.unlisted_units().map(|unit| (unit, false));
-            for (unit, allocated) in listed.chain(unlisted) {
+            for (unit, allocated, read) in store.checked_slots() {
                 if allocated {
                     checked += 1;
                 } else {
                     probed += 1;
                 }
-                let read = store.read_slot(unit);
                 if !replay_units.contains(&unit) && matches!(read, Ok(SlotRead::Ciphertext { .. }))
                 {
                     stored_ciphertext = true;
@@ -351,6 +348,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     } else {
         "clean"
     };
+    backing.check_freshness()?;
     report.info.push(format!("deep check verdict: {verdict}"));
 
     Ok(report)
