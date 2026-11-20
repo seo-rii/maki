@@ -1056,35 +1056,7 @@ impl Engine {
                 .as_ref()
                 .filter(|cache| cache.can_hold(unit_size));
             for unit in first..=last {
-                match cache {
-                    Some(cache) if !inner.cache_verify_on_hit => {
-                        match volume.current_sequence(unit)? {
-                            None => continue,
-                            Some(seq) => {
-                                if let Some(buf) = cache.get(unit, seq) {
-                                    cached.insert(unit, buf);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    Some(cache) => {
-                        if let Some((seq, data)) = volume.read_ct(unit)? {
-                            if let Some(buf) = cache.get(unit, seq) {
-                                cached.insert(unit, buf);
-                            } else {
-                                seqs.insert(unit, seq);
-                                cts.push(CiphertextUnit {
-                                    unit_index: unit,
-                                    data,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-                    None => {}
-                }
-                if let Some((seq, data)) = volume.read_ct(unit)? {
+                if let Some((seq, data)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
                     seqs.insert(unit, seq);
                     cts.push(CiphertextUnit {
                         unit_index: unit,
@@ -1096,6 +1068,11 @@ impl Engine {
         })
         .await??;
         let mut plain = self.decrypt_units(cts).await?;
+        let cache = self
+            .inner
+            .cache
+            .as_ref()
+            .filter(|cache| !plain.is_empty() && cache.can_hold(unit_size));
 
         let mut out = SecretBuffer::zeroed(len);
         let mut cursor = 0usize;
@@ -1106,7 +1083,7 @@ impl Engine {
             let dst = &mut out.expose_mut()[cursor..cursor + (to - from)];
             if let Some(buf) = plain.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);
-                if let Some(cache) = &self.inner.cache {
+                if let Some(cache) = cache {
                     cache.put(unit, seqs[&unit], buf);
                 }
             } else if let Some(buf) = cached.remove(&unit) {
@@ -1206,29 +1183,7 @@ impl Engine {
                     continue;
                 }
                 need_rmw.push(unit);
-                if let Some(cache) = cache {
-                    if !inner.cache_verify_on_hit {
-                        match volume.current_sequence(unit)? {
-                            None => continue,
-                            Some(seq) => {
-                                if let Some(buf) = cache.get(unit, seq) {
-                                    cached.insert(unit, buf);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some((seq, ct)) = volume.read_ct(unit)? {
-                    // With `verify_on_hit` the payload was just read and
-                    // CRC-checked; the cache only saves the decryption.
-                    let hit = cache
-                        .filter(|_| inner.cache_verify_on_hit)
-                        .and_then(|cache| cache.get(unit, seq));
-                    if let Some(buf) = hit {
-                        cached.insert(unit, buf);
-                        continue;
-                    }
+                if let Some((_, ct)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
                     rmw_cts.push(CiphertextUnit {
                         unit_index: unit,
                         data: ct,
@@ -1850,6 +1805,39 @@ impl Engine {
 }
 
 impl EngineInner {
+    /// Record a plaintext hit or return ciphertext to decrypt. The caller
+    /// holds the same volume read guard across version lookup and payload I/O.
+    fn read_unit(
+        &self,
+        volume: &Volume,
+        unit: u64,
+        cache: Option<&maki_cache::VersionedLruCache>,
+        cached: &mut HashMap<u64, Arc<SecretBuffer>>,
+    ) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        let Some(cache) = cache else {
+            return volume.read_ct(unit);
+        };
+        let mut hit = |seq| {
+            if let Some(buf) = cache.get(unit, seq) {
+                cached.insert(unit, buf);
+                true
+            } else {
+                false
+            }
+        };
+        if self.cache_verify_on_hit {
+            return Ok(volume.read_ct(unit)?.filter(|(seq, _)| !hit(*seq)));
+        }
+        volume.read_ct_if(unit, |seq| {
+            if hit(seq) {
+                return Ok(false);
+            }
+            // Keep the freshness check between a cache miss and payload I/O.
+            volume.check_freshness()?;
+            Ok(true)
+        })
+    }
+
     /// Explicit journal barriers, including failed syncs. This excludes
     /// provider, volume-lock and blocking-pool wait; public callback guards
     /// measure those waits in the full request latency instead.

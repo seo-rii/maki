@@ -118,9 +118,15 @@ async fn a_cache_hit_reads_only_the_slot_header_from_the_backing() {
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap(); // unit 3 lives in a slot now
 
+    let before = backing.read_bytes();
     assert_eq!(
         engine.read(off(3), UNIT as usize).await.unwrap(),
         data(0x33)
+    );
+    assert_eq!(
+        backing.read_bytes() - before,
+        64 + CT,
+        "the first read must reuse the header on a cache miss"
     );
     let decrypts = provider.decrypt_calls();
     let before = backing.read_bytes();
