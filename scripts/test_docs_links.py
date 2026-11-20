@@ -46,6 +46,12 @@ class DocumentationLinks(unittest.TestCase):
             "be.md:2: absent.md", "le.md:2: absent.md",
         ])
 
+    def test_overlong_target_preserves_other_documents_diagnostics(self):
+        target = "x" * 512 + ".md"
+        self.write("a.md", f"[too long]({target})\n")
+        self.write("b.md", "[absent](other.md)\n")
+        self.assertEqual(broken_links(self.root), [f"a.md:1: {target}", "b.md:1: other.md"])
+
     def test_malformed_document_does_not_interrupt_other_diagnostics(self):
         self.write("docs/invalid.md", "").write_bytes(b"\xffx")
         self.write("odd.md", "").write_bytes(codecs.BOM_UTF16_LE + b"x")
@@ -163,6 +169,33 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "See <https://example.org/[a](example.pdf)/[b][unused]> "
                    "and [guide](missing.md).\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
+
+    def test_gfm_bare_urls_hide_only_their_own_markdown(self):
+        self.write("README.md",
+                   "https://example.org/a/[label](inside.md)/[ref][unknown] [next](one.md)\n"
+                   "(*www.example.org/[label](example.pdf)*) [next](two.md)\n"
+                   "FTP://localhost/[x](example.pdf)<kbd>[next](three.md)</kbd>\n"
+                   "[https://example.org/[nested](four.md)](outer.md)\n"
+                   "prefixhttps://example.org/[plain](five.md) wordwww.example.org/[x](six.md)\n"
+                   "https://invalid_host.example/[plain](seven.md)\n"
+                   "# https://example.org/_path_/[x](file.md)\n"
+                   "[heading](#httpsexampleorg_path_xfilemd)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: one.md", "README.md:2: two.md", "README.md:3: three.md",
+            "README.md:4: four.md", "README.md:5: five.md", "README.md:5: six.md",
+            "README.md:6: seven.md",
+        ])
+
+    def test_bare_url_unicode_hosts_follow_gfm_character_classes(self):
+        self.write("README.md",
+                   "https://🌍.example/[x](url-path.md)\n"
+                   "https://he\u0301llo.example/[x](url-path.md)\n"
+                   "https://🌍_invalid.example/[x](bad-name.md)\n"
+                   "https://—example.org/[x](bad-start.md)\n"
+                   "https://abc.example/ [x](separate.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: bad-name.md", "README.md:4: bad-start.md", "README.md:5: separate.md",
+        ])
 
     def test_inline_markup_can_start_a_setext_heading(self):
         self.write("README.md", "<https://example.org>\n===\n\n<kbd>Enter</kbd> key\n---\n\n"

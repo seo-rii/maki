@@ -30,6 +30,7 @@ Usage: python3 -B scripts/check_docs_links.py [repository-root]
 
 from bisect import bisect_right
 import codecs
+import errno
 import hashlib
 import html
 import json
@@ -69,6 +70,8 @@ HTML_TOKENS = re.compile(
     r"<(?P<raw>script|style|textarea)(?=[\s>]).*?(?:</(?P=raw)>|$)|"
     rf"{HTML_OPEN}", re.IGNORECASE | re.DOTALL | re.ASCII)
 AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
+BARE_LINK_START = re.compile(r"(?<![A-Za-z])(?i:https?|ftp)://|(?<![^ \t\r\n*_~(])www\.")
+BARE_LINK_TAIL = re.compile(r"[^ \t\r\n\v\f<]*")
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 BACKTICKS = re.compile(r"`+")
 ASCII_PUNCTUATION = frozenset(string.punctuation)
@@ -527,12 +530,53 @@ def reference_definitions(text):
     return definitions
 
 
+def bare_host_char(char):
+    # GFM permits symbols and combining marks in a host. ASCII punctuation
+    # and Unicode punctuation are delimiters unless the host rule allows them.
+    return (not char.isspace() and char not in ASCII_PUNCTUATION
+            and not unicodedata.category(char).startswith("P"))
+
+
+def bare_link_end(text, start):
+    """End of a GFM extended URL autolink, excluding trailing prose punctuation."""
+    prefix = BARE_LINK_START.match(text, start)
+    if prefix is None:
+        return start
+    www = prefix[0] == "www."
+    host_start = start if www else prefix.end()
+    if host_start == len(text) or not bare_host_char(text[host_start]):
+        return start
+    host_end = host_start + 1
+    while host_end < len(text) and (text[host_end] in "._-" or bare_host_char(text[host_end])):
+        host_end += 1
+    if any("_" in label for label in text[host_start:host_end].rsplit(".", 2)[-2:]):
+        return start
+    end = BARE_LINK_TAIL.match(text, host_end).end()
+    extra_closing = text.count(")", start, end) - text.count("(", start, end)
+    while end > start:
+        last = text[end - 1]
+        if last == ")" and extra_closing > 0:
+            extra_closing -= 1
+        elif last == ";":
+            name = end - 1
+            while name > start and text[name - 1] in string.ascii_letters:
+                name -= 1
+            if start < name < end - 1 and text[name - 1] == "&":
+                end = name - 1
+                continue
+        elif last not in "?!.,:*_~'\"":
+            break
+        end -= 1
+    return end
+
+
 def scan_inline_paragraph(line, labels):
     """Mask literals and record link destinations with their offsets in this paragraph."""
     out = []
     targets = []
     html_tags = []
     link_spans = {}
+    bare_links = {}
     brackets = []
     last_link = -1
     index = 0
@@ -558,6 +602,13 @@ def scan_inline_paragraph(line, labels):
                 html_tags.append(tag.group())
                 out.append(" " * len(tag.group()))
                 index = tag.end()
+                continue
+        if not brackets and char in "hHfFw":
+            end = bare_link_end(line, index)
+            if end > index:
+                bare_links[index] = end
+                out.append(" " * (end - index))
+                index = end
                 continue
         if line.startswith("![", index):
             brackets.append((index + 1, (len(targets), len(html_tags))))
@@ -616,7 +667,7 @@ def scan_inline_paragraph(line, labels):
             continue
         out.append(char)
         index += 1
-    return "".join(out), targets, html_tags, link_spans
+    return "".join(out), targets, html_tags, link_spans, bare_links
 
 
 def inline_paragraphs(text, definition_lines):
@@ -649,7 +700,7 @@ def inline_paragraphs(text, definition_lines):
 
 def inline_lines(text, definition_lines, labels):
     for paragraph in inline_paragraphs(text, definition_lines):
-        masked, targets, _, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        masked, targets, _, _, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
         starts = []
         start = 0
         for _, line in paragraph:
@@ -717,11 +768,16 @@ def inline_text(raw, labels=frozenset()):
     never emphasis delimiters or entity references. `labels` holds the
     document's defined reference labels: a reference to one renders as a link.
     """
-    _, _, _, links = scan_inline_paragraph(raw, labels)
+    _, _, _, links, bare_links = scan_inline_paragraph(raw, labels)
     ends = {close: end for close, end, image in links.values() if not image}
     out = []
     index = 0
     while index < len(raw):
+        if index in bare_links:
+            end = bare_links[index]
+            out.extend((char, True) for char in raw[index:end])
+            index = end
+            continue
         char = raw[index]
         if char == "\\" and index + 1 < len(raw) and raw[index + 1] in ASCII_PUNCTUATION:
             out.append((raw[index + 1], True))
@@ -928,7 +984,7 @@ def document_anchors(text):
     for lines in raw_blocks:
         collect_html("\n".join(line for _, line in lines))
     for paragraph in inline_paragraphs(text, definition_lines):
-        _, _, tags, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        _, _, tags, _, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
         for tag in tags:
             collect_html(tag)
     return anchors
@@ -981,8 +1037,13 @@ def broken_links(root):
     def published_target(path):
         if not path.is_relative_to(root):
             return None
-        if not path.exists():
-            return None  # also catches dangling links and cycles
+        try:
+            if not path.exists():
+                return None  # also catches dangling links and cycles
+        except OSError as error:
+            if error.errno == errno.ENAMETOOLONG:
+                return None
+            raise
         # A local alias may resolve to a tracked file through an ignored
         # intermediate link. Follow the path using only checkout candidates.
         pending = list(reversed(path.relative_to(root).parts))
