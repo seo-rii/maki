@@ -243,7 +243,7 @@ impl ControlBackend for EngineControlBackend {
             "maki_journal_pending_bytes": stats.journal_pending_bytes,
             "maki_journal_sync_failures_total": stats.journal_sync_failures_total,
             "maki_journal_writeback_uncertain": u8::from(stats.journal_writeback_uncertain),
-            "maki_checkpoint_lag_bytes": stats.overlay_bytes,
+            "maki_checkpoint_lag_bytes": stats.checkpoint_lag_bytes,
             "maki_checkpoints_total": stats.checkpoints_total,
             "maki_checkpoint_failures_total": stats.checkpoint_failures_total,
             "maki_backing_free_bytes": stats.backing_free_bytes,

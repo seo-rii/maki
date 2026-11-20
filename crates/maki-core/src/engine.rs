@@ -1829,6 +1829,7 @@ impl Engine {
             durable_sequence: volume.durable_sequence,
             appended_sequence: volume.appended_sequence,
             checkpoint_sequence: volume.checkpoint_sequence,
+            checkpoint_lag_bytes: volume.checkpoint_lag_bytes,
             journal_segments: volume.journal_segments,
             journal_pending_bytes: volume.journal_pending_bytes,
             journal_total_bytes: volume.journal_total_bytes,
@@ -2400,6 +2401,7 @@ struct VolumeSnapshot {
     durable_sequence: u64,
     appended_sequence: u64,
     checkpoint_sequence: u64,
+    checkpoint_lag_bytes: u64,
     journal_segments: usize,
     journal_pending_bytes: u64,
     journal_total_bytes: u64,
@@ -2417,6 +2419,7 @@ impl VolumeSnapshot {
             durable_sequence: volume.journal_durable_sequence(),
             appended_sequence: volume.journal_appended_sequence(),
             checkpoint_sequence: volume.checkpoint_sequence(),
+            checkpoint_lag_bytes: volume.checkpoint_lag_bytes(),
             journal_segments: volume.journal_segment_count(),
             journal_pending_bytes: volume.journal_pending_bytes(),
             journal_total_bytes: volume.journal_total_bytes(),
@@ -2481,6 +2484,8 @@ pub struct EngineStats {
     pub durable_sequence: u64,
     pub appended_sequence: u64,
     pub checkpoint_sequence: u64,
+    /// Durable journal record bytes newer than the published checkpoint.
+    pub checkpoint_lag_bytes: u64,
     pub journal_segments: usize,
     /// Appended but not yet fdatasync'd bytes.
     pub journal_pending_bytes: u64,
