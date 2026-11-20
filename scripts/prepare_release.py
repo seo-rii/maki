@@ -129,11 +129,13 @@ def candidate_source_version():
     # Capture only a committed source tree. Untracked files are excluded by
     # the selected Git tree, and staged/unstaged tracked changes must not be mistaken
     # for source included in this candidate.
+    commit = git("rev-parse", "--verify", "HEAD^{commit}")
     if tracked_changes():
         fail("tracked changes must be committed before preparing a candidate")
+    if git("rev-parse", "--verify", "HEAD^{commit}") != commit:
+        fail("HEAD changed while checking tracked changes; retry candidate preparation")
     if git("rev-parse", "--is-shallow-repository") != "false":
         fail("candidate versions require complete Git history; fetch --unshallow before retrying")
-    commit = git("rev-parse", "HEAD")
     workspace_version = tomllib.loads(git("show", f"{commit}:Cargo.toml"))["workspace"]["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", workspace_version):
         fail("candidate preparation requires a numeric major.minor.patch workspace version")

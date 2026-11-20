@@ -438,6 +438,28 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual((output / "sentinel").read_text(), "preserve")
         self.assertFalse(self.cargo_trace.exists())
 
+    def test_head_change_during_cleanliness_check_stops_candidate(self):
+        from scripts import prepare_release
+
+        (self.repo / "notes.txt").write_text("release notes\n")
+        self.git("add", "notes.txt")
+        self.git("commit", "-qm", "fixture: add release notes")
+        tracked_changes = prepare_release.tracked_changes
+
+        def change_checked_head():
+            dirty = tracked_changes()
+            self.assertFalse(dirty)
+            self.git("reset", "--soft", self.commit)
+            return dirty
+
+        output = self.work / "candidate"
+        with mock.patch.object(prepare_release, "ROOT", self.repo), \
+                mock.patch.object(prepare_release, "tracked_changes", change_checked_head):
+            with self.assertRaisesRegex(SystemExit, "HEAD changed"):
+                prepare_release.prepare(output)
+        self.assertFalse(output.exists())
+        self.assertFalse(self.cargo_trace.exists())
+
     def test_failed_build_leaves_no_partial_candidate(self):
         self.environment["CANDIDATE_FIXTURE_BUILD_FAIL"] = "1"
         output, result = self.prepare(succeeds=False)
