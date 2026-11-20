@@ -191,6 +191,7 @@ fn idle_checkpoint_reclaims_covered_segments_left_by_a_failed_deletion() {
     vol.flush().unwrap();
     let before = vol.journal_segment_count();
     assert!(before >= 3);
+    assert_eq!(vol.journal_covered_segment_count(), 0);
 
     let fp = failpoints::fail_n_times(
         "checkpoint.segment_delete",
@@ -207,8 +208,14 @@ fn idle_checkpoint_reclaims_covered_segments_left_by_a_failed_deletion() {
     );
     assert_eq!(vol.journal_segment_count(), before, "nothing reclaimed yet");
 
+    assert_eq!(
+        vol.journal_covered_segment_count(),
+        vol.journal_sealed_segment_count()
+    );
+
     // Nothing new is durable: the "idle" path must still reclaim.
     vol.checkpoint().unwrap();
+    assert_eq!(vol.journal_covered_segment_count(), 0);
     assert!(
         vol.journal_segment_count() <= 1,
         "covered segments still on disk: {}",
@@ -348,6 +355,7 @@ fn partially_resurrected_covered_prefix_is_accepted() {
     let vol =
         recover(&backing).unwrap_or_else(|e| panic!("resurrected covered segment refused: {e:?}"));
     assert_eq!(vol.read_ct(5).unwrap().unwrap().1, ct(100));
+    assert_eq!(vol.journal_covered_segment_count(), 2);
     // The genuine gap case still fails: an uncovered segment missing.
     let _ = StdRng::seed_from_u64(0);
 }

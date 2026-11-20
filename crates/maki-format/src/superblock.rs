@@ -318,11 +318,20 @@ fn select_volume_copy(copies: &VolumeCopies) -> Result<usize, FormatError> {
 pub fn load_volume_superblock(
     backing: &dyn maki_backing::Backing,
 ) -> Result<VolumeSuperblock, FormatError> {
+    Ok(load_volume_superblock_with_fallback(backing)?.0)
+}
+
+pub(crate) fn load_volume_superblock_with_fallback(
+    backing: &dyn maki_backing::Backing,
+) -> Result<(VolumeSuperblock, Option<&'static str>), FormatError> {
     let mut copies = read_volume_copies(backing)?;
     let selected = select_volume_copy(&copies)?;
+    let invalid = copies[1 - selected]
+        .is_none()
+        .then_some(SUPERBLOCK_PATHS[1 - selected]);
     copies[selected]
         .take()
-        .map(|(record, _)| record)
+        .map(|(record, _)| (record, invalid))
         .ok_or_else(|| FormatError::Invalid("no valid superblock".into()))
 }
 

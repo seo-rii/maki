@@ -250,3 +250,38 @@ fn first_allocated_unit_ignores_unused_tail_of_last_shard() {
     store.mark_allocated(5).unwrap();
     assert_eq!(store.first_allocated_unit(), Some(5));
 }
+
+#[test]
+fn zero_sequence_cannot_create_or_replace_a_slot() {
+    for filesystem in [false, true] {
+        let (backing, geometry, mut store, _directory) = store(filesystem, 8);
+        let before = snapshot(backing.as_ref());
+        for unit in [0, 4] {
+            assert!(matches!(
+                store.write_slot(unit, 0, &[0x52; 32]),
+                Err(CoreError::Corrupt(_))
+            ));
+        }
+        assert_eq!(snapshot(backing.as_ref()), before);
+        assert_original_slot(&store);
+
+        // An older low-level writer could have persisted this header.
+        let file = backing.open(&layout::shard_data(0), false).unwrap();
+        for unit in [0, 1] {
+            let header = maki_format::slot::SlotHeader {
+                unit_index: unit,
+                write_sequence: 0,
+                ciphertext_len: 0,
+                ciphertext_crc: 0,
+                flags: 0,
+            };
+            file.write_at(geometry.slot_offset(unit), &header.encode())
+                .unwrap();
+            assert!(matches!(
+                store.slot_sequence(unit),
+                Err(CoreError::Corrupt(_))
+            ));
+            assert!(matches!(store.read_slot(unit), Err(CoreError::Corrupt(_))));
+        }
+    }
+}

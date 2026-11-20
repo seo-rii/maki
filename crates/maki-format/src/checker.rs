@@ -13,7 +13,9 @@ use crate::checkpoint::{CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use crate::durable_proof::DurableProofStore;
 use crate::error::FormatError;
 use crate::layout;
-use crate::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3};
+use crate::superblock::{
+    load_volume_superblock_with_fallback, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
+};
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -31,7 +33,7 @@ impl CheckReport {
 pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     let mut report = CheckReport::default();
 
-    let envelope = match load_volume_superblock(backing) {
+    let (envelope, invalid_copy) = match load_volume_superblock_with_fallback(backing) {
         Ok(envelope) => envelope,
         Err(error @ FormatError::Io(_)) => return Err(error),
         Err(error) => {
@@ -41,6 +43,11 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             return Ok(report);
         }
     };
+    if let Some(path) = invalid_copy {
+        report.warnings.push(format!(
+            "superblock: {path} is missing or invalid (A/B fallback in use)"
+        ));
+    }
     let superblock = envelope.superblock;
     if matches!(
         envelope.metadata_version,

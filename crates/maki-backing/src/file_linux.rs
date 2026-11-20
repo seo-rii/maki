@@ -720,7 +720,13 @@ impl Backing for FileBacking {
             }
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
             if name != c"." && name != c".." {
-                names.push(name.to_string_lossy().into_owned());
+                let name = name.to_str().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry name is not UTF-8",
+                    )
+                })?;
+                names.push(name.to_owned());
             }
         }
         names.sort();
