@@ -193,6 +193,8 @@ pub trait Backing: Send + Sync + 'static {
 
     fn remove(&self, path: &str) -> io::Result<()>;
 
+    /// Atomically rename a file. Directory moves are backend-specific;
+    /// portable callers must use file paths.
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
 
     fn create_dir_all(&self, path: &str) -> io::Result<()>;

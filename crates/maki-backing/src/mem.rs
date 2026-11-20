@@ -221,6 +221,12 @@ impl Backing for MemBacking {
         validate(to, false)?;
         let mut ns = self.ns.lock();
         ns.require_dir(parent(from))?;
+        if ns.dirs.contains(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory rename is unsupported",
+            ));
+        }
         ns.require_file_name(to)?;
         let data = ns
             .files
