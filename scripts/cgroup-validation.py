@@ -456,11 +456,18 @@ socket = "/case/control.sock"
             self.identifier = None
 
 
-def constrained_recovery(target, memory="32m", rounds=1):
+def require_memory_limits(resources, memory_mib):
+    expected = {"memory.max": str(memory_mib << 20), "memory.swap.max": "0"}
+    for field, limit in expected.items():
+        observed = resources.get(field)
+        ensure(observed == limit, f"expected {field}={limit}, observed {observed!r}")
+
+
+def constrained_recovery(target, memory_mib=32, rounds=1):
     """Report availability at the requested cap without relaxing durability."""
     with remove_after(target):
         try:
-            target.start(memory=memory)
+            target.start(memory=f"{memory_mib}m")
         except (TimeoutError, RuntimeError) as error:
             if target.identifier is None:
                 raise
@@ -475,16 +482,24 @@ def constrained_recovery(target, memory="32m", rounds=1):
                     if state["Running"]:
                         raise
                 else:
-                    return {"ready": False, "outcome": "startup-timeout", "deadline_seconds": 30,
+                    require_memory_limits(resources, memory_mib)
+                    return {"ready": False, "outcome": "startup-timeout", "limits_verified": True,
+                            "deadline_seconds": 30,
                             "resources": resources, "state_before_cleanup": state,
                             "cleanup_termination": termination}
             require_oom(state)
-            return {"ready": False, "outcome": "startup-oom", "termination": state}
+            # Docker can confirm OOM after the task exits, when its live
+            # cgroup limits can no longer be verified.
+            return {"ready": False, "outcome": "startup-oom", "limits_verified": False,
+                    "termination": state}
         else:
-            result = {"ready": True, "outcome": "verified", "verification": target.client("verify", rounds=rounds),
-                      "resources": target.stats()}
+            require_memory_limits(target.stats(), memory_mib)
+            verification = target.client("verify", rounds=rounds)
+            resources = target.stats()
+            require_memory_limits(resources, memory_mib)
             target.kill()
-            return result
+            return {"ready": True, "outcome": "verified", "limits_verified": True,
+                    "verification": verification, "resources": resources}
 
 
 def campaign(args):
@@ -509,6 +524,7 @@ def campaign(args):
                 target.start(memory="96m", cpus="0.25" if scenario == "cpu-memory-kill" else "1")
                 record["workload"] = target.client("write", rounds=args.rounds)
                 record["resources"] = target.stats()
+                require_memory_limits(record["resources"], 96)
                 if scenario == "cpu-memory-kill":
                     cpu = dict(line.split() for line in record["resources"]["cpu.stat"].splitlines())
                     ensure(int(cpu["nr_throttled"]) > 0, "no observed CPU throttling")
@@ -522,6 +538,7 @@ def campaign(args):
                     run(["docker", "update", "--memory", "32m", "--memory-swap", "32m", target.identifier])
                     ensure(target.state()["Running"], "limit shrink killed target before pressure I/O")
                     record["pressure_resources"] = target.stats()
+                    require_memory_limits(record["pressure_resources"], 32)
                     record["pressure_client"] = target.client("pressure", check=False)
                     record["pressure_progress"] = json.loads(target.ledger.with_name("pressure-progress.json").read_text())
                     require_pressure(record["pressure_progress"])
@@ -530,11 +547,12 @@ def campaign(args):
                 if scenario == "memory-oom":
                     # A safe recovery result is separate from availability at
                     # the original cap. Preserve both outcomes explicitly.
-                    memory = f"{args.recovery_memory_mib}m"
-                    record[f"recovery_at_{memory}"] = constrained_recovery(target, memory=memory, rounds=args.rounds)
+                    record[f"recovery_at_{args.recovery_memory_mib}m"] = constrained_recovery(
+                        target, memory_mib=args.recovery_memory_mib, rounds=args.rounds)
                 target.start()
                 record["recovery"] = target.client("verify", rounds=args.rounds + int(scenario == "freeze-resume"))
                 record["recovery_resources"] = target.stats()
+                require_memory_limits(record["recovery_resources"], 192)
                 target.kill()
                 target.remove()
                 # Offline format/CRC check complements authenticated NBD readback.

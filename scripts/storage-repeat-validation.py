@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Repeat existing Linux storage regressions using frozen source and binaries."""
 import argparse
+from contextlib import ExitStack
 import datetime
 import hashlib
 import json
@@ -382,30 +383,35 @@ def start(args):
         raise RuntimeError("at least 2 GiB of free space is required before building")
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = logs / f"maki-storage-{stamp}-{uuid.uuid4().hex[:6]}"
-    directory.mkdir(mode=0o700)
-    source = directory / "source"
-    source.mkdir(mode=0o700)
-    target = directory / "target"
-    target.mkdir(mode=0o700)
-    archive = directory / "source.tar"
-    snapshot.extract_revision(repo, revision, archive, source)
-    runner = directory / "runner.py"
-    shutil.copyfile(source / "scripts/storage-repeat-validation.py", runner)
-    runner.chmod(0o400)
-    save_json(directory / "config.json", {
-        "revision": revision, "source": str(source), "target_dir": str(target),
-        "build_dir": str(directory / "build"),
-        "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
-        "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-        "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
-        "profile": profile,
-        "suites": [suite for group in groups.values() for suite in group],
-        "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, text=True).strip(),
-    })
-    with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
-        process = subprocess.Popen([sys.executable, "-B", str(runner), "_published_worker", "--run-dir", str(directory)],
-                                   stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+    with ExitStack() as preparation:
+        directory.mkdir(mode=0o700)
+        preparation.callback(shutil.rmtree, directory)
+        source = directory / "source"
+        source.mkdir(mode=0o700)
+        target = directory / "target"
+        target.mkdir(mode=0o700)
+        archive = directory / "source.tar"
+        snapshot.extract_revision(repo, revision, archive, source)
+        runner = directory / "runner.py"
+        shutil.copyfile(source / "scripts/storage-repeat-validation.py", runner)
+        runner.chmod(0o400)
+        save_json(directory / "config.json", {
+            "revision": revision, "source": str(source), "target_dir": str(target),
+            "build_dir": str(directory / "build"),
+            "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
+            "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+            "profile": profile,
+            "suites": [suite for group in groups.values() for suite in group],
+            "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, text=True).strip(),
+        })
+        with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
+            process = subprocess.Popen([sys.executable, "-B", str(runner), "_published_worker", "--run-dir", str(directory)],
+                                       stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        # Once the worker exists, preserve its directory and let the
+        # publication gate below manage its lifetime.
+        preparation.pop_all()
     # The worker waits for this byte before spawning any build. A publication
     # failure or a controller crash closes the pipe without starting a campaign.
     try:

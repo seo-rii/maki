@@ -176,6 +176,29 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                     self.verify_events("cancel-start", ("attach-start", event), "inactive",
                                        states={"daemon": "active"}, resource=True)
 
+    def test_cancellation_waits_for_the_partial_attachment_before_stop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "cancel-start")
+            fixture.event(case.directory, "attach-start")
+            resource = case.directory / "resource"
+
+            def wait(condition, label):
+                if label == "partial attachment created":
+                    self.assertFalse(condition())
+                    resource.touch()
+                    self.assertFalse(condition())
+                    resource.write_bytes(b"owned")
+                self.assertTrue(condition())
+
+            def ctl(action, *_args):
+                if action == "stop":
+                    self.assertEqual(resource.read_bytes(), b"owned")
+
+            with (patch.object(case, "wait", side_effect=wait), patch.object(case, "ctl", side_effect=ctl),
+                  patch.object(case, "state", side_effect=lambda unit: "active" if unit == "daemon" else "inactive"),
+                  patch.object(fixture.time, "sleep")):
+                case.verify("cancel-start")
+
     def test_cancellation_waits_for_service_stop_jobs_before_checking_safety(self):
         for terminal_state in ("inactive", "failed"):
             with self.subTest(terminal_state=terminal_state), tempfile.TemporaryDirectory() as temporary:

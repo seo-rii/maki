@@ -133,9 +133,10 @@ class CycleBoundaryContracts(unittest.TestCase):
                  witness_service="active", graceful_stop_witness="absent")
             before = (client.writes, client.trims, client.flushes)
             with mock.patch.object(self.guest, "wait_for_reset") as wait_for_reset:
-                self.guest.execute_cycle(argparse.Namespace(
+                final = self.guest.execute_cycle(argparse.Namespace(
                     cycle=cycle, profile=profile, verify_only=verify_only, token=token), client, emit)
             if verify_only:
+                emit("verified", **final)  # This fixture completes the guest's final shutdown.
                 self.assertEqual((client.writes, client.trims, client.flushes), before)
                 wait_for_reset.assert_not_called()
             else:

@@ -246,16 +246,18 @@ def wait_for_reset():
 
 def execute_cycle(args, client, emit):
     profile = getattr(args, "profile", "v2")
+    if args.verify_only:
+        ensure(args.cycle > 0, "verify-only requires a prior generation")
     if args.cycle:
         generation = args.cycle - 1
         blocks = [client.read(offset_for_index(index)) for index in range(16)]
         field = {"manifest": manifest(generation, blocks)} if profile == "v3-discard" \
             else {"records": manifest(generation, blocks)}
         emit("readback", generation=generation, **field)
-        emit("verified", generation=generation, count=16)
-    if args.verify_only:
-        ensure(args.cycle > 0, "verify-only requires a prior generation")
-        return
+        verification = {"generation": generation, "count": len(blocks)}
+        if args.verify_only:
+            return verification  # Published after the final daemon shutdown.
+        emit("verified", **verification)
     mode = mode_for_cycle(args.cycle)
     if profile == "v3-discard":
         result = discard_barrier(client, args.cycle, mode, args.token)
@@ -287,7 +289,7 @@ def run_nbdkit(args, runtime):
     notify.bind(str(notify_path))
     notify.settimeout(0.2)
     environment = dict(os.environ, PATH=SYSTEM_PATH, NOTIFY_SOCKET=str(notify_path))
-    log = open(log_path, "xb")
+    log = open(log_path, "x+b")
     child = subprocess.Popen([args.nbdkit, "--exit-with-parent", "--threads", "4", "-U",
                               str(socket_path), "--filter=log", args.plugin, "config=" + args.config,
                               "logfile=" + str(runtime / "connections.log")],
@@ -315,17 +317,30 @@ def run_nbdkit(args, runtime):
         notify.close()
 
 
-def cleanup(child, log, client):
-    if client is not None:
-        client.close()
-    if child is not None and child.poll() is None:
-        child.terminate()
+def cleanup(child, log, client, *, require_clean=False):
+    try:
         try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
-    if log is not None:
+            if client is not None:
+                client.close()
+        finally:
+            status = child.poll()
+            if status is None:
+                child.terminate()
+                try:
+                    status = child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    status = child.wait(timeout=5)
+                    if require_clean:
+                        raise RuntimeError("nbdkit shutdown required SIGKILL")
+        if require_clean:
+            ensure(status == 0, f"nbdkit exited {status} during final verification")
+            # The nbdkit unload callback is void. The plugin also reports a
+            # failed final drain to stderr when the process itself exits zero.
+            log.seek(0)
+            ensure(not any(b"maki-nbdkit: shutdown during unload failed" in line for line in log),
+                   "maki-nbdkit reported a shutdown failure during final verification")
+    finally:
         log.close()
 
 
@@ -347,7 +362,6 @@ def main():
     ensure(1 <= args.ready_timeout <= 900, "invalid READY timeout")
     boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     ensure(BOOT_ID.fullmatch(boot_id) is not None, "invalid boot identity")
-    child = log = client = None
 
     def emit(event, **fields):
         frame = {"token": args.token, "cycle": args.cycle, "boot_id": boot_id,
@@ -370,23 +384,26 @@ def main():
         os.umask(0o077)
         runtime = pathlib.Path(tempfile.mkdtemp(prefix="maki-gcp-reset-", dir="/run"))
         child, log, socket_path = run_nbdkit(args, runtime)
-        client = Nbd(socket_path)
-        features = capabilities(client, args.profile)
-        require_native_fua(runtime)
-        emit("ready", provider=provider, config=str(config), native_fua=True,
-             kernel=os.uname().release, fs_uuid=fs_uuid, data_device=args.device_name, **features, **witness)
-        execute_cycle(args, client, emit)
+        client = None
+        completed = False
+        try:
+            client = Nbd(socket_path)
+            features = capabilities(client, args.profile)
+            require_native_fua(runtime)
+            emit("ready", provider=provider, config=str(config), native_fua=True,
+                 kernel=os.uname().release, fs_uuid=fs_uuid, data_device=args.device_name, **features, **witness)
+            final = execute_cycle(args, client, emit)
+            completed = True
+        finally:
+            cleanup(child, log, client, require_clean=completed and args.verify_only)
+        if args.verify_only:
+            emit("verified", **final)
     except BaseException as error:
         try:
             emit("error", message=f"{type(error).__name__}: {error}"[:2048])
         except BaseException:
             pass
         raise
-    finally:
-        # A successful write cycle never reaches here: only the external reset
-        # ends wait_for_reset. Final verify-only and pre-ACK failures clean up
-        # their process-local resources without touching the data mount.
-        cleanup(child, log, client)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ class GuestProviderContracts(unittest.TestCase):
         previous_umask = os.umask(0o077)
         self.addCleanup(os.umask, previous_umask)
 
-    def run_guest(self, text, *, profile="v2", verify_only=True, read_error=None):
+    def run_guest(self, text, *, profile="v2", verify_only=True, read_error=None, shutdown_error=None):
         self.config.write_bytes(text.encode() if isinstance(text, str) else text)
         client = mock.Mock(can_fua=True, can_flush=True, can_trim=profile == "v3-discard")
         client.read.side_effect = lambda offset: self.guest.payload(
@@ -92,7 +92,7 @@ class GuestProviderContracts(unittest.TestCase):
                 mock.sentinel.process, None, self.runtime / "nbd.sock")))
             stack.enter_context(mock.patch.object(self.guest, "Nbd", return_value=client))
             stack.enter_context(mock.patch.object(self.guest, "wait_for_reset"))
-            stack.enter_context(mock.patch.object(self.guest, "cleanup"))
+            stack.enter_context(mock.patch.object(self.guest, "cleanup", side_effect=shutdown_error))
             stack.enter_context(contextlib.redirect_stdout(stream))
             error = None
             try:
@@ -130,6 +130,11 @@ class GuestProviderContracts(unittest.TestCase):
                         self.assertEqual(ready["provider"], "local-aes-gcm-siv")
                         self.host.validate_ready(ready, None, profile)
                         self.assertEqual(events[-1]["event"], "verified" if verify_only else "ack")
+
+    def test_final_guest_emits_an_error_before_verified_if_shutdown_fails(self):
+        error, events, _, _ = self.run_guest(VALID_CONFIG, shutdown_error=RuntimeError("shutdown failed"))
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual([record["event"] for record in events], ["ready", "readback", "error"])
 
     def test_bom_does_not_admit_wrong_provider_or_malformed_config(self):
         marker = "synthetic-bom-private-marker"

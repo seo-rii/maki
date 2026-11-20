@@ -718,6 +718,33 @@ class GuestContracts(unittest.TestCase):
         self.guest = load("gcp_reset_guest", "gcp-reset-guest.py")
         self.host = load("gcp_reset_host_guest_test", "gcp-reset-validation.py")
 
+    def test_final_shutdown_checks_status_unload_errors_and_forced_kill(self):
+        for label, status, log_data, error in (
+                ("clean", 0, b"normal\n", None),
+                ("nonzero", 42, b"", "exited 42"),
+                ("unload", 0, b"maki-nbdkit: shutdown during unload failed: I/O error\n", "shutdown failure"),
+                ("timeout", -9, b"", "required SIGKILL")):
+            with self.subTest(label=label):
+                child, client = mock.Mock(), mock.Mock()
+                child.poll.return_value = None
+                child.wait.side_effect = ([subprocess.TimeoutExpired("nbdkit", 10), status]
+                                          if label == "timeout" else [status])
+                log = io.BytesIO()
+                log.write(log_data)
+                with mock.patch.object(self.guest.os, "killpg") as kill:
+                    if error:
+                        with self.assertRaisesRegex((RuntimeError, ValueError), error):
+                            self.guest.cleanup(child, log, client, require_clean=True)
+                    else:
+                        self.guest.cleanup(child, log, client, require_clean=True)
+                    if label == "timeout":
+                        kill.assert_called_once_with(child.pid, signal.SIGKILL)
+                        self.assertEqual(child.wait.call_count, 2)
+                    else:
+                        kill.assert_not_called()
+                self.assertTrue(log.closed)
+                client.close.assert_called_once_with()
+
     def test_missing_config_emits_an_identified_error_before_ready(self):
         token = "a" * 32
         boot_id = "12345678-1234-1234-1234-123456789abc"
@@ -833,11 +860,12 @@ class GuestContracts(unittest.TestCase):
                   for row in expected}
         client.read.side_effect = blocks.__getitem__
         args = argparse.Namespace(token="a" * 32, cycle=2, verify_only=True, profile="v3-discard")
-        self.guest.execute_cycle(args, client,
-                                 lambda event, **fields: events.append((event, fields)))
+        final = self.guest.execute_cycle(args, client,
+                                         lambda event, **fields: events.append((event, fields)))
+        self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], "readback")
         self.assertEqual(events[0][1]["manifest"], expected)
-        self.assertEqual(events[1], ("verified", {"generation": 1, "count": 16}))
+        self.assertEqual(final, {"generation": 1, "count": 16})
 
     def test_active_shutdown_witness_and_absent_ledger_are_required(self):
         path = pathlib.Path("/mnt/maki-data/graceful-stop.jsonl")
@@ -885,8 +913,9 @@ class GuestContracts(unittest.TestCase):
         client = mock.Mock()
         client.read.side_effect = lambda offset: self.guest.payload(2, self.guest.index_for_offset(offset), "a" * 32)
         args = argparse.Namespace(token="a" * 32, cycle=3, verify_only=True)
-        self.guest.execute_cycle(args, client, lambda event, **fields: events.append((event, fields)))
-        self.assertEqual([event for event, _ in events], ["readback", "verified"])
+        final = self.guest.execute_cycle(args, client, lambda event, **fields: events.append((event, fields)))
+        self.assertEqual([event for event, _ in events], ["readback"])
+        self.assertEqual(final, {"generation": 2, "count": 16})
 
 
 if __name__ == "__main__":
