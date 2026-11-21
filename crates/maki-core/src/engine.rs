@@ -1077,6 +1077,19 @@ impl Engine {
             .as_ref()
             .filter(|cache| !plain.is_empty() && cache.can_hold(unit_size));
 
+        // A whole decrypted unit is already an owned, zeroizing result.
+        if cache.is_none() && len as u64 == unit_size && first == last {
+            if let Some(buf) = plain.remove(&first) {
+                // Keep provider scratch capacity inside its original guard.
+                // The caller only needs the requested length.
+                return Ok(if buf.capacity() == len {
+                    buf
+                } else {
+                    buf.duplicate()
+                });
+            }
+        }
+
         let mut out = SecretBuffer::zeroed(len);
         let mut cursor = 0usize;
         for unit in first..=last {
