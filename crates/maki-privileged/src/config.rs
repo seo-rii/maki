@@ -118,6 +118,16 @@ impl AttachConfig {
                 "nbd_socket must end with a socket filename".into(),
             ));
         }
+        // These paths describe the Linux host even when rendering a plan elsewhere.
+        if request
+            .mountpoint
+            .strip_prefix(&request.nbd_socket)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        {
+            return Err(ConfigError::Invalid(
+                "mountpoint cannot be the nbd_socket path or a directory beneath it".into(),
+            ));
+        }
         #[cfg(target_os = "linux")]
         check_mountpoint_path(&request.mountpoint)?;
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
