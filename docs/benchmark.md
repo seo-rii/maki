@@ -77,7 +77,10 @@ The sweep uses live reads through the same engine and cache. It does not close
 and reopen the volume, bypass the cache, or qualify persistence after a crash or
 power loss. Those guarantees require separate recovery and durability campaigns.
 
-The oracle stores eight bytes per I/O slot, capped at 64 MiB (8,388,608 slots,
+Sequential phased runs allocate eight oracle bytes per reachable slot, up to
+the smaller of the working-set slot count and the operations per phase. Random
+and mixed workloads track the full working set. The working-set limit remains
+8,388,608 slots (64 MiB for a full oracle,
 or a 32 GiB working set for 4 KiB I/O). Larger working sets are rejected before
 backing creation. Only addresses with an outstanding job/result retain a lock,
 so lock metadata is bounded by concurrency (at most 256 entries).

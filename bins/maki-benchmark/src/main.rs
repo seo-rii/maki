@@ -5,6 +5,7 @@ mod latency;
 mod workload;
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use maki_format::error::FormatError;
@@ -17,7 +18,7 @@ const USAGE: &str = "usage: maki-benchmark [--destroy-data] [--json] [--fua] [--
 const MAX_OPERATIONS: u64 = 1_000_000_000;
 
 struct Options {
-    config_path: String,
+    config_path: PathBuf,
     destroy_data: bool,
     json: bool,
     fua: bool,
@@ -34,7 +35,7 @@ struct Options {
 fn parse_args() -> Result<Options, String> {
     let mut positional = Vec::new();
     let mut options = Options {
-        config_path: String::new(),
+        config_path: PathBuf::new(),
         destroy_data: false,
         json: false,
         fua: false,
@@ -49,7 +50,7 @@ fn parse_args() -> Result<Options, String> {
     };
     let mut literal = false;
     let mut seen = std::collections::HashSet::new();
-    let mut arguments = std::env::args().skip(1);
+    let mut arguments = std::env::args_os().skip(1);
     while let Some(argument) = arguments.next() {
         if literal {
             positional.push(argument);
@@ -59,10 +60,13 @@ fn parse_args() -> Result<Options, String> {
             literal = true;
             continue;
         }
-        if !argument.starts_with('-') {
+        if !argument.as_encoded_bytes().starts_with(b"-") {
             positional.push(argument);
             continue;
         }
+        let argument = argument
+            .into_string()
+            .map_err(|_| "option name must be UTF-8")?;
         if !seen.insert(argument.clone()) {
             return Err(format!("duplicate option: {argument}"));
         }
@@ -74,8 +78,11 @@ fn parse_args() -> Result<Options, String> {
             | "--seed" => {
                 let value = arguments
                     .next()
-                    .filter(|value| !value.starts_with('-'))
+                    .filter(|value| !value.as_encoded_bytes().starts_with(b"-"))
                     .ok_or_else(|| format!("missing value for {argument}"))?;
+                let value = value
+                    .into_string()
+                    .map_err(|_| format!("invalid value for {argument}"))?;
                 match argument.as_str() {
                     "--concurrency" => {
                         options.concurrency =
@@ -129,6 +136,8 @@ fn parse_args() -> Result<Options, String> {
     }
     if let Some(ops) = positional.get(1) {
         options.ops = ops
+            .to_str()
+            .ok_or("ops must be a positive integer")?
             .parse::<u64>()
             .map_err(|_| "ops must be a positive integer")?;
     }
@@ -137,10 +146,12 @@ fn parse_args() -> Result<Options, String> {
     }
     if let Some(size) = positional.get(2) {
         options.io_size = size
+            .to_str()
+            .ok_or("io-size must be a positive integer")?
             .parse::<usize>()
             .map_err(|_| "io-size must be a positive integer")?;
     }
-    options.config_path = positional.remove(0);
+    options.config_path = positional.remove(0).into();
     Ok(options)
 }
 
@@ -190,8 +201,14 @@ struct Report {
 
 fn main() -> ExitCode {
     maki_core::logging::install_default_logging();
-    if std::env::args().len() == 2
-        && matches!(std::env::args().nth(1).as_deref(), Some("--help" | "-h"))
+    if std::env::args_os().len() == 2
+        && matches!(
+            std::env::args_os()
+                .nth(1)
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("--help" | "-h")
+        )
     {
         println!("{USAGE}\nOverwrites a disposable volume; reports verified I/O and latency.");
         return ExitCode::SUCCESS;
@@ -206,7 +223,7 @@ fn main() -> ExitCode {
     let raw = match std::fs::read_to_string(&options.config_path) {
         Ok(raw) => raw,
         Err(error) => {
-            eprintln!("error: {}: {error}", options.config_path);
+            eprintln!("error: {}: {error}", options.config_path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -275,7 +292,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "error: {} names an existing volume; the benchmark overwrites its \
                  data. Pass --destroy-data to run it anyway.",
-                options.config_path
+                options.config_path.display()
             );
             return ExitCode::from(2);
         }
@@ -307,7 +324,8 @@ fn main() -> ExitCode {
         let measured = workload::run(engine, &options, working_set_bytes).await?;
         // Each recorded read has already passed the workload's comparison.
         // Keep the measured-read verdict separate from the final sweep.
-        let verified_read_operations = measured.reads.report().samples;
+        let read = OperationReport::new(measured.read_elapsed, io_size, &measured.reads);
+        let verified_read_operations = read.latency.samples;
         Ok(Report {
             schema_version: 1,
             provider: config.crypto.provider.clone(),
@@ -324,7 +342,7 @@ fn main() -> ExitCode {
             verified_read_operations,
             flush_us: measured.final_flush_us,
             write: OperationReport::new(measured.write_elapsed, io_size, &measured.writes),
-            read: OperationReport::new(measured.read_elapsed, io_size, &measured.reads),
+            read,
             flush: OperationReport::new(measured.elapsed, 0, &measured.flushes),
             workload: workload::Description {
                 mode: if options.read_percent.is_some() {

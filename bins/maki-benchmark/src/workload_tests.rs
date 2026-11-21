@@ -201,7 +201,7 @@ async fn mixed_final_verification_checks_the_last_write_without_a_later_measured
 
 fn options() -> Options {
     Options {
-        config_path: String::new(),
+        config_path: Default::default(),
         destroy_data: false,
         json: true,
         fua: false,
@@ -385,19 +385,18 @@ async fn rejected_write_does_not_advance_expected_generation() {
 }
 
 #[test]
-fn final_sweep_bounds_follow_the_initialized_address_range() {
-    let oracle = Oracle::new(32).unwrap();
+fn oracle_tracks_the_initialized_address_range() {
     let mut options = options();
     for (ops, expected) in [(1, 1), (32, 32), (48, 32)] {
         options.ops = ops;
-        assert_eq!(oracle.final_sweep_states(&options).len(), expected);
+        assert_eq!(Oracle::tracked_slots(32, &options), expected);
     }
     options.ops = 1;
     options.random = true;
-    assert_eq!(oracle.final_sweep_states(&options).len(), 32);
+    assert_eq!(Oracle::tracked_slots(32, &options), 32);
     options.random = false;
     options.read_percent = Some(100);
-    assert_eq!(oracle.final_sweep_states(&options).len(), 32);
+    assert_eq!(Oracle::tracked_slots(32, &options), 32);
 }
 
 #[test]
@@ -432,4 +431,28 @@ fn payload_distinguishes_every_crypto_unit_in_a_large_request() {
         .iter()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(units.len(), 4);
+}
+
+#[tokio::test]
+async fn a_serial_phase_polls_the_engine_in_its_first_poll() {
+    let (engine, _) = fixture().await;
+    let mut options = options();
+    options.concurrency = 1;
+    let oracle = Arc::new(Oracle::new(options.ops).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    let mut writes = std::pin::pin!(phase(
+        &engine,
+        &options,
+        options.ops,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending.peak.load(Ordering::SeqCst), 1);
+    writes.await.unwrap();
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
 }

@@ -234,7 +234,7 @@ fn mixed_coverage_reports_the_sequential_address_and_ratio_correlation() {
 
 #[test]
 fn phased_final_sweep_only_visits_written_slots_in_a_sparse_working_set() {
-    for (access, written) in [("sequential", 32), ("random", 30)] {
+    for (access, written, tracked) in [("sequential", 32, 32), ("random", 30, 256)] {
         let (_directory, config) = fixture();
         let output = run(
             &config,
@@ -267,7 +267,7 @@ fn phased_final_sweep_only_visits_written_slots_in_a_sparse_working_set() {
         ] {
             assert_eq!(report["verification"][field], written, "{access}: {field}");
         }
-        assert_eq!(report["resources"]["oracle_generation_bytes"], 256 * 8);
+        assert_eq!(report["resources"]["oracle_generation_bytes"], tracked * 8);
     }
 }
 
@@ -327,5 +327,26 @@ fn entirely_read_or_write_mixed_workloads_have_finite_empty_operation_reports() 
         );
         assert_eq!(report["verification"]["read_after_write_verified_slots"], 0);
         assert_eq!(report["verification"]["final_sweep_verified_slots"], 32);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn benchmarks_accept_a_non_unicode_configuration_path() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let (directory, config) = fixture();
+    let alias = directory
+        .path()
+        .join(OsStr::from_bytes(b"config-\xff.toml"));
+    std::fs::rename(config, &alias).unwrap();
+    for flags in [vec!["--json"], vec!["--destroy-data", "--json"]] {
+        let output = run(&alias, &flags);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["read_verified"], true);
     }
 }
