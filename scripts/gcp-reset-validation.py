@@ -222,12 +222,12 @@ def bounded_run(command, timeout, *, include_stdout_on_error=False):
                         except ProcessLookupError:
                             pass
                         leader_exited = True
-                if leader_exited and not selector.get_map():
-                    break
                 remaining = until - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, timeout,
                                                     output=bytes(stdout), stderr=bytes(stderr))
+                if leader_exited and not selector.get_map():
+                    break
                 for key, _ in selector.select(min(.05, remaining)):
                     chunk = os.read(key.fd, 65536)
                     if not chunk:

@@ -131,6 +131,16 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "daemon stopped before"):
             self.verify_events("normal-stop", (*prefix, "daemon-stop", "cleanup-complete"), "inactive")
 
+    def test_workload_requires_readiness_from_its_own_attachment(self):
+        for trace in (
+            ("attach-start", "cleanup-recover", "cleanup-complete",
+             "attach-start", "workload-start", "attach-ready"),
+            ("attach-start", "attach-ready", "cleanup-recover", "cleanup-complete",
+             "attach-start", "workload-start"),
+        ):
+            with self.subTest(trace=trace), self.assertRaisesRegex(AssertionError, "workload.*ready"):
+                self.verify_events("exit-once", trace, "active")
+
     def test_normal_stop_waits_for_the_actual_daemon_shutdown(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("normal-stop", (
