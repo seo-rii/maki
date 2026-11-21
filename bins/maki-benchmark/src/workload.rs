@@ -182,7 +182,8 @@ async fn phase(
         let mut jobs = JoinSet::new();
         // Only addresses with an outstanding job/result need a sequencer.
         // The map therefore contains at most `concurrency` entries.
-        let mut sequencers: HashMap<u64, (Arc<tokio::sync::Mutex<()>>, usize)> = HashMap::new();
+        // With a single worker, each result is joined before the next submission.
+        let mut sequencers = (options.concurrency > 1).then(HashMap::new);
         let mut next = first;
         while next < end || !jobs.is_empty() {
             while next < end && jobs.len() < options.concurrency {
@@ -208,11 +209,15 @@ async fn phase(
                 // Acquire in submission order, before spawning. Keeping the
                 // guard through I/O and the oracle update serializes an
                 // address's reads/writes even if task scheduling reorders.
-                let (lock, outstanding) = sequencers
-                    .entry(slot)
-                    .or_insert_with(|| (Arc::new(tokio::sync::Mutex::new(())), 0));
-                *outstanding += 1;
-                let sequence = lock.clone().lock_owned().await;
+                let sequence = if let Some(sequencers) = &mut sequencers {
+                    let (lock, outstanding) = sequencers
+                        .entry(slot)
+                        .or_insert_with(|| (Arc::new(tokio::sync::Mutex::new(())), 0usize));
+                    *outstanding += 1;
+                    Some(lock.clone().lock_owned().await)
+                } else {
+                    None
+                };
                 let oracle = oracle.clone();
                 let pending = pending.clone();
                 jobs.spawn(async move {
@@ -255,10 +260,12 @@ async fn phase(
                 .map_err(|error| format!("I/O worker failed: {error}"))??;
             // Earlier completed results can share their address with newer
             // tasks or results; retain their common lock until all are joined.
-            let outstanding = &mut sequencers.get_mut(&slot).expect("submitted address").1;
-            *outstanding -= 1;
-            if *outstanding == 0 {
-                sequencers.remove(&slot);
+            if let Some(sequencers) = &mut sequencers {
+                let outstanding = &mut sequencers.get_mut(&slot).expect("submitted address").1;
+                *outstanding -= 1;
+                if *outstanding == 0 {
+                    sequencers.remove(&slot);
+                }
             }
             if read {
                 samples.reads.record(elapsed);
