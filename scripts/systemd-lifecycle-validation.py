@@ -42,12 +42,14 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def unit_argument(value):
+def unit_argument(value, *, executable=False):
     value = str(value)
     if any(ord(character) < 32 for character in value):
         raise ValueError("control character in unit argument")
+    if not executable:
+        value = value.replace("$", "$$")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace(
-        "%", "%%").replace("$", "$$") + '"'
+        "%", "%%") + '"'
 
 
 def names(volume):
@@ -80,8 +82,8 @@ def packaged_unit_section(template, volume):
 
 def fixture_units(volume, directory, helper):
     units = names(volume)
-    actor_command = " ".join(unit_argument(argument) for argument in
-                             (sys.executable, Path(__file__).resolve(), "actor", directory))
+    actor_command = " ".join((unit_argument(sys.executable, executable=True),
+                              unit_argument(Path(__file__).resolve()), unit_argument("actor"), unit_argument(directory)))
     daemon = packaged_unit_section("maki@.service", volume)
     daemon += ("\n[Service]\nType=notify\nNotifyAccess=main\n"
                "TimeoutStartSec=3\nTimeoutStopSec=3\n"
@@ -105,7 +107,7 @@ def fixture_units(volume, directory, helper):
              if line.startswith("ExecStopPost=")]
     if hooks != ["ExecStopPost=/usr/bin/maki-attach recover-failed-start --volume %i"]:
         raise ValueError("unexpected failed-start hook contract")
-    attach += hooks[0].replace("%i", volume).replace("/usr/bin/maki-attach", unit_argument(helper)) + "\n"
+    attach += hooks[0].replace("%i", volume).replace("/usr/bin/maki-attach", unit_argument(helper, executable=True)) + "\n"
     recovery = packaged_unit_section("maki-recover@.service", volume)
     recovery += ("JobTimeoutSec=12\n\n[Service]\nType=oneshot\nTimeoutStartSec=3\n"
                  f"ExecStart={actor_command} cleanup-recover\n")

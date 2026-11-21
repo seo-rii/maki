@@ -51,6 +51,15 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                     self.verify_events(mode, (*base, *suffix), "inactive",
                                        states={"recovery": "failed"}, resource=True)
 
+    def test_command_name_preserves_dollar_while_arguments_are_escaped(self):
+        volume = "mkci_dollar"
+        with patch.object(fixture.sys, "executable", "/tmp/python$build"):
+            units = fixture.fixture_units(volume, Path("/tmp/dir$build"), Path("/tmp/helper$build"))
+        attach = units[fixture.names(volume)["attach"]]
+        self.assertIn('ExecStopPost="/tmp/helper$build"', attach)
+        self.assertIn('ExecStart="/tmp/python$build"', attach)
+        self.assertIn('"/tmp/dir$$build" attach', attach)
+
     def test_partial_event_fails_both_the_writer_and_final_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "normal-stop")
