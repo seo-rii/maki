@@ -89,6 +89,23 @@ async fn trim_preserves_partial_unit_edges_and_survives_fua_crash() {
 }
 
 #[tokio::test]
+async fn trim_reads_each_checkpointed_slot_header_once() {
+    let (backing, engine) = fixture(true).await;
+    engine.stop_checkpoint_worker().await;
+    engine.write(0, &[0x31; 4096], true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+
+    let before = backing.read_bytes();
+    engine.trim(0, 4096, false).await.unwrap();
+    assert_eq!(backing.read_bytes() - before, 4 * 64);
+
+    let after = backing.read_bytes();
+    engine.trim(0, 4096, false).await.unwrap();
+    assert_eq!(backing.read_bytes(), after);
+    assert_eq!(engine.read(0, 4096).await.unwrap(), vec![0; 4096]);
+}
+
+#[tokio::test]
 async fn trimming_unwritten_units_and_partial_edges_does_not_append() {
     let (_backing, engine) = fixture(true).await;
     engine.trim(0, 16 * 1024, true).await.unwrap();

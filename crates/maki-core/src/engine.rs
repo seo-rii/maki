@@ -49,7 +49,7 @@ use maki_format::{layout, FormatError};
 
 use crate::error::CoreError;
 use crate::recovery::RecoveryError;
-use crate::volume::{Volume, VolumeOptions};
+use crate::volume::{DiscardProbe, Volume, VolumeOptions};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttachError {
@@ -1077,6 +1077,19 @@ impl Engine {
             .as_ref()
             .filter(|cache| !plain.is_empty() && cache.can_hold(unit_size));
 
+        // A whole decrypted unit is already an owned, zeroizing result.
+        if cache.is_none() && len as u64 == unit_size && first == last {
+            if let Some(buf) = plain.remove(&first) {
+                // Keep provider scratch capacity inside its original guard.
+                // The caller only needs the requested length.
+                return Ok(if buf.capacity() == len {
+                    buf
+                } else {
+                    buf.duplicate()
+                });
+            }
+        }
+
         let mut out = SecretBuffer::zeroed(len);
         let mut cursor = 0usize;
         for unit in first..=last {
@@ -1403,14 +1416,20 @@ impl Engine {
         // is never read, and a damaged unit is retired by its tombstone
         // instead of failing the discard with EIO (R5-012).
         let mut filtered = Vec::new();
+        let mut recheck = false;
         let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
             for ct in cts {
-                if !volume.reclaim_unwritten(ct.unit_index)? {
-                    filtered.push(CiphertextUnit {
-                        unit_index: ct.unit_index,
-                        data: Vec::new(),
-                    });
+                match volume.reclaim_unwritten(ct.unit_index)? {
+                    DiscardProbe::Unwritten => continue,
+                    DiscardProbe::Written => {}
+                    // A transient read failure may have hidden a hole. Retry
+                    // classification on this batch before publishing its records.
+                    DiscardProbe::Unreadable => recheck = true,
                 }
+                filtered.push(CiphertextUnit {
+                    unit_index: ct.unit_index,
+                    data: Vec::new(),
+                });
             }
             filtered.as_slice()
         } else {
@@ -1431,7 +1450,12 @@ impl Engine {
                 self.inner.sync_journal(volume)?;
             }
             if ct.data.is_empty() {
-                volume.discard_ct(ct.unit_index, false)?;
+                if recheck {
+                    volume.discard_ct(ct.unit_index, false)?;
+                } else {
+                    volume.check_freshness()?;
+                    volume.append_discard(ct.unit_index, false)?;
+                }
             } else {
                 volume.write_ct(ct.unit_index, &ct.data, false)?;
             }

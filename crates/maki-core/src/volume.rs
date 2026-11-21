@@ -39,6 +39,13 @@ impl Default for VolumeOptions {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DiscardProbe {
+    Unwritten,
+    Written,
+    Unreadable,
+}
+
 pub struct Volume {
     backing: Arc<dyn Backing>,
     _lock: Box<dyn VolumeLock>,
@@ -395,11 +402,18 @@ impl Volume {
                 self.sanitize();
                 return Ok(sequence);
             }
-        } else if self.reclaim_unwritten(unit)? {
+        } else if self.reclaim_unwritten(unit)? == DiscardProbe::Unwritten {
             // Only a header proving the unit unwritten skips the tombstone;
             // a damaged slot is retired by one rather than refused (R5-012).
             return Ok(self.journal.appended_sequence());
         }
+        self.append_discard(unit, fua)
+    }
+
+    /// Journal a tombstone for a v3 unit already checked for reclamation.
+    /// The caller must check freshness and hold the same exclusive volume
+    /// lock from classification through append.
+    pub(crate) fn append_discard(&mut self, unit: u64, fua: bool) -> Result<u64, CoreError> {
         if self.journal.next_sequence() == u64::MAX {
             return Err(CoreError::Corrupt("journal sequence exhausted".into()));
         }
@@ -426,16 +440,23 @@ impl Volume {
     /// release hint. A volatile overlay tombstone must not expose the older
     /// durable write's reservation to reclamation. Header errors still take
     /// the normal tombstone path so damaged units can be retired (R5-012).
-    pub(crate) fn reclaim_unwritten(&mut self, unit: u64) -> Result<bool, CoreError> {
+    pub(crate) fn reclaim_unwritten(&mut self, unit: u64) -> Result<DiscardProbe, CoreError> {
         self.check_freshness()?;
         if let Some(version) = self.overlay.get(unit) {
-            return Ok(version.ciphertext.is_empty());
+            return Ok(if version.ciphertext.is_empty() {
+                DiscardProbe::Unwritten
+            } else {
+                DiscardProbe::Written
+            });
         }
-        if !matches!(self.store.slot_sequence(unit), Ok(None)) {
-            return Ok(false);
+        match self.store.slot_sequence(unit) {
+            Ok(Some(_)) => Ok(DiscardProbe::Written),
+            Err(_) => Ok(DiscardProbe::Unreadable),
+            Ok(None) => {
+                self.store.reclaim_unwritten(unit)?;
+                Ok(DiscardProbe::Unwritten)
+            }
         }
-        self.store.reclaim_unwritten(unit)?;
-        Ok(true)
     }
 
     /// FLUSH barrier (SPEC §25): everything appended becomes durable.
@@ -918,7 +939,7 @@ mod zero_trim_freshness_tests {
     use maki_backing::{Backing, BackingFile, MemBacking, VolumeLock};
     use maki_format::{geometry::Geometry, init, superblock::Superblock};
 
-    use super::{Volume, VolumeOptions};
+    use super::{DiscardProbe, Volume, VolumeOptions};
 
     #[derive(Default)]
     struct FreshnessGate {
@@ -991,7 +1012,10 @@ mod zero_trim_freshness_tests {
         let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
         volume.write_ct(0, &[0x41; 520], true).unwrap();
         volume.discard_ct(0, false).unwrap();
-        assert!(volume.reclaim_unwritten(0).unwrap());
+        assert_eq!(
+            volume.reclaim_unwritten(0).unwrap(),
+            DiscardProbe::Unwritten
+        );
 
         // The engine's initial guard may pass before a request waits for its
         // unit locks. The zero-only publication path must check again even
