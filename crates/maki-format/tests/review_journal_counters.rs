@@ -13,6 +13,7 @@ fn record(sequence: u64) -> Vec<u8> {
         unit_index: 7,
         payload: vec![42; 8],
     })
+    .unwrap()
 }
 
 #[test]

@@ -159,7 +159,8 @@ fn distinct_recovery_allocations(records: u64) -> Allocations {
             sequence,
             unit_index: sequence - 1,
             payload: vec![sequence as u8; 4096],
-        });
+        })
+        .unwrap();
         file.write_at(position, &bytes).unwrap();
         position += bytes.len() as u64;
     }
@@ -264,7 +265,8 @@ fn covered_scan_allocations(records: u64) -> Allocations {
             sequence,
             unit_index: 0,
             payload: vec![sequence as u8; 4096],
-        });
+        })
+        .unwrap();
         file.write_at(position, &record).unwrap();
         position += record.len() as u64;
     }
@@ -310,7 +312,8 @@ fn overwrite_fixture(records: u64) -> Fixture {
             sequence,
             unit_index: (sequence - 1) % 4,
             payload: vec![sequence as u8; 4096],
-        });
+        })
+        .unwrap();
         file.write_at(position, &bytes).unwrap();
         position += bytes.len() as u64;
     }
@@ -551,7 +554,8 @@ fn a_geometry_oversized_record_is_checked_without_allocating_its_payload() {
             sequence: 1,
             unit_index: 0,
             payload: vec![5; 1 << 20],
-        });
+        })
+        .unwrap();
         if !intact {
             *body.last_mut().unwrap() ^= 1;
         }
@@ -580,6 +584,7 @@ fn record(sequence: u64) -> Vec<u8> {
         unit_index: 0,
         payload: vec![sequence as u8; 512],
     })
+    .unwrap()
 }
 
 #[test]
@@ -619,11 +624,14 @@ fn streaming_scan_matches_the_format_scanner_at_tail_and_durability_boundaries()
     let header_crc = crc32fast::hash(&impossible_length[..28]);
     impossible_length[28..32].copy_from_slice(&header_crc.to_le_bytes());
     cases.push(impossible_length);
-    cases.push(encode_record(&JournalRecord {
-        sequence: 1,
-        unit_index: 0,
-        payload: Vec::new(),
-    }));
+    cases.push(
+        encode_record(&JournalRecord {
+            sequence: 1,
+            unit_index: 0,
+            payload: Vec::new(),
+        })
+        .unwrap(),
+    );
 
     for (case, body) in cases.iter().enumerate() {
         for durable in [None, Some(0), Some(body.len() / 2), Some(body.len())] {

@@ -13,8 +13,9 @@ use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_ST
 use maki_format::error::FormatError;
 use maki_format::geometry::Geometry;
 use maki_format::journal::{
-    encode_record, max_segment_file_size, scan_segment_bounded, DurableMark, JournalRecord,
-    ScanOutcome, DURABLE_MARK_SIZE, MAX_PAYLOAD, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE,
+    encode_record, encode_record_parts, max_segment_file_size, scan_segment_bounded, DurableMark,
+    JournalRecord, ScanOutcome, DURABLE_MARK_SIZE, MAX_PAYLOAD, RECORD_HEADER_SIZE,
+    SEGMENT_HEADER_SIZE,
 };
 use maki_format::superblock::Superblock;
 use maki_format::{init, layout};
@@ -40,6 +41,34 @@ fn rec(seq: u64, fill: u8, len: usize) -> Vec<u8> {
         unit_index: seq * 3,
         payload: vec![fill; len],
     })
+    .unwrap()
+}
+
+#[test]
+fn journal_encoders_enforce_the_scanners_payload_limit() {
+    let mut record = JournalRecord {
+        sequence: 1,
+        unit_index: 7,
+        payload: vec![3; MAX_PAYLOAD as usize],
+    };
+    for len in [0, MAX_PAYLOAD as usize - 1, MAX_PAYLOAD as usize] {
+        let bytes = encode_record_parts(record.sequence, record.unit_index, &record.payload[..len])
+            .unwrap();
+        let (decoded, outcome) = scan_segment_bounded(&bytes, 1, Some(bytes.len()));
+        assert_eq!(outcome, ScanOutcome::Clean);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload, record.payload[..len]);
+    }
+    assert!(encode_record(&record).is_ok());
+    record.payload.push(3);
+    assert!(matches!(
+        encode_record(&record),
+        Err(FormatError::Invalid(_))
+    ));
+    assert!(matches!(
+        encode_record_parts(record.sequence, record.unit_index, &record.payload),
+        Err(FormatError::Invalid(_))
+    ));
 }
 
 // ---------- durable mark ----------

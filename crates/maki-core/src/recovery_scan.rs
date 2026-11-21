@@ -372,7 +372,8 @@ mod tests {
             sequence: 1,
             unit_index: 0,
             payload: vec![7; 512],
-        });
+        })
+        .unwrap();
         body[RECORD_HEADER_SIZE] ^= 1;
         body.resize(READ_CHUNK * 2 + 17, 1);
         let mut bytes = header.to_vec();
@@ -404,6 +405,7 @@ mod tests {
             unit_index: sequence - 1,
             payload: vec![sequence as u8; 512],
         })
+        .unwrap()
     }
 
     fn scan_required_boundary(
@@ -514,11 +516,14 @@ mod tests {
     #[test]
     fn required_boundary_still_checks_the_required_records_geometry() {
         let mut body = boundary_record(1);
-        body.extend(encode_record(&JournalRecord {
-            sequence: 2,
-            unit_index: u64::MAX,
-            payload: vec![2; 512],
-        }));
+        body.extend(
+            encode_record(&JournalRecord {
+                sequence: 2,
+                unit_index: u64::MAX,
+                payload: vec![2; 512],
+            })
+            .unwrap(),
+        );
         assert!(matches!(
             scan_required_boundary(&body, Some((2, body.len() as u64))),
             Err(RecoveryError::Corrupt(_))

@@ -232,7 +232,8 @@ fn journal_scanner_never_panics_and_never_accepts_a_corrupt_durable_prefix() {
                 sequence: 10 + seq,
                 unit_index: seq * 3,
                 payload,
-            });
+            })
+            .unwrap();
             lengths.push(rec.len());
             body.extend(rec);
         }
