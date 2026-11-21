@@ -372,10 +372,16 @@ class Fixture:
         elif mode in ("exit-once", "timeout-once", "kill-once"):
             self.wait(lambda: self.count("attach-ready") == 1 and self.count("workload-start") == 1
                       and self.state("target") == "active", "failed target start recovered")
+            require(self.state("daemon") == "active", "recovered workload lost its daemon")
             require(self.count("attach-start") == 2, "unexpected attach attempt count")
             require(self.count("cleanup-recover") == 1, "failed start did not recover exactly once")
         elif mode in ("cleanup-failure", "foreign-resource"):
             self.wait(lambda: self.state("recovery") == "failed", "coordinator refusal")
+            events = [record["event"] for record in self.events()]
+            refusal = "foreign-resource-preserved" if mode == "foreign-resource" else "cleanup-refused"
+            require(events.count("cleanup-recover") == 1 and
+                    refusal in events[events.index("cleanup-recover") + 1:],
+                    "recovery did not reject cleanup for the expected reason")
             time.sleep(0.5)
             require(self.count("attach-start") == 1, "failed cleanup allowed a new attach")
             require(self.count("workload-start") == 0, "failed cleanup started the workload")
@@ -459,6 +465,7 @@ class Fixture:
                 require(attachment == "starting", "attachment became ready outside a start attempt")
                 attachment = "ready"
             elif name == "workload-start":
+                require(daemon == "ready", "workload started without a ready daemon")
                 require(attachment == "ready", "workload started before its attachment was ready")
             elif name == "cleanup-complete":
                 attachment = "absent"
