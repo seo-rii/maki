@@ -101,3 +101,17 @@ fn rollback_capacity_must_cover_progress_reserves() {
     assert!(message.contains("exceed"), "unexpected error: {message}");
     assert!(message.contains("reserve"), "unexpected error: {message}");
 }
+
+#[test]
+fn rollback_compares_resolved_root_paths() {
+    let mut cfg = parse_config(&config(
+        "[backing.rollback_protection]\nwitness_root = \"/var/lib/maki/rollback/../other\"\ncapacity = \"64MiB\"",
+    )).unwrap();
+    cfg.validate().unwrap();
+    cfg.backing
+        .rollback_protection
+        .as_mut()
+        .unwrap()
+        .witness_root = "/var/lib/maki/else/../rollback".into();
+    assert!(cfg.validate().unwrap_err().to_string().contains("distinct"));
+}

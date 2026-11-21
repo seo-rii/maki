@@ -213,6 +213,8 @@ struct State {
     reserved_pages: u64,
     entries: BTreeMap<String, Entry>,
     files: BTreeMap<u64, Node>,
+    // Only these working nodes can differ from an existing committed node.
+    possibly_dirty: BTreeSet<u64>,
     handles: BTreeMap<u64, usize>,
     // Identities with neither a working nor a committed name. They become
     // reclaimable at last close. Unlink or replacement can invalidate this set.
@@ -514,6 +516,7 @@ impl RollbackBacking {
                 arena,
                 witness,
                 _disk_lock: disk_lock,
+                possibly_dirty: BTreeSet::new(),
                 handles: BTreeMap::new(),
                 unlinked_files: None,
                 locks: BTreeSet::new(),
@@ -707,6 +710,7 @@ impl State {
         self.committed = candidate;
         self.manifest_slot = slot;
         self.files.retain(|id, _| retain.contains(id));
+        self.possibly_dirty.retain(|id| retain.contains(id));
         self.committed_slots = slots_of(self.committed.files.values());
         self.used_slots = None;
         Ok(())
@@ -733,7 +737,10 @@ impl State {
         };
         if covered(self.committed.files.get(&id)) && covered(self.files.get(&id)) {
             let node = self.files.get_mut(&id).ok_or_else(missing)?;
-            node.len = node.len.max(end);
+            if node.len < end {
+                node.len = end;
+                self.possibly_dirty.insert(id);
+            }
             return Ok(());
         }
         self.reclaim_closed_files()?;
@@ -756,6 +763,7 @@ impl State {
         let node = self.files.get_mut(&id).ok_or_else(missing)?;
         node.reserved.extend(range);
         node.len = node.len.max(end);
+        self.possibly_dirty.insert(id);
         Ok(())
     }
 
@@ -831,6 +839,7 @@ impl State {
             self.poisoned = true;
             return Err(error);
         }
+        self.possibly_dirty.insert(id);
         self.files.get_mut(&id).ok_or_else(missing)?.pages.insert(
             index,
             PageRef {
@@ -943,8 +952,12 @@ impl BackingFile for CowFile {
         let mut state = self.state.lock();
         state.check()?;
         let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
-        if len >= node.len {
+        if len == node.len {
+            return Ok(());
+        }
+        if len > node.len {
             node.len = len;
+            state.possibly_dirty.insert(self.id);
             return Ok(());
         }
         let tail = state.page_ref(self.id, len / PAGE)?;
@@ -957,6 +970,7 @@ impl BackingFile for CowFile {
         node.len = len;
         node.pages.retain(|index, _| *index < len.div_ceil(PAGE));
         node.reserved.retain(|index| *index < len.div_ceil(PAGE));
+        state.possibly_dirty.insert(self.id);
         // Dropped pages may free slots.
         state.used_slots = None;
         Ok(())
@@ -994,13 +1008,16 @@ impl BackingFile for CowFile {
                 let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
                 node.pages.remove(&index);
                 node.reserved.remove(&index);
+                state.possibly_dirty.insert(self.id);
                 state.used_slots = None;
             } else if let Some(page) = state.page_ref(self.id, index)? {
                 let mut bytes = state.page(Some(page))?;
                 let from = offset.saturating_sub(page_start) as usize;
                 let to = (visible_end - page_start).min(PAGE) as usize;
-                bytes[from..to].fill(0);
-                state.write_page(self.id, index, &bytes)?;
+                if bytes[from..to].iter().any(|&byte| byte != 0) {
+                    bytes[from..to].fill(0);
+                    state.write_page(self.id, index, &bytes)?;
+                }
             }
             next = index + 1;
         }
@@ -1018,12 +1035,20 @@ impl BackingFile for CowFile {
         let mut state = self.state.lock();
         state.check()?;
         let node = state.files.get(&self.id).ok_or_else(missing)?;
-        if state.committed.files.get(&self.id) == Some(node) {
+        if state
+            .committed
+            .files
+            .get(&self.id)
+            .is_some_and(|durable| !state.possibly_dirty.contains(&self.id) || durable == node)
+        {
+            state.possibly_dirty.remove(&self.id);
             return state.reclaim_closed_files();
         }
         let mut candidate = state.committed.clone();
         candidate.files.insert(self.id, node.clone());
-        state.commit(candidate)
+        state.commit(candidate)?;
+        state.possibly_dirty.remove(&self.id);
+        Ok(())
     }
 }
 
@@ -1196,6 +1221,27 @@ impl Backing for RollbackBacking {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn punching_an_already_zero_part_of_a_mapped_page_is_idle() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 4 * PAGE).unwrap();
+        let file = backing.open("file", true).unwrap();
+        file.write_at(0, &[1, 0, 2]).unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("").unwrap();
+        let generation = backing.state.lock().committed.generation;
+        file.punch_hole(1, 1).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(backing.state.lock().committed.generation, generation);
+        file.punch_hole(0, 1).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(backing.state.lock().committed.generation, generation + 1);
+        let mut bytes = [0; 3];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0, 2]);
+    }
 
     #[test]
     fn clean_file_and_directory_barriers_leave_the_witness_generation_unchanged() {
