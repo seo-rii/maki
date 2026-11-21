@@ -316,13 +316,19 @@ impl Volume {
         // Keep searching without checkpointing or changing the volume.
         // If both valid allocation maps lag behind the slot data, the normal
         // read path can still serve an unlisted slot. Probe those last.
+        let mut previous_shard = None;
         for unit in self
             .store
             .allocated_units()
             .chain(self.store.unlisted_units())
         {
-            if let Some((_, data)) = self.read_ct(unit)? {
-                return Ok(Some((unit, data)));
+            self.check_freshness()?;
+            // Any remaining overlay entry is a tombstone hiding the slot.
+            if self.overlay.get(unit).is_some() {
+                continue;
+            }
+            if let Some(header) = self.store.scan_slot_header(unit, &mut previous_shard)? {
+                return Ok(Some((unit, self.store.read_ciphertext(&header)?)));
             }
         }
         Ok(None)

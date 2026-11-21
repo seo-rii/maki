@@ -623,7 +623,10 @@ impl SlotStore {
             catalog,
             catalog_ab,
             catalog_dirty,
-            pending_allocations: shards.values().filter(|s| s.dirty_alloc || !s.map_stored).count(),
+            pending_allocations: shards
+                .values()
+                .filter(|s| s.dirty_alloc || !s.map_stored)
+                .count(),
             pending_discards: shards.values().filter(|s| s.dirty_discard).count(),
             shards,
             repaired_units,
@@ -1421,6 +1424,24 @@ impl SlotStore {
         self.slot_header_with_len(unit, |_, data| data.len())
     }
 
+    /// Reuse one observed file length across consecutive probes under the volume lock.
+    pub(crate) fn scan_slot_header(
+        &self,
+        unit: u64,
+        previous: &mut Option<(u64, u64)>,
+    ) -> Result<Option<SlotHeader>, CoreError> {
+        self.slot_header_with_len(unit, |shard, data| {
+            if let Some((last_shard, len)) = *previous {
+                if last_shard == shard {
+                    return Ok(len);
+                }
+            }
+            let len = data.len()?;
+            *previous = Some((shard, len));
+            Ok(len)
+        })
+    }
+
     fn slot_header_with_len(
         &self,
         unit: u64,
@@ -1510,16 +1531,7 @@ impl SlotStore {
         let mut previous = None;
         let mut scratch = None;
         listed.chain(unlisted).map(move |(unit, allocated)| {
-            let header = self.slot_header_with_len(unit, |shard, data| {
-                if let Some((last_shard, len)) = previous {
-                    if last_shard == shard {
-                        return Ok(len);
-                    }
-                }
-                let len = data.len()?;
-                previous = Some((shard, len));
-                Ok(len)
-            });
+            let header = self.scan_slot_header(unit, &mut previous);
             let verified = header.and_then(|header| {
                 let Some(header) = header else {
                     return Ok(false);
