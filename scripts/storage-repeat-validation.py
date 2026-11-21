@@ -38,6 +38,14 @@ def suite_groups(config):
     return PROFILES[profile]
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(128 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def save_json(path, value, before_publish=None):
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(name)
@@ -254,7 +262,7 @@ def prepare(directory, config, deadline):
         shutil.copyfile(original, frozen)
         frozen.chmod(0o500)
         executables[name] = frozen
-        manifest[name] = {"sha256": hashlib.sha256(frozen.read_bytes()).hexdigest(),
+        manifest[name] = {"sha256": sha256_file(frozen),
                           "library_path": library_path}
         result = run_child([str(frozen), "--list", "--include-ignored"], source,
                            directory / f"list-{name}.log", stop, remaining(30),
@@ -399,8 +407,8 @@ def start(args):
             "revision": revision, "source": str(source), "target_dir": str(target),
             "build_dir": str(directory / "build"),
             "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
-            "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-            "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+            "source_sha256": sha256_file(archive),
+            "runner_sha256": sha256_file(runner),
             "profile": profile,
             "suites": [suite for group in groups.values() for suite in group],
             "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, text=True).strip(),

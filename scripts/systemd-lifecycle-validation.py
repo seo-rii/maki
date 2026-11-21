@@ -85,7 +85,10 @@ def fixture_units(volume, directory, helper):
     daemon = packaged_unit_section("maki@.service", volume)
     daemon += ("\n[Service]\nType=notify\nNotifyAccess=main\n"
                "TimeoutStartSec=3\nTimeoutStopSec=3\n"
-               f"ExecStart={actor_command} daemon\n")
+               f"ExecStart={actor_command} daemon\n"
+               # Type=notify runs this after the manager receives READY=1 and
+               # completes it before any service ordered After= the daemon.
+               f"ExecStartPost={actor_command} daemon-ready\n")
     attach = packaged_unit_section("maki-attach@.service", volume)
     attach += ("\n[Service]\nType=oneshot\nRemainAfterExit=yes\n"
                "TimeoutStartSec=2\nTimeoutStopSec=3\n"
@@ -141,6 +144,9 @@ def actor(directory, action):
     mode = (directory / "mode").read_text().strip()
     resource = directory / "resource"
     workload = directory / "workload-running"
+    if action == "daemon-ready":
+        event(directory, action)
+        return 0
     if action == "attach":
         attempts = directory / "attempts"
         attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
@@ -435,11 +441,18 @@ class Fixture:
             expected_cycles = 2 if mode in ("target-restart", "stop-start", "active-recovery") else 1
             require(self.count("attach-start") == expected_cycles, "planned stop allowed a new attach")
             require(self.count("workload-stop") == expected_cycles, "planned stop did not quiesce workload")
+        daemon = "stopped"
         attachment = "absent"
         for record in self.events():
             name = record["event"]
             require(not name.startswith("unsafe-"), "unsafe ordering in simulated lifecycle")
-            if name == "attach-start":
+            if name == "daemon-start":
+                daemon = "starting"
+            elif name == "daemon-ready":
+                require(daemon == "starting", "daemon became ready outside a start")
+                daemon = "ready"
+            elif name == "attach-start":
+                require(daemon == "ready", "attachment began before its daemon was ready")
                 require(attachment == "absent", "reattach began before previous cleanup completed")
                 attachment = "starting"
             elif name == "attach-ready":
@@ -449,10 +462,11 @@ class Fixture:
                 require(attachment == "ready", "workload started before its attachment was ready")
             elif name == "cleanup-complete":
                 attachment = "absent"
-            elif name == "daemon-stop" and mode in (
-                    "normal-stop", "failed-stop", "timeout-stop", "kill-stop",
-                    "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
-                require(attachment == "absent", "daemon stopped before successful cleanup")
+            elif name == "daemon-stop":
+                daemon = "stopped"
+                if mode in ("normal-stop", "failed-stop", "timeout-stop", "kill-stop",
+                            "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
+                    require(attachment == "absent", "daemon stopped before successful cleanup")
 
 
 def main():

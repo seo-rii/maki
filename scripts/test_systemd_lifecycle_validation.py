@@ -12,6 +12,7 @@ SCRIPT = Path(__file__).with_name("systemd-lifecycle-validation.py")
 SPEC = importlib.util.spec_from_file_location("maki_systemd_fixture", SCRIPT)
 fixture = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fixture)
+READY_DAEMON = ("daemon-start", "daemon-ready")
 
 
 class SystemdLifecycleFixtureTests(unittest.TestCase):
@@ -45,21 +46,21 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
     def test_failed_cleanup_trace_requires_live_daemon(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("failed-stop", (
-                "daemon-start", "attach-start", "attach-ready", "workload-start",
+                *READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                 "workload-stop", "cleanup-stop", "cleanup-refused", "daemon-stop",
             ), "inactive", states={"attach": "failed"}, resource=True)
 
     def test_cancelled_start_cannot_stop_daemon_with_resource(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("cancel-start", (
-                "daemon-start", "attach-start", "daemon-stop",
+                *READY_DAEMON, "attach-start", "daemon-stop",
             ), "inactive", resource=True)
 
     def test_failed_or_interrupted_cleanup_preserves_live_daemon(self):
         for mode in ("failed-stop", "timeout-stop", "kill-stop"):
             with self.subTest(mode=mode):
                 self.verify_events(mode, (
-                    "daemon-start", "attach-start", "attach-ready", "workload-start",
+                    *READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                     "workload-stop", "cleanup-stop", "cleanup-refused",
                 ), "inactive", states={"attach": "failed", "daemon": "active"}, resource=True)
 
@@ -125,11 +126,24 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             self.assertIn("Expecting value", result["events_error"])
 
     def test_normal_stop_requires_cleanup_before_daemon_stop(self):
-        prefix = ("daemon-start", "attach-start", "attach-ready", "workload-start",
+        prefix = (*READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                   "workload-stop", "cleanup-stop")
         self.verify_events("normal-stop", (*prefix, "cleanup-complete", "daemon-stop"), "inactive")
         with self.assertRaisesRegex(AssertionError, "daemon stopped before"):
             self.verify_events("normal-stop", (*prefix, "daemon-stop", "cleanup-complete"), "inactive")
+
+    def test_attach_requires_readiness_from_the_running_daemon(self):
+        tail = ("attach-ready", "workload-start", "workload-stop", "cleanup-stop", "cleanup-complete", "daemon-stop")
+        for prefix in (("attach-start", *READY_DAEMON), ("daemon-start", "attach-start", "daemon-ready"),
+                       ("daemon-ready", "attach-start"), (*READY_DAEMON, "daemon-stop", "attach-start")):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(AssertionError, "daemon"):
+                self.verify_events("normal-stop", (*prefix, *tail), "inactive")
+
+        first = (*READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete", "daemon-stop", "daemon-start")
+        retry = ("attach-start", "attach-ready", "workload-start")
+        with self.assertRaisesRegex(AssertionError, "daemon"):
+            self.verify_events("exit-once", (*first, *retry), "active")
+        self.verify_events("exit-once", (*first, "daemon-ready", *retry), "active")
 
     def test_workload_requires_readiness_from_its_own_attachment(self):
         for trace in (
@@ -139,22 +153,22 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
              "attach-start", "workload-start"),
         ):
             with self.subTest(trace=trace), self.assertRaisesRegex(AssertionError, "workload.*ready"):
-                self.verify_events("exit-once", trace, "active")
+                self.verify_events("exit-once", (*READY_DAEMON, *trace), "active")
 
     def test_normal_stop_waits_for_the_actual_daemon_shutdown(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("normal-stop", (
-                "daemon-start", "attach-start", "attach-ready", "workload-start",
+                *READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                 "workload-stop", "cleanup-stop", "cleanup-complete",
             ), "inactive", states={"daemon": "active"})
 
     def test_recovery_oracle_accepts_cleanup_before_each_reattach(self):
         self.verify_events("exit-once", (
-            "attach-start", "cleanup-recover", "cleanup-complete",
+            *READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
             "attach-start", "attach-ready", "workload-start",
         ), "active")
         self.verify_events("repeated-failure", (
-            "attach-start", "cleanup-recover", "cleanup-complete",
+            *READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
             "attach-start", "cleanup-recover", "cleanup-complete",
             "attach-start", "cleanup-recover", "cleanup-complete",
         ), "failed")
@@ -164,7 +178,7 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             with self.subTest(completion=completion):
                 with self.assertRaisesRegex(AssertionError, "reattach"):
                     self.verify_events("exit-once", (
-                        "attach-start", "cleanup-recover",
+                        *READY_DAEMON, "attach-start", "cleanup-recover",
                         "attach-start", "attach-ready", "workload-start",
                         *completion,
                     ), "active")
@@ -172,24 +186,25 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
     def test_recovery_oracle_rejects_stale_cleanup_completion(self):
         with self.assertRaisesRegex(AssertionError, "reattach"):
             self.verify_events("repeated-failure", (
-                "attach-start", "cleanup-recover", "cleanup-complete",
+                *READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
                 "attach-start", "cleanup-recover",
                 "attach-start", "cleanup-complete",
             ), "failed")
 
     def test_cancellation_oracle_rejects_unsafe_events(self):
-        self.verify_events("cancel-start", ("attach-start",), "inactive",
+        self.verify_events("cancel-start", (*READY_DAEMON, "attach-start"), "inactive",
                            states={"daemon": "active"}, resource=True)
         for event in ("unsafe-workload-start", "unsafe-cleanup-before-workload-stop"):
             with self.subTest(event=event):
                 with self.assertRaisesRegex(AssertionError, "unsafe"):
-                    self.verify_events("cancel-start", ("attach-start", event), "inactive",
+                    self.verify_events("cancel-start", (*READY_DAEMON, "attach-start", event), "inactive",
                                        states={"daemon": "active"}, resource=True)
 
     def test_cancellation_waits_for_the_partial_attachment_before_stop(self):
         with tempfile.TemporaryDirectory() as temporary:
             case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "cancel-start")
-            fixture.event(case.directory, "attach-start")
+            for event in (*READY_DAEMON, "attach-start"):
+                fixture.event(case.directory, event)
             resource = case.directory / "resource"
 
             def wait(condition, label):
@@ -214,7 +229,7 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             with self.subTest(terminal_state=terminal_state), tempfile.TemporaryDirectory() as temporary:
                 case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "cancel-start")
                 (case.directory / "resource").write_text("owned")
-                records = [{"event": "attach-start"}]
+                records = [{"event": name} for name in (*READY_DAEMON, "attach-start")]
                 stopping = iter(("deactivating", terminal_state))
 
                 def state(which):
@@ -251,6 +266,10 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
         units = fixture.names(volume)
         files = fixture.fixture_units(volume, Path("/tmp/private fixture"), Path("/tmp/real helper"))
         self.assertEqual(set(files), set(units.values()))
+        daemon = files[units["daemon"]].splitlines()
+        self.assertIn("Type=notify", daemon)
+        start = next(line for line in daemon if line.startswith("ExecStart="))
+        self.assertIn(start.replace("ExecStart=", "ExecStartPost=") + "-ready", daemon)
         for content in files.values():
             self.assertNotIn("%i", content)
             self.assertNotIn("AssertPathExists=", content)

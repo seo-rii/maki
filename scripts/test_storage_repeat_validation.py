@@ -1,4 +1,5 @@
 """The background runner must not mistake interruption or empty runs for a pass."""
+import hashlib
 import importlib.util
 import json
 import os
@@ -30,6 +31,7 @@ class BackgroundStorageTests(unittest.TestCase):
             "maki-core": ("rollback_protection", "rollback_process"),
         }
         calls = []
+        binary = bytes(range(256)) * 4097
 
         def child(command, _cwd, log, _stop, _timeout, **_kwargs):
             calls.append(command)
@@ -42,7 +44,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 events = []
                 for name in selected:
                     executable = self.root / (name + "-build")
-                    executable.write_bytes(b"frozen fixture")
+                    executable.write_bytes(binary)
                     events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(executable),
                                               "library_path": "/fixture/lib"}))
                     events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
@@ -55,11 +57,13 @@ class BackgroundStorageTests(unittest.TestCase):
         config = {"source": str(self.root), "target_dir": str(self.root / "target"),
                   "profile": "rollback"}
         with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
-                mock.patch.object(self.runner, "run_child", side_effect=child):
+                mock.patch.object(self.runner, "run_child", side_effect=child), \
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole binary read")):
             binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
         self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
         manifest = json.loads((self.root / "binaries.json").read_text())
         self.assertEqual(set(manifest), set(binaries))
+        self.assertEqual({entry["sha256"] for entry in manifest.values()}, {hashlib.sha256(binary).hexdigest()})
         self.assertTrue(all(value["expected_tests"] == 1 for value in manifest.values()))
         self.assertEqual(sum(command[0] == "cargo" for command in calls), 2)
 
@@ -296,7 +300,8 @@ class BackgroundStorageTests(unittest.TestCase):
                 mock.patch.object(self.runner.qualification_source(), "clean_revision",
                                   side_effect=["revision-one", "revision-two"]), \
                 mock.patch.object(self.runner.subprocess, "check_output", return_value="cargo fixture\n") as probes, \
-                mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
+                mock.patch.object(self.runner.subprocess, "Popen", return_value=process), \
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole campaign artifact read")):
             self.runner.start(args)
             first = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
             args.profile = "rollback"
@@ -309,7 +314,10 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
         for index, config in enumerate((first_config, second_config)):
             source = Path(config["source"])
-            self.assertEqual((source.parent / "runner.py").read_text(), f"# runner at {config['revision']}\n")
+            runner_text = f"# runner at {config['revision']}\n"
+            self.assertEqual((source.parent / "runner.py").read_text(), runner_text)
+            self.assertEqual(config["source_sha256"], hashlib.sha256(b"frozen source").hexdigest())
+            self.assertEqual(config["runner_sha256"], hashlib.sha256(runner_text.encode()).hexdigest())
             self.assertEqual(probes.call_args_list[index], mock.call(["cargo", "-V"], cwd=source, text=True))
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
         self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
