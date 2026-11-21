@@ -1,4 +1,4 @@
-"""Private host-side evidence I/O shared by the reset qualification controllers."""
+"""Process and evidence I/O for the Linux reset qualification campaigns."""
 
 from contextlib import contextmanager
 import json
@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import subprocess
 import tempfile
 import threading
+import time
 
 
 _termination_requested = False
@@ -58,6 +60,43 @@ def save_json(path, value):
             os.close(parent)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def guest_command_output(command, *, timeout, search_path):
+    """Capture a setup command with a shared 64 KiB stdout/stderr budget."""
+    limit = 65536
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True,
+                          env=dict(os.environ, PATH=search_path)) as child:
+        stdout, stderr = bytearray(), bytearray()
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ, stdout)
+                ready.register(child.stderr, selectors.EVENT_READ, stderr)
+                while ready.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    for key, _ in ready.select(remaining):
+                        budget = limit - len(stdout) - len(stderr)
+                        chunk = os.read(key.fd, min(8192, budget + 1))
+                        if len(chunk) > budget:
+                            raise ValueError("setup output limit exceeded")
+                        if chunk:
+                            key.data.extend(chunk)
+                        else:
+                            ready.unregister(key.fd)
+            status = child.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+    if status:
+        raise RuntimeError(f"{command[0]} exited {status}: " + stderr[-2048:].decode(errors="replace"))
+    return stdout.decode().strip()
 
 
 class DiagnosticLog:

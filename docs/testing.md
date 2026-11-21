@@ -588,6 +588,9 @@ invalidates nothing. Simulation is useful
 development evidence, not proof that a real filesystem and device stack obeys
 the same model.
 
+Install `scripts/campaign_io.py` alongside either the Firecracker or GCE guest agent.
+Use host and guest scripts from the same revision for matching block patterns.
+
 The opt-in Firecracker runner boots the same writable data image after each
 VMM `SIGKILL`. Its virtio data drive explicitly uses Firecracker `Writeback`
 cache semantics and synchronous host I/O, while the root filesystem remains

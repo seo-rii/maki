@@ -20,6 +20,11 @@ import termios
 import time
 import tty
 
+try:
+    from campaign_io import guest_command_output
+except ModuleNotFoundError:
+    from scripts.campaign_io import guest_command_output
+
 CONFIG = '''config_schema_version = 1
 [volume]
 name = "firecracker-disposable"
@@ -115,16 +120,7 @@ def barrier(client, cycle, mode):
 
 
 def run(command, timeout=30):
-    # Setup commands are bounded children. capture_output is inspected only
-    # after run() has waited, or after its timeout has killed/reaped the child.
-    environment = dict(os.environ, PATH=SYSTEM_PATH)
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            timeout=timeout, env=environment)
-    if result.returncode:
-        raise RuntimeError(f"{command[0]} exited {result.returncode}: "
-                           + result.stderr[-2048:].decode(errors="replace"))
-    ensure(len(result.stdout) <= 65536, "setup output limit exceeded")
-    return result.stdout.decode(errors="strict").strip()
+    return guest_command_output(command, timeout=timeout, search_path=SYSTEM_PATH)
 
 
 def mount_guest():

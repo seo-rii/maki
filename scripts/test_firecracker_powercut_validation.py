@@ -187,11 +187,27 @@ class GuestContracts(unittest.TestCase):
                 self.guest.barrier(client, 0, mode)
 
     def test_pid1_children_use_an_explicit_system_path(self):
-        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
-        with mock.patch.object(self.guest.subprocess, "run", return_value=completed) as invoked:
-            self.guest.run(["blkid"])
-        environment = invoked.call_args.kwargs["env"]
-        self.assertEqual(environment["PATH"], "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        with mock.patch.dict("os.environ", PATH="/unknown"):
+            child_path = self.guest.run([sys.executable, "-c", "import os; print(os.environ['PATH'])"])
+        self.assertEqual(child_path, self.guest.SYSTEM_PATH)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux guest")
+    def test_guest_setup_limits_combined_output_before_child_exit(self):
+        gce = load("gce_setup", "gcp-reset-guest.py")
+        for run in (self.guest.run, gce.run_output):
+            for fd in (1, 2):
+                with self.subTest(run=run, fd=fd), self.assertRaisesRegex(ValueError, "output limit"):
+                    run([sys.executable, "-c",
+                         f"import os,time; os.write({fd}, b'x' * 65537); time.sleep(10)"], timeout=1)
+            with self.subTest(run=run):
+                exact = "import os; os.write(1, b'a'*32768); os.write(2, b'b'*32768)"
+                self.assertEqual(run([sys.executable, "-c", exact]), "a" * 32768)
+                with self.assertRaisesRegex(ValueError, "output limit"):
+                    run([sys.executable, "-c", exact + "; os.write(2, b'!')"])
+                with self.assertRaisesRegex(RuntimeError, "exited 9: diagnostic"):
+                    run([sys.executable, "-c", "import sys; print('diagnostic', file=sys.stderr); sys.exit(9)"])
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.1)
 
     def test_real_payload_manifest_matches_host_and_barrier_calls(self):
         for cycle, mode in ((0, "flush"), (1, "fua")):
