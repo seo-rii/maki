@@ -10,6 +10,8 @@ until `inactive` and stop on `failed`.
 
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import unittest
 
 
@@ -26,6 +28,26 @@ def bash_blocks(text):
 
 
 class StopWaitContract(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash")
+    def test_rechecks_units_while_others_stop(self):
+        for path in STOP_GUIDES:
+            definition = re.search(r"^wait_stopped\(\) \{.*?^\}", path.read_text(), re.M | re.S)[0]
+            script = """
+tick=0
+sleep() { tick=1; }
+systemctl() {
+    case "$tick:$4" in
+        0:first) echo inactive ;;
+        0:second) echo deactivating ;;
+        1:first) echo failed ;;
+        1:second) echo inactive ;;
+    esac
+}
+""" + definition + "\nwait_stopped first second"
+            with self.subTest(path=path):
+                self.assertEqual(subprocess.run(["bash", "-c", script], capture_output=True,
+                                                timeout=5).returncode, 1)
+
     def test_no_guide_waits_while_is_active(self):
         for path in [*STOP_GUIDES, *sorted((ROOT / "docs").rglob("*.md"))]:
             if "qualification" in path.parts:
