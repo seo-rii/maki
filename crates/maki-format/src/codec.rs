@@ -80,6 +80,12 @@ impl Writer {
         Self::default()
     }
 
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.buf.len()
     }

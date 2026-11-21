@@ -8,7 +8,7 @@
 //! the only crash-safe copy of that unit. An unchanged latest/durable pair
 //! shares its immutable ciphertext, as do internal checkpoint snapshots.
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -17,7 +17,7 @@ pub struct OverlayVersion {
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UnitOverlay {
     latest: Arc<OverlayVersion>,
     durable: Option<Arc<OverlayVersion>>,
@@ -94,19 +94,25 @@ impl Overlay {
     pub fn publish(&mut self, unit: u64, sequence: u64, ciphertext: Vec<u8>) {
         self.bytes += ciphertext.len() as u64;
         self.latest_bytes += ciphertext.len() as u64;
-        let entry = self.units.entry(unit).or_default();
-        if entry.latest.sequence != 0 {
-            self.bytes = self
-                .bytes
-                .saturating_sub(entry.latest.ciphertext.len() as u64);
-            self.latest_bytes = self
-                .latest_bytes
-                .saturating_sub(entry.latest.ciphertext.len() as u64);
-        }
-        entry.latest = Arc::new(OverlayVersion {
+        let latest = Arc::new(OverlayVersion {
             sequence,
             ciphertext,
         });
+        match self.units.entry(unit) {
+            Entry::Vacant(entry) => {
+                entry.insert(UnitOverlay {
+                    latest,
+                    durable: None,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                let entry = entry.get_mut();
+                let old_len = entry.latest.ciphertext.len() as u64;
+                self.bytes -= old_len;
+                self.latest_bytes -= old_len;
+                entry.latest = latest;
+            }
+        }
         self.pending_promotion.insert(sequence, unit);
         self.sanitize();
     }
