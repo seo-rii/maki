@@ -39,7 +39,8 @@ pub fn test_lock() -> MutexGuard<'static, ()> {
 pub fn set(name: &str, action: FailpointAction) -> FailpointGuard {
     let action = Arc::new(action);
     let registration = Arc::downgrade(&action);
-    registry().lock().insert(name.to_string(), action);
+    let previous = registry().lock().insert(name.to_string(), action);
+    drop(previous); // A callback may own another guard.
     FailpointGuard {
         name: name.to_string(),
         registration,
@@ -67,7 +68,8 @@ pub fn fail_n_times(name: &str, n: usize, kind: io::ErrorKind, msg: &str) -> Fai
 }
 
 pub fn clear_all() {
-    registry().lock().clear();
+    let actions = std::mem::take(&mut *registry().lock());
+    drop(actions);
 }
 
 /// Evaluate the failpoint `name`. No-op unless an action is registered.
@@ -100,7 +102,9 @@ impl Drop for FailpointGuard {
             .get(&self.name)
             .is_some_and(|current| self.registration.ptr_eq(&Arc::downgrade(current)))
         {
-            actions.remove(&self.name);
+            let removed = actions.remove(&self.name);
+            drop(actions);
+            drop(removed);
         }
     }
 }
@@ -108,6 +112,36 @@ impl Drop for FailpointGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callbacks_are_destroyed_after_unlocking_the_registry() {
+        struct CheckDrop;
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(
+                    registry().try_lock().is_some(),
+                    "action dropped under registry lock"
+                );
+            }
+        }
+        let _lock = test_lock();
+        for operation in ["remove", "replace", "clear"] {
+            let owned = CheckDrop;
+            let guard = set(
+                "owned",
+                FailpointAction::Callback(Arc::new(move || {
+                    let _reference = &owned;
+                    None
+                })),
+            );
+            match operation {
+                "replace" => drop(set("owned", FailpointAction::Panic(String::new()))),
+                "clear" => clear_all(),
+                _ => (),
+            }
+            drop(guard);
+        }
+    }
 
     #[test]
     fn stale_guard_preserves_current_registration() {
