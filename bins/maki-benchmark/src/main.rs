@@ -4,6 +4,7 @@
 mod latency;
 mod workload;
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use maki_format::error::FormatError;
@@ -352,17 +353,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if options.json {
-        match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{json}"),
-            Err(error) => {
-                eprintln!("cannot encode report: {error}");
-                return ExitCode::FAILURE;
-            }
+    match write_report(&mut io::stdout().lock(), &report, options.json) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "benchmark I/O and verification completed, but writing the report failed: {error}"
+            );
+            ExitCode::FAILURE
         }
+    }
+}
+
+fn write_report(out: &mut impl Write, report: &Report, json: bool) -> io::Result<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut *out, report)?;
+        writeln!(out)?;
     } else {
+        let io_size = report.io_size_bytes;
         for (name, stats) in [("write", &report.write), ("read", &report.read)] {
-            println!(
+            writeln!(
+                out,
                 "{name}: {} x {io_size}B in {:.3}s ({:.1} MiB/s, {:.0} IOPS); \
                  latency us: mean {:.1}, p50 <= {:.1}, p95 <= {:.1}, p99 <= {:.1}, max {:.1}",
                 stats.latency.samples,
@@ -374,17 +386,18 @@ fn main() -> ExitCode {
                 stats.latency.p95_upper_us,
                 stats.latency.p99_upper_us,
                 stats.latency.max_us,
-            );
+            )?;
         }
         let rss = report
             .resources
             .process_peak_rss_bytes
             .map(|bytes| format!("{bytes}B"))
             .unwrap_or_else(|| "unavailable".into());
-        println!("concurrency: {}; access: {}; mode: {}; working set: {}B; peak pending: {}; process peak RSS: {rss}",
+        writeln!(out, "concurrency: {}; access: {}; mode: {}; working set: {}B; peak pending: {}; process peak RSS: {rss}",
             report.concurrency, report.workload.access, report.workload.mode,
-            report.workload.working_set_bytes, report.resources.peak_pending_operations);
-        println!(
+            report.workload.working_set_bytes, report.resources.peak_pending_operations)?;
+        writeln!(
+            out,
             "FUA: {}; final FLUSH: {:.1} us (included in write throughput); read verification: {}",
             report.fua,
             report.flush_us,
@@ -393,15 +406,15 @@ fn main() -> ExitCode {
             } else {
                 "skipped: no read operations"
             }
-        );
-        println!(
+        )?;
+        writeln!(out,
             "verification: {} slots written during measurement; {} slots read after a measured write; \
              final sweep passed for {} slots in {:.3}s (excluded from throughput and latency)",
             report.verification.written_slots,
             report.verification.read_after_write_verified_slots,
             report.verification.final_sweep_verified_slots,
             report.verification.final_sweep_elapsed_seconds,
-        );
+        )?;
     }
-    ExitCode::SUCCESS
+    out.flush()
 }
