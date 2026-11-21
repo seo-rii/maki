@@ -160,9 +160,11 @@ impl Inode {
     /// length changes count as lost.
     fn sync(&mut self) {
         let pages = dirty_pages(&self.pending);
-        let mut durable = durable_after_sync(self);
+        for op in &self.pending {
+            apply(&mut self.durable, op);
+        }
         for &page in &pages {
-            write_back_page(&mut durable, &self.image, page);
+            write_back_page(&mut self.durable, &self.image, page);
         }
         let cut = self
             .pending
@@ -176,7 +178,6 @@ impl Inode {
             .into_iter()
             .flat_map(|op| unsettled(op, &pages, cut))
             .collect();
-        self.durable = durable;
         self.pending.clear();
     }
 }
@@ -390,17 +391,6 @@ impl Inner {
 
 fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-
-/// The durable content plus every *dirty* operation, in order. Writes an
-/// earlier failed sync marked clean are not part of it; [`Inode::sync`]
-/// adds those in the pages it writes back.
-fn durable_after_sync(inode: &Inode) -> Vec<u8> {
-    let mut data = inode.durable.clone();
-    for p in &inode.pending {
-        apply(&mut data, p);
-    }
-    data
 }
 
 /// Pages a dirty write touched.
@@ -1149,6 +1139,14 @@ mod tests {
 
     fn eio() -> io::Error {
         io::Error::other("injected EIO")
+    }
+
+    #[test]
+    fn syncing_an_unchanged_file_keeps_its_durable_allocation() {
+        let mut inode = Inode::from_content(vec![7; 8192]);
+        let original = inode.durable.as_ptr();
+        inode.sync();
+        assert_eq!(inode.durable.as_ptr(), original);
     }
 
     #[test]
