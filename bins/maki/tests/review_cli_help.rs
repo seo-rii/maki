@@ -43,3 +43,27 @@ fn misuse_still_exits_two_with_usage_on_stderr() {
         assert!(stdout.is_empty() && stderr.contains("usage:"), "{args:?}");
     }
 }
+
+#[test]
+fn malformed_remote_volume_commands_show_usage_before_opening_config() {
+    let config = "missing-remote-config.toml";
+    for args in [
+        vec!["volume", "witness", config, "extra"],
+        vec!["volume", "gc", config, "extra"],
+        vec!["volume", "snapshot", config],
+        vec!["volume", "takeover", config, "1"],
+        vec!["volume", "restore", config, "dir", "1", "root"],
+        vec![
+            "volume",
+            "resume-enrollment",
+            config,
+            "1",
+            "id",
+            "--unknown",
+        ],
+    ] {
+        let (status, stdout, stderr) = run(&args);
+        assert_eq!(status, 2, "{args:?}: {stderr}");
+        assert!(stdout.is_empty() && stderr.contains("usage:"), "{args:?}");
+    }
+}

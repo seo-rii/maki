@@ -264,13 +264,28 @@ fn main() -> ExitCode {
                 Err(e) => fail(e.to_string()),
             }
         }
-        ["volume", command, ..]
-            if matches!(
-                *command,
-                "witness" | "snapshot" | "takeover" | "restore" | "resume-enrollment" | "gc"
-            ) =>
-        {
-            match remote_volume(&argv[1..]) {
+        ["volume", verb, config, tail @ ..] => {
+            let command = match (*verb, tail) {
+                ("witness", []) => RemoteVolume::Witness,
+                ("gc", []) => RemoteVolume::Gc,
+                ("snapshot", [directory]) => RemoteVolume::Snapshot { directory },
+                ("resume-enrollment", [fence, identity] | [fence, identity, "--discard"]) => {
+                    RemoteVolume::ResumeEnrollment {
+                        fence,
+                        identity,
+                        discard: tail.len() == 3,
+                    }
+                }
+                ("takeover", [fence, root]) => RemoteVolume::Takeover { fence, root },
+                ("restore", [directory, fence, root, approved_source]) => RemoteVolume::Restore {
+                    directory,
+                    fence,
+                    root,
+                    approved_source,
+                },
+                _ => return usage(),
+            };
+            match remote_volume(config, command) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(error),
             }
@@ -597,17 +612,37 @@ fn read_snapshot(
     Ok(descriptor)
 }
 
-fn remote_volume(args: &[&str]) -> Result<(), String> {
+enum RemoteVolume<'a> {
+    Witness,
+    Gc,
+    Snapshot {
+        directory: &'a str,
+    },
+    Takeover {
+        fence: &'a str,
+        root: &'a str,
+    },
+    Restore {
+        directory: &'a str,
+        fence: &'a str,
+        root: &'a str,
+        approved_source: &'a str,
+    },
+    ResumeEnrollment {
+        fence: &'a str,
+        identity: &'a str,
+        discard: bool,
+    },
+}
+
+fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> {
     use maki_backing::remote_witness::Phase;
     use maki_backing::{Backing, FileBacking, RollbackBacking};
     use std::path::Path;
     #[cfg(not(target_os = "linux"))]
-    if args.first() != Some(&"witness") {
+    if !matches!(command, RemoteVolume::Witness) {
         return Err("remote rollback volume operations are supported only on Linux".into());
     }
-    let config = args
-        .get(1)
-        .ok_or("remote volume command requires a configuration file")?;
     let cfg = read_config(config)?;
     let remote = cfg
         .backing
@@ -616,14 +651,14 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
         .and_then(|rollback| rollback.remote.as_ref())
         .ok_or("command requires remote rollback protection")?;
     let rpc = maki_nbdkit::daemon::remote_witness_client(remote).map_err(|e| e.to_string())?;
-    match args {
-        ["witness", _] => {
+    match command {
+        RemoteVolume::Witness => {
             println!(
                 "{}",
                 serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
             );
         }
-        ["gc", _] => {
+        RemoteVolume::Gc => {
             let report =
                 RollbackBacking::collect_remote(Path::new(&cfg.backing.root), rpc.as_ref())
                     .map_err(|e| e.to_string())?;
@@ -639,8 +674,11 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 })
             );
         }
-        ["resume-enrollment", _, fence, identity]
-        | ["resume-enrollment", _, fence, identity, "--discard"] => {
+        RemoteVolume::ResumeEnrollment {
+            fence,
+            identity,
+            discard,
+        } => {
             let fence: u64 = fence
                 .parse()
                 .map_err(|_| "approved fence must be an unsigned integer")?;
@@ -662,13 +700,8 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                     "enrollment approval does not match a never-activated authority".into(),
                 );
             }
-            maki_nbdkit::daemon::resume_enrollment_from_config(
-                &cfg,
-                rpc.clone(),
-                &before,
-                args.len() == 5,
-            )
-            .map_err(|e| e.to_string())?;
+            maki_nbdkit::daemon::resume_enrollment_from_config(&cfg, rpc.clone(), &before, discard)
+                .map_err(|e| e.to_string())?;
             let after = witness_record(rpc.as_ref())?;
             if after.identity != before.identity
                 || Some(after.fence) != before.fence.checked_add(1)
@@ -682,7 +715,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&after).map_err(|e| e.to_string())?
             );
         }
-        ["snapshot", _, directory] => {
+        RemoteVolume::Snapshot { directory } => {
             let target = Path::new(directory);
             RollbackBacking::check_snapshot_destination(target).map_err(|e| e.to_string())?;
             let backing = RollbackBacking::open_remote(Path::new(&cfg.backing.root), rpc.clone())
@@ -715,7 +748,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
             );
         }
-        ["takeover", _, fence, root] => {
+        RemoteVolume::Takeover { fence, root } => {
             let before = approved_record(rpc.as_ref(), fence, root)?;
             let backing = RollbackBacking::takeover_remote(
                 Path::new(&cfg.backing.root),
@@ -730,7 +763,12 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&record).map_err(|e| e.to_string())?
             );
         }
-        ["restore", _, directory, fence, root, approved_source] => {
+        RemoteVolume::Restore {
+            directory,
+            fence,
+            root,
+            approved_source,
+        } => {
             let approved_source = approved_hash(approved_source)?;
             let source = read_snapshot(Path::new(directory))?;
             if source.anchor.root != approved_source {
@@ -752,7 +790,6 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&record).map_err(|e| e.to_string())?
             );
         }
-        _ => return Err("invalid remote volume command arguments; see maki usage".into()),
     }
     Ok(())
 }
