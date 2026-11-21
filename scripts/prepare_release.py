@@ -292,15 +292,30 @@ def prepare(output):
                        "filename": source_name, "sha256": digest(source_archive)},
             "build_host": {"distribution": distribution, "architecture": architecture, "rust_target": host},
             "toolchain": toolchain,
-            "build": {"command": command, "compiler_environment": build_environment},
+            "build": {
+                "command": command,
+                "compiler_environment": build_environment,
+                "package_environment": {
+                    key: environment[key] for key in (
+                        "DPKG_DEB_COMPRESSOR_TYPE", "DPKG_DEB_COMPRESSOR_LEVEL", "DPKG_DEB_THREADS_MAX"
+                    ) if key in environment
+                },
+            },
             "package": {"filename": package_name, "version": version, "sha256": digest(package),
                         "depends": run(["dpkg-deb", "--field", str(package), "Depends"])},
         }
         (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        checksums = "".join(f"{digest(path)}  {path.name}\n" for path in sorted(bundle.iterdir()))
+        hashes = {source_name: manifest["source"]["sha256"], package_name: manifest["package"]["sha256"],
+                  "manifest.json": digest(bundle / "manifest.json")}
+        checksums = "".join(f"{hashes[name]}  {name}\n" for name in sorted(hashes))
         (bundle / "SHA256SUMS").write_text(checksums)
         publish_bundle(bundle, output)
-    print(output)
+    try:
+        print(output, flush=True)
+    except BrokenPipeError:
+        # Publication succeeded. Avoid retrying the broken buffered stream at shutdown.
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
 
 
 def main():

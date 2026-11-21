@@ -113,16 +113,18 @@ candidate_output="$HOME/maki-candidates/$(git rev-parse --short=12 HEAD)-$(dpkg 
 candidate_log="$(mktemp "$HOME/logs/maki-candidate.XXXXXX.log")"
 candidate_status="${candidate_log%.log}.status"
 (
-  rustup run 1.94.0 python3 -B scripts/prepare_release.py --output "$candidate_output"
-  candidate_rc=$?
+  candidate_rc=0
+  rustup run 1.94.0 python3 -B scripts/prepare_release.py --output "$candidate_output" || candidate_rc=$?
   printf '%s\n' "$candidate_rc" > "$candidate_status"
   exit "$candidate_rc"
 ) > "$candidate_log" 2>&1 < /dev/null &
 candidate_pid=$!
 printf 'PID=%s\nlog=%s\nstatus=%s\n' "$candidate_pid" "$candidate_log" "$candidate_status"
-wait "$candidate_pid"
+candidate_rc=0
+wait "$candidate_pid" || candidate_rc=$?
 cat "$candidate_status"
 tail -n 40 "$candidate_log"       # inspect only after the process exits
+(exit "$candidate_rc")
 ```
 
 A successful directory contains:
@@ -131,7 +133,7 @@ A successful directory contains:
 |---|---|
 | `maki_<candidate-version>_<architecture>.deb` | Runtime package with scanned native dependencies |
 | `maki-<candidate-version>-source.tar.gz` | Git archive of the exact committed source, including `Cargo.lock` |
-| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler environment overrides, package dependencies and artifact hashes |
+| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler and Debian compression environment overrides, package dependencies and artifact hashes |
 | `SHA256SUMS` | Hashes of the package, source archive and manifest |
 
 The output appears only after all build and packaging steps succeed. An
