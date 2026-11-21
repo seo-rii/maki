@@ -5,6 +5,7 @@
 //! the daemon control socket (Unix). `attach`/`detach`/`grow` delegate to
 //! the privileged helper.
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -237,15 +238,26 @@ fn main() -> ExitCode {
                         .as_ref()
                         .map(|cfg| cfg.volume.name.as_str())
                         .unwrap_or_default();
-                    println!(
+                    // Creation is already durable. Report output errors without
+                    // making callers retry a successfully initialized volume.
+                    let summary = writeln!(
+                        io::stdout().lock(),
                         "created volume {name} (provider {}, uuid {}, {} bytes virtual, slot size {})",
                         sb.provider_type,
                         sb.volume_uuid,
                         sb.geometry.max_virtual_size,
                         sb.geometry.slot_size
                     );
+                    if let Err(error) = summary {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            let _ = writeln!(
+                                io::stderr().lock(),
+                                "warning: volume {name} was created, but writing the creation summary failed: {error}"
+                            );
+                        }
+                    }
                     if let Some(hint) = ownership_hint(running_as_root(), cfg.as_ref()) {
-                        eprintln!("warning: {hint}");
+                        let _ = writeln!(io::stderr().lock(), "warning: {hint}");
                     }
                     ExitCode::SUCCESS
                 }

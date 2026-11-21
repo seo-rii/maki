@@ -145,6 +145,52 @@ fn check_survives_one_corrupt_superblock_copy_and_fails_on_both() {
     assert!(stdout(&out).contains("check FAILED"), "{}", stdout(&out));
 }
 
+fn create_with_stdout(stdout: std::process::Stdio) -> String {
+    let vol = setup("output-test", "output-key");
+    let key = ("MAKI_CREDENTIAL_OUTPUT_KEY", KEY_HEX);
+    let out = Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(["volume", "create", &vol.config_path])
+        .env(key.0, key.1)
+        .stdout(stdout)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let inspect = maki(&["volume", "inspect", &vol.config_path], Some(key));
+    assert!(inspect.status.success(), "{}", stderr(&inspect));
+    let retry = maki(&["volume", "create", &vol.config_path], Some(key));
+    assert!(!retry.status.success());
+    assert!(
+        stderr(&retry).contains("already exists"),
+        "{}",
+        stderr(&retry)
+    );
+    stderr(&out)
+}
+
+#[test]
+fn create_succeeds_when_stdout_reader_closes() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let warnings = create_with_stdout(writer.into());
+    assert!(!warnings.contains("creation summary"), "{warnings}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn create_warns_when_its_output_cannot_be_saved() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let warnings = create_with_stdout(full.into());
+    assert!(
+        warnings.contains("volume output-test was created"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("creation summary"), "{warnings}");
+}
+
 #[test]
 fn usage_and_bad_inputs_fail_closed() {
     let out = maki(&[], None);
