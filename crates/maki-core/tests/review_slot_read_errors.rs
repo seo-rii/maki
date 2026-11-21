@@ -15,6 +15,7 @@ use std::{
     },
 };
 
+#[derive(Default)]
 struct ReadFailure {
     backing: MemBacking,
     fault: Arc<ReadFault>,
@@ -85,25 +86,22 @@ impl Backing for ReadFailure {
         self.backing.try_lock(p)
     }
 }
+fn superblock() -> Superblock {
+    Superblock {
+        generation: 0,
+        volume_uuid: uuid::Uuid::from_u128(0xa011),
+        provider_type: "fake".into(),
+        crypto_compatibility_id: "test-profile-v1".into(),
+        key_identity: "k".into(),
+        geometry: Geometry::compute(512, 512, 512, 544, 8192, 4096).unwrap(),
+        format_version: 1,
+        created_unix: 0,
+    }
+}
+
 fn fixture(journaled_overwrite: bool) -> Arc<ReadFailure> {
-    let backing = Arc::new(ReadFailure {
-        backing: MemBacking::new(),
-        fault: Arc::new(ReadFault::default()),
-    });
-    init::create_volume(
-        backing.as_ref(),
-        Superblock {
-            generation: 0,
-            volume_uuid: uuid::Uuid::from_u128(0xa011),
-            provider_type: "fake".into(),
-            crypto_compatibility_id: "test-profile-v1".into(),
-            key_identity: "k".into(),
-            geometry: Geometry::compute(512, 512, 512, 544, 8192, 4096).unwrap(),
-            format_version: 1,
-            created_unix: 0,
-        },
-    )
-    .unwrap();
+    let backing = Arc::new(ReadFailure::default());
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
     let mut volume = Volume::recover(
         backing.clone(),
         VolumeOptions {
@@ -247,4 +245,19 @@ fn deep_check_reads_a_sparse_shards_length_once_for_all_unlisted_slots() {
     assert!(deep_check(backing.clone(), 4096).unwrap().ok());
     // One query at store open and one for the offline unlisted-slot scan.
     assert_eq!(backing.fault.shard_len_queries.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn key_probe_reads_a_sparse_shards_length_once_for_all_unlisted_slots() {
+    let backing = Arc::new(ReadFailure::default());
+    init::create_volume_with_discard(backing.as_ref(), superblock()).unwrap();
+    let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+    volume.write_ct(0, &[7; 540], true).unwrap();
+    volume.checkpoint().unwrap();
+    volume.discard_ct(0, true).unwrap();
+    volume.checkpoint().unwrap();
+
+    backing.fault.shard_len_queries.store(0, Ordering::Relaxed);
+    assert_eq!(volume.first_ciphertext_unit().unwrap(), None);
+    assert_eq!(backing.fault.shard_len_queries.load(Ordering::Relaxed), 1);
 }

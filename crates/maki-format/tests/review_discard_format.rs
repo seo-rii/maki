@@ -173,3 +173,21 @@ fn checker_reports_lost_allocation_redundancy_until_both_copies_validate() {
         .unwrap();
     assert!(has_warning());
 }
+
+#[test]
+fn checker_warns_about_a_missing_catalog_mirror_after_the_initial_generation() {
+    let backing = MemBacking::new();
+    init::create_volume_with_discard(&backing, sb()).unwrap();
+    let warning = || {
+        check_volume(&backing)
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|msg| msg.contains("catalog") && msg.contains("one valid copy"))
+    };
+    assert!(!warning());
+    catalog_shard(&backing, sb().geometry.units_per_shard(), true);
+    assert!(!warning());
+    backing.remove(layout::SHARD_CATALOG_A).unwrap();
+    assert!(warning());
+}

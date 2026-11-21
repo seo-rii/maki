@@ -444,13 +444,14 @@ pub struct DurableMark {
 
 impl DurableMark {
     pub fn encode(&self) -> [u8; DURABLE_MARK_SIZE] {
-        let mut w = Writer::new();
-        w.bytes(DURABLE_MARK_MAGIC)
-            .u32(DURABLE_MARK_VERSION)
-            .u64(self.segment_index)
-            .u64(self.durable_size);
-        let out = w.finish_with_crc();
-        out.try_into().expect("durable mark is 32 bytes")
+        let mut bytes = [0; DURABLE_MARK_SIZE];
+        bytes[..8].copy_from_slice(DURABLE_MARK_MAGIC);
+        bytes[8..12].copy_from_slice(&DURABLE_MARK_VERSION.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.segment_index.to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.durable_size.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..28]);
+        bytes[28..].copy_from_slice(&crc.to_le_bytes());
+        bytes
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {

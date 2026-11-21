@@ -185,6 +185,10 @@ pub struct SlotStore {
     /// Shards adopted from the data directory that the loaded catalog copy
     /// did not list; persisted with the next allocation persist.
     catalog_dirty: bool,
+    // Counts of shards that still need the corresponding metadata barrier.
+    // A failed barrier keeps its count until directory durability is proven.
+    pending_allocations: usize,
+    pending_discards: usize,
     shards: HashMap<u64, Shard>,
     /// Units whose bit was repaired from slot headers at open.
     repaired_units: Vec<u64>,
@@ -619,6 +623,11 @@ impl SlotStore {
             catalog,
             catalog_ab,
             catalog_dirty,
+            pending_allocations: shards
+                .values()
+                .filter(|s| s.dirty_alloc || !s.map_stored)
+                .count(),
+            pending_discards: shards.values().filter(|s| s.dirty_discard).count(),
             shards,
             repaired_units,
             damaged_units,
@@ -649,11 +658,7 @@ impl SlotStore {
     /// to apply: an adopted shard, repaired map, or loaded pair awaiting
     /// durability proof in this store session is pending.
     pub fn has_pending_repairs(&self) -> bool {
-        self.catalog_dirty
-            || self
-                .shards
-                .values()
-                .any(|s| s.dirty_alloc || !s.map_stored || s.dirty_discard)
+        self.catalog_dirty || self.pending_allocations != 0 || self.pending_discards != 0
     }
 
     pub(crate) fn supports_discard(&self) -> bool {
@@ -1042,6 +1047,7 @@ impl SlotStore {
             let shard = self.shards.get_mut(idx).unwrap();
             shard.map_stored = true;
             shard.dirty_alloc = false;
+            self.pending_allocations -= 1;
         }
         Ok(())
     }
@@ -1091,6 +1097,9 @@ impl SlotStore {
         let shard = self.shards.get_mut(&shard_idx).unwrap();
         if !shard.alloc.get(in_shard) {
             shard.alloc.set(in_shard, true);
+            if !shard.dirty_alloc && shard.map_stored {
+                self.pending_allocations += 1;
+            }
             shard.dirty_alloc = true;
         }
         Ok(())
@@ -1143,6 +1152,7 @@ impl SlotStore {
                 let shard = self.shards.get_mut(idx).unwrap();
                 shard.dirty_alloc = false;
                 shard.map_stored = true;
+                self.pending_allocations -= 1;
             }
         }
         // The catalog commits an adopted shard only *after* its allocation
@@ -1190,6 +1200,9 @@ impl SlotStore {
         })?;
         if map.get(in_shard) != discarded {
             map.set(in_shard, discarded);
+            if !shard.dirty_discard {
+                self.pending_discards += 1;
+            }
             shard.dirty_discard = true;
         }
         Ok(())
@@ -1228,6 +1241,7 @@ impl SlotStore {
         self.backing.sync_dir(layout::DATA_DIR)?;
         for idx in dirty {
             self.shards.get_mut(&idx).unwrap().dirty_discard = false;
+            self.pending_discards -= 1;
         }
         Ok(())
     }
@@ -1410,6 +1424,24 @@ impl SlotStore {
         self.slot_header_with_len(unit, |_, data| data.len())
     }
 
+    /// Reuse one observed file length across consecutive probes under the volume lock.
+    pub(crate) fn scan_slot_header(
+        &self,
+        unit: u64,
+        previous: &mut Option<(u64, u64)>,
+    ) -> Result<Option<SlotHeader>, CoreError> {
+        self.slot_header_with_len(unit, |shard, data| {
+            if let Some((last_shard, len)) = *previous {
+                if last_shard == shard {
+                    return Ok(len);
+                }
+            }
+            let len = data.len()?;
+            *previous = Some((shard, len));
+            Ok(len)
+        })
+    }
+
     fn slot_header_with_len(
         &self,
         unit: u64,
@@ -1499,16 +1531,7 @@ impl SlotStore {
         let mut previous = None;
         let mut scratch = None;
         listed.chain(unlisted).map(move |(unit, allocated)| {
-            let header = self.slot_header_with_len(unit, |shard, data| {
-                if let Some((last_shard, len)) = previous {
-                    if last_shard == shard {
-                        return Ok(len);
-                    }
-                }
-                let len = data.len()?;
-                previous = Some((shard, len));
-                Ok(len)
-            });
+            let header = self.scan_slot_header(unit, &mut previous);
             let verified = header.and_then(|header| {
                 let Some(header) = header else {
                     return Ok(false);

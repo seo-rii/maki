@@ -52,8 +52,8 @@ use maki_format::journal::{
 };
 use maki_format::layout;
 use maki_format::superblock::{
-    load_volume_superblock, persist_volume_superblock, Superblock, VolumeSuperblock,
-    SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
+    load_volume_superblock, load_volume_superblock_with_fallback, persist_volume_superblock,
+    Superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
 };
 use maki_format::FormatError;
 
@@ -314,7 +314,7 @@ fn recover_with_replay(
     progress();
 
     // 2. superblock
-    let envelope = load_volume_superblock(backing.as_ref())?;
+    let (envelope, invalid_partner) = load_volume_superblock_with_fallback(backing.as_ref())?;
     if !matches!(
         envelope.metadata_version,
         SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
@@ -330,8 +330,7 @@ fn recover_with_replay(
     progress();
 
     // 3./4. catalog + allocation metadata
-    let mut store =
-        SlotStore::open_with_progress(backing.clone(), superblock.geometry.clone(), progress)?;
+    let mut store = SlotStore::open_from_superblock(backing.clone(), &envelope, progress)?;
 
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
@@ -357,7 +356,11 @@ fn recover_with_replay(
     )?;
     // This recovery, the attach after it and later checkpoints store A/B
     // metadata; refuse a generation that leaves no room before any write.
-    check_metadata_generations(backing, &store, None)?;
+    check_metadata_generations(
+        backing,
+        &store,
+        invalid_partner.is_none().then_some(superblock.generation),
+    )?;
     // The superblock is the volume's commit point; every repair below, and
     // the resumed writer, depends on it. A failed or interrupted creation, or
     // a restart, can hand recovery a copy that exists only in the page cache
@@ -504,8 +507,7 @@ fn checkpoint_validated_replay(
     scan: &JournalScan,
     progress: &RecoveryProgress<'_>,
 ) -> Result<CheckpointState, RecoveryError> {
-    let allow_discard =
-        load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
+    let allow_discard = store.supports_discard();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
 
