@@ -1097,14 +1097,16 @@ impl Backing for CrashableBacking {
                 || namespace_changes.contains_key(&entry.change)
         });
         inner.collect_garbage();
-        let dirnames: Vec<String> = inner.dirs.keys().cloned().collect();
-        for name in dirnames {
-            let direct = name
-                .strip_prefix(&prefix)
-                .map(|r| !r.is_empty() && !r.contains('/'))
-                .unwrap_or(false);
-            if direct {
-                inner.dirs.insert(name, true);
+        use std::ops::Bound::{Included, Unbounded};
+        for (name, durable) in inner
+            .dirs
+            .range_mut::<str, _>((Included(prefix.as_str()), Unbounded))
+        {
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                break;
+            };
+            if !rest.is_empty() && !rest.contains('/') {
+                *durable = true;
             }
         }
         Ok(())
