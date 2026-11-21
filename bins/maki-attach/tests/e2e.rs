@@ -31,6 +31,38 @@ fn attach_plan_prints_ordered_steps_without_executing() {
     );
 }
 
+#[test]
+fn attach_plan_checks_socket_and_mountpoint_before_provisioning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("attach.toml");
+    std::fs::write(&config, "").unwrap();
+    let socket = tmp.path().join("nbd");
+    let plan = |command: &str, mountpoint: &std::path::Path| {
+        run(&[
+            command,
+            "--volume",
+            "v1",
+            "--config",
+            config.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+            "--mountpoint",
+            mountpoint.to_str().unwrap(),
+            "--plan",
+        ])
+    };
+    for mountpoint in [&socket, &socket.join("data")] {
+        let out = plan("attach", mountpoint);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("nbd_socket"));
+        assert!(plan("detach", mountpoint).status.success());
+    }
+    assert!(plan("attach", &tmp.path().join("nbd-data"))
+        .status
+        .success());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn attach_plan_checks_existing_mountpoint_paths_and_linux_path_length() {

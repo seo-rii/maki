@@ -118,6 +118,11 @@ impl AttachConfig {
                 "nbd_socket must end with a socket filename".into(),
             ));
         }
+        if std::path::Path::new(&request.mountpoint).starts_with(&request.nbd_socket) {
+            return Err(ConfigError::Invalid(
+                "mountpoint cannot be the nbd_socket path or a directory beneath it".into(),
+            ));
+        }
         #[cfg(target_os = "linux")]
         check_mountpoint_path(&request.mountpoint)?;
         // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
