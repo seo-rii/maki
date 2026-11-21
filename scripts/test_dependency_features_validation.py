@@ -1,6 +1,7 @@
 """Production builds must not enable test-only dependency features."""
 
 from pathlib import Path
+import subprocess
 import tomllib
 import unittest
 
@@ -19,6 +20,16 @@ class TokioFeatureContract(unittest.TestCase):
         # production build, including the nbdkit plugin.
         features = manifest("Cargo.toml")["workspace"]["dependencies"]["tokio"]["features"]
         self.assertNotIn("test-util", features)
+
+    def test_normal_and_build_dependencies_do_not_activate_test_util(self):
+        features = subprocess.check_output([
+            "cargo", "tree", "--locked", "--workspace", "--exclude", "maki-test-support",
+            "--target", "all", "--edges", "normal,build", "--invert", "tokio",
+            "--depth", "0", "--prefix", "none", "--format", "{f}",
+        ], cwd=ROOT, text=True)
+        self.assertTrue(features.strip(), "expected the production Tokio dependency")
+        for line in features.splitlines():
+            self.assertNotIn("test-util", line.split(","))
 
     def test_crates_with_paused_clock_tests_request_test_util_as_dev_dependency(self):
         for crate in sorted((ROOT / "crates").iterdir()):
