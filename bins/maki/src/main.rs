@@ -917,8 +917,21 @@ fn control(
     });
     match result {
         Ok(v) => {
-            println!("{}", serde_json::to_string_pretty(&v).unwrap());
-            if v["ok"] == serde_json::Value::Bool(true) {
+            let ok = v["ok"] == serde_json::Value::Bool(true);
+            let mut out = io::stdout().lock();
+            let written = serde_json::to_writer_pretty(&mut out, &v)
+                .map_err(io::Error::from)
+                .and_then(|()| writeln!(out))
+                .and_then(|()| out.flush());
+            if let Err(error) = written {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    let verdict = if ok { "success" } else { "failure" };
+                    let _ = writeln!(io::stderr().lock(),
+                        "{command}: daemon reported {verdict}, but writing the response failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if ok {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE

@@ -140,3 +140,22 @@ async fn concurrent_trim_and_write_have_whole_unit_ordering() {
         expected
     );
 }
+
+#[tokio::test]
+async fn a_partial_fua_trim_records_a_fua_barrier() {
+    let (_backing, engine) = fixture(true).await;
+    engine.stop_checkpoint_worker().await;
+    for size in [512, 1024] {
+        engine.write(0, &[0x31; 1024], false).await.unwrap();
+        let before = engine.stats().await;
+        engine.trim(4096, size, true).await.unwrap();
+        let after = engine.stats().await;
+        assert_eq!(after.fua_latency.count, before.fua_latency.count + 1);
+        assert_eq!(after.flush_latency.count, before.flush_latency.count);
+        assert_eq!(
+            after.journal_sync_latency.count,
+            before.journal_sync_latency.count + 1
+        );
+        assert!(after.durable_sequence > before.durable_sequence);
+    }
+}
