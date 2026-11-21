@@ -17,7 +17,7 @@ pub struct Latencies {
 }
 
 /// Store exact nanoseconds until rendering the report in microseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(into = "f64")]
 pub struct LatencyNs(u64);
 
