@@ -23,9 +23,11 @@ import time
 import uuid
 
 try:
-    from campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
+    from campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                             handle_termination, ledger_block_pattern, save_json)
 except ModuleNotFoundError:
-    from scripts.campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
+    from scripts.campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                                     handle_termination, ledger_block_pattern, save_json)
 
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
@@ -41,24 +43,22 @@ def mode_for_cycle(cycle):
     return "flush" if cycle % 2 == 0 else "fua"
 
 
-def expected_records(cycle, token=None):
+def expected_records(cycle, token=None, pattern=CURRENT_BLOCK_PATTERN):
     mode_for_cycle(cycle)
     prefix = "maki-gcp-reset-v1" if token is None else f"maki-gcp-reset-v2:{token}"
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        block = hashlib.shake_256(f"{prefix}:{cycle}:{index}".encode()).digest(4096)
         records.append({"offset": offset, "length": 4096,
-                        "sha256": hashlib.sha256(block).hexdigest()})
+                        "sha256": block_digest(f"{prefix}:{cycle}:{index}", pattern)})
     return records
 
 
-def expected_discard_manifest(cycle, token=None):
-    writes = expected_records(cycle, token)
+def expected_discard_manifest(cycle, token=None, pattern=CURRENT_BLOCK_PATTERN):
+    writes = expected_records(cycle, token, pattern)
     prefix = "maki-gcp-reset-v3-rewrite" if token is None else f"maki-gcp-reset-v3-rewrite:{token}"
-    rewrite_block = hashlib.shake_256(f"{prefix}:{cycle}".encode()).digest(4096)
     rewrite = {"offset": 0, "length": 4096,
-               "sha256": hashlib.sha256(rewrite_block).hexdigest()}
+               "sha256": block_digest(f"{prefix}:{cycle}", pattern)}
     final = [dict(row) for row in writes]
     final[0] = rewrite
     final[8] = {"offset": 4096, "length": 4096, "sha256": ZERO_SHA256}
@@ -132,7 +132,7 @@ def validate_records(records, expected):
         raise ValueError("record manifest mismatch, missing, reordered, or duplicated")
 
 
-def validate_ack(event, cycle, profile="v2", token=None):
+def validate_ack(event, cycle, profile="v2", token=None, *, pattern=CURRENT_BLOCK_PATTERN):
     if not isinstance(event, dict):
         raise ValueError("ACK must be an object")
     if event.get("token") != token or (token is not None and (
@@ -145,10 +145,10 @@ def validate_ack(event, cycle, profile="v2", token=None):
             or event.get("mode") != mode_for_cycle(cycle)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
     if profile == "v3-discard":
-        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle, token):
+        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle, token, pattern):
             raise ValueError("discard manifest mismatch, missing, reordered, or duplicated")
     else:
-        validate_records(event.get("records"), expected_records(cycle, token))
+        validate_records(event.get("records"), expected_records(cycle, token, pattern))
 
 
 def record_ack(ledger, event, cycle, profile="v2", *, token):
@@ -158,6 +158,7 @@ def record_ack(ledger, event, cycle, profile="v2", *, token):
     keys = ("event", "command", "cycle", "mode", "boot_id", "profile", "manifest") \
         if profile == "v3-discard" else ("event", "command", "cycle", "mode", "boot_id", "records")
     record = {key: event[key] for key in (*keys, "token")}
+    record["block_pattern"] = CURRENT_BLOCK_PATTERN
     descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
@@ -170,7 +171,7 @@ def record_ack(ledger, event, cycle, profile="v2", *, token):
         os.close(parent)
 
 
-def load_ledger(ledger, profile="v2", *, token=None):
+def load_ledger(ledger, profile="v2", *, token=None, require_current=False):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ACK ledger")
     raw = ledger.read_text(encoding="utf-8")
@@ -178,6 +179,7 @@ def load_ledger(ledger, profile="v2", *, token=None):
         raise ValueError("empty or truncated ACK ledger")
     latest = None
     seen_boots = set()
+    pattern = CURRENT_BLOCK_PATTERN if require_current else None
     for cycle, line in enumerate(raw.splitlines()):
         try:
             event = json.loads(line)
@@ -186,7 +188,8 @@ def load_ledger(ledger, profile="v2", *, token=None):
         # Older archived ledgers have neither a token nor run-specific payloads.
         if cycle == 0 and token is None and isinstance(event, dict):
             token = event.get("token")
-        validate_ack(event, cycle, profile, token)
+        pattern = ledger_block_pattern(event, pattern)
+        validate_ack(event, cycle, profile, token, pattern=pattern)
         require_unique_boot(seen_boots, event["boot_id"])
         latest = event
     return latest
@@ -668,7 +671,7 @@ def campaign(args):
             finally:
                 process.close()
             save_json(args.output / "results.json", result)
-        latest = load_ledger(ledger, args.profile, token=token)
+        latest = load_ledger(ledger, args.profile, token=token, require_current=True)
         if latest["cycle"] != args.cycles - 1:
             raise ValueError("ACK ledger did not cover every reset cycle")
         result["offline_deep_check"] = run_offline_check(args, args.timeout)

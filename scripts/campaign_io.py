@@ -1,6 +1,7 @@
 """Process and evidence I/O for the Linux reset qualification campaigns."""
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -60,6 +61,33 @@ def save_json(path, value):
             os.close(parent)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+CURRENT_BLOCK_PATTERN = "shake256-4096"
+ARCHIVED_BLOCK_PATTERN = "repeated-sha256"
+
+
+def block_digest(seed, pattern):
+    """Compute the controller's expected digest for a recorded 4 KiB block."""
+    if pattern == CURRENT_BLOCK_PATTERN:
+        block = hashlib.shake_256(seed.encode()).digest(4096)
+    elif pattern == ARCHIVED_BLOCK_PATTERN:
+        block = hashlib.sha256(seed.encode()).digest() * 128
+    else:
+        raise ValueError("unknown ACK block pattern")
+    return hashlib.sha256(block).hexdigest()
+
+
+def ledger_block_pattern(record, expected):
+    """Read host-only format metadata. Older ledgers have no pattern field."""
+    if not isinstance(record, dict):
+        raise ValueError("ACK ledger record must be an object")
+    pattern = record.pop("block_pattern", ARCHIVED_BLOCK_PATTERN)
+    if pattern not in (CURRENT_BLOCK_PATTERN, ARCHIVED_BLOCK_PATTERN):
+        raise ValueError("unknown ACK block pattern")
+    if expected is not None and pattern != expected:
+        raise ValueError("ACK ledger block pattern changed")
+    return pattern
 
 
 def guest_command_output(command, *, timeout, search_path):

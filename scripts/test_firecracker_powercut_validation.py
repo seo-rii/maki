@@ -1,5 +1,6 @@
 """Host-oracle and guest-barrier contracts, without KVM or device operations."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -101,6 +102,21 @@ class HostContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.host.record_ack(self.ledger, ack, 0)
             self.assertFalse(self.ledger.exists())
+
+    def test_previous_ledgers_remain_readable_only_as_historical_evidence(self):
+        archived = self.ack()
+        for index, row in enumerate(archived["records"]):
+            seed = f"maki-firecracker-v1:0:{index}".encode()
+            row["sha256"] = hashlib.sha256(hashlib.sha256(seed).digest() * 128).hexdigest()
+        self.ledger.write_text(json.dumps(archived) + "\n")
+        self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=1), archived["records"])
+        with self.assertRaises(ValueError):
+            self.host.load_ledger(self.ledger, expected_cycles=1, require_current=True)
+        with self.assertRaises(ValueError):
+            self.host.record_ack(self.ledger, archived, 0)
+        self.host.record_ack(self.ledger, self.ack(1), 1)
+        with self.assertRaises(ValueError):
+            self.host.load_ledger(self.ledger, expected_cycles=2)
 
     def test_correct_ack_is_fsynced_and_latest_generation_is_loaded(self):
         with mock.patch.object(self.host.os, "fsync", wraps=self.host.os.fsync) as sync:
