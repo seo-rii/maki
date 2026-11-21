@@ -424,3 +424,22 @@ mod namespace_parity;
 fn crashable_backing_namespace_follows_posix_path_rules() {
     namespace_parity::check("CrashableBacking", || Box::new(CrashableBacking::new()));
 }
+
+#[test]
+fn torn_overwrite_preserves_the_earlier_pending_suffix() {
+    for (offset, keep, expected) in [
+        (1, 0, &b"ABCDEFGH"[..]),
+        (1, 2, b"AxyDEFGH"),
+        (10, 0, b"ABCDEFGH"),
+    ] {
+        let backing = CrashableBacking::new().with_tearing(1);
+        let file = backing.process().open("sample", true).unwrap();
+        file.write_at(0, b"ABCDEFGH").unwrap();
+        file.write_at(offset, b"xyz").unwrap();
+        backing.crash_keep_torn_prefix("sample", keep);
+        let recovered = backing.process().open("sample", false).unwrap();
+        let mut data = vec![0; recovered.len().unwrap() as usize];
+        recovered.read_at(0, &mut data).unwrap();
+        assert_eq!(data, expected);
+    }
+}

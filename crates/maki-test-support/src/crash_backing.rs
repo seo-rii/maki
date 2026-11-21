@@ -719,17 +719,15 @@ impl CrashableBacking {
             if Some(i) == last_write_idx {
                 if let Pend::Write { offset, data: src } = p {
                     let keep = keep_bytes.min(src.len());
-                    // Torn tail: the file only grew as far as the kept
-                    // prefix reaches.
-                    let end = *offset as usize + keep;
-                    apply(
-                        &mut data,
-                        &Pend::Write {
-                            offset: *offset,
-                            data: src[..keep].to_vec(),
-                        },
-                    );
-                    data.truncate(end.max(inode.durable.len()));
+                    if keep > 0 {
+                        apply(
+                            &mut data,
+                            &Pend::Write {
+                                offset: *offset,
+                                data: src[..keep].to_vec(),
+                            },
+                        );
+                    }
                     continue;
                 }
             }
