@@ -1166,14 +1166,14 @@ impl VolumeConfig {
                         "backing.rollback_protection.witness_root {witness:?} must be an absolute path without NUL"
                     )));
                 }
-                let root_path = std::path::Path::new(root);
-                let witness_path = std::path::Path::new(witness);
+                let root_path = resolved_config_path(std::path::Path::new(root));
+                let witness_path = resolved_config_path(std::path::Path::new(witness));
                 if root_path == witness_path {
                     return Err(ConfigError::Invalid(
                         "rollback witness and backing root must be distinct".to_string(),
                     ));
                 }
-                if root_path.starts_with(witness_path) || witness_path.starts_with(root_path) {
+                if root_path.starts_with(&witness_path) || witness_path.starts_with(&root_path) {
                     return Err(ConfigError::Invalid(
                         "rollback witness and backing root must not be nested".to_string(),
                     ));
