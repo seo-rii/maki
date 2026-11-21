@@ -131,7 +131,7 @@ A successful directory contains:
 |---|---|
 | `maki_<candidate-version>_<architecture>.deb` | Runtime package with scanned native dependencies |
 | `maki-<candidate-version>-source.tar.gz` | Git archive of the exact committed source, including `Cargo.lock` |
-| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler environment overrides, package dependencies and artifact hashes |
+| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler and Debian compression environment overrides, package dependencies and artifact hashes |
 | `SHA256SUMS` | Hashes of the package, source archive and manifest |
 
 The output appears only after all build and packaging steps succeed. An

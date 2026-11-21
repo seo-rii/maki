@@ -1,6 +1,7 @@
 """Candidate bundles bind packaged native artifacts to committed source."""
 
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -144,8 +145,10 @@ class ReleasePreparationTests(unittest.TestCase):
     def test_bundle_has_committed_source_dependencies_and_verifiable_manifest(self):
         # Untracked files must neither enter the archive nor affect the build.
         (self.repo / "local-secret").write_text("do not package me")
+        self.environment["DPKG_DEB_COMPRESSOR_TYPE"] = "gzip"
         output, _ = self.prepare()
         manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["package_environment"], {"DPKG_DEB_COMPRESSOR_TYPE": "gzip"})
         self.assertEqual(manifest["source"]["commit"], self.commit)
         self.assertEqual(manifest["source"]["tree"], self.git("rev-parse", "HEAD^{tree}"))
         self.assertEqual(manifest["workspace_version"], "0.1.0")
@@ -175,6 +178,26 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertNotIn("--features", invocation["args"])
         self.assertNotEqual(pathlib.Path(invocation["cwd"]), self.repo)
         self.assertEqual(invocation["epoch"], self.git("show", "-s", "--format=%ct", "HEAD"))
+
+    def test_candidate_hashes_each_published_artifact_once(self):
+        spec = importlib.util.spec_from_file_location("prepare", self.repo / "scripts/prepare_release.py")
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        with mock.patch.dict(os.environ, self.environment, clear=True), mock.patch.object(
+                builder, "digest", wraps=builder.digest) as trace:
+            builder.prepare(self.work / "result")
+        names = [call.args[0].name for call in trace.call_args_list]
+        self.assertCountEqual(names, [p.name for p in (self.work / "result").iterdir() if p.name != "SHA256SUMS"])
+
+    def test_closed_output_after_build_banner_preserves_success(self):
+        output = self.work / "candidate"
+        with subprocess.Popen([sys.executable, "-B", self.repo / "scripts/prepare_release.py",
+                               "--output", output], env=self.environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            self.assertIn(b"Building candidate", child.stdout.readline())
+            child.stdout.close()
+            self.assertEqual(child.wait(timeout=30), 0, child.stderr.read())
+        self.assertTrue((output / "SHA256SUMS").is_file())
 
     def test_source_bytes_and_modes_are_independent_of_archive_attributes(self):
         contents = b"#!/bin/sh\n# revision: $Format:%H$\n"
