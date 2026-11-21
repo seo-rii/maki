@@ -225,19 +225,14 @@ fn main() -> ExitCode {
                 Ok(raw) => raw,
                 Err(e) => return fail(format!("{config}: {e}")),
             };
-            let created = if argv.len() == 4 {
-                maki_nbdkit::daemon::create_volume_with_discard_from_config_str(&raw)
-            } else {
-                maki_nbdkit::daemon::create_volume_from_config_str(&raw)
+            let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
+                Ok(creation) => creation,
+                Err(error) => return fail(error.to_string()),
             };
-            match created {
+            match creation.create(argv.len() == 4) {
                 Ok(sb) => {
-                    // The superblock does not record the volume name.
-                    let cfg = maki_format::config::parse_config(&raw).ok();
-                    let name = cfg
-                        .as_ref()
-                        .map(|cfg| cfg.volume.name.as_str())
-                        .unwrap_or_default();
+                    let cfg = creation.config();
+                    let name = &cfg.volume.name;
                     // Creation is already durable. Report output errors without
                     // making callers retry a successfully initialized volume.
                     let summary = writeln!(
@@ -256,7 +251,7 @@ fn main() -> ExitCode {
                             );
                         }
                     }
-                    if let Some(hint) = ownership_hint(running_as_root(), cfg.as_ref()) {
+                    if let Some(hint) = ownership_hint(running_as_root(), cfg) {
                         let _ = writeln!(io::stderr().lock(), "warning: {hint}");
                     }
                     ExitCode::SUCCESS
@@ -264,13 +259,28 @@ fn main() -> ExitCode {
                 Err(e) => fail(e.to_string()),
             }
         }
-        ["volume", command, ..]
-            if matches!(
-                *command,
-                "witness" | "snapshot" | "takeover" | "restore" | "resume-enrollment" | "gc"
-            ) =>
-        {
-            match remote_volume(&argv[1..]) {
+        ["volume", verb, config, tail @ ..] => {
+            let command = match (*verb, tail) {
+                ("witness", []) => RemoteVolume::Witness,
+                ("gc", []) => RemoteVolume::Gc,
+                ("snapshot", [directory]) => RemoteVolume::Snapshot { directory },
+                ("resume-enrollment", [fence, identity] | [fence, identity, "--discard"]) => {
+                    RemoteVolume::ResumeEnrollment {
+                        fence,
+                        identity,
+                        discard: tail.len() == 3,
+                    }
+                }
+                ("takeover", [fence, root]) => RemoteVolume::Takeover { fence, root },
+                ("restore", [directory, fence, root, approved_source]) => RemoteVolume::Restore {
+                    directory,
+                    fence,
+                    root,
+                    approved_source,
+                },
+                _ => return usage(),
+            };
+            match remote_volume(config, command) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(error),
             }
@@ -446,20 +456,16 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
 /// The backing tree is created owner-only; a root-created volume is
 /// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). A local
 /// rollback witness is created the same way, so name both paths.
-fn ownership_hint(
-    as_root: bool,
-    cfg: Option<&maki_format::config::VolumeConfig>,
-) -> Option<String> {
+fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Option<String> {
     if !as_root {
         return None;
     }
-    let local_witness = cfg.and_then(|cfg| {
-        cfg.backing
-            .rollback_protection
-            .as_ref()
-            .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
-            .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()))
-    });
+    let local_witness = cfg
+        .backing
+        .rollback_protection
+        .as_ref()
+        .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
+        .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()));
     Some(match local_witness {
         Some((root, witness)) => format!(
             "the volume tree {root} and the rollback witness in {witness} were created \
@@ -597,17 +603,37 @@ fn read_snapshot(
     Ok(descriptor)
 }
 
-fn remote_volume(args: &[&str]) -> Result<(), String> {
+enum RemoteVolume<'a> {
+    Witness,
+    Gc,
+    Snapshot {
+        directory: &'a str,
+    },
+    Takeover {
+        fence: &'a str,
+        root: &'a str,
+    },
+    Restore {
+        directory: &'a str,
+        fence: &'a str,
+        root: &'a str,
+        approved_source: &'a str,
+    },
+    ResumeEnrollment {
+        fence: &'a str,
+        identity: &'a str,
+        discard: bool,
+    },
+}
+
+fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> {
     use maki_backing::remote_witness::Phase;
     use maki_backing::{Backing, FileBacking, RollbackBacking};
     use std::path::Path;
     #[cfg(not(target_os = "linux"))]
-    if args.first() != Some(&"witness") {
+    if !matches!(command, RemoteVolume::Witness) {
         return Err("remote rollback volume operations are supported only on Linux".into());
     }
-    let config = args
-        .get(1)
-        .ok_or("remote volume command requires a configuration file")?;
     let cfg = read_config(config)?;
     let remote = cfg
         .backing
@@ -616,14 +642,14 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
         .and_then(|rollback| rollback.remote.as_ref())
         .ok_or("command requires remote rollback protection")?;
     let rpc = maki_nbdkit::daemon::remote_witness_client(remote).map_err(|e| e.to_string())?;
-    match args {
-        ["witness", _] => {
+    match command {
+        RemoteVolume::Witness => {
             println!(
                 "{}",
                 serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
             );
         }
-        ["gc", _] => {
+        RemoteVolume::Gc => {
             let report =
                 RollbackBacking::collect_remote(Path::new(&cfg.backing.root), rpc.as_ref())
                     .map_err(|e| e.to_string())?;
@@ -639,8 +665,11 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 })
             );
         }
-        ["resume-enrollment", _, fence, identity]
-        | ["resume-enrollment", _, fence, identity, "--discard"] => {
+        RemoteVolume::ResumeEnrollment {
+            fence,
+            identity,
+            discard,
+        } => {
             let fence: u64 = fence
                 .parse()
                 .map_err(|_| "approved fence must be an unsigned integer")?;
@@ -662,13 +691,8 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                     "enrollment approval does not match a never-activated authority".into(),
                 );
             }
-            maki_nbdkit::daemon::resume_enrollment_from_config(
-                &cfg,
-                rpc.clone(),
-                &before,
-                args.len() == 5,
-            )
-            .map_err(|e| e.to_string())?;
+            maki_nbdkit::daemon::resume_enrollment_from_config(&cfg, rpc.clone(), &before, discard)
+                .map_err(|e| e.to_string())?;
             let after = witness_record(rpc.as_ref())?;
             if after.identity != before.identity
                 || Some(after.fence) != before.fence.checked_add(1)
@@ -682,7 +706,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&after).map_err(|e| e.to_string())?
             );
         }
-        ["snapshot", _, directory] => {
+        RemoteVolume::Snapshot { directory } => {
             let target = Path::new(directory);
             RollbackBacking::check_snapshot_destination(target).map_err(|e| e.to_string())?;
             let backing = RollbackBacking::open_remote(Path::new(&cfg.backing.root), rpc.clone())
@@ -715,7 +739,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
             );
         }
-        ["takeover", _, fence, root] => {
+        RemoteVolume::Takeover { fence, root } => {
             let before = approved_record(rpc.as_ref(), fence, root)?;
             let backing = RollbackBacking::takeover_remote(
                 Path::new(&cfg.backing.root),
@@ -730,7 +754,12 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&record).map_err(|e| e.to_string())?
             );
         }
-        ["restore", _, directory, fence, root, approved_source] => {
+        RemoteVolume::Restore {
+            directory,
+            fence,
+            root,
+            approved_source,
+        } => {
             let approved_source = approved_hash(approved_source)?;
             let source = read_snapshot(Path::new(directory))?;
             if source.anchor.root != approved_source {
@@ -752,7 +781,6 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&record).map_err(|e| e.to_string())?
             );
         }
-        _ => return Err("invalid remote volume command arguments; see maki usage".into()),
     }
     Ok(())
 }
