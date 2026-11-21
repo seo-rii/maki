@@ -97,6 +97,23 @@ fn initialization_and_each_advance_make_both_copies_durable() {
 }
 
 #[test]
+fn healthy_proof_publication_reuses_the_validated_copies() {
+    let (backing, mut proof) = setup();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let observed = opens.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op| {
+        if matches!(op, FaultOp::Open { path, create: false } if matches!(*path, A | B)) {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }
+        None
+    })));
+    advance(&backing, &mut proof, 1);
+    // Each publication opens both copies for validation and reopens the
+    // preserved side to rewrite its validated image before overwriting its peer.
+    assert_eq!(opens.load(Ordering::Relaxed), 6);
+}
+
+#[test]
 fn required_proof_never_falls_back_to_empty_or_reinitializes_history() {
     let backing = CrashableBacking::new();
     assert!(DurableProofStore::load(&backing, UUID).is_err());
