@@ -8,6 +8,7 @@ The host needs Docker, libnbd.so.0, and Python 3. No Python packages are needed.
 import argparse
 from contextlib import contextmanager
 import ctypes
+from fractions import Fraction
 import hashlib
 import json
 import os
@@ -23,6 +24,9 @@ try:
     from campaign_io import save_json
 except ModuleNotFoundError:
     from scripts.campaign_io import save_json
+
+
+PIDS_LIMIT = "64"
 
 
 def ensure(condition, message):
@@ -280,7 +284,7 @@ socket = "/case/control.sock"
         source = str(self.case).replace('"', '""')
         return ["--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--user", f"{os.getuid()}:{os.getgid()}",
-                "--pids-limit", "64", "--memory", memory, "--memory-swap", memory,
+                "--pids-limit", PIDS_LIMIT, "--memory", memory, "--memory-swap", memory,
                 "--cpus", cpus, "--label", "maki.failure-validation=" + self.token,
                 "--mount", f'type=bind,"src={source}",dst=/case']
 
@@ -456,11 +460,17 @@ socket = "/case/control.sock"
             self.identifier = None
 
 
-def require_memory_limits(resources, memory_mib):
-    expected = {"memory.max": str(memory_mib << 20), "memory.swap.max": "0"}
+def require_limits(resources, memory_mib, cpus="1"):
+    expected = {"memory.max": str(memory_mib << 20), "memory.swap.max": "0", "pids.max": PIDS_LIMIT}
     for field, limit in expected.items():
         observed = resources.get(field)
         ensure(observed == limit, f"expected {field}={limit}, observed {observed!r}")
+    observed = resources.get("cpu.max")
+    pair = re.fullmatch(r"([0-9]+)\s+([0-9]+)", observed or "")
+    message = f"expected cpu.max quota/period of {cpus}, observed {observed!r}"
+    ensure(pair, message)
+    quota, period = map(int, pair.groups())
+    ensure(period > 0 and quota == Fraction(cpus) * period, message)
 
 
 def constrained_recovery(target, memory_mib=32, rounds=1):
@@ -482,7 +492,7 @@ def constrained_recovery(target, memory_mib=32, rounds=1):
                     if state["Running"]:
                         raise
                 else:
-                    require_memory_limits(resources, memory_mib)
+                    require_limits(resources, memory_mib)
                     return {"ready": False, "outcome": "startup-timeout", "limits_verified": True,
                             "deadline_seconds": 30,
                             "resources": resources, "state_before_cleanup": state,
@@ -493,10 +503,10 @@ def constrained_recovery(target, memory_mib=32, rounds=1):
             return {"ready": False, "outcome": "startup-oom", "limits_verified": False,
                     "termination": state}
         else:
-            require_memory_limits(target.stats(), memory_mib)
+            require_limits(target.stats(), memory_mib)
             verification = target.client("verify", rounds=rounds)
             resources = target.stats()
-            require_memory_limits(resources, memory_mib)
+            require_limits(resources, memory_mib)
             target.kill()
             return {"ready": True, "outcome": "verified", "limits_verified": True,
                     "verification": verification, "resources": resources}
@@ -521,10 +531,11 @@ def campaign(args):
             directory.mkdir(mode=0o700)
             target = Target(image_id, directory)
             with remove_after(target):
-                target.start(memory="96m", cpus="0.25" if scenario == "cpu-memory-kill" else "1")
+                cpus = "0.25" if scenario == "cpu-memory-kill" else "1"
+                target.start(memory="96m", cpus=cpus)
                 record["workload"] = target.client("write", rounds=args.rounds)
                 record["resources"] = target.stats()
-                require_memory_limits(record["resources"], 96)
+                require_limits(record["resources"], 96, cpus)
                 if scenario == "cpu-memory-kill":
                     cpu = dict(line.split() for line in record["resources"]["cpu.stat"].splitlines())
                     ensure(int(cpu["nr_throttled"]) > 0, "no observed CPU throttling")
@@ -538,7 +549,7 @@ def campaign(args):
                     run(["docker", "update", "--memory", "32m", "--memory-swap", "32m", target.identifier])
                     ensure(target.state()["Running"], "limit shrink killed target before pressure I/O")
                     record["pressure_resources"] = target.stats()
-                    require_memory_limits(record["pressure_resources"], 32)
+                    require_limits(record["pressure_resources"], 32, cpus)
                     record["pressure_client"] = target.client("pressure", check=False)
                     record["pressure_progress"] = json.loads(target.ledger.with_name("pressure-progress.json").read_text())
                     require_pressure(record["pressure_progress"])
@@ -552,7 +563,7 @@ def campaign(args):
                 target.start()
                 record["recovery"] = target.client("verify", rounds=args.rounds + int(scenario == "freeze-resume"))
                 record["recovery_resources"] = target.stats()
-                require_memory_limits(record["recovery_resources"], 192)
+                require_limits(record["recovery_resources"], 192)
                 target.kill()
                 target.remove()
                 # Offline format/CRC check complements authenticated NBD readback.

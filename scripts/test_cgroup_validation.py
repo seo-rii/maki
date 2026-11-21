@@ -16,6 +16,11 @@ campaign = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(campaign)
 
 
+def resource_snapshot(memory_mib, cpu="100000 100000"):
+    return {"memory.max": str(memory_mib << 20), "memory.swap.max": "0",
+            "cpu.max": cpu, "pids.max": "64"}
+
+
 class Client:
     def __init__(self, fail=None):
         self.data = {}
@@ -423,8 +428,8 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
                          SwapLimit=True, CpuCfsQuota=True, PidsLimit=True, ServerVersion="fixture")))
         target = mock.Mock()
         target.client.return_value = target.kill.return_value = {}
-        target.stats.side_effect = [{"cpu.stat": "nr_throttled 1", "memory.max": str(96 << 20), "memory.swap.max": "0"},
-                                    {"memory.max": str(192 << 20), "memory.swap.max": "0"}]
+        target.stats.side_effect = [{**resource_snapshot(96, "12500 50000"), "cpu.stat": "nr_throttled 1"},
+                                    resource_snapshot(192)]
         target.one_shot.return_value = mock.Mock(returncode=0, stdout="ok")
 
         def create(_image, directory):
@@ -485,7 +490,7 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target = mock.Mock()
         target.start.side_effect = TimeoutError("no READY")
         target.state.return_value = {"Running": True, "OOMKilled": False}
-        target.stats.return_value = {"memory.max": "33554432", "memory.swap.max": "0"}
+        target.stats.return_value = resource_snapshot(32)
         result = campaign.constrained_recovery(target)
         self.assertFalse(result["ready"])
         self.assertEqual(result["outcome"], "startup-timeout")
@@ -498,13 +503,13 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target = mock.Mock()
         target.start.side_effect = TimeoutError("no READY")
         target.state.return_value = {"Running": True, "OOMKilled": False}
-        target.stats.return_value = {"memory.max": "67108864", "memory.swap.max": "0"}
+        target.stats.return_value = resource_snapshot(64)
         result = campaign.constrained_recovery(target, memory_mib=64)
         self.assertFalse(result["ready"])
         target.start.assert_called_once_with(memory="64m")
 
     def test_only_the_observed_memory_cap_and_disabled_swap_can_qualify_readback(self):
-        expected = {"memory.max": str(64 << 20), "memory.swap.max": "0"}
+        expected = resource_snapshot(64)
         for field, value in (("memory.max", "max"), ("memory.max", str(192 << 20)),
                              ("memory.swap.max", "max"), ("memory.swap.max", "unavailable"),
                              ("memory.max", None)):
@@ -529,11 +534,26 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         target.assert_has_calls([mock.call.stats(), mock.call.client("verify", rounds=7),
                                  mock.call.stats(), mock.call.kill()])
 
+    def test_throttling_does_not_prove_expected_cpu_or_pid_limits(self):
+        expected = {**resource_snapshot(96, "25000 100000"), "cpu.stat": "nr_throttled 7"}
+        campaign.require_limits(expected, 96, "0.25")
+        for field, value in (("cpu.max", "50000 100000"), ("cpu.max", "max 100000"),
+                             ("cpu.max", "0 0"), ("cpu.max", "unavailable"), ("cpu.max", None),
+                             ("pids.max", "128"), ("pids.max", "max"), ("pids.max", None)):
+            with self.subTest(field=field, value=value):
+                observed = dict(expected)
+                if value is None:
+                    del observed[field]
+                else:
+                    observed[field] = value
+                with self.assertRaisesRegex(AssertionError, field):
+                    campaign.require_limits(observed, 96, "0.25")
+
     def test_limits_must_still_match_after_recovery_readback(self):
         target = mock.Mock()
         target.stats.side_effect = [
-            {"memory.max": str(32 << 20), "memory.swap.max": "0"},
-            {"memory.max": "max", "memory.swap.max": "0"},
+            resource_snapshot(32),
+            {**resource_snapshot(32), "memory.max": "max"},
         ]
         with self.assertRaisesRegex(AssertionError, "memory.max"):
             campaign.constrained_recovery(target)
