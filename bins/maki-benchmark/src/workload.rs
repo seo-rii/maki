@@ -125,6 +125,17 @@ impl Oracle {
     fn generation(&self, slot: usize) -> u64 {
         self.generations[slot].load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG
     }
+
+    fn final_sweep_states(&self, options: &Options) -> &[AtomicU64] {
+        if !options.random && options.read_percent.is_none() {
+            // Sequential phased writes start at slot zero and wrap after the
+            // last slot. All initialized slots form a prefix.
+            let written = options.ops.min(self.generations.len() as u64) as usize;
+            &self.generations[..written]
+        } else {
+            &self.generations
+        }
+    }
 }
 fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
     // SplitMix64: reproducible independent address draws, without an address
@@ -283,14 +294,15 @@ async fn verify_final(
 ) -> Result<VerificationReport, String> {
     let began = Instant::now();
     let mut report = VerificationReport::default();
-    for (slot, state) in oracle.generations.iter().enumerate() {
-        let generation = oracle.generation(slot);
+    for (slot, state) in oracle.final_sweep_states(options).iter().enumerate() {
+        let state = state.load(Ordering::Acquire);
+        let generation = state & !READ_AFTER_WRITE_FLAG;
         if generation > 0 {
             report.written_slots += 1;
         } else if options.read_percent.is_none() {
             continue;
         }
-        if state.load(Ordering::Acquire) & READ_AFTER_WRITE_FLAG != 0 {
+        if state & READ_AFTER_WRITE_FLAG != 0 {
             report.read_after_write_verified_slots += 1;
         }
         let offset = slot as u64 * options.io_size as u64;
