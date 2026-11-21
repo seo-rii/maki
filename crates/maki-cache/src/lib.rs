@@ -174,9 +174,9 @@ impl VersionedLruCache {
     /// misses. TTL is evaluated on lookup, not by a background timer. The
     /// returned owner remains valid until dropped, including after eviction.
     pub fn get(&self, unit: u64, write_sequence: u64) -> Option<Arc<SecretBuffer>> {
-        let now = self.clock.now();
         let ttl = self.ttl.lock();
         let mut inner = self.inner.lock();
+        let now = self.clock.now();
         let result = match inner.map.get(&unit) {
             Some(entry)
                 if entry.write_sequence == write_sequence
@@ -340,5 +340,56 @@ mod monitoring_tests {
         observer.join().unwrap();
         assert_eq!(during.expect("monitoring waited for cache mutation"), None);
         assert_eq!(cache.try_stats(), Some(cache.stats()));
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::*;
+    use maki_crypto::clock::SleepFuture;
+
+    #[derive(Default)]
+    struct InterleavingClock {
+        millis: AtomicU64,
+        on_sample: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl Clock for InterleavingClock {
+        fn now(&self) -> Duration {
+            let time = Duration::from_millis(self.millis.load(Ordering::SeqCst));
+            if let Some(action) = self.on_sample.lock().take() {
+                action();
+            }
+            time
+        }
+
+        fn sleep(&self, _: Duration) -> SleepFuture {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn lookup_cannot_combine_an_old_timestamp_with_a_new_ttl() {
+        let clock = Arc::new(InterleavingClock::default());
+        let cache = Arc::new(VersionedLruCache::new(
+            CacheConfig {
+                max_bytes: 4096,
+                ttl: Duration::from_millis(100),
+                zeroize_on_evict: true,
+            },
+            clock.clone(),
+        ));
+        cache.put(1, 1, SecretBuffer::from_slice(&[42]));
+        clock.millis.store(150, Ordering::SeqCst);
+        let changing = cache.clone();
+        let advancing = clock.clone();
+        *clock.on_sample.lock() = Some(Box::new(move || {
+            // If lookup allows reconfiguration after sampling time, publish
+            // the longer TTL at age 300ms. Neither TTL ever covers this read.
+            advancing.millis.store(300, Ordering::SeqCst);
+            if changing.ttl.try_lock().is_some() && changing.inner.try_lock().is_some() {
+                changing.reconfigure(4096, Some(Duration::from_millis(200)));
+            }
+        }));
+        assert!(cache.get(1, 1).is_none());
     }
 }
