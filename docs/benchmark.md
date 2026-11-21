@@ -116,8 +116,10 @@ and sweeps the complete initialized working set.
 
 `resources` distinguishes exact and sampled values:
 
-- `peak_pending_operations` counts submitted, unfinished engine calls and
-  returns to `pending_operations_at_exit = 0` on success.
+- `peak_pending_operations` is the largest number of measured engine reads and
+  writes in progress at once. Counting starts when a worker polls the engine
+  call and ends when the call completes. `pending_operations_at_exit` is zero
+  on success.
 - `oracle_generation_bytes` reports eight bytes per tracked slot, excluding
   allocator overhead and the at-most-256 sequencing locks.
 - `observed_peak_active_callbacks`, `observed_peak_plaintext_bytes`,

@@ -225,6 +225,36 @@ fn samples() -> Samples {
 }
 
 #[tokio::test]
+async fn queued_workers_do_not_count_as_pending_engine_calls() {
+    let (engine, _) = fixture().await;
+    let options = options();
+    let slots = options.ops;
+    let oracle = Arc::new(Oracle::new(slots).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    let mut writes = std::pin::pin!(phase(
+        &engine,
+        &options,
+        slots,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples,
+    ));
+
+    // On this current-thread runtime, the first poll queues a distinct-slot
+    // cohort and waits for a result before any worker can run.
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+    assert_eq!(pending.peak.load(Ordering::SeqCst), 0);
+
+    writes.await.unwrap();
+    assert!(pending.peak.load(Ordering::SeqCst) > 0);
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn same_address_previous_generation_fails_the_real_read_phase() {
     let (engine, provider) = fixture().await;
     let options = options();
@@ -352,6 +382,22 @@ async fn rejected_write_does_not_advance_expected_generation() {
     assert!(result.unwrap_err().contains("write at offset 0 failed"));
     assert_eq!(oracle.generations[0].load(Ordering::Acquire), 0);
     assert!(provider.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn final_sweep_bounds_follow_the_initialized_address_range() {
+    let oracle = Oracle::new(32).unwrap();
+    let mut options = options();
+    for (ops, expected) in [(1, 1), (32, 32), (48, 32)] {
+        options.ops = ops;
+        assert_eq!(oracle.final_sweep_states(&options).len(), expected);
+    }
+    options.ops = 1;
+    options.random = true;
+    assert_eq!(oracle.final_sweep_states(&options).len(), 32);
+    options.random = false;
+    options.read_percent = Some(100);
+    assert_eq!(oracle.final_sweep_states(&options).len(), 32);
 }
 
 #[test]
