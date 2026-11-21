@@ -187,15 +187,23 @@ If cleanup fails, the daemon stays running for the remaining mount; follow the
 # Succeeds once every named unit is inactive; fails at once if one failed
 # (inspect it before continuing) or after WAIT_SECONDS (default 600).
 wait_stopped() {
-    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
-    for unit in "$@"; do
-        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
-            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
-                echo "$unit is $state: preserve the host state and inspect it" >&2
+    local unit state pending deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    while :; do
+        pending=
+        for unit in "$@"; do
+            state=$(systemctl show -P ActiveState "$unit") || return 1
+            if [ "$state" = failed ]; then
+                echo "$unit failed: preserve the host state and inspect it" >&2
                 return 1
             fi
-            sleep 1
+            if [ "$state" != inactive ]; then pending="$unit ($state)"; fi
         done
+        [ -n "$pending" ] || return 0
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Still waiting for $pending" >&2
+            return 1
+        fi
+        sleep 1
     done
 }
 maki-attach verify --volume demo &&

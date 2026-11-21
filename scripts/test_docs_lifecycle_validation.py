@@ -9,7 +9,11 @@ until `inactive` and stop on `failed`.
 """
 
 from pathlib import Path
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 
@@ -26,6 +30,49 @@ def bash_blocks(text):
 
 
 class StopWaitContract(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash")
+    def test_rechecks_units_while_others_stop(self):
+        for path in STOP_GUIDES:
+            definition = re.search(r"^wait_stopped\(\) \{.*?^\}", path.read_text(), re.M | re.S)[0]
+            script = """
+tick=0
+sleep() { tick=1; }
+systemctl() {
+    case "$tick:$4" in
+        0:first) echo inactive ;;
+        0:second) echo deactivating ;;
+        1:first) echo failed ;;
+        1:second) echo inactive ;;
+    esac
+}
+""" + definition + "\nwait_stopped first second"
+            with self.subTest(path=path):
+                self.assertEqual(subprocess.run(["bash", "-c", script], capture_output=True,
+                                                timeout=5).returncode, 1)
+
+    @unittest.skipUnless(all(shutil.which(tool) for tool in ("bash", "nbdkit", "nbdcopy", "nbdinfo")),
+                         "requires local NBD userspace tools")
+    def test_rootless_smoke_checks_only_tested_extent_and_propagates_failure(self):
+        section = STOP_GUIDES[0].read_text().split("## Rootless userspace smoke test", 1)[1]
+        block = bash_blocks(section)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            script = work / "smoke"
+            script.write_text(block.replace("'nbd+unix:///?socket=/run/maki/example/nbd.sock'", '"$uri"'))
+            # fio is independent of the byte comparison. A successful last step
+            # must never turn a failed copy or comparison into a passing test.
+            fio = work / "fio"
+            fio.write_text("#!/bin/sh\nexit 0\n")
+            fio.chmod(0o700)
+            env = {**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"], "TMPDIR": directory}
+            for size, succeeds in [("12M", True), ("4M", False)]:
+                result = subprocess.run(["nbdkit", "-U", "-", "memory", size, "--run", 'export uri; bash "$SMOKE"'],
+                                        env={**env, "SMOKE": str(script)}, capture_output=True, timeout=30)
+                with self.subTest(size=size):
+                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    if succeeds:
+                        self.assertNotIn(b"EOF on", result.stderr)
+
     def test_no_guide_waits_while_is_active(self):
         for path in [*STOP_GUIDES, *sorted((ROOT / "docs").rglob("*.md"))]:
             if "qualification" in path.parts:

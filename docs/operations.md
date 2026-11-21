@@ -331,16 +331,21 @@ Read the journal with `journalctl -u maki@<volume>.service`.
 
 ## Rootless userspace smoke test
 
-The following test overwrites the complete disposable export:
+Use a disposable export at least 8 MiB in size. This test overwrites its first
+8 MiB. The readback uses the nbdkit offset filter to copy exactly that range:
 
 ```bash
+(
+set -euo pipefail
 uri='nbd+unix:///?socket=/run/maki/example/nbd.sock'
 test_dir="$(mktemp -d)"
 
 nbdinfo "$uri"
 dd if=/dev/urandom of="$test_dir/source.bin" bs=1M count=8 status=none
 nbdcopy --flush --synchronous "$test_dir/source.bin" "$uri"
-nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"
+export test_dir
+nbdkit -r -U - --filter=offset nbd "$uri" range=8M \
+  --run 'nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"'
 cmp "$test_dir/source.bin" "$test_dir/roundtrip.bin"
 
 fio --name=maki-nbd-verify \
@@ -348,6 +353,7 @@ fio --name=maki-nbd-verify \
   --rw=write --bs=4k --size=8M --iodepth=1 --fsync=32 \
   --verify=crc32c --do_verify=1 --verify_fatal=1 \
   --verify_state_save=0
+)
 ```
 
 This covers Maki through nbdkit and libnbd without a kernel device. It does not
@@ -756,15 +762,23 @@ backing storage:
 # Succeeds once every named unit is inactive; fails at once if one failed
 # (inspect it before continuing) or after WAIT_SECONDS (default 600).
 wait_stopped() {
-    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
-    for unit in "$@"; do
-        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
-            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
-                echo "$unit is $state: preserve the host state and inspect it" >&2
+    local unit state pending deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    while :; do
+        pending=
+        for unit in "$@"; do
+            state=$(systemctl show -P ActiveState "$unit") || return 1
+            if [ "$state" = failed ]; then
+                echo "$unit failed: preserve the host state and inspect it" >&2
                 return 1
             fi
-            sleep 1
+            if [ "$state" != inactive ]; then pending="$unit ($state)"; fi
         done
+        [ -n "$pending" ] || return 0
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Still waiting for $pending" >&2
+            return 1
+        fi
+        sleep 1
     done
 }
 systemctl stop maki-workload@pg.target
