@@ -25,7 +25,8 @@ cargo test --workspace --release --locked -- --ignored
 
 On Linux, `run_cargo_tests.py` first compiles the same selection with
 `--no-run --message-format=json` and passes the exact reported nbdkit cdylib
-path into the test run. Cargo 1.100 puts integration tests and libraries in
+path into the test run. Windows cross-target tests use Cargo's configured
+runner without a Linux plugin path. Cargo 1.100 puts integration tests and libraries in
 separate unit directories, so native fixtures cannot infer the plugin path
 from the test executable or loader search path. The wrapper uses the same
 Cargo options, features and profile for both phases; it does not search old
