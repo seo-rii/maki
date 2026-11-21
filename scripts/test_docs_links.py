@@ -113,6 +113,29 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "[real](guide.md#real-title) [literal](guide.md#code-heading)\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#code-heading (missing anchor)"])
 
+    def test_footnote_paragraph_links_and_literal_blocks(self):
+        self.write("guide.md", "# Setup\n")
+        self.write("README.md", "Notes[^wide-label] and [^two].\n\n"
+                   "   [^wide-label]:[first](missing-first.md)\n\n"
+                   "    [ok](guide.md#setup) and [bad](guide.md#absent)\n\n"
+                   "\t\t[code](ignored.md)\n\n"
+                   "    ~~~\n    [fenced](ignored.md)\n    ~~~\n\n"
+                   "[^two]:\n\n\t[second](missing-second.md)\n\n"
+                   "Outside.\n\n    [code](ignored.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing-first.md", "README.md:5: guide.md#absent (missing anchor)",
+            "README.md:15: missing-second.md",
+        ])
+
+    def test_footnote_continuation_inside_a_list_and_block_quote(self):
+        self.write("README.md", "Notes[^listed] and [^quoted].\n\n"
+                   "- [^listed]: first paragraph\n\n      [nested](missing.md)\n\n"
+                   "> [^quoted]: [first](quoted.md)\n>\n>     [code](ignored.md)\n\n"
+                   "[outside](also-missing.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:5: missing.md", "README.md:7: quoted.md", "README.md:11: also-missing.md",
+        ])
+
     def test_table_cells_cannot_hide_a_link_in_another_cell_or_row(self):
         self.write("README.md", "| Token | Link | Token |\n| --- | --- | --- |\n"
                    "| ` | [one](missing.md) | ` |\n\n"

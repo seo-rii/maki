@@ -80,6 +80,8 @@ LINK_LABEL = re.compile(r"\[((?:[^\\\[\]]|\\.){0,999})\]")
 # Container margins are consumed in nesting order before classifying a block.
 QUOTE_MARKER = re.compile(r" {0,3}>[ \t]?")
 BLOCK_LIST_MARKER = re.compile(r" {0,3}(?:[-+*]|[0-9]{1,9}[.)])( +|$)")
+FOOTNOTE_MARKER = re.compile(r" {0,3}\[\^[^\] \t\r\n\x00]+\]:[ \t]*")
+FOOTNOTE_CONTAINER = object()
 THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 
@@ -134,9 +136,8 @@ def opening_fence(content):
 
 def document_lines(text):
     """Strip container margins and distinguish Markdown from literal blocks."""
-    # Each open container is a block quote (None) or a list item's continuation
-    # indentation in columns. Preserve their order for lists inside quotes and
-    # quotes inside lists. A literal block cannot continue beyond its container.
+    # None denotes a block quote. List items store their continuation width,
+    # and footnotes have a fixed four-column margin and their own blank-line rule.
     containers = []
     block = None
     html_end = None
@@ -146,7 +147,8 @@ def document_lines(text):
         pos = 0
         changed = False
         lazy = False
-        for index, indent in enumerate(containers):
+        for index, container in enumerate(containers):
+            indent = 4 if container is FOOTNOTE_CONTAINER else container
             if indent is None:
                 quote = QUOTE_MARKER.match(columns, pos)
                 if quote:
@@ -155,12 +157,13 @@ def document_lines(text):
             elif columns.startswith(" " * indent, pos):
                 pos += indent
                 continue
-            elif not columns[pos:].strip():
+            elif not columns[pos:].strip() and (container is not FOOTNOTE_CONTAINER or not line):
                 pos = len(columns)
                 continue
             rest = columns[pos:]
             if (in_paragraph and rest.strip() and not QUOTE_MARKER.match(rest)
-                    and not BLOCK_LIST_MARKER.match(rest) and not ATX_HEADING.match(rest)
+                    and not BLOCK_LIST_MARKER.match(rest) and not FOOTNOTE_MARKER.match(rest)
+                    and not ATX_HEADING.match(rest)
                     and not THEMATIC_BREAK.fullmatch(rest) and not opening_fence(rest)
                     and html_block_end(rest, True) is None):
                 # A paragraph can continue without repeating list indentation
@@ -190,6 +193,11 @@ def document_lines(text):
             if quote:
                 containers.append(None)
                 pos = quote.end()
+                continue
+            footnote = FOOTNOTE_MARKER.match(columns, pos)
+            if footnote:
+                containers.append(FOOTNOTE_CONTAINER)
+                pos = footnote.end()
                 continue
             if THEMATIC_BREAK.fullmatch(columns[pos:]):
                 break
