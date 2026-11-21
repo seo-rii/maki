@@ -164,3 +164,47 @@ fn existing_volume_geometry_still_bounds_a_changed_config() {
     assert!(output.stdout.is_empty());
     assert_eq!(std::fs::read(&superblock).unwrap(), original);
 }
+
+#[cfg(unix)]
+#[test]
+fn closed_report_pipe_after_the_workload_exits_quietly() {
+    for flags in [&["--json"][..], &[][..]] {
+        let (_dir, config) = fixture();
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))
+            .args(flags)
+            .arg(&config)
+            .args(["2", "4096"])
+            .env("MAKI_CREDENTIAL_BENCHMARK_REPORT_KEY", "17".repeat(32))
+            .stdout(writer)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_report_destination_reports_the_completed_workload() {
+    let (_dir, config) = fixture();
+    let full = std::fs::File::options()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))
+        .arg("--json")
+        .arg(&config)
+        .args(["2", "4096"])
+        .env("MAKI_CREDENTIAL_BENCHMARK_REPORT_KEY", "17".repeat(32))
+        .stdout(full)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("verification completed, but writing the report failed"));
+}
