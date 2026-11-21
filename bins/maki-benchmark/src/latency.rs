@@ -1,6 +1,7 @@
 //! Fixed-memory latency histogram. 32 subdivisions per power of two bound
 //! quantile overestimation by 3.125%, without retaining one sample per I/O.
 
+use std::fmt;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -15,14 +16,31 @@ pub struct Latencies {
     max_ns: u64,
 }
 
+/// Store exact nanoseconds until rendering the report in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(into = "f64")]
+pub struct LatencyNs(u64);
+
+impl From<LatencyNs> for f64 {
+    fn from(value: LatencyNs) -> Self {
+        value.0 as f64 / 1000.0
+    }
+}
+
+impl fmt::Display for LatencyNs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:03}", self.0 / 1000, self.0 % 1000)
+    }
+}
+
 #[derive(Serialize)]
 pub struct LatencyReport {
     pub samples: u64,
     pub mean_us: f64,
-    pub p50_upper_us: f64,
-    pub p95_upper_us: f64,
-    pub p99_upper_us: f64,
-    pub max_us: f64,
+    pub p50_upper_us: LatencyNs,
+    pub p95_upper_us: LatencyNs,
+    pub p99_upper_us: LatencyNs,
+    pub max_us: LatencyNs,
 }
 
 impl Latencies {
@@ -75,10 +93,10 @@ impl Latencies {
         LatencyReport {
             samples: self.count,
             mean_us: self.sum_ns as f64 / self.count.max(1) as f64 / 1000.0,
-            p50_upper_us: self.percentile(50) as f64 / 1000.0,
-            p95_upper_us: self.percentile(95) as f64 / 1000.0,
-            p99_upper_us: self.percentile(99) as f64 / 1000.0,
-            max_us: self.max_ns as f64 / 1000.0,
+            p50_upper_us: LatencyNs(self.percentile(50)),
+            p95_upper_us: LatencyNs(self.percentile(95)),
+            p99_upper_us: LatencyNs(self.percentile(99)),
+            max_us: LatencyNs(self.max_ns),
         }
     }
 }
@@ -86,6 +104,22 @@ impl Latencies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_bounds_include_the_full_nanosecond_remainder() {
+        let mut histogram = Latencies::new();
+        histogram.record(Duration::from_nanos(3_493_840));
+        let report = histogram.report();
+        for bound in [
+            report.p50_upper_us,
+            report.p95_upper_us,
+            report.p99_upper_us,
+        ] {
+            assert_eq!(bound.to_string(), "3493.840");
+            assert_eq!(serde_json::to_value(bound).unwrap(), 3493.84);
+        }
+        assert_eq!(LatencyNs(u64::MAX).to_string(), "18446744073709551.615");
+    }
 
     #[test]
     fn quantile_bounds_cover_exact_ranks_across_bucket_edges() {
@@ -123,8 +157,8 @@ mod tests {
         let report = histogram.report();
         assert_eq!(report.samples, 100);
         assert_eq!(report.mean_us, 9.9);
-        assert_eq!(report.p50_upper_us, 10.0);
-        assert_eq!(report.p99_upper_us, 10.0);
-        assert_eq!(report.max_us, 10.0);
+        assert_eq!(report.p50_upper_us, LatencyNs(10_000));
+        assert_eq!(report.p99_upper_us, LatencyNs(10_000));
+        assert_eq!(report.max_us, LatencyNs(10_000));
     }
 }

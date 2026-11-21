@@ -376,7 +376,7 @@ fn write_report(out: &mut impl Write, report: &Report, json: bool) -> io::Result
             writeln!(
                 out,
                 "{name}: {} x {io_size}B in {:.3}s ({:.1} MiB/s, {:.0} IOPS); \
-                 latency us: mean {:.1}, p50 <= {:.1}, p95 <= {:.1}, p99 <= {:.1}, max {:.1}",
+                 latency us: mean {:.1}, p50 <= {}, p95 <= {}, p99 <= {}, max {}",
                 stats.latency.samples,
                 stats.elapsed_seconds,
                 stats.mib_per_second,
