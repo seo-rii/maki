@@ -304,6 +304,28 @@ class DocumentationLinks(unittest.TestCase):
             "docs/readme.md:4: guide.md/old/..", "docs/readme.md:4: ../../docs/guide.md",
         ])
 
+    def test_dot_segments_count_empty_url_segments(self):
+        self.write("guide.md", "# Root\n")
+        self.write("live/guide.md", "# Nested\n")
+        self.write("README.md", "[missing](missing//../guide.md#root) [nested](live//%2e./guide.md#nested)\n"
+                   "[wrong](live//../guide.md#root) [root](.//../guide.md#root)\n"
+                   "[dir](live//..) [file](guide.md//..) [escape](.//../../guide.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: missing//../guide.md#root", "README.md:2: live//../guide.md#root (missing anchor)",
+            "README.md:3: guide.md//..", "README.md:3: .//../../guide.md",
+        ])
+
+    def test_encoded_slash_does_not_split_a_url_segment(self):
+        self.write("guide.md", "# Root\n")
+        self.write("live/guide.md", "# Nested\n")
+        self.write("live/%2f.md", "# Percent\n")
+        self.write("README.md", "[root](live%2Fchild/../guide.md#root) [nested](live/%2f/../guide.md#nested)\n"
+                   "[split](live%2fguide.md#nested) [literal](live/%252f.md#percent)\n"
+                   "[escape](%2f../guide.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: live%2fguide.md#nested", "README.md:3: %2f../guide.md",
+        ])
+
     @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
     def test_removed_url_segment_is_not_resolved_as_a_checkout_symlink(self):
         self.write("guide.md", "# Root\n")
