@@ -54,6 +54,41 @@ fn durable_zeros(len: usize) -> CrashableBacking {
     backing
 }
 
+#[test]
+fn pending_writes_follow_each_inodes_writeback() {
+    let backing = CrashableBacking::new();
+    let a = backing.open("a", true).unwrap();
+    let b = backing.open("b", true).unwrap();
+    a.set_len(4).unwrap();
+    a.write_at(0, b"").unwrap();
+    a.punch_hole(4, 1).unwrap();
+    assert_eq!(backing.pending_write_count(), 0);
+
+    a.punch_hole(0, 1).unwrap();
+    b.write_at(0, b"b").unwrap();
+    assert_eq!(backing.pending_write_count(), 2);
+    a.sync_data().unwrap();
+    assert_eq!(backing.pending_write_count(), 1);
+    b.sync_data().unwrap();
+    assert_eq!(backing.pending_write_count(), 0);
+    assert_eq!(backing.write_count_since_crash(), 2);
+
+    for lenient in [false, true] {
+        backing.set_lenient_sync_failures(lenient);
+        b.write_at(0, b"c").unwrap();
+        fail_next_sync(&backing);
+        assert!(b.sync_data().is_err());
+        assert_eq!(backing.pending_write_count(), usize::from(lenient));
+        b.sync_data().unwrap();
+        assert_eq!(backing.pending_write_count(), 0);
+    }
+    assert_eq!(backing.write_count_since_crash(), 4);
+    b.write_at(0, b"d").unwrap();
+    backing.crash_all_lost();
+    assert_eq!(backing.pending_write_count(), 0);
+    assert_eq!(backing.write_count_since_crash(), 0);
+}
+
 /// Two dirty pages whose sync fails: a power loss may keep either, both or
 /// neither, and the page cache keeps showing both.
 #[test]

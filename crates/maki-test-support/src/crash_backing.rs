@@ -203,6 +203,31 @@ struct NamespaceChange {
     predecessors: BTreeSet<u64>,
 }
 
+/// Fault injection and counters shared by file and namespace operations.
+#[derive(Default)]
+struct IoState {
+    hook: Option<FaultHook>,
+    partial_hook: Option<PartialWriteHook>,
+    /// When set, a failed `sync_data` leaves its dirty writes dirty (the
+    /// "syscall never happened" model). The default is the Linux model:
+    /// the writes are marked clean, possibly but not certainly persisted.
+    lenient_sync_failures: bool,
+    writes_since_crash: usize,
+    /// Bytes returned by `read_at` since creation (cache-efficiency tests).
+    stats_read_bytes: u64,
+}
+
+impl IoState {
+    fn check(&self, op: &FaultOp<'_>) -> io::Result<()> {
+        if let Some(hook) = &self.hook {
+            if let Some(err) = hook(op) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// Number of power losses so far. Handles of an earlier epoch are dead.
@@ -217,15 +242,7 @@ struct Inner {
     /// dir path -> dirent durable?
     dirs: BTreeMap<String, bool>,
     locks: std::collections::HashSet<String>,
-    hook: Option<FaultHook>,
-    partial_hook: Option<PartialWriteHook>,
-    /// When set, a failed `sync_data` leaves its dirty writes dirty (the
-    /// "syscall never happened" model). The default is the Linux model:
-    /// the writes are marked clean, possibly but not certainly persisted.
-    lenient_sync_failures: bool,
-    stats_pending_writes: usize,
-    /// Bytes returned by `read_at` since creation (cache-efficiency tests).
-    stats_read_bytes: u64,
+    io: IoState,
     /// Simulated free space reported by `Backing::free_bytes`.
     free_bytes: Option<u64>,
 }
@@ -236,16 +253,7 @@ impl Inner {
         self.epoch += 1;
         self.handles.clear();
         self.locks.clear();
-        self.stats_pending_writes = 0;
-    }
-
-    fn check(&self, op: &FaultOp<'_>) -> io::Result<()> {
-        if let Some(hook) = &self.hook {
-            if let Some(err) = hook(op) {
-                return Err(err);
-            }
-        }
-        Ok(())
+        self.io.writes_since_crash = 0;
     }
 
     fn volatile(&self, path: &str) -> Option<InodeId> {
@@ -576,12 +584,12 @@ impl CrashableBacking {
     }
 
     pub fn set_fault_hook(&self, hook: Option<FaultHook>) {
-        self.inner.lock().hook = hook;
+        self.inner.lock().io.hook = hook;
     }
 
     /// Install a partial-write hook (see [`PartialWriteHook`]).
     pub fn set_partial_write_hook(&self, hook: Option<PartialWriteHook>) {
-        self.inner.lock().partial_hook = hook;
+        self.inner.lock().io.partial_hook = hook;
     }
 
     /// Choose what a failed `sync_data` does to the dirty writes it could
@@ -590,7 +598,7 @@ impl CrashableBacking {
     /// them) and a retry of the sync has nothing to write. `true` keeps them
     /// dirty, as if the syscall had never run.
     pub fn set_lenient_sync_failures(&self, lenient: bool) {
-        self.inner.lock().lenient_sync_failures = lenient;
+        self.inner.lock().io.lenient_sync_failures = lenient;
     }
 
     /// Simulate the free space the backing filesystem reports (`None` =
@@ -599,13 +607,28 @@ impl CrashableBacking {
         self.inner.lock().free_bytes = free;
     }
 
+    /// Dirty writes and hole punches across all retained inodes. A failed
+    /// writeback counts only if the model leaves the operation dirty.
+    /// Length changes are tracked separately from writes in the crash model.
     pub fn pending_write_count(&self) -> usize {
-        self.inner.lock().stats_pending_writes
+        self.inner
+            .lock()
+            .inodes
+            .values()
+            .flat_map(|inode| &inode.pending)
+            .filter(|op| matches!(op, Pend::Write { .. }))
+            .count()
+    }
+
+    /// Nonempty writes and hole punches applied since the last power loss,
+    /// including partial writes. Syncing a file leaves this count unchanged.
+    pub fn write_count_since_crash(&self) -> usize {
+        self.inner.lock().io.writes_since_crash
     }
 
     /// Total bytes served by `read_at` on any file of this backing.
     pub fn read_bytes(&self) -> u64 {
-        self.inner.lock().stats_read_bytes
+        self.inner.lock().io.stats_read_bytes
     }
 
     /// Simulate a crash: sample pending namespace operations, keeping their
@@ -767,7 +790,7 @@ impl Drop for CrashFile {
 impl CrashFile {
     fn with_inode<R>(
         &self,
-        f: impl FnOnce(&mut Inner, &mut Inode) -> io::Result<R>,
+        f: impl FnOnce(&mut IoState, &mut Inode) -> io::Result<R>,
     ) -> io::Result<R> {
         let mut inner = self.inner.lock();
         if inner.epoch != self.epoch {
@@ -776,24 +799,20 @@ impl CrashFile {
                 self.path
             )));
         }
-        let mut inode = inner.inodes.get(&self.inode).cloned().ok_or_else(|| {
+        let Inner { inodes, io, .. } = &mut *inner;
+        let inode = inodes.get_mut(&self.inode).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} (lost in a crash)", self.path),
             )
         })?;
-        // A failing operation can still have changed the file (a partial
-        // write persisted its prefix, a failed sync marked pages clean):
-        // keep the state whatever the outcome.
-        let r = f(&mut inner, &mut inode);
-        inner.inodes.insert(self.inode, inode);
-        r
+        f(io, inode)
     }
 }
 
 impl BackingFile for CrashFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.with_inode(|inner, inode| {
+        self.with_inode(|io, inode| {
             let data = &inode.image;
             let start = offset as usize;
             let end = start + buf.len();
@@ -804,20 +823,20 @@ impl BackingFile for CrashFile {
                 ));
             }
             buf.copy_from_slice(&data[start..end]);
-            inner.stats_read_bytes += buf.len() as u64;
+            io.stats_read_bytes += buf.len() as u64;
             Ok(())
         })
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.with_inode(|inner, inode| {
+        self.with_inode(|io, inode| {
             let op = FaultOp::WriteAt {
                 path: &self.path,
                 offset,
                 len: data.len(),
             };
-            inner.check(&op)?;
-            let partial = inner.partial_hook.as_ref().and_then(|hook| hook(&op));
+            io.check(&op)?;
+            let partial = io.partial_hook.as_ref().and_then(|hook| hook(&op));
             let (written, outcome) = match partial {
                 Some((n, err)) => (&data[..n.min(data.len())], Err(err)),
                 None => (data, Ok(())),
@@ -829,14 +848,14 @@ impl BackingFile for CrashFile {
                 };
                 apply(&mut inode.image, &pend);
                 inode.pending.push(pend);
-                inner.stats_pending_writes += 1;
+                io.writes_since_crash += 1;
             }
             outcome
         })
     }
 
     fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.with_inode(|inner, inode| {
+        self.with_inode(|io, inode| {
             let end = offset
                 .checked_add(len)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "punch overflow"))?;
@@ -854,21 +873,21 @@ impl BackingFile for CrashFile {
                 offset,
                 len,
             };
-            inner.check(&op)?;
+            io.check(&op)?;
             let pend = Pend::Write {
                 offset,
                 data: zeros,
             };
             apply(&mut inode.image, &pend);
             inode.pending.push(pend);
-            inner.stats_pending_writes += 1;
+            io.writes_since_crash += 1;
             Ok(())
         })
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        self.with_inode(|inner, inode| {
-            inner.check(&FaultOp::SetLen {
+        self.with_inode(|io, inode| {
+            io.check(&FaultOp::SetLen {
                 path: &self.path,
                 len,
             })?;
@@ -882,9 +901,9 @@ impl BackingFile for CrashFile {
         self.with_inode(|_, inode| Ok(inode.image.len() as u64))
     }
     fn sync_data(&self) -> io::Result<()> {
-        self.with_inode(|inner, inode| {
-            if let Err(e) = inner.check(&FaultOp::SyncData { path: &self.path }) {
-                if !inner.lenient_sync_failures {
+        self.with_inode(|io, inode| {
+            if let Err(e) = io.check(&FaultOp::SyncData { path: &self.path }) {
+                if !io.lenient_sync_failures {
                     // Writeback failed: the kernel marks the pages clean and
                     // keeps their content in the page cache. A retry of fsync
                     // has nothing dirty to write and succeeds without
@@ -927,7 +946,7 @@ impl Backing for CrashableBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         validate(path, false)?;
         let mut inner = self.live("open", path)?;
-        inner.check(&FaultOp::Open { path, create })?;
+        inner.io.check(&FaultOp::Open { path, create })?;
         inner.require_file_name(path)?;
         let inode = match inner.volatile(path) {
             Some(inode) => inode,
@@ -967,7 +986,7 @@ impl Backing for CrashableBacking {
     fn remove(&self, path: &str) -> io::Result<()> {
         validate(path, false)?;
         let mut inner = self.live("remove", path)?;
-        inner.check(&FaultOp::Remove { path })?;
+        inner.io.check(&FaultOp::Remove { path })?;
         inner.require_file_name(path)?;
         if inner.volatile(path).is_none() {
             return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string()));
@@ -983,7 +1002,7 @@ impl Backing for CrashableBacking {
         validate(from, false)?;
         validate(to, false)?;
         let mut inner = self.live("rename", from)?;
-        inner.check(&FaultOp::Rename { from, to })?;
+        inner.io.check(&FaultOp::Rename { from, to })?;
         inner.require_dir(parent(from))?;
         if inner.dirs.contains_key(from) {
             return Err(io::Error::new(
@@ -1057,7 +1076,7 @@ impl Backing for CrashableBacking {
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
         validate(dir, true)?;
         let mut inner = self.live("sync_dir", dir)?;
-        inner.check(&FaultOp::SyncDir { dir })?;
+        inner.io.check(&FaultOp::SyncDir { dir })?;
         inner.require_dir(dir)?;
         // Commit operations on entries directly inside `dir` and their
         // predecessors. A rename persists as one operation, never half.
@@ -1125,6 +1144,25 @@ mod tests {
 
     fn eio() -> io::Error {
         io::Error::other("injected EIO")
+    }
+
+    #[test]
+    fn length_and_reads_keep_the_files_image_in_place() {
+        let backing = CrashableBacking::new();
+        let file = backing.open("f", true).unwrap();
+        file.write_at(0, &[1; PAGE_SIZE]).unwrap();
+        file.sync_data().unwrap();
+        let image_address = || {
+            let inner = backing.inner.lock();
+            inner.inodes[&inner.volatile("f").unwrap()].image.as_ptr()
+        };
+        let address = image_address();
+        assert_eq!(file.len().unwrap(), PAGE_SIZE as u64);
+        assert_eq!(image_address(), address);
+        let mut byte = [0];
+        file.read_at(0, &mut byte).unwrap();
+        assert_eq!(byte, [1]);
+        assert_eq!(image_address(), address);
     }
 
     /// The Linux writeback-error model: a failed fsync leaves the bytes

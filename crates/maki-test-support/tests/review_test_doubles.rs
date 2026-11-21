@@ -119,6 +119,31 @@ impl Future for WaitGate {
     }
 }
 
+#[test]
+fn a_finished_tasks_waker_cannot_wake_a_new_task() {
+    let mut sched = DeterministicScheduler::new(7);
+    let first = Rc::new(Gate::default());
+    sched.spawn(WaitGate(first.clone()));
+    assert!(!sched.run_bounded(1));
+    let stale = first.waiter.borrow_mut().take().unwrap();
+    first.open.set(true);
+    stale.wake_by_ref();
+    assert!(sched.run_bounded(1));
+
+    let next = Rc::new(Gate::default());
+    sched.spawn(WaitGate(next.clone()));
+    assert!(!sched.run_bounded(1));
+    stale.wake();
+    assert!(!sched.run_bounded(1));
+    assert_eq!(next.polls.get(), 1);
+    assert_eq!(sched.pending(), 1);
+
+    next.open.set(true);
+    next.waiter.borrow_mut().take().unwrap().wake();
+    assert!(sched.run_bounded(1));
+    assert_eq!(sched.pending(), 0);
+}
+
 /// A task is polled again only after its waker fires: exactly once to park
 /// and once after the release, however long the releasing task runs first.
 /// Every seed must complete (the wake-up is delivered) and none may poll
