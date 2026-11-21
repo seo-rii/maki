@@ -405,7 +405,13 @@ impl Volume {
         } else if self.reclaim_unwritten(unit)? == DiscardProbe::Unwritten {
             // Only a header proving the unit unwritten skips the tombstone;
             // a damaged slot is retired by one rather than refused (R5-012).
-            return Ok(self.journal.appended_sequence());
+            // There is no new record. A FUA result must not acknowledge
+            // another unit's unsynced append as a durable discard.
+            return Ok(if fua {
+                self.journal.durable_sequence()
+            } else {
+                self.journal.appended_sequence()
+            });
         }
         self.append_discard(unit, fua)
     }
