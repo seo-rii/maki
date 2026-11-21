@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 
 use maki_backing::Backing;
 
-use crate::ab::AbStore;
+use crate::ab::{AbRecord, AbStore};
 use crate::allocation::AllocationMap;
 use crate::catalog::ShardCatalog;
 use crate::checkpoint::{CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
@@ -97,13 +97,20 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     let cat_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B).with_max_len(
         ShardCatalog::max_encoded_len(superblock.geometry.num_shards()),
     );
-    let catalog = match cat_ab.load::<ShardCatalog>(backing)? {
+    let (catalog, copies) = cat_ab.load_with_copy_count::<ShardCatalog>(backing)?;
+    let catalog = match catalog {
         Some(c) => c,
         None => {
             report.errors.push("no valid shard catalog".to_string());
             return Ok(report);
         }
     };
+    // Creation intentionally publishes the empty generation-one catalog once.
+    if copies == 1 && catalog.generation() > 1 {
+        report
+            .warnings
+            .push("shard catalog has one valid copy".into());
+    }
     report
         .info
         .push(format!("catalog: {} shard(s)", catalog.len()));
