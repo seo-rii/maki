@@ -177,9 +177,9 @@ impl CryptoProvider for CheckedProvider {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let caps = self.caps().await?.clone();
+        let caps = self.caps().await?;
         let out = self.inner.encrypt_batch(context, items).await?;
-        validate_owned_encrypt_result(items, out, &caps)
+        validate_owned_encrypt_result(items, out, caps)
     }
 
     async fn decrypt_batch(
@@ -187,9 +187,9 @@ impl CryptoProvider for CheckedProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let caps = self.caps().await?.clone();
+        let caps = self.caps().await?;
         let out = self.inner.decrypt_batch(context, items).await?;
-        validate_decrypt_result(items, &out, &caps)?;
+        validate_decrypt_result(items, &out, caps)?;
         if let Some(unit_size) = self.unit_size {
             if let Some(pt) = out.iter().find(|pt| pt.data.len() != unit_size as usize) {
                 return Err(CryptoError::Contract(format!(
