@@ -223,7 +223,7 @@ struct Inner {
     /// "syscall never happened" model). The default is the Linux model:
     /// the writes are marked clean, possibly but not certainly persisted.
     lenient_sync_failures: bool,
-    stats_pending_writes: usize,
+    writes_since_crash: usize,
     /// Bytes returned by `read_at` since creation (cache-efficiency tests).
     stats_read_bytes: u64,
     /// Simulated free space reported by `Backing::free_bytes`.
@@ -236,7 +236,7 @@ impl Inner {
         self.epoch += 1;
         self.handles.clear();
         self.locks.clear();
-        self.stats_pending_writes = 0;
+        self.writes_since_crash = 0;
     }
 
     fn check(&self, op: &FaultOp<'_>) -> io::Result<()> {
@@ -599,8 +599,23 @@ impl CrashableBacking {
         self.inner.lock().free_bytes = free;
     }
 
+    /// Dirty writes and hole punches across all retained inodes. A failed
+    /// writeback counts only if the model leaves the operation dirty.
+    /// Length changes are tracked separately from writes in the crash model.
     pub fn pending_write_count(&self) -> usize {
-        self.inner.lock().stats_pending_writes
+        self.inner
+            .lock()
+            .inodes
+            .values()
+            .flat_map(|inode| &inode.pending)
+            .filter(|op| matches!(op, Pend::Write { .. }))
+            .count()
+    }
+
+    /// Nonempty writes and hole punches applied since the last power loss,
+    /// including partial writes. Syncing a file leaves this count unchanged.
+    pub fn write_count_since_crash(&self) -> usize {
+        self.inner.lock().writes_since_crash
     }
 
     /// Total bytes served by `read_at` on any file of this backing.
@@ -829,7 +844,7 @@ impl BackingFile for CrashFile {
                 };
                 apply(&mut inode.image, &pend);
                 inode.pending.push(pend);
-                inner.stats_pending_writes += 1;
+                inner.writes_since_crash += 1;
             }
             outcome
         })
@@ -861,7 +876,7 @@ impl BackingFile for CrashFile {
             };
             apply(&mut inode.image, &pend);
             inode.pending.push(pend);
-            inner.stats_pending_writes += 1;
+            inner.writes_since_crash += 1;
             Ok(())
         })
     }
