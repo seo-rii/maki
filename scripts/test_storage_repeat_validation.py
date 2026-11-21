@@ -59,7 +59,8 @@ class BackgroundStorageTests(unittest.TestCase):
                   "profile": "rollback"}
         with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
                 mock.patch.object(self.runner, "run_child", side_effect=child), \
-                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole binary read")):
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole binary read")), \
+                mock.patch.object(Path, "read_text", side_effect=AssertionError("whole build/list log read")):
             binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
         self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
         manifest = json.loads((self.root / "binaries.json").read_text())
