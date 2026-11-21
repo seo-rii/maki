@@ -207,7 +207,18 @@ impl AbStore {
     ) -> Result<(), FormatError> {
         let a = self.read_bytes::<T>(backing, &self.a)?;
         let b = self.read_bytes::<T>(backing, &self.b)?;
-        let max_existing = [a.as_deref(), b.as_deref()]
+        self.store_with_images(backing, record, a.as_deref(), b.as_deref())
+    }
+
+    /// Use the exact copies already read under the caller's exclusive volume lock.
+    pub(crate) fn store_with_images<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+        record: &mut T,
+        a: Option<&[u8]>,
+        b: Option<&[u8]>,
+    ) -> Result<(), FormatError> {
+        let max_existing = [a, b]
             .into_iter()
             .flatten()
             .filter_map(|bytes| RawGeneration::decode(bytes).ok())
@@ -215,8 +226,8 @@ impl AbStore {
             .max()
             .unwrap_or(0);
         let typed_generation = |bytes: &[u8]| T::decode(bytes).ok().map(|r| r.generation());
-        let ta = a.as_deref().and_then(typed_generation);
-        let tb = b.as_deref().and_then(typed_generation);
+        let ta = a.and_then(typed_generation);
+        let tb = b.and_then(typed_generation);
         let target = self.target_for(ta, tb);
         let preserved = if target == self.a {
             tb.and(b).map(|bytes| (self.b.as_str(), bytes))
@@ -263,7 +274,7 @@ impl AbStore {
             // Its dirent may also be new if the caller's dirsync failed.
             let file = backing.open(preserved, false)?;
             file.set_len(bytes.len() as u64)?;
-            file.write_at(0, &bytes)?;
+            file.write_at(0, bytes)?;
             file.sync_data()?;
             backing.sync_dir(maki_backing::path::parent(preserved))?;
         }
