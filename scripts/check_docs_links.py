@@ -30,7 +30,6 @@ Usage: python3 -B scripts/check_docs_links.py [repository-root]
 
 from bisect import bisect_right
 import codecs
-import errno
 import hashlib
 import html
 import json
@@ -87,16 +86,21 @@ THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 def candidate_files(root):
     git = ["git", "-C", str(root), "ls-files", "-z"]
-    tracked = subprocess.check_output([*git, "--stage"])
+    tracked = subprocess.check_output([*git, "-t", "--stage"])
     untracked = subprocess.check_output([*git, "--others", "--exclude-standard"])
     candidates = {root / os.fsdecode(name) for name in untracked.split(b"\0") if name}
+    skipped = {}
     for entry in tracked.split(b"\0"):
         if entry:
             metadata, name = entry.split(b"\t", 1)
             path = root / os.fsdecode(name)
-            if metadata.startswith(b"160000 ") or path.is_file() or path.is_symlink():
+            tag, mode, oid, stage = metadata.split()
+            if tag == b"S" and stage == b"0" and not os.path.lexists(path):
+                skipped[path] = (mode, oid)
                 candidates.add(path)
-    return candidates
+            elif path.is_symlink() or path.is_file() or (mode == b"160000" and path.is_dir()):
+                candidates.add(path)
+    return candidates, skipped
 
 
 class SourceLine(NamedTuple):
@@ -122,7 +126,7 @@ def html_block_end(content, in_paragraph):
         return ("]]>",)
     if re.match(r"<![A-Z]", stripped):
         return (">",)
-    if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip())):
+    if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip(" \t"))):
         return ()
     return None
 
@@ -157,11 +161,11 @@ def document_lines(text):
             elif columns.startswith(" " * indent, pos):
                 pos += indent
                 continue
-            elif not columns[pos:].strip() and (container is not FOOTNOTE_CONTAINER or not line):
+            elif not columns[pos:].strip(" \t") and (container is not FOOTNOTE_CONTAINER or not line):
                 pos = len(columns)
                 continue
             rest = columns[pos:]
-            if (in_paragraph and rest.strip() and not QUOTE_MARKER.match(rest)
+            if (in_paragraph and rest.strip(" \t") and not QUOTE_MARKER.match(rest)
                     and not BLOCK_LIST_MARKER.match(rest) and not FOOTNOTE_MARKER.match(rest)
                     and not ATX_HEADING.match(rest)
                     and not THEMATIC_BREAK.fullmatch(rest) and not opening_fence(rest)
@@ -178,7 +182,7 @@ def document_lines(text):
             break
 
         content = columns[pos:]
-        if html_end == () and not content.strip():
+        if html_end == () and not content.strip(" \t"):
             html_end = None
         if block is not None:
             close = FENCE.fullmatch(content)
@@ -247,7 +251,7 @@ def document_lines(text):
         if not in_paragraph and CODE_INDENT.match(content):
             continue
         yield SourceLine(number, content, changed, False, lazy)
-        in_paragraph = bool(content.strip() and not ATX_HEADING.match(content)
+        in_paragraph = bool(content.strip(" \t") and not ATX_HEADING.match(content)
                             and not THEMATIC_BREAK.match(content)
                             and not (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content)))
 
@@ -272,7 +276,7 @@ def block_lines(text):
             width = 0
             after_table = False
         indented = CODE_INDENT.match(value)
-        if (width or after_table) and (not value.strip() or indented):
+        if (width or after_table) and (not value.strip(" \t") or indented):
             # A blank ends the table. Four columns start a literal code block,
             # including when the first such line follows a table row directly.
             width = 0
@@ -284,7 +288,7 @@ def block_lines(text):
         if width:
             yield line, table_cells(value)[:width]
             continue
-        if (not line.raw_html and value.strip() and not indented
+        if (not line.raw_html and value.strip(" \t") and not indented
                 and not ATX_HEADING.match(value) and not THEMATIC_BREAK.fullmatch(value)
                 and index + 1 < len(lines)):
             divider = lines[index + 1]
@@ -334,7 +338,9 @@ def markdown_entities(text):
     def decode(match):
         entity = match.group()
         if entity[1] == "#":
-            return html.unescape(entity)
+            digits = entity[2:-1]
+            code = int(digits[1:], 16) if digits.startswith(("x", "X")) else int(digits)
+            return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "\ufffd"
         return html.entities.html5.get(entity[1:], entity)
     return ENTITY.sub(decode, text)
 
@@ -529,7 +535,7 @@ def reference_definitions(text):
             index += consumed
             continue
         in_paragraph = not (
-            not content.strip()
+            not content.strip(" \t")
             or ATX_HEADING.match(content)
             or THEMATIC_BREAK.match(content)
             or (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content))
@@ -692,12 +698,12 @@ def inline_paragraphs(text, definition_lines):
             continue
         single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
                       or (not lazy and SETEXT_UNDERLINE.match(content)))
-        if (not content.strip() or raw_html or number in definition_lines or single or changed
+        if (not content.strip(" \t") or raw_html or number in definition_lines or single or changed
                 or (paragraph and number != paragraph[-1][0] + 1)):
             if paragraph:
                 yield paragraph
                 paragraph = []
-        if content.strip() and not raw_html and number not in definition_lines:
+        if content.strip(" \t") and not raw_html and number not in definition_lines:
             paragraph.append((number, content))
             if single:
                 yield paragraph
@@ -708,7 +714,13 @@ def inline_paragraphs(text, definition_lines):
 
 def inline_lines(text, definition_lines, labels):
     for paragraph in inline_paragraphs(text, definition_lines):
-        masked, targets, _, _, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        masked, targets, _, spans, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        if any(image for _, _, image in spans.values()):
+            visible = list(masked)
+            for opening, (close, _, image) in spans.items():
+                if image:
+                    visible[opening + 1:close] = " " * (close - opening - 1)
+            masked = "".join(visible)
         starts = []
         start = 0
         for _, line in paragraph:
@@ -770,27 +782,28 @@ def undefined_references(line, masked, labels):
 
 
 def inline_text(raw, labels=frozenset()):
-    """Reduce inline Markdown to its rendered text as (character, literal) pairs.
-
-    Code span contents and backslash-escaped characters are literal: they are
-    never emphasis delimiters or entity references. `labels` holds the
-    document's defined reference labels: a reference to one renders as a link.
-    """
+    """Render heading text within one Markdown inline scope."""
     _, _, _, links, bare_links = scan_inline_paragraph(raw, labels)
-    ends = {close: end for close, end, image in links.values() if not image}
     out = []
+    marker_offsets = {}
     index = 0
     while index < len(raw):
         if index in bare_links:
             end = bare_links[index]
-            out.extend((char, True) for char in raw[index:end])
+            out.extend(raw[index:end])
             index = end
             continue
         char = raw[index]
         if char == "\\" and index + 1 < len(raw) and raw[index + 1] in ASCII_PUNCTUATION:
-            out.append((raw[index + 1], True))
+            out.append(raw[index + 1])
             index += 2
             continue
+        if char == "&":
+            entity = ENTITY.match(raw, index)
+            if entity:
+                out.extend(markdown_entities(entity.group()))
+                index = entity.end()
+                continue
         if char == "`":
             opening = BACKTICKS.match(raw, index).group(0)
             closing = next(
@@ -799,23 +812,22 @@ def inline_text(raw, labels=frozenset()):
                 None,
             )
             if closing is None:
-                out.extend((tick, True) for tick in opening)
+                out.extend(opening)
                 index += len(opening)
                 continue
             content = raw[index + len(opening):closing.start()].replace("\n", " ")
             if len(content) > 1 and content[0] == content[-1] == " " and content.strip(" "):
                 content = content[1:-1]
-            out.extend((code, True) for code in content)
+            out.extend(content)
             index = closing.end()
             continue
         if char == "!" and index + 1 in links and links[index + 1][2]:
             index = links[index + 1][1]
             continue
         if index in links:
-            index += 1
-            continue
-        if index in ends:
-            index = ends[index]
+            close, end, _ = links[index]
+            out.extend(inline_text(raw[index + 1:close], labels))
+            index = end
             continue
         if char == "<":
             special = INLINE_SPECIAL.match(raw, index)
@@ -824,7 +836,7 @@ def inline_text(raw, labels=frozenset()):
                 continue
             autolink = AUTOLINK.match(raw, index)
             if autolink:
-                out.extend((link, True) for link in autolink.group(1))
+                out.extend(autolink.group(1))
                 index = autolink.end()
                 continue
             tag = HTML_TAG.match(raw, index)
@@ -838,36 +850,44 @@ def inline_text(raw, labels=frozenset()):
             while before_break and raw[before_break - 1] in " \t":
                 out.pop()
                 before_break -= 1
-        out.append((char, False))
+        if char in "_*":
+            marker_offsets[len(out)] = index
+        out.append(char)
         index += 1
-    return out
+    delimiters = emphasis_delimiters(raw, marker_offsets)
+    return "".join(char for index, char in enumerate(out) if index not in delimiters)
 
 
-def emphasis_underscores(pairs):
-    """Find only underscores consumed by paired GFM emphasis delimiters."""
+def emphasis_delimiters(raw, marker_offsets):
+    """Pair runs in this scope using their neighbors in the Markdown source."""
     def punctuation(char):
         return char in ASCII_PUNCTUATION or unicodedata.category(char).startswith("P")
 
     openers = []
     consumed = set()
-    index = 0
-    while index < len(pairs):
-        if pairs[index] != ("_", False):
-            index += 1
+    next_run = 0
+    for index, start in marker_offsets.items():
+        if index < next_run:
             continue
+        marker = raw[start]
         end = index + 1
-        while end < len(pairs) and pairs[end] == ("_", False):
+        while (marker_offsets.get(end) == start + end - index
+               and raw[marker_offsets[end]] == marker):
             end += 1
-        before = pairs[index - 1][0] if index else " "
-        after = pairs[end][0] if end < len(pairs) else " "
+        next_run = end
+        source_end = start + end - index
+        before = raw[start - 1] if start else " "
+        after = raw[source_end] if source_end < len(raw) else " "
         left = not after.isspace() and (not punctuation(after) or before.isspace() or punctuation(before))
         right = not before.isspace() and (not punctuation(before) or after.isspace() or punctuation(after))
-        can_open = left and (not right or punctuation(before))
-        can_close = right and (not left or punctuation(after))
+        can_open = left and (marker == "*" or not right or punctuation(before))
+        can_close = right and (marker == "*" or not left or punctuation(after))
         remaining = index
         if can_close:
             for pos in range(len(openers) - 1, -1, -1):
                 first, last, length, closes = openers[pos]
+                if raw[marker_offsets[first]] != marker:
+                    continue
                 if ((can_open or closes) and (length + end - index) % 3 == 0
                         and length % 3 != 0):
                     continue
@@ -882,28 +902,7 @@ def emphasis_underscores(pairs):
                     break
         if can_open and remaining < end:
             openers.append((remaining, end, end - index, can_close))
-        index = end
     return consumed
-
-
-def heading_text(raw, labels=frozenset()):
-    """The text GitHub renders for a heading's inline content."""
-    pairs = inline_text(raw, labels)
-    delimiters = emphasis_underscores(pairs)
-    # Entity references are decoded outside code spans and escapes only.
-    rendered = []
-    plain = []
-    for index, (char, literal) in enumerate(pairs):
-        if index in delimiters:
-            continue
-        if literal:
-            rendered.append(markdown_entities("".join(plain)))
-            plain = []
-            rendered.append(char)
-        else:
-            plain.append(char)
-    rendered.append(markdown_entities("".join(plain)))
-    return "".join(rendered).strip()
 
 
 def github_slug(text):
@@ -953,7 +952,7 @@ def document_anchors(text):
             headings.append("\n".join(content for _, content in paragraph))
             paragraph = []
             continue
-        if not line.strip() or THEMATIC_BREAK.fullmatch(line):
+        if not line.strip(" \t") or THEMATIC_BREAK.fullmatch(line):
             paragraph = []
             continue
         if paragraph and paragraph[-1][0] != number - 1:
@@ -963,7 +962,7 @@ def document_anchors(text):
     anchors = set()
     occurrences = {}
     for heading in headings:
-        base = github_slug(heading_text(heading, labels))
+        base = github_slug(inline_text(heading, labels).strip())
         slug = base
         while slug in occurrences:
             occurrences[base] += 1
@@ -998,7 +997,7 @@ def document_anchors(text):
     return anchors
 
 
-def omitted_archive_reference(root, document, content, target, packages):
+def omitted_archive_reference(root, document, content, target, resolved, packages):
     """Accept only an unchanged archive's unpublished package-local target."""
     parts = document.relative_to(root).parts
     if len(parts) < 3 or parts[0] != "vendor":
@@ -1008,10 +1007,7 @@ def omitted_archive_reference(root, document, content, target, packages):
     if files.get(document_name) != hashlib.sha256(content).hexdigest():
         return False
     archive_root = root / "vendor" / parts[1]
-    try:
-        requested = pathlib.Path(os.path.abspath(target)).relative_to(archive_root).as_posix()
-        resolved = target.resolve().relative_to(archive_root.resolve()).as_posix()
-    except (OSError, RuntimeError, ValueError):
+    if not (target.is_relative_to(archive_root) and resolved.is_relative_to(archive_root)):
         return False
     # Inventories list files, not directories. A missing directory containing
     # published files is lost packaged content, not an omitted source path.
@@ -1019,7 +1015,7 @@ def omitted_archive_reference(root, document, content, target, packages):
     # missing published file as an unrelated unpublished target.
     return all(
         name not in files and not any(path.startswith(name + "/") for path in files)
-        for name in (requested, resolved)
+        for name in (target.relative_to(archive_root).as_posix(), resolved.relative_to(archive_root).as_posix())
     )
 
 
@@ -1050,49 +1046,65 @@ def checkout_url_path(root, document, file_part):
 
 def broken_links(root):
     root = root.resolve()
-    inventory = root / "vendor/upstream.json"
-    packages = (
-        json.loads(inventory.read_text(encoding="utf-8"))["packages"]
-        if inventory.exists() else {}
-    )
+    candidates, skipped = candidate_files(root)
+
+    def contents(path):
+        if path in skipped:
+            return subprocess.check_output(["git", "-C", str(root), "cat-file", "blob", skipped[path][1]])
+        return path.read_bytes()
+
     anchor_cache = {}
     line_counts = {}
     encoding_errors = {}
-    candidates = candidate_files(root)
-    published = {root}
+    directories = {root}
     symlinks = {}
     for candidate in candidates:
-        published.add(candidate)
-        published.update(parent for parent in candidate.parents if parent.is_relative_to(root))
-        if candidate.is_symlink():
-            symlinks[candidate] = candidate.readlink()
+        directories.update(parent for parent in candidate.parents if parent.is_relative_to(root))
+        if candidate in skipped:
+            mode, _ = skipped[candidate]
+            if mode == b"120000":
+                symlinks[candidate] = os.fsdecode(contents(candidate))
+            elif mode == b"160000":
+                directories.add(candidate)
+        elif candidate.is_symlink():
+            symlinks[candidate] = os.readlink(candidate)
+        elif candidate.is_dir():
+            directories.add(candidate)
+    published = candidates | directories
 
-    def published_target(path):
+    def resolve_target(path):
+        """Follow checkout symlinks, preserving a dangling target's repository path."""
         if not path.is_relative_to(root):
             return None
-        try:
-            if not path.exists():
-                return None  # also catches dangling links and cycles
-        except OSError as error:
-            if error.errno == errno.ENAMETOOLONG:
-                return None
-            raise
-        # A local alias may resolve to a tracked file through an ignored
-        # intermediate link. Follow the path using only checkout candidates.
         pending = list(reversed(path.relative_to(root).parts))
         current = root
+        hops = 0
         while pending:
             part = pending.pop()
+            if current in published and current not in directories:
+                return None
+            if current not in published and part in (".", ".."):
+                return None
             current = current.parent if part == ".." else current / part
-            if current not in published:
+            if not current.is_relative_to(root):
                 return None
             if current in symlinks:
-                target = symlinks[current]
-                if target.is_absolute():
-                    return None  # an absolute link cannot move with the checkout
+                link = symlinks[current]
+                target = pathlib.Path(link)
+                hops += 1
+                if target.is_absolute() or hops > 40:
+                    return None
+                # Path.parts strips a final slash or dot, which requires a directory.
+                if os.path.basename(link) in ("", "."):
+                    pending.append(".")
                 pending.extend(reversed(target.parts))
                 current = current.parent
         return current
+
+    inventory = resolve_target(root / "vendor/upstream.json")
+    packages = {}
+    if inventory in candidates and inventory not in directories:
+        packages = json.loads(contents(inventory))["packages"]
 
     def decode_document(path, content):
         encoding = "utf-16" if content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else "utf-8"
@@ -1115,21 +1127,23 @@ def broken_links(root):
         if checkout is None:
             return target
         target_path, directory = checkout
-        resolved = published_target(target_path)
+        resolved = resolve_target(target_path)
         if resolved is None:
-            if omitted_archive_reference(root, path, content, target_path, packages):
+            return target
+        if resolved not in published:
+            if omitted_archive_reference(root, path, content, target_path, resolved, packages):
                 return None
             return target
-        if directory and not resolved.is_dir():
+        if directory and resolved not in directories:
             return target
         fragment = urllib.parse.unquote(fragment)
-        if fragment and resolved.is_file() and target_path.suffix.lower() == ".md":
+        if fragment and resolved not in directories and target_path.suffix.lower() == ".md":
             if resolved in encoding_errors:
                 return None
             span = re.fullmatch(r"L([1-9][0-9]*)(?:-L([1-9][0-9]*))?", fragment)
             if span and ("plain", "1") in urllib.parse.parse_qsl(query):
                 if resolved not in line_counts:
-                    if decode_document(resolved, resolved.read_bytes()) is None:
+                    if decode_document(resolved, contents(resolved)) is None:
                         return None
                 count = line_counts[resolved]
                 first, last = span[1], span[2] or span[1]
@@ -1137,7 +1151,7 @@ def broken_links(root):
                     return None
                 return f"{target} (missing line)"
             if resolved not in anchor_cache:
-                text = decode_document(resolved, resolved.read_bytes())
+                text = decode_document(resolved, contents(resolved))
                 if text is None:
                     return None
                 anchor_cache[resolved] = document_anchors(text)
@@ -1150,11 +1164,13 @@ def broken_links(root):
         if path in encoding_errors:
             continue
         relative = path.relative_to(root).as_posix()
-        if path.is_symlink() and (not path.is_file() or published_target(path) is None):
-            broken.append(f"{relative}: invalid Markdown symlink target")
+        resolved = resolve_target(path)
+        if resolved not in candidates or resolved in directories:
+            if path in symlinks:
+                broken.append(f"{relative}: invalid Markdown symlink target")
             continue
         try:
-            content = path.read_bytes()
+            content = contents(resolved)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             continue  # the indexed file was deleted or replaced by a directory
         text = decode_document(path, content)

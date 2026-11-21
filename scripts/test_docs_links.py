@@ -30,6 +30,92 @@ class DocumentationLinks(unittest.TestCase):
             )
         return path
 
+    def test_emphasis_delimiters_cannot_cross_inline_boundaries(self):
+        self.write("guide.md", "# [Read _config](file) after_\n# *inside _text* and_\n")
+        self.write("file", "")
+        self.write("README.md", "[a](guide.md#read-_config-after_) [b](guide.md#inside-_text-and_)\n"
+                   "[c](guide.md#read-config-after) [d](guide.md#inside-text-and)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:2: guide.md#read-config-after (missing anchor)",
+            "README.md:2: guide.md#inside-text-and (missing anchor)"])
+
+    def test_emphasis_flanking_uses_source_characters_at_link_boundaries(self):
+        self.write("guide.md", "# [X](file)_word_\n# _word_[X](file)\n")
+        self.write("file", "")
+        self.write("README.md", "[first](guide.md#xword) [second](guide.md#wordx)\n"
+                   "[a](guide.md#x_word_) [b](guide.md#_word_x)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:2: guide.md#x_word_ (missing anchor)",
+            "README.md:2: guide.md#_word_x (missing anchor)",
+        ])
+
+    def test_heading_entities_are_decoded_only_when_contiguous_in_source(self):
+        self.write("file", "")
+        self.write("guide.md", "# &am*p*;\n# &co[py](file);\n# real &#95; and &amp;copy;\n")
+        self.write("README.md", "[a](guide.md#amp) [b](guide.md#copy) "
+                   "[c](guide.md#real-_-and-copy) [bad](guide.md#real-_-and-)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#real-_-and- (missing anchor)"])
+
+    def test_non_ascii_spaces_do_not_end_markdown_or_html_blocks(self):
+        for space in ("\u00a0", "\u2003"):
+            self.write("README.md", f"Prose\n{space}\n    [a](missing.md)\n\n"
+                       f"<div>hello</div>\n{space}\n[b](literal.md)\n")
+            self.assertEqual(broken_links(self.root), ["README.md:3: missing.md"])
+
+    def test_numeric_references_in_markdown_destinations_use_unicode_scalars(self):
+        self.write("README.md", "[a](&#128;.txt) [b](&#x85;.txt) [c](&#8364;.txt)\n")
+        self.write("€.txt", "")
+        self.assertCountEqual(broken_links(self.root), ["README.md:1: \x80.txt", "README.md:1: \x85.txt"])
+
+    def test_image_description_does_not_report_a_reference_from_alt_text(self):
+        self.write("plot.png", "")
+        self.write("README.md", "[![Grid[row][column]](plot.png)](absent.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: absent.md"])
+
+    def test_sparse_checkout_validates_omitted_documents_and_destinations(self):
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True)
+        self.write("docs/start.md", "[example](../examples/data) [anchor](../examples/guide.md#known)\n")
+        self.write("examples/data", "data")
+        self.write("examples/guide.md", "# Known\n[missing](absent.md)\n")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
+        expected = ["examples/guide.md:2: absent.md"]
+        self.assertEqual(broken_links(self.root), expected)
+        git("sparse-checkout", "set", "docs")
+        self.assertFalse((self.root / "examples/guide.md").exists())
+        self.assertEqual(broken_links(self.root), expected)
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_sparse_checkout_resolves_inventory_and_dangling_archive_links(self):
+        self.archive(content="[included](alias) [outside](escape/missing) [omitted](docs/missing)\n",
+                     extra_files={"missing-license": "0" * 64})
+        inventory = self.root / "vendor/upstream.json"
+        inventory.rename(inventory.with_name("packages.json"))
+        inventory.symlink_to("packages.json")
+        (self.root / "vendor/hyper/alias").symlink_to("missing-license")
+        (self.root / "vendor/hyper/escape").symlink_to("../../elsewhere")
+        self.write("docs/index.md", "[readme](../vendor/hyper/README.md)\n")
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "add", "--all"], check=True)
+        subprocess.run([*git, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "fixture"], check=True)
+        expected = ["vendor/hyper/README.md:1: alias", "vendor/hyper/README.md:1: escape/missing"]
+        self.assertEqual(broken_links(self.root), expected)
+        subprocess.run([*git, "sparse-checkout", "set", "docs"], check=True)
+        self.assertEqual(broken_links(self.root), expected)
+
+    def test_sparse_checkout_keeps_deleted_gitlink_missing(self):
+        self.write("docs/index.md", "[component](../modules/component) [directory](../modules/component/)\n")
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "fixture"], check=True)
+        oid = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},modules/component"], check=True)
+        self.assertEqual(broken_links(self.root), ["docs/index.md:1: ../modules/component",
+                                                  "docs/index.md:1: ../modules/component/"])
+        subprocess.run([*git, "update-index", "--skip-worktree", "modules/component"], check=True)
+        self.assertEqual(broken_links(self.root), [])
+
     def test_markdown_line_endings_and_bom(self):
         self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
         self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
