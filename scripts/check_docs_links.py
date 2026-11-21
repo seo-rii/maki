@@ -1015,6 +1015,31 @@ def omitted_archive_reference(root, document, content, target, packages):
     )
 
 
+def checkout_url_path(root, document, file_part):
+    """Resolve URL segments before mapping the destination into the checkout."""
+    if not file_part:
+        return document, False
+    base = root if file_part.startswith("/") else document.parent
+    parts = [os.fsencode(name) for name in base.relative_to(root).parts]
+    for raw in file_part.removeprefix("/").split("/"):
+        segment = urllib.parse.unquote_to_bytes(raw)
+        if segment == b"..":
+            if not parts:
+                return None  # the URL left this repository
+            parts.pop()
+        elif segment != b".":
+            parts.append(segment)  # an empty segment can also be removed by a later ".."
+    directory = segment in (b"", b".", b"..")
+    try:
+        names = [os.fsdecode(part) for part in parts if part]
+    except UnicodeDecodeError:
+        return None
+    # An encoded slash inside a surviving segment cannot name a checkout file.
+    if any(pathlib.Path(name).name != name for name in names):
+        return None
+    return root.joinpath(*names), directory
+
+
 def broken_links(root):
     root = root.resolve()
     inventory = root / "vendor/upstream.json"
@@ -1078,18 +1103,16 @@ def broken_links(root):
             return None
         file_part, _, fragment = target.partition("#")
         file_part, _, query = file_part.partition("?")
-        try:
-            decoded = os.fsdecode(urllib.parse.unquote_to_bytes(file_part))
-        except UnicodeDecodeError:
-            return target  # these bytes cannot name a file on this platform
-        if file_part.startswith("/"):
-            target_path = root / decoded.lstrip("/")
-        else:
-            target_path = path.parent / decoded if decoded else path
+        checkout = checkout_url_path(root, path, file_part)
+        if checkout is None:
+            return target
+        target_path, directory = checkout
         resolved = published_target(target_path)
         if resolved is None:
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
+            return target
+        if directory and not resolved.is_dir():
             return target
         fragment = urllib.parse.unquote(fragment)
         if fragment and resolved.is_file() and target_path.suffix.lower() == ".md":
