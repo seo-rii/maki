@@ -443,3 +443,22 @@ fn torn_overwrite_preserves_the_earlier_pending_suffix() {
         assert_eq!(data, expected);
     }
 }
+
+#[test]
+fn a_new_crash_backing_lock_has_an_ordinary_file_name() {
+    let backing = CrashableBacking::new();
+    let live = backing.process();
+    let guard = live.try_lock("lock").unwrap();
+    assert_eq!(live.list("").unwrap(), ["lock"]);
+    assert!(live.try_lock("lock").is_err());
+    assert_eq!(live.open("lock", false).unwrap().len().unwrap(), 0);
+    drop(guard);
+    live.sync_dir("").unwrap();
+    backing.crash_all_lost();
+    let recovered = backing.process();
+    assert!(recovered.exists("lock").unwrap());
+    drop(recovered.try_lock("lock").unwrap());
+    drop(recovered.try_lock("unsynced").unwrap());
+    backing.crash_all_lost();
+    assert!(!backing.process().exists("unsynced").unwrap());
+}

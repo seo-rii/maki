@@ -301,6 +301,18 @@ impl Inner {
         Ok(())
     }
 
+    fn open_or_create_inode(&mut self, path: &str) -> InodeId {
+        if let Some(inode) = self.volatile(path) {
+            return inode;
+        }
+        // Recreating an unlinked name gets a fresh, empty inode.
+        self.next_inode += 1;
+        let inode = self.next_inode;
+        self.inodes.insert(inode, Inode::default());
+        self.relink(vec![(path.to_string(), Some(inode))]);
+        inode
+    }
+
     /// The parent of `path` exists and `path` itself is not a directory: a
     /// directory name cannot be opened, locked, renamed over or unlinked as
     /// a file (EISDIR, as Linux `FileBacking` reports).
@@ -946,18 +958,12 @@ impl Backing for CrashableBacking {
         let mut inner = self.live("open", path)?;
         inner.io.check(&FaultOp::Open { path, create })?;
         inner.require_file_name(path)?;
-        let inode = match inner.volatile(path) {
-            Some(inode) => inode,
-            None if create => {
-                // A new, empty inode: nothing of an unlinked predecessor at
-                // this name is visible through it, before or after a crash.
-                inner.next_inode += 1;
-                let inode = inner.next_inode;
-                inner.inodes.insert(inode, Inode::default());
-                inner.relink(vec![(path.to_string(), Some(inode))]);
-                inode
-            }
-            None => return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string())),
+        let inode = if create {
+            inner.open_or_create_inode(path)
+        } else {
+            inner
+                .volatile(path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.to_string()))?
         };
         *inner.handles.entry(inode).or_default() += 1;
         Ok(Arc::new(CrashFile {
@@ -1128,6 +1134,7 @@ impl Backing for CrashableBacking {
                 "VOLUME_ALREADY_ATTACHED",
             ));
         }
+        inner.open_or_create_inode(path);
         Ok(Box::new(CrashLock {
             inner: self.inner.clone(),
             path: path.to_string(),
