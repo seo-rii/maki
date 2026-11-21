@@ -358,8 +358,8 @@ socket = "/case/control.sock"
         # Startup can remain alive without READY. Resolve the current PID,
         # rather than reusing the previous (removed) container's cgroup.
         state = self.state()
-        memberships = pathlib.Path(f"/proc/{state['Pid']}/cgroup").read_text().splitlines()
-        relative = next(line[3:] for line in memberships if line.startswith("0::"))
+        memberships = pathlib.Path(f"/proc/{state['Pid']}/cgroup").read_bytes().split(b"\n")
+        relative = os.fsdecode(next(line[3:] for line in memberships if line.startswith(b"0::")))
         cgroup = pathlib.Path("/sys/fs/cgroup") / relative.lstrip("/")
         for name in ("memory.current", "memory.peak", "memory.max", "memory.swap.max",
                      "memory.events", "cpu.max", "cpu.stat", "pids.max", "pids.events"):
