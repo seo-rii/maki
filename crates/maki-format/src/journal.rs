@@ -169,7 +169,7 @@ pub fn encode_record(rec: &JournalRecord) -> Vec<u8> {
 
 /// Encode an append directly from the caller's ciphertext slice.
 pub fn encode_record_parts(sequence: u64, unit_index: u64, payload: &[u8]) -> Vec<u8> {
-    let mut header = Writer::new();
+    let mut header = Writer::with_capacity(RECORD_HEADER_SIZE + payload.len());
     header
         .bytes(RECORD_MAGIC)
         .u64(sequence)
