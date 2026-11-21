@@ -432,3 +432,27 @@ fn payload_distinguishes_every_crypto_unit_in_a_large_request() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(units.len(), 4);
 }
+
+#[tokio::test]
+async fn a_serial_phase_polls_the_engine_in_its_first_poll() {
+    let (engine, _) = fixture().await;
+    let mut options = options();
+    options.concurrency = 1;
+    let oracle = Arc::new(Oracle::new(options.ops).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    let mut writes = std::pin::pin!(phase(
+        &engine,
+        &options,
+        options.ops,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending.peak.load(Ordering::SeqCst), 1);
+    writes.await.unwrap();
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+}

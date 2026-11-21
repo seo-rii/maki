@@ -180,11 +180,11 @@ async fn phase(
         let mut jobs = JoinSet::new();
         // Only addresses with an outstanding job/result need a sequencer.
         // The map therefore contains at most `concurrency` entries.
-        // With a single worker, each result is joined before the next submission.
+        // A single caller runs its I/O inline in submission order.
         let mut sequencers = (options.concurrency > 1).then(HashMap::new);
         let mut next = first;
         while next < end || !jobs.is_empty() {
-            while next < end && jobs.len() < options.concurrency {
+            let (slot, read, elapsed) = if next < end && jobs.len() < options.concurrency {
                 let index = next;
                 next += 1;
                 let read = match kind {
@@ -218,7 +218,7 @@ async fn phase(
                 };
                 let oracle = oracle.clone();
                 let pending = pending.clone();
-                jobs.spawn(async move {
+                let operation = async move {
                     let _sequence = sequence;
                     let previous = oracle.generation(slot as usize);
                     let generation = if read { previous } else { previous + 1 };
@@ -249,13 +249,18 @@ async fn phase(
                         oracle.generations[slot as usize].fetch_add(1, Ordering::Release);
                     }
                     Ok::<_, String>((slot, read, elapsed))
-                });
-            }
-            let (slot, read, elapsed) = jobs
-                .join_next()
-                .await
-                .expect("one pending job")
-                .map_err(|error| format!("I/O worker failed: {error}"))??;
+                };
+                if options.concurrency > 1 {
+                    jobs.spawn(operation);
+                    continue;
+                }
+                operation.await?
+            } else {
+                jobs.join_next()
+                    .await
+                    .expect("one pending job")
+                    .map_err(|error| format!("I/O worker failed: {error}"))??
+            };
             // Earlier completed results can share their address with newer
             // tasks or results; retain their common lock until all are joined.
             if let Some(sequencers) = &mut sequencers {
