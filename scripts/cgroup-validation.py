@@ -61,9 +61,9 @@ def durable_write(client, ledger, writes, mode):
 
 
 def epoch_writes(epoch):
-    flush = [(i * 4096, hashlib.sha256(f"{epoch}:{i}".encode()).digest() * 128)
+    flush = [(i * 4096, hashlib.shake_256(f"{epoch}:{i}".encode()).digest(4096))
              for i in range(128)]
-    fua = [((128 + i) * 4096, bytes([(epoch + i + 1) % 256]) * 4096) for i in range(8)]
+    fua = [((128 + i) * 4096, hashlib.shake_256(f"{epoch}:{128 + i}".encode()).digest(4096)) for i in range(8)]
     return (("flush", flush), ("fua", fua))
 
 

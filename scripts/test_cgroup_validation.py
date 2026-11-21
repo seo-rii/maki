@@ -53,6 +53,12 @@ class OracleTests(unittest.TestCase):
         with mock.patch.object(campaign.Target, "one_shot"):
             return campaign.Target("fixture-image", directory)
 
+    def test_each_durable_block_distinguishes_sector_positions(self):
+        for mode, writes in campaign.epoch_writes(0):
+            for offset, block in writes:
+                with self.subTest(mode=mode, offset=offset):
+                    self.assertNotEqual(block, block[512:] + block[:512])
+
     def test_failed_flush_never_records_durable_writes(self):
         with self.assertRaises(RuntimeError):
             campaign.durable_write(Client("flush"), self.ledger, [(0, b"a" * 4096)], "flush")

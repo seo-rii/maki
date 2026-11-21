@@ -105,7 +105,7 @@ def barrier(client, cycle, mode):
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        payload = hashlib.sha256(f"maki-firecracker-v1:{cycle}:{index}".encode()).digest() * 128
+        payload = hashlib.shake_256(f"maki-firecracker-v1:{cycle}:{index}".encode()).digest(4096)
         client.write(offset, payload, fua=mode == "fua")
         records.append({"offset": offset, "length": 4096, "sha256": hashlib.sha256(payload).hexdigest()})
     if mode == "flush":

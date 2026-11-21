@@ -201,6 +201,8 @@ class GuestContracts(unittest.TestCase):
             self.assertEqual(client.write.call_count, 16)
             for call in client.write.call_args_list:
                 self.assertEqual(call.kwargs["fua"], mode == "fua")
+                block = call.args[1]
+                self.assertNotEqual(block, block[512:] + block[:512])
             self.assertEqual(client.flush.call_count, int(mode == "flush"))
 
 

@@ -781,6 +781,8 @@ class GuestContracts(unittest.TestCase):
             self.assertEqual(client.write.call_count, 16)
             for call in client.write.call_args_list:
                 self.assertEqual(call.kwargs["fua"], mode == "fua")
+                block = call.args[1]
+                self.assertNotEqual(block, block[512:] + block[:512])
             self.assertEqual(client.flush.call_count, int(mode == "flush"))
 
     def test_guest_launch_uses_parent_lifetime_and_server_capability_evidence(self):
@@ -832,6 +834,8 @@ class GuestContracts(unittest.TestCase):
             client = mock.Mock()
             manifest = self.guest.discard_barrier(client, cycle, mode, "a" * 32)
             self.assertEqual(manifest, self.host.expected_discard_manifest(cycle, "a" * 32))
+            rewrite = client.write.call_args_list[-1].args[1]
+            self.assertNotEqual(rewrite, rewrite[512:] + rewrite[:512])
             self.assertEqual(client.write.call_count, 17)
             self.assertEqual(client.trim.call_args_list, [
                 mock.call(0, 4096, fua=mode == "fua"),

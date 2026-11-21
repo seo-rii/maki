@@ -34,7 +34,7 @@ def expected_records(cycle):
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        data = hashlib.sha256(f"maki-firecracker-v1:{cycle}:{index}".encode()).digest() * 128
+        data = hashlib.shake_256(f"maki-firecracker-v1:{cycle}:{index}".encode()).digest(4096)
         records.append({"offset": offset, "length": 4096, "sha256": hashlib.sha256(data).hexdigest()})
     return records
 

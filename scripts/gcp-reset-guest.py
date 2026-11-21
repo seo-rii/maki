@@ -53,12 +53,12 @@ def index_for_offset(offset):
 def payload(cycle, index, token):
     mode_for_cycle(cycle)
     offset_for_index(index)
-    return hashlib.sha256(f"maki-gcp-reset-v2:{token}:{cycle}:{index}".encode()).digest() * 128
+    return hashlib.shake_256(f"maki-gcp-reset-v2:{token}:{cycle}:{index}".encode()).digest(4096)
 
 
 def rewrite_payload(cycle, token):
     mode_for_cycle(cycle)
-    return hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{token}:{cycle}".encode()).digest() * 128
+    return hashlib.shake_256(f"maki-gcp-reset-v3-rewrite:{token}:{cycle}".encode()).digest(4096)
 
 
 def discard_final_block(cycle, offset, token):

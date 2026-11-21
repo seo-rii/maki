@@ -47,7 +47,7 @@ def expected_records(cycle, token=None):
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        block = hashlib.sha256(f"{prefix}:{cycle}:{index}".encode()).digest() * 128
+        block = hashlib.shake_256(f"{prefix}:{cycle}:{index}".encode()).digest(4096)
         records.append({"offset": offset, "length": 4096,
                         "sha256": hashlib.sha256(block).hexdigest()})
     return records
@@ -56,7 +56,7 @@ def expected_records(cycle, token=None):
 def expected_discard_manifest(cycle, token=None):
     writes = expected_records(cycle, token)
     prefix = "maki-gcp-reset-v3-rewrite" if token is None else f"maki-gcp-reset-v3-rewrite:{token}"
-    rewrite_block = hashlib.sha256(f"{prefix}:{cycle}".encode()).digest() * 128
+    rewrite_block = hashlib.shake_256(f"{prefix}:{cycle}".encode()).digest(4096)
     rewrite = {"offset": 0, "length": 4096,
                "sha256": hashlib.sha256(rewrite_block).hexdigest()}
     final = [dict(row) for row in writes]
