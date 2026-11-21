@@ -36,8 +36,8 @@ fn attach_plan_checks_socket_and_mountpoint_before_provisioning() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("attach.toml");
     std::fs::write(&config, "").unwrap();
-    let socket = tmp.path().join("nbd");
-    let plan = |command: &str, mountpoint: &std::path::Path| {
+    let socket = "/srv/maki-plan-fixture/nbd";
+    let plan = |command: &str, mountpoint: &str| {
         run(&[
             command,
             "--volume",
@@ -45,22 +45,25 @@ fn attach_plan_checks_socket_and_mountpoint_before_provisioning() {
             "--config",
             config.to_str().unwrap(),
             "--socket",
-            socket.to_str().unwrap(),
+            socket,
             "--mountpoint",
-            mountpoint.to_str().unwrap(),
+            mountpoint,
             "--plan",
         ])
     };
-    for mountpoint in [&socket, &socket.join("data")] {
+    for mountpoint in [socket, "/srv/maki-plan-fixture/nbd/data"] {
         let out = plan("attach", mountpoint);
         assert_eq!(out.status.code(), Some(2));
         assert!(out.stdout.is_empty());
         assert!(String::from_utf8_lossy(&out.stderr).contains("nbd_socket"));
         assert!(plan("detach", mountpoint).status.success());
     }
-    assert!(plan("attach", &tmp.path().join("nbd-data"))
-        .status
-        .success());
+    for sibling in [
+        "/srv/maki-plan-fixture/nbd-data",
+        r"/srv/maki-plan-fixture/nbd\data",
+    ] {
+        assert!(plan("attach", sibling).status.success());
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -118,7 +118,12 @@ impl AttachConfig {
                 "nbd_socket must end with a socket filename".into(),
             ));
         }
-        if std::path::Path::new(&request.mountpoint).starts_with(&request.nbd_socket) {
+        // These paths describe the Linux host even when rendering a plan elsewhere.
+        if request
+            .mountpoint
+            .strip_prefix(&request.nbd_socket)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        {
             return Err(ConfigError::Invalid(
                 "mountpoint cannot be the nbd_socket path or a directory beneath it".into(),
             ));
