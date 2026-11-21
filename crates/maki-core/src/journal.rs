@@ -515,10 +515,10 @@ impl JournalWriter {
     pub fn append(&mut self, unit_index: u64, payload: &[u8]) -> Result<u64, CoreError> {
         let (next_sequence, needs_roll) = self.check_append(payload.len())?;
         let sequence = self.next_sequence;
+        let bytes = encode_record_parts(sequence, unit_index, payload)?;
         if needs_roll {
             self.roll()?;
         }
-        let bytes = encode_record_parts(sequence, unit_index, payload);
         let active = self.active.as_mut().expect("active segment after roll");
         if active.needs_tail_cleanup {
             // A shorter retry cannot overwrite the whole failed prefix.

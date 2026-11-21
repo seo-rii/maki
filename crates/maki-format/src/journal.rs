@@ -163,12 +163,23 @@ pub struct JournalRecord {
     pub payload: Vec<u8>,
 }
 
-pub fn encode_record(rec: &JournalRecord) -> Vec<u8> {
+/// Encode a record whose payload fits the journal format.
+pub fn encode_record(rec: &JournalRecord) -> Result<Vec<u8>, FormatError> {
     encode_record_parts(rec.sequence, rec.unit_index, &rec.payload)
 }
 
 /// Encode an append directly from the caller's ciphertext slice.
-pub fn encode_record_parts(sequence: u64, unit_index: u64, payload: &[u8]) -> Vec<u8> {
+pub fn encode_record_parts(
+    sequence: u64,
+    unit_index: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    if payload.len() > MAX_PAYLOAD as usize {
+        return Err(FormatError::Invalid(format!(
+            "journal payload length {} exceeds maximum {MAX_PAYLOAD}",
+            payload.len()
+        )));
+    }
     let mut header = Writer::with_capacity(RECORD_HEADER_SIZE + payload.len());
     header
         .bytes(RECORD_MAGIC)
@@ -179,7 +190,7 @@ pub fn encode_record_parts(sequence: u64, unit_index: u64, payload: &[u8]) -> Ve
     let mut out = header.finish_with_crc();
     debug_assert_eq!(out.len(), RECORD_HEADER_SIZE);
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

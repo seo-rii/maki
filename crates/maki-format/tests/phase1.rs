@@ -336,7 +336,7 @@ fn rec(seq: u64, unit: u64, fill: u8, len: usize) -> JournalRecord {
 fn journal_records_scan_cleanly() {
     let mut buf = Vec::new();
     for i in 0..5u64 {
-        buf.extend(encode_record(&rec(i + 1, i * 2, i as u8, 100 + i as usize)));
+        buf.extend(encode_record(&rec(i + 1, i * 2, i as u8, 100 + i as usize)).unwrap());
     }
     let (records, outcome) = scan_segment(&buf, 1);
     assert_eq!(records.len(), 5);
@@ -347,10 +347,10 @@ fn journal_records_scan_cleanly() {
 #[test]
 fn journal_torn_tail_is_truncated() {
     let mut buf = Vec::new();
-    buf.extend(encode_record(&rec(1, 0, 1, 200)));
-    buf.extend(encode_record(&rec(2, 1, 2, 200)));
+    buf.extend(encode_record(&rec(1, 0, 1, 200)).unwrap());
+    buf.extend(encode_record(&rec(2, 1, 2, 200)).unwrap());
     let full = buf.len();
-    buf.extend(encode_record(&rec(3, 2, 3, 200)));
+    buf.extend(encode_record(&rec(3, 2, 3, 200)).unwrap());
     buf.truncate(full + 50); // torn mid-record-3
 
     let (records, outcome) = scan_segment(&buf, 1);
@@ -364,11 +364,11 @@ fn journal_torn_tail_is_truncated() {
 #[test]
 fn journal_middle_corruption_is_detected_not_truncated() {
     let mut buf = Vec::new();
-    let r1 = encode_record(&rec(1, 0, 1, 200));
+    let r1 = encode_record(&rec(1, 0, 1, 200)).unwrap();
     let r1_len = r1.len();
     buf.extend(r1);
-    buf.extend(encode_record(&rec(2, 1, 2, 200)));
-    buf.extend(encode_record(&rec(3, 2, 3, 200)));
+    buf.extend(encode_record(&rec(2, 1, 2, 200)).unwrap());
+    buf.extend(encode_record(&rec(3, 2, 3, 200)).unwrap());
     // Flip one payload byte in record 1: its CRC fails but record 2 is valid.
     buf[r1_len - 10] ^= 0x01;
 
@@ -382,8 +382,8 @@ fn journal_middle_corruption_is_detected_not_truncated() {
 #[test]
 fn journal_sequence_gap_is_corruption() {
     let mut buf = Vec::new();
-    buf.extend(encode_record(&rec(1, 0, 1, 100)));
-    buf.extend(encode_record(&rec(5, 1, 2, 100))); // gap!
+    buf.extend(encode_record(&rec(1, 0, 1, 100)).unwrap());
+    buf.extend(encode_record(&rec(5, 1, 2, 100)).unwrap()); // gap!
     let (_r, outcome) = scan_segment(&buf, 1);
     assert!(matches!(outcome, ScanOutcome::Corrupt { .. }));
 }
@@ -400,7 +400,7 @@ fn segment_header_roundtrip_and_journal_golden() {
     assert_eq!(d.segment_index, 9);
     assert_eq!(d.base_sequence, 1000);
 
-    let record_bytes = encode_record(&rec(77, 12, 0xAA, 64));
+    let record_bytes = encode_record(&rec(77, 12, 0xAA, 64)).unwrap();
     assert_eq!(
         crc32fast::hash(&record_bytes),
         golden::JOURNAL_RECORD_V1_CRC
@@ -690,7 +690,7 @@ fn binary_decoders_never_panic_on_garbage() {
     };
     let mut record_stream = Vec::new();
     for i in 0..3 {
-        record_stream.extend(encode_record(&rec(i + 1, i, 9, 50)));
+        record_stream.extend(encode_record(&rec(i + 1, i, 9, 50)).unwrap());
     }
 
     for i in 0..4000 {

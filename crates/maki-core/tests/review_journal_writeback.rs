@@ -328,12 +328,14 @@ fn retry_rejects_a_changed_header_even_when_the_record_crc_residue_is_unchanged(
         sequence: 2,
         unit_index: 1,
         payload: vec![2; CIPHERTEXT_SIZE],
-    });
+    })
+    .unwrap();
     let changed = encode_record(&JournalRecord {
         sequence: 2,
         unit_index: 2,
         payload: vec![2; CIPHERTEXT_SIZE],
-    });
+    })
+    .unwrap();
     // Hashing a self-checksummed header with the same CRC algorithm cannot
     // fingerprint its contents: both valid headers have the same residue.
     assert_eq!(crc32fast::hash(&original), crc32fast::hash(&changed));

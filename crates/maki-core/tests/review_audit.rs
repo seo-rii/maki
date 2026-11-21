@@ -286,7 +286,8 @@ fn record_with_out_of_range_unit_is_corruption_not_replay() {
         sequence: 2,
         unit_index: DEVICE_UNITS, // one past the end
         payload: ct(9),
-    });
+    })
+    .unwrap();
     let f = backing.open(&seg, false).unwrap();
     f.write_at(48 + RECORD, &forged).unwrap();
     f.sync_data().unwrap();
@@ -308,7 +309,8 @@ fn record_with_oversized_payload_is_corruption_not_replay() {
         sequence: 2,
         unit_index: 1,
         payload: vec![7u8; 600], // max_ciphertext_size is 544
-    });
+    })
+    .unwrap();
     let f = backing.open(&seg, false).unwrap();
     f.write_at(48 + RECORD, &forged).unwrap();
     f.sync_data().unwrap();

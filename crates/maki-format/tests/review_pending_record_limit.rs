@@ -10,6 +10,7 @@ fn pending_limit_must_hold_one_maximum_encoded_record() {
         unit_index: 0,
         payload: vec![0; cfg.crypto.capabilities.max_ciphertext_size as usize],
     })
+    .unwrap()
     .len() as u64;
     for limit in [0, required - 1] {
         cfg.limits.max_journal_pending_bytes = ByteSize(limit);
