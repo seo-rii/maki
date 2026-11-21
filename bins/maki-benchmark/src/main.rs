@@ -307,7 +307,8 @@ fn main() -> ExitCode {
         let measured = workload::run(engine, &options, working_set_bytes).await?;
         // Each recorded read has already passed the workload's comparison.
         // Keep the measured-read verdict separate from the final sweep.
-        let verified_read_operations = measured.reads.report().samples;
+        let read = OperationReport::new(measured.read_elapsed, io_size, &measured.reads);
+        let verified_read_operations = read.latency.samples;
         Ok(Report {
             schema_version: 1,
             provider: config.crypto.provider.clone(),
@@ -324,7 +325,7 @@ fn main() -> ExitCode {
             verified_read_operations,
             flush_us: measured.final_flush_us,
             write: OperationReport::new(measured.write_elapsed, io_size, &measured.writes),
-            read: OperationReport::new(measured.read_elapsed, io_size, &measured.reads),
+            read,
             flush: OperationReport::new(measured.elapsed, 0, &measured.flushes),
             workload: workload::Description {
                 mode: if options.read_percent.is_some() {
