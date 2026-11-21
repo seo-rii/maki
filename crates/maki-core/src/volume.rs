@@ -579,9 +579,11 @@ impl Volume {
             if self.checkpoint_cleanup_pending {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
+                // A published checkpoint can leave covered versions behind
+                // only while its journal cleanup is pending.
+                self.overlay.retire(base_checkpoint);
                 self.checkpoint_cleanup_pending = false;
             }
-            self.overlay.retire(base_checkpoint);
             // Physical reclamation is a space hint (R5-008): a window that
             // cannot be punched (ENOSPC splitting an extent, EIO) is logged
             // and retried by a later checkpoint, never failed here, or

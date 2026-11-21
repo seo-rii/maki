@@ -159,7 +159,11 @@ fn deleted_segments_do_not_hide_a_failed_journal_directory_barrier() {
         "cleanup must retry the failed barrier even without sealed segments"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(volume.overlay_len(), 8);
+    let newer = volume.write_ct(0, &[0x55; 32], false).unwrap();
     volume.checkpoint().unwrap();
+    assert_eq!(volume.overlay_len(), 1);
+    assert_eq!(volume.read_ct(0).unwrap(), Some((newer, vec![0x55; 32])));
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
     // Once the barrier succeeds, an idle pass need not repeat it.
     volume.checkpoint().unwrap();
