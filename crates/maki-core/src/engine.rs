@@ -1152,7 +1152,8 @@ impl Engine {
         };
         let unit_size = self.unit_size();
         let first = offset / unit_size;
-        let last = (offset + data_len as u64 - 1) / unit_size;
+        let end = offset + data_len as u64;
+        let last = (end - 1) / unit_size;
 
         // Serialize against other writers/RMW of the same units (SPEC §28).
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
@@ -1162,54 +1163,50 @@ impl Engine {
         // when it holds `(unit, sequence)`, exactly as on the read path
         // (R4-006, including `verify_on_hit`); the unit locks keep the
         // sequence stable meanwhile (R5-032).
-        let volume = self.inner.read_volume().await?;
-        let inner = self.inner.clone();
-        let io_admission = admission.clone();
-        let io_guards = guards.clone();
-        let (rmw_cts, need_rmw, cached) = storage_task(move || {
-            let (_admission, _guards) = (io_admission, io_guards);
-            let mut rmw_cts = Vec::new();
-            let mut need_rmw = Vec::new();
-            let mut cached = HashMap::new();
-            let cache = inner
-                .cache
-                .as_ref()
-                .filter(|cache| cache.can_hold(unit_size));
-            for unit in first..=last {
-                let unit_start = unit * unit_size;
-                let full =
-                    offset <= unit_start && offset + data_len as u64 >= unit_start + unit_size;
-                if full {
-                    continue;
+        let head = (!offset.is_multiple_of(unit_size)).then_some(first);
+        let tail = (!end.is_multiple_of(unit_size) && head != Some(last)).then_some(last);
+        let mut existing = if head.is_some() || tail.is_some() {
+            let volume = self.inner.read_volume().await?;
+            let inner = self.inner.clone();
+            let io_admission = admission.clone();
+            let io_guards = guards.clone();
+            let (rmw_cts, cached) = storage_task(move || {
+                let (_admission, _guards) = (io_admission, io_guards);
+                let mut rmw_cts = Vec::new();
+                let mut cached = HashMap::new();
+                let cache = inner
+                    .cache
+                    .as_ref()
+                    .filter(|cache| cache.can_hold(unit_size));
+                for unit in head.into_iter().chain(tail) {
+                    if let Some((_, ct)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
+                        rmw_cts.push(CiphertextUnit {
+                            unit_index: unit,
+                            data: ct,
+                        });
+                    }
                 }
-                need_rmw.push(unit);
-                if let Some((_, ct)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
-                    rmw_cts.push(CiphertextUnit {
-                        unit_index: unit,
-                        data: ct,
-                    });
-                }
+                Ok::<_, CoreError>((rmw_cts, cached))
+            })
+            .await??;
+            let mut existing = self.decrypt_units(rmw_cts).await?;
+            for (unit, buf) in cached {
+                existing.insert(unit, buf.duplicate());
             }
-            Ok::<_, CoreError>((rmw_cts, need_rmw, cached))
-        })
-        .await??;
-        let mut existing = self.decrypt_units(rmw_cts).await?;
-        for (unit, buf) in cached {
-            existing.insert(unit, buf.duplicate());
-        }
+            existing
+        } else {
+            self.inner.check_running()?;
+            HashMap::new()
+        };
 
         let mut items = Vec::with_capacity((last - first + 1) as usize);
         for unit in first..=last {
             let unit_start = unit * unit_size;
-            let mut buf = if need_rmw.contains(&unit) {
-                existing
-                    .remove(&unit)
-                    .unwrap_or_else(|| SecretBuffer::zeroed(unit_size as usize))
-            } else {
-                SecretBuffer::zeroed(unit_size as usize)
-            };
+            let mut buf = existing
+                .remove(&unit)
+                .unwrap_or_else(|| SecretBuffer::zeroed(unit_size as usize));
             let dst_from = offset.max(unit_start) - unit_start;
-            let dst_to = (offset + data_len as u64).min(unit_start + unit_size) - unit_start;
+            let dst_to = end.min(unit_start + unit_size) - unit_start;
             let destination = &mut buf.expose_mut()[dst_from as usize..dst_to as usize];
             match data {
                 WriteInput::Borrowed(bytes) => {
