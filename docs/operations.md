@@ -331,16 +331,21 @@ Read the journal with `journalctl -u maki@<volume>.service`.
 
 ## Rootless userspace smoke test
 
-The following test overwrites the complete disposable export:
+Use a disposable export at least 8 MiB in size. This test overwrites its first
+8 MiB. The readback uses the nbdkit offset filter to copy exactly that range:
 
 ```bash
+(
+set -euo pipefail
 uri='nbd+unix:///?socket=/run/maki/example/nbd.sock'
 test_dir="$(mktemp -d)"
 
 nbdinfo "$uri"
 dd if=/dev/urandom of="$test_dir/source.bin" bs=1M count=8 status=none
 nbdcopy --flush --synchronous "$test_dir/source.bin" "$uri"
-nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"
+export test_dir
+nbdkit -r -U - --filter=offset nbd "$uri" range=8M \
+  --run 'nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"'
 cmp "$test_dir/source.bin" "$test_dir/roundtrip.bin"
 
 fio --name=maki-nbd-verify \
@@ -348,6 +353,7 @@ fio --name=maki-nbd-verify \
   --rw=write --bs=4k --size=8M --iodepth=1 --fsync=32 \
   --verify=crc32c --do_verify=1 --verify_fatal=1 \
   --verify_state_save=0
+)
 ```
 
 This covers Maki through nbdkit and libnbd without a kernel device. It does not
