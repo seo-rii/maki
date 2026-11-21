@@ -44,7 +44,7 @@ impl ShardCatalog {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::new();
+        let mut w = Writer::with_capacity(Self::max_encoded_len(self.shards.len() as u64) as usize);
         w.bytes(CATALOG_MAGIC)
             .u32(CATALOG_VERSION)
             .u64(self.generation)
