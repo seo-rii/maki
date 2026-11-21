@@ -29,7 +29,7 @@ use crate::recovery::{
     acquire_lock, check_metadata_generations, load_checkpoint_state, load_durable_mark,
     summarize_journal, JournalRepair, RecoveryError,
 };
-use crate::store::{SlotRead, SlotStore};
+use crate::store::SlotStore;
 
 /// Cap on individually reported slot errors (the count is always exact).
 const MAX_SLOT_ERRORS: usize = 64;
@@ -236,8 +236,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                 } else {
                     probed += 1;
                 }
-                if !replay_units.contains(&unit) && matches!(read, Ok(SlotRead::Ciphertext { .. }))
-                {
+                if !replay_units.contains(&unit) && matches!(read, Ok(true)) {
                     stored_ciphertext = true;
                 }
                 if let Err(e) = read {
