@@ -1479,17 +1479,25 @@ impl SlotStore {
     /// SPEC §22 read classification: header, then the payload verified
     /// against the header's CRC.
     pub fn read_slot(&self, unit: u64) -> Result<SlotRead, CoreError> {
-        self.read_payload(self.slot_header(unit)?)
+        let Some(header) = self.slot_header(unit)? else {
+            return Ok(SlotRead::Zero);
+        };
+        Ok(SlotRead::Ciphertext {
+            write_sequence: header.write_sequence,
+            data: self.read_ciphertext(&header)?,
+        })
     }
 
     /// The offline caller holds the volume lock. Unlisted units arrive in
     /// shard order so one observed length covers their whole header scan.
+    /// The result is true when the slot contains verified ciphertext.
     pub(crate) fn checked_slots(
         &self,
-    ) -> impl Iterator<Item = (u64, bool, Result<SlotRead, CoreError>)> + '_ {
+    ) -> impl Iterator<Item = (u64, bool, Result<bool, CoreError>)> + '_ {
         let listed = self.allocated_units().map(|unit| (unit, true));
         let unlisted = self.unlisted_units().map(|unit| (unit, false));
         let mut previous = None;
+        let mut scratch = None;
         listed.chain(unlisted).map(move |(unit, allocated)| {
             let header = self.slot_header_with_len(unit, |shard, data| {
                 if let Some((last_shard, len)) = previous {
@@ -1501,26 +1509,32 @@ impl SlotStore {
                 previous = Some((shard, len));
                 Ok(len)
             });
-            (
-                unit,
-                allocated,
-                header.and_then(|header| self.read_payload(header)),
-            )
-        })
-    }
-
-    fn read_payload(&self, header: Option<SlotHeader>) -> Result<SlotRead, CoreError> {
-        let Some(header) = header else {
-            return Ok(SlotRead::Zero);
-        };
-        Ok(SlotRead::Ciphertext {
-            write_sequence: header.write_sequence,
-            data: self.read_ciphertext(&header)?,
+            let verified = header.and_then(|header| {
+                let Some(header) = header else {
+                    return Ok(false);
+                };
+                let buffer = scratch.get_or_insert_with(|| vec![0; 64 * 1024]);
+                self.read_and_verify_ciphertext(&header, buffer)?;
+                Ok(true)
+            });
+            (unit, allocated, verified)
         })
     }
 
     /// Read the body corresponding to an already validated slot header.
     pub(crate) fn read_ciphertext(&self, header: &SlotHeader) -> Result<Vec<u8>, CoreError> {
+        let mut data = vec![0; header.ciphertext_len as usize];
+        self.read_and_verify_ciphertext(header, &mut data)?;
+        Ok(data)
+    }
+
+    /// A full-size buffer retains the body. Offline verification reuses a
+    /// smaller buffer and feeds each consecutive chunk into the same CRC.
+    fn read_and_verify_ciphertext(
+        &self,
+        header: &SlotHeader,
+        buffer: &mut [u8],
+    ) -> Result<(), CoreError> {
         let unit = header.unit_index;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let shard = self
@@ -1528,17 +1542,28 @@ impl SlotStore {
             .get(&shard_idx)
             .expect("slot_header found the shard");
         let offset = self.geometry.slot_offset(in_shard);
-        let mut data = vec![0u8; header.ciphertext_len as usize];
-        shard
-            .data
-            .read_at(offset + 64, &mut data)
-            .map_err(|error| slot_read_error(unit, "ciphertext", error))?;
-        if crc32fast::hash(&data) != header.ciphertext_crc {
+        let len = header.ciphertext_len as usize;
+        let mut crc = crc32fast::Hasher::new();
+        let mut read = 0;
+        loop {
+            let chunk_len = (len - read).min(buffer.len());
+            let chunk = &mut buffer[..chunk_len];
+            shard
+                .data
+                .read_at(offset + 64 + read as u64, chunk)
+                .map_err(|error| slot_read_error(unit, "ciphertext", error))?;
+            crc.update(chunk);
+            read += chunk_len;
+            if read == len {
+                break;
+            }
+        }
+        if crc.finalize() != header.ciphertext_crc {
             return Err(CoreError::Corrupt(format!(
                 "unit {unit}: ciphertext CRC mismatch"
             )));
         }
-        Ok(data)
+        Ok(())
     }
 
     /// Shards touched by the given unit list (for checkpoint fdatasync).
@@ -1553,10 +1578,8 @@ mod tests {
     use maki_backing::MemBacking;
     use maki_format::{init, superblock::Superblock};
 
-    #[test]
-    fn covered_slot_requires_matching_write_metadata() {
+    fn open_store(geometry: Geometry) -> (Arc<MemBacking>, SlotStore) {
         let backing = Arc::new(MemBacking::new());
-        let geometry = Geometry::compute(512, 512, 512, 520, 512 * 64, 512 * 64).unwrap();
         init::create_volume(
             backing.as_ref(),
             Superblock {
@@ -1571,7 +1594,35 @@ mod tests {
             },
         )
         .unwrap();
-        let mut store = SlotStore::open(backing, geometry).unwrap();
+        let store = SlotStore::open(backing.clone(), geometry).unwrap();
+        (backing, store)
+    }
+
+    #[test]
+    fn offline_slot_checks_verify_the_last_chunk_of_a_large_payload() {
+        let len = 128 * 1024 + 1;
+        let geometry = Geometry::compute(512, 512, 512, len, 512, 512).unwrap();
+        let (backing, mut store) = open_store(geometry);
+        let payload = vec![7; len as usize];
+        store.write_slot(0, 1, &payload).unwrap();
+        store.mark_allocated(0).unwrap();
+        assert!(store.checked_slots().next().unwrap().2.unwrap());
+
+        backing
+            .open(&layout::shard_data(0), false)
+            .unwrap()
+            .write_at(64 + u64::from(len) - 1, &[4])
+            .unwrap();
+        assert!(matches!(
+            store.checked_slots().next().unwrap().2,
+            Err(CoreError::Corrupt(reason)) if reason.contains("ciphertext CRC mismatch")
+        ));
+    }
+
+    #[test]
+    fn covered_slot_requires_matching_write_metadata() {
+        let geometry = Geometry::compute(512, 512, 512, 520, 512 * 64, 512 * 64).unwrap();
+        let (_, mut store) = open_store(geometry);
         let payload = b"ciphertext";
         let len = payload.len() as u32;
         let crc = crc32fast::hash(payload);
