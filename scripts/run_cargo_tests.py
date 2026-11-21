@@ -5,7 +5,8 @@ Forward cargo-test options and optional harness arguments verbatim. On Linux,
 first compile the identical test selection with --no-run and parse Cargo's
 compiler-artifact messages. This preserves the toolchain, profile, target and
 unified dependency features without depending on Cargo's internal cache layout.
-Non-Linux runs need no native Linux plugin and invoke cargo test directly, as
+Windows target artifacts do not need a Linux plugin when cross-testing.
+Non-Linux hosts invoke cargo test directly, as
 do doc-test (--doc) selections, which Cargo cannot compile with --no-run and
 which never load the plugin.
 """
@@ -52,7 +53,8 @@ def compiler_artifacts(lines):
         # Package and lib-only selections do not necessarily build that cdylib.
         if (event.get("reason") == "compiler-artifact" and native_package
                 and "test" in target.get("kind", [])
-                and event.get("profile", {}).get("test") is True):
+                and event.get("profile", {}).get("test") is True
+                and Path(event.get("executable") or "").suffix != ".exe"):
             needs_plugin = True
         if (event.get("reason") != "compiler-artifact"
                 or target.get("name") != "maki_nbdkit"
@@ -61,11 +63,12 @@ def compiler_artifacts(lines):
             continue
         if manifest is not None and Path(manifest).resolve() != MANIFEST.resolve():
             continue
-        # A reported plugin must still name the expected artifact, even when
-        # this selection has no native integration tests.
-        needs_plugin = True
-        paths.update(Path(name) for name in event.get("filenames", [])
-                     if Path(name).name == PLUGIN_NAME)
+        files = [Path(name) for name in event.get("filenames", [])]
+        paths.update(path for path in files if path.name == PLUGIN_NAME)
+        # Cargo reports target artifacts for CLI, environment and config-file
+        # target selections alike. A Windows DLL needs no native Linux plugin.
+        if not any(path.name == "maki_nbdkit.dll" for path in files):
+            needs_plugin = True
     return paths, needs_plugin
 
 

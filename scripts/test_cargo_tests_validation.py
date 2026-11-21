@@ -93,6 +93,28 @@ class CargoTestRunnerTests(unittest.TestCase):
         self.assertEqual(status, 1)
         tests.assert_not_called()
 
+    def test_windows_cross_target_uses_cargo_runner_without_a_linux_plugin(self):
+        for target in ("x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc"):
+            arguments = ["--target", target, "--test", "review_native_plugin_path", "--", "--list"]
+            with self.subTest(target=target), mock.patch.dict(
+                    os.environ, {runner.PLUGIN_ENV: "/stale/plugin.so"}):
+                events = [self.compiled_test(executable=str(self.root / "test.exe")),
+                          self.artifact(self.root / "maki_nbdkit.dll")]
+                status, _, tests = self.invoke(events, arguments, test_status=7, native_tests=False)
+                self.assertEqual(status, 7)
+                self.assertEqual(tests.call_args.args[0][1:], ["test", *arguments])
+                self.assertNotIn(runner.PLUGIN_ENV, tests.call_args.kwargs["env"])
+
+    def test_windows_artifacts_do_not_satisfy_linux_tests_in_same_build(self):
+        windows = [self.compiled_test(executable=str(self.root / "test.exe")),
+                   self.artifact(self.root / "maki_nbdkit.dll")]
+        status, _, tests = self.invoke(windows)
+        self.assertEqual(status, 1)
+        tests.assert_not_called()
+        status, _, tests = self.invoke([*windows, self.artifact()])
+        self.assertEqual(status, 0)
+        self.assertEqual(tests.call_args.kwargs["env"][runner.PLUGIN_ENV], str(self.plugin))
+
     def test_older_native_test_artifact_without_manifest_still_requires_plugin(self):
         event = self.compiled_test()
         del event["manifest_path"]
