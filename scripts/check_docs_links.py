@@ -30,7 +30,6 @@ Usage: python3 -B scripts/check_docs_links.py [repository-root]
 
 from bisect import bisect_right
 import codecs
-import errno
 import hashlib
 import html
 import json
@@ -87,16 +86,21 @@ THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 
 def candidate_files(root):
     git = ["git", "-C", str(root), "ls-files", "-z"]
-    tracked = subprocess.check_output([*git, "--stage"])
+    tracked = subprocess.check_output([*git, "-t", "--stage"])
     untracked = subprocess.check_output([*git, "--others", "--exclude-standard"])
     candidates = {root / os.fsdecode(name) for name in untracked.split(b"\0") if name}
+    skipped = {}
     for entry in tracked.split(b"\0"):
         if entry:
             metadata, name = entry.split(b"\t", 1)
             path = root / os.fsdecode(name)
-            if metadata.startswith(b"160000 ") or path.is_file() or path.is_symlink():
+            tag, mode, oid, stage = metadata.split()
+            if tag == b"S" and stage == b"0" and not os.path.lexists(path):
+                skipped[path] = (mode, oid)
                 candidates.add(path)
-    return candidates
+            elif path.is_symlink() or path.is_file() or (mode == b"160000" and path.is_dir()):
+                candidates.add(path)
+    return candidates, skipped
 
 
 class SourceLine(NamedTuple):
@@ -1009,7 +1013,7 @@ def document_anchors(text):
     return anchors
 
 
-def omitted_archive_reference(root, document, content, target, packages):
+def omitted_archive_reference(root, document, content, target, resolved, packages):
     """Accept only an unchanged archive's unpublished package-local target."""
     parts = document.relative_to(root).parts
     if len(parts) < 3 or parts[0] != "vendor":
@@ -1019,10 +1023,7 @@ def omitted_archive_reference(root, document, content, target, packages):
     if files.get(document_name) != hashlib.sha256(content).hexdigest():
         return False
     archive_root = root / "vendor" / parts[1]
-    try:
-        requested = pathlib.Path(os.path.abspath(target)).relative_to(archive_root).as_posix()
-        resolved = target.resolve().relative_to(archive_root.resolve()).as_posix()
-    except (OSError, RuntimeError, ValueError):
+    if not (target.is_relative_to(archive_root) and resolved.is_relative_to(archive_root)):
         return False
     # Inventories list files, not directories. A missing directory containing
     # published files is lost packaged content, not an omitted source path.
@@ -1030,7 +1031,7 @@ def omitted_archive_reference(root, document, content, target, packages):
     # missing published file as an unrelated unpublished target.
     return all(
         name not in files and not any(path.startswith(name + "/") for path in files)
-        for name in (requested, resolved)
+        for name in (target.relative_to(archive_root).as_posix(), resolved.relative_to(archive_root).as_posix())
     )
 
 
@@ -1061,49 +1062,65 @@ def checkout_url_path(root, document, file_part):
 
 def broken_links(root):
     root = root.resolve()
-    inventory = root / "vendor/upstream.json"
-    packages = (
-        json.loads(inventory.read_text(encoding="utf-8"))["packages"]
-        if inventory.exists() else {}
-    )
+    candidates, skipped = candidate_files(root)
+
+    def contents(path):
+        if path in skipped:
+            return subprocess.check_output(["git", "-C", str(root), "cat-file", "blob", skipped[path][1]])
+        return path.read_bytes()
+
     anchor_cache = {}
     line_counts = {}
     encoding_errors = {}
-    candidates = candidate_files(root)
-    published = {root}
+    directories = {root}
     symlinks = {}
     for candidate in candidates:
-        published.add(candidate)
-        published.update(parent for parent in candidate.parents if parent.is_relative_to(root))
-        if candidate.is_symlink():
-            symlinks[candidate] = candidate.readlink()
+        directories.update(parent for parent in candidate.parents if parent.is_relative_to(root))
+        if candidate in skipped:
+            mode, _ = skipped[candidate]
+            if mode == b"120000":
+                symlinks[candidate] = os.fsdecode(contents(candidate))
+            elif mode == b"160000":
+                directories.add(candidate)
+        elif candidate.is_symlink():
+            symlinks[candidate] = os.readlink(candidate)
+        elif candidate.is_dir():
+            directories.add(candidate)
+    published = candidates | directories
 
-    def published_target(path):
+    def resolve_target(path):
+        """Follow checkout symlinks, preserving a dangling target's repository path."""
         if not path.is_relative_to(root):
             return None
-        try:
-            if not path.exists():
-                return None  # also catches dangling links and cycles
-        except OSError as error:
-            if error.errno == errno.ENAMETOOLONG:
-                return None
-            raise
-        # A local alias may resolve to a tracked file through an ignored
-        # intermediate link. Follow the path using only checkout candidates.
         pending = list(reversed(path.relative_to(root).parts))
         current = root
+        hops = 0
         while pending:
             part = pending.pop()
+            if current in published and current not in directories:
+                return None
+            if current not in published and part in (".", ".."):
+                return None
             current = current.parent if part == ".." else current / part
-            if current not in published:
+            if not current.is_relative_to(root):
                 return None
             if current in symlinks:
-                target = symlinks[current]
-                if target.is_absolute():
-                    return None  # an absolute link cannot move with the checkout
+                link = symlinks[current]
+                target = pathlib.Path(link)
+                hops += 1
+                if target.is_absolute() or hops > 40:
+                    return None
+                # Path.parts strips a final slash or dot, which requires a directory.
+                if os.path.basename(link) in ("", "."):
+                    pending.append(".")
                 pending.extend(reversed(target.parts))
                 current = current.parent
         return current
+
+    inventory = resolve_target(root / "vendor/upstream.json")
+    packages = {}
+    if inventory in candidates and inventory not in directories:
+        packages = json.loads(contents(inventory))["packages"]
 
     def decode_document(path, content):
         encoding = "utf-16" if content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else "utf-8"
@@ -1126,21 +1143,23 @@ def broken_links(root):
         if checkout is None:
             return target
         target_path, directory = checkout
-        resolved = published_target(target_path)
+        resolved = resolve_target(target_path)
         if resolved is None:
-            if omitted_archive_reference(root, path, content, target_path, packages):
+            return target
+        if resolved not in published:
+            if omitted_archive_reference(root, path, content, target_path, resolved, packages):
                 return None
             return target
-        if directory and not resolved.is_dir():
+        if directory and resolved not in directories:
             return target
         fragment = urllib.parse.unquote(fragment)
-        if fragment and resolved.is_file() and target_path.suffix.lower() == ".md":
+        if fragment and resolved not in directories and target_path.suffix.lower() == ".md":
             if resolved in encoding_errors:
                 return None
             span = re.fullmatch(r"L([1-9][0-9]*)(?:-L([1-9][0-9]*))?", fragment)
             if span and ("plain", "1") in urllib.parse.parse_qsl(query):
                 if resolved not in line_counts:
-                    if decode_document(resolved, resolved.read_bytes()) is None:
+                    if decode_document(resolved, contents(resolved)) is None:
                         return None
                 count = line_counts[resolved]
                 first, last = span[1], span[2] or span[1]
@@ -1148,7 +1167,7 @@ def broken_links(root):
                     return None
                 return f"{target} (missing line)"
             if resolved not in anchor_cache:
-                text = decode_document(resolved, resolved.read_bytes())
+                text = decode_document(resolved, contents(resolved))
                 if text is None:
                     return None
                 anchor_cache[resolved] = document_anchors(text)
@@ -1161,11 +1180,13 @@ def broken_links(root):
         if path in encoding_errors:
             continue
         relative = path.relative_to(root).as_posix()
-        if path.is_symlink() and (not path.is_file() or published_target(path) is None):
-            broken.append(f"{relative}: invalid Markdown symlink target")
+        resolved = resolve_target(path)
+        if resolved not in candidates or resolved in directories:
+            if path in symlinks:
+                broken.append(f"{relative}: invalid Markdown symlink target")
             continue
         try:
-            content = path.read_bytes()
+            content = contents(resolved)
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             continue  # the indexed file was deleted or replaced by a directory
         text = decode_document(path, content)

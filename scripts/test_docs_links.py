@@ -65,6 +65,50 @@ class DocumentationLinks(unittest.TestCase):
         self.write("README.md", "[![Grid[row][column]](plot.png)](absent.md)\n")
         self.assertEqual(broken_links(self.root), ["README.md:1: absent.md"])
 
+    def test_sparse_checkout_validates_omitted_documents_and_destinations(self):
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True)
+        self.write("docs/start.md", "[example](../examples/data) [anchor](../examples/guide.md#known)\n")
+        self.write("examples/data", "data")
+        self.write("examples/guide.md", "# Known\n[missing](absent.md)\n")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
+        expected = ["examples/guide.md:2: absent.md"]
+        self.assertEqual(broken_links(self.root), expected)
+        git("sparse-checkout", "set", "docs")
+        self.assertFalse((self.root / "examples/guide.md").exists())
+        self.assertEqual(broken_links(self.root), expected)
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_sparse_checkout_resolves_inventory_and_dangling_archive_links(self):
+        self.archive(content="[included](alias) [outside](escape/missing) [omitted](docs/missing)\n",
+                     extra_files={"missing-license": "0" * 64})
+        inventory = self.root / "vendor/upstream.json"
+        inventory.rename(inventory.with_name("packages.json"))
+        inventory.symlink_to("packages.json")
+        (self.root / "vendor/hyper/alias").symlink_to("missing-license")
+        (self.root / "vendor/hyper/escape").symlink_to("../../elsewhere")
+        self.write("docs/index.md", "[readme](../vendor/hyper/README.md)\n")
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "add", "--all"], check=True)
+        subprocess.run([*git, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "fixture"], check=True)
+        expected = ["vendor/hyper/README.md:1: alias", "vendor/hyper/README.md:1: escape/missing"]
+        self.assertEqual(broken_links(self.root), expected)
+        subprocess.run([*git, "sparse-checkout", "set", "docs"], check=True)
+        self.assertEqual(broken_links(self.root), expected)
+
+    def test_sparse_checkout_keeps_deleted_gitlink_missing(self):
+        self.write("docs/index.md", "[component](../modules/component) [directory](../modules/component/)\n")
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "fixture"], check=True)
+        oid = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},modules/component"], check=True)
+        self.assertEqual(broken_links(self.root), ["docs/index.md:1: ../modules/component",
+                                                  "docs/index.md:1: ../modules/component/"])
+        subprocess.run([*git, "update-index", "--skip-worktree", "modules/component"], check=True)
+        self.assertEqual(broken_links(self.root), [])
+
     def test_markdown_line_endings_and_bom(self):
         self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
         self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
