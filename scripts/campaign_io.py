@@ -1,13 +1,16 @@
-"""Private host-side evidence I/O shared by the reset qualification controllers."""
+"""Process and evidence I/O for the Linux reset qualification campaigns."""
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import selectors
 import signal
+import subprocess
 import tempfile
 import threading
+import time
 
 
 _termination_requested = False
@@ -58,6 +61,70 @@ def save_json(path, value):
             os.close(parent)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+CURRENT_BLOCK_PATTERN = "shake256-4096"
+ARCHIVED_BLOCK_PATTERN = "repeated-sha256"
+
+
+def block_digest(seed, pattern):
+    """Compute the controller's expected digest for a recorded 4 KiB block."""
+    if pattern == CURRENT_BLOCK_PATTERN:
+        block = hashlib.shake_256(seed.encode()).digest(4096)
+    elif pattern == ARCHIVED_BLOCK_PATTERN:
+        block = hashlib.sha256(seed.encode()).digest() * 128
+    else:
+        raise ValueError("unknown ACK block pattern")
+    return hashlib.sha256(block).hexdigest()
+
+
+def ledger_block_pattern(record, expected):
+    """Read host-only format metadata. Older ledgers have no pattern field."""
+    if not isinstance(record, dict):
+        raise ValueError("ACK ledger record must be an object")
+    pattern = record.pop("block_pattern", ARCHIVED_BLOCK_PATTERN)
+    if pattern not in (CURRENT_BLOCK_PATTERN, ARCHIVED_BLOCK_PATTERN):
+        raise ValueError("unknown ACK block pattern")
+    if expected is not None and pattern != expected:
+        raise ValueError("ACK ledger block pattern changed")
+    return pattern
+
+
+def guest_command_output(command, *, timeout, search_path):
+    """Capture a setup command with a shared 64 KiB stdout/stderr budget."""
+    limit = 65536
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True,
+                          env=dict(os.environ, PATH=search_path)) as child:
+        stdout, stderr = bytearray(), bytearray()
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ, stdout)
+                ready.register(child.stderr, selectors.EVENT_READ, stderr)
+                while ready.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    for key, _ in ready.select(remaining):
+                        budget = limit - len(stdout) - len(stderr)
+                        chunk = os.read(key.fd, min(8192, budget + 1))
+                        if len(chunk) > budget:
+                            raise ValueError("setup output limit exceeded")
+                        if chunk:
+                            key.data.extend(chunk)
+                        else:
+                            ready.unregister(key.fd)
+            status = child.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+    if status:
+        raise RuntimeError(f"{command[0]} exited {status}: " + stderr[-2048:].decode(errors="replace"))
+    return stdout.decode().strip()
 
 
 class DiagnosticLog:

@@ -23,6 +23,11 @@ import tempfile
 import time
 import tomllib
 
+try:
+    from campaign_io import guest_command_output
+except ModuleNotFoundError:
+    from scripts.campaign_io import guest_command_output
+
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
 BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -53,12 +58,12 @@ def index_for_offset(offset):
 def payload(cycle, index, token):
     mode_for_cycle(cycle)
     offset_for_index(index)
-    return hashlib.sha256(f"maki-gcp-reset-v2:{token}:{cycle}:{index}".encode()).digest() * 128
+    return hashlib.shake_256(f"maki-gcp-reset-v2:{token}:{cycle}:{index}".encode()).digest(4096)
 
 
 def rewrite_payload(cycle, token):
     mode_for_cycle(cycle)
-    return hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{token}:{cycle}".encode()).digest() * 128
+    return hashlib.shake_256(f"maki-gcp-reset-v3-rewrite:{token}:{cycle}".encode()).digest(4096)
 
 
 def discard_final_block(cycle, offset, token):
@@ -197,13 +202,7 @@ def configured_backing(path):
 
 
 def run_output(command, timeout=10):
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            timeout=timeout, env=dict(os.environ, PATH=SYSTEM_PATH), check=False)
-    ensure(len(result.stdout) + len(result.stderr) <= 65536, "setup output limit exceeded")
-    if result.returncode != 0:
-        raise RuntimeError(f"{command[0]} exited {result.returncode}: "
-                           + result.stderr[-2048:].decode(errors="replace"))
-    return result.stdout.decode(errors="strict").strip()
+    return guest_command_output(command, timeout=timeout, search_path=SYSTEM_PATH)
 
 
 def filesystem_uuid(path):

@@ -1,5 +1,6 @@
 """Whole-GCE-reset host oracle and native guest durability contracts."""
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -110,14 +111,39 @@ class HostContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.host.load_ledger(self.ledger)
 
-    def test_historical_ledger_can_be_read_but_cannot_qualify_a_new_campaign(self):
-        archived = self.ack()
-        del archived["token"]
-        archived["records"] = self.host.expected_records(0)
-        self.ledger.write_text(json.dumps(archived) + "\n")
-        self.assertEqual(self.host.load_ledger(self.ledger), archived)
-        with self.assertRaisesRegex(ValueError, "identity"):
-            self.host.load_ledger(self.ledger, token=self.token)
+    def test_previous_ack_ledgers_remain_readable_only_as_historical_evidence(self):
+        def old_digest(seed):
+            return hashlib.sha256(hashlib.sha256(seed.encode()).digest() * 128).hexdigest()
+
+        for token in (None, self.token):
+            prefix = "maki-gcp-reset-v1" if token is None else f"maki-gcp-reset-v2:{token}"
+            archived = self.ack()
+            if token is None:
+                del archived["token"]
+            for index, row in enumerate(archived["records"]):
+                row["sha256"] = old_digest(f"{prefix}:0:{index}")
+            for profile in ("v2", "v3-discard"):
+                if profile == "v3-discard":
+                    writes = archived.pop("records")
+                    rewrite_prefix = "maki-gcp-reset-v3-rewrite"
+                    if token is not None:
+                        rewrite_prefix += f":{token}"
+                    rewrite = dict(writes[0], sha256=old_digest(f"{rewrite_prefix}:0"))
+                    final = writes.copy()
+                    final[0] = rewrite
+                    final[8] = dict(writes[8], sha256=hashlib.sha256(bytes(4096)).hexdigest())
+                    archived.update(command="discard-0", profile=profile, manifest={
+                        "write": writes, "trim": [{"offset": 0, "length": 4096}, {"offset": 4096, "length": 4096}],
+                        "rewrite": rewrite, "final": final,
+                    })
+                with self.subTest(token=token, profile=profile):
+                    self.ledger.write_text(json.dumps(archived) + "\n")
+                    self.assertEqual(self.host.load_ledger(self.ledger, profile), archived)
+                    self.assertEqual(self.host.load_ledger(self.ledger, profile, token=token), archived)
+                    with self.assertRaises(ValueError):
+                        self.host.load_ledger(self.ledger, profile, token=self.token, require_current=True)
+                    with self.assertRaises(ValueError):
+                        self.host.record_ack(self.ledger, archived, 0, profile, token=self.token)
 
     def test_missing_wrong_duplicate_or_guest_supplied_expectation_is_failure(self):
         expected = self.host.expected_records(0)
@@ -781,6 +807,8 @@ class GuestContracts(unittest.TestCase):
             self.assertEqual(client.write.call_count, 16)
             for call in client.write.call_args_list:
                 self.assertEqual(call.kwargs["fua"], mode == "fua")
+                block = call.args[1]
+                self.assertNotEqual(block, block[512:] + block[:512])
             self.assertEqual(client.flush.call_count, int(mode == "flush"))
 
     def test_guest_launch_uses_parent_lifetime_and_server_capability_evidence(self):
@@ -832,6 +860,8 @@ class GuestContracts(unittest.TestCase):
             client = mock.Mock()
             manifest = self.guest.discard_barrier(client, cycle, mode, "a" * 32)
             self.assertEqual(manifest, self.host.expected_discard_manifest(cycle, "a" * 32))
+            rewrite = client.write.call_args_list[-1].args[1]
+            self.assertNotEqual(rewrite, rewrite[512:] + rewrite[:512])
             self.assertEqual(client.write.call_count, 17)
             self.assertEqual(client.trim.call_args_list, [
                 mock.call(0, 4096, fua=mode == "fua"),

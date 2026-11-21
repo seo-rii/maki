@@ -147,7 +147,8 @@ Completed launcher evidence:
 Reproduction needs an explicitly provisioned disposable Linux host with KVM,
 the pinned Firecracker/kernel, Python 3 and a prepared rootfs. The rootfs needs
 nbdkit with the log filter, `libnbd.so.0`, Python 3, `mount`, `blkid`, the normal release CLI/plugin,
-an executable agent at `/opt/maki/firecracker-guest-agent.py`, and a disposable
+an executable agent at `/opt/maki/firecracker-guest-agent.py`, the matching
+`scripts/campaign_io.py` alongside the agent, and a disposable
 32-byte `/opt/maki/key`. Prepare `/proc`, `/sys`, `/dev`, `/run`, `/data` and the
 initial console/null/ttyS0 device nodes before making the rootfs read-only.
 Check binary/runtime compatibility. The separate data file must already be a

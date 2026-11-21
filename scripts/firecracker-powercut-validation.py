@@ -8,7 +8,6 @@ background supervisor. stdout from Firecracker is a serial control channel,
 recorded from launch; diagnostic files are inspected only after child exit.
 """
 import argparse
-import hashlib
 import json
 import os
 import pathlib
@@ -21,21 +20,23 @@ import time
 import uuid
 
 try:
-    from campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
+    from campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                             handle_termination, ledger_block_pattern, save_json)
 except ModuleNotFoundError:
-    from scripts.campaign_io import DiagnosticLog, check_termination, handle_termination, save_json
+    from scripts.campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                                     handle_termination, ledger_block_pattern, save_json)
 
 PREFIX = b"MAKI_FC_V1 "
 MAX_FRAME = 16384
 MAX_OUTPUT = 8 << 20
 
 
-def expected_records(cycle):
+def expected_records(cycle, pattern=CURRENT_BLOCK_PATTERN):
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        data = hashlib.sha256(f"maki-firecracker-v1:{cycle}:{index}".encode()).digest() * 128
-        records.append({"offset": offset, "length": 4096, "sha256": hashlib.sha256(data).hexdigest()})
+        digest = block_digest(f"maki-firecracker-v1:{cycle}:{index}", pattern)
+        records.append({"offset": offset, "length": 4096, "sha256": digest})
     return records
 
 
@@ -59,18 +60,19 @@ def decode_frame(line, token, boot):
     return value
 
 
-def validate_ack(event, cycle):
+def validate_ack(event, cycle, *, pattern=CURRENT_BLOCK_PATTERN):
     mode = "flush" if cycle % 2 == 0 else "fua"
     if (event.get("event") != "ack" or event.get("command") != f"write-{cycle}"
             or type(event.get("cycle")) is not int or event["cycle"] != cycle
             or event.get("mode") != mode
-            or json.dumps(event.get("records"), sort_keys=True) != json.dumps(expected_records(cycle), sort_keys=True)):
+            or json.dumps(event.get("records"), sort_keys=True) != json.dumps(expected_records(cycle, pattern), sort_keys=True)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
 
 
 def record_ack(ledger, event, cycle):
     validate_ack(event, cycle)
     record = {key: event[key] for key in ("event", "command", "cycle", "mode", "records")}
+    record["block_pattern"] = CURRENT_BLOCK_PATTERN
     fd = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -84,7 +86,7 @@ def record_ack(ledger, event, cycle):
         os.close(parent)
 
 
-def load_ledger(ledger, expected_cycles):
+def load_ledger(ledger, expected_cycles, *, require_current=False):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ledger")
     raw = ledger.read_text(encoding="utf-8")
@@ -94,9 +96,11 @@ def load_ledger(ledger, expected_cycles):
     lines = raw.splitlines()
     if len(lines) != expected_cycles:
         raise ValueError(f"ACK count {len(lines)} does not match {expected_cycles} completed cycles")
+    pattern = CURRENT_BLOCK_PATTERN if require_current else None
     for cycle, line in enumerate(lines):
         event = json.loads(line)
-        validate_ack(event, cycle)
+        pattern = ledger_block_pattern(event, pattern)
+        validate_ack(event, cycle, pattern=pattern)
         latest = event["records"]
     return latest
 
@@ -307,7 +311,7 @@ def campaign(args):
                     fs_uuid = ready["fs_uuid"]
                     entry["ready"] = ready
                     if boot:
-                        expected = load_ledger(ledger, expected_cycles=boot)
+                        expected = load_ledger(ledger, expected_cycles=boot, require_current=True)
                         command = f"verify-{boot}"
                         process.send({"command": command, "op": "verify",
                                       "offsets": [r["offset"] for r in expected]})

@@ -161,7 +161,7 @@ Launcher filenames use UTC timestamps; the report date uses Asia/Seoul time.
 
 The harness has no third-party Python dependencies. Prepare an explicitly
 authorized disposable GCE instance with a separate persistent data disk, mount
-that disk at `/mnt/maki-data`, install the pinned Maki binaries and guest agent,
+that disk at `/mnt/maki-data`, install the pinned Maki binaries, guest agent and its sibling `campaign_io.py`,
 and create the configuration, key, volume, and shutdown witness. Run the
 controller outside the workload VM. Use matching controller and guest scripts. The
 controller passes the GCE attachment device name and READY timeout on each boot.

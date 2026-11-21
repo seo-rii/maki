@@ -268,17 +268,18 @@ def prepare(directory, config, deadline):
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"{package} build did not complete: {result}")
         remaining(1800)
-        for line in log.read_text(errors="replace").splitlines():
-            if not line.startswith("{"):
-                continue
-            event = json.loads(line)
-            if event.get("reason") == "maki-test-runtime":
-                library_paths[Path(event["executable"])] = event["library_path"]
-                continue
-            name = event.get("target", {}).get("name")
-            if (event.get("reason") == "compiler-artifact" and name in selected
-                    and event.get("executable")):
-                executables[name] = Path(event["executable"])
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.startswith("{"):
+                    continue
+                event = json.loads(line)
+                if event.get("reason") == "maki-test-runtime":
+                    library_paths[Path(event["executable"])] = event["library_path"]
+                    continue
+                name = event.get("target", {}).get("name")
+                if (event.get("reason") == "compiler-artifact" and name in selected
+                        and event.get("executable")):
+                    executables[name] = Path(event["executable"])
     if set(executables) != set(suites):
         raise RuntimeError("build did not produce every requested test binary")
     binary_dir = directory / "bin"
@@ -302,8 +303,8 @@ def prepare(directory, config, deadline):
             raise TimeoutError(f"cannot enumerate {name}: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"cannot enumerate {name}: {result}")
-        count = sum(line.endswith(": test") for line in
-                    (directory / f"list-{name}.log").read_text().splitlines())
+        with (directory / f"list-{name}.log").open(encoding="utf-8") as stream:
+            count = sum(line.removesuffix("\n").endswith(": test") for line in stream)
         if count < 1:
             raise RuntimeError(f"empty suite: {name}")
         manifest[name]["expected_tests"] = count

@@ -53,6 +53,12 @@ class OracleTests(unittest.TestCase):
         with mock.patch.object(campaign.Target, "one_shot"):
             return campaign.Target("fixture-image", directory)
 
+    def test_each_durable_block_distinguishes_sector_positions(self):
+        for mode, writes in campaign.epoch_writes(0):
+            for offset, block in writes:
+                with self.subTest(mode=mode, offset=offset):
+                    self.assertNotEqual(block, block[512:] + block[:512])
+
     def test_failed_flush_never_records_durable_writes(self):
         with self.assertRaises(RuntimeError):
             campaign.durable_write(Client("flush"), self.ledger, [(0, b"a" * 4096)], "flush")
@@ -568,21 +574,36 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
             campaign.constrained_recovery(target)
         target.remove.assert_called_once_with()
 
+    def test_membership_path_preserves_non_lf_bytes(self):
+        target = self.unstarted_target()
+        target.state = mock.Mock(return_value={"Pid": 1234})
+        root = pathlib.Path(self.directory.name)
+        proc = root / "proc/1234"
+        proc.mkdir(parents=True)
+        (proc / "status").write_text("")
+        for leaf in ("parent\u2028child", "parent\x85child", "parent\r", "nonutf\udcfe"):
+            with self.subTest(leaf=leaf):
+                cgroup = root / "sys/fs/cgroup" / leaf
+                cgroup.mkdir(parents=True)
+                (cgroup / "memory.max").write_text("50331648")
+                (proc / "cgroup").write_bytes(b"0::/" + campaign.os.fsencode(leaf) + b"\n")
+                with mock.patch.object(campaign.pathlib, "Path", side_effect=lambda path: root / path.lstrip("/")):
+                    self.assertEqual(target.stats()["memory.max"], "50331648")
+
     def test_startup_metrics_use_the_current_container_before_ready(self):
         target = self.unstarted_target()
         target.cgroup = pathlib.Path("/stale-previous-container")
         target.state = mock.Mock(return_value={"Pid": 1234})
 
         def read(path):
-            if str(path) == "/proc/1234/cgroup":
-                return "0::/current-container\n"
             if str(path) == "/proc/1234/status":
                 return "Name:\tnbdkit\nVmHWM:\t12345 kB\nVmRSS:\t8192 kB\nRssAnon:\t4096 kB\nRssFile:\t4096 kB\nRssShmem:\t0 kB\n"
             if str(path) == "/sys/fs/cgroup/current-container/memory.max":
                 return "33554432\n"
             return "0"
 
-        with mock.patch.object(pathlib.Path, "read_text", autospec=True, side_effect=read):
+        with mock.patch.object(pathlib.Path, "read_bytes", return_value=b"0::/current-container\n"), \
+                mock.patch.object(pathlib.Path, "read_text", autospec=True, side_effect=read):
             stats = target.stats()
             self.assertEqual(stats["memory.max"], "33554432")
             self.assertEqual(stats["process.VmHWM.bytes"], 12345 * 1024)
