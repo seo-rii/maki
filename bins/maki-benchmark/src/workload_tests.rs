@@ -225,6 +225,36 @@ fn samples() -> Samples {
 }
 
 #[tokio::test]
+async fn queued_workers_do_not_count_as_pending_engine_calls() {
+    let (engine, _) = fixture().await;
+    let options = options();
+    let slots = options.ops;
+    let oracle = Arc::new(Oracle::new(slots).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    let mut writes = std::pin::pin!(phase(
+        &engine,
+        &options,
+        slots,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples,
+    ));
+
+    // On this current-thread runtime, the first poll queues a distinct-slot
+    // cohort and waits for a result before any worker can run.
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+    assert_eq!(pending.peak.load(Ordering::SeqCst), 0);
+
+    writes.await.unwrap();
+    assert!(pending.peak.load(Ordering::SeqCst) > 0);
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn same_address_previous_generation_fails_the_real_read_phase() {
     let (engine, provider) = fixture().await;
     let options = options();

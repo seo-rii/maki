@@ -2,6 +2,7 @@ use crate::{latency::Latencies, Options};
 use maki_core::engine::Engine;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,15 +61,16 @@ struct Pending {
     current: AtomicU64,
     peak: AtomicU64,
 }
-struct PendingGuard(Arc<Pending>);
-impl PendingGuard {
-    fn new(pending: Arc<Pending>) -> Self {
-        let count = pending.current.fetch_add(1, Ordering::SeqCst) + 1;
-        pending.peak.fetch_max(count, Ordering::SeqCst);
-        Self(pending)
+impl Pending {
+    async fn track<F: Future>(&self, operation: F) -> F::Output {
+        let count = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(count, Ordering::SeqCst);
+        let _guard = PendingGuard(self);
+        operation.await
     }
 }
-impl Drop for PendingGuard {
+struct PendingGuard<'a>(&'a Pending);
+impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         self.0.current.fetch_sub(1, Ordering::SeqCst);
     }
@@ -201,9 +203,8 @@ async fn phase(
                 *outstanding += 1;
                 let sequence = lock.clone().lock_owned().await;
                 let oracle = oracle.clone();
-                let guard = PendingGuard::new(pending.clone());
+                let pending = pending.clone();
                 jobs.spawn(async move {
-                    let _guard = guard;
                     let _sequence = sequence;
                     let previous = oracle.generation(slot as usize);
                     let generation = if read { previous } else { previous + 1 };
@@ -211,8 +212,8 @@ async fn phase(
                     let began = Instant::now();
                     let elapsed;
                     if read {
-                        let actual = engine
-                            .read(offset, size)
+                        let actual = pending
+                            .track(engine.read(offset, size))
                             .await
                             .map_err(|error| format!("read at offset {offset} failed: {error}"))?;
                         elapsed = began.elapsed();
@@ -224,8 +225,8 @@ async fn phase(
                                 .fetch_or(READ_AFTER_WRITE_FLAG, Ordering::Release);
                         }
                     } else {
-                        engine
-                            .write(offset, &expected, fua)
+                        pending
+                            .track(engine.write(offset, &expected, fua))
                             .await
                             .map_err(|error| format!("write at offset {offset} failed: {error}"))?;
                         elapsed = began.elapsed();
