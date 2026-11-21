@@ -24,7 +24,7 @@ use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
 use crate::recovery::{recover_bounded, Recovered, RecoveryError, RecoveryProgress};
-use crate::store::{CheckpointSlotPlan, SlotRead, SlotStore};
+use crate::store::{CheckpointSlotPlan, SlotStore};
 
 #[derive(Debug, Clone)]
 pub struct VolumeOptions {
@@ -466,20 +466,33 @@ impl Volume {
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
     pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        self.read_ct_if(unit, |_| Ok(true))
+    }
+
+    /// Read a present unit only if its version needs a payload. A skipped
+    /// payload and an unwritten unit both return None to the caller.
+    pub(crate) fn read_ct_if(
+        &self,
+        unit: u64,
+        needs_payload: impl FnOnce(u64) -> Result<bool, CoreError>,
+    ) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
         self.check_freshness()?;
         if let Some(v) = self.overlay.get(unit) {
-            if self.supports_discard() && v.ciphertext.is_empty() {
+            if (self.supports_discard() && v.ciphertext.is_empty()) || !needs_payload(v.sequence)? {
                 return Ok(None);
             }
             return Ok(Some((v.sequence, v.ciphertext.clone())));
         }
-        match self.store.read_slot(unit)? {
-            SlotRead::Zero => Ok(None),
-            SlotRead::Ciphertext {
-                write_sequence,
-                data,
-            } => Ok(Some((write_sequence, data))),
+        let Some(header) = self.store.slot_header(unit)? else {
+            return Ok(None);
+        };
+        if !needs_payload(header.write_sequence)? {
+            return Ok(None);
         }
+        Ok(Some((
+            header.write_sequence,
+            self.store.read_ciphertext(&header)?,
+        )))
     }
 
     /// Checkpoint (SPEC §26). Consumes only durable journal records;

@@ -1397,7 +1397,7 @@ impl SlotStore {
     /// holds, or `None` for zeros. Refuses undecodable, foreign-unit and
     /// oversized headers and damaged unlisted slots exactly as a full read
     /// would.
-    fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
+    pub(crate) fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
         self.slot_header_with_len(unit, |_, data| data.len())
     }
 
@@ -1470,7 +1470,7 @@ impl SlotStore {
     /// SPEC §22 read classification: header, then the payload verified
     /// against the header's CRC.
     pub fn read_slot(&self, unit: u64) -> Result<SlotRead, CoreError> {
-        self.read_payload(unit, self.slot_header(unit)?)
+        self.read_payload(self.slot_header(unit)?)
     }
 
     /// The offline caller holds the volume lock. Unlisted units arrive in
@@ -1495,15 +1495,24 @@ impl SlotStore {
             (
                 unit,
                 allocated,
-                header.and_then(|header| self.read_payload(unit, header)),
+                header.and_then(|header| self.read_payload(header)),
             )
         })
     }
 
-    fn read_payload(&self, unit: u64, header: Option<SlotHeader>) -> Result<SlotRead, CoreError> {
+    fn read_payload(&self, header: Option<SlotHeader>) -> Result<SlotRead, CoreError> {
         let Some(header) = header else {
             return Ok(SlotRead::Zero);
         };
+        Ok(SlotRead::Ciphertext {
+            write_sequence: header.write_sequence,
+            data: self.read_ciphertext(&header)?,
+        })
+    }
+
+    /// Read the body corresponding to an already validated slot header.
+    pub(crate) fn read_ciphertext(&self, header: &SlotHeader) -> Result<Vec<u8>, CoreError> {
+        let unit = header.unit_index;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let shard = self
             .shards
@@ -1520,10 +1529,7 @@ impl SlotStore {
                 "unit {unit}: ciphertext CRC mismatch"
             )));
         }
-        Ok(SlotRead::Ciphertext {
-            write_sequence: header.write_sequence,
-            data,
-        })
+        Ok(data)
     }
 
     /// Shards touched by the given unit list (for checkpoint fdatasync).
