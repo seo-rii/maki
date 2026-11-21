@@ -155,3 +155,57 @@ fn socket_option_is_refused_outside_control_commands() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn checkpoint_output(ok: bool, stdout: std::process::Stdio) -> Output {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&request).unwrap()["command"],
+            "checkpoint"
+        );
+        writeln!(stream, "{{\"ok\":{ok}}}").unwrap();
+    });
+    let result = Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(["checkpoint", "--socket"])
+        .arg(socket)
+        .stdout(stdout)
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+    result
+}
+
+#[test]
+fn closed_output_pipe_preserves_the_daemons_verdict() {
+    for ok in [true, false] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let result = checkpoint_output(ok, writer.into());
+        assert_eq!(result.status.code(), Some(if ok { 0 } else { 1 }));
+        assert!(
+            result.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_output_reports_the_received_verdict() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let result = checkpoint_output(true, full.into());
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("daemon reported success"));
+}
