@@ -228,40 +228,31 @@ impl FakeCryptoProvider {
         Ok(())
     }
 
-    fn misbehave_ct(&self, mut out: Vec<CiphertextUnit>) -> Vec<CiphertextUnit> {
-        match *self.misbehavior.lock() {
-            None => out,
-            Some(Misbehavior::ReorderResults) => {
-                if out.len() >= 2 {
-                    out.swap(0, 1);
-                }
-                out
-            }
+    fn alter_batch<T>(
+        mut out: Vec<T>,
+        fault: Option<Misbehavior>,
+        duplicate: impl FnOnce(&T) -> T,
+        index: impl FnOnce(&mut T) -> &mut u64,
+    ) -> Vec<T> {
+        match fault {
+            Some(Misbehavior::ReorderResults) if out.len() >= 2 => out.swap(0, 1),
             Some(Misbehavior::DropLastItem) => {
                 out.pop();
-                out
             }
             Some(Misbehavior::DuplicateFirstItem) => {
-                if let Some(first) = out.first().cloned() {
-                    out.push(first);
+                if let Some(first) = out.first() {
+                    out.push(duplicate(first));
                 }
-                out
-            }
-            Some(Misbehavior::OversizeCiphertext) => {
-                if let Some(first) = out.first_mut() {
-                    first
-                        .data
-                        .extend(std::iter::repeat_n(0u8, self.overhead as usize + 64));
-                }
-                out
             }
             Some(Misbehavior::MismatchedIndex) => {
                 if let Some(first) = out.first_mut() {
-                    first.unit_index = first.unit_index.wrapping_add(1_000_000);
+                    let value = index(first);
+                    *value = value.wrapping_add(1_000_000);
                 }
-                out
             }
+            _ => (),
         }
+        out
     }
 }
 
@@ -325,7 +316,17 @@ impl CryptoProvider for FakeCryptoProvider {
                 data,
             });
         }
-        Ok(self.misbehave_ct(out))
+        let fault = *self.misbehavior.lock();
+        if fault == Some(Misbehavior::OversizeCiphertext) {
+            if let Some(first) = out.first_mut() {
+                first
+                    .data
+                    .extend(std::iter::repeat_n(0u8, self.overhead as usize + 64));
+            }
+        }
+        Ok(Self::alter_batch(out, fault, Clone::clone, |item| {
+            &mut item.unit_index
+        }))
     }
 
     async fn decrypt_batch(
@@ -365,6 +366,15 @@ impl CryptoProvider for FakeCryptoProvider {
                 data: SecretBuffer::from_vec(pt),
             });
         }
-        Ok(out)
+        let fault = *self.misbehavior.lock();
+        Ok(Self::alter_batch(
+            out,
+            fault,
+            |item| PlaintextUnit {
+                unit_index: item.unit_index,
+                data: item.data.duplicate(),
+            },
+            |item| &mut item.unit_index,
+        ))
     }
 }

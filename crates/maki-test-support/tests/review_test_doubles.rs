@@ -424,3 +424,63 @@ mod namespace_parity;
 fn crashable_backing_namespace_follows_posix_path_rules() {
     namespace_parity::check("CrashableBacking", || Box::new(CrashableBacking::new()));
 }
+
+#[test]
+fn torn_overwrite_preserves_the_earlier_pending_suffix() {
+    for (offset, keep, expected) in [
+        (1, 0, &b"ABCDEFGH"[..]),
+        (1, 2, b"AxyDEFGH"),
+        (10, 0, b"ABCDEFGH"),
+    ] {
+        let backing = CrashableBacking::new().with_tearing(1);
+        let file = backing.process().open("sample", true).unwrap();
+        file.write_at(0, b"ABCDEFGH").unwrap();
+        file.write_at(offset, b"xyz").unwrap();
+        backing.crash_keep_torn_prefix("sample", keep);
+        let recovered = backing.process().open("sample", false).unwrap();
+        let mut data = vec![0; recovered.len().unwrap() as usize];
+        recovered.read_at(0, &mut data).unwrap();
+        assert_eq!(data, expected);
+    }
+}
+
+#[test]
+fn a_new_crash_backing_lock_has_an_ordinary_file_name() {
+    let backing = CrashableBacking::new();
+    let live = backing.process();
+    let guard = live.try_lock("lock").unwrap();
+    assert_eq!(live.list("").unwrap(), ["lock"]);
+    assert!(live.try_lock("lock").is_err());
+    assert_eq!(live.open("lock", false).unwrap().len().unwrap(), 0);
+    drop(guard);
+    live.sync_dir("").unwrap();
+    backing.crash_all_lost();
+    let recovered = backing.process();
+    assert!(recovered.exists("lock").unwrap());
+    drop(recovered.try_lock("lock").unwrap());
+    drop(recovered.try_lock("unsynced").unwrap());
+    backing.crash_all_lost();
+    assert!(!backing.process().exists("unsynced").unwrap());
+}
+
+#[test]
+fn fake_decrypt_applies_batch_shape_faults() {
+    use maki_test_support::fake_provider::Misbehavior::*;
+    let provider = FakeCryptoProvider::new(UNIT);
+    let ctx = context();
+    let valid = block_on(provider.encrypt_batch(&ctx, &plaintexts(3))).unwrap();
+    for (fault, expected) in [
+        (ReorderResults, vec![1, 0, 2]),
+        (DropLastItem, vec![0, 1]),
+        (DuplicateFirstItem, vec![0, 1, 2, 0]),
+        (MismatchedIndex, vec![1_000_000, 1, 2]),
+        (OversizeCiphertext, vec![0, 1, 2]),
+    ] {
+        provider.set_misbehavior(Some(fault));
+        let out = block_on(provider.decrypt_batch(&ctx, &valid)).unwrap();
+        assert_eq!(
+            out.iter().map(|item| item.unit_index).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}

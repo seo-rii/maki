@@ -160,9 +160,11 @@ impl Inode {
     /// length changes count as lost.
     fn sync(&mut self) {
         let pages = dirty_pages(&self.pending);
-        let mut durable = durable_after_sync(self);
+        for op in &self.pending {
+            apply(&mut self.durable, op);
+        }
         for &page in &pages {
-            write_back_page(&mut durable, &self.image, page);
+            write_back_page(&mut self.durable, &self.image, page);
         }
         let cut = self
             .pending
@@ -176,7 +178,6 @@ impl Inode {
             .into_iter()
             .flat_map(|op| unsettled(op, &pages, cut))
             .collect();
-        self.durable = durable;
         self.pending.clear();
     }
 }
@@ -301,6 +302,18 @@ impl Inner {
         Ok(())
     }
 
+    fn open_or_create_inode(&mut self, path: &str) -> InodeId {
+        if let Some(inode) = self.volatile(path) {
+            return inode;
+        }
+        // Recreating an unlinked name gets a fresh, empty inode.
+        self.next_inode += 1;
+        let inode = self.next_inode;
+        self.inodes.insert(inode, Inode::default());
+        self.relink(vec![(path.to_string(), Some(inode))]);
+        inode
+    }
+
     /// The parent of `path` exists and `path` itself is not a directory: a
     /// directory name cannot be opened, locked, renamed over or unlinked as
     /// a file (EISDIR, as Linux `FileBacking` reports).
@@ -378,17 +391,6 @@ impl Inner {
 
 fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-
-/// The durable content plus every *dirty* operation, in order. Writes an
-/// earlier failed sync marked clean are not part of it; [`Inode::sync`]
-/// adds those in the pages it writes back.
-fn durable_after_sync(inode: &Inode) -> Vec<u8> {
-    let mut data = inode.durable.clone();
-    for p in &inode.pending {
-        apply(&mut data, p);
-    }
-    data
 }
 
 /// Pages a dirty write touched.
@@ -719,17 +721,15 @@ impl CrashableBacking {
             if Some(i) == last_write_idx {
                 if let Pend::Write { offset, data: src } = p {
                     let keep = keep_bytes.min(src.len());
-                    // Torn tail: the file only grew as far as the kept
-                    // prefix reaches.
-                    let end = *offset as usize + keep;
-                    apply(
-                        &mut data,
-                        &Pend::Write {
-                            offset: *offset,
-                            data: src[..keep].to_vec(),
-                        },
-                    );
-                    data.truncate(end.max(inode.durable.len()));
+                    if keep > 0 {
+                        apply(
+                            &mut data,
+                            &Pend::Write {
+                                offset: *offset,
+                                data: src[..keep].to_vec(),
+                            },
+                        );
+                    }
                     continue;
                 }
             }
@@ -948,18 +948,12 @@ impl Backing for CrashableBacking {
         let mut inner = self.live("open", path)?;
         inner.io.check(&FaultOp::Open { path, create })?;
         inner.require_file_name(path)?;
-        let inode = match inner.volatile(path) {
-            Some(inode) => inode,
-            None if create => {
-                // A new, empty inode: nothing of an unlinked predecessor at
-                // this name is visible through it, before or after a crash.
-                inner.next_inode += 1;
-                let inode = inner.next_inode;
-                inner.inodes.insert(inode, Inode::default());
-                inner.relink(vec![(path.to_string(), Some(inode))]);
-                inode
-            }
-            None => return Err(io::Error::new(io::ErrorKind::NotFound, path.to_string())),
+        let inode = if create {
+            inner.open_or_create_inode(path)
+        } else {
+            inner
+                .volatile(path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.to_string()))?
         };
         *inner.handles.entry(inode).or_default() += 1;
         Ok(Arc::new(CrashFile {
@@ -1103,14 +1097,16 @@ impl Backing for CrashableBacking {
                 || namespace_changes.contains_key(&entry.change)
         });
         inner.collect_garbage();
-        let dirnames: Vec<String> = inner.dirs.keys().cloned().collect();
-        for name in dirnames {
-            let direct = name
-                .strip_prefix(&prefix)
-                .map(|r| !r.is_empty() && !r.contains('/'))
-                .unwrap_or(false);
-            if direct {
-                inner.dirs.insert(name, true);
+        use std::ops::Bound::{Included, Unbounded};
+        for (name, durable) in inner
+            .dirs
+            .range_mut::<str, _>((Included(prefix.as_str()), Unbounded))
+        {
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                break;
+            };
+            if !rest.is_empty() && !rest.contains('/') {
+                *durable = true;
             }
         }
         Ok(())
@@ -1130,6 +1126,7 @@ impl Backing for CrashableBacking {
                 "VOLUME_ALREADY_ATTACHED",
             ));
         }
+        inner.open_or_create_inode(path);
         Ok(Box::new(CrashLock {
             inner: self.inner.clone(),
             path: path.to_string(),
@@ -1144,6 +1141,14 @@ mod tests {
 
     fn eio() -> io::Error {
         io::Error::other("injected EIO")
+    }
+
+    #[test]
+    fn syncing_an_unchanged_file_keeps_its_durable_allocation() {
+        let mut inode = Inode::from_content(vec![7; 8192]);
+        let original = inode.durable.as_ptr();
+        inode.sync();
+        assert_eq!(inode.durable.as_ptr(), original);
     }
 
     #[test]
