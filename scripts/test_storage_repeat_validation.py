@@ -1,6 +1,7 @@
 """The background runner must not mistake interruption or empty runs for a pass."""
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -526,6 +527,18 @@ class BackgroundStorageTests(unittest.TestCase):
                      valid.replace("0 failed", "1 failed")):
             with self.assertRaises(ValueError):
                 self.runner.passed_count(text)
+
+    def test_suite_summaries_cross_chunk_boundaries_in_long_lines(self):
+        summary = "test result: ok. ١٤ passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+        block = 64 * 1024
+        for split in range(len(summary) + 1):
+            with self.subTest(split=split):
+                text = "x" * (block - split) + summary + "z" * block
+                self.assertEqual(self.runner.passed_count(io.StringIO(text)), 14)
+        for text in (summary + "x" * block + summary, summary + summary,
+                     summary + "x" * block + summary.replace("١٤", "9" * (3 * block))):
+            with self.assertRaises(ValueError):
+                self.runner.passed_count(io.StringIO(text))
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_child_exit_timeout_and_cancellation_are_distinct(self):

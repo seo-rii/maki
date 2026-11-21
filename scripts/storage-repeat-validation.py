@@ -4,6 +4,7 @@ import argparse
 from contextlib import ExitStack
 import datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -77,12 +78,42 @@ def alive(controller):
     return bool(controller.get("identity")) and process_identity(controller["pid"]) == controller["identity"]
 
 
-def passed_count(text):
-    matches = re.findall(
-        r"test result: ok\. (\d+) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;", text)
-    if len(matches) != 1 or int(matches[0]) < 1:
+RESULT_PREFIX = "test result: ok. "
+RESULT_SUFFIX = " passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+RESULT_PATTERN = re.compile(re.escape(RESULT_PREFIX) + r"(\d+)" + re.escape(RESULT_SUFFIX))
+RESULT_DIGITS = re.compile(r"\d*")
+
+
+def passed_count(stream):
+    # Retain only an unfinished summary, including a partial prefix at a chunk
+    # boundary. Even a diagnostic line without newlines can span the entire log.
+    if isinstance(stream, str):
+        stream = io.StringIO(stream)
+    count = None
+    carry = ""
+    # Libtest's count fits usize. Preserve Python's normal decimal conversion
+    # limit as well, and retain one extra digit to reject an oversized match.
+    digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)() or 4300
+    while chunk := stream.read(64 * 1024):
+        window = carry + chunk
+        end = 0
+        for match in RESULT_PATTERN.finditer(window):
+            if count is not None or len(match[1]) > digit_limit:
+                raise ValueError("duplicate or oversized test result")
+            count = int(match[1])
+            end = match.end()
+        start = window.rfind(RESULT_PREFIX, end)
+        if start >= 0:
+            digits = RESULT_DIGITS.match(window, start + len(RESULT_PREFIX))
+            rest = window[digits.end():]
+            if RESULT_SUFFIX.startswith(rest):
+                keep = min(digits.end(), digits.start() + digit_limit + 1)
+                carry = window[start:keep] + rest
+                continue
+        carry = window[max(end, len(window) - len(RESULT_PREFIX) + 1):]
+    if not count:
         raise ValueError("missing, empty, filtered or incomplete test result")
-    return int(matches[0])
+    return count
 
 
 def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
@@ -320,7 +351,8 @@ def worker(directory):
                     status["state"] = {"cancelled": "cancelled", "timeout": "incomplete"}.get(
                         result["reason"], "failed")
                     raise RuntimeError(f"suite did not complete: {status['last_result']}")
-                count = passed_count(log.read_text(errors="replace"))
+                with log.open(errors="replace") as output:
+                    count = passed_count(output)
                 if name in manifest and count != manifest[name]["expected_tests"]:
                     raise ValueError(f"{name}: passed test count changed")
                 status["passed_tests"] += count
