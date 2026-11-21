@@ -1057,7 +1057,10 @@ impl Engine {
                 .filter(|cache| cache.can_hold(unit_size));
             for unit in first..=last {
                 if let Some((seq, data)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
-                    seqs.insert(unit, seq);
+                    // A configured cache may grow while decryption is in flight.
+                    if inner.cache.is_some() {
+                        seqs.insert(unit, seq);
+                    }
                     cts.push(CiphertextUnit {
                         unit_index: unit,
                         data,
