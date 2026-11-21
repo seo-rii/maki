@@ -462,3 +462,25 @@ fn a_new_crash_backing_lock_has_an_ordinary_file_name() {
     backing.crash_all_lost();
     assert!(!backing.process().exists("unsynced").unwrap());
 }
+
+#[test]
+fn fake_decrypt_applies_batch_shape_faults() {
+    use maki_test_support::fake_provider::Misbehavior::*;
+    let provider = FakeCryptoProvider::new(UNIT);
+    let ctx = context();
+    let valid = block_on(provider.encrypt_batch(&ctx, &plaintexts(3))).unwrap();
+    for (fault, expected) in [
+        (ReorderResults, vec![1, 0, 2]),
+        (DropLastItem, vec![0, 1]),
+        (DuplicateFirstItem, vec![0, 1, 2, 0]),
+        (MismatchedIndex, vec![1_000_000, 1, 2]),
+        (OversizeCiphertext, vec![0, 1, 2]),
+    ] {
+        provider.set_misbehavior(Some(fault));
+        let out = block_on(provider.decrypt_batch(&ctx, &valid)).unwrap();
+        assert_eq!(
+            out.iter().map(|item| item.unit_index).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
