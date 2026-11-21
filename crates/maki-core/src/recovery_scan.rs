@@ -90,17 +90,27 @@ impl SegmentScanner<'_> {
     /// the caller controls whether superseded records remain in memory.
     pub fn scan(
         self,
-        accept: impl FnMut(JournalRecord) -> Result<(), RecoveryError>,
+        mut accept: impl FnMut(JournalRecord) -> Result<(), RecoveryError>,
     ) -> Result<SegmentBodyScan, RecoveryError> {
-        self.scan_observing(accept, |_| {})
+        self.scan_observing(true, |header, payload| {
+            if let Some(payload) = payload {
+                accept(JournalRecord {
+                    sequence: header.sequence,
+                    unit_index: header.unit,
+                    payload,
+                })?;
+            }
+            Ok(())
+        })
     }
 
     /// Report compact metadata for every validated record, including those
-    /// already covered by the checkpoint, without retaining their payloads.
+    /// already covered by the checkpoint. Only callers that replay records
+    /// request payloads, and only uncovered records can supply one.
     pub(super) fn scan_observing(
         self,
-        mut accept: impl FnMut(JournalRecord) -> Result<(), RecoveryError>,
-        mut observe: impl FnMut(RecordHeader),
+        retain_uncovered_payloads: bool,
+        mut observe: impl FnMut(RecordHeader, Option<Vec<u8>>) -> Result<(), RecoveryError>,
     ) -> Result<SegmentBodyScan, RecoveryError> {
         let mut fingerprint = DefaultHasher::new();
         fingerprint.write(self.header);
@@ -187,7 +197,9 @@ impl SegmentScanner<'_> {
             // Refuse to allocate geometry-invalid lengths. Their CRC still
             // determines whether they were a record at all: an unsynced torn
             // payload retains its torn-tail classification.
-            let mut payload = (valid_geometry && header.sequence > self.checkpoint_sequence)
+            let mut payload = (retain_uncovered_payloads
+                && valid_geometry
+                && header.sequence > self.checkpoint_sequence)
                 .then(|| vec![0u8; header.payload_len as usize]);
             let mut crc = crc32fast::Hasher::new();
             let mut candidate_fingerprint = fingerprint.clone();
@@ -254,14 +266,7 @@ impl SegmentScanner<'_> {
                     required_boundary_seen = true;
                 }
             }
-            observe(header);
-            if let Some(payload) = payload {
-                accept(JournalRecord {
-                    sequence: header.sequence,
-                    unit_index: header.unit,
-                    payload,
-                })?;
-            }
+            observe(header, payload)?;
             // Commit only the accepted record. Invalid/zero/torn tails must
             // not enter the prefix later redirtied and acknowledged durable.
             fingerprint = candidate_fingerprint;

@@ -62,7 +62,7 @@ use crate::store::SlotStore;
 
 #[path = "recovery_scan.rs"]
 mod scan;
-use scan::{range_is_zero, SegmentScanner};
+use scan::{range_is_zero, RecordHeader, SegmentScanner};
 
 #[path = "checkpoint_evidence.rs"]
 mod checkpoint_evidence;
@@ -188,7 +188,10 @@ impl JournalScan {
                     name: &prefix.path,
                     progress,
                 }
-                .scan_observing(|_| Ok(()), |record| evidence.observe(record))?;
+                .scan_observing(false, |header, _| {
+                    evidence.observe(header);
+                    Ok(())
+                })?;
                 if !matches!(scan.outcome, ScanOutcome::Clean)
                     || scan.valid_body_bytes != body_len
                     || scan.record_count != segment.record_count
@@ -225,21 +228,28 @@ enum ReplayRecords {
 }
 
 impl ReplayRecords {
-    fn push(&mut self, record: JournalRecord) -> Result<(), RecoveryError> {
+    fn retain_payloads(&self) -> bool {
+        matches!(self, Self::All(_) | Self::ScanOnly(_))
+    }
+
+    fn push(&mut self, header: RecordHeader, payload: Option<Vec<u8>>) {
         match self {
-            Self::All(records) | Self::ScanOnly(records) => records.push(record),
+            Self::All(records) | Self::ScanOnly(records) => records.push(JournalRecord {
+                sequence: header.sequence,
+                unit_index: header.unit,
+                payload: payload.expect("uncovered replay payload requested"),
+            }),
             Self::Discard => {}
             Self::Units { units, written } => {
-                units.insert(record.unit_index);
+                units.insert(header.unit);
                 // Records arrive in sequence order: the newest one decides.
-                if record.payload.is_empty() {
-                    written.remove(&record.unit_index);
+                if header.payload_len == 0 {
+                    written.remove(&header.unit);
                 } else {
-                    written.insert(record.unit_index);
+                    written.insert(header.unit);
                 }
             }
         }
-        Ok(())
     }
 
     /// (retained records, units with an uncovered record, those of them
@@ -679,8 +689,7 @@ pub fn scan_journal(
 
 /// The checker needs counts and repair decisions, not replay payloads. Keep
 /// the empty replay representation private so the public all-record API keeps
-/// its contract. Each candidate is still fully read and validated; at most
-/// one geometry-bounded payload allocation is alive at a time.
+/// its contract. Each candidate is fully validated with fixed read scratch.
 pub(crate) struct JournalSummary {
     pub segment_count: usize,
     pub uncovered_records: u64,
@@ -977,14 +986,15 @@ fn scan_journal_with_proof(
             name: &name,
             progress,
         }
-        .scan_observing(
-            |record| replay.push(record),
-            |record| {
-                if let Some(evidence) = &mut checkpoint_evidence {
-                    evidence.observe(record);
-                }
-            },
-        )?;
+        .scan_observing(replay.retain_payloads(), |header, payload| {
+            if let Some(evidence) = &mut checkpoint_evidence {
+                evidence.observe(header);
+            }
+            if header.sequence > checkpoint_sequence {
+                replay.push(header, payload);
+            }
+            Ok(())
+        })?;
         if required.is_some_and(|p| p.segment_index == index) {
             required_seen = true;
         }
