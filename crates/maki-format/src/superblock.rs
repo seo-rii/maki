@@ -321,7 +321,9 @@ pub fn load_volume_superblock(
     Ok(load_volume_superblock_with_fallback(backing)?.0)
 }
 
-pub(crate) fn load_volume_superblock_with_fallback(
+/// Select the volume superblock and identify an invalid partner, if any.
+/// When both copies decode, the selected generation is the maximum on disk.
+pub fn load_volume_superblock_with_fallback(
     backing: &dyn maki_backing::Backing,
 ) -> Result<(VolumeSuperblock, Option<&'static str>), FormatError> {
     let mut copies = read_volume_copies(backing)?;

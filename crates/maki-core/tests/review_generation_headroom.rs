@@ -209,3 +209,27 @@ async fn generations_up_to_the_bound_are_accepted_by_check_and_attach() {
         }
     }
 }
+
+#[tokio::test]
+async fn deep_check_counts_the_raw_generation_of_an_invalid_superblock_partner() {
+    use maki_format::{ab::AbRecord, catalog::ShardCatalog};
+
+    let backing = volume().await;
+    let mut wrong_type = ShardCatalog::new();
+    wrong_type.set_generation(LIMIT + 1);
+    let bytes = wrong_type.encode();
+    let file = backing.open(layout::SUPERBLOCK_B, false).unwrap();
+    file.set_len(bytes.len() as u64).unwrap();
+    file.write_at(0, &bytes).unwrap();
+    file.sync_data().unwrap();
+
+    let report = deep_check(backing, 256 << 20).unwrap();
+    assert!(
+        report.errors.iter().any(|error| error.contains(&format!(
+            "superblock: A/B generation {} is above {LIMIT}",
+            LIMIT + 1
+        ))),
+        "{:?}",
+        report.errors
+    );
+}
