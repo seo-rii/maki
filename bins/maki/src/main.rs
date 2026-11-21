@@ -835,6 +835,17 @@ fn check(config: &str, deep: bool) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
+async fn within_control_timeout<T>(
+    timeout: Duration,
+    round_trip: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(timeout, round_trip).await.ok()?;
+    // Tokio can poll a ready reply first when the CLI resumes after its timer.
+    (started.elapsed() < timeout).then_some(result)
+}
+
+#[cfg(unix)]
 fn control(
     target: &ControlTarget<'_>,
     command: &str,
@@ -867,9 +878,9 @@ fn control(
             .map_err(|e| e.to_string())
     };
     let result: Result<serde_json::Value, String> = runtime.block_on(async {
-        match tokio::time::timeout(timeout, round_trip).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(format!(
+        match within_control_timeout(timeout, round_trip).await {
+            Some(result) => result,
+            None => Err(format!(
                 "{command}: no response from {socket} within {}s; the daemon may be stalled \
                  (pass --timeout <seconds> to wait longer)",
                 timeout.as_secs()
@@ -898,4 +909,21 @@ fn control(
     _timeout: Duration,
 ) -> ExitCode {
     fail("control socket commands require a Unix host".to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_response_after_the_control_deadline_is_rejected() {
+        let timeout = Duration::from_millis(5);
+        let response = within_control_timeout(timeout, async {
+            // The reply and timer are both ready before the executor regains control.
+            std::thread::sleep(timeout * 2);
+            "reply"
+        })
+        .await;
+        assert_eq!(response, None);
+    }
 }
