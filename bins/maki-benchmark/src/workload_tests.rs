@@ -201,7 +201,7 @@ async fn mixed_final_verification_checks_the_last_write_without_a_later_measured
 
 fn options() -> Options {
     Options {
-        config_path: String::new(),
+        config_path: Default::default(),
         destroy_data: false,
         json: true,
         fua: false,

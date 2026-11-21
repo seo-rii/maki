@@ -329,3 +329,24 @@ fn entirely_read_or_write_mixed_workloads_have_finite_empty_operation_reports() 
         assert_eq!(report["verification"]["final_sweep_verified_slots"], 32);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn benchmarks_accept_a_non_unicode_configuration_path() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let (directory, config) = fixture();
+    let alias = directory
+        .path()
+        .join(OsStr::from_bytes(b"config-\xff.toml"));
+    std::fs::rename(config, &alias).unwrap();
+    for flags in [vec!["--json"], vec!["--destroy-data", "--json"]] {
+        let output = run(&alias, &flags);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["read_verified"], true);
+    }
+}
