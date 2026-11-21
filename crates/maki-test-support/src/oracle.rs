@@ -5,7 +5,7 @@
 //! observation (reads and post-crash content) against the model.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 
 use maki_backing::{Backing, BackingFile};
 
@@ -19,6 +19,14 @@ pub struct SequenceConfig {
     pub ops: usize,
 }
 
+fn fill_write_payload(data: &mut [u8], rng: &mut StdRng) {
+    if let Some((stamp, rest)) = data.split_first_mut() {
+        // Keep successive one-byte writes distinguishable from each other and from unwritten zeros.
+        *stamp = stamp.wrapping_add(1).max(1);
+        rng.fill_bytes(rest);
+    }
+}
+
 /// Run one random op sequence; `Err` on any durability-oracle violation.
 pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), OracleViolation> {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
@@ -30,14 +38,9 @@ pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), Oracle
     backing.sync_dir("").expect("sync_dir");
 
     let mut model = ReferenceBlockModel::new(cfg.unit_size, cfg.num_units);
-    let mut stamp: u8 = 0;
-    let mut next_stamp = || {
-        stamp = stamp.wrapping_add(1);
-        if stamp == 0 {
-            stamp = 1;
-        }
-        stamp
-    };
+    // Generating position-sensitive data must not change the seeded operation or crash schedule.
+    let mut payload_rng = StdRng::seed_from_u64(seed);
+    let mut data = vec![0; cfg.unit_size];
 
     let read_unit = |file: &dyn BackingFile, unit: u64| -> Vec<u8> {
         let mut buf = vec![0u8; cfg.unit_size];
@@ -47,23 +50,19 @@ pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), Oracle
     };
 
     for _ in 0..cfg.ops {
-        match rng.random_range(0..100u32) {
-            // normal write
-            0..=49 => {
+        let operation = rng.random_range(0..100u32);
+        match operation {
+            0..=64 => {
                 let unit = rng.random_range(0..cfg.num_units);
-                let data = vec![next_stamp(); cfg.unit_size];
+                fill_write_payload(&mut data, &mut payload_rng);
                 file.write_at(unit * cfg.unit_size as u64, &data)
                     .expect("write");
-                model.write(unit, &data);
-            }
-            // FUA write
-            50..=64 => {
-                let unit = rng.random_range(0..cfg.num_units);
-                let data = vec![next_stamp(); cfg.unit_size];
-                file.write_at(unit * cfg.unit_size as u64, &data)
-                    .expect("write");
-                file.sync_data().expect("sync");
-                model.write_fua(unit, &data);
+                if operation < 50 {
+                    model.write(unit, &data);
+                } else {
+                    file.sync_data().expect("sync");
+                    model.write_fua(unit, &data);
+                }
             }
             // FLUSH
             65..=79 => {
@@ -112,4 +111,24 @@ pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), Oracle
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oracle_rejects_reordered_bytes_and_sectors_in_a_written_unit() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut data = vec![0; 4096];
+        fill_write_payload(&mut data, &mut rng);
+        let mut model = ReferenceBlockModel::new(data.len(), 1);
+        model.write_fua(0, &data);
+        for offset in [1, 256, 512] {
+            let mut reordered = data.clone();
+            reordered.rotate_left(offset);
+            assert!(model.crash_adopt(0, &reordered).is_err());
+        }
+        model.crash_adopt(0, &data).unwrap();
+    }
 }
