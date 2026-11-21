@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use maki_backing::remote_witness::{Action, Request, Role, Rpc, StateStore};
+use maki_backing::remote_witness::{Action, Record, Request, Role, Rpc, StateStore};
 use maki_witness::etcd::{EtcdOptions, EtcdStore};
 use maki_witness::{
     certificate_file_fingerprint, state_handler, Client, ClientOptions, Server, ServerOptions,
@@ -92,6 +92,20 @@ fn inspect_request() -> Request {
     }
 }
 
+fn report_initialization(record: &Record) -> io::Result<()> {
+    let json = serde_json::to_string(record)?;
+    let mut stdout = io::stdout().lock();
+    if let Err(error) = writeln!(stdout, "{json}").and_then(|()| stdout.flush()) {
+        if error.kind() != io::ErrorKind::BrokenPipe {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "maki-witness: warning: witness was initialized, but writing the record failed: {error}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run(args: &[String]) -> io::Result<()> {
     match args {
         [help] if help == "--help" || help == "-h" => print!("{HELP}"),
@@ -104,8 +118,7 @@ fn run(args: &[String]) -> io::Result<()> {
             })?;
             let mut store = StateStore::create(Path::new(directory), *identity.as_bytes())?;
             let record = store.handle(Role::Admin, &inspect_request())?;
-            serde_json::to_writer(io::stdout().lock(), &record)?;
-            println!();
+            report_initialization(&record)?;
         }
         [command, path] if command == "serve" => {
             let config: ServiceConfig = read_config(Path::new(path))?;
@@ -147,8 +160,7 @@ fn run(args: &[String]) -> io::Result<()> {
                 *identity.as_bytes(),
             )?;
             let record = store.handle(Role::Admin, &inspect_request())?;
-            serde_json::to_writer(io::stdout().lock(), &record)?;
-            println!();
+            report_initialization(&record)?;
         }
         [command, path] if command == "inspect" => {
             let client = Client::new(read_config::<ClientOptions>(Path::new(path))?)?;
