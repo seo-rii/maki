@@ -30,6 +30,41 @@ class DocumentationLinks(unittest.TestCase):
             )
         return path
 
+    def test_emphasis_delimiters_cannot_cross_inline_boundaries(self):
+        self.write("guide.md", "# [Read _config](file) after_\n# *inside _text* and_\n")
+        self.write("file", "")
+        self.write("README.md", "[a](guide.md#read-_config-after_) [b](guide.md#inside-_text-and_)\n"
+                   "[c](guide.md#read-config-after) [d](guide.md#inside-text-and)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:2: guide.md#read-config-after (missing anchor)",
+            "README.md:2: guide.md#inside-text-and (missing anchor)"])
+
+    def test_emphasis_flanking_uses_source_characters_at_link_boundaries(self):
+        self.write("guide.md", "# [X](file)_word_\n# _word_[X](file)\n")
+        self.write("file", "")
+        self.write("README.md", "[first](guide.md#xword) [second](guide.md#wordx)\n"
+                   "[a](guide.md#x_word_) [b](guide.md#_word_x)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:2: guide.md#x_word_ (missing anchor)",
+            "README.md:2: guide.md#_word_x (missing anchor)",
+        ])
+
+    def test_non_ascii_spaces_do_not_end_markdown_or_html_blocks(self):
+        for space in ("\u00a0", "\u2003"):
+            self.write("README.md", f"Prose\n{space}\n    [a](missing.md)\n\n"
+                       f"<div>hello</div>\n{space}\n[b](literal.md)\n")
+            self.assertEqual(broken_links(self.root), ["README.md:3: missing.md"])
+
+    def test_numeric_references_in_markdown_destinations_use_unicode_scalars(self):
+        self.write("README.md", "[a](&#128;.txt) [b](&#x85;.txt) [c](&#8364;.txt)\n")
+        self.write("€.txt", "")
+        self.assertCountEqual(broken_links(self.root), ["README.md:1: \x80.txt", "README.md:1: \x85.txt"])
+
+    def test_image_description_does_not_report_a_reference_from_alt_text(self):
+        self.write("plot.png", "")
+        self.write("README.md", "[![Grid[row][column]](plot.png)](absent.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: absent.md"])
+
     def test_markdown_line_endings_and_bom(self):
         self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
         self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")

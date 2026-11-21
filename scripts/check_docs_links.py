@@ -122,7 +122,7 @@ def html_block_end(content, in_paragraph):
         return ("]]>",)
     if re.match(r"<![A-Z]", stripped):
         return (">",)
-    if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip())):
+    if BLOCK_ELEMENT.match(stripped) or (not in_paragraph and HTML_TAG.fullmatch(stripped.rstrip(" \t"))):
         return ()
     return None
 
@@ -157,11 +157,11 @@ def document_lines(text):
             elif columns.startswith(" " * indent, pos):
                 pos += indent
                 continue
-            elif not columns[pos:].strip() and (container is not FOOTNOTE_CONTAINER or not line):
+            elif not columns[pos:].strip(" \t") and (container is not FOOTNOTE_CONTAINER or not line):
                 pos = len(columns)
                 continue
             rest = columns[pos:]
-            if (in_paragraph and rest.strip() and not QUOTE_MARKER.match(rest)
+            if (in_paragraph and rest.strip(" \t") and not QUOTE_MARKER.match(rest)
                     and not BLOCK_LIST_MARKER.match(rest) and not FOOTNOTE_MARKER.match(rest)
                     and not ATX_HEADING.match(rest)
                     and not THEMATIC_BREAK.fullmatch(rest) and not opening_fence(rest)
@@ -178,7 +178,7 @@ def document_lines(text):
             break
 
         content = columns[pos:]
-        if html_end == () and not content.strip():
+        if html_end == () and not content.strip(" \t"):
             html_end = None
         if block is not None:
             close = FENCE.fullmatch(content)
@@ -247,7 +247,7 @@ def document_lines(text):
         if not in_paragraph and CODE_INDENT.match(content):
             continue
         yield SourceLine(number, content, changed, False, lazy)
-        in_paragraph = bool(content.strip() and not ATX_HEADING.match(content)
+        in_paragraph = bool(content.strip(" \t") and not ATX_HEADING.match(content)
                             and not THEMATIC_BREAK.match(content)
                             and not (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content)))
 
@@ -272,7 +272,7 @@ def block_lines(text):
             width = 0
             after_table = False
         indented = CODE_INDENT.match(value)
-        if (width or after_table) and (not value.strip() or indented):
+        if (width or after_table) and (not value.strip(" \t") or indented):
             # A blank ends the table. Four columns start a literal code block,
             # including when the first such line follows a table row directly.
             width = 0
@@ -284,7 +284,7 @@ def block_lines(text):
         if width:
             yield line, table_cells(value)[:width]
             continue
-        if (not line.raw_html and value.strip() and not indented
+        if (not line.raw_html and value.strip(" \t") and not indented
                 and not ATX_HEADING.match(value) and not THEMATIC_BREAK.fullmatch(value)
                 and index + 1 < len(lines)):
             divider = lines[index + 1]
@@ -334,7 +334,9 @@ def markdown_entities(text):
     def decode(match):
         entity = match.group()
         if entity[1] == "#":
-            return html.unescape(entity)
+            digits = entity[2:-1]
+            code = int(digits[1:], 16) if digits.startswith(("x", "X")) else int(digits)
+            return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "\ufffd"
         return html.entities.html5.get(entity[1:], entity)
     return ENTITY.sub(decode, text)
 
@@ -529,7 +531,7 @@ def reference_definitions(text):
             index += consumed
             continue
         in_paragraph = not (
-            not content.strip()
+            not content.strip(" \t")
             or ATX_HEADING.match(content)
             or THEMATIC_BREAK.match(content)
             or (in_paragraph and not lazy and SETEXT_UNDERLINE.match(content))
@@ -692,12 +694,12 @@ def inline_paragraphs(text, definition_lines):
             continue
         single = bool(ATX_HEADING.match(content) or THEMATIC_BREAK.match(content)
                       or (not lazy and SETEXT_UNDERLINE.match(content)))
-        if (not content.strip() or raw_html or number in definition_lines or single or changed
+        if (not content.strip(" \t") or raw_html or number in definition_lines or single or changed
                 or (paragraph and number != paragraph[-1][0] + 1)):
             if paragraph:
                 yield paragraph
                 paragraph = []
-        if content.strip() and not raw_html and number not in definition_lines:
+        if content.strip(" \t") and not raw_html and number not in definition_lines:
             paragraph.append((number, content))
             if single:
                 yield paragraph
@@ -708,7 +710,13 @@ def inline_paragraphs(text, definition_lines):
 
 def inline_lines(text, definition_lines, labels):
     for paragraph in inline_paragraphs(text, definition_lines):
-        masked, targets, _, _, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        masked, targets, _, spans, _ = scan_inline_paragraph("\n".join(line for _, line in paragraph), labels)
+        if any(image for _, _, image in spans.values()):
+            visible = list(masked)
+            for opening, (close, _, image) in spans.items():
+                if image:
+                    visible[opening + 1:close] = " " * (close - opening - 1)
+            masked = "".join(visible)
         starts = []
         start = 0
         for _, line in paragraph:
@@ -777,8 +785,8 @@ def inline_text(raw, labels=frozenset()):
     document's defined reference labels: a reference to one renders as a link.
     """
     _, _, _, links, bare_links = scan_inline_paragraph(raw, labels)
-    ends = {close: end for close, end, image in links.values() if not image}
     out = []
+    marker_offsets = {}
     index = 0
     while index < len(raw):
         if index in bare_links:
@@ -812,10 +820,9 @@ def inline_text(raw, labels=frozenset()):
             index = links[index + 1][1]
             continue
         if index in links:
-            index += 1
-            continue
-        if index in ends:
-            index = ends[index]
+            close, end, _ = links[index]
+            out.extend(inline_text(raw[index + 1:close], labels))
+            index = end
             continue
         if char == "<":
             special = INLINE_SPECIAL.match(raw, index)
@@ -838,36 +845,44 @@ def inline_text(raw, labels=frozenset()):
             while before_break and raw[before_break - 1] in " \t":
                 out.pop()
                 before_break -= 1
+        if char in "_*":
+            marker_offsets[len(out)] = index
         out.append((char, False))
         index += 1
-    return out
+    delimiters = emphasis_delimiters(raw, marker_offsets)
+    return [pair for index, pair in enumerate(out) if index not in delimiters]
 
 
-def emphasis_underscores(pairs):
-    """Find only underscores consumed by paired GFM emphasis delimiters."""
+def emphasis_delimiters(raw, marker_offsets):
+    """Pair runs in this scope using their neighbors in the Markdown source."""
     def punctuation(char):
         return char in ASCII_PUNCTUATION or unicodedata.category(char).startswith("P")
 
     openers = []
     consumed = set()
-    index = 0
-    while index < len(pairs):
-        if pairs[index] != ("_", False):
-            index += 1
+    next_run = 0
+    for index, start in marker_offsets.items():
+        if index < next_run:
             continue
+        marker = raw[start]
         end = index + 1
-        while end < len(pairs) and pairs[end] == ("_", False):
+        while (marker_offsets.get(end) == start + end - index
+               and raw[marker_offsets[end]] == marker):
             end += 1
-        before = pairs[index - 1][0] if index else " "
-        after = pairs[end][0] if end < len(pairs) else " "
+        next_run = end
+        source_end = start + end - index
+        before = raw[start - 1] if start else " "
+        after = raw[source_end] if source_end < len(raw) else " "
         left = not after.isspace() and (not punctuation(after) or before.isspace() or punctuation(before))
         right = not before.isspace() and (not punctuation(before) or after.isspace() or punctuation(after))
-        can_open = left and (not right or punctuation(before))
-        can_close = right and (not left or punctuation(after))
+        can_open = left and (marker == "*" or not right or punctuation(before))
+        can_close = right and (marker == "*" or not left or punctuation(after))
         remaining = index
         if can_close:
             for pos in range(len(openers) - 1, -1, -1):
                 first, last, length, closes = openers[pos]
+                if raw[marker_offsets[first]] != marker:
+                    continue
                 if ((can_open or closes) and (length + end - index) % 3 == 0
                         and length % 3 != 0):
                     continue
@@ -882,20 +897,16 @@ def emphasis_underscores(pairs):
                     break
         if can_open and remaining < end:
             openers.append((remaining, end, end - index, can_close))
-        index = end
     return consumed
 
 
 def heading_text(raw, labels=frozenset()):
     """The text GitHub renders for a heading's inline content."""
     pairs = inline_text(raw, labels)
-    delimiters = emphasis_underscores(pairs)
     # Entity references are decoded outside code spans and escapes only.
     rendered = []
     plain = []
-    for index, (char, literal) in enumerate(pairs):
-        if index in delimiters:
-            continue
+    for char, literal in pairs:
         if literal:
             rendered.append(markdown_entities("".join(plain)))
             plain = []
@@ -953,7 +964,7 @@ def document_anchors(text):
             headings.append("\n".join(content for _, content in paragraph))
             paragraph = []
             continue
-        if not line.strip() or THEMATIC_BREAK.fullmatch(line):
+        if not line.strip(" \t") or THEMATIC_BREAK.fullmatch(line):
             paragraph = []
             continue
         if paragraph and paragraph[-1][0] != number - 1:
