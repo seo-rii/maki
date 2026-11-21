@@ -223,7 +223,7 @@ class DebianPackageTests(unittest.TestCase):
         self.assertEqual(self.field(package, "Architecture"), "amd64")
         dependencies = self.field(package, "Depends")
         self.assertIn("nbd-client (>= 1:3.27.0)", dependencies)
-        for dependency in ("nbdkit", "lvm2", "xfsprogs", "systemd", "kmod"):
+        for dependency in ("nbdkit", "lvm2", "xfsprogs", "systemd (>= 249)", "kmod"):
             self.assertIn(dependency, dependencies)
 
         root, control = self.extract(package)
@@ -724,7 +724,7 @@ class DebianPackageTests(unittest.TestCase):
         self.assertIn("native library dependencies", result.stderr)
         self.assertEqual(
             self.field(output, "Depends"),
-            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd, kmod",
+            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod",
         )
 
     def test_unspecified_epoch_also_applies_to_archive_headers(self):

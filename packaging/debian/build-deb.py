@@ -434,7 +434,7 @@ def create_tree(package_root, args, runtimes, epoch):
         page = ROOT / "packaging/debian/man" / f"{name}.8"
         install_gzip(page.read_bytes(), package_root / "usr/share/man/man8" / f"{name}.8.gz")
 
-    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd", "kmod"]
+    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd (>= 249)", "kmod"]
     if args.shlibdeps:
         for entry in shared_library_dependencies(package_root):
             if entry not in depends:
