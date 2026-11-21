@@ -210,6 +210,32 @@ class ReleasePreparationTests(unittest.TestCase):
         with tarfile.open(output / manifest["source"]["filename"]) as archive:
             self.assertEqual(archive.extractfile("maki-0.1.0/notes.txt").read(), b"committed contents\n")
 
+    def test_filemode_false_does_not_hide_executable_changes_on_posix(self):
+        tracked = self.repo / "Cargo.toml"
+        self.git("config", "core.fileMode", "false")
+        mode = tracked.stat().st_mode
+        tracked.chmod(mode | 0o100)
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertFalse(self.cargo_trace.exists())
+        tracked.chmod(mode)
+        self.print_version()
+        executable = self.repo / "packaging/debian/build-deb.py"
+        executable_mode = executable.stat().st_mode
+        self.assertTrue(executable_mode & 0o100)
+        executable.chmod(executable_mode & ~0o100)
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        executable.chmod(executable_mode)
+        self.print_version()
+        self.assertEqual(self.git("config", "--bool", "core.fileMode"), "false")
+
+    def test_filemode_false_is_preserved_on_a_fixed_mode_filesystem(self):
+        from scripts import prepare_release
+        self.git("config", "core.fileMode", "false")
+        tracked = self.repo / "Cargo.toml"
+        tracked.chmod(tracked.stat().st_mode | 0o100)
+        with mock.patch.object(prepare_release.os, "fchmod", return_value=None):
+            self.assertFalse(prepare_release.tracked_changes(repo=self.repo))
+
     def test_print_version_needs_no_build_tools_or_output_directory(self):
         # Only Git is needed: neither dpkg nor the selected compiler is usable.
         (self.tools / "git").symlink_to(shutil.which("git"))

@@ -98,9 +98,37 @@ def commit_epoch(commit, *, repo=None):
     ))
 
 
+def checkout_filemode(repo):
+    """Override core.fileMode only where the checkout can represent Git's executable bit."""
+    if os.name != "posix":
+        return []
+    configured = subprocess.check_output(
+        git_command("config", "--bool", "--default", "true", "--get", "core.fileMode", repo=repo))
+    if configured.strip() == b"true":
+        return []
+    # Git can legitimately disable fileMode on a mount with fixed permissions.
+    # Test a private file on the same filesystem, without chmodding any tracked file.
+    device = repo.stat().st_dev
+    for directory in (repo, None):  # try the system temp directory if the checkout is read-only
+        try:
+            with tempfile.TemporaryFile(dir=directory) as probe:
+                fd = probe.fileno()
+                before = os.fstat(fd)
+                if before.st_dev != device:
+                    continue
+                os.fchmod(fd, before.st_mode ^ 0o100)
+                if (os.fstat(fd).st_mode ^ before.st_mode) & 0o100:
+                    return ["-c", "core.fileMode=true"]
+                return []
+        except OSError:
+            continue
+    return []
+
+
 def tracked_changes(*, repo=None):
     repo = ROOT if repo is None else repo
-    command = git_command("status", "--porcelain", "--untracked-files=no", repo=repo)
+    command = git_command("--no-optional-locks", *checkout_filemode(repo), "status",
+                          "--porcelain", "--untracked-files=no", repo=repo)
     if subprocess.check_output(command):
         return True
     entries = subprocess.check_output(git_command("ls-files", "-v", "-z", repo=repo)).split(b"\0")
