@@ -52,7 +52,7 @@ impl AllocationMap {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::new();
+        let mut w = Writer::with_capacity(Self::encoded_len(self.units) as usize);
         w.bytes(ALLOCATION_MAGIC)
             .u32(ALLOCATION_VERSION)
             .u64(self.generation)
