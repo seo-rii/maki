@@ -209,13 +209,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let config = match maki_nbdkit::daemon::parse_and_validate(&raw) {
+    let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let config = creation.config();
     // Validate the workload before creating or recovering any backing state.
     let io_size = options.io_size;
     let working_set_bytes = options.working_set.unwrap_or_else(|| {
@@ -237,7 +238,7 @@ fn main() -> ExitCode {
     }
     // A refusal must not claim a remote writer or advance its fence. The actual
     // attach below validates the backing and its witness after authorization.
-    let existing = match maki_nbdkit::daemon::volume_layout_present(&config) {
+    let existing = match maki_nbdkit::daemon::volume_layout_present(config) {
         Ok(present) => present,
         Err(error) => {
             eprintln!("error: cannot open the existing volume: {error}");
@@ -257,7 +258,7 @@ fn main() -> ExitCode {
     let created = if existing {
         None
     } else {
-        match runtime.block_on(maki_nbdkit::daemon::create_and_attach_from_config_str(&raw)) {
+        match runtime.block_on(creation.create_and_attach()) {
             Ok(engine) => Some(engine),
             // A plain volume may have appeared after the existing-volume probe.
             Err(DaemonError::Format(FormatError::AlreadyExists(_))) => None,
@@ -277,7 +278,7 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        None => match runtime.block_on(maki_nbdkit::daemon::attach_from_config(&config)) {
+        None => match runtime.block_on(maki_nbdkit::daemon::attach_from_config(config)) {
             Ok(engine) => engine,
             Err(error) => {
                 eprintln!("attach failed: {error}");

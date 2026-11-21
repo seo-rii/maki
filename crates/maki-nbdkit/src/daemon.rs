@@ -1210,26 +1210,47 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
     }
 }
 
-/// `maki volume create`: initialize the on-disk layout for a configured
-/// volume.
+/// Configuration checked for volume creation with the providers in this build.
+/// Keep it immutable so the options inspected by the CLI are those used on disk.
+pub struct VolumeCreationConfig(VolumeConfig);
+
+impl VolumeCreationConfig {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        parse_and_validate(raw).map(Self)
+    }
+
+    pub fn config(&self) -> &VolumeConfig {
+        &self.0
+    }
+
+    /// Initialize the layout. Discard support is chosen only at creation.
+    pub fn create(&self, discard: bool) -> Result<Superblock, DaemonError> {
+        create_volume_from_config(&self.0, discard)
+    }
+
+    /// Resolve credentials and construct transports before publishing the layout.
+    /// Remote endpoint self-tests then use the recovered volume's identity.
+    pub async fn create_and_attach(&self) -> Result<Engine, DaemonError> {
+        crate::security::apply(&self.0)?;
+        let prepared = prepare_provider(&self.0).await?;
+        self.create(false)?;
+        Ok(attach_hardened(&self.0, None, Some(prepared)).await?.0)
+    }
+}
+
+/// Initialize the on-disk layout for a configured volume.
 pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
-    create_volume_from_config(&parse_and_validate(raw)?, false)
+    VolumeCreationConfig::parse(raw)?.create(false)
 }
 
-/// Initialize a new v3 volume with discard support. Existing volumes are
-/// refused by the format initializer; this never upgrades an attached volume.
+/// Initialize a new v3 volume with discard support.
 pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
-    create_volume_from_config(&parse_and_validate(raw)?, true)
+    VolumeCreationConfig::parse(raw)?.create(true)
 }
 
-/// Resolve credentials and construct transports before publishing the layout.
-/// Remote endpoint self-tests then use the recovered volume's identity.
+/// Create and attach a new volume using the supplied configuration.
 pub async fn create_and_attach_from_config_str(raw: &str) -> Result<Engine, DaemonError> {
-    let config = parse_and_validate(raw)?;
-    crate::security::apply(&config)?;
-    let prepared = prepare_provider(&config).await?;
-    create_volume_from_config(&config, false)?;
-    Ok(attach_hardened(&config, None, Some(prepared)).await?.0)
+    VolumeCreationConfig::parse(raw)?.create_and_attach().await
 }
 
 fn create_volume_from_config(

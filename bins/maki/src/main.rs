@@ -225,19 +225,14 @@ fn main() -> ExitCode {
                 Ok(raw) => raw,
                 Err(e) => return fail(format!("{config}: {e}")),
             };
-            let created = if argv.len() == 4 {
-                maki_nbdkit::daemon::create_volume_with_discard_from_config_str(&raw)
-            } else {
-                maki_nbdkit::daemon::create_volume_from_config_str(&raw)
+            let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
+                Ok(creation) => creation,
+                Err(error) => return fail(error.to_string()),
             };
-            match created {
+            match creation.create(argv.len() == 4) {
                 Ok(sb) => {
-                    // The superblock does not record the volume name.
-                    let cfg = maki_format::config::parse_config(&raw).ok();
-                    let name = cfg
-                        .as_ref()
-                        .map(|cfg| cfg.volume.name.as_str())
-                        .unwrap_or_default();
+                    let cfg = creation.config();
+                    let name = &cfg.volume.name;
                     // Creation is already durable. Report output errors without
                     // making callers retry a successfully initialized volume.
                     let summary = writeln!(
@@ -256,7 +251,7 @@ fn main() -> ExitCode {
                             );
                         }
                     }
-                    if let Some(hint) = ownership_hint(running_as_root(), cfg.as_ref()) {
+                    if let Some(hint) = ownership_hint(running_as_root(), cfg) {
                         let _ = writeln!(io::stderr().lock(), "warning: {hint}");
                     }
                     ExitCode::SUCCESS
@@ -461,20 +456,16 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
 /// The backing tree is created owner-only; a root-created volume is
 /// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). A local
 /// rollback witness is created the same way, so name both paths.
-fn ownership_hint(
-    as_root: bool,
-    cfg: Option<&maki_format::config::VolumeConfig>,
-) -> Option<String> {
+fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Option<String> {
     if !as_root {
         return None;
     }
-    let local_witness = cfg.and_then(|cfg| {
-        cfg.backing
-            .rollback_protection
-            .as_ref()
-            .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
-            .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()))
-    });
+    let local_witness = cfg
+        .backing
+        .rollback_protection
+        .as_ref()
+        .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
+        .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()));
     Some(match local_witness {
         Some((root, witness)) => format!(
             "the volume tree {root} and the rollback witness in {witness} were created \
