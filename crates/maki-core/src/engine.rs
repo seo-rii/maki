@@ -1299,7 +1299,7 @@ impl Engine {
         let end = (offset + len as u64) / unit_size;
         if first >= end {
             return if fua {
-                self.flush_inner().await
+                self.flush_inner(true).await
             } else {
                 let admission = Arc::new(self.inner.admission.acquire(0).await?);
                 self.check_freshness(admission).await
@@ -1682,11 +1682,11 @@ impl Engine {
     /// FLUSH barrier: everything acknowledged before this call is durable
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
-        self.observe_request(RequestKind::Flush, false, self.flush_inner())
+        self.observe_request(RequestKind::Flush, false, self.flush_inner(false))
             .await
     }
 
-    async fn flush_inner(&self) -> Result<(), CoreError> {
+    async fn flush_inner(&self, fua: bool) -> Result<(), CoreError> {
         let admission = Arc::new(self.inner.admission.acquire(0).await?);
         self.check_freshness(admission.clone()).await?;
         let mut volume = self.inner.write_volume().await?;
@@ -1696,9 +1696,12 @@ impl Engine {
             let started = inner.clock.now();
             let outcome = inner.sync_journal(&mut volume);
             outcome?;
-            inner
-                .flush_latency
-                .record(inner.clock.now().saturating_sub(started));
+            let latency = if fua {
+                &inner.fua_latency
+            } else {
+                &inner.flush_latency
+            };
+            latency.record(inner.clock.now().saturating_sub(started));
             Ok(())
         })
         .await?
