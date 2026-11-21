@@ -126,10 +126,14 @@ readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
 required_commands=(
-    blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
+    blkid blockdev cargo dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
     modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
-    sync vgchange vgcreate vgremove vgs
+    sudo sync vgchange vgcreate vgremove vgs
 )
+
+if [[ "$discard" == true ]]; then
+    required_commands+=(fstrim)
+fi
 
 missing_commands() {
     local command_name

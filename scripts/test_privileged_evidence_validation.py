@@ -38,6 +38,19 @@ while ! test -f "$run_dir/ready"; do sleep 0.01; done
                 self.assertEqual(proc.returncode == 0, ok)
                 self.assertEqual((Path(tmp) / "maki-check.txt").exists(), ok)
 
+    def test_preflight_lists_missing_git_sudo_and_optional_trim(self):
+        script = Path(__file__).with_name("privileged-linux-validation.sh")
+        with tempfile.TemporaryDirectory() as tmp:
+            inject = Path(tmp) / "lookup"
+            inject.write_text('command() { if [[ $1 == -v ]]; then [[ $2 != "$ABSENT" ]]; else builtin command "$@"; fi; }\n')
+            for tool, flags, missing in (("git", [], True), ("sudo", [], True),
+                                         ("fstrim", [], False), ("fstrim", ["--discard"], True)):
+                with self.subTest(tool=tool, flags=flags):
+                    proc = subprocess.run(["bash", script, "--preflight", *flags],
+                                          env=dict(os.environ, BASH_ENV=str(inject), ABSENT=tool),
+                                          check=True, capture_output=True, text=True)
+                    self.assertEqual("  " + tool in proc.stdout.splitlines(), missing)
+
     def test_wal_checkpoint_requires_mode_all_frames_and_integrity(self):
         check = SCRIPT[SCRIPT.index("verify_sqlite_result() {"):SCRIPT.index('log "running a safe SQLite')]
         with tempfile.TemporaryDirectory() as directory:
