@@ -782,12 +782,7 @@ def undefined_references(line, masked, labels):
 
 
 def inline_text(raw, labels=frozenset()):
-    """Reduce inline Markdown to its rendered text as (character, literal) pairs.
-
-    Code span contents and backslash-escaped characters are literal: they are
-    never emphasis delimiters or entity references. `labels` holds the
-    document's defined reference labels: a reference to one renders as a link.
-    """
+    """Render heading text within one Markdown inline scope."""
     _, _, _, links, bare_links = scan_inline_paragraph(raw, labels)
     out = []
     marker_offsets = {}
@@ -795,14 +790,20 @@ def inline_text(raw, labels=frozenset()):
     while index < len(raw):
         if index in bare_links:
             end = bare_links[index]
-            out.extend((char, True) for char in raw[index:end])
+            out.extend(raw[index:end])
             index = end
             continue
         char = raw[index]
         if char == "\\" and index + 1 < len(raw) and raw[index + 1] in ASCII_PUNCTUATION:
-            out.append((raw[index + 1], True))
+            out.append(raw[index + 1])
             index += 2
             continue
+        if char == "&":
+            entity = ENTITY.match(raw, index)
+            if entity:
+                out.extend(markdown_entities(entity.group()))
+                index = entity.end()
+                continue
         if char == "`":
             opening = BACKTICKS.match(raw, index).group(0)
             closing = next(
@@ -811,13 +812,13 @@ def inline_text(raw, labels=frozenset()):
                 None,
             )
             if closing is None:
-                out.extend((tick, True) for tick in opening)
+                out.extend(opening)
                 index += len(opening)
                 continue
             content = raw[index + len(opening):closing.start()].replace("\n", " ")
             if len(content) > 1 and content[0] == content[-1] == " " and content.strip(" "):
                 content = content[1:-1]
-            out.extend((code, True) for code in content)
+            out.extend(content)
             index = closing.end()
             continue
         if char == "!" and index + 1 in links and links[index + 1][2]:
@@ -835,7 +836,7 @@ def inline_text(raw, labels=frozenset()):
                 continue
             autolink = AUTOLINK.match(raw, index)
             if autolink:
-                out.extend((link, True) for link in autolink.group(1))
+                out.extend(autolink.group(1))
                 index = autolink.end()
                 continue
             tag = HTML_TAG.match(raw, index)
@@ -851,10 +852,10 @@ def inline_text(raw, labels=frozenset()):
                 before_break -= 1
         if char in "_*":
             marker_offsets[len(out)] = index
-        out.append((char, False))
+        out.append(char)
         index += 1
     delimiters = emphasis_delimiters(raw, marker_offsets)
-    return [pair for index, pair in enumerate(out) if index not in delimiters]
+    return "".join(char for index, char in enumerate(out) if index not in delimiters)
 
 
 def emphasis_delimiters(raw, marker_offsets):
@@ -902,23 +903,6 @@ def emphasis_delimiters(raw, marker_offsets):
         if can_open and remaining < end:
             openers.append((remaining, end, end - index, can_close))
     return consumed
-
-
-def heading_text(raw, labels=frozenset()):
-    """The text GitHub renders for a heading's inline content."""
-    pairs = inline_text(raw, labels)
-    # Entity references are decoded outside code spans and escapes only.
-    rendered = []
-    plain = []
-    for char, literal in pairs:
-        if literal:
-            rendered.append(markdown_entities("".join(plain)))
-            plain = []
-            rendered.append(char)
-        else:
-            plain.append(char)
-    rendered.append(markdown_entities("".join(plain)))
-    return "".join(rendered).strip()
 
 
 def github_slug(text):
@@ -978,7 +962,7 @@ def document_anchors(text):
     anchors = set()
     occurrences = {}
     for heading in headings:
-        base = github_slug(heading_text(heading, labels))
+        base = github_slug(inline_text(heading, labels).strip())
         slug = base
         while slug in occurrences:
             occurrences[base] += 1

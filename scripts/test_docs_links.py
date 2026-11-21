@@ -49,6 +49,13 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:2: guide.md#_word_x (missing anchor)",
         ])
 
+    def test_heading_entities_are_decoded_only_when_contiguous_in_source(self):
+        self.write("file", "")
+        self.write("guide.md", "# &am*p*;\n# &co[py](file);\n# real &#95; and &amp;copy;\n")
+        self.write("README.md", "[a](guide.md#amp) [b](guide.md#copy) "
+                   "[c](guide.md#real-_-and-copy) [bad](guide.md#real-_-and-)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#real-_-and- (missing anchor)"])
+
     def test_non_ascii_spaces_do_not_end_markdown_or_html_blocks(self):
         for space in ("\u00a0", "\u2003"):
             self.write("README.md", f"Prose\n{space}\n    [a](missing.md)\n\n"
