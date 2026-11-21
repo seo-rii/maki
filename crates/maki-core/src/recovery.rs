@@ -357,7 +357,7 @@ fn recover_with_replay(
     )?;
     // This recovery, the attach after it and later checkpoints store A/B
     // metadata; refuse a generation that leaves no room before any write.
-    check_metadata_generations(backing, &store)?;
+    check_metadata_generations(backing, &store, None)?;
     // The superblock is the volume's commit point; every repair below, and
     // the resumed writer, depends on it. A failed or interrupted creation, or
     // a restart, can hand recovery a copy that exists only in the page cache
@@ -704,14 +704,15 @@ pub(crate) struct JournalSummary {
 
 pub(crate) fn summarize_journal(
     backing: &Arc<dyn Backing>,
-    superblock: &Superblock,
+    envelope: &VolumeSuperblock,
     checkpoint_sequence: u64,
     segment_size: u64,
     store: Option<&SlotStore>,
 ) -> Result<JournalSummary, RecoveryError> {
     // The deep check scans against the volume's stored checkpoint state, so
     // it applies the rule recovery applies to that state.
-    let proof = load_required_proof(backing, superblock)?;
+    let superblock = &envelope.superblock;
+    let proof = load_required_proof(backing, envelope)?;
     if let Some(proof) = &proof {
         check_checkpoint_horizon(checkpoint_sequence, proof)?;
     }
@@ -756,7 +757,13 @@ fn scan_journal_with_replay(
     segment_size: u64,
     replay: ReplayRecords,
 ) -> Result<JournalScan, RecoveryError> {
-    let proof = load_required_proof(backing, superblock)?;
+    let envelope = load_volume_superblock(backing.as_ref())?;
+    if envelope.superblock.volume_uuid != superblock.volume_uuid {
+        return Err(RecoveryError::Corrupt(
+            "journal scan superblock identity mismatch".into(),
+        ));
+    }
+    let proof = load_required_proof(backing, &envelope)?;
     scan_journal_with_proof(
         backing,
         superblock,
@@ -772,14 +779,8 @@ fn scan_journal_with_replay(
 /// volume, whose read-only inspection retains its historical classification.
 fn load_required_proof(
     backing: &Arc<dyn Backing>,
-    superblock: &Superblock,
+    envelope: &VolumeSuperblock,
 ) -> Result<Option<DurableProof>, RecoveryError> {
-    let envelope = load_volume_superblock(backing.as_ref())?;
-    if envelope.superblock.volume_uuid != superblock.volume_uuid {
-        return Err(RecoveryError::Corrupt(
-            "journal scan superblock identity mismatch".into(),
-        ));
-    }
     if !matches!(
         envelope.metadata_version,
         SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
@@ -788,7 +789,7 @@ fn load_required_proof(
     }
     Ok(Some(DurableProofStore::load(
         backing.as_ref(),
-        superblock.volume_uuid,
+        envelope.superblock.volume_uuid,
     )?))
 }
 
@@ -1252,6 +1253,9 @@ const MAX_METADATA_GENERATION: u64 = u64::MAX - (1 << 62);
 pub(crate) fn check_metadata_generations(
     backing: &Arc<dyn Backing>,
     store: &SlotStore,
+    // Known only when both superblocks decoded under this lock. A malformed
+    // partner can still contain a CRC-valid raw generation above the selected one.
+    known_superblock_generation: Option<u64>,
 ) -> Result<(), RecoveryError> {
     fn highest<T: AbRecord>(
         backing: &Arc<dyn Backing>,
@@ -1265,7 +1269,14 @@ pub(crate) fn check_metadata_generations(
     for (what, generation) in [
         (
             "superblock",
-            highest::<VolumeSuperblock>(backing, layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)?,
+            match known_superblock_generation {
+                Some(generation) => Some(generation),
+                None => highest::<VolumeSuperblock>(
+                    backing,
+                    layout::SUPERBLOCK_A,
+                    layout::SUPERBLOCK_B,
+                )?,
+            },
         ),
         (
             "checkpoint state",

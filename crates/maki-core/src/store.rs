@@ -52,7 +52,7 @@ use maki_format::catalog::ShardCatalog;
 use maki_format::geometry::Geometry;
 use maki_format::layout;
 use maki_format::slot::SlotHeader;
-use maki_format::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V3};
+use maki_format::superblock::{load_volume_superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V3};
 use maki_format::FormatError;
 
 use crate::error::CoreError;
@@ -390,6 +390,15 @@ impl SlotStore {
                 "slot store geometry differs from the volume superblock".into(),
             ));
         }
+        Self::open_from_superblock(backing, &envelope, progress)
+    }
+
+    pub(crate) fn open_from_superblock(
+        backing: Arc<dyn Backing>,
+        envelope: &VolumeSuperblock,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<Self, CoreError> {
+        let geometry = envelope.superblock.geometry.clone();
         let discard_enabled = envelope.metadata_version == SUPERBLOCK_VERSION_V3;
         let catalog_ab = catalog_store(&geometry);
         let mut catalog = catalog_ab

@@ -20,13 +20,14 @@ use maki_format::canary::KeyCanary;
 use maki_format::checker::CheckReport;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use maki_format::layout;
+use maki_format::superblock::load_volume_superblock_with_fallback;
 use maki_format::FormatError;
 
 use crate::error::CoreError;
 use crate::journal::effective_segment_size;
 use crate::recovery::{
     acquire_lock, check_metadata_generations, load_checkpoint_state, load_durable_mark,
-    load_superblock, summarize_journal, JournalRepair, RecoveryError,
+    summarize_journal, JournalRepair, RecoveryError,
 };
 use crate::store::{SlotRead, SlotStore};
 
@@ -68,16 +69,16 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // means the check cannot run (I/O) or the copy changed since; neither
     // may end in a report without errors, which would claim a pass for a
     // journal and slots nobody examined (BUG-090).
-    let superblock = match load_superblock(&backing) {
-        Ok(sb) => sb,
-        Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
-            return Err(CoreError::Io(e))
-        }
+    let (envelope, invalid_copy) = match load_volume_superblock_with_fallback(backing.as_ref()) {
+        Ok(copies) => copies,
+        Err(FormatError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => {
             report.errors.push(format!("superblock: {e}"));
             return Ok(report);
         }
     };
+
+    let superblock = &envelope.superblock;
 
     // Checkpoint state: both copies inspected, at least one required.
     let ck_ab = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
@@ -160,14 +161,14 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // Apply recovery's validation and repair policy without retaining the
     // replay payloads: this report needs counts, repair decisions and the
     // set of units a replay would rewrite.
-    let store = SlotStore::open(backing.clone(), superblock.geometry.clone());
+    let store = SlotStore::open_from_superblock(backing.clone(), &envelope, &|| {});
     let mut replay_units = std::collections::BTreeSet::new();
     let mut replay_written = std::collections::BTreeSet::new();
     let mut journal_durable = None;
     let mut journal_ok = false;
     match summarize_journal(
         &backing,
-        &superblock,
+        &envelope,
         checkpoint_sequence,
         effective_segment_size(segment_size),
         store.as_ref().ok(),
@@ -219,7 +220,8 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         Ok(store) => {
             shard_count = Some(store.shard_count());
             // The A/B generations recovery checks before its first write.
-            match check_metadata_generations(&backing, &store) {
+            let known_generation = invalid_copy.is_none().then_some(superblock.generation);
+            match check_metadata_generations(&backing, &store, known_generation) {
                 Ok(()) => {}
                 Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
                     return Err(CoreError::Io(e))
