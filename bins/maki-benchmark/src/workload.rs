@@ -126,14 +126,12 @@ impl Oracle {
         self.generations[slot].load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG
     }
 
-    fn final_sweep_states(&self, options: &Options) -> &[AtomicU64] {
+    fn tracked_slots(slots: u64, options: &Options) -> u64 {
         if !options.random && options.read_percent.is_none() {
-            // Sequential phased writes start at slot zero and wrap after the
-            // last slot. All initialized slots form a prefix.
-            let written = options.ops.min(self.generations.len() as u64) as usize;
-            &self.generations[..written]
+            // Sequential phased I/O only visits this prefix (even across wraps).
+            slots.min(options.ops)
         } else {
-            &self.generations
+            slots
         }
     }
 }
@@ -301,7 +299,7 @@ async fn verify_final(
 ) -> Result<VerificationReport, String> {
     let began = Instant::now();
     let mut report = VerificationReport::default();
-    for (slot, state) in oracle.final_sweep_states(options).iter().enumerate() {
+    for (slot, state) in oracle.generations.iter().enumerate() {
         let state = state.load(Ordering::Acquire);
         let generation = state & !READ_AFTER_WRITE_FLAG;
         if generation > 0 {
@@ -372,7 +370,7 @@ pub async fn run(
     working_set_bytes: u64,
 ) -> Result<Measurements, String> {
     let slots = working_set_bytes / options.io_size as u64;
-    let oracle = Arc::new(Oracle::new(slots)?);
+    let oracle = Arc::new(Oracle::new(Oracle::tracked_slots(slots, options))?);
     let began = Instant::now();
     let mut setup = SetupReport {
         writes: 0,

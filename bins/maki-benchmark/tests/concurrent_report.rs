@@ -234,7 +234,7 @@ fn mixed_coverage_reports_the_sequential_address_and_ratio_correlation() {
 
 #[test]
 fn phased_final_sweep_only_visits_written_slots_in_a_sparse_working_set() {
-    for (access, written) in [("sequential", 32), ("random", 30)] {
+    for (access, written, tracked) in [("sequential", 32, 32), ("random", 30, 256)] {
         let (_directory, config) = fixture();
         let output = run(
             &config,
@@ -267,7 +267,7 @@ fn phased_final_sweep_only_visits_written_slots_in_a_sparse_working_set() {
         ] {
             assert_eq!(report["verification"][field], written, "{access}: {field}");
         }
-        assert_eq!(report["resources"]["oracle_generation_bytes"], 256 * 8);
+        assert_eq!(report["resources"]["oracle_generation_bytes"], tracked * 8);
     }
 }
 

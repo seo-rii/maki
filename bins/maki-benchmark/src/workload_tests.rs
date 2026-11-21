@@ -385,19 +385,18 @@ async fn rejected_write_does_not_advance_expected_generation() {
 }
 
 #[test]
-fn final_sweep_bounds_follow_the_initialized_address_range() {
-    let oracle = Oracle::new(32).unwrap();
+fn oracle_tracks_the_initialized_address_range() {
     let mut options = options();
     for (ops, expected) in [(1, 1), (32, 32), (48, 32)] {
         options.ops = ops;
-        assert_eq!(oracle.final_sweep_states(&options).len(), expected);
+        assert_eq!(Oracle::tracked_slots(32, &options), expected);
     }
     options.ops = 1;
     options.random = true;
-    assert_eq!(oracle.final_sweep_states(&options).len(), 32);
+    assert_eq!(Oracle::tracked_slots(32, &options), 32);
     options.random = false;
     options.read_percent = Some(100);
-    assert_eq!(oracle.final_sweep_states(&options).len(), 32);
+    assert_eq!(Oracle::tracked_slots(32, &options), 32);
 }
 
 #[test]
