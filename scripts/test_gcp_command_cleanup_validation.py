@@ -138,6 +138,24 @@ class CommandCleanupTests(unittest.TestCase):
                          (command, 0, b"{}", b"warning"))
         self.assert_cleaned(0)
 
+    def test_completed_command_observed_after_its_deadline_times_out(self):
+        command = self.fixture("pass\n", leader_exits=True)
+        clock = mock.Mock()
+        clock.monotonic.return_value = 0
+
+        class DelayedEOF(self.host.selectors.DefaultSelector):
+            def unregister(self, fileobj):
+                key = super().unregister(fileobj)
+                if not self.get_map():
+                    clock.monotonic.return_value = 2
+                return key
+
+        with (mock.patch.object(self.host, "time", clock),
+              mock.patch.object(self.host.selectors, "DefaultSelector", DelayedEOF),
+              self.assertRaisesRegex(TimeoutError, "command deadline")):
+            self.host.bounded_run(command, 1)
+        self.assert_cleaned(0)
+
     def test_bug196_success_does_not_wait_for_descendant_pipe_eof(self):
         command = self.fixture("os.write(1, b'{}')\n", inherited_pipes=True,
                                leader_exits=True)
