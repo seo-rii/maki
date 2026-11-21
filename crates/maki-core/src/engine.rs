@@ -441,25 +441,30 @@ impl Drop for RequestGuard<'_> {
 
 /// Sum, count and maximum of a latency series, in nanoseconds.
 #[derive(Default)]
-struct LatencyStats {
-    nanos_sum: AtomicU64,
-    count: AtomicU64,
-    nanos_max: AtomicU64,
+struct LatencyStats(parking_lot::Mutex<LatencyTotals>);
+
+#[derive(Default, Clone, Copy)]
+struct LatencyTotals {
+    nanos_sum: u128,
+    count: u64,
+    nanos_max: u64,
 }
 
 impl LatencyStats {
     fn record(&self, elapsed: Duration) {
         let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-        self.nanos_sum.fetch_add(nanos, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.nanos_max.fetch_max(nanos, Ordering::Relaxed);
+        let mut totals = self.0.lock();
+        totals.nanos_sum += u128::from(nanos);
+        totals.count += 1;
+        totals.nanos_max = totals.nanos_max.max(nanos);
     }
 
     fn snapshot(&self) -> LatencySnapshot {
+        let totals = *self.0.lock();
         LatencySnapshot {
-            seconds_sum: self.nanos_sum.load(Ordering::Relaxed) as f64 / 1e9,
-            count: self.count.load(Ordering::Relaxed),
-            seconds_max: self.nanos_max.load(Ordering::Relaxed) as f64 / 1e9,
+            seconds_sum: totals.nanos_sum as f64 / 1e9,
+            count: totals.count,
+            seconds_max: totals.nanos_max as f64 / 1e9,
         }
     }
 }
@@ -2519,4 +2524,35 @@ pub struct EngineStats {
     pub checkpoints_total: u64,
     pub checkpoint_failures_total: u64,
     pub state: EngineState,
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    #[test]
+    fn concurrent_snapshots_describe_one_set_of_observations() {
+        let series = LatencyStats::default();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                for _ in 0..100_000 {
+                    series.record(Duration::from_millis(1));
+                }
+            });
+            start.wait();
+            loop {
+                let sample = series.snapshot();
+                assert_eq!((sample.seconds_sum * 1000.).round() as u64, sample.count);
+                if sample.count > 0 {
+                    assert_eq!(sample.seconds_max, 0.001);
+                }
+                if writer.is_finished() {
+                    break;
+                }
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(series.snapshot().count, 100_000);
+    }
 }
