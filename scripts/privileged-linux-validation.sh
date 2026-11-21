@@ -126,10 +126,14 @@ readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
 required_commands=(
-    blkid blockdev cargo dd df findmnt fio lsblk lvcreate lvremove lvs mkfs.xfs
+    blkid blockdev cargo dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
     modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
-    sync vgchange vgcreate vgremove vgs
+    sudo sync vgchange vgcreate vgremove vgs
 )
+
+if [[ "$discard" == true ]]; then
+    required_commands+=(fstrim)
+fi
 
 missing_commands() {
     local command_name
@@ -249,21 +253,25 @@ stop_process_normally() {
     local pid="$1"
     local label="$2"
     [[ -n "$pid" ]] || return 0
-    if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid" 2>/dev/null || true
-        return 0
-    fi
-    log "cleanup: sending SIGTERM to $label (PID $pid)"
-    kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 100); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true
-            return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        log "cleanup: sending SIGTERM to $label (PID $pid)"
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            log "cleanup warning: $label did not stop after SIGTERM; no SIGKILL was sent"
+            return 1
         fi
-        sleep 0.1
-    done
-    log "cleanup warning: $label did not stop after SIGTERM; no SIGKILL was sent"
-    return 1
+    fi
+    local status=0
+    wait "$pid" || status=$?
+    if [[ "${3:-}" == clean && "$status" != 0 ]]; then
+        log "$label exited with status $status"
+        return 1
+    fi
+    return 0
 }
 
 nbd_has_pid() {
@@ -1065,8 +1073,14 @@ pv_created=false
 disconnect_test_nbd
 pass "disposable LVM state removed"
 
-stop_process_normally "$nbdkit_pid" "nbdkit" || die "nbdkit did not stop cleanly"
+stop_process_normally "$nbdkit_pid" "nbdkit" clean || die "nbdkit did not stop cleanly"
 nbdkit_pid=""
+# The unload hook reports its final drain failure to stderr even on exit 0.
+if grep -Fq 'maki-nbdkit: shutdown during unload failed' "$run_dir/nbdkit.log"; then
+    die "plugin reported a shutdown failure; see nbdkit.log"
+else
+    [[ $? == 1 ]] || die "could not inspect the plugin shutdown log"
+fi
 "$maki_bin" check "$config_path" | tee "$run_dir/maki-check.txt"
 pass "clean nbdkit shutdown and offline Maki check"
 

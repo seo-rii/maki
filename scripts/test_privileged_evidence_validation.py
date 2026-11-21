@@ -15,6 +15,42 @@ SCRIPT = Path(__file__).with_name("privileged-linux-validation.sh").read_text()
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("bash"), "Linux shell")
 class PrivilegedEvidence(unittest.TestCase):
+    def test_clean_shutdown_checks_exit_and_plugin_log_before_offline_check(self):
+        stop = SCRIPT[SCRIPT.index("stop_process_normally() {"):SCRIPT.index("nbd_has_pid() {")]
+        final = SCRIPT[SCRIPT.rindex('stop_process_normally "$nbdkit_pid"'):SCRIPT.index('pass "clean nbdkit')]
+        setup = """
+set -e
+run_dir=$1
+log() { :; }
+die() { exit 1; }
+maki_bin=true
+config_path=unused
+bash -c 'trap "exit $1" TERM; echo ready > "$2/ready"; while :; do sleep 0.05; done' bash "$2" "$1" &
+nbdkit_pid=$!
+while ! test -f "$run_dir/ready"; do sleep 0.01; done
+"""
+        for code, contents, ok in ((0, "", True), (42, "", False),
+                                   (0, "maki-nbdkit: shutdown during unload failed: error", False)):
+            with self.subTest(code=code, contents=contents), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "nbdkit.log").write_text(contents)
+                proc = subprocess.run(["bash", "-c", setup + stop + final, "bash", tmp, str(code)],
+                                      capture_output=True, timeout=5)
+                self.assertEqual(proc.returncode == 0, ok)
+                self.assertEqual((Path(tmp) / "maki-check.txt").exists(), ok)
+
+    def test_preflight_lists_missing_git_sudo_and_optional_trim(self):
+        script = Path(__file__).with_name("privileged-linux-validation.sh")
+        with tempfile.TemporaryDirectory() as tmp:
+            inject = Path(tmp) / "lookup"
+            inject.write_text('command() { if [[ $1 == -v ]]; then [[ $2 != "$ABSENT" ]]; else builtin command "$@"; fi; }\n')
+            for tool, flags, missing in (("git", [], True), ("sudo", [], True),
+                                         ("fstrim", [], False), ("fstrim", ["--discard"], True)):
+                with self.subTest(tool=tool, flags=flags):
+                    proc = subprocess.run(["bash", script, "--preflight", *flags],
+                                          env=dict(os.environ, BASH_ENV=str(inject), ABSENT=tool),
+                                          check=True, capture_output=True, text=True)
+                    self.assertEqual("  " + tool in proc.stdout.splitlines(), missing)
+
     def test_wal_checkpoint_requires_mode_all_frames_and_integrity(self):
         check = SCRIPT[SCRIPT.index("verify_sqlite_result() {"):SCRIPT.index('log "running a safe SQLite')]
         with tempfile.TemporaryDirectory() as directory:

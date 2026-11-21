@@ -31,6 +31,35 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                   patch.object(fixture.time, "sleep")):
                 case.verify(mode)
 
+    def test_recovered_workload_requires_a_live_ready_daemon(self):
+        events = (*READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
+                  "daemon-stop", *READY_DAEMON, "attach-start", "attach-ready")
+        for mode in ("exit-once", "timeout-once", "kill-once"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(AssertionError, "daemon"):
+                self.verify_events(mode, (*events, "daemon-stop", "workload-start"), "active")
+            with self.subTest(mode=mode), self.assertRaisesRegex(AssertionError, "daemon|timed out"):
+                self.verify_events(mode, (*events, "workload-start"), "active", states={"daemon": "inactive"})
+
+    def test_failed_recovery_requires_its_specific_cleanup_event(self):
+        for mode, refusal in (("foreign-resource", "foreign-resource-preserved"),
+                              ("cleanup-failure", "cleanup-refused")):
+            base = (*READY_DAEMON, "attach-start")
+            self.verify_events(mode, (*base, "cleanup-recover", refusal), "inactive",
+                               states={"recovery": "failed"}, resource=True)
+            for suffix in ((), ("cleanup-recover",), (refusal, "cleanup-recover")):
+                with self.subTest(mode=mode, suffix=suffix), self.assertRaises(AssertionError):
+                    self.verify_events(mode, (*base, *suffix), "inactive",
+                                       states={"recovery": "failed"}, resource=True)
+
+    def test_command_name_preserves_dollar_while_arguments_are_escaped(self):
+        volume = "mkci_dollar"
+        with patch.object(fixture.sys, "executable", "/tmp/python$build"):
+            units = fixture.fixture_units(volume, Path("/tmp/dir$build"), Path("/tmp/helper$build"))
+        attach = units[fixture.names(volume)["attach"]]
+        self.assertIn('ExecStopPost="/tmp/helper$build"', attach)
+        self.assertIn('ExecStart="/tmp/python$build"', attach)
+        self.assertIn('"/tmp/dir$$build" attach', attach)
+
     def test_partial_event_fails_both_the_writer_and_final_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "normal-stop")
