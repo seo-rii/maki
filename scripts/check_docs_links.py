@@ -1082,14 +1082,19 @@ def broken_links(root):
             decoded = os.fsdecode(urllib.parse.unquote_to_bytes(file_part))
         except UnicodeDecodeError:
             return target  # these bytes cannot name a file on this platform
+        document = path.relative_to(root)
         if file_part.startswith("/"):
-            target_path = root / decoded.lstrip("/")
+            requested = decoded.lstrip("/")
         else:
-            target_path = path.parent / decoded if decoded else path
+            requested = document.parent / decoded if decoded else document
+        # Browsers remove URL dot segments before the checkout resolves any symlinks.
+        target_path = root / os.path.normpath(requested)
         resolved = published_target(target_path)
         if resolved is None:
             if omitted_archive_reference(root, path, content, target_path, packages):
                 return None
+            return target
+        if decoded and decoded.rpartition("/")[2] in ("", ".", "..") and not resolved.is_dir():
             return target
         fragment = urllib.parse.unquote(fragment)
         if fragment and resolved.is_file() and target_path.suffix.lower() == ".md":

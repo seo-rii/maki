@@ -293,6 +293,27 @@ class DocumentationLinks(unittest.TestCase):
         self.assertEqual(broken_links(self.root), [
             "README.md:2: ignored/notes.txt", "README.md:2: ignored/", f"README.md:2: ../{outside.name}"])
 
+    def test_url_dot_segments_are_removed_before_checking_files_and_anchors(self):
+        self.write("docs/guide.md", "# Guide\n")
+        self.write("docs/readme.md", "[direct](guide.md#guide) [gone](old/../guide.md#guide)\n"
+                   "[file](guide.md/../guide.md#guide) [encoded](/old/%2e%2E/docs/guide.md#guide)\n"
+                   "[bad](old/../guide.md#absent) [missing](old/../missing.md)\n"
+                   "[directory](guide.md/old/..) [above](../../docs/guide.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "docs/readme.md:3: old/../guide.md#absent (missing anchor)", "docs/readme.md:3: old/../missing.md",
+            "docs/readme.md:4: guide.md/old/..", "docs/readme.md:4: ../../docs/guide.md",
+        ])
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_removed_url_segment_is_not_resolved_as_a_checkout_symlink(self):
+        self.write("guide.md", "# Root\n")
+        self.write("deep/guide.md", "# Deep\n")
+        self.write("deep/sub/file", "")
+        (self.root / "alias").symlink_to("deep/sub", target_is_directory=True)
+        self.write("README.md", "[root](alias/../guide.md#root) [wrong](alias/../guide.md#deep)\n"
+                   "[through alias](alias/file)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: alias/../guide.md#deep (missing anchor)"])
+
     def test_a_tracked_submodule_directory_is_publishable(self):
         self.write("README.md", "[component](component)\n")
         (self.root / "component").mkdir()
