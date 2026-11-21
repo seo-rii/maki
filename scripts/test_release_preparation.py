@@ -199,6 +199,19 @@ class ReleasePreparationTests(unittest.TestCase):
             self.assertEqual(child.wait(timeout=30), 0, child.stderr.read())
         self.assertTrue((output / "SHA256SUMS").is_file())
 
+    def test_documented_background_build_preserves_status_with_and_without_errexit(self):
+        guide = (ROOT / "docs/releasing.md").read_text().split("## Prepare and inspect", 1)[1]
+        block = guide.split("```bash\n", 1)[1].split("\n```", 1)[0]
+        for strict in (False, True):
+            for status in (0, 7):
+                with self.subTest(strict=strict, status=status), tempfile.TemporaryDirectory() as work:
+                    script = ("set -e\n" if strict else "") + f"rustup() {{ return {status}; }}\n" + block
+                    result = subprocess.run(["bash", "-c", script], cwd=self.repo, capture_output=True,
+                                            env={**self.environment, "HOME": work})
+                    self.assertEqual(result.returncode, status)
+                    self.assertEqual([f.read_text().strip() for f in (pathlib.Path(work) / "logs").glob("*.status")],
+                                     [str(status)])
+
     def test_source_bytes_and_modes_are_independent_of_archive_attributes(self):
         contents = b"#!/bin/sh\n# revision: $Format:%H$\n"
         note = self.repo / "release notes"
