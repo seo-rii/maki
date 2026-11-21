@@ -435,21 +435,24 @@ class Fixture:
             expected_cycles = 2 if mode in ("target-restart", "stop-start", "active-recovery") else 1
             require(self.count("attach-start") == expected_cycles, "planned stop allowed a new attach")
             require(self.count("workload-stop") == expected_cycles, "planned stop did not quiesce workload")
-        needs_cleanup = False
+        attachment = "absent"
         for record in self.events():
             name = record["event"]
             require(not name.startswith("unsafe-"), "unsafe ordering in simulated lifecycle")
             if name == "attach-start":
-                require(not needs_cleanup, "reattach began before previous cleanup completed")
-                # Each attempt consumes the preceding cleanup. An earlier
-                # completion cannot authorize a later retry in a failure loop.
-                needs_cleanup = True
+                require(attachment == "absent", "reattach began before previous cleanup completed")
+                attachment = "starting"
+            elif name == "attach-ready":
+                require(attachment == "starting", "attachment became ready outside a start attempt")
+                attachment = "ready"
+            elif name == "workload-start":
+                require(attachment == "ready", "workload started before its attachment was ready")
             elif name == "cleanup-complete":
-                needs_cleanup = False
+                attachment = "absent"
             elif name == "daemon-stop" and mode in (
                     "normal-stop", "failed-stop", "timeout-stop", "kill-stop",
                     "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
-                require(not needs_cleanup, "daemon stopped before successful cleanup")
+                require(attachment == "absent", "daemon stopped before successful cleanup")
 
 
 def main():
