@@ -39,7 +39,7 @@ use crate::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
 use crate::checked::{validate_decrypt_result, validate_owned_encrypt_result, CheckedProvider};
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
-use crate::flow::{DualPermit, DualSemaphore};
+use crate::flow::{semaphore_limits, DualPermit, DualSemaphore};
 use crate::provider::CryptoProvider;
 use crate::retry::{full_jitter_delay, RetryBudget, RetryBudgetConfig, RetryPolicy};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
@@ -170,7 +170,7 @@ pub struct EndpointStatus {
 
 pub struct EndpointSet {
     endpoints: Vec<Arc<Endpoint>>,
-    global: Arc<DualSemaphore>,
+    global: Arc<GlobalRpcBudget>,
     admission_gate: AsyncMutex<()>,
     capacity_changed: Arc<Notify>,
     policy: RetryPolicy,
@@ -188,11 +188,56 @@ pub struct EndpointSet {
     plaintext_size: Option<u32>,
 }
 
+/// Serving and validation RPCs try to reserve both dimensions together. The
+/// admission waiters already use `capacity_changed` to await a release.
+struct GlobalRpcBudget {
+    max_batches: u64,
+    max_bytes: u64,
+    inflight: parking_lot::Mutex<(u64, u64)>,
+}
+
+impl GlobalRpcBudget {
+    fn new(max_batches: u32, max_bytes: u64) -> Self {
+        let (max_batches, max_bytes) = semaphore_limits(max_batches, max_bytes);
+        Self {
+            max_batches: max_batches as u64,
+            max_bytes,
+            inflight: Default::default(),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<GlobalRpcPermit> {
+        let mut usage = self.inflight.lock();
+        if usage.0 >= self.max_batches || bytes > self.max_bytes - usage.1 {
+            return None;
+        }
+        usage.0 += 1;
+        usage.1 += bytes;
+        Some(GlobalRpcPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+
+struct GlobalRpcPermit {
+    budget: Arc<GlobalRpcBudget>,
+    bytes: u64,
+}
+
+impl Drop for GlobalRpcPermit {
+    fn drop(&mut self) {
+        let mut usage = self.budget.inflight.lock();
+        usage.0 -= 1;
+        usage.1 -= self.bytes;
+    }
+}
+
 /// Both budgets are acquired without waiting, then retained only for the RPC.
 /// Release capacity before notifying the FIFO admission waiter.
 struct EndpointAdmission {
     endpoint: Arc<Endpoint>,
-    global: Option<DualPermit>,
+    global: Option<GlobalRpcPermit>,
     local: Option<DualPermit>,
     changed: Arc<Notify>,
 }
@@ -230,7 +275,7 @@ impl Drop for ValidationGuard {
 /// calls the other peer, including when global capacity is just one RPC.
 struct ValidationProvider {
     endpoint: Arc<Endpoint>,
-    global: Arc<DualSemaphore>,
+    global: Arc<GlobalRpcBudget>,
     changed: Arc<Notify>,
     reference: bool,
 }
@@ -263,9 +308,9 @@ impl ValidationProvider {
     }
 
     async fn admit(&self, bytes: u64) -> Result<EndpointAdmission, CryptoError> {
-        if self.global.max_items() == 0
+        if self.global.max_batches == 0
             || self.endpoint.semaphore.max_items() == 0
-            || bytes > self.global.max_bytes()
+            || bytes > self.global.max_bytes
             || bytes > self.endpoint.semaphore.max_bytes()
         {
             return Err(CryptoError::NonRetryableRequest(
@@ -314,7 +359,7 @@ impl CryptoProvider for ValidationProvider {
         // unchanged; only these background probes use the smaller batches.
         let byte_budget = self
             .global
-            .max_bytes()
+            .max_bytes
             .min(self.endpoint.semaphore.max_bytes());
         let largest_plaintext = caps
             .supported_plaintext_sizes
@@ -452,7 +497,7 @@ impl EndpointSet {
             .collect();
         Self {
             endpoints,
-            global: Arc::new(DualSemaphore::new(
+            global: Arc::new(GlobalRpcBudget::new(
                 config.global_max_inflight_batches,
                 config.global_max_inflight_bytes,
             )),
@@ -615,10 +660,7 @@ impl EndpointSet {
     /// RPCs and bytes currently holding the set's global permits
     /// (`maki_crypto_inflight_batches`, `maki_crypto_inflight_bytes`).
     pub fn global_inflight(&self) -> (u64, u64) {
-        (
-            (self.global.max_items() - self.global.available_items()) as u64,
-            self.global.max_bytes() - self.global.available_bytes(),
-        )
+        *self.global.inflight.lock()
     }
 
     pub fn endpoint_status(&self) -> Vec<EndpointStatus> {
@@ -920,9 +962,9 @@ impl EndpointSet {
         sent: &mut bool,
     ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
-        if self.global.max_items() == 0
+        if self.global.max_batches == 0
             || self.endpoints[0].semaphore.max_items() == 0
-            || bytes > self.global.max_bytes()
+            || bytes > self.global.max_bytes
             || bytes > self.endpoints[0].semaphore.max_bytes()
         {
             return Err(CryptoError::NonRetryableRequest(
