@@ -284,6 +284,17 @@ pub struct RealFile {
     file: File,
 }
 
+#[cfg(target_os = "linux")]
+fn retry_interrupted_allocation(mut allocate: impl FnMut() -> libc::c_int) -> io::Result<()> {
+    loop {
+        match allocate() {
+            0 => return Ok(()),
+            libc::EINTR => continue,
+            errno => return Err(io::Error::from_raw_os_error(errno)),
+        }
+    }
+}
+
 impl BackingFile for RealFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         read_exact_at(&self.file, offset, buf)
@@ -319,13 +330,10 @@ impl BackingFile for RealFile {
                     "allocation length exceeds off_t",
                 )
             })?;
-            // SAFETY: the descriptor stays open for the call and both
-            // non-negative ranges were checked to fit `off_t`.
-            let error = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, len) };
-            if error != 0 {
-                return Err(io::Error::from_raw_os_error(error));
-            }
-            Ok(())
+            retry_interrupted_allocation(|| {
+                // SAFETY: the descriptor stays open and the range fits off_t.
+                unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, len) }
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -600,6 +608,20 @@ fn sync_dir_impl(p: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_allocation_retries_and_preserves_the_terminal_result() {
+        for terminal in [0, libc::ENOSPC] {
+            let mut results = [libc::EINTR, libc::EINTR, terminal].into_iter();
+            let result = retry_interrupted_allocation(|| results.next().unwrap());
+            assert_eq!(
+                result.err().and_then(|e| e.raw_os_error()),
+                (terminal != 0).then_some(terminal)
+            );
+            assert_eq!(results.next(), None);
+        }
+    }
 
     #[test]
     fn read_write_roundtrip_and_eof() {

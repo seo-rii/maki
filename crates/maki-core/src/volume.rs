@@ -593,6 +593,9 @@ impl Volume {
             )));
         }
         if horizon <= base_checkpoint {
+            // An idle plan can finish without touching the backing. Check the
+            // session before reporting success or clearing a degraded state.
+            self.check_freshness()?;
             // Nothing new is durable; still retire anything a previously
             // interrupted checkpoint applied but could not clean up, and
             // persist metadata the store repaired at open (an adopted shard
@@ -943,7 +946,7 @@ mod reservation_barrier_tests {
 }
 
 #[cfg(test)]
-mod zero_trim_freshness_tests {
+mod freshness_tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1004,8 +1007,7 @@ mod zero_trim_freshness_tests {
         }
     }
 
-    #[test]
-    fn zero_trim_prefilter_rechecks_freshness_before_skipping_overlay_tombstone() {
+    fn open_volume() -> (Arc<FreshnessGate>, Volume) {
         let backing = Arc::new(FreshnessGate::default());
         init::create_volume_with_discard(
             backing.as_ref(),
@@ -1021,7 +1023,30 @@ mod zero_trim_freshness_tests {
             },
         )
         .unwrap();
-        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        let volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        (backing, volume)
+    }
+
+    #[test]
+    fn idle_checkpoint_requires_a_current_session() {
+        let (backing, mut volume) = open_volume();
+        assert_eq!(volume.checkpoint().unwrap(), 0);
+
+        // The engine releases its volume lock between preparation and publication.
+        let prepared = volume.prepare_checkpoint().unwrap();
+        backing.revoked.store(true, Ordering::SeqCst);
+        let completed = prepared.execute().unwrap();
+        let error = volume.finish_checkpoint(completed).unwrap_err();
+        assert!(error.to_string().contains("test writer revoked"));
+        assert!(volume.checkpoint().is_err());
+
+        backing.revoked.store(false, Ordering::SeqCst);
+        assert_eq!(volume.checkpoint().unwrap(), 0);
+    }
+
+    #[test]
+    fn zero_trim_prefilter_rechecks_freshness_before_skipping_overlay_tombstone() {
+        let (backing, mut volume) = open_volume();
         volume.write_ct(0, &[0x41; 520], true).unwrap();
         volume.discard_ct(0, false).unwrap();
         assert_eq!(
