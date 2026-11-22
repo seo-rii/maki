@@ -29,10 +29,23 @@ fn fill_write_payload(data: &mut [u8], rng: &mut StdRng) {
 
 /// Run one random op sequence; `Err` on any durability-oracle violation.
 pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), OracleViolation> {
+    if cfg.num_units == 0 || cfg.unit_size == 0 {
+        return Err(OracleViolation {
+            unit: 0,
+            detail: "sequence requires nonzero num_units and unit_size".into(),
+        });
+    }
+    let total = cfg
+        .num_units
+        .checked_mul(cfg.unit_size as u64)
+        .filter(|&len| len <= isize::MAX as u64)
+        .ok_or_else(|| OracleViolation {
+            unit: 0,
+            detail: "sequence geometry exceeds the in-memory backing size limit".into(),
+        })?;
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
     let backing = CrashableBacking::new();
     let mut file = backing.open("data", true).expect("open");
-    let total = cfg.num_units * cfg.unit_size as u64;
     file.set_len(total).expect("set_len");
     file.sync_data().expect("sync");
     backing.sync_dir("").expect("sync_dir");
@@ -116,6 +129,24 @@ pub fn run_random_sequence(seed: u64, cfg: &SequenceConfig) -> Result<(), Oracle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_geometry_must_describe_addressable_nonempty_units() {
+        for (num_units, unit_size) in [(0, 32), (8, 0), (u64::MAX, 32)] {
+            let cfg = SequenceConfig {
+                num_units,
+                unit_size,
+                ops: 1,
+            };
+            assert!(run_random_sequence(0, &cfg).is_err());
+        }
+        let cfg = SequenceConfig {
+            num_units: 8,
+            unit_size: 32,
+            ops: 128,
+        };
+        run_random_sequence(0, &cfg).unwrap();
+    }
 
     #[test]
     fn oracle_rejects_reordered_bytes_and_sectors_in_a_written_unit() {
