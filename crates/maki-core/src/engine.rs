@@ -355,8 +355,8 @@ struct EngineInner {
     /// A completed reclamation sweep left failed ranges. Its own backoff
     /// must not postpone checkpoints needed by unrelated journal writes.
     reclamation_retry_at: parking_lot::Mutex<Option<Duration>>,
-    free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
-    /// Published samples have their own memory-only locks: `free_space`
+    free_space_refresh: parking_lot::Mutex<()>,
+    /// Published samples have their own memory-only locks: `free_space_refresh`
     /// may be held across a stalled statvfs, and `volume` across storage I/O.
     observed_free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
     observed_volume: parking_lot::Mutex<VolumeSnapshot>,
@@ -780,7 +780,7 @@ impl Engine {
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
             space_refused: AtomicBool::new(false),
-            free_space: parking_lot::Mutex::new(None),
+            free_space_refresh: parking_lot::Mutex::new(()),
             observed_free_space: parking_lot::Mutex::new(None),
             observed_volume: parking_lot::Mutex::new(observed_volume),
             journal_uncertain: AtomicBool::new(false),
@@ -1718,11 +1718,15 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let inner = self.inner.clone();
-        let backing_free_bytes =
-            storage_task(move || inner.backing_free_bytes(FREE_SPACE_CACHE_TTL))
-                .await
-                .unwrap_or(None);
+        let backing_free_bytes = match self.inner.cached_free_bytes(FREE_SPACE_CACHE_TTL) {
+            Some(value) => value,
+            None => {
+                let inner = self.inner.clone();
+                storage_task(move || inner.backing_free_bytes(FREE_SPACE_CACHE_TTL))
+                    .await
+                    .unwrap_or(None)
+            }
+        };
         let volume = self.inner.volume.read().await;
         let snapshot = VolumeSnapshot::new(&volume, self.state(), self.inner.clock.now());
         self.stats_from_snapshot(&snapshot, cache, backing_free_bytes)
@@ -1807,15 +1811,21 @@ impl Engine {
 }
 
 impl EngineInner {
+    /// A fresh sample may itself report unknown free space.
+    fn cached_free_bytes(&self, max_age: Duration) -> Option<Option<u64>> {
+        self.observed_free_space
+            .lock()
+            .filter(|(_, at)| self.clock.now().saturating_sub(*at) < max_age)
+            .map(|(value, _)| value)
+    }
+
     /// Backing free space (`None` = unknown), allowing samples younger than
     /// `max_age`. A zero age forces a fresh sample for write admission; stats
     /// retain their cache and monitoring reads only the published observation.
     fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
-        let mut cache = self.free_space.lock();
-        if let Some((value, at)) = *cache {
-            if self.clock.now().saturating_sub(at) < max_age {
-                return value;
-            }
+        let _refresh = self.free_space_refresh.lock();
+        if let Some(value) = self.cached_free_bytes(max_age) {
+            return value;
         }
         let value = match self.backing.free_bytes() {
             Ok(v) => v,
@@ -1825,7 +1835,6 @@ impl EngineInner {
             }
         };
         let now = self.clock.now();
-        *cache = Some((value, now));
         *self.observed_free_space.lock() = Some((value, now));
         value
     }

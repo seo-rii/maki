@@ -468,3 +468,33 @@ fn real_file_checkpoint_slot_has_physical_blocks_before_journal_ack() {
     }
     assert_eq!(volume.journal_appended_sequence(), 1);
 }
+
+#[test]
+fn fresh_statistics_do_not_wait_for_a_blocking_worker() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            for available in [Some(RESERVE), None] {
+                let (backing, _, engine) = fixture(0).await;
+                engine.stop_checkpoint_worker().await;
+                backing.storage.set_free_bytes(available);
+                assert_eq!(engine.stats().await.backing_free_bytes, available);
+
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                let worker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    let _ = wait.recv();
+                });
+                started_rx.await.unwrap();
+                let cached = tokio::time::timeout(Duration::from_secs(1), engine.stats()).await;
+                drop(release);
+                worker.await.unwrap();
+                assert_eq!(cached.unwrap().backing_free_bytes, available);
+                assert_eq!(backing.queries.load(Ordering::SeqCst), 1);
+            }
+        });
+}
