@@ -163,6 +163,20 @@ fn assert_inventory_attaches(count: usize, hidden: bool) {
 }
 
 #[test]
+fn allocated_nbd_device_conflicting_with_the_vg_fails_before_connect() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut request = request();
+    request.vg_name = "nbd3".into();
+    let mut system = FakeSystem::default();
+    let error = execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap_err();
+    assert!(error.to_string().contains("nbd_device"), "{error}");
+    assert!(system.backends.is_empty());
+    assert!(state.read("pg").unwrap().is_none());
+    assert_eq!(system.steps, ["modprobe-nbd"]);
+}
+
+#[test]
 fn supported_lvm_inventory_sizes_persist_activation_intent_and_attach() {
     for count in [1, 40, 64] {
         assert_inventory_attaches(count, false);
