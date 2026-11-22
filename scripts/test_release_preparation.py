@@ -476,12 +476,15 @@ class ReleasePreparationTests(unittest.TestCase):
                 self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
                 self.assertEqual((outside / "sentinel").read_text(), "preserve")
 
-    def test_manifest_records_build_and_selected_target_rustflags(self):
+    def test_manifest_records_rustflags_and_the_selected_target_linker(self):
         target_key = "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_RUSTFLAGS"
+        linker_key = "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_LINKER"
         self.environment.update({
             target_key: "--cfg target_marker",
+            linker_key: "native-linker",
             "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
             "CARGO_TARGET_OTHER_LINUX_GNU_RUSTFLAGS": "--cfg other_marker",
+            "CARGO_TARGET_OTHER_LINUX_GNU_LINKER": "other-linker",
             "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_UNRELATED": "unrelated",
         })
         output, _ = self.prepare()
@@ -489,6 +492,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(manifest["build"]["compiler_environment"], {
             "RUSTC": str(self.tools / "rustc"),
             target_key: "--cfg target_marker",
+            linker_key: "native-linker",
             "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
         })
 
