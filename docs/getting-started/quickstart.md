@@ -221,9 +221,9 @@ wait_stopped maki-attach@demo.service maki@demo.service &&
 ## 8. Start again and read the data back
 
 ```bash
-systemctl start maki-workload@demo.target
-maki-attach verify --volume demo
-cat /srv/demo/hello.txt
+systemctl start maki-workload@demo.target &&
+    maki-attach verify --volume demo &&
+    cat /srv/demo/hello.txt
 ```
 
 The same commands work after a reboot once the target is enabled:
