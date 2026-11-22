@@ -1056,3 +1056,63 @@ fn local_witness_directory_and_anchor_files_cannot_be_socket_paths() {
     config.nbd.socket = Some("/witness-store/volume-old/anchor".into());
     config.validate().unwrap();
 }
+
+#[test]
+fn local_file_keys_require_a_filename_independent_of_the_runtime_layout() {
+    for provider in ["local-aes-gcm-siv", "local-aes-xts"] {
+        let raw = local().replace("local-aes-gcm-siv", provider);
+        let mut config = parse(&raw);
+        config.backing.root = "/runtime-checks/volume".into();
+        config.control.socket = Some("/runtime-checks/control.sock".into());
+        config.nbd.socket = Some("/runtime-checks/nbd.sock".into());
+        config.crypto.key.as_mut().unwrap().source = "file".into();
+        for path in [
+            "/runtime-checks",
+            "/runtime-checks/volume",
+            "/runtime-checks/volume/superblock.a",
+            "/runtime-checks/volume/superblock.a/key",
+            "/runtime-checks/volume/checkpoint/state.a",
+            "/runtime-checks/volume/data/shard-0000002a.alloc.b",
+            "/runtime-checks/control.sock/key",
+            "/runtime-checks/nbd.sock",
+        ] {
+            config.crypto.key.as_mut().unwrap().name = path.into();
+            let error = config.validate().expect_err(path).to_string();
+            assert!(
+                error.contains("crypto.key") && !error.contains(path),
+                "{error}"
+            );
+        }
+        for path in [
+            "/runtime-checks/volume/data/custom.key",
+            "/runtime-checks/volume-old/key",
+        ] {
+            config.crypto.key.as_mut().unwrap().name = path.into();
+            config.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn rollback_file_keys_use_the_physical_backing_and_witness_layouts() {
+    let mut config = parse(&format!("{}[backing.rollback_protection]\nwitness_root = \"/runtime-witness/volume\"\ncapacity = \"64MiB\"\n", local()));
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    config.crypto.key.as_mut().unwrap().source = "file".into();
+    for path in [
+        "/x/rollback.arena",
+        "/runtime-witness",
+        "/runtime-witness/volume/anchor.next/key",
+    ] {
+        config.crypto.key.as_mut().unwrap().name = path.into();
+        assert!(config
+            .validate()
+            .expect_err(path)
+            .to_string()
+            .contains("crypto.key"));
+    }
+    for path in ["/x/superblock.a", "/runtime-witness/volume/anchor.key"] {
+        config.crypto.key.as_mut().unwrap().name = path.into();
+        config.validate().unwrap();
+    }
+}

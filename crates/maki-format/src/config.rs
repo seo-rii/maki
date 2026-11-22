@@ -1244,10 +1244,9 @@ impl VolumeConfig {
         }
         self.geometry()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        self.validate_settings()?;
-        // Name conflicts first: they say more than a per-credential error
-        // about the same name.
+        // Validate credential names before using file references in layout checks.
         self.validate_credential_sources()?;
+        self.validate_settings()?;
         self.validate_provider_sections()?;
         if !self
             .crypto
@@ -1616,16 +1615,16 @@ fn resolved_config_path(path: &std::path::Path) -> std::path::PathBuf {
     path.to_owned()
 }
 
-fn socket_conflicts_with_backing(
-    socket: &std::path::Path,
+fn file_conflicts_with_backing(
+    file: &std::path::Path,
     root: &std::path::Path,
     rollback: Option<&RollbackProtectionSection>,
 ) -> bool {
     use crate::{checkpoint, durable_proof, layout};
-    if root.starts_with(socket) {
+    if root.starts_with(file) {
         return true; // The backing needs this pathname to be a directory.
     }
-    let Ok(relative) = socket.strip_prefix(root) else {
+    let Ok(relative) = file.strip_prefix(root) else {
         return false;
     };
     let mut entries = relative.iter();
@@ -2305,19 +2304,42 @@ impl VolumeConfig {
             .as_ref()
             .filter(|rollback| rollback.remote.is_none())
             .map(|rollback| resolved_config_path(rollback.witness_root.as_ref()));
-        for (name, socket) in [("control.socket", control), ("nbd.socket", nbd)] {
-            if socket_conflicts_with_backing(
-                &socket,
-                &root,
-                self.backing.rollback_protection.as_ref(),
-            ) {
+        // Creation records the local AES key identity before the daemon reads
+        // the file. Its path must remain available after backing initialization.
+        let key = self
+            .crypto
+            .key
+            .as_ref()
+            .filter(|key| {
+                key.source == "file"
+                    && matches!(
+                        self.crypto.provider.as_str(),
+                        "local-aes-gcm-siv" | "local-aes-xts"
+                    )
+            })
+            .map(|key| resolved_config_path(key.name.as_ref()));
+        if key.as_ref().is_some_and(|key| {
+            [&control, &nbd]
+                .iter()
+                .any(|socket| key.starts_with(socket) || socket.starts_with(key))
+        }) {
+            return Err(invalid(
+                "crypto.key conflicts with a configured socket path",
+            ));
+        }
+        for (name, file) in [("control.socket", control), ("nbd.socket", nbd)]
+            .into_iter()
+            .chain(key.map(|file| ("crypto.key", file)))
+        {
+            if file_conflicts_with_backing(&file, &root, self.backing.rollback_protection.as_ref())
+            {
                 return Err(invalid(format!(
                     "{name} conflicts with the backing.root layout"
                 )));
             }
             if witness.as_ref().is_some_and(|dir| {
-                dir.starts_with(&socket)
-                    || socket
+                dir.starts_with(&file)
+                    || file
                         .strip_prefix(dir)
                         .is_ok_and(maki_backing::witness::FileWitness::reserves_path)
             }) {
