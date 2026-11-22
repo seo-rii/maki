@@ -45,7 +45,7 @@ nbd-client -h 2>&1 | grep -o 'version [0-9.]*'
 ```
 
 If the candidate version is `1:3.27.0` or later, install it with `apt` and
-skip to [Install the Maki package](#install-the-maki-package).
+continue with [Build the Maki package](#build-the-maki-package).
 
 On Debian 12 the candidate is `1:3.24-*`. The qualification campaigns used
 `nbd-client` 3.27.1 built from upstream commit
@@ -94,12 +94,8 @@ that upstream 3.27 already contains and re-run the build. If the
 out and `maki-attach` will fail closed at attach time, so keep
 `apt build-dep` in step 1.
 
-Pin the package so an ordinary `apt upgrade` does not replace it with the
-older stock version:
-
-```bash
-apt-mark hold nbd-client
-```
+With the default APT priorities, an older stock version leaves the installed
+backport in place. Leave the package eligible for newer updates.
 
 ## Build the Maki package
 
@@ -111,7 +107,8 @@ source, tool versions and checksums, follow [release preparation](../releasing.m
 
 ```bash
 set -euo pipefail
-git clone https://github.com/seo-rii/maki.git && cd maki
+git clone https://github.com/seo-rii/maki.git
+cd maki
 # Select and record the immutable revision being qualified before building.
 git rev-parse HEAD
 rustup toolchain install 1.94.0 --profile minimal
@@ -122,7 +119,7 @@ maki_target_dir="$(cargo +1.94.0 metadata --format-version 1 --no-deps |
 maki_host="$(rustc +1.94.0 -vV | sed -n 's/^host: //p')"
 cargo +1.94.0 build --release --locked --target "$maki_host" \
   -p maki -p maki-attach -p maki-check -p maki-nbdkit
-SOURCE_DATE_EPOCH="$(git show --no-show-signature -s --format=%ct HEAD)" \
+SOURCE_DATE_EPOCH="$(git --no-replace-objects show --no-show-signature -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
   --release-dir "$maki_target_dir/$maki_host/release" \
   --version "$maki_version" \
