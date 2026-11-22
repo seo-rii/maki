@@ -45,7 +45,7 @@ nbd-client -h 2>&1 | grep -o 'version [0-9.]*'
 ```
 
 If the candidate version is `1:3.27.0` or later, install it with `apt` and
-skip to [Install the Maki package](#install-the-maki-package).
+continue with [Build the Maki package](#build-the-maki-package).
 
 On Debian 12 the candidate is `1:3.24-*`. The qualification campaigns used
 `nbd-client` 3.27.1 built from upstream commit
