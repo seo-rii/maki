@@ -107,10 +107,15 @@ class OracleTests(unittest.TestCase):
                 campaign.durable_write(client, self.ledger, writes, mode)
         self.assertEqual(campaign.verify(client, self.ledger, 2), 136)
         rows = self.ledger.read_text().splitlines(keepends=True)
-        for incomplete in (rows[1:], rows[:-1], rows[:136], [rows[1], *rows[1:]]):
-            self.ledger.write_text("".join(incomplete))
+        for invalid in (rows[1:], rows[:-1], rows[:136], [rows[1], *rows[1:]], [*rows, rows[0]]):
+            self.ledger.write_text("".join(invalid))
             with self.assertRaises(ValueError):
                 campaign.verify(client, self.ledger, 2)
+
+    def test_rejects_a_mismatched_ack_before_parsing_later_rows(self):
+        self.ledger.write_text('{"offset": 4096}\nunfinished row\n')
+        with self.assertRaisesRegex(ValueError, "differs from the planned workload"):
+            campaign.verify(Client(), self.ledger, 1)
 
     def test_freeze_observation_requires_a_connected_client(self):
         target = self.unstarted_target()
