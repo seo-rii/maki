@@ -119,6 +119,42 @@ fn dropping_a_pre_crash_handle_leaves_post_crash_handles_alone() {
     }
 }
 
+#[test]
+fn a_lock_follows_the_original_inode_when_its_name_is_reused() {
+    let backing = CrashableBacking::new();
+    let original = backing.try_lock("original").unwrap();
+    backing.rename("original", "moved").unwrap();
+    assert_eq!(
+        backing.try_lock("moved").err().map(|error| error.kind()),
+        Some(ErrorKind::WouldBlock)
+    );
+    let replacement = backing.try_lock("original").unwrap();
+    drop(original);
+    let moved = backing.try_lock("moved").unwrap();
+
+    backing
+        .open("original", false)
+        .unwrap()
+        .write_at(0, b"x")
+        .unwrap();
+    backing.remove("original").unwrap();
+    backing.sync_dir("").unwrap();
+    assert_eq!(backing.pending_write_count(), 1);
+    let newest = backing.try_lock("original").unwrap();
+    drop(replacement);
+    assert_eq!(backing.pending_write_count(), 0);
+    for path in ["original", "moved"] {
+        assert_eq!(
+            backing.try_lock(path).err().map(|error| error.kind()),
+            Some(ErrorKind::WouldBlock),
+            "{path}"
+        );
+    }
+    drop((newest, moved));
+    drop(backing.try_lock("original").unwrap());
+    drop(backing.try_lock("moved").unwrap());
+}
+
 /// A power loss releases every lock its processes held; the dead holder's
 /// handle cannot release a lock taken after the crash.
 #[test]
@@ -128,6 +164,7 @@ fn a_power_loss_releases_the_volume_lock_of_the_dead_process() {
         drop(backing.open("f", true).unwrap());
         backing.sync_dir("").unwrap();
         let stale = backing.try_lock("volume.lock").unwrap();
+        backing.sync_dir("").unwrap();
 
         power_loss(&backing);
         let live = backing

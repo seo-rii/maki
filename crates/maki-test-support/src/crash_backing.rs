@@ -242,7 +242,7 @@ struct Inner {
     namespace_changes: BTreeMap<u64, NamespaceChange>,
     /// dir path -> dirent durable?
     dirs: BTreeMap<String, bool>,
-    locks: std::collections::HashSet<String>,
+    locks: std::collections::HashSet<InodeId>,
     io: IoState,
     /// Simulated free space reported by `Backing::free_bytes`.
     free_bytes: Option<u64>,
@@ -359,7 +359,8 @@ impl Inner {
         for change in self.namespace_changes.values() {
             reached.extend(change.entries.iter().filter_map(|(_, inode)| *inode));
         }
-        self.inodes.retain(|id, _| reached.contains(id));
+        self.inodes
+            .retain(|id, _| reached.contains(id) || self.locks.contains(id));
     }
 
     /// Settle selected namespace operations, then permanently drop names
@@ -922,6 +923,8 @@ impl BackingFile for CrashFile {
 
 struct CrashLock {
     inner: Arc<Mutex<Inner>>,
+    inode: InodeId,
+    // Fast reachability check when the original name still exists.
     path: String,
     /// The power-loss epoch the lock was taken in; a crash released it.
     epoch: u64,
@@ -933,7 +936,10 @@ impl Drop for CrashLock {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
         if inner.epoch == self.epoch {
-            inner.locks.remove(&self.path);
+            inner.locks.remove(&self.inode);
+            if inner.volatile(&self.path) != Some(self.inode) {
+                inner.collect_garbage();
+            }
         }
     }
 }
@@ -1120,15 +1126,16 @@ impl Backing for CrashableBacking {
         validate(path, false)?;
         let mut inner = self.live("try_lock", path)?;
         inner.require_file_name(path)?;
-        if !inner.locks.insert(path.to_string()) {
+        let inode = inner.open_or_create_inode(path);
+        if !inner.locks.insert(inode) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",
             ));
         }
-        inner.open_or_create_inode(path);
         Ok(Box::new(CrashLock {
             inner: self.inner.clone(),
+            inode,
             path: path.to_string(),
             epoch: inner.epoch,
         }))
