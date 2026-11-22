@@ -336,12 +336,52 @@ class HostContracts(unittest.TestCase):
                 self.host.cut_instance(args, process)
         reset.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux command supervision")
+    def test_verification_drains_stdout_to_the_shared_output_limit(self):
+        frame = self.frame(event="verified") + b"\n"
+        tail_size = 256 * 1024
+        program = ("import sys; "
+                   "sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]) + b'x' * int(sys.argv[2]))")
+        for extra in (0, 1):
+            with self.subTest(extra=extra):
+                folder = self.path / f"ssh-{extra}"
+                command = [sys.executable, "-c", program, frame.hex(), str(tail_size + extra)]
+                with mock.patch.object(self.host, "MAX_OUTPUT", len(frame) + tail_size), \
+                        self.host.RemoteProcess(command, folder, self.token, 1) as process:
+                    process.expect("verified", 5)
+                    if extra:
+                        with self.assertRaisesRegex(ValueError, "SSH output limit exceeded"):
+                            process.wait_clean(3)
+                    else:
+                        process.wait_clean(3)
+                output = (folder / "stdout.log").read_bytes()
+                if extra:
+                    self.assertLessEqual(len(output), len(frame) + tail_size)
+                else:
+                    self.assertEqual(output, frame + b"x" * tail_size)
+
+    def test_draining_verification_stdout_keeps_the_exit_deadline(self):
+        process = object.__new__(self.host.RemoteProcess)
+        process.child = mock.Mock(returncode=None)
+        process.poll = mock.Mock(return_value=None)
+        process.selector = mock.Mock()
+        process.selector.select.return_value = [object()]
+        process._read_stdout = mock.Mock(return_value=b"diagnostic")
+        process._kill_owned = mock.Mock()
+        with mock.patch.object(self.host.time, "monotonic", side_effect=[0, 4, 10]):
+            with self.assertRaisesRegex(TimeoutError, "verification SSH did not exit"):
+                process.wait_clean(10)
+        process._read_stdout.assert_called_once_with()
+        process._kill_owned.assert_called_once_with()
+
     def test_first_observed_ssh_exit_must_meet_the_deadline(self):
         for observed_at in (4, 10, 12):
             with self.subTest(observed_at=observed_at):
                 process = object.__new__(self.host.RemoteProcess)
                 process.child = mock.Mock(returncode=0)
                 process.poll = mock.Mock(return_value=0)
+                process.selector = mock.Mock()
+                process.selector.select.return_value = []
                 process._kill_owned = mock.Mock()
                 with mock.patch.object(self.host.time, "monotonic", side_effect=[0, observed_at]):
                     if observed_at < 10:
