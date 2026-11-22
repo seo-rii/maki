@@ -1273,6 +1273,13 @@ fn execute_with_options(
                 _ => None,
             })
             .unwrap();
+        let attachment = plan
+            .attachment
+            .as_ref()
+            .ok_or_else(|| identity_error("missing attachment configuration identity"))?;
+        // An automatic device becomes concrete only after loading the module.
+        crate::config::check_vg_device(&attachment.vg_name, &device)
+            .map_err(|error| identity_error(error.to_string()))?;
         if system.backend(&device)?.is_some() {
             return Err(identity_error("requested NBD device is already connected"));
         }
@@ -1280,10 +1287,7 @@ fn execute_with_options(
         let prepared = BoundDeviceRecord {
             version: 1,
             volume: plan.volume.clone(),
-            attachment: plan
-                .attachment
-                .clone()
-                .ok_or_else(|| identity_error("missing attachment configuration identity"))?,
+            attachment: attachment.clone(),
             device,
             connection_id: format!("maki-{}", nonce.trim()),
             recovery: None,

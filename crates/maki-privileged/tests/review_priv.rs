@@ -670,6 +670,36 @@ fn pinned_nbd_devices_must_be_canonical() {
 }
 
 #[test]
+fn a_pinned_nbd_device_cannot_also_be_the_volume_group_directory() {
+    let cfg = AttachConfig {
+        vg_name: Some("nbd1048575".into()),
+        ..Default::default()
+    };
+    let error = cfg
+        .clone()
+        .into_request(
+            "audit",
+            AttachOverrides {
+                nbd_device: Some("/dev/nbd1048575".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("nbd_device"));
+    cfg.into_request(
+        "audit",
+        AttachOverrides {
+            nbd_device: Some("/dev/nbd1048575".into()),
+            vg_name: Some("nbd1048575_vg".into()),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
 fn attach_socket_must_end_in_a_filename() {
     for (path, valid) in [
         ("/run/nbd.sock", true),

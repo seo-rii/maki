@@ -126,9 +126,8 @@ impl AttachConfig {
         }
         #[cfg(target_os = "linux")]
         check_mountpoint_path(&request.mountpoint)?;
-        // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
-        // the VG and LV with a hyphen and doubles every hyphen in either name.
         let vg = &request.vg_name;
+        check_vg_device(vg, &request.nbd_device)?;
         #[cfg(target_os = "linux")]
         if std::fs::metadata(std::path::Path::new("/dev").join(vg))
             .is_ok_and(|entry| !entry.is_dir())
@@ -138,6 +137,8 @@ impl AttachConfig {
             ));
         }
         let lv = &request.lv_name;
+        // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
+        // the VG and LV with a hyphen and doubles every hyphen in either name.
         let mapper_name = format!("{}-{}", vg.replace('-', "--"), lv.replace('-', "--"));
         if mapper_name.len() > 127 {
             return Err(ConfigError::Invalid(
@@ -279,6 +280,16 @@ impl AttachConfig {
             init_sentinel: overrides.init_sentinel || self.init_sentinel,
         })
     }
+}
+
+// NBD and the VG directory both live directly under /dev on the target host.
+pub(crate) fn check_vg_device(vg_name: &str, nbd_device: &str) -> Result<(), ConfigError> {
+    if nbd_device.strip_prefix("/dev/") == Some(vg_name) {
+        return Err(ConfigError::Invalid(
+            "vg_name would use the nbd_device path as a directory".into(),
+        ));
+    }
+    Ok(())
 }
 
 // These canonical paths use Linux separators on every plan-rendering host.
