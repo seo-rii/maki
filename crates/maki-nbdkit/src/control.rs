@@ -178,6 +178,11 @@ impl ControlBackend for EngineControlBackend {
         let stats = &observation.stats;
         let (_, state_code, _) = state_label(&stats.state);
         let dispatch = self.endpoints.as_ref().map(|set| set.metrics());
+        let (pending_items, pending_bytes) = self
+            .crypto_stats
+            .as_ref()
+            .map(|s| (s.pending_items(), s.pending_bytes()))
+            .unwrap_or_default();
         let (inflight_rpcs, inflight_bytes) = self
             .endpoints
             .as_ref()
@@ -190,8 +195,8 @@ impl ControlBackend for EngineControlBackend {
             "maki_plaintext_bytes": stats.plaintext_bytes_in_flight,
             // Ciphertext held in memory: journal records not yet checkpointed.
             "maki_ciphertext_bytes": stats.overlay_bytes,
-            "maki_submission_queue_items": self.crypto_stats.as_ref().map(|s| s.pending_items()).unwrap_or(0),
-            "maki_submission_queue_bytes": self.crypto_stats.as_ref().map(|s| s.pending_bytes()).unwrap_or(0),
+            "maki_submission_queue_items": pending_items,
+            "maki_submission_queue_bytes": pending_bytes,
             "maki_crypto_inflight_batches": self.crypto_stats.as_ref().map(|s| s.inflight_batches()).unwrap_or(inflight_rpcs),
             "maki_crypto_inflight_bytes": inflight_bytes,
             "maki_endpoint_inflight": self.per_endpoint(|set| {
@@ -253,8 +258,8 @@ impl ControlBackend for EngineControlBackend {
             "maki_cache_misses_total": observation.cache.map(|cache| cache.misses),
             "maki_cache_bytes": observation.cache.map(|cache| cache.bytes),
             "maki_cache_entries": observation.cache.map(|cache| cache.entries),
-            "maki_crypto_pending_items": self.crypto_stats.as_ref().map(|s| s.pending_items()).unwrap_or(0),
-            "maki_crypto_pending_bytes": self.crypto_stats.as_ref().map(|s| s.pending_bytes()).unwrap_or(0),
+            "maki_crypto_pending_items": pending_items,
+            "maki_crypto_pending_bytes": pending_bytes,
             "maki_crypto_batches_total": self.crypto_stats.as_ref().map(|s| s.batches_total()).unwrap_or(0),
             "maki_crypto_coalesced_batches_total": self.crypto_stats.as_ref().map(|s| s.coalesced_batches_total()).unwrap_or(0),
         });
