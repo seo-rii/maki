@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -18,9 +19,8 @@ use crate::{Backing, BackingFile, VolumeLock};
 
 #[derive(Default)]
 struct Namespace {
-    files: BTreeMap<String, Arc<Mutex<Vec<u8>>>>,
+    files: BTreeMap<String, Arc<MemFile>>,
     dirs: HashSet<String>,
-    locks: HashSet<String>,
 }
 
 impl Namespace {
@@ -63,7 +63,7 @@ fn parent(path: &str) -> &str {
 /// In-memory `Backing`. All operations are immediately "durable".
 #[derive(Default)]
 pub struct MemBacking {
-    ns: Arc<Mutex<Namespace>>,
+    ns: Mutex<Namespace>,
 }
 
 impl MemBacking {
@@ -72,8 +72,10 @@ impl MemBacking {
     }
 }
 
+#[derive(Default)]
 pub struct MemFile {
-    data: Arc<Mutex<Vec<u8>>>,
+    data: Mutex<Vec<u8>>,
+    locked: AtomicBool,
 }
 
 impl BackingFile for MemFile {
@@ -165,15 +167,14 @@ fn bad_offset<E: std::fmt::Debug>(e: E) -> io::Error {
 }
 
 struct MemLock {
-    ns: Arc<Mutex<Namespace>>,
-    path: String,
+    file: Arc<MemFile>,
 }
 
 impl VolumeLock for MemLock {}
 
 impl Drop for MemLock {
     fn drop(&mut self) {
-        self.ns.lock().locks.remove(&self.path);
+        self.file.locked.store(false, Ordering::Release);
     }
 }
 
@@ -182,8 +183,8 @@ impl Backing for MemBacking {
         validate(path, false)?;
         let mut ns = self.ns.lock();
         ns.require_file_name(path)?;
-        if let Some(data) = ns.files.get(path) {
-            return Ok(Arc::new(MemFile { data: data.clone() }));
+        if let Some(file) = ns.files.get(path) {
+            return Ok(file.clone());
         }
         if !create {
             return Err(io::Error::new(
@@ -191,9 +192,9 @@ impl Backing for MemBacking {
                 format!("no such file: {path}"),
             ));
         }
-        let data = Arc::new(Mutex::new(Vec::new()));
-        ns.files.insert(path.to_string(), data.clone());
-        Ok(Arc::new(MemFile { data }))
+        let file = Arc::new(MemFile::default());
+        ns.files.insert(path.to_string(), file.clone());
+        Ok(file)
     }
 
     fn exists(&self, path: &str) -> io::Result<bool> {
@@ -284,19 +285,13 @@ impl Backing for MemBacking {
         validate(path, false)?;
         let mut ns = self.ns.lock();
         ns.require_file_name(path)?;
-        if !ns.locks.insert(path.to_string()) {
+        let file = ns.files.entry(path.to_string()).or_default();
+        if file.locked.swap(true, Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",
             ));
         }
-        // Ensure the lock file exists in the namespace.
-        ns.files
-            .entry(path.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
-        Ok(Box::new(MemLock {
-            ns: self.ns.clone(),
-            path: path.to_string(),
-        }))
+        Ok(Box::new(MemLock { file: file.clone() }))
     }
 }
