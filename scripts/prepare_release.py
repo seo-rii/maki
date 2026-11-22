@@ -270,7 +270,8 @@ def prepare(output):
             key: environment[key]
             for key in ("RUSTC", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
                         target_rustflags, "CARGO_BUILD_RUSTFLAGS",
-                        "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+                        "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+                        "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
             if key in environment
         }
         command = [
