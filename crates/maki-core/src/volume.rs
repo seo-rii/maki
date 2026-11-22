@@ -518,14 +518,16 @@ impl Volume {
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
     pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
-        self.read_ct_if(unit, |_| Ok(true))
+        self.read_ct_if(unit, &mut None, |_| Ok(true))
     }
 
     /// Read a present unit only if its version needs a payload. A skipped
-    /// payload and an unwritten unit both return None to the caller.
+    /// payload and an unwritten unit both return None to the caller. Reuse
+    /// the shard length only while holding this volume's read guard.
     pub(crate) fn read_ct_if(
         &self,
         unit: u64,
+        shard_len: &mut Option<(u64, u64)>,
         needs_payload: impl FnOnce(u64) -> Result<bool, CoreError>,
     ) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
         self.check_freshness()?;
@@ -535,7 +537,7 @@ impl Volume {
             }
             return Ok(Some((v.sequence, v.ciphertext.clone())));
         }
-        let Some(header) = self.store.slot_header(unit)? else {
+        let Some(header) = self.store.scan_slot_header(unit, shard_len)? else {
             return Ok(None);
         };
         if !needs_payload(header.write_sequence)? {

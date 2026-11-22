@@ -1060,8 +1060,11 @@ impl Engine {
                 .cache
                 .as_ref()
                 .filter(|cache| cache.can_hold(unit_size));
+            let mut shard_len = None;
             for unit in first..=last {
-                if let Some((seq, data)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
+                if let Some((seq, data)) =
+                    inner.read_unit(&volume, unit, &mut shard_len, cache, &mut cached)?
+                {
                     // A configured cache may grow while decryption is in flight.
                     if inner.cache.is_some() {
                         seqs.insert(unit, seq);
@@ -1199,8 +1202,11 @@ impl Engine {
                     .cache
                     .as_ref()
                     .filter(|cache| cache.can_hold(unit_size));
+                let mut shard_len = None;
                 for unit in head.into_iter().chain(tail) {
-                    if let Some((_, ct)) = inner.read_unit(&volume, unit, cache, &mut cached)? {
+                    if let Some((_, ct)) =
+                        inner.read_unit(&volume, unit, &mut shard_len, cache, &mut cached)?
+                    {
                         rmw_cts.push(CiphertextUnit {
                             unit_index: unit,
                             data: ct,
@@ -1830,11 +1836,12 @@ impl EngineInner {
         &self,
         volume: &Volume,
         unit: u64,
+        shard_len: &mut Option<(u64, u64)>,
         cache: Option<&maki_cache::VersionedLruCache>,
         cached: &mut HashMap<u64, Arc<SecretBuffer>>,
     ) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
         let Some(cache) = cache else {
-            return volume.read_ct(unit);
+            return volume.read_ct_if(unit, shard_len, |_| Ok(true));
         };
         let mut hit = |seq| {
             if let Some(buf) = cache.get(unit, seq) {
@@ -1845,9 +1852,11 @@ impl EngineInner {
             }
         };
         if self.cache_verify_on_hit {
-            return Ok(volume.read_ct(unit)?.filter(|(seq, _)| !hit(*seq)));
+            return Ok(volume
+                .read_ct_if(unit, shard_len, |_| Ok(true))?
+                .filter(|(seq, _)| !hit(*seq)));
         }
-        volume.read_ct_if(unit, |seq| {
+        volume.read_ct_if(unit, shard_len, |seq| {
             if hit(seq) {
                 return Ok(false);
             }

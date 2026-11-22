@@ -261,3 +261,41 @@ fn key_probe_reads_a_sparse_shards_length_once_for_all_unlisted_slots() {
     assert_eq!(volume.first_ciphertext_unit().unwrap(), None);
     assert_eq!(backing.fault.shard_len_queries.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test]
+async fn engine_read_reuses_sparse_shard_length_within_each_request() {
+    use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
+    use maki_test_support::FakeCryptoProvider;
+
+    let backing = Arc::new(ReadFailure::default());
+    let sb = superblock();
+    init::create_volume(backing.as_ref(), sb).unwrap();
+    let engine = Engine::attach(
+        backing.clone(),
+        Arc::new(FakeCryptoProvider::new(512).with_overhead(32)),
+        EngineOptions {
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    engine.stop_checkpoint_worker().await;
+    engine.write(0, &[5; 512], true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+
+    backing.fault.shard_len_queries.store(0, Ordering::Relaxed);
+    for requests in 1..=2 {
+        assert_eq!(engine.read(512, 3 * 512).await.unwrap(), vec![0; 3 * 512]);
+        assert_eq!(
+            backing.fault.shard_len_queries.load(Ordering::Relaxed),
+            requests
+        );
+    }
+    backing.fault.offset.store(2 * 1024, Ordering::SeqCst);
+    backing.fault.errno.store(5, Ordering::SeqCst);
+    assert_io(engine.read(512, 3 * 512).await, 5);
+}
