@@ -860,6 +860,9 @@ def inline_text(raw, labels=frozenset()):
 
 def emphasis_delimiters(raw, marker_offsets):
     """Pair runs in this scope using their neighbors in the Markdown source."""
+    def whitespace(char):
+        return char in "\t\n\f\r" or unicodedata.category(char) == "Zs"
+
     def punctuation(char):
         return char in ASCII_PUNCTUATION or unicodedata.category(char).startswith("P")
 
@@ -878,8 +881,9 @@ def emphasis_delimiters(raw, marker_offsets):
         source_end = start + end - index
         before = raw[start - 1] if start else " "
         after = raw[source_end] if source_end < len(raw) else " "
-        left = not after.isspace() and (not punctuation(after) or before.isspace() or punctuation(before))
-        right = not before.isspace() and (not punctuation(before) or after.isspace() or punctuation(after))
+        before_space, after_space = whitespace(before), whitespace(after)
+        left = not after_space and (not punctuation(after) or before_space or punctuation(before))
+        right = not before_space and (not punctuation(before) or after_space or punctuation(after))
         can_open = left and (marker == "*" or not right or punctuation(before))
         can_close = right and (marker == "*" or not left or punctuation(after))
         remaining = index
