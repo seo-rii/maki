@@ -161,3 +161,52 @@ fn enumeration_memory_is_bounded_when_allocated_unit_count_grows() {
         "enumeration must stream unit IDs: small allocated {small} bytes, large allocated {large} bytes"
     );
 }
+
+#[test]
+fn quick_check_reads_map_frames_without_copying_the_bitmaps() {
+    let units = 1 << 22;
+    let shard_size = units * 4096;
+    let backing = maki_backing::MemBacking::new();
+    let geometry = Geometry::compute(4096, 4096, 512, 4384, shard_size, shard_size).unwrap();
+    maki_format::init::create_volume_with_discard(
+        &backing,
+        maki_format::superblock::Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::from_u128(108),
+            provider_type: "test".into(),
+            crypto_compatibility_id: "checker-memory".into(),
+            key_identity: "k".into(),
+            geometry,
+            format_version: 1,
+            created_unix: 0,
+        },
+    )
+    .unwrap();
+    backing.open(&layout::shard_data(0), true).unwrap();
+    for (a, b) in [
+        (layout::shard_alloc_a(0), layout::shard_alloc_b(0)),
+        (layout::shard_discard_a(0), layout::shard_discard_b(0)),
+    ] {
+        let store = AbStore::new(a, b);
+        let mut map = AllocationMap::new(units);
+        store.store(&backing, &mut map).unwrap();
+        store.store(&backing, &mut map).unwrap();
+    }
+    let mut catalog = ShardCatalog::new();
+    catalog.insert(0);
+    AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B)
+        .store(&backing, &mut catalog)
+        .unwrap();
+
+    ALLOCATION_BYTES.with(|counter| counter.set(Some(0)));
+    let report = maki_format::checker::check_volume(&backing).unwrap();
+    let allocated = ALLOCATION_BYTES.with(|counter| counter.replace(None).unwrap());
+    assert!(report.ok(), "{:?}", report.errors);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    // Allow the four encoded A/B frames and fixed report/metadata overhead.
+    let frame_bytes = 4 * AllocationMap::encoded_len(units) as usize;
+    assert!(
+        allocated < frame_bytes + 65536,
+        "quick check allocated {allocated} bytes for {frame_bytes} bytes of frames"
+    );
+}

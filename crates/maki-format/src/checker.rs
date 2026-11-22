@@ -206,11 +206,11 @@ fn check_allocation_map(
 ) -> Result<bool, FormatError> {
     let store = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
         .with_max_len(AllocationMap::encoded_len(units));
-    let (map, copies) = store.load_with_copy_count::<AllocationMap>(backing)?;
-    match map {
-        Some(map) if map.units() != units => report.errors.push(format!(
-            "shard {shard}: allocation map covers {} units, geometry says {units}",
-            map.units()
+    let (map_units, copies) = store
+        .load_with_copy_count_by::<AllocationMap, _>(backing, AllocationMap::decode_geometry)?;
+    match map_units {
+        Some(found) if found != units => report.errors.push(format!(
+            "shard {shard}: allocation map covers {found} units, geometry says {units}"
         )),
         Some(_) if copies == 1 => {
             report.warnings.push(format!(
@@ -261,17 +261,17 @@ fn check_discard_map(
         layout::shard_discard_b(shard),
     )
     .with_max_len(AllocationMap::encoded_len(units));
-    let (record, copies) = discard_ab.load_with_copy_count::<AllocationMap>(backing)?;
-    let Some(map) = record else {
+    let (map_units, copies) = discard_ab
+        .load_with_copy_count_by::<AllocationMap, _>(backing, AllocationMap::decode_geometry)?;
+    let Some(found) = map_units else {
         report
             .errors
             .push(format!("shard {shard}: no valid discard map"));
         return Ok(false);
     };
-    if map.units() != units {
+    if found != units {
         report.errors.push(format!(
-            "shard {shard}: discard map covers {} units, geometry says {units}",
-            map.units()
+            "shard {shard}: discard map covers {found} units, geometry says {units}"
         ));
         return Ok(false);
     }
