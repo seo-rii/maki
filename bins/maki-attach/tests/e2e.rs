@@ -66,6 +66,49 @@ fn attach_plan_checks_socket_and_mountpoint_before_provisioning() {
     }
 }
 
+#[test]
+fn attach_plan_requires_separate_lv_mount_and_socket_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("attach.toml");
+    std::fs::write(&config, "").unwrap();
+    let plan = |command: &str, flag: &str, path: &str| {
+        run(&[
+            command,
+            "--plan",
+            "--volume",
+            "v1",
+            "--config",
+            config.to_str().unwrap(),
+            "--vg",
+            "maki-plan-vg",
+            "--lv",
+            "app-data",
+            flag,
+            path,
+        ])
+    };
+    for device in [
+        "/dev/maki-plan-vg/app-data",
+        "/dev/mapper/maki--plan--vg-app--data",
+    ] {
+        for flag in ["--mountpoint", "--socket"] {
+            for collision in [
+                device.to_owned(),
+                format!("{device}/child"),
+                device.rsplit_once('/').unwrap().0.to_owned(),
+            ] {
+                let out = plan("attach", flag, &collision);
+                assert_eq!(out.status.code(), Some(2), "{flag} {collision}");
+                assert!(out.stdout.is_empty());
+                assert!(plan("detach", flag, &collision).status.success());
+            }
+            assert!(plan("attach", flag, &format!("{device}-other"))
+                .status
+                .success());
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn attach_plan_checks_existing_mountpoint_paths_and_linux_path_length() {
