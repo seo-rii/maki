@@ -137,7 +137,6 @@ impl VersionedLruCache {
     /// cached; a rejected current/newer version invalidates the old entry.
     pub fn put(&self, unit: u64, write_sequence: u64, data: SecretBuffer) {
         let allocation = data.capacity() as u64;
-        let now = self.clock.now();
         let mut inner = self.inner.lock();
         if inner
             .map
@@ -157,7 +156,7 @@ impl VersionedLruCache {
             Entry {
                 write_sequence,
                 data: Arc::new(data),
-                inserted_at: now,
+                inserted_at: self.clock.now(),
                 last_used: tick,
             },
         );
@@ -358,7 +357,8 @@ mod ttl_tests {
     impl Clock for InterleavingClock {
         fn now(&self) -> Duration {
             let time = Duration::from_millis(self.millis.load(Ordering::SeqCst));
-            if let Some(action) = self.on_sample.lock().take() {
+            let action = self.on_sample.lock().take();
+            if let Some(action) = action {
                 action();
             }
             time
@@ -367,6 +367,40 @@ mod ttl_tests {
         fn sleep(&self, _: Duration) -> SleepFuture {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn overlapping_puts_cannot_shorten_the_refreshed_ttl() {
+        let clock = Arc::new(InterleavingClock::default());
+        let cache = Arc::new(VersionedLruCache::new(
+            CacheConfig {
+                max_bytes: 4096,
+                ttl: Duration::from_millis(10),
+                zeroize_on_evict: true,
+            },
+            clock.clone(),
+        ));
+        let refreshed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finish_refresh = refreshed.clone();
+        let refreshing = cache.clone();
+        let advancing = clock.clone();
+        *clock.on_sample.lock() = Some(Box::new(move || {
+            advancing.millis.store(5, Ordering::SeqCst);
+            // Complete the second put before publication if the first put
+            // sampled time without holding the entries lock.
+            if refreshing.inner.try_lock().is_some() {
+                refreshing.put(0, 4, SecretBuffer::from_slice(&[42]));
+                finish_refresh.store(true, Ordering::SeqCst);
+            }
+        }));
+        cache.put(0, 4, SecretBuffer::from_slice(&[42]));
+        if !refreshed.load(Ordering::SeqCst) {
+            cache.put(0, 4, SecretBuffer::from_slice(&[42]));
+        }
+        clock.millis.store(11, Ordering::SeqCst);
+        assert!(cache.get(0, 4).is_some(), "the 5ms refresh expires at 15ms");
+        clock.millis.store(15, Ordering::SeqCst);
+        assert!(cache.get(0, 4).is_none());
     }
 
     #[test]
