@@ -512,8 +512,9 @@ async fn byte_capacity_wait_returns_partial_permits_and_preserves_fifo() {
     let mut config = cfg();
     config.global_max_inflight_batches = 4;
     config.per_endpoint_max_inflight = 3;
-    config.global_max_inflight_bytes = 2 * UNIT as u64;
-    config.per_endpoint_max_bytes = UNIT as u64;
+    let one_ciphertext = u64::from(left.inner.capabilities().await.unwrap().max_ciphertext_size);
+    config.global_max_inflight_bytes = 2 * one_ciphertext;
+    config.per_endpoint_max_bytes = one_ciphertext;
     let set = EndpointSet::new(
         vec![
             ("left".into(), left.clone()),
@@ -554,8 +555,9 @@ async fn global_byte_shortage_returns_a_tentative_idle_peers_local_permit() {
     let right = Arc::new(GatedProvider::new(None));
     let mut config = cfg();
     config.global_max_inflight_batches = 4;
-    config.global_max_inflight_bytes = UNIT as u64;
-    config.per_endpoint_max_bytes = UNIT as u64;
+    let one_ciphertext = u64::from(left.inner.capabilities().await.unwrap().max_ciphertext_size);
+    config.global_max_inflight_bytes = one_ciphertext;
+    config.per_endpoint_max_bytes = one_ciphertext;
     config.breaker.failure_threshold = 1;
     config.retry_safe = false;
     let set = EndpointSet::new(

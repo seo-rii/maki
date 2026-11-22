@@ -355,8 +355,7 @@ impl CryptoProvider for ValidationProvider {
             .await
             .map_err(|error| self.failure("capabilities", error))?;
         // Split self-test probes to fit both logical batch limits and the
-        // worst-case resident ciphertext budget. Serving capabilities stay
-        // unchanged; only these background probes use the smaller batches.
+        // worst-case resident ciphertext budget of this validation endpoint.
         let byte_budget = self
             .global
             .max_bytes
@@ -426,6 +425,19 @@ impl Request<'_> {
             Request::Decrypt(items) => items.iter().map(|i| i.data.len() as u64).sum(),
         }
     }
+}
+
+/// Count whole items that fit both limits without overflowing a byte sum.
+fn rpc_chunk_len(sizes: impl Iterator<Item = usize>, max_items: usize, mut bytes: u64) -> usize {
+    let mut count = 0;
+    for size in sizes.take(max_items) {
+        let Some(remaining) = bytes.checked_sub(size as u64) else {
+            break;
+        };
+        bytes = remaining;
+        count += 1;
+    }
+    count
 }
 
 const DEADLINE_MESSAGE: &str = "operation deadline exceeded";
@@ -521,6 +533,16 @@ impl EndpointSet {
         self.plaintext_size = Some(plaintext_size);
         self.caps = OnceCell::new();
         self
+    }
+
+    /// All serving endpoints have the same semaphore limits. Use the actual,
+    /// platform-clamped budget shared by both directions.
+    fn rpc_byte_limit(&self) -> u64 {
+        let endpoint = &self.endpoints[0].semaphore;
+        if self.global.max_batches == 0 || endpoint.max_items() == 0 {
+            return 0;
+        }
+        self.global.max_bytes.min(endpoint.max_bytes())
     }
 
     /// Freeze the contract across all configured peers, including ones that
@@ -1185,7 +1207,30 @@ impl CryptoProvider for EndpointSet {
     }
 
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        Ok(self.common_caps().await?.clone())
+        let mut caps = self.common_caps().await?.clone();
+        let budget = self.rpc_byte_limit();
+        // Callers may plan either direction. Account for the largest ciphertext
+        // they could have to submit, as well as the plaintext byte limit.
+        caps.batch.max_bytes = caps.batch.max_bytes.min(budget);
+        caps.batch.max_items = u64::from(caps.batch.max_items)
+            .min(budget / u64::from(caps.max_ciphertext_size))
+            as u32;
+        if caps.batch.max_items == 0
+            || caps
+                .supported_plaintext_sizes
+                .first()
+                .is_some_and(|&size| u64::from(size) > budget)
+            || self
+                .plaintext_size
+                .is_some_and(|size| u64::from(size) > budget)
+        {
+            return Err(CryptoError::NonRetryableRequest(
+                "one endpoint unit exceeds RPC admission capacity".into(),
+            ));
+        }
+        caps.supported_plaintext_sizes
+            .retain(|&size| u64::from(size) <= budget);
+        Ok(caps)
     }
 
     async fn encrypt_batch(
@@ -1198,10 +1243,11 @@ impl CryptoProvider for EndpointSet {
             .max_operation_time
             .map(|d| self.clock.now().saturating_add(d));
         let caps = self.common_caps_with_deadline(deadline).await?;
+        let max_bytes = caps.batch.max_bytes.min(self.rpc_byte_limit());
         // Validate the entire input before sending even the first chunk.
         if items.iter().any(|item| {
             !caps.accepts_plaintext_size(item.data.len())
-                || item.data.len() as u64 > caps.batch.max_bytes
+                || item.data.len() as u64 > max_bytes
                 || self
                     .plaintext_size
                     .is_some_and(|size| item.data.len() != size as usize)
@@ -1213,16 +1259,12 @@ impl CryptoProvider for EndpointSet {
         let mut out = Vec::with_capacity(items.len());
         let mut start = 0;
         while start < items.len() {
-            let mut end = start;
-            let mut bytes = 0u64;
-            while end < items.len() && end - start < caps.batch.max_items as usize {
-                let size = items[end].data.len() as u64;
-                if size > caps.batch.max_bytes - bytes {
-                    break;
-                }
-                bytes += size;
-                end += 1;
-            }
+            let end = start
+                + rpc_chunk_len(
+                    items[start..].iter().map(|item| item.data.len()),
+                    caps.batch.max_items as usize,
+                    max_bytes,
+                );
             let chunk = &items[start..end];
             let result = self
                 .dispatch(
@@ -1255,10 +1297,11 @@ impl CryptoProvider for EndpointSet {
             .max_operation_time
             .map(|d| self.clock.now().saturating_add(d));
         let caps = self.common_caps_with_deadline(deadline).await?;
-        if items
-            .iter()
-            .any(|item| item.data.is_empty() || item.data.len() > caps.max_ciphertext_size as usize)
-        {
+        let budget = self.rpc_byte_limit();
+        if items.iter().any(|item| {
+            item.data.is_empty()
+                || item.data.len() as u64 > budget.min(u64::from(caps.max_ciphertext_size))
+        }) {
             return Err(CryptoError::NonRetryableRequest(
                 "ciphertext unit exceeds the common endpoint contract".into(),
             ));
@@ -1282,7 +1325,15 @@ impl CryptoProvider for EndpointSet {
             ));
         }
         let mut out = Vec::with_capacity(items.len());
-        for (index, chunk) in items.chunks(chunk_size).enumerate() {
+        let mut start = 0;
+        while start < items.len() {
+            let end = start
+                + rpc_chunk_len(
+                    items[start..].iter().map(|item| item.data.len()),
+                    chunk_size,
+                    budget,
+                );
+            let chunk = &items[start..end];
             let result = self
                 .dispatch(
                     context,
@@ -1293,12 +1344,13 @@ impl CryptoProvider for EndpointSet {
                 )
                 .await;
             // Earlier chunks of this call were sent.
-            match result.map_err(|error| if index > 0 { error.maybe_sent() } else { error })? {
+            match result.map_err(|error| if start > 0 { error.maybe_sent() } else { error })? {
                 Response::Decrypted(mut result) => {
                     out.append(&mut result);
                 }
                 Response::Encrypted(_) => unreachable!(),
             }
+            start = end;
         }
         Ok(out)
     }
