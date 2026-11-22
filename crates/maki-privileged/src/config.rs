@@ -119,11 +119,7 @@ impl AttachConfig {
             ));
         }
         // These paths describe the Linux host even when rendering a plan elsewhere.
-        if request
-            .mountpoint
-            .strip_prefix(&request.nbd_socket)
-            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-        {
+        if path_at_or_below(&request.mountpoint, &request.nbd_socket) {
             return Err(ConfigError::Invalid(
                 "mountpoint cannot be the nbd_socket path or a directory beneath it".into(),
             ));
@@ -142,11 +138,28 @@ impl AttachConfig {
             ));
         }
         let lv = &request.lv_name;
-        let hyphens = vg.bytes().chain(lv.bytes()).filter(|&b| b == b'-').count();
-        if vg.len() + lv.len() + 1 + hyphens > 127 {
+        let mapper_name = format!("{}-{}", vg.replace('-', "--"), lv.replace('-', "--"));
+        if mapper_name.len() > 127 {
             return Err(ConfigError::Invalid(
                 "vg_name and lv_name exceed the 127-byte device-mapper name limit".into(),
             ));
+        }
+        // Both names refer to the LV once the VG is activated. A mount or
+        // socket at an ancestor can also hide or prevent creation of the LV.
+        for device in [
+            format!("/dev/{vg}/{lv}"),
+            format!("/dev/mapper/{mapper_name}"),
+        ] {
+            for (field, path) in [
+                ("mountpoint", &request.mountpoint),
+                ("nbd_socket", &request.nbd_socket),
+            ] {
+                if path_at_or_below(path, &device) || path_at_or_below(&device, path) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{field} conflicts with the logical volume device path"
+                    )));
+                }
+            }
         }
         // LVM reserves these names and fragments for its internal LVs.
         if lv.starts_with("snapshot")
@@ -266,6 +279,12 @@ impl AttachConfig {
             init_sentinel: overrides.init_sentinel || self.init_sentinel,
         })
     }
+}
+
+// These canonical paths use Linux separators on every plan-rendering host.
+fn path_at_or_below(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
 fn normalize_lvm_identity(mut pins: LvmIdentityPins) -> Result<LvmIdentityPins, ConfigError> {
