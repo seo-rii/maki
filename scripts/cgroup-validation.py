@@ -67,22 +67,28 @@ def epoch_writes(epoch):
     return (("flush", flush), ("fua", fua))
 
 
+def check_planned_acks(records, rounds):
+    expected = ({"offset": offset, "length": len(data), "barrier": mode,
+                 "sha256": hashlib.sha256(data).hexdigest()}
+                for epoch in range(rounds)
+                for mode, writes in epoch_writes(epoch) for offset, data in writes)
+    for recorded, planned in zip(records, expected, strict=True):
+        if recorded != planned:
+            raise ValueError("durable ACK ledger differs from the planned workload")
+        yield recorded
+
+
 def verify(client, ledger, expected_rounds=None):
     latest = {}
-    records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
-    if expected_rounds is not None:
-        expected = ({"offset": offset, "length": len(data), "barrier": mode,
-                     "sha256": hashlib.sha256(data).hexdigest()}
-                    for epoch in range(expected_rounds)
-                    for mode, writes in epoch_writes(epoch) for offset, data in writes)
-        for recorded, planned in zip(records, expected, strict=True):
-            if recorded != planned:
-                raise ValueError("durable ACK ledger differs from the planned workload")
-    for record in records:
-        offset, length = record["offset"], record["length"]
-        if offset < 0 or offset % 4096 or length != 4096:
-            raise ValueError("oracle accepts aligned, non-overlapping 4 KiB units only")
-        latest[offset] = record
+    with ledger.open(encoding="utf-8") as stream:
+        records = map(json.loads, stream)
+        if expected_rounds is not None:
+            records = check_planned_acks(records, expected_rounds)
+        for record in records:
+            offset, length = record["offset"], record["length"]
+            if offset < 0 or offset % 4096 or length != 4096:
+                raise ValueError("oracle accepts aligned, non-overlapping 4 KiB units only")
+            latest[offset] = record
     if not latest:
         raise ValueError("an empty oracle cannot qualify durable data")
     for offset, record in latest.items():
