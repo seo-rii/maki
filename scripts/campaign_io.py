@@ -102,10 +102,20 @@ def guest_command_output(command, *, timeout, search_path):
             with selectors.DefaultSelector() as ready:
                 ready.register(child.stdout, selectors.EVENT_READ, stdout)
                 ready.register(child.stderr, selectors.EVENT_READ, stderr)
-                while ready.get_map():
+                while True:
+                    draining = bool(ready.get_map())
+                    # Both pipes can close before the command exits. Keep the
+                    # leader unreaped until timeout cleanup can no longer run.
+                    exited = not draining and os.waitid(
+                        os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(command, timeout)
+                    if exited:
+                        break
+                    if not draining:
+                        time.sleep(min(0.01, remaining))
+                        continue
                     for key, _ in ready.select(remaining):
                         budget = limit - len(stdout) - len(stderr)
                         chunk = os.read(key.fd, min(8192, budget + 1))
@@ -115,13 +125,13 @@ def guest_command_output(command, *, timeout, search_path):
                             key.data.extend(chunk)
                         else:
                             ready.unregister(key.fd)
-            status = child.wait(timeout=max(0, deadline - time.monotonic()))
         except BaseException:
             try:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             raise
+        status = child.wait()
     if status:
         raise RuntimeError(f"{command[0]} exited {status}: " + stderr[-2048:].decode(errors="replace"))
     return stdout.decode().strip()
