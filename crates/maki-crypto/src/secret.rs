@@ -92,21 +92,42 @@ fn lock_pages(address: *const u8, length: usize) -> Option<PageLock> {
 }
 
 #[cfg(unix)]
+fn release_pages(
+    references: &mut HashMap<usize, usize>,
+    pages: std::ops::RangeInclusive<usize>,
+    page_size: usize,
+    mut unlock: impl FnMut(usize, usize),
+) {
+    let last_page = *pages.end();
+    let mut run_start = None;
+    for page in pages.step_by(page_size) {
+        let owners = references.get_mut(&page).expect("page lock is registered");
+        *owners -= 1;
+        if *owners == 0 {
+            references.remove(&page);
+            run_start.get_or_insert(page);
+        } else if let Some(start) = run_start.take() {
+            unlock(start, page - start);
+        }
+    }
+    if let Some(start) = run_start {
+        unlock(start, last_page - start + page_size);
+    }
+}
+
+#[cfg(unix)]
 impl Drop for PageLock {
     fn drop(&mut self) {
-        let mut references = locked_pages().lock();
-        for page in (self.start..=self.last).step_by(self.page_size) {
-            let owners = references.get_mut(&page).expect("page lock is registered");
-            *owners -= 1;
-            if *owners == 0 {
-                references.remove(&page);
-                // SAFETY: the buffer still owns its allocation during
-                // unlock, and no other SecretBuffer owns this page's lock.
-                unsafe {
-                    libc::munlock(page as *const libc::c_void, self.page_size);
-                }
-            }
-        }
+        release_pages(
+            &mut locked_pages().lock(),
+            self.start..=self.last,
+            self.page_size,
+            |start, length| {
+                // SAFETY: the allocation remains live and all pages in this range
+                // have lost their last owner under the process-wide registry lock.
+                unsafe { libc::munlock(start as *const libc::c_void, length) };
+            },
+        );
     }
 }
 
@@ -388,6 +409,19 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn releases_contiguous_ranges_while_preserving_shared_pages() {
+        let mut references: HashMap<_, _> = (1..=6).map(|n| (n * 4096, 1)).collect();
+        references.insert(4 * 4096, 2);
+        let mut ranges = Vec::new();
+        release_pages(&mut references, 4096..=6 * 4096, 4096, |start, len| {
+            ranges.push((start, len))
+        });
+        assert_eq!(ranges, [(4096, 3 * 4096), (5 * 4096, 2 * 4096)]);
+        assert_eq!(references, HashMap::from([(4 * 4096, 1)]));
     }
 
     #[test]
