@@ -806,11 +806,27 @@ impl BatchScheduler {
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
         let result = match self.max_operation_time() {
-            Some(limit) => tokio::select! {
-                biased;
-                _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
-                result = operation => result,
-            },
+            Some(limit) => {
+                let deadline = self.clock.now().saturating_add(limit);
+                let remaining = deadline.saturating_sub(self.clock.now());
+                if remaining.is_zero() {
+                    Err(crate::endpoint::deadline_error())
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = self.clock.sleep(remaining) => Err(crate::endpoint::deadline_error()),
+                        result = operation => {
+                            // The timer may wake on a later tick. Check the clock
+                            // after the operation's final poll, as the dispatcher does.
+                            if self.clock.now() < deadline {
+                                result
+                            } else {
+                                Err(crate::endpoint::deadline_error())
+                            }
+                        }
+                    }
+                }
+            }
             None => operation.await,
         };
         // The caller owns this outcome, whether its queue timer or the inner
