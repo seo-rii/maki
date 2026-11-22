@@ -146,13 +146,6 @@ impl UnitIndexed for CiphertextUnit {
     }
 }
 
-fn units_of<I: UnitIndexed, O>(groups: &[Group<I, O>]) -> HashSet<u64> {
-    groups
-        .iter()
-        .flat_map(|g| g.items.iter().map(UnitIndexed::unit_index))
-        .collect()
-}
-
 struct Group<I, O> {
     context: CryptoContext,
     items: Vec<I>,
@@ -537,7 +530,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         let mut batch: Vec<Group<I, O>> = vec![first];
         let mut items: usize = batch[0].items.len();
         let mut bytes: u64 = batch[0].logical_bytes;
-        let mut units = units_of(&batch);
+        let mut units = HashSet::new();
 
         while items < config.target_items && bytes < config.target_bytes {
             let remaining = deadline.saturating_sub(clock.now());
@@ -555,7 +548,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                             .expect("live batch").saturating_add(config.max_wait);
                         items = batch.iter().map(|g| g.items.len()).sum();
                         bytes = batch.iter().map(|g| g.logical_bytes).sum();
-                        units = units_of(&batch);
+                        units.clear();
                         continue;
                     },
                     g = inbox.requests.recv() => g,
@@ -574,10 +567,21 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
             let fits = items + group.items.len() <= config.max_items
                 && bytes + group.logical_bytes <= config.max_bytes
                 && group.context == batch[0].context
-                && group
-                    .items
-                    .iter()
-                    .all(|item| !units.contains(&item.unit_index()));
+                && {
+                    // Every group is nonempty. Build the index on the first
+                    // eligible merge, or rebuild it after a cancellation.
+                    if units.is_empty() {
+                        units.extend(
+                            batch
+                                .iter()
+                                .flat_map(|g| g.items.iter().map(UnitIndexed::unit_index)),
+                        );
+                    }
+                    group
+                        .items
+                        .iter()
+                        .all(|item| !units.contains(&item.unit_index()))
+                };
             if !fits {
                 queued.push_front(group);
                 break;
@@ -989,5 +993,58 @@ impl CryptoProvider for BatchScheduler {
                 .await
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CountedUnit(Arc<AtomicU64>);
+
+    impl UnitIndexed for CountedUnit {
+        fn unit_index(&self) -> u64 {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            7
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_batches_skip_the_coalescing_unit_index() {
+        let context = CryptoContext {
+            volume_uuid: uuid::Uuid::nil(),
+            format_version: 1,
+            crypto_compatibility_id: "test".into(),
+        };
+        for (target_items, max_wait) in [(1, Duration::from_secs(1)), (4, Duration::ZERO)] {
+            let stats = Arc::new(SchedulerStats::default());
+            let lane = Lane::spawn(
+                SchedulerConfig {
+                    target_items,
+                    max_wait,
+                    ..SchedulerConfig::default()
+                },
+                64,
+                Arc::new(crate::SystemClock::new()),
+                stats.clone(),
+                Arc::new(|_, items| Box::pin(async move { (items, Ok(vec![()])) })),
+                Arc::new(|| Box::pin(async { false })),
+            );
+            let lookups = Arc::new(AtomicU64::new(0));
+            let permit = lane.admission.acquire(64).await.unwrap();
+            let reply = lane
+                .submit(
+                    &context,
+                    vec![CountedUnit(lookups.clone())],
+                    64,
+                    64,
+                    permit,
+                    &stats,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.len(), 1);
+            assert_eq!(lookups.load(Ordering::Relaxed), 0);
+        }
     }
 }
