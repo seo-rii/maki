@@ -49,6 +49,19 @@ class DocumentationLinks(unittest.TestCase):
             "README.md:2: guide.md#_word_x (missing anchor)",
         ])
 
+    def test_emphasis_flanking_uses_gfm_unicode_whitespace(self):
+        for char in ("\v", "\x1c", "\u0085", "\u2028", "\u2029"):
+            with self.subTest(char=repr(char)):
+                self.write("guide.md", f"# a{char}_inside_\n# _inside_{char}b\n"
+                           "# c\u2003_yes_\n# _yes_ d\n")
+                self.write("README.md", "[open](guide.md#a_inside_) [close](guide.md#_inside_b)\n"
+                           "[em space](guide.md#cyes) [space](guide.md#yes-d)\n"
+                           "[absent](guide.md#ainside) [absent](guide.md#insideb)\n")
+                self.assertCountEqual(broken_links(self.root), [
+                    "README.md:3: guide.md#ainside (missing anchor)",
+                    "README.md:3: guide.md#insideb (missing anchor)",
+                ])
+
     def test_heading_entities_are_decoded_only_when_contiguous_in_source(self):
         self.write("file", "")
         self.write("guide.md", "# &am*p*;\n# &co[py](file);\n# real &#95; and &amp;copy;\n")
