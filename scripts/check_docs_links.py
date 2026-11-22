@@ -143,6 +143,7 @@ def document_lines(text):
     # None denotes a block quote. List items store their continuation width,
     # and footnotes have a fixed four-column margin and their own blank-line rule.
     containers = []
+    empty_item = False
     block = None
     html_end = None
     in_paragraph = False
@@ -182,6 +183,12 @@ def document_lines(text):
             break
 
         content = columns[pos:]
+        # A list item with no first child ends at the next blank line.
+        # The outer containers can still continue across that blank.
+        if empty_item and not changed and not content.strip(" "):
+            containers.pop()
+            changed = True
+        empty_item = False
         if html_end == () and not content.strip(" \t"):
             html_end = None
         if block is not None:
@@ -218,6 +225,7 @@ def document_lines(text):
             # item still needs one column after its marker on the next line.
             width = padding if 1 <= padding <= 4 and item.end() < len(columns) else 1
             containers.append(marker_end - pos + width)
+            empty_item = item.end() == len(columns)
             pos = marker_end + width
 
         changed = changed or pos != before_markers
