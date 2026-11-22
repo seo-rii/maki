@@ -475,3 +475,73 @@ async fn a_serial_phase_polls_the_engine_in_its_first_poll() {
     writes.await.unwrap();
     assert_eq!(pending.current.load(Ordering::SeqCst), 0);
 }
+
+thread_local! {
+    pub(super) static PATTERN_BUFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[tokio::test]
+async fn measured_reads_and_final_sweep_verify_without_building_write_buffers() {
+    let (engine, _) = fixture().await;
+    let mut options = options();
+    options.ops = 1;
+    options.concurrency = 1;
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    PATTERN_BUFFERS.set(0);
+    phase(
+        &engine,
+        &options,
+        1,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples,
+    )
+    .await
+    .unwrap();
+    assert_eq!(PATTERN_BUFFERS.replace(0), 1);
+    phase(
+        &engine,
+        &options,
+        1,
+        Kind::Read,
+        &oracle,
+        &pending,
+        &mut samples,
+    )
+    .await
+    .unwrap();
+    let measured = PATTERN_BUFFERS.replace(0);
+    let report = verify_final(&engine, &options, &oracle).await.unwrap();
+    assert_eq!(report.final_sweep_verified_slots, 1);
+    assert_eq!((measured, PATTERN_BUFFERS.get()), (0, 0));
+}
+
+#[test]
+fn verification_checks_length_and_partial_pattern_blocks() {
+    let id = uuid::Uuid::from_bytes([0x71; 16]);
+    let offset = 512;
+    let generation = 9;
+    for size in [0, 1, 31, 32, 33, 65] {
+        let mut data = data_for(id, offset, generation, size);
+        assert!(matches_data(&data, id, offset, generation, size));
+        assert!(!matches_data(&data, id, offset, generation, size + 1));
+        if let Some(last) = data.last_mut() {
+            *last ^= 1;
+            assert!(!matches_data(&data, id, offset, generation, size));
+        }
+    }
+    let data = data_for(id, offset, generation, 65);
+    assert!(!matches_data(&data, id, offset, generation, 64));
+    assert!(!matches_data(&data, id, offset + 1, generation, 65));
+    assert!(!matches_data(&data, id, offset, generation + 1, 65));
+    assert!(!matches_data(
+        &data,
+        uuid::Uuid::nil(),
+        offset,
+        generation,
+        65
+    ));
+}

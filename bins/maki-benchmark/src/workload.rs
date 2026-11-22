@@ -165,17 +165,47 @@ fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
     (value ^ (value >> 31)) % slots
 }
-fn data_for(run_id: uuid::Uuid, offset: u64, generation: u64, size: usize) -> Vec<u8> {
-    let mut bytes = vec![0; size];
+
+fn pattern_blocks(
+    run_id: uuid::Uuid,
+    offset: u64,
+    generation: u64,
+) -> impl Iterator<Item = [u8; 32]> {
     let mut pattern = [0; 32];
     pattern[8..16].copy_from_slice(&generation.to_le_bytes());
     pattern[16..].copy_from_slice(run_id.as_bytes());
-    for (index, chunk) in bytes.chunks_mut(pattern.len()).enumerate() {
-        let position = offset + (index * pattern.len()) as u64;
+    (0..).map(move |index: u64| {
+        let position = offset + index * pattern.len() as u64;
         pattern[..8].copy_from_slice(&position.to_le_bytes());
+        pattern
+    })
+}
+
+fn data_for(run_id: uuid::Uuid, offset: u64, generation: u64, size: usize) -> Vec<u8> {
+    #[cfg(test)]
+    tests::PATTERN_BUFFERS.with(|count| count.set(count.get() + 1));
+    let mut bytes = vec![0; size];
+    for (chunk, pattern) in bytes
+        .chunks_mut(32)
+        .zip(pattern_blocks(run_id, offset, generation))
+    {
         chunk.copy_from_slice(&pattern[..chunk.len()]);
     }
     bytes
+}
+
+fn matches_data(
+    actual: &[u8],
+    run_id: uuid::Uuid,
+    offset: u64,
+    generation: u64,
+    size: usize,
+) -> bool {
+    actual.len() == size
+        && actual
+            .chunks(32)
+            .zip(pattern_blocks(run_id, offset, generation))
+            .all(|(chunk, pattern)| chunk == &pattern[..chunk.len()])
 }
 
 /// At most `concurrency` jobs/results exist. Completion order drives refill;
@@ -245,24 +275,25 @@ async fn phase(
                     let state = oracle.state(slot);
                     let previous = state.load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG;
                     let generation = if read { previous } else { previous + 1 };
-                    let expected = data_for(oracle.run_id, offset, generation, size);
-                    let began = Instant::now();
                     let elapsed;
                     if read {
+                        let began = Instant::now();
                         let actual = pending
                             .track(engine.read(offset, size))
                             .await
                             .map_err(|error| format!("read at offset {offset} failed: {error}"))?;
                         elapsed = began.elapsed();
-                        if actual != expected {
+                        if !matches_data(&actual, oracle.run_id, offset, generation, size) {
                             return Err(format!("read verification failed at offset {offset} (expected generation {generation})"));
                         }
                         if generation > 0 {
                             state.fetch_or(READ_AFTER_WRITE_FLAG, Ordering::Release);
                         }
                     } else {
+                        let data = data_for(oracle.run_id, offset, generation, size);
+                        let began = Instant::now();
                         pending
-                            .track(engine.write(offset, &expected, fua))
+                            .track(engine.write(offset, &data, fua))
                             .await
                             .map_err(|error| format!("write at offset {offset} failed: {error}"))?;
                         elapsed = began.elapsed();
@@ -343,14 +374,13 @@ async fn verify_final(
             report.read_after_write_verified_slots += 1;
         }
         let offset = slot * options.io_size as u64;
-        let expected = data_for(oracle.run_id, offset, generation, options.io_size);
         let actual = engine
             .read(offset, options.io_size)
             .await
             .map_err(|error| {
                 format!("final verification read at offset {offset} failed: {error}")
             })?;
-        if actual != expected {
+        if !matches_data(&actual, oracle.run_id, offset, generation, options.io_size) {
             return Err(format!(
                 "final verification failed at offset {offset} (expected generation {generation})"
             ));
