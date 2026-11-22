@@ -71,6 +71,37 @@ fn linux_file_locks_follow_the_file_across_rename_and_unlink() {
     check_lock_identity(&maki_backing::FileBacking::new(root.path()).unwrap());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn rollback_file_locks_follow_the_file_across_rename_and_unlink() {
+    let root = tempfile::tempdir().unwrap();
+    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let backing =
+        maki_backing::RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
+    check_lock_identity(&backing);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rollback_file_lock_keeps_unlinked_pages_until_release() {
+    let root = tempfile::tempdir().unwrap();
+    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let backing =
+        maki_backing::RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
+    let file = backing.open("lock", true).unwrap();
+    file.write_at(0, &[7; 4096]).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    backing.sync_dir("").unwrap();
+    let held = backing.try_lock("lock").unwrap();
+    let free = backing.free_bytes().unwrap().unwrap();
+    backing.remove("lock").unwrap();
+    backing.sync_dir("").unwrap();
+    assert_eq!(backing.free_bytes().unwrap(), Some(free));
+    drop(held);
+    assert_eq!(backing.free_bytes().unwrap(), Some(free + 4096));
+}
+
 // ---------- zero-length allocation ----------
 
 /// Every backing must agree on `allocate_range(_, 0)`: it reserves nothing

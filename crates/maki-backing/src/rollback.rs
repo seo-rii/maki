@@ -220,7 +220,7 @@ struct State {
     // reclaimable at last close. Unlink or replacement can invalidate this set.
     unlinked_files: Option<BTreeSet<u64>>,
     next_id: u64,
-    locks: BTreeSet<String>,
+    locks: BTreeSet<u64>,
     poisoned: bool,
     /// Arena slots the committed manifest references; recomputed only when
     /// a commit succeeds.
@@ -522,6 +522,14 @@ impl RollbackBacking {
                 locks: BTreeSet::new(),
                 poisoned: false,
             })),
+        }
+    }
+
+    fn retain_file(&self, state: &mut State, id: u64) -> CowFile {
+        *state.handles.entry(id).or_default() += 1;
+        CowFile {
+            state: self.state.clone(),
+            id,
         }
     }
 }
@@ -1053,13 +1061,12 @@ impl BackingFile for CowFile {
 }
 
 struct CowLock {
-    state: Arc<Mutex<State>>,
-    path: String,
+    file: CowFile,
 }
 impl VolumeLock for CowLock {}
 impl Drop for CowLock {
     fn drop(&mut self) {
-        self.state.lock().locks.remove(&self.path);
+        self.file.state.lock().locks.remove(&self.file.id);
     }
 }
 
@@ -1072,11 +1079,7 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         let id = state.open_file(name, create)?;
-        *state.handles.entry(id).or_default() += 1;
-        Ok(Arc::new(CowFile {
-            state: self.state.clone(),
-            id,
-        }))
+        Ok(Arc::new(self.retain_file(&mut state, id)))
     }
     fn exists(&self, name: &str) -> io::Result<bool> {
         validate_name(name, false)?;
@@ -1197,17 +1200,15 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        if state.locks.contains(name) {
+        let id = state.open_file(name, true)?;
+        if !state.locks.insert(id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "volume already attached",
             ));
         }
-        state.open_file(name, true)?;
-        state.locks.insert(name.to_owned());
         Ok(Box::new(CowLock {
-            state: self.state.clone(),
-            path: name.to_owned(),
+            file: self.retain_file(&mut state, id),
         }))
     }
     fn free_bytes(&self) -> io::Result<Option<u64>> {
