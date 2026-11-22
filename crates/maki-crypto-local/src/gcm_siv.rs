@@ -148,21 +148,21 @@ impl CryptoProvider for AesGcmSivProvider {
             let mut nonce = [0u8; NONCE_LEN];
             rng.fill_bytes(&mut nonce);
             let aad = self.aad(context, item.unit_index);
-            // The working copy is guarded before any plaintext lands in it
-            // and is encrypted in place; it holds ciphertext by the time it
-            // is read out and zeroizes on drop regardless.
-            let mut work = SecretBuffer::from_slice(pt);
+            // Guard the final frame before copying plaintext into its body.
+            // Transfer the allocation only after successful encryption.
+            let mut frame = SecretBuffer::zeroed(self.max_ciphertext_size as usize);
+            let (nonce_field, rest) = frame.expose_mut().split_at_mut(NONCE_LEN);
+            nonce_field.copy_from_slice(&nonce);
+            let (body, tag_field) = rest.split_at_mut(pt.len());
+            body.copy_from_slice(pt);
             let tag = self
                 .cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, work.expose_mut())
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, body)
                 .map_err(|_| CryptoError::ProviderFatal("AEAD encryption failed".to_string()))?;
-            let mut data = Vec::with_capacity(NONCE_LEN + work.len() + TAG_LEN);
-            data.extend_from_slice(&nonce);
-            data.extend_from_slice(work.expose());
-            data.extend_from_slice(&tag);
+            tag_field.copy_from_slice(&tag);
             out.push(CiphertextUnit {
                 unit_index: item.unit_index,
-                data,
+                data: frame.into_vec(),
             });
         }
         Ok(out)
