@@ -76,11 +76,14 @@ pub struct DispatchMetrics {
     failovers: AtomicU64,
     deadline_exceeded: AtomicU64,
     retries_refused_unsafe: AtomicU64,
-    /// Completed RPC attempts and their total latency in nanoseconds
-    /// (SPEC §40 `maki_crypto_latency_seconds`); an attempt abandoned at
-    /// the deadline is not a sample.
-    rpc_count: AtomicU64,
-    rpc_nanos: AtomicU64,
+    /// Only completed attempts contribute a sample (SPEC §40).
+    rpc: parking_lot::Mutex<RpcLatency>,
+}
+
+#[derive(Default)]
+struct RpcLatency {
+    count: u64,
+    total: Duration,
 }
 
 impl DispatchMetrics {
@@ -90,12 +93,18 @@ impl DispatchMetrics {
 
     /// Completed RPC attempts (successful or failed).
     pub fn rpc_count(&self) -> u64 {
-        self.rpc_count.load(Ordering::SeqCst)
+        self.rpc.lock().count
     }
 
     /// Total latency of completed RPC attempts, in seconds.
     pub fn rpc_seconds_sum(&self) -> f64 {
-        self.rpc_nanos.load(Ordering::SeqCst) as f64 / 1e9
+        self.rpc.lock().total.as_secs_f64()
+    }
+
+    /// Count and total seconds of completed RPCs from one observation.
+    pub fn rpc_latency(&self) -> (u64, f64) {
+        let rpc = self.rpc.lock();
+        (rpc.count, rpc.total.as_secs_f64())
     }
 
     pub fn failovers_total(&self) -> u64 {
@@ -862,11 +871,9 @@ impl EndpointSet {
             }
         });
         let elapsed = self.clock.now().saturating_sub(started);
-        self.metrics.rpc_count.fetch_add(1, Ordering::SeqCst);
-        self.metrics.rpc_nanos.fetch_add(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::SeqCst,
-        );
+        let mut rpc = self.metrics.rpc.lock();
+        rpc.count = rpc.count.saturating_add(1);
+        rpc.total = rpc.total.saturating_add(elapsed);
         result
     }
 

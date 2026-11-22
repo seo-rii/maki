@@ -241,6 +241,17 @@ async fn admission_waiters_are_counted_separately() {
     let second = f.request(2, false);
     settle().await;
     assert_eq!(f.scheduler.stats().pending_items(), 1);
+    let metrics = f.backend.metrics().await;
+    assert_eq!(metrics["maki_submission_queue_items"], 1);
+    assert_eq!(metrics["maki_submission_queue_bytes"], UNIT);
+    assert_eq!(
+        metrics["maki_submission_queue_items"],
+        metrics["maki_crypto_pending_items"]
+    );
+    assert_eq!(
+        metrics["maki_submission_queue_bytes"],
+        metrics["maki_crypto_pending_bytes"]
+    );
     f.clock.advance(DEADLINE);
     settle().await;
     expired(first).await;
