@@ -107,7 +107,8 @@ source, tool versions and checksums, follow [release preparation](../releasing.m
 
 ```bash
 set -euo pipefail
-git clone https://github.com/seo-rii/maki.git && cd maki
+git clone https://github.com/seo-rii/maki.git
+cd maki
 # Select and record the immutable revision being qualified before building.
 git rev-parse HEAD
 rustup toolchain install 1.94.0 --profile minimal
