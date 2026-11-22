@@ -215,12 +215,17 @@ class DocumentationLinks(unittest.TestCase):
     def test_blank_after_empty_list_item_ends_its_margin(self):
         for marker in ("-", "+   ", "1.", "42)"):
             with self.subTest(marker=marker):
-                self.write("README.md", f"{marker}\n \t\n\t[code](literal.md)\n\n"
+                self.write("README.md", f"{marker}\n \n\t[code](literal.md)\n\n"
                            f"{marker}\n    [immediate](missing.md)\n\n"
                            f"{marker.rstrip()} body\n\n    [continued](also-missing.md)\n")
                 self.assertEqual(broken_links(self.root), [
                     "README.md:6: missing.md", "README.md:10: also-missing.md",
                 ])
+
+    def test_empty_item_needs_its_full_margin_on_each_blank(self):
+        self.write("README.md", "1.\n\t\n   \n    [continued](missing.md)\n\n"
+                   "1.\n\t\n  \n    [code](literal.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: missing.md"])
 
     def test_blank_closes_only_the_empty_item_inside_outer_containers(self):
         self.write("README.md", "> - outer\n>\n>   -\n>\n>       [code](literal.md)\n\n"
