@@ -506,6 +506,7 @@ fn grpc_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonErr
             "remote-grpc requires at least one [[crypto.grpc.endpoint]]".to_string(),
         ));
     }
+    let keys = std::cell::LazyCell::new(|| RoutedKeySource::from_config(config));
     let tls = grpc
         .tls
         .as_ref()
@@ -514,7 +515,7 @@ fn grpc_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonErr
                 (Some(cert), Some(key)) => Some(maki_crypto_grpc::GrpcClientIdentity {
                     certificate_pem: read_tls_file("grpc", "client_cert_file", Some(cert))?
                         .expect("certificate path is present"),
-                    private_key_pem: RoutedKeySource::from_config(config).load_text(&key.name)?,
+                    private_key_pem: keys.load_text(&key.name)?,
                 }),
                 (None, None) => None,
                 _ => return Err(DaemonError::Unsupported(
@@ -548,10 +549,9 @@ fn grpc_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonErr
         max_message_bytes: grpc.message_byte_limit()?,
     };
     for (name, value) in &grpc.metadata {
-        template.metadata.push((
-            name.clone(),
-            resolve_metadata_value(&RoutedKeySource::from_config(config), value)?,
-        ));
+        template
+            .metadata
+            .push((name.clone(), resolve_metadata_value(&keys, value)?));
     }
     let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &grpc.endpoint {
