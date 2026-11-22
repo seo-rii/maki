@@ -83,6 +83,27 @@ exit 0
                 self.assertLess(verify, next(i for i, line in enumerate(calls)
                                             if line.startswith(after)))
 
+    def test_restart_reads_back_only_after_start_and_verify_succeed(self):
+        document = (ROOT / "docs/getting-started/quickstart.md").read_text()
+        block = next(part for part in re.findall(r"```bash\n(.*?)```", document, re.S)
+                     if "cat /srv/demo/hello.txt" in part)
+        commands = """
+systemctl() { echo "start"; return "$START_STATUS"; }
+maki-attach() { echo "verify"; return "$VERIFY_STATUS"; }
+cat() { echo "read"; }
+"""
+        for start, verify, calls in [(1, 0, ["start"]),
+                                     (0, 1, ["start", "verify"]),
+                                     (0, 0, ["start", "verify", "read"])]:
+            with self.subTest(start=start, verify=verify):
+                result = subprocess.run(
+                    ["bash", "-c", commands + block], capture_output=True, text=True,
+                    env=dict(os.environ, START_STATUS=str(start), VERIFY_STATUS=str(verify)),
+                    timeout=5,
+                )
+                self.assertEqual(result.stdout.splitlines(), calls)
+                self.assertEqual(result.returncode, start or verify)
+
 
 if __name__ == "__main__":
     unittest.main()
