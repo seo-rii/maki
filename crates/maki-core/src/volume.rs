@@ -10,6 +10,7 @@
 //! checkpoint at that boundary would then delete its journal segment without
 //! ever copying it into a slot.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
@@ -338,6 +339,15 @@ impl Volume {
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
+        self.write_ciphertext(unit, Cow::Borrowed(ciphertext), fua)
+    }
+
+    pub(crate) fn write_ciphertext(
+        &mut self,
+        unit: u64,
+        ciphertext: Cow<'_, [u8]>,
+        fua: bool,
+    ) -> Result<u64, CoreError> {
         self.check_freshness()?;
         // Counter refusal must precede physical reservation and its barrier,
         // including an exhausted segment index when this append would roll.
@@ -354,7 +364,7 @@ impl Volume {
         // for slot data: an admitted record always has physical completion
         // space even if another filesystem user consumes every free byte.
         self.store.reserve_slot(unit)?;
-        let appended = self.journal.append(unit, ciphertext);
+        let appended = self.journal.append(unit, &ciphertext);
         // An automatic roll inside `append` may have advanced the durable
         // boundary (even when the append itself failed). Promote *before*
         // publishing, so a just-durable previous version of this unit is
@@ -365,7 +375,10 @@ impl Volume {
         // barrier (or recovery) would surface it anyway. Publish before the
         // FUA sync so a sync failure never leaves the live view behind the
         // on-disk journal.
-        self.publish_record(unit, sequence, ciphertext.to_vec());
+        // Chargeable overlay storage is the ciphertext length. Do not retain
+        // extra capacity a provider may have reserved for temporary work.
+        let data = ciphertext.into_owned().into_boxed_slice().into_vec();
+        self.publish_record(unit, sequence, data);
         self.overlay.promote(self.journal.durable_sequence());
         if fua {
             let sync = self.journal.sync();
@@ -946,7 +959,7 @@ mod reservation_barrier_tests {
 }
 
 #[cfg(test)]
-mod freshness_tests {
+mod volume_tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1025,6 +1038,25 @@ mod freshness_tests {
         .unwrap();
         let volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
         (backing, volume)
+    }
+
+    #[test]
+    fn owned_ciphertext_moves_to_the_overlay_without_retaining_spare_capacity() {
+        let (_backing, mut volume) = open_volume();
+        let payload = vec![0xab; 520];
+        let address = payload.as_ptr();
+        volume.write_ciphertext(0, payload.into(), false).unwrap();
+        let stored = &volume.overlay.get(0).unwrap().ciphertext;
+        assert_eq!(stored.as_ptr(), address);
+
+        let mut oversized = Vec::with_capacity(65536);
+        oversized.extend_from_slice(&[0xcd; 520]);
+        volume.write_ciphertext(0, oversized.into(), true).unwrap();
+        let stored = &volume.overlay.get(0).unwrap().ciphertext;
+        assert_eq!(stored.capacity(), stored.len());
+        assert_eq!(stored, &[0xcd; 520]);
+        volume.checkpoint().unwrap();
+        assert_eq!(volume.read_ct(0).unwrap().unwrap().1, vec![0xcd; 520]);
     }
 
     #[test]

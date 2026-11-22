@@ -1339,7 +1339,7 @@ impl Engine {
 
     async fn publish_ciphertexts(
         &self,
-        cts: Vec<CiphertextUnit>,
+        mut cts: Vec<CiphertextUnit>,
         fua: bool,
         admission: Arc<maki_crypto::flow::DualPermit>,
         guards: Arc<Vec<OwnedMutexGuard<()>>>,
@@ -1351,22 +1351,20 @@ impl Engine {
         // the queue when the task ends, however the caller is cancelled.
         let engine = self.clone();
         tokio::spawn(async move {
-            let cts = Arc::new(cts);
             let (_admission, _guards) = (admission, guards);
             let mut ticket: Option<ReclaimTicket> = None;
             let mut reclaims = 0;
             loop {
                 let mut volume = engine.inner.write_volume().await?;
                 let io_engine = engine.clone();
-                let io_cts = cts.clone();
                 let io_admission = _admission.clone();
                 let io_guards = _guards.clone();
                 let mut io_ticket = ticket.take();
-                let (outcome, io_ticket) = storage_task(move || {
+                let (outcome, next_cts, io_ticket) = storage_task(move || {
                     let (_admission, _guards) = (io_admission, io_guards);
                     let outcome = io_engine.journal_request(
                         &mut volume,
-                        &io_cts,
+                        &mut cts,
                         fua,
                         &mut io_ticket,
                         reclaims,
@@ -1379,9 +1377,10 @@ impl Engine {
                     {
                         io_engine.inner.checkpoint_notify.notify_one();
                     }
-                    (outcome, io_ticket)
+                    (outcome, cts, io_ticket)
                 })
                 .await?;
+                cts = next_cts;
                 ticket = io_ticket;
                 match outcome? {
                     Admission::Admit => return Ok(()),
@@ -1410,7 +1409,7 @@ impl Engine {
     fn journal_request(
         &self,
         volume: &mut Volume,
-        cts: &[CiphertextUnit],
+        cts: &mut [CiphertextUnit],
         fua: bool,
         ticket: &mut Option<ReclaimTicket>,
         reclaims: usize,
@@ -1423,7 +1422,7 @@ impl Engine {
         let mut filtered = Vec::new();
         let mut recheck = false;
         let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
-            for ct in cts {
+            for ct in cts.iter() {
                 match volume.reclaim_unwritten(ct.unit_index)? {
                     DiscardProbe::Unwritten => continue,
                     DiscardProbe::Written => {}
@@ -1436,7 +1435,7 @@ impl Engine {
                     data: Vec::new(),
                 });
             }
-            filtered.as_slice()
+            filtered.as_mut_slice()
         } else {
             cts
         };
@@ -1462,7 +1461,13 @@ impl Engine {
                     volume.append_discard(ct.unit_index, false)?;
                 }
             } else {
-                volume.write_ct(ct.unit_index, &ct.data, false)?;
+                // Admission has committed to this batch. The overlay can take
+                // the provider buffer after the journal append succeeds.
+                volume.write_ciphertext(
+                    ct.unit_index,
+                    std::mem::take(&mut ct.data).into(),
+                    false,
+                )?;
             }
             // Any cached plaintext of an older version is now dead. The
             // version key alone already prevents stale reads; this frees
