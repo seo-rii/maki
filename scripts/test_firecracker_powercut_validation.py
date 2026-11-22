@@ -125,6 +125,23 @@ class HostContracts(unittest.TestCase):
         self.host.record_ack(self.ledger, self.ack(1), 1)
         self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=2), self.host.expected_records(1))
 
+    def test_each_boot_rechecks_prior_acks_without_rehashing_their_blocks(self):
+        events = [self.ack(cycle) for cycle in range(4)]
+        with mock.patch.object(self.host, "block_digest", wraps=self.host.block_digest) as digest:
+            for cycle, event in enumerate(events):
+                self.host.record_ack(self.ledger, event, cycle)
+                self.assertEqual(self.host.load_ledger(self.ledger, cycle + 1, require_current=True),
+                                 event["records"])
+            self.assertEqual(digest.call_count, sum(len(event["records"]) for event in events))
+
+            lines = self.ledger.read_text().splitlines()
+            earliest = json.loads(lines[0])
+            earliest["records"][0]["sha256"] = "0" * 64
+            lines[0] = json.dumps(earliest)
+            self.ledger.write_text("\n".join(lines) + "\n")
+            with self.assertRaisesRegex(ValueError, "unexpected durable ACK"):
+                self.host.load_ledger(self.ledger, len(events), require_current=True)
+
     def test_empty_truncated_or_duplicate_ledger_cannot_qualify(self):
         for text in ("", "{", json.dumps(self.ack()) + "\n" + json.dumps(self.ack()) + "\n"):
             self.ledger.write_text(text)

@@ -8,6 +8,7 @@ background supervisor. stdout from Firecracker is a serial control channel,
 recorded from launch; diagnostic files are inspected only after child exit.
 """
 import argparse
+from functools import lru_cache
 import json
 import os
 import pathlib
@@ -27,6 +28,7 @@ except ModuleNotFoundError:
                                      handle_termination, ledger_block_pattern, save_json)
 
 PREFIX = b"MAKI_FC_V1 "
+MAX_CYCLES = 64
 MAX_FRAME = 16384
 MAX_OUTPUT = 8 << 20
 
@@ -38,6 +40,12 @@ def expected_records(cycle, pattern=CURRENT_BLOCK_PATTERN):
         digest = block_digest(f"maki-firecracker-v1:{cycle}:{index}", pattern)
         records.append({"offset": offset, "length": 4096, "sha256": digest})
     return records
+
+
+@lru_cache(maxsize=MAX_CYCLES)
+def expected_records_json(cycle, pattern):
+    """Keep the immutable host expectation across verification boots."""
+    return json.dumps(expected_records(cycle, pattern), sort_keys=True)
 
 
 def decode_frame(line, token, boot):
@@ -65,7 +73,7 @@ def validate_ack(event, cycle, *, pattern=CURRENT_BLOCK_PATTERN):
     if (event.get("event") != "ack" or event.get("command") != f"write-{cycle}"
             or type(event.get("cycle")) is not int or event["cycle"] != cycle
             or event.get("mode") != mode
-            or json.dumps(event.get("records"), sort_keys=True) != json.dumps(expected_records(cycle, pattern), sort_keys=True)):
+            or json.dumps(event.get("records"), sort_keys=True) != expected_records_json(cycle, pattern)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
 
 
@@ -112,7 +120,7 @@ def verify_readbacks(expected, actual):
 
 
 def make_config(args, boot, token):
-    if not re.fullmatch("[0-9a-f]{32}", token) or type(boot) is not int or not 0 <= boot <= 64:
+    if not re.fullmatch("[0-9a-f]{32}", token) or type(boot) is not int or not 0 <= boot <= MAX_CYCLES:
         raise ValueError("invalid boot identity")
     return {
         "boot-source": {"kernel_image_path": str(args.kernel), "boot_args":
@@ -273,8 +281,8 @@ class SerialProcess:
 
 def campaign(args):
     os.umask(0o077)
-    if not 2 <= args.cycles <= 64 or not 64 <= args.memory_mib <= 16384 or not 1 <= args.vcpus <= 8:
-        raise ValueError("require cycles 2..64, memory 64..16384 MiB, vcpus 1..8")
+    if not 2 <= args.cycles <= MAX_CYCLES or not 64 <= args.memory_mib <= 16384 or not 1 <= args.vcpus <= 8:
+        raise ValueError(f"require cycles 2..{MAX_CYCLES}, memory 64..16384 MiB, vcpus 1..8")
     if not 1 <= args.timeout <= 600:
         raise ValueError("timeout must be 1..600 seconds")
     for name in ("firecracker", "kernel", "rootfs", "data"):
