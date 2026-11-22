@@ -107,6 +107,11 @@ impl CryptoProvider for RecordingProvider {
                 out.pop();
             }
             Some("reordered") => out.reverse(),
+            Some("logical echo") => {
+                for (output, input) in out.iter_mut().zip(items) {
+                    output.data = input.data.expose()[PREFIX as usize..].to_vec();
+                }
+            }
             _ => {}
         }
         Ok(out)
@@ -465,5 +470,19 @@ async fn no_op_inner_provider_cannot_hide_behind_random_prefix() {
         .await,
         Err(error) if error.class() == maki_crypto::ErrorClass::ProviderFatal
             && error.to_string().contains("not encrypting")
+    ));
+}
+
+#[tokio::test]
+async fn checking_padded_input_does_not_exempt_the_logical_plaintext() {
+    let inner = Arc::new(RecordingProvider::new());
+    let wrapper = RandomPrefixProvider::new(inner.clone(), LOGICAL, PREFIX, "outer-v1".into())
+        .await
+        .unwrap();
+    let checked = maki_crypto::checked::CheckedProvider::new(Arc::new(wrapper));
+    *inner.encrypt_shape.lock().unwrap() = Some("logical echo");
+    assert!(matches!(
+        checked.encrypt_batch(&context("outer-v1"), &units()).await,
+        Err(CryptoError::Contract(reason)) if reason.contains("carries its plaintext")
     ));
 }

@@ -40,7 +40,7 @@ use crate::checked::{validate_decrypt_result, validate_owned_encrypt_result, Che
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
 use crate::flow::{semaphore_limits, DualPermit, DualSemaphore};
-use crate::provider::CryptoProvider;
+use crate::provider::{private::ValidationCaller, CryptoProvider};
 use crate::retry::{full_jitter_delay, RetryBudget, RetryBudgetConfig, RetryPolicy};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
@@ -893,7 +893,8 @@ impl EndpointSet {
         let result = result.and_then(|response| {
             match (request, response) {
                 (Request::Encrypt(items), Response::Encrypted(output)) => {
-                    validate_owned_encrypt_result(items, output, caps).map(Response::Encrypted)
+                    validate_owned_encrypt_result(endpoint.provider.as_ref(), items, output, caps)
+                        .map(Response::Encrypted)
                 }
                 (Request::Decrypt(items), Response::Decrypted(output)) => {
                     validate_decrypt_result(items, &output, caps)?;
@@ -1193,6 +1194,12 @@ impl EndpointSet {
 
 #[async_trait]
 impl CryptoProvider for EndpointSet {
+    fn checks_plaintext_echo(&self, _: ValidationCaller) -> bool {
+        // Every endpoint is checked before dispatch accepts its result.
+        // Concatenating whole chunks preserves each input/output pair.
+        true
+    }
+
     fn max_operation_time(&self) -> Option<Duration> {
         self.config.max_operation_time
     }
