@@ -94,12 +94,8 @@ that upstream 3.27 already contains and re-run the build. If the
 out and `maki-attach` will fail closed at attach time, so keep
 `apt build-dep` in step 1.
 
-Pin the package so an ordinary `apt upgrade` does not replace it with the
-older stock version:
-
-```bash
-apt-mark hold nbd-client
-```
+With the default APT priorities, an older stock version leaves the installed
+backport in place. Leave the package eligible for newer updates.
 
 ## Build the Maki package
 
