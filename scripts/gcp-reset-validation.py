@@ -484,16 +484,21 @@ class RemoteProcess:
                 raise TimeoutError("guest SSH event deadline")
             if not self.selector.select(min(0.1, remaining)):
                 continue
-            chunk = os.read(self.child.stdout.fileno(), 4096)
+            chunk = self._read_stdout()
             if not chunk:
                 status = self.poll()
                 raise SSHClosedError(f"guest SSH closed before expected event: {status}")
+            self.buffer.extend(chunk)
+
+    def _read_stdout(self):
+        chunk = os.read(self.child.stdout.fileno(), 4096)
+        if chunk:
             self.total += len(chunk)
             if self.total > MAX_OUTPUT:
                 raise ValueError("SSH output limit exceeded")
             self.stdout_log.write(chunk)
             self.stdout_log.flush()
-            self.buffer.extend(chunk)
+        return chunk
 
     def expect(self, event, timeout):
         frame = self.event(timeout)
@@ -513,7 +518,7 @@ class RemoteProcess:
 
     def wait_clean(self, timeout):
         try:
-            status = self._wait_owned(timeout)
+            status = self._wait_owned(timeout, drain_stdout=True)
         except subprocess.TimeoutExpired as error:
             self._kill_owned()
             raise TimeoutError("verification SSH did not exit") from error
@@ -530,7 +535,7 @@ class RemoteProcess:
             return None
         return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
 
-    def _wait_owned(self, timeout):
+    def _wait_owned(self, timeout, *, drain_stdout=False):
         until = time.monotonic() + timeout
         while True:
             check_termination()
@@ -539,9 +544,18 @@ class RemoteProcess:
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(self.child.args, timeout)
             if status is not None:
+                # Stop inherited writers before draining the final pipe contents.
                 self._kill_owned()
+            if drain_stdout:
+                wait = 0 if status is not None else min(.05, remaining)
+                if self.selector.select(wait):
+                    if self._read_stdout():
+                        continue
+                    drain_stdout = False
+            elif status is None:
+                time.sleep(min(.05, remaining))
+            if status is not None:
                 return self.child.returncode
-            time.sleep(min(.05, remaining))
 
     def _kill_owned(self):
         if self.child is not None and self.child.returncode is None:
