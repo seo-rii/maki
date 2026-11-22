@@ -1558,7 +1558,7 @@ impl Engine {
                     "reserves {reserved} plus journal append footprint {append_footprint} exceeds free-space accounting range"
                 ))
             })?;
-            let Some(free) = self.backing_free_bytes(Duration::ZERO) else {
+            let Some(free) = self.inner.backing_free_bytes(Duration::ZERO) else {
                 return Err(enospc(
                     "backing free space unavailable while emergency reserve is enabled",
                 ));
@@ -1639,29 +1639,6 @@ impl Engine {
         ticket
             .get_or_insert_with(|| ReclaimTicket::join(&self.inner))
             .try_enter()
-    }
-
-    /// Backing free space (`None` = unknown), allowing samples younger than
-    /// `max_age`. A zero age forces a fresh sample for write admission; stats
-    /// retain their cache and monitoring reads only the published observation.
-    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
-        let now = self.inner.clock.now();
-        let mut cache = self.inner.free_space.lock();
-        if let Some((value, at)) = *cache {
-            if now.saturating_sub(at) < max_age {
-                return value;
-            }
-        }
-        let value = match self.inner.backing.free_bytes() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("backing free-space query failed: {e}");
-                None
-            }
-        };
-        *cache = Some((value, now));
-        *self.inner.observed_free_space.lock() = Some((value, now));
-        value
     }
 
     /// Hot-resize the plaintext read cache (SPEC §20; 0 disables).
@@ -1753,9 +1730,9 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let engine = self.clone();
+        let inner = self.inner.clone();
         let backing_free_bytes =
-            storage_task(move || engine.backing_free_bytes(FREE_SPACE_CACHE_TTL))
+            storage_task(move || inner.backing_free_bytes(FREE_SPACE_CACHE_TTL))
                 .await
                 .unwrap_or(None);
         let volume = self.inner.volume.read().await;
@@ -1842,6 +1819,29 @@ impl Engine {
 }
 
 impl EngineInner {
+    /// Backing free space (`None` = unknown), allowing samples younger than
+    /// `max_age`. A zero age forces a fresh sample for write admission; stats
+    /// retain their cache and monitoring reads only the published observation.
+    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
+        let mut cache = self.free_space.lock();
+        if let Some((value, at)) = *cache {
+            if self.clock.now().saturating_sub(at) < max_age {
+                return value;
+            }
+        }
+        let value = match self.backing.free_bytes() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("backing free-space query failed: {e}");
+                None
+            }
+        };
+        let now = self.clock.now();
+        *cache = Some((value, now));
+        *self.observed_free_space.lock() = Some((value, now));
+        value
+    }
+
     /// Record a plaintext hit or return ciphertext to decrypt. The caller
     /// holds the same volume read guard across version lookup and payload I/O.
     fn read_unit(
@@ -2095,14 +2095,12 @@ impl EngineInner {
             return;
         }
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
-            let backing = self.backing.clone();
-            storage_task(move || backing.free_bytes())
+            let inner = self.clone();
+            storage_task(move || inner.backing_free_bytes(Duration::ZERO))
                 .await
                 .ok()
-                .and_then(Result::ok)
                 .flatten()
-                .map(|free| free < self.policy.low_space_checkpoint_bytes)
-                .unwrap_or(false)
+                .is_some_and(|free| free < self.policy.low_space_checkpoint_bytes)
         } else {
             false
         };
