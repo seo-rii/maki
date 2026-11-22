@@ -127,28 +127,27 @@ def checkout_filemode(repo):
 
 def tracked_changes(*, repo=None):
     repo = ROOT if repo is None else repo
-    command = git_command("--no-optional-locks", *checkout_filemode(repo), "status",
+    filemode = checkout_filemode(repo)
+    command = git_command("--no-optional-locks", *filemode, "status",
                           "--porcelain", "--untracked-files=no", repo=repo)
     if subprocess.check_output(command):
         return True
-    entries = subprocess.check_output(git_command("ls-files", "-v", "-z", repo=repo)).split(b"\0")
-    assumed = [entry[2:] for entry in entries if entry[:1].islower()]
-    present_skipped = [entry[2:] for entry in entries if entry[:1].upper() == b"S"
-                       and os.path.lexists(repo / os.fsdecode(entry[2:]))]
-    if not assumed and not present_skipped:
-        return False
-    # Refresh the flagged paths through Git's normal stat/filter checks,
-    # without changing the user's index flags or sparse-checkout selection.
+    # A fresh index compares contents through Git's normal clean filters without
+    # inheriting cached stat data or assume-unchanged hints from the checkout.
+    # Only absent, explicitly skipped paths are allowed to lack a working copy.
+    entries = subprocess.check_output(git_command("ls-files", "-t", "-z", repo=repo)).split(b"\0")
+    absent_skipped = [entry[2:] for entry in entries if entry.startswith(b"S ")
+                      and not os.path.lexists(repo / os.fsdecode(entry[2:]))]
     with tempfile.TemporaryDirectory() as directory:
-        index = pathlib.Path(directory) / "index"
-        index_path = run(git_command("rev-parse", "--path-format=absolute", "--git-path", "index", repo=repo))
-        shutil.copyfile(index_path, index)
-        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
-        for flag, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", present_skipped)):
-            if paths:
-                subprocess.run(git_command("update-index", flag, "-z", "--stdin", repo=repo),
-                               input=b"\0".join(paths) + b"\0", env=env, check=True)
-        return bool(subprocess.check_output(command, env=env))
+        env = {**os.environ, "GIT_INDEX_FILE": str(pathlib.Path(directory) / "index")}
+        private_git = git_command("-c", "core.sparseCheckout=false", "-c", "core.splitIndex=false",
+                                  *filemode, repo=repo)
+        subprocess.run([*private_git, "read-tree", "HEAD"], env=env, check=True)
+        if absent_skipped:
+            subprocess.run([*private_git, "update-index", "--skip-worktree", "-z", "--stdin"],
+                           input=b"\0".join(absent_skipped) + b"\0", env=env, check=True)
+        return bool(subprocess.check_output([*private_git, "status", "--porcelain", "--untracked-files=no"],
+                                            env=env))
 
 
 def candidate_source_version():

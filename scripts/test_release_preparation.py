@@ -376,6 +376,21 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
         self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "h Cargo.toml")
 
+    def test_release_checks_contents_when_git_stat_information_is_unchanged(self):
+        tracked = self.repo / "Cargo.lock"
+        original = tracked.read_bytes()
+        self.git("config", "core.trustctime", "false")
+        self.git("config", "core.checkStat", "minimal")
+        before = 1_700_000_000_000_000_000
+        os.utime(tracked, ns=(before, before))
+        self.git("update-index", "--refresh")
+        tracked.write_bytes(original.replace(b"version = 3", b"version = 4"))
+        os.utime(tracked, ns=(before, before))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        tracked.write_bytes(original)
+        self.print_version()
+
     def test_present_skipped_file_is_checked_but_absent_sparse_file_is_supported(self):
         self.git("update-index", "--split-index")
         self.git("update-index", "--skip-worktree", "Cargo.lock", "Cargo.toml")
