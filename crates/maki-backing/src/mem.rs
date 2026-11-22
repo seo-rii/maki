@@ -117,7 +117,13 @@ impl BackingFile for MemFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut data = self.data.lock();
         let len = usize::try_from(len).map_err(bad_offset)?;
+        let truncated = len < data.len();
         data.resize(len, 0);
+        // Leave room for Vec's growth so alternating a tail write and a small
+        // truncation doesn't repeatedly free and reallocate the same buffer.
+        if truncated && len <= data.capacity() / 4 {
+            data.shrink_to_fit();
+        }
         Ok(())
     }
 
@@ -293,5 +299,38 @@ impl Backing for MemBacking {
             ));
         }
         Ok(Box::new(MemLock { file: file.clone() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_truncations_keep_room_for_repeated_tail_writes() {
+        let file = MemFile::default();
+        file.set_len(4096).unwrap();
+        file.write_at(4096, b"x").unwrap();
+        let capacity = file.data.lock().capacity();
+        file.set_len(4096).unwrap();
+        assert_eq!(file.data.lock().capacity(), capacity);
+    }
+
+    #[test]
+    fn truncating_a_memory_file_releases_its_large_buffer() {
+        let file = MemFile::default();
+        file.set_len(1 << 20).unwrap();
+        file.write_at(0, b"abc").unwrap();
+        file.set_len(3).unwrap();
+        assert!(file.data.lock().capacity() < 1 << 20);
+        let mut prefix = [0; 3];
+        file.read_at(0, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"abc");
+
+        file.set_len(0).unwrap();
+        assert_eq!(file.data.lock().capacity(), 0);
+        file.write_at(2, b"z").unwrap();
+        file.read_at(0, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"\0\0z");
     }
 }
