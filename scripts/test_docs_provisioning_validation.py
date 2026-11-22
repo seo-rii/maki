@@ -188,6 +188,24 @@ class ProvisioningContract(unittest.TestCase):
         self.assertNotIn("vgchange", [call[0] for call in calls])
         self.assertIsNone(content)
 
+    def test_quickstart_create_block_stops_at_each_failed_command(self):
+        text = (ROOT / "docs/getting-started/quickstart.md").read_text()
+        blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
+        block, = [block for block in blocks if "sudo -u maki maki volume create" in block]
+        commands = ["install", "create", "inspect", "check"]
+        fixture = """
+stage() { echo "$1"; if [[ "$1" == "$FAIL_AT" ]]; then return 42; fi; }
+install() { stage install; }
+sudo() { shift 2; "$@"; }
+maki() { if [[ "$1" == volume ]]; then stage "$2"; else stage "$1"; fi; }
+"""
+        for index, failed in enumerate([*commands, "none"]):
+            with self.subTest(failed=failed):
+                result = subprocess.run(["bash", "-c", fixture + block], capture_output=True,
+                                        text=True, timeout=5, env=dict(os.environ, FAIL_AT=failed))
+                self.assertEqual(result.returncode, 0 if failed == "none" else 42, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), commands[:index + 1])
+
     def test_quickstart_uses_the_shared_checked_procedure(self):
         text = (ROOT / "docs/getting-started/quickstart.md").read_text()
         self.assertIn("first-volume.md#1-provision-and-record-the-layout", text)
