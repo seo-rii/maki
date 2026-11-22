@@ -178,6 +178,7 @@ impl ControlBackend for EngineControlBackend {
         let stats = &observation.stats;
         let (_, state_code, _) = state_label(&stats.state);
         let dispatch = self.endpoints.as_ref().map(|set| set.metrics());
+        let (rpc_count, rpc_seconds) = dispatch.map(|m| m.rpc_latency()).unwrap_or_default();
         let (pending_items, pending_bytes) = self
             .crypto_stats
             .as_ref()
@@ -205,8 +206,8 @@ impl ControlBackend for EngineControlBackend {
                     .map(|(name, n)| (name, json!(n)))
                     .collect()
             }),
-            "maki_crypto_latency_seconds_sum": dispatch.map(|m| m.rpc_seconds_sum()).unwrap_or(0.0),
-            "maki_crypto_latency_seconds_count": dispatch.map(|m| m.rpc_count()).unwrap_or(0),
+            "maki_crypto_latency_seconds_sum": rpc_seconds,
+            "maki_crypto_latency_seconds_count": rpc_count,
             "maki_crypto_retries_total": dispatch.map(|m| m.retries_total()).unwrap_or(0),
             "maki_crypto_retries_refused_unsafe_total": dispatch.map(|m| m.retries_refused_unsafe_total()).unwrap_or(0),
             // The scheduler owns caller outcomes, including queue expiry.
