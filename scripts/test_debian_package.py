@@ -276,6 +276,9 @@ class DebianPackageTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(notice.stat().st_mode), 0o644)
         self.assertEqual(notice.read_bytes(), (ROOT / "packaging/debian/copyright").read_bytes())
         text = notice.read_text(encoding="utf-8")
+        generator = ROOT / "packaging/debian/update-copyright.py"
+        self.assertEqual(text, runpy.run_path(str(generator))["render"](),
+                         "Regenerate packaging/debian/copyright with update-copyright.py")
         self.assertIn("https://github.com/seo-rii/maki", text)
         self.assertIn("/usr/share/common-licenses/Apache-2.0", text)
         self.assertIn((ROOT / "vendor/bytes/LICENSE").read_text().strip(), text)
