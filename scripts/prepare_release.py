@@ -265,9 +265,11 @@ def prepare(output):
         }
         # Record inherited compiler customization rather than claiming a
         # reproducible build across machines or silently changing its flags.
+        target_rustflags = f"CARGO_TARGET_{host.upper().replace('-', '_')}_RUSTFLAGS"
         build_environment = {
             key: environment[key]
             for key in ("RUSTC", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                        target_rustflags, "CARGO_BUILD_RUSTFLAGS",
                         "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
             if key in environment
         }
