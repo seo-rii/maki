@@ -115,14 +115,15 @@ without being written; the production profile additionally sets
 The backing tree must be owned by the daemon user, so create it as `maki`:
 
 ```bash
-install -d -o maki -g maki -m 0700 /var/lib/maki/demo
-sudo -u maki maki volume create /etc/maki/volumes/demo.toml
-maki volume inspect /etc/maki/volumes/demo.toml
-maki check /etc/maki/volumes/demo.toml
+install -d -o maki -g maki -m 0700 /var/lib/maki/demo &&
+    sudo -u maki maki volume create /etc/maki/volumes/demo.toml &&
+    maki volume inspect /etc/maki/volumes/demo.toml &&
+    maki check /etc/maki/volumes/demo.toml
 ```
 
 `inspect` prints the volume UUID the bootstrap will pin and the format-file
-sizes at full allocation.
+sizes at full allocation. Continue to provisioning only if the entire block
+succeeds.
 
 ## 4. Provision LVM and XFS on the export
 
