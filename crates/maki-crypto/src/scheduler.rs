@@ -424,10 +424,11 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
     /// the old clamp-and-serialize path let a group exceed the budget (R04).
     fn check_admissible(
         &self,
-        items: usize,
+        group: &[I],
         logical_bytes: u64,
         resident_bytes: u64,
     ) -> Result<(), CryptoError> {
+        let items = group.len();
         if items > self.max_admit_items
             || logical_bytes > self.max_admit_logical_bytes
             || resident_bytes > self.admission.max_bytes()
@@ -440,6 +441,19 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
                 self.max_admit_logical_bytes,
                 self.admission.max_bytes()
             )));
+        }
+        // Engine groups are in ascending order, so validating the common
+        // case needs no allocation. A library caller may use any order.
+        if group
+            .windows(2)
+            .any(|pair| pair[0].unit_index() >= pair[1].unit_index())
+        {
+            let mut seen = HashSet::with_capacity(items);
+            if group.iter().any(|item| !seen.insert(item.unit_index())) {
+                return Err(CryptoError::NonRetryableRequest(
+                    "a scheduler request contains a repeated unit index".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -896,7 +910,7 @@ impl CryptoProvider for BatchScheduler {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
             // Validate before duplicating the plaintext: an inadmissible
             // request must not copy secrets or charge pending capacity (R04).
-            self.encrypt.check_admissible(items.len(), bytes, bytes)?;
+            self.encrypt.check_admissible(items, bytes, bytes)?;
             if items.is_empty() {
                 return Ok(Vec::new());
             }
@@ -951,8 +965,7 @@ impl CryptoProvider for BatchScheduler {
             }
             // Check logical batching independently of resident ciphertext,
             // then reserve its full resident cost before cloning (R3-003).
-            self.decrypt
-                .check_admissible(items.len(), logical_bytes, bytes)?;
+            self.decrypt.check_admissible(items, logical_bytes, bytes)?;
             let permit = self
                 .decrypt
                 .admission
