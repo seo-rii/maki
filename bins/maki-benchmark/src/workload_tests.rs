@@ -229,7 +229,7 @@ async fn queued_workers_do_not_count_as_pending_engine_calls() {
     let (engine, _) = fixture().await;
     let options = options();
     let slots = options.ops;
-    let oracle = Arc::new(Oracle::new(slots).unwrap());
+    let oracle = Arc::new(Oracle::new(slots, &options).unwrap());
     let pending = Arc::new(Pending::default());
     let mut samples = samples();
     let mut writes = std::pin::pin!(phase(
@@ -258,7 +258,7 @@ async fn queued_workers_do_not_count_as_pending_engine_calls() {
 async fn same_address_previous_generation_fails_the_real_read_phase() {
     let (engine, provider) = fixture().await;
     let options = options();
-    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
     let pending = Arc::new(Pending::default());
     let mut samples = samples();
     phase(
@@ -343,7 +343,7 @@ async fn measured_read_coverage_survives_a_later_unread_overwrite() {
     let (engine, _) = fixture().await;
     let mut options = options();
     options.ops = 1;
-    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
     let pending = Arc::new(Pending::default());
     let mut samples = samples();
     for kind in [Kind::Write, Kind::Read, Kind::Write] {
@@ -351,7 +351,10 @@ async fn measured_read_coverage_survives_a_later_unread_overwrite() {
             .await
             .unwrap();
     }
-    assert_eq!(oracle.generation(0), 2);
+    assert_eq!(
+        oracle.state(0).load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG,
+        2
+    );
     assert_eq!(samples.reads.report().samples, 1);
     let verification = verify_final(&engine, &options, &oracle).await.unwrap();
     assert_eq!(verification.written_slots, 1);
@@ -365,7 +368,7 @@ async fn rejected_write_does_not_advance_expected_generation() {
     let (engine, provider) = fixture().await;
     let mut options = options();
     options.ops = 1;
-    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
     provider
         .inner
         .fail_next([CryptoError::NonRetryableRequest("injected".into())]);
@@ -389,14 +392,23 @@ fn oracle_tracks_the_initialized_address_range() {
     let mut options = options();
     for (ops, expected) in [(1, 1), (32, 32), (48, 32)] {
         options.ops = ops;
-        assert_eq!(Oracle::tracked_slots(32, &options), expected);
+        assert_eq!(
+            Oracle::new(32, &options).unwrap().generations.len(),
+            expected
+        );
     }
     options.ops = 1;
     options.random = true;
-    assert_eq!(Oracle::tracked_slots(32, &options), 32);
+    let sparse = Oracle::new(32, &options).unwrap();
+    assert_eq!(sparse.generations.len(), 1);
+    assert_eq!(sparse.slot_index, [random_slot(0, options.seed, 32)]);
+    options.ops = 16;
+    let dense = Oracle::new(32, &options).unwrap();
+    assert_eq!(dense.generations.len(), 32);
+    assert!(dense.slot_index.is_empty());
     options.random = false;
     options.read_percent = Some(100);
-    assert_eq!(Oracle::tracked_slots(32, &options), 32);
+    assert_eq!(Oracle::new(32, &options).unwrap().generations.len(), 32);
 }
 
 #[test]
@@ -405,7 +417,14 @@ fn oracle_capacity_has_an_explicit_byte_bound() {
     assert!(validate_oracle_capacity(max_slots).is_ok());
     assert!(validate_oracle_capacity(max_slots + 1).is_err());
     assert!(validate_oracle_capacity(u64::MAX).is_err());
-    let oracle = Oracle::new(512).unwrap();
+    let oracle = Oracle::new(
+        512,
+        &Options {
+            read_percent: Some(100),
+            ..options()
+        },
+    )
+    .unwrap();
     assert_eq!(oracle.generations.len(), 512);
 }
 
@@ -438,7 +457,7 @@ async fn a_serial_phase_polls_the_engine_in_its_first_poll() {
     let (engine, _) = fixture().await;
     let mut options = options();
     options.concurrency = 1;
-    let oracle = Arc::new(Oracle::new(options.ops).unwrap());
+    let oracle = Arc::new(Oracle::new(options.ops, &options).unwrap());
     let pending = Arc::new(Pending::default());
     let mut samples = samples();
     let mut writes = std::pin::pin!(phase(

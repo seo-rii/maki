@@ -33,6 +33,7 @@ pub struct VerificationReport {
 #[derive(Default, Serialize)]
 pub struct ResourceReport {
     pub oracle_generation_bytes: u64,
+    pub oracle_slot_index_bytes: u64,
     pub peak_pending_operations: u64,
     pub pending_operations_at_exit: u64,
     pub observed_peak_active_callbacks: u64,
@@ -105,34 +106,55 @@ pub fn validate_oracle_capacity(slots: u64) -> Result<(), String> {
 struct Oracle {
     run_id: uuid::Uuid,
     generations: Vec<AtomicU64>,
+    // Sorted physical slots for a sparse phased random run. Dense oracles
+    // use the slot number directly as their generation index.
+    slot_index: Vec<u64>,
 }
 
 impl Oracle {
-    fn new(slots: u64) -> Result<Self, String> {
+    fn new(slots: u64, options: &Options) -> Result<Self, String> {
         validate_oracle_capacity(slots)?;
-        let slots = slots as usize;
+        let mut slot_index = Vec::new();
+        let tracked = if options.read_percent.is_some() {
+            slots
+        } else if !options.random {
+            slots.min(options.ops)
+        } else if options.ops <= slots / 4 {
+            // Both phases use the same seeded addresses. Even with no
+            // collisions, index + generations take at most half the dense budget.
+            slot_index
+                .try_reserve_exact(options.ops as usize)
+                .map_err(|_| "cannot allocate the bounded oracle slot index")?;
+            slot_index
+                .extend((0..options.ops).map(|index| random_slot(index, options.seed, slots)));
+            slot_index.sort_unstable();
+            slot_index.dedup();
+            slot_index.len() as u64
+        } else {
+            slots
+        };
+
         let mut generations = Vec::new();
         generations
-            .try_reserve_exact(slots)
+            .try_reserve_exact(tracked as usize)
             .map_err(|_| "cannot allocate the bounded generation oracle")?;
-        generations.resize_with(slots, || AtomicU64::new(0));
+        generations.resize_with(tracked as usize, || AtomicU64::new(0));
         Ok(Self {
             run_id: uuid::Uuid::new_v4(),
             generations,
+            slot_index,
         })
     }
 
-    fn generation(&self, slot: usize) -> u64 {
-        self.generations[slot].load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG
-    }
-
-    fn tracked_slots(slots: u64, options: &Options) -> u64 {
-        if !options.random && options.read_percent.is_none() {
-            // Sequential phased I/O only visits this prefix (even across wraps).
-            slots.min(options.ops)
+    fn state(&self, slot: u64) -> &AtomicU64 {
+        let index = if self.slot_index.is_empty() {
+            slot as usize
         } else {
-            slots
-        }
+            self.slot_index
+                .binary_search(&slot)
+                .expect("phased address was indexed at setup")
+        };
+        &self.generations[index]
     }
 }
 fn random_slot(index: u64, seed: u64, slots: u64) -> u64 {
@@ -220,7 +242,8 @@ async fn phase(
                 let pending = pending.clone();
                 let operation = async move {
                     let _sequence = sequence;
-                    let previous = oracle.generation(slot as usize);
+                    let state = oracle.state(slot);
+                    let previous = state.load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG;
                     let generation = if read { previous } else { previous + 1 };
                     let expected = data_for(oracle.run_id, offset, generation, size);
                     let began = Instant::now();
@@ -235,8 +258,7 @@ async fn phase(
                             return Err(format!("read verification failed at offset {offset} (expected generation {generation})"));
                         }
                         if generation > 0 {
-                            oracle.generations[slot as usize]
-                                .fetch_or(READ_AFTER_WRITE_FLAG, Ordering::Release);
+                            state.fetch_or(READ_AFTER_WRITE_FLAG, Ordering::Release);
                         }
                     } else {
                         pending
@@ -246,7 +268,7 @@ async fn phase(
                         elapsed = began.elapsed();
                         // A rejected/cancelled write must not advance the
                         // expected value used by a later read.
-                        oracle.generations[slot as usize].fetch_add(1, Ordering::Release);
+                        state.fetch_add(1, Ordering::Release);
                     }
                     Ok::<_, String>((slot, read, elapsed))
                 };
@@ -304,7 +326,12 @@ async fn verify_final(
 ) -> Result<VerificationReport, String> {
     let began = Instant::now();
     let mut report = VerificationReport::default();
-    for (slot, state) in oracle.generations.iter().enumerate() {
+    for (index, state) in oracle.generations.iter().enumerate() {
+        let slot = oracle
+            .slot_index
+            .get(index)
+            .copied()
+            .unwrap_or(index as u64);
         let state = state.load(Ordering::Acquire);
         let generation = state & !READ_AFTER_WRITE_FLAG;
         if generation > 0 {
@@ -315,7 +342,7 @@ async fn verify_final(
         if state & READ_AFTER_WRITE_FLAG != 0 {
             report.read_after_write_verified_slots += 1;
         }
-        let offset = slot as u64 * options.io_size as u64;
+        let offset = slot * options.io_size as u64;
         let expected = data_for(oracle.run_id, offset, generation, options.io_size);
         let actual = engine
             .read(offset, options.io_size)
@@ -375,7 +402,7 @@ pub async fn run(
     working_set_bytes: u64,
 ) -> Result<Measurements, String> {
     let slots = working_set_bytes / options.io_size as u64;
-    let oracle = Arc::new(Oracle::new(Oracle::tracked_slots(slots, options))?);
+    let oracle = Arc::new(Oracle::new(slots, options)?);
     let began = Instant::now();
     let mut setup = SetupReport {
         writes: 0,
@@ -490,6 +517,8 @@ pub async fn run(
     resources.peak_pending_operations = pending.peak.load(Ordering::SeqCst);
     resources.oracle_generation_bytes =
         (oracle.generations.len() * std::mem::size_of::<AtomicU64>()) as u64;
+    resources.oracle_slot_index_bytes =
+        (oracle.slot_index.capacity() * std::mem::size_of::<u64>()) as u64;
     resources.pending_operations_at_exit = pending.current.load(Ordering::SeqCst);
     resources.monitor_interval_ms = 1;
     // Keep sweep I/O outside measured latency/throughput and sampled resources.
