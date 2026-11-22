@@ -93,14 +93,15 @@ impl AbStore {
         Ok(Some(buf))
     }
 
-    fn read_side<T: AbRecord>(
+    fn read_side<T: AbRecord, V>(
         &self,
         backing: &dyn Backing,
         path: &str,
-    ) -> Result<Option<T>, FormatError> {
+        decode: impl FnOnce(&[u8]) -> Result<V, FormatError>,
+    ) -> Result<Option<V>, FormatError> {
         Ok(self
             .read_bytes::<T>(backing, path)?
-            .and_then(|bytes| T::decode(&bytes).ok()))
+            .and_then(|bytes| decode(&bytes).ok()))
     }
 
     /// Best valid copy, if any. `Err` only for hard I/O failures.
@@ -113,18 +114,24 @@ impl AbStore {
         &self,
         backing: &dyn Backing,
     ) -> Result<(Option<T>, usize), FormatError> {
-        let a = self.read_side::<T>(backing, &self.a)?;
-        let b = self.read_side::<T>(backing, &self.b)?;
+        self.load_with_copy_count_by::<T, _>(backing, |bytes| {
+            let record = T::decode(bytes)?;
+            Ok((record.generation(), record))
+        })
+    }
+
+    /// Validate each frame, retaining only the fields the caller needs.
+    /// The decoder supplies the generation used for the usual A/B selection.
+    pub(crate) fn load_with_copy_count_by<T: AbRecord, V>(
+        &self,
+        backing: &dyn Backing,
+        decode: impl Fn(&[u8]) -> Result<(u64, V), FormatError>,
+    ) -> Result<(Option<V>, usize), FormatError> {
+        let a = self.read_side::<T, _>(backing, &self.a, &decode)?;
+        let b = self.read_side::<T, _>(backing, &self.b, decode)?;
         Ok(match (a, b) {
-            (Some(a), Some(b)) => (
-                Some(if a.generation() >= b.generation() {
-                    a
-                } else {
-                    b
-                }),
-                2,
-            ),
-            (Some(record), None) | (None, Some(record)) => (Some(record), 1),
+            (Some((ga, a)), Some((gb, b))) => (Some(if ga >= gb { a } else { b }), 2),
+            (Some((_, record)), None) | (None, Some((_, record))) => (Some(record), 1),
             (None, None) => (None, 0),
         })
     }
@@ -150,10 +157,10 @@ impl AbStore {
         backing: &dyn Backing,
     ) -> Result<(Option<u64>, Option<u64>), FormatError> {
         let a = self
-            .read_side::<T>(backing, &self.a)?
+            .read_side::<T, _>(backing, &self.a, T::decode)?
             .map(|r| r.generation());
         let b = self
-            .read_side::<T>(backing, &self.b)?
+            .read_side::<T, _>(backing, &self.b, T::decode)?
             .map(|r| r.generation());
         Ok((a, b))
     }
