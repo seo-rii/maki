@@ -78,8 +78,12 @@ and reopen the volume, bypass the cache, or qualify persistence after a crash or
 power loss. Those guarantees require separate recovery and durability campaigns.
 
 Sequential phased runs allocate eight oracle bytes per reachable slot, up to
-the smaller of the working-set slot count and the operations per phase. Random
-and mixed workloads track the full working set. The working-set limit remains
+the smaller of the working-set slot count and the operations per phase. For a
+phased random run with at most one operation per four working-set slots, the
+oracle indexes the distinct seeded addresses before measurement. Its index
+reserves eight bytes per planned write, and each distinct address needs one
+eight-byte generation. Denser random runs and mixed workloads use a direct
+generation array for the full working set. The working-set limit remains
 8,388,608 slots (64 MiB for a full oracle,
 or a 32 GiB working set for 4 KiB I/O). Larger working sets are rejected before
 backing creation. Only addresses with an outstanding job/result retain a lock,
@@ -125,6 +129,8 @@ and sweeps the complete initialized working set.
   on success.
 - `oracle_generation_bytes` reports eight bytes per tracked slot, excluding
   allocator overhead and the at-most-256 sequencing locks.
+- `oracle_slot_index_bytes` reports the reserved address-index storage for
+  sparse phased random runs. Directly indexed workloads report zero.
 - `observed_peak_active_callbacks`, `observed_peak_plaintext_bytes`,
   `observed_peak_overlay_bytes` and `observed_peak_journal_pending_bytes` come
   from nonblocking engine snapshots. The monitor samples at most once per
