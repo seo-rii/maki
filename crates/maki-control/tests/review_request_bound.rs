@@ -104,3 +104,24 @@ async fn buffered_frames_preserve_pipelined_and_eof_terminated_responses() {
         Err(ProtocolError::LineTooLong)
     ));
 }
+
+#[tokio::test]
+async fn buffered_client_rejects_incomplete_json_in_the_final_response() {
+    use maki_control::protocol::read_buffered_response;
+    use tokio::io::BufReader;
+
+    let wire = b"{\"ok\":true}\n{\"ok\":";
+    let mut reader = BufReader::new(wire.as_slice());
+    assert_eq!(
+        read_buffered_response(&mut reader).await.unwrap(),
+        json!({"ok": true})
+    );
+    assert!(matches!(
+        read_buffered_response(&mut reader).await,
+        Err(ProtocolError::Json(_))
+    ));
+    assert!(matches!(
+        read_buffered_response(&mut reader).await,
+        Err(ProtocolError::Closed)
+    ));
+}

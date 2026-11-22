@@ -384,8 +384,14 @@ NBD isolation relies on the restricted ancestor: nbdkit resets its own umask,
 so a service `UMask` is not a socket-mode guarantee.
 [nbdkit plugin manual](https://libguestfs.org/nbdkit-plugin.3.html#UMASK)
 
-The unprivileged control socket accepts newline-delimited JSON with a 64 KiB
-line limit. The `maki` CLI exposes the supported operations:
+The unprivileged control socket uses one JSON object per line for requests and
+responses. Each payload can be up to 64 KiB, excluding its terminating newline.
+Writers send a newline after each object. A reader also accepts a complete
+final object when the peer closes its write side immediately after the JSON.
+An empty end of stream closes the session. Incomplete JSON at end of stream
+produces a parse error.
+
+The `maki` CLI exposes the supported operations:
 
 ```bash
 maki status /etc/maki/volumes/example.toml
