@@ -77,6 +77,43 @@ async fn status_and_metrics_work() {
 }
 
 #[tokio::test]
+async fn final_request_at_eof_dispatches_only_complete_json() {
+    use maki_control::protocol::{read_buffered_response, ProtocolError};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    for (last, expected_ok) in [
+        (r#"{"command":"checkpoint"}"#, Some(true)),
+        (r#"{"command":"checkpoint""#, Some(false)),
+        ("", None),
+    ] {
+        let backend = Arc::new(FakeBackend::default());
+        let (mut client, server) = tokio::io::duplex(4096);
+        let frames = format!("{{\"command\":\"status\"}}\n{last}");
+        client.write_all(frames.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        serve_connection(server, backend.clone(), Default::default())
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let status = read_buffered_response(&mut reader).await.unwrap();
+        assert_eq!(status["data"]["state"], "ready");
+        if let Some(ok) = expected_ok {
+            let final_reply = read_buffered_response(&mut reader).await.unwrap();
+            assert_eq!(final_reply["ok"], ok);
+        }
+        assert!(matches!(
+            read_buffered_response(&mut reader).await,
+            Err(ProtocolError::Closed)
+        ));
+        assert_eq!(
+            backend.checkpoints.load(Ordering::SeqCst),
+            u64::from(expected_ok == Some(true))
+        );
+    }
+}
+
+#[tokio::test]
 async fn checkpoint_and_hot_reload_work() {
     let backend = Arc::new(FakeBackend::default());
     let r = roundtrip(backend.clone(), Request::new("checkpoint")).await;
