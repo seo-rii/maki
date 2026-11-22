@@ -1558,7 +1558,7 @@ impl Engine {
                     "reserves {reserved} plus journal append footprint {append_footprint} exceeds free-space accounting range"
                 ))
             })?;
-            let Some(free) = self.backing_free_bytes(Duration::ZERO) else {
+            let Some(free) = self.inner.backing_free_bytes(Duration::ZERO) else {
                 return Err(enospc(
                     "backing free space unavailable while emergency reserve is enabled",
                 ));
@@ -1576,24 +1576,7 @@ impl Engine {
                 )));
             }
         }
-        // Overlay bound (R4-005): the RAM held by uncheckpointed records is
-        // independent of the disk journal limit. Charge the request at its
-        // eventual size — every unit ends up with a durable copy equal to its
-        // latest version, so the projection is 2x the latest bytes — and, if
-        // it does not fit, sync and checkpoint inline exactly like the hard
-        // journal limit; after a reclaim that still cannot make room the
-        // write is refused rather than growing memory.
-        let payload: u64 = cts.iter().map(|ct| ct.data.len() as u64).sum();
-        let over_bytes = self.inner.max_overlay_bytes > 0
-            && volume
-                .overlay_bytes()
-                .max(volume.overlay_latest_bytes().saturating_mul(2))
-                .saturating_add(payload.saturating_mul(2))
-                > self.inner.max_overlay_bytes;
-        let over_entries = self.inner.max_overlay_entries > 0
-            && (volume.overlay_len() as u64).saturating_add(cts.len() as u64)
-                > self.inner.max_overlay_entries;
-        let over_overlay = over_bytes || over_entries;
+        let over_overlay = self.inner.would_exceed_overlay_limit(volume, cts);
         let over_journal = volume
             .journal_total_bytes()
             .saturating_add(footprint(volume))
@@ -1641,29 +1624,6 @@ impl Engine {
             .try_enter()
     }
 
-    /// Backing free space (`None` = unknown), allowing samples younger than
-    /// `max_age`. A zero age forces a fresh sample for write admission; stats
-    /// retain their cache and monitoring reads only the published observation.
-    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
-        let now = self.inner.clock.now();
-        let mut cache = self.inner.free_space.lock();
-        if let Some((value, at)) = *cache {
-            if now.saturating_sub(at) < max_age {
-                return value;
-            }
-        }
-        let value = match self.inner.backing.free_bytes() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("backing free-space query failed: {e}");
-                None
-            }
-        };
-        *cache = Some((value, now));
-        *self.inner.observed_free_space.lock() = Some((value, now));
-        value
-    }
-
     /// Hot-resize the plaintext read cache (SPEC §20; 0 disables).
     /// Resize the plaintext read cache. Returns `false` when the engine runs
     /// without a cache (`cache.mode = off`): there is nothing to apply, and
@@ -1692,8 +1652,7 @@ impl Engine {
     }
 
     async fn flush_inner(&self, fua: bool) -> Result<(), CoreError> {
-        let admission = Arc::new(self.inner.admission.acquire(0).await?);
-        self.check_freshness(admission.clone()).await?;
+        let admission = self.inner.admission.acquire(0).await?;
         let mut volume = self.inner.write_volume().await?;
         let inner = self.inner.clone();
         storage_task(move || {
@@ -1753,9 +1712,9 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let engine = self.clone();
+        let inner = self.inner.clone();
         let backing_free_bytes =
-            storage_task(move || engine.backing_free_bytes(FREE_SPACE_CACHE_TTL))
+            storage_task(move || inner.backing_free_bytes(FREE_SPACE_CACHE_TTL))
                 .await
                 .unwrap_or(None);
         let volume = self.inner.volume.read().await;
@@ -1842,6 +1801,29 @@ impl Engine {
 }
 
 impl EngineInner {
+    /// Backing free space (`None` = unknown), allowing samples younger than
+    /// `max_age`. A zero age forces a fresh sample for write admission; stats
+    /// retain their cache and monitoring reads only the published observation.
+    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
+        let mut cache = self.free_space.lock();
+        if let Some((value, at)) = *cache {
+            if self.clock.now().saturating_sub(at) < max_age {
+                return value;
+            }
+        }
+        let value = match self.backing.free_bytes() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("backing free-space query failed: {e}");
+                None
+            }
+        };
+        let now = self.clock.now();
+        *cache = Some((value, now));
+        *self.observed_free_space.lock() = Some((value, now));
+        value
+    }
+
     /// Record a plaintext hit or return ciphertext to decrypt. The caller
     /// holds the same volume read guard across version lookup and payload I/O.
     fn read_unit(
@@ -2022,6 +2004,39 @@ impl EngineInner {
             && volume.journal_sealed_segment_count() > 0
     }
 
+    fn would_exceed_overlay_limit(&self, volume: &Volume, records: &[CiphertextUnit]) -> bool {
+        if self.max_overlay_entries == 0 && self.max_overlay_bytes == 0 {
+            return false;
+        }
+        let entries = volume.overlay_len() as u64;
+        let bytes = volume
+            .overlay_bytes()
+            .max(volume.overlay_latest_bytes().saturating_mul(2));
+        // A journal sync (including a segment roll within the batch) can
+        // promote each latest version to a second, durable charge.
+        let exceeds = |new_entries: u64, growth: u64| {
+            (self.max_overlay_entries > 0
+                && entries.saturating_add(new_entries) > self.max_overlay_entries)
+                || (self.max_overlay_bytes > 0
+                    && bytes.saturating_add(growth.saturating_mul(2)) > self.max_overlay_bytes)
+        };
+        // Skip overlay lookups while even a wholly new batch would fit.
+        let payload = records.iter().map(|ct| ct.data.len() as u64).sum();
+        if !exceeds(records.len() as u64, payload) {
+            return false;
+        }
+        let mut new_entries = 0;
+        let mut growth = 0;
+        for ct in records {
+            let previous = volume.overlay_ciphertext_len(ct.unit_index);
+            new_entries += u64::from(previous.is_none());
+            // Never spend space from a later shrinking overwrite. Every
+            // prefix must fit even if an append fails partway through.
+            growth += ct.data.len().saturating_sub(previous.unwrap_or(0)) as u64;
+        }
+        exceeds(new_entries, growth)
+    }
+
     /// The overlay has crossed half of a configured bound (R4-005): the
     /// worker should checkpoint before write admission has to do it inline.
     fn overlay_above_watermark(&self, volume: &Volume) -> bool {
@@ -2095,14 +2110,12 @@ impl EngineInner {
             return;
         }
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
-            let backing = self.backing.clone();
-            storage_task(move || backing.free_bytes())
+            let inner = self.clone();
+            storage_task(move || inner.backing_free_bytes(Duration::ZERO))
                 .await
                 .ok()
-                .and_then(Result::ok)
                 .flatten()
-                .map(|free| free < self.policy.low_space_checkpoint_bytes)
-                .unwrap_or(false)
+                .is_some_and(|free| free < self.policy.low_space_checkpoint_bytes)
         } else {
             false
         };

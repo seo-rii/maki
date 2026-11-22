@@ -150,6 +150,37 @@ async fn overlay_bytes_never_exceed_their_limit_under_sustained_writes() {
 }
 
 #[tokio::test]
+async fn replacing_one_unit_reuses_its_overlay_budget() {
+    let _guard = failpoints::test_lock();
+    for (entry_limit, byte_limit) in [(1, 0), (0, 2 * CT)] {
+        let backing = Arc::new(CrashableBacking::new());
+        let engine = engine(
+            &backing,
+            EngineLimits {
+                max_overlay_entries: entry_limit,
+                max_overlay_bytes: byte_limit,
+                ..Default::default()
+            },
+            Some(manual_clock()),
+        )
+        .await;
+        engine.stop_checkpoint_worker().await;
+        for stamp in 0..8 {
+            engine.write(0, &data(stamp), stamp % 2 == 0).await.unwrap();
+        }
+        let stats = engine.stats().await;
+        assert_eq!(stats.checkpoints_total, 0);
+        assert_eq!(stats.overlay_units, 1);
+        assert_eq!(stats.overlay_bytes, 2 * CT);
+        assert_eq!(engine.read(0, UNIT as usize).await.unwrap(), data(7));
+
+        engine.write(off(1), &data(8), true).await.unwrap();
+        assert_eq!(engine.stats().await.checkpoints_total, 1);
+        assert_eq!(engine.read(0, UNIT as usize).await.unwrap(), data(7));
+    }
+}
+
+#[tokio::test]
 async fn overlay_entry_limit_bounds_the_number_of_units_held() {
     let _guard = failpoints::test_lock();
     let backing = Arc::new(CrashableBacking::new());

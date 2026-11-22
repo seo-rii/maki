@@ -283,6 +283,37 @@ async fn newly_known_shortage_replaces_a_sufficient_cached_sample() {
 }
 
 #[tokio::test]
+async fn checkpoint_worker_publishes_its_free_space_sample() {
+    let (backing, clock, engine) = fixture_with_checkpoint_headroom(0, CHECKPOINT_HEADROOM).await;
+    backing
+        .storage
+        .set_free_bytes(Some(2 * CHECKPOINT_HEADROOM));
+    assert_eq!(
+        engine.stats().await.backing_free_bytes,
+        Some(2 * CHECKPOINT_HEADROOM)
+    );
+    engine.write(0, &[5; UNIT as usize], false).await.unwrap();
+    backing.storage.set_free_bytes(Some(17));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while clock.sleeper_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(3600));
+        while engine.monitoring_snapshot().stats.checkpoint_sequence == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint worker did not finish");
+    let snapshot = engine.monitoring_snapshot();
+    assert_eq!(snapshot.stats.backing_free_bytes, Some(17));
+    assert_eq!(snapshot.backing_space_age, Some(Duration::ZERO));
+    let queries = backing.queries.load(Ordering::SeqCst);
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(17));
+    assert_eq!(backing.queries.load(Ordering::SeqCst), queries);
+}
+
+#[tokio::test]
 async fn statistics_keep_their_cache_and_monitoring_never_refreshes_space() {
     let (backing, clock, engine) = fixture(RESERVE).await;
     backing.storage.set_free_bytes(Some(2 * RESERVE));
