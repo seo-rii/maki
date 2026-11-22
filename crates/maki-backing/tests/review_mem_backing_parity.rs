@@ -29,6 +29,48 @@ fn file_backing_namespace_matches_the_expectations() {
     });
 }
 
+fn check_lock_identity(backing: &dyn Backing) {
+    let original = backing.try_lock("lock").unwrap();
+    let displaced = backing.try_lock("renamed").unwrap();
+    backing.rename("lock", "renamed").unwrap();
+    let replacement = backing.try_lock("lock").unwrap();
+
+    drop(displaced);
+    assert_eq!(
+        backing.try_lock("renamed").err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(original);
+    let renamed = backing.try_lock("renamed").unwrap();
+    assert_eq!(
+        backing.try_lock("lock").err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    backing.remove("lock").unwrap();
+    let recreated = backing.try_lock("lock").unwrap();
+    drop(replacement);
+    assert_eq!(
+        backing.try_lock("lock").err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(recreated);
+    drop(renamed);
+    backing.try_lock("lock").unwrap();
+}
+
+#[test]
+fn memory_file_locks_follow_the_file_across_rename_and_unlink() {
+    check_lock_identity(&MemBacking::new());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_file_locks_follow_the_file_across_rename_and_unlink() {
+    let root = tempfile::tempdir().unwrap();
+    check_lock_identity(&maki_backing::FileBacking::new(root.path()).unwrap());
+}
+
 // ---------- zero-length allocation ----------
 
 /// Every backing must agree on `allocate_range(_, 0)`: it reserves nothing
