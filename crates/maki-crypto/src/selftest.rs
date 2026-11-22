@@ -55,7 +55,7 @@ async fn encrypt_chunked(
     for range in batch_ranges(items, caps, |p| p.data.len() as u64) {
         let chunk = &items[range];
         let cts = provider.encrypt_batch(context, chunk).await?;
-        out.extend(validate_owned_encrypt_result(chunk, cts, caps)?);
+        out.extend(validate_owned_encrypt_result(provider, chunk, cts, caps)?);
     }
     Ok(out)
 }

@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 use crate::clock::Clock;
 use crate::error::CryptoError;
 use crate::flow::{DualPermit, DualSemaphore};
-use crate::provider::CryptoProvider;
+use crate::provider::{private::ValidationCaller, CryptoProvider};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
 #[derive(Debug, Clone)]
@@ -829,6 +829,12 @@ impl BatchScheduler {
 
 #[async_trait]
 impl CryptoProvider for BatchScheduler {
+    fn checks_plaintext_echo(&self, caller: ValidationCaller) -> bool {
+        // The lane copies input bytes unchanged, then gives each caller its
+        // original consecutive slice of the provider's ordered output.
+        self.inner.checks_plaintext_echo(caller)
+    }
+
     fn max_operation_time(&self) -> Option<Duration> {
         self.inner.max_operation_time()
     }

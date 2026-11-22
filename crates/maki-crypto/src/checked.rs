@@ -15,7 +15,7 @@ use tokio::sync::OnceCell;
 use zeroize::Zeroize;
 
 use crate::error::CryptoError;
-use crate::provider::CryptoProvider;
+use crate::provider::{private::ValidationCaller, CryptoProvider};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
 pub struct CheckedProvider {
@@ -72,12 +72,18 @@ impl Drop for PendingEncryptResult {
 /// Validate an owned encrypt response, erasing every payload on rejection.
 /// Successful validation transfers the existing allocations without copying.
 pub(crate) fn validate_owned_encrypt_result(
+    provider: &dyn CryptoProvider,
     items: &[PlaintextUnit],
     out: Vec<CiphertextUnit>,
     caps: &CryptoCapabilities,
 ) -> Result<Vec<CiphertextUnit>, CryptoError> {
     let mut pending = PendingEncryptResult(out);
-    validate_encrypt_result(items, &pending.0, caps)?;
+    check_encrypt_result(
+        items,
+        &pending.0,
+        caps,
+        !provider.checks_plaintext_echo(ValidationCaller),
+    )?;
     Ok(std::mem::take(&mut pending.0))
 }
 
@@ -88,6 +94,15 @@ pub fn validate_encrypt_result(
     items: &[PlaintextUnit],
     out: &[CiphertextUnit],
     caps: &CryptoCapabilities,
+) -> Result<(), CryptoError> {
+    check_encrypt_result(items, out, caps, true)
+}
+
+fn check_encrypt_result(
+    items: &[PlaintextUnit],
+    out: &[CiphertextUnit],
+    caps: &CryptoCapabilities,
+    scan_plaintext: bool,
 ) -> Result<(), CryptoError> {
     if out.len() != items.len() {
         return Err(CryptoError::Contract(format!(
@@ -123,7 +138,8 @@ pub fn validate_encrypt_result(
         // reproduces a whole unit of plaintext with negligible probability.
         // The error charges the endpoint that answered.
         let plain = item.data.expose();
-        if !plain.is_empty() && contains_plaintext(&ct.data, plain, |a, b| a == b) {
+        if scan_plaintext && !plain.is_empty() && contains_plaintext(&ct.data, plain, |a, b| a == b)
+        {
             return Err(CryptoError::Contract(format!(
                 "encrypt result {i} carries its plaintext: the provider is not encrypting"
             )));
@@ -164,6 +180,10 @@ pub fn validate_decrypt_result(
 
 #[async_trait]
 impl CryptoProvider for CheckedProvider {
+    fn checks_plaintext_echo(&self, _: ValidationCaller) -> bool {
+        true
+    }
+
     fn max_operation_time(&self) -> Option<std::time::Duration> {
         self.inner.max_operation_time()
     }
@@ -179,7 +199,7 @@ impl CryptoProvider for CheckedProvider {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         let caps = self.caps().await?;
         let out = self.inner.encrypt_batch(context, items).await?;
-        validate_owned_encrypt_result(items, out, caps)
+        validate_owned_encrypt_result(self.inner.as_ref(), items, out, caps)
     }
 
     async fn decrypt_batch(
