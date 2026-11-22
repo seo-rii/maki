@@ -49,6 +49,7 @@ impl RandomPrefixProvider {
         let wire_unit_size = logical_unit_size.checked_add(prefix_bytes).ok_or_else(|| {
             CryptoError::ProviderFatal("logical unit plus random prefix overflows u32".into())
         })?;
+        let inner = CheckedProvider::pinned(inner, wire_unit_size);
         let inner_caps = inner.capabilities().await?;
         if !inner_caps
             .supported_plaintext_sizes
@@ -106,7 +107,7 @@ impl RandomPrefixProvider {
         };
         let max_operation_time = inner.max_operation_time();
         Ok(Self {
-            inner: CheckedProvider::pinned(inner, wire_unit_size),
+            inner,
             inner_compatibility_id: inner_caps.crypto_compatibility_id,
             logical_unit_size,
             wire_unit_size,
@@ -231,25 +232,15 @@ impl CryptoProvider for RandomPrefixProvider {
                 self.caps.max_ciphertext_size
             )));
         }
-        let expanded = self.inner.decrypt_batch(&inner_context, items).await?;
-        let mut stripped = Vec::new();
-        stripped.try_reserve_exact(expanded.len()).map_err(|_| {
-            CryptoError::ProviderFatal("failed to allocate decrypted plaintext batch".into())
-        })?;
-        for item in expanded {
-            let payload = &item.data.expose()[self.prefix_bytes as usize..];
-            let mut data =
-                SecretBuffer::with_capacity(self.logical_unit_size as usize).map_err(|_| {
-                    CryptoError::ProviderFatal("failed to allocate decrypted plaintext unit".into())
-                })?;
-            data.try_extend_from_slice(payload).map_err(|_| {
-                CryptoError::ProviderFatal("decrypted plaintext capacity invariant failed".into())
-            })?;
-            stripped.push(PlaintextUnit {
-                unit_index: item.unit_index,
-                data,
-            });
+        let mut units = self.inner.decrypt_batch(&inner_context, items).await?;
+        for item in &mut units {
+            // The checked provider has pinned each expanded unit to the wire
+            // size. Keep its guarded allocation and erase the vacated tail.
+            item.data
+                .expose_mut()
+                .copy_within(self.prefix_bytes as usize.., 0);
+            item.data.truncate(self.logical_unit_size as usize);
         }
-        Ok(stripped)
+        Ok(units)
     }
 }

@@ -93,6 +93,29 @@ fn lru_evicts_least_recently_used_within_byte_budget() {
 }
 
 #[test]
+fn retained_capacity_is_charged_on_insert_replacement_and_eviction() {
+    let (cache, _) = cache(1024, Duration::from_secs(60));
+    let buffer = |capacity| {
+        let mut data = SecretBuffer::with_capacity(capacity).unwrap();
+        data.try_extend_from_slice(&[1]).unwrap();
+        data
+    };
+
+    cache.put(1, 1, buffer(512));
+    cache.put(2, 1, buffer(256));
+    assert_eq!(cache.stats().bytes, 768);
+    cache.put(1, 2, buffer(1024));
+    assert!(cache.get(2, 1).is_none());
+    assert_eq!(cache.stats().bytes, 1024);
+    cache.set_max_bytes(512);
+    assert!(cache.get(1, 2).is_none());
+    assert_eq!(cache.stats().bytes, 0);
+    cache.put(1, 3, buffer(1024));
+    cache.put(2, 2, SecretBuffer::with_capacity(256).unwrap());
+    assert_eq!(cache.stats().entries, 0);
+}
+
+#[test]
 fn oversized_entry_is_not_cached() {
     let (cache, _clock) = cache(512, Duration::from_secs(60));
     cache.put(1, 1, buf(1, 4096));
