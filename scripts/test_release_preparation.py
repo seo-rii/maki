@@ -492,6 +492,20 @@ class ReleasePreparationTests(unittest.TestCase):
             "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
         })
 
+    def test_manifest_records_cargo_and_environment_wrapper_inputs(self):
+        wrappers = {
+            "CARGO_BUILD_RUSTC_WRAPPER": "build-wrapper",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": "workspace-build-wrapper",
+            "RUSTC_WRAPPER": "override-wrapper",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+        }
+        self.environment.update(wrappers)
+        self.environment["CARGO_BUILD_UNRELATED"] = "unrelated"
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["compiler_environment"],
+                         {"RUSTC": str(self.tools / "rustc"), **wrappers})
+
     def test_compiler_overrides_match_the_recorded_toolchain_and_target(self):
         alternate = self.tools / "alternate-rustc"
         alternate.write_text(
