@@ -50,7 +50,7 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
     # Read the committed blobs directly. git archive applies checkout-local
     # attributes such as export-ignore and export-subst to the same tree.
     listing = subprocess.check_output(git_command("ls-tree", "-rz", "-t", commit, repo=repo))
-    with tarfile.open(destination, "w", pax_headers={"comment": commit}) as archive, \
+    with tarfile.open(destination, "w", encoding="utf-8", pax_headers={"comment": commit}) as archive, \
             subprocess.Popen(git_command("cat-file", "--batch", repo=repo),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as blobs:
         directory = tarfile.TarInfo(prefix)
@@ -61,7 +61,8 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
         for entry in listing.rstrip(b"\0").split(b"\0"):
             metadata, name = entry.split(b"\t", 1)
             mode, _, oid = metadata.split()
-            member = tarfile.TarInfo(f"{prefix}/{os.fsdecode(name)}")
+            path = name.decode("utf-8", "surrogateescape")
+            member = tarfile.TarInfo(f"{prefix}/{path}")
             member.mtime = epoch
             if mode == b"040000":
                 member.type = tarfile.DIRTYPE
@@ -79,7 +80,7 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
             if mode == b"120000":
                 member.type = tarfile.SYMTYPE
                 member.mode = 0o777
-                member.linkname = os.fsdecode(blobs.stdout.read(size))
+                member.linkname = blobs.stdout.read(size).decode("utf-8", "surrogateescape")
                 archive.addfile(member)
             else:
                 member.size = size
@@ -232,7 +233,7 @@ def prepare(output):
                 shutil.copyfileobj(source, compressed)
         extracted = work / "source"
         extracted.mkdir()
-        with tarfile.open(archive_tar) as archive:
+        with tarfile.open(archive_tar, encoding="utf-8") as archive:
             # Python 3.11 does not yet provide tarfile's data filter. Git
             # tracks no device files, and this project needs no source links;
             # reject links instead of letting extraction escape the build.
@@ -241,6 +242,8 @@ def prepare(output):
                 relative = pathlib.PurePosixPath(member.name)
                 if relative.is_absolute() or ".." in relative.parts or not (member.isdir() or member.isfile()):
                     fail(f"unsupported source archive entry: {member.name}")
+                # Hand the original Git path bytes back to the local filesystem.
+                member.name = os.fsdecode(member.name.encode("utf-8", "surrogateescape"))
             archive.extractall(extracted, members=members)
         source = extracted / f"maki-{workspace_version}"
         environment = os.environ.copy()
