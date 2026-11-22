@@ -242,6 +242,44 @@ class GuestContracts(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     run([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.1)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux guest")
+    def test_guest_setup_rejects_exit_observed_after_deadline(self):
+        gce = load("gce_deadline", "gcp-reset-guest.py")
+        shared = sys.modules[self.guest.guest_command_output.__module__]
+        clock = mock.Mock(wraps=shared.time)
+        command = """import os, sys, time
+os.close(1)
+os.close(2)
+until = time.monotonic() + 5
+while not os.path.exists(sys.argv[1]):
+    if time.monotonic() >= until:
+        sys.exit(1)
+    time.sleep(0.001)
+"""
+
+        def release_child():
+            # The first clock sample after EOF is still within budget. Only
+            # then can the child exit, and the next observation is too late.
+            release.touch()
+            clock.monotonic.side_effect = None
+            clock.monotonic.return_value = 2
+            return 0
+
+        class DelayedEOF(shared.selectors.DefaultSelector):
+            def unregister(self, fileobj):
+                key = super().unregister(fileobj)
+                if not self.get_map():
+                    clock.monotonic.side_effect = release_child
+                return key
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(shared, "time", clock), \
+                mock.patch.object(shared.selectors, "DefaultSelector", DelayedEOF):
+            for run in (self.guest.run, gce.run_output):
+                release = pathlib.Path(directory) / run.__name__
+                clock.monotonic.return_value = 0
+                with self.subTest(run=run), self.assertRaises(subprocess.TimeoutExpired):
+                    run([sys.executable, "-c", command, str(release)], timeout=1)
+
     def test_real_payload_manifest_matches_host_and_barrier_calls(self):
         for cycle, mode in ((0, "flush"), (1, "fua")):
             client = mock.Mock()
