@@ -434,8 +434,7 @@ pub(crate) fn deadline_error() -> CryptoError {
     CryptoError::Retryable(DEADLINE_MESSAGE.to_string())
 }
 
-/// The *operation's* wall-clock budget ran out; says nothing about the
-/// health of whichever endpoint happened to be in flight.
+/// Recognize reported deadline outcomes for scheduler caller metrics.
 pub(crate) fn is_deadline_error(err: &CryptoError) -> bool {
     matches!(err, CryptoError::Retryable(m) if m == DEADLINE_MESSAGE)
 }
@@ -598,7 +597,7 @@ impl EndpointSet {
         &self,
         deadline: Option<Duration>,
     ) -> Result<&CryptoCapabilities, CryptoError> {
-        self.until_deadline(deadline, self.common_caps()).await
+        self.until_deadline(deadline, self.common_caps()).await?
     }
 
     /// One absolute budget covers every await. If polling was delayed, both
@@ -607,10 +606,10 @@ impl EndpointSet {
     async fn until_deadline<T>(
         &self,
         deadline: Option<Duration>,
-        operation: impl std::future::Future<Output = Result<T, CryptoError>>,
+        operation: impl std::future::Future<Output = T>,
     ) -> Result<T, CryptoError> {
         let Some(deadline) = deadline else {
-            return operation.await;
+            return Ok(operation.await);
         };
         let remaining = deadline.saturating_sub(self.clock.now());
         if !remaining.is_zero() {
@@ -619,7 +618,7 @@ impl EndpointSet {
                 _ = self.clock.sleep(remaining) => {},
                 result = operation => {
                     if self.clock.now() < deadline {
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
@@ -859,8 +858,7 @@ impl EndpointSet {
                 }
             }
         };
-        self.until_deadline(deadline, async { Ok(admit.await) })
-            .await
+        self.until_deadline(deadline, admit).await
     }
 
     async fn call_endpoint(
@@ -918,20 +916,6 @@ impl EndpointSet {
         rpc.count = rpc.count.saturating_add(1);
         rpc.total = rpc.total.saturating_add(elapsed);
         result
-    }
-
-    /// The RPC, abandoned at the deadline (the dropped future cancels the
-    /// transport request).
-    async fn call_with_deadline(
-        &self,
-        endpoint: &Endpoint,
-        context: &CryptoContext,
-        request: &Request<'_>,
-        deadline: Option<Duration>,
-        caps: &CryptoCapabilities,
-    ) -> Result<Response, CryptoError> {
-        let call = self.call_endpoint(endpoint, context, request, caps);
-        self.until_deadline(deadline, call).await
     }
 
     async fn dispatch(
@@ -1064,27 +1048,22 @@ impl EndpointSet {
                 }
                 last_endpoint = Some(endpoint.clone());
                 attempted = true;
-                match self
-                    .call_with_deadline(&endpoint, context, &request, deadline, caps)
-                    .await
-                {
-                    Ok(response) => {
+                let call = self.call_endpoint(&endpoint, context, &request, caps);
+                match self.until_deadline(deadline, call).await {
+                    Err(expired) => {
+                        // Our timer canceled the RPC. Its delivery is unknown;
+                        // dropping the probe returns its slot without a verdict.
+                        *sent = true;
+                        return Err(expired);
+                    }
+                    Ok(Ok(response)) => {
                         probe.on_success();
                         return Ok(response);
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         // Only a transport's proof keeps the request unsent.
                         let unsent = err.is_not_sent();
                         *sent |= !unsent;
-                        if is_deadline_error(&err) {
-                            // The operation's budget ran out mid-RPC: not
-                            // an endpoint failure, so no breaker or budget
-                            // charge (C-06). The probe permit drops here
-                            // and returns its half-open slot without a
-                            // verdict, or abandoned probes would wedge the
-                            // circuit (BUG-004 / N-10).
-                            return Err(err);
-                        }
                         match err.class() {
                             class @ (ErrorClass::Retryable
                             | ErrorClass::Throttled

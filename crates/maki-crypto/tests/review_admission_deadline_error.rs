@@ -188,3 +188,56 @@ async fn a_late_rpc_cannot_win_against_an_already_expired_deadline() {
     assert_eq!(set.metrics().deadline_exceeded_total(), 32);
     assert_eq!(set.metrics().rpc_count(), 0);
 }
+
+#[tokio::test]
+async fn nested_peer_deadline_obeys_the_outer_failover_policy() {
+    for (budget, retry_safe) in [
+        (Some(DEADLINE), true),
+        (None, true),
+        (Some(DEADLINE), false),
+    ] {
+        let clock = Arc::new(ManualClock::new());
+        let slow = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+        slow.set_latency(clock.clone(), DEADLINE * 2);
+        let peer_budget = Duration::from_millis(10);
+        let inner = Arc::new(EndpointSet::new(
+            vec![("slow".into(), slow.clone())],
+            DispatchConfig {
+                max_operation_time: Some(peer_budget),
+                ..cfg()
+            },
+            clock.clone(),
+        ));
+        let healthy = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+        let outer = Arc::new(EndpointSet::new(
+            vec![
+                ("inner".into(), inner.clone()),
+                ("healthy".into(), healthy.clone()),
+            ],
+            DispatchConfig {
+                max_operation_time: budget,
+                retry_safe,
+                ..cfg()
+            },
+            clock.clone(),
+        ));
+
+        let operation = spawn_encrypt(&outer, 1);
+        settle().await;
+        assert_eq!(slow.encrypt_calls(), 1);
+        clock.advance(peer_budget);
+        settle().await;
+        assert!(operation.is_finished());
+        let result = operation.await.unwrap();
+        assert_eq!(inner.metrics().deadline_exceeded_total(), 1);
+        assert_eq!(outer.metrics().deadline_exceeded_total(), 0);
+        assert_eq!(healthy.encrypt_calls(), usize::from(retry_safe));
+        assert_eq!(outer.metrics().failovers_total(), u64::from(retry_safe));
+        if retry_safe {
+            assert_eq!(result.unwrap().len(), 1);
+        } else {
+            assert!(!result.unwrap_err().is_not_sent());
+            assert_eq!(outer.metrics().retries_refused_unsafe_total(), 1);
+        }
+    }
+}
