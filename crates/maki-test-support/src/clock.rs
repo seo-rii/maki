@@ -24,7 +24,7 @@ struct Inner {
 /// Sleep futures complete exactly when their deadline is reached. Sleepers
 /// that become due in one `advance` are woken by deadline, then in the
 /// order they were created, so the run order of the woken tasks is the same
-/// on every run.
+/// on every run. Time and deadlines saturate at `Duration::MAX`.
 #[derive(Clone, Default)]
 pub struct ManualClock {
     inner: Arc<Mutex<Inner>>,
@@ -36,7 +36,7 @@ impl ManualClock {
     }
 
     pub fn advance(&self, d: Duration) {
-        self.update_time(|now| now + d);
+        self.update_time(|now| now.saturating_add(d));
     }
 
     pub fn set(&self, t: Duration) {
@@ -77,7 +77,7 @@ impl Clock for ManualClock {
         let mut inner = self.inner.lock();
         let id = inner.next_id;
         inner.next_id += 1;
-        let deadline = inner.now + duration;
+        let deadline = inner.now.saturating_add(duration);
         inner.sleepers.insert((deadline, id), None);
         drop(inner);
         Box::pin(ManualSleep {
