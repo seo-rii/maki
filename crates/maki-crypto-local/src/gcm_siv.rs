@@ -89,12 +89,22 @@ impl AesGcmSivProvider {
         self.cipher.is_page_locked()
     }
 
-    fn aad(&self, context: &CryptoContext, unit_index: u64) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(16 + 8 + 4 + context.crypto_compatibility_id.len());
-        aad.extend_from_slice(context.volume_uuid.as_bytes());
-        aad.extend_from_slice(&unit_index.to_le_bytes());
-        aad.extend_from_slice(&context.format_version.to_le_bytes());
-        aad.extend_from_slice(context.crypto_compatibility_id.as_bytes());
+    /// The volume, version and profile are shared by every item in the batch.
+    /// Initialize the buffer at the first valid unit, then replace only its index.
+    fn aad_for_unit<'a>(
+        context: &CryptoContext,
+        unit_index: u64,
+        aad: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        if aad.is_empty() {
+            aad.reserve_exact(16 + 8 + 4 + context.crypto_compatibility_id.len());
+            aad.extend_from_slice(context.volume_uuid.as_bytes());
+            aad.extend_from_slice(&unit_index.to_le_bytes());
+            aad.extend_from_slice(&context.format_version.to_le_bytes());
+            aad.extend_from_slice(context.crypto_compatibility_id.as_bytes());
+        } else {
+            aad[16..24].copy_from_slice(&unit_index.to_le_bytes());
+        }
         aad
     }
 
@@ -136,6 +146,7 @@ impl CryptoProvider for AesGcmSivProvider {
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
         self.check_context(context)?;
         let mut out = Vec::with_capacity(items.len());
+        let mut batch_aad = Vec::new();
         let mut rng = rand::rng();
         for item in items {
             let pt = item.data.expose();
@@ -147,7 +158,7 @@ impl CryptoProvider for AesGcmSivProvider {
             }
             let mut nonce = [0u8; NONCE_LEN];
             rng.fill_bytes(&mut nonce);
-            let aad = self.aad(context, item.unit_index);
+            let aad = Self::aad_for_unit(context, item.unit_index, &mut batch_aad);
             // Guard the final frame before copying plaintext into its body.
             // Transfer the allocation only after successful encryption.
             let mut frame = SecretBuffer::zeroed(self.max_ciphertext_size as usize);
@@ -157,7 +168,7 @@ impl CryptoProvider for AesGcmSivProvider {
             body.copy_from_slice(pt);
             let tag = self
                 .cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, body)
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, body)
                 .map_err(|_| CryptoError::ProviderFatal("AEAD encryption failed".to_string()))?;
             tag_field.copy_from_slice(&tag);
             out.push(CiphertextUnit {
@@ -175,6 +186,7 @@ impl CryptoProvider for AesGcmSivProvider {
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
         self.check_context(context)?;
         let mut out = Vec::with_capacity(items.len());
+        let mut batch_aad = Vec::new();
         for item in items {
             if item.data.len() < NONCE_LEN + TAG_LEN {
                 return Err(CryptoError::Integrity("ciphertext too short".to_string()));
@@ -188,7 +200,7 @@ impl CryptoProvider for AesGcmSivProvider {
                     "decrypted length mismatch".to_string(),
                 ));
             }
-            let aad = self.aad(context, item.unit_index);
+            let aad = Self::aad_for_unit(context, item.unit_index, &mut batch_aad);
             // Plaintext is produced inside a buffer that was guarded before
             // decryption started; on failure the cipher re-encrypts the
             // buffer and the buffer is zeroized when dropped here.
@@ -196,7 +208,7 @@ impl CryptoProvider for AesGcmSivProvider {
             self.cipher
                 .decrypt_in_place_detached(
                     Nonce::from_slice(nonce),
-                    &aad,
+                    aad,
                     pt.expose_mut(),
                     Tag::from_slice(tag),
                 )
