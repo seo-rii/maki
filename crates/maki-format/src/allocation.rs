@@ -46,6 +46,22 @@ impl AllocationMap {
         }
     }
 
+    /// Set units below an exclusive limit, in ascending order. Skip empty
+    /// bytes and stop at the addressable end of a partially filled shard.
+    pub fn set_units(&self, limit: u64) -> impl Iterator<Item = u64> + '_ {
+        let limit = limit.min(self.units);
+        self.bits[..limit.div_ceil(8) as usize]
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, byte)| *byte != 0)
+            .flat_map(|(index, byte)| {
+                let base = index as u64 * 8;
+                (0..8).filter_map(move |bit| (byte & (1 << bit) != 0).then_some(base + bit))
+            })
+            .take_while(move |&unit| unit < limit)
+    }
+
     /// Number of allocated units (padding bits are always clear).
     pub fn set_count(&self) -> u64 {
         self.bits.iter().map(|b| b.count_ones() as u64).sum()
@@ -126,5 +142,24 @@ impl AbRecord for AllocationMap {
 
     fn decode(data: &[u8]) -> Result<Self, FormatError> {
         AllocationMap::decode(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AllocationMap;
+
+    #[test]
+    fn set_units_stops_at_the_addressable_limit() {
+        let mut map = AllocationMap::new(67);
+        for slot in [0, 7, 32, 35, 63, 65] {
+            map.set(slot, true);
+        }
+        for limit in [0, 1, 7, 8, 24, 35, 36, 64, 66, 67, u64::MAX] {
+            let expected: Vec<_> = (0..limit.min(map.units()))
+                .filter(|&slot| map.get(slot))
+                .collect();
+            assert_eq!(map.set_units(limit).collect::<Vec<_>>(), expected);
+        }
     }
 }

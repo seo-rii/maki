@@ -844,14 +844,16 @@ impl SlotStore {
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
             let base = shard_idx * per_shard;
-            (0..addressable_units(&self.geometry, shard_idx)).filter_map(move |in_shard| {
-                (shard.alloc.get(in_shard)
-                    && !shard
+            shard
+                .alloc
+                .set_units(addressable_units(&self.geometry, shard_idx))
+                .filter(move |&in_shard| {
+                    !shard
                         .discard
                         .as_ref()
-                        .is_some_and(|discard| discard.get(in_shard)))
-                .then_some(base + in_shard)
-            })
+                        .is_some_and(|discard| discard.get(in_shard))
+                })
+                .map(move |in_shard| base + in_shard)
         })
     }
 
@@ -879,24 +881,7 @@ impl SlotStore {
 
     /// Lowest allocated unit, if any slot has ever been checkpointed.
     pub fn first_allocated_unit(&self) -> Option<u64> {
-        let mut shards: Vec<u64> = self.shards.keys().copied().collect();
-        shards.sort_unstable();
-        for shard_idx in shards {
-            let shard = &self.shards[&shard_idx];
-            if shard.alloc.set_count() == 0 {
-                continue;
-            }
-            if let Some(in_shard) = (0..addressable_units(&self.geometry, shard_idx)).find(|u| {
-                shard.alloc.get(*u)
-                    && !shard
-                        .discard
-                        .as_ref()
-                        .is_some_and(|discard| discard.get(*u))
-            }) {
-                return Some(shard_idx * self.geometry.units_per_shard() + in_shard);
-            }
-        }
-        None
+        self.allocated_units().next()
     }
 
     fn ensure_shard(&mut self, shard_idx: u64) -> Result<(), CoreError> {
