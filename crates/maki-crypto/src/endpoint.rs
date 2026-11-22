@@ -574,6 +574,7 @@ impl EndpointSet {
                         common = common.intersect(&caps);
                     }
                 }
+                common.retry_safe &= self.config.retry_safe;
                 common.supported_plaintext_sizes.sort_unstable();
                 common.supported_plaintext_sizes.dedup();
                 if !common.batch.supported {
@@ -1228,7 +1229,7 @@ impl CryptoProvider for EndpointSet {
                     context,
                     Request::Encrypt(chunk),
                     deadline,
-                    self.config.retry_safe && caps.retry_safe,
+                    caps.retry_safe,
                     caps,
                 )
                 .await;
@@ -1287,7 +1288,7 @@ impl CryptoProvider for EndpointSet {
                     context,
                     Request::Decrypt(chunk),
                     deadline,
-                    self.config.retry_safe && caps.retry_safe,
+                    caps.retry_safe,
                     caps,
                 )
                 .await;
