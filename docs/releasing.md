@@ -152,7 +152,8 @@ packaging of identical artifacts stable. The command does not claim bitwise
 reproducibility across compiler versions, system libraries, paths, or Cargo
 configuration. The manifest records inherited Rust flag inputs, including
 `CARGO_BUILD_RUSTFLAGS` and the `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for the
-selected build target. It also records compiler wrapper inputs from
+selected build target. It records the target-specific linker from
+`CARGO_TARGET_<TRIPLE>_LINKER` and compiler wrapper inputs from
 `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`
 and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`. Cargo applies its usual precedence
 when several inputs are set.
