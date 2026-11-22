@@ -476,6 +476,22 @@ class ReleasePreparationTests(unittest.TestCase):
                 self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
                 self.assertEqual((outside / "sentinel").read_text(), "preserve")
 
+    def test_manifest_records_build_and_selected_target_rustflags(self):
+        target_key = "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_RUSTFLAGS"
+        self.environment.update({
+            target_key: "--cfg target_marker",
+            "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
+            "CARGO_TARGET_OTHER_LINUX_GNU_RUSTFLAGS": "--cfg other_marker",
+            "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_UNRELATED": "unrelated",
+        })
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["compiler_environment"], {
+            "RUSTC": str(self.tools / "rustc"),
+            target_key: "--cfg target_marker",
+            "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
+        })
+
     def test_compiler_overrides_match_the_recorded_toolchain_and_target(self):
         alternate = self.tools / "alternate-rustc"
         alternate.write_text(

@@ -150,7 +150,10 @@ dpkg-deb --contents "$candidate_output"/*.deb
 The fixed source epoch and deterministic package builder make repeated
 packaging of identical artifacts stable. The command does not claim bitwise
 reproducibility across compiler versions, system libraries, paths, or Cargo
-configuration. The recorded environment overrides are diagnostic metadata;
+configuration. The manifest records inherited Rust flag inputs, including
+`CARGO_BUILD_RUSTFLAGS` and the `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for the
+selected build target. Cargo applies its usual precedence when several are set.
+The recorded environment overrides are diagnostic metadata;
 they are not a hermetic-build attestation. Review those overrides before
 sharing the manifest. Checksums establish bundle consistency, not publisher
 authenticity; a public release additionally needs the chosen signing or
