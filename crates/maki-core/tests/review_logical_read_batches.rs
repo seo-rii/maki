@@ -144,3 +144,25 @@ async fn expanded_ciphertexts_still_obey_resident_admission() {
         UNIT as usize
     );
 }
+
+#[tokio::test]
+async fn engine_attaches_and_splits_io_at_the_schedulers_smaller_item_limit() {
+    let scheduler = BatchScheduler::with_unit_size(
+        Arc::new(FakeCryptoProvider::new(UNIT)),
+        SchedulerConfig {
+            max_items: 2,
+            target_items: 1,
+            ..Default::default()
+        },
+        Arc::new(ManualClock::new()),
+        UNIT,
+    );
+    let engine = engine(Arc::new(scheduler)).await;
+    let data: Vec<u8> = (1u8..=9)
+        .flat_map(|n| std::iter::repeat_n(n, UNIT as usize))
+        .collect();
+    engine.write(0, &data, true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+    assert_eq!(engine.read(0, data.len()).await.unwrap(), data);
+    engine.stop_checkpoint_worker().await;
+}
