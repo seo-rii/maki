@@ -119,7 +119,7 @@ maki_target_dir="$(cargo +1.94.0 metadata --format-version 1 --no-deps |
 maki_host="$(rustc +1.94.0 -vV | sed -n 's/^host: //p')"
 cargo +1.94.0 build --release --locked --target "$maki_host" \
   -p maki -p maki-attach -p maki-check -p maki-nbdkit
-SOURCE_DATE_EPOCH="$(git show --no-show-signature -s --format=%ct HEAD)" \
+SOURCE_DATE_EPOCH="$(git --no-replace-objects show --no-show-signature -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
   --release-dir "$maki_target_dir/$maki_host/release" \
   --version "$maki_version" \
