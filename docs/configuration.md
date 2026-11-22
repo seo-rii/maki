@@ -794,7 +794,8 @@ window, while time waiting for queue admission does not. A full lane can delay
 dispatch beyond that deadline; available capacity does not start a new window.
 A request's items are never split and keep
 their order. Requests that touch the same unit are never coalesced: one
-provider call never carries a unit twice. Each lane keeps up to `limits.max_crypto_inflight_batches`
+provider call never carries a unit twice. A single request with a repeated unit
+number is rejected before queue admission. Each lane keeps up to `limits.max_crypto_inflight_batches`
 batches in flight at once (the dispatcher's own limits bound what reaches the
 endpoints), so one slow batch does not serialize the requests behind it.
 `limits.max_pending_crypto_items` bounds queued items per lane (one permit per

@@ -194,3 +194,35 @@ async fn two_writes_of_one_unit_never_share_an_encrypt_call() {
     }
     assert_distinct(&provider.calls.lock());
 }
+
+#[tokio::test]
+async fn repeated_units_within_one_request_are_rejected_before_dispatch() {
+    let provider = Arc::new(UnitKeyed {
+        inner: FakeCryptoProvider::new(UNIT as u32),
+        calls: Mutex::new(Vec::new()),
+    });
+    let scheduler = BatchScheduler::new(provider.clone(), config(), Arc::new(ManualClock::new()));
+    let repeated = [pt(7, 5), pt(3, 9), pt(7, 6)];
+    let ciphertext = provider
+        .inner
+        .encrypt_batch(&ctx(), &repeated)
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler.encrypt_batch(&ctx(), &repeated).await,
+        Err(CryptoError::NonRetryableRequest(_))
+    ));
+    assert!(matches!(
+        scheduler.decrypt_batch(&ctx(), &ciphertext).await,
+        Err(CryptoError::NonRetryableRequest(_))
+    ));
+    assert!(provider.calls.lock().is_empty());
+
+    let distinct = [pt(7, 5), pt(3, 9), pt(6, 6)];
+    let ciphertext = scheduler.encrypt_batch(&ctx(), &distinct).await.unwrap();
+    let back = scheduler.decrypt_batch(&ctx(), &ciphertext).await.unwrap();
+    for (actual, expected) in back.iter().zip(&distinct) {
+        assert_eq!(actual.unit_index, expected.unit_index);
+        assert_eq!(actual.data, expected.data);
+    }
+}

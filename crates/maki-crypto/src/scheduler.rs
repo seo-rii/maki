@@ -424,10 +424,11 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
     /// the old clamp-and-serialize path let a group exceed the budget (R04).
     fn check_admissible(
         &self,
-        items: usize,
+        group: &[I],
         logical_bytes: u64,
         resident_bytes: u64,
     ) -> Result<(), CryptoError> {
+        let items = group.len();
         if items > self.max_admit_items
             || logical_bytes > self.max_admit_logical_bytes
             || resident_bytes > self.admission.max_bytes()
@@ -440,6 +441,19 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
                 self.max_admit_logical_bytes,
                 self.admission.max_bytes()
             )));
+        }
+        // Engine groups are in ascending order, so validating the common
+        // case needs no allocation. A library caller may use any order.
+        if group
+            .windows(2)
+            .any(|pair| pair[0].unit_index() >= pair[1].unit_index())
+        {
+            let mut seen = HashSet::with_capacity(items);
+            if group.iter().any(|item| !seen.insert(item.unit_index())) {
+                return Err(CryptoError::NonRetryableRequest(
+                    "a scheduler request contains a repeated unit index".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -798,6 +812,15 @@ impl BatchScheduler {
         self.stats.clone()
     }
 
+    fn decrypt_unit_size(&self, caps: &CryptoCapabilities) -> Result<u32, CryptoError> {
+        self.unit_size
+            .or_else(|| caps.supported_plaintext_sizes.iter().copied().max())
+            .filter(|size| *size > 0 && caps.supported_plaintext_sizes.contains(size))
+            .ok_or_else(|| {
+                CryptoError::Contract("provider has no compatible plaintext unit size".into())
+            })
+    }
+
     /// Start the caller's budget before its first queue-admission wait.
     /// Expiry drops the submit future; the lane then removes that group or
     /// abandons an RPC whose final caller has expired (BUG-012 / BUG-013).
@@ -806,11 +829,27 @@ impl BatchScheduler {
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
         let result = match self.max_operation_time() {
-            Some(limit) => tokio::select! {
-                biased;
-                _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
-                result = operation => result,
-            },
+            Some(limit) => {
+                let deadline = self.clock.now().saturating_add(limit);
+                let remaining = deadline.saturating_sub(self.clock.now());
+                if remaining.is_zero() {
+                    Err(crate::endpoint::deadline_error())
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = self.clock.sleep(remaining) => Err(crate::endpoint::deadline_error()),
+                        result = operation => {
+                            // The timer may wake on a later tick. Check the clock
+                            // after the operation's final poll, as the dispatcher does.
+                            if self.clock.now() < deadline {
+                                result
+                            } else {
+                                Err(crate::endpoint::deadline_error())
+                            }
+                        }
+                    }
+                }
+            }
             None => operation.await,
         };
         // The caller owns this outcome, whether its queue timer or the inner
@@ -834,7 +873,32 @@ impl CryptoProvider for BatchScheduler {
     }
 
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        self.inner.capabilities().await
+        let mut caps = self.inner.capabilities().await?;
+        let decrypt_unit = u64::from(self.decrypt_unit_size(&caps)?);
+        // Both lanes admit whole groups. The decrypt lane charges a fixed
+        // logical size and must hold each unit's worst-case ciphertext.
+        let max_items = (self.encrypt.max_admit_items as u64)
+            .min(self.decrypt.max_admit_logical_bytes / decrypt_unit)
+            .min(self.decrypt.admission.max_bytes() / u64::from(caps.max_ciphertext_size.max(1)));
+        caps.batch.max_items = u64::from(caps.batch.max_items).min(max_items) as u32;
+        caps.batch.max_bytes = caps
+            .batch
+            .max_bytes
+            .min(self.encrypt.max_admit_logical_bytes)
+            .min(self.encrypt.admission.max_bytes());
+        caps.supported_plaintext_sizes
+            .retain(|size| *size > 0 && u64::from(*size) <= caps.batch.max_bytes);
+        if caps.batch.max_items == 0
+            || caps.supported_plaintext_sizes.is_empty()
+            || self
+                .unit_size
+                .is_some_and(|size| !caps.supported_plaintext_sizes.contains(&size))
+        {
+            return Err(CryptoError::Contract(
+                "scheduler budgets cannot admit a supported unit".into(),
+            ));
+        }
+        Ok(caps)
     }
 
     async fn encrypt_batch(
@@ -846,7 +910,7 @@ impl CryptoProvider for BatchScheduler {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
             // Validate before duplicating the plaintext: an inadmissible
             // request must not copy secrets or charge pending capacity (R04).
-            self.encrypt.check_admissible(items.len(), bytes, bytes)?;
+            self.encrypt.check_admissible(items, bytes, bytes)?;
             if items.is_empty() {
                 return Ok(Vec::new());
             }
@@ -885,13 +949,7 @@ impl CryptoProvider for BatchScheduler {
                 .caps
                 .get_or_try_init(|| self.inner.capabilities())
                 .await?;
-            let unit_size = self
-                .unit_size
-                .or_else(|| caps.supported_plaintext_sizes.iter().copied().max())
-                .filter(|size| *size > 0 && caps.supported_plaintext_sizes.contains(size))
-                .ok_or_else(|| {
-                    CryptoError::Contract("provider has no compatible plaintext unit size".into())
-                })?;
+            let unit_size = self.decrypt_unit_size(caps)?;
             let logical_bytes = (items.len() as u64)
                 .checked_mul(u64::from(unit_size))
                 .ok_or_else(|| {
@@ -907,8 +965,7 @@ impl CryptoProvider for BatchScheduler {
             }
             // Check logical batching independently of resident ciphertext,
             // then reserve its full resident cost before cloning (R3-003).
-            self.decrypt
-                .check_admissible(items.len(), logical_bytes, bytes)?;
+            self.decrypt.check_admissible(items, logical_bytes, bytes)?;
             let permit = self
                 .decrypt
                 .admission
