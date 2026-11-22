@@ -27,6 +27,7 @@ use maki_crypto::SecretBuffer;
 
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
+    /// Limit on the sum of retained plaintext buffer capacities.
     pub max_bytes: u64,
     pub ttl: Duration,
     /// Kept for config parity; buffers always zeroize on drop via
@@ -38,6 +39,7 @@ pub struct CacheConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub entries: usize,
+    /// Sum of retained plaintext buffer capacities, including spare bytes.
     pub bytes: u64,
     pub hits: u64,
     pub misses: u64,
@@ -64,7 +66,7 @@ impl Inner {
     fn remove(&mut self, unit: u64) {
         if let Some(entry) = self.map.remove(&unit) {
             self.recency.remove(&entry.last_used);
-            self.bytes -= entry.data.len() as u64;
+            self.bytes -= entry.data.capacity() as u64;
         }
     }
 
@@ -88,7 +90,7 @@ impl Inner {
 
     /// Evict LRU entries until `need` bytes fit within the budget.
     fn make_room(&mut self, need: u64) {
-        while self.bytes + need > self.max_bytes {
+        while self.bytes > self.max_bytes.saturating_sub(need) {
             let Some((&_, &unit)) = self.recency.iter().next() else {
                 return;
             };
@@ -134,7 +136,7 @@ impl VersionedLruCache {
     /// cached the current one (R5-020). Empty and oversized entries are not
     /// cached; a rejected current/newer version invalidates the old entry.
     pub fn put(&self, unit: u64, write_sequence: u64, data: SecretBuffer) {
-        let len = data.len() as u64;
+        let allocation = data.capacity() as u64;
         let now = self.clock.now();
         let mut inner = self.inner.lock();
         if inner
@@ -145,10 +147,10 @@ impl VersionedLruCache {
             return; // dropped => zeroized
         }
         inner.remove(unit);
-        if len == 0 || len > inner.max_bytes || inner.max_bytes == 0 {
+        if data.is_empty() || allocation > inner.max_bytes {
             return; // dropped => zeroized
         }
-        inner.make_room(len);
+        inner.make_room(allocation);
         let tick = inner.next_tick();
         inner.map.insert(
             unit,
@@ -160,7 +162,7 @@ impl VersionedLruCache {
             },
         );
         inner.recency.insert(tick, unit);
-        inner.bytes += len;
+        inner.bytes += allocation;
     }
 
     /// A read can skip its cache-only header probe when an entire unit
