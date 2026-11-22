@@ -50,7 +50,7 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
     # Read the committed blobs directly. git archive applies checkout-local
     # attributes such as export-ignore and export-subst to the same tree.
     listing = subprocess.check_output(git_command("ls-tree", "-rz", "-t", commit, repo=repo))
-    with tarfile.open(destination, "w", pax_headers={"comment": commit}) as archive, \
+    with tarfile.open(destination, "w", encoding="utf-8", pax_headers={"comment": commit}) as archive, \
             subprocess.Popen(git_command("cat-file", "--batch", repo=repo),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as blobs:
         directory = tarfile.TarInfo(prefix)
@@ -61,7 +61,8 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
         for entry in listing.rstrip(b"\0").split(b"\0"):
             metadata, name = entry.split(b"\t", 1)
             mode, _, oid = metadata.split()
-            member = tarfile.TarInfo(f"{prefix}/{os.fsdecode(name)}")
+            path = name.decode("utf-8", "surrogateescape")
+            member = tarfile.TarInfo(f"{prefix}/{path}")
             member.mtime = epoch
             if mode == b"040000":
                 member.type = tarfile.DIRTYPE
@@ -79,7 +80,7 @@ def archive_source(destination, commit, prefix, epoch, *, repo=None):
             if mode == b"120000":
                 member.type = tarfile.SYMTYPE
                 member.mode = 0o777
-                member.linkname = os.fsdecode(blobs.stdout.read(size))
+                member.linkname = blobs.stdout.read(size).decode("utf-8", "surrogateescape")
                 archive.addfile(member)
             else:
                 member.size = size
@@ -127,28 +128,27 @@ def checkout_filemode(repo):
 
 def tracked_changes(*, repo=None):
     repo = ROOT if repo is None else repo
-    command = git_command("--no-optional-locks", *checkout_filemode(repo), "status",
+    filemode = checkout_filemode(repo)
+    command = git_command("--no-optional-locks", *filemode, "status",
                           "--porcelain", "--untracked-files=no", repo=repo)
     if subprocess.check_output(command):
         return True
-    entries = subprocess.check_output(git_command("ls-files", "-v", "-z", repo=repo)).split(b"\0")
-    assumed = [entry[2:] for entry in entries if entry[:1].islower()]
-    present_skipped = [entry[2:] for entry in entries if entry[:1].upper() == b"S"
-                       and os.path.lexists(repo / os.fsdecode(entry[2:]))]
-    if not assumed and not present_skipped:
-        return False
-    # Refresh the flagged paths through Git's normal stat/filter checks,
-    # without changing the user's index flags or sparse-checkout selection.
+    # A fresh index compares contents through Git's normal clean filters without
+    # inheriting cached stat data or assume-unchanged hints from the checkout.
+    # Only absent, explicitly skipped paths are allowed to lack a working copy.
+    entries = subprocess.check_output(git_command("ls-files", "-t", "-z", repo=repo)).split(b"\0")
+    absent_skipped = [entry[2:] for entry in entries if entry.startswith(b"S ")
+                      and not os.path.lexists(repo / os.fsdecode(entry[2:]))]
     with tempfile.TemporaryDirectory() as directory:
-        index = pathlib.Path(directory) / "index"
-        index_path = run(git_command("rev-parse", "--path-format=absolute", "--git-path", "index", repo=repo))
-        shutil.copyfile(index_path, index)
-        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
-        for flag, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", present_skipped)):
-            if paths:
-                subprocess.run(git_command("update-index", flag, "-z", "--stdin", repo=repo),
-                               input=b"\0".join(paths) + b"\0", env=env, check=True)
-        return bool(subprocess.check_output(command, env=env))
+        env = {**os.environ, "GIT_INDEX_FILE": str(pathlib.Path(directory) / "index")}
+        private_git = git_command("-c", "core.sparseCheckout=false", "-c", "core.splitIndex=false",
+                                  *filemode, repo=repo)
+        subprocess.run([*private_git, "read-tree", "HEAD"], env=env, check=True)
+        if absent_skipped:
+            subprocess.run([*private_git, "update-index", "--skip-worktree", "-z", "--stdin"],
+                           input=b"\0".join(absent_skipped) + b"\0", env=env, check=True)
+        return bool(subprocess.check_output([*private_git, "status", "--porcelain", "--untracked-files=no"],
+                                            env=env))
 
 
 def candidate_source_version():
@@ -233,7 +233,7 @@ def prepare(output):
                 shutil.copyfileobj(source, compressed)
         extracted = work / "source"
         extracted.mkdir()
-        with tarfile.open(archive_tar) as archive:
+        with tarfile.open(archive_tar, encoding="utf-8") as archive:
             # Python 3.11 does not yet provide tarfile's data filter. Git
             # tracks no device files, and this project needs no source links;
             # reject links instead of letting extraction escape the build.
@@ -242,6 +242,8 @@ def prepare(output):
                 relative = pathlib.PurePosixPath(member.name)
                 if relative.is_absolute() or ".." in relative.parts or not (member.isdir() or member.isfile()):
                     fail(f"unsupported source archive entry: {member.name}")
+                # Hand the original Git path bytes back to the local filesystem.
+                member.name = os.fsdecode(member.name.encode("utf-8", "surrogateescape"))
             archive.extractall(extracted, members=members)
         source = extracted / f"maki-{workspace_version}"
         environment = os.environ.copy()

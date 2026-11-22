@@ -234,6 +234,25 @@ class ReleasePreparationTests(unittest.TestCase):
                 archives.append(manifest["source"]["sha256"])
         self.assertEqual(archives[0], archives[1])
 
+    def test_source_names_and_bytes_are_reproducible_across_filesystem_encodings(self):
+        names = [b"release-\xc3\xa9.md", b"release-\xff.md"]
+        for name in names:
+            (self.repo / os.fsdecode(name)).write_bytes(name)
+        self.git("add", ".")
+        self.git("commit", "-qm", "test: non-ASCII archive members")
+        digests = []
+        for mode in ("0", "1"):
+            with self.subTest(utf8_mode=mode):
+                self.environment.update(LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8=mode)
+                bundle, _ = self.prepare(f"locale-{mode}")
+                archive = next(bundle.glob("*-source.tar.gz"))
+                digests.append(hashlib.sha256(archive.read_bytes()).hexdigest())
+                with tarfile.open(archive, encoding="utf-8") as source:
+                    for name in names:
+                        path = "maki-0.1.0/" + name.decode("utf-8", "surrogateescape")
+                        self.assertEqual(source.extractfile(path).read(), name)
+        self.assertEqual(digests[0], digests[1])
+
     def test_source_archive_uses_original_git_objects_with_local_replacements(self):
         (self.repo / "notes.txt").write_text("committed contents\n")
         (self.repo / "other.txt").write_text("different contents\n")
@@ -375,6 +394,21 @@ class ReleasePreparationTests(unittest.TestCase):
             source.write("# worktree edit\n")
         self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
         self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "h Cargo.toml")
+
+    def test_release_checks_contents_when_git_stat_information_is_unchanged(self):
+        tracked = self.repo / "Cargo.lock"
+        original = tracked.read_bytes()
+        self.git("config", "core.trustctime", "false")
+        self.git("config", "core.checkStat", "minimal")
+        before = 1_700_000_000_000_000_000
+        os.utime(tracked, ns=(before, before))
+        self.git("update-index", "--refresh")
+        tracked.write_bytes(original.replace(b"version = 3", b"version = 4"))
+        os.utime(tracked, ns=(before, before))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        tracked.write_bytes(original)
+        self.print_version()
 
     def test_present_skipped_file_is_checked_but_absent_sparse_file_is_supported(self):
         self.git("update-index", "--split-index")
