@@ -191,6 +191,12 @@ impl FakeCryptoProvider {
         out
     }
 
+    fn ciphertext_size(&self) -> Result<u32, CryptoError> {
+        self.unit_size.checked_add(self.overhead).ok_or_else(|| {
+            CryptoError::ProviderFatal("fake provider ciphertext size exceeds u32".into())
+        })
+    }
+
     /// Checks every call makes before doing work. `plaintext_bytes` is what
     /// the batch carries against `batch.max_bytes`: the plaintext sent for
     /// an encrypt, one unit of plaintext per item for a decrypt (the
@@ -263,7 +269,7 @@ impl CryptoProvider for FakeCryptoProvider {
             provider_id: "fake".to_string(),
             crypto_compatibility_id: self.compat_id.clone(),
             supported_plaintext_sizes: vec![self.unit_size],
-            max_ciphertext_size: self.unit_size + self.overhead,
+            max_ciphertext_size: self.ciphertext_size()?,
             stateless: true,
             retry_safe: true,
             batch: BatchCapability {
@@ -296,6 +302,7 @@ impl CryptoProvider for FakeCryptoProvider {
             .iter()
             .fold(0u64, |sum, item| sum.saturating_add(item.data.len() as u64));
         self.common(context, items.len(), plaintext_bytes).await?;
+        let ciphertext_size = self.ciphertext_size()? as usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let pt = item.data.expose();
@@ -306,11 +313,11 @@ impl CryptoProvider for FakeCryptoProvider {
                 )));
             }
             let ks = self.keystream(context, item.unit_index, pt.len());
-            let mut data = Vec::with_capacity(pt.len() + self.overhead as usize);
+            let mut data = Vec::with_capacity(ciphertext_size);
             data.extend_from_slice(MAGIC);
             data.extend_from_slice(&crc32fast::hash(pt).to_le_bytes());
             data.extend(pt.iter().zip(ks.iter()).map(|(p, k)| p ^ k));
-            data.resize(pt.len() + self.overhead as usize, 0);
+            data.resize(ciphertext_size, 0);
             out.push(CiphertextUnit {
                 unit_index: item.unit_index,
                 data,
@@ -338,7 +345,7 @@ impl CryptoProvider for FakeCryptoProvider {
         self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
         let plaintext_bytes = (items.len() as u64).saturating_mul(u64::from(self.unit_size));
         self.common(context, items.len(), plaintext_bytes).await?;
-        let expected_len = (self.unit_size + self.overhead) as usize;
+        let expected_len = self.ciphertext_size()? as usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let ct = &item.data;
