@@ -1576,24 +1576,7 @@ impl Engine {
                 )));
             }
         }
-        // Overlay bound (R4-005): the RAM held by uncheckpointed records is
-        // independent of the disk journal limit. Charge the request at its
-        // eventual size — every unit ends up with a durable copy equal to its
-        // latest version, so the projection is 2x the latest bytes — and, if
-        // it does not fit, sync and checkpoint inline exactly like the hard
-        // journal limit; after a reclaim that still cannot make room the
-        // write is refused rather than growing memory.
-        let payload: u64 = cts.iter().map(|ct| ct.data.len() as u64).sum();
-        let over_bytes = self.inner.max_overlay_bytes > 0
-            && volume
-                .overlay_bytes()
-                .max(volume.overlay_latest_bytes().saturating_mul(2))
-                .saturating_add(payload.saturating_mul(2))
-                > self.inner.max_overlay_bytes;
-        let over_entries = self.inner.max_overlay_entries > 0
-            && (volume.overlay_len() as u64).saturating_add(cts.len() as u64)
-                > self.inner.max_overlay_entries;
-        let over_overlay = over_bytes || over_entries;
+        let over_overlay = self.inner.would_exceed_overlay_limit(volume, cts);
         let over_journal = volume
             .journal_total_bytes()
             .saturating_add(footprint(volume))
@@ -2020,6 +2003,39 @@ impl EngineInner {
     fn journal_above_watermark(&self, volume: &Volume) -> bool {
         volume.journal_total_bytes() >= self.policy.journal_high_watermark_bytes
             && volume.journal_sealed_segment_count() > 0
+    }
+
+    fn would_exceed_overlay_limit(&self, volume: &Volume, records: &[CiphertextUnit]) -> bool {
+        if self.max_overlay_entries == 0 && self.max_overlay_bytes == 0 {
+            return false;
+        }
+        let entries = volume.overlay_len() as u64;
+        let bytes = volume
+            .overlay_bytes()
+            .max(volume.overlay_latest_bytes().saturating_mul(2));
+        // A journal sync (including a segment roll within the batch) can
+        // promote each latest version to a second, durable charge.
+        let exceeds = |new_entries: u64, growth: u64| {
+            (self.max_overlay_entries > 0
+                && entries.saturating_add(new_entries) > self.max_overlay_entries)
+                || (self.max_overlay_bytes > 0
+                    && bytes.saturating_add(growth.saturating_mul(2)) > self.max_overlay_bytes)
+        };
+        // Skip overlay lookups while even a wholly new batch would fit.
+        let payload = records.iter().map(|ct| ct.data.len() as u64).sum();
+        if !exceeds(records.len() as u64, payload) {
+            return false;
+        }
+        let mut new_entries = 0;
+        let mut growth = 0;
+        for ct in records {
+            let previous = volume.overlay_ciphertext_len(ct.unit_index);
+            new_entries += u64::from(previous.is_none());
+            // Never spend space from a later shrinking overwrite. Every
+            // prefix must fit even if an append fails partway through.
+            growth += ct.data.len().saturating_sub(previous.unwrap_or(0)) as u64;
+        }
+        exceeds(new_entries, growth)
     }
 
     /// The overlay has crossed half of a configured bound (R4-005): the

@@ -267,6 +267,12 @@ impl Volume {
         self.overlay.latest_bytes()
     }
 
+    pub(crate) fn overlay_ciphertext_len(&self, unit: u64) -> Option<usize> {
+        self.overlay
+            .get(unit)
+            .map(|version| version.ciphertext.len())
+    }
+
     pub fn supports_discard(&self) -> bool {
         self.store.supports_discard()
     }
