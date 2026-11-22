@@ -581,7 +581,7 @@ equivalent 1.0.2 — LICENSE-APACHE
 errno 0.3.14 — LICENSE-APACHE
 fastrand 2.5.0 — LICENSE-APACHE
 fnv 1.0.7 — LICENSE-APACHE
-form_urlencoded 1.2.2 — LICENSE-APACHE
+form_urlencoded 1.2.3 — LICENSE-APACHE
 hashbrown 0.17.1 — LICENSE-APACHE
 httparse 1.10.1 — LICENSE-APACHE
 hyper-rustls 0.27.9 — LICENSE-APACHE
@@ -616,7 +616,7 @@ stable_deref_trait 1.2.1 — LICENSE-APACHE
 tempfile 3.27.0 — LICENSE-APACHE
 thread_local 1.1.10 — LICENSE-APACHE
 tungstenite 0.26.2 — LICENSE-APACHE
-url 2.5.8 — LICENSE-APACHE
+url 2.5.9 — LICENSE-APACHE
 uuid 1.26.0 — LICENSE-APACHE
 
 Apache License
@@ -1689,7 +1689,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
 
-form_urlencoded 1.2.2 — LICENSE-MIT
+form_urlencoded 1.2.3 — LICENSE-MIT
 
 Copyright (c) 2013-2016 The rust-url developers
 
@@ -3075,7 +3075,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 idna 1.1.0 — LICENSE-MIT
 percent-encoding 2.3.2 — LICENSE-MIT
-url 2.5.8 — LICENSE-MIT
+url 2.5.9 — LICENSE-MIT
 
 Copyright (c) 2013-2025 The rust-url developers
 
