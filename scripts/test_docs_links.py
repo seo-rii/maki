@@ -10,7 +10,18 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.check_docs_links import broken_links
+from scripts.check_docs_links import block_lines, broken_links, table_cells
+
+
+class ShippedDocumentationTables(unittest.TestCase):
+    def test_benchmark_and_review_tables_do_not_drop_cells(self):
+        docs = Path(__file__).resolve().parents[1] / "docs"
+        for name in ("benchmark.md", "review-remediation.md"):
+            with self.subTest(document=name):
+                for line, rendered in block_lines((docs / name).read_text(encoding="utf-8")):
+                    if rendered is not None:
+                        self.assertEqual(len(table_cells(line.content)), len(rendered),
+                                         f"{name}:{line.number}: extra table cells are discarded")
 
 
 class DocumentationLinks(unittest.TestCase):

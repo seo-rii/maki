@@ -35,7 +35,7 @@ maki-benchmark --json --concurrency 32 --access random --read-percent 70 \
 | Option | Behavior |
 | --- | --- |
 | `--concurrency N` | At most N submitted I/O jobs and their completion results; 1–256, default 1. Compare 1, 2, 8 and 32 with the same configuration. |
-| `--access sequential|random` | Sequential wrapped addresses or reproducible independent random addresses; default sequential. |
+| `--access sequential\|random` | Sequential wrapped addresses or reproducible independent random addresses; default sequential. |
 | `--seed N` | Nonnegative seed for random addresses; default 1. |
 | `--read-percent N` | Mixed workload with N percent reads, 0–100. `ops` becomes the total measured read/write count; reads number `floor(ops × N / 100)`. Omit to retain two phases. |
 | `--working-set SIZE` | Positive multiple of I/O size within the volume, accepting bytes or KiB/MiB/GiB suffixes. Default is `min(ops, volume I/O slots) × io-size`. |
