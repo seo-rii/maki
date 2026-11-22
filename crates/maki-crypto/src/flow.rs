@@ -24,18 +24,25 @@ pub struct DualPermit {
     _bytes: OwnedSemaphorePermit,
 }
 
+/// Count and byte ceilings supported by both local and global admission.
+/// Tokio bounds the permit count and each multi-permit acquisition.
+pub(crate) fn semaphore_limits(max_items: u32, max_bytes: u64) -> (usize, u64) {
+    (
+        (max_items as usize).min(Semaphore::MAX_PERMITS),
+        max_bytes
+            .min(u64::from(u32::MAX >> 1))
+            .min(Semaphore::MAX_PERMITS as u64),
+    )
+}
+
 impl DualSemaphore {
     pub fn new(max_items: u32, max_bytes: u64) -> Self {
-        // Budget ceilings must fit the platform semaphore as well as a single acquire.
-        let max_items = (max_items as usize).min(Semaphore::MAX_PERMITS);
-        let capped = max_bytes
-            .min(u64::from(u32::MAX >> 1))
-            .min(Semaphore::MAX_PERMITS as u64) as usize;
+        let (max_items, max_bytes) = semaphore_limits(max_items, max_bytes);
         Self {
             items: Arc::new(Semaphore::new(max_items)),
-            bytes: Arc::new(Semaphore::new(capped)),
+            bytes: Arc::new(Semaphore::new(max_bytes as usize)),
             max_items,
-            max_bytes: capped as u64,
+            max_bytes,
         }
     }
 
