@@ -85,10 +85,17 @@ fn init_with_stdout(stdout: std::process::Stdio) -> String {
         .unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{stderr}");
-    assert!(maki_backing::remote_witness::StateStore::open(&state).is_ok());
     let retry = command(&args);
     assert!(!retry.status.success());
-    assert!(String::from_utf8_lossy(&retry.stderr).contains("already"));
+    let retry_stderr = String::from_utf8_lossy(&retry.stderr);
+    assert!(
+        retry_stderr.contains("remote witness already enrolled"),
+        "{retry_stderr}"
+    );
+
+    // Open the store after the last CLI call. A child forked by another
+    // test can inherit the harness's lock and hold it until exec.
+    maki_backing::remote_witness::StateStore::open(&state).expect("reopen initialized witness");
     stderr
 }
 
