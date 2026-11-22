@@ -1105,7 +1105,7 @@ impl Engine {
             if let Some(buf) = plain.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);
                 if let Some(cache) = cache {
-                    cache.put(unit, seqs[&unit], buf);
+                    cache.put_read_unit(unit, seqs[&unit], buf);
                 }
             } else if let Some(buf) = cached.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);

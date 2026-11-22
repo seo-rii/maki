@@ -15,7 +15,7 @@
 //! tens of thousands of units evicts on every insert, and a linear scan
 //! there would turn the hot read path quadratic.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +57,8 @@ struct Inner {
     map: HashMap<u64, Entry>,
     /// last_used tick -> unit, oldest first. Ticks are unique.
     recency: BTreeMap<u64, u64>,
+    /// Cache-owned fixed-size read units with spare capacity, largest last.
+    padded_units: BTreeSet<(usize, u64)>,
     bytes: u64,
     max_bytes: u64,
     tick: u64,
@@ -67,6 +69,9 @@ impl Inner {
         if let Some(entry) = self.map.remove(&unit) {
             self.recency.remove(&entry.last_used);
             self.bytes -= entry.data.capacity() as u64;
+            if entry.data.capacity() > entry.data.len() {
+                self.padded_units.remove(&(entry.data.capacity(), unit));
+            }
         }
     }
 
@@ -88,6 +93,37 @@ impl Inner {
         }
     }
 
+    /// Let sparse reads retain their provider allocations. Reserve one vacant
+    /// logical slot per temporarily padded entry, so filling each subsequent
+    /// slot needs at most one old entry repacked. Padding that fits even at
+    /// full occupancy can stay indefinitely.
+    fn fit_read_unit(&mut self, data: SecretBuffer) -> SecretBuffer {
+        let units = self.max_bytes / data.len() as u64;
+        let per_unit = self.max_bytes / units;
+        let vacant_after_insert = units.saturating_sub(self.map.len() as u64 + 1);
+
+        let to_compact = self.padded_units.last().copied().filter(|&(capacity, _)| {
+            capacity as u64 > per_unit && self.padded_units.len() as u64 > vacant_after_insert
+        });
+        if let Some((capacity, unit)) = to_compact {
+            let entry = self.map.get_mut(&unit).expect("padded unit exists");
+            let compact = entry.data.duplicate();
+            self.bytes = self.bytes - capacity as u64 + compact.capacity() as u64;
+            self.padded_units.pop_last();
+            entry.data = Arc::new(compact);
+        }
+
+        let capacity = data.capacity() as u64;
+        if capacity > per_unit
+            && (capacity - per_unit > per_unit
+                || self.padded_units.len() as u64 >= vacant_after_insert)
+        {
+            data.duplicate()
+        } else {
+            data
+        }
+    }
+
     /// Evict LRU entries until `need` bytes fit within the budget.
     fn make_room(&mut self, need: u64) {
         while self.bytes > self.max_bytes.saturating_sub(need) {
@@ -101,6 +137,7 @@ impl Inner {
     fn clear(&mut self) {
         self.map.clear();
         self.recency.clear();
+        self.padded_units.clear();
         self.bytes = 0;
     }
 }
@@ -121,6 +158,7 @@ impl VersionedLruCache {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 recency: BTreeMap::new(),
+                padded_units: BTreeSet::new(),
                 bytes: 0,
                 max_bytes: config.max_bytes,
                 tick: 0,
@@ -136,8 +174,16 @@ impl VersionedLruCache {
     /// cached the current one (R5-020). Empty and oversized entries are not
     /// cached; a rejected current/newer version invalidates the old entry.
     pub fn put(&self, unit: u64, write_sequence: u64, data: SecretBuffer) {
-        let allocation = data.capacity() as u64;
-        let now = self.clock.now();
+        self.insert(unit, write_sequence, data, false);
+    }
+
+    /// Cache one fixed-size volume unit. Spare capacity in provider buffers
+    /// may be released to preserve the number of logical units that fit.
+    pub fn put_read_unit(&self, unit: u64, write_sequence: u64, data: SecretBuffer) {
+        self.insert(unit, write_sequence, data, true);
+    }
+
+    fn insert(&self, unit: u64, write_sequence: u64, data: SecretBuffer, read_unit: bool) {
         let mut inner = self.inner.lock();
         if inner
             .map
@@ -147,17 +193,30 @@ impl VersionedLruCache {
             return; // dropped => zeroized
         }
         inner.remove(unit);
-        if data.is_empty() || allocation > inner.max_bytes {
-            return; // dropped => zeroized
+        if data.is_empty() || data.len() as u64 > inner.max_bytes {
+            return;
+        }
+        let data = if read_unit && (data.capacity() > data.len() || !inner.padded_units.is_empty())
+        {
+            inner.fit_read_unit(data)
+        } else {
+            data
+        };
+        let allocation = data.capacity() as u64;
+        if allocation > inner.max_bytes {
+            return;
         }
         inner.make_room(allocation);
+        if read_unit && data.capacity() > data.len() {
+            inner.padded_units.insert((data.capacity(), unit));
+        }
         let tick = inner.next_tick();
         inner.map.insert(
             unit,
             Entry {
                 write_sequence,
                 data: Arc::new(data),
-                inserted_at: now,
+                inserted_at: self.clock.now(),
                 last_used: tick,
             },
         );
@@ -358,7 +417,8 @@ mod ttl_tests {
     impl Clock for InterleavingClock {
         fn now(&self) -> Duration {
             let time = Duration::from_millis(self.millis.load(Ordering::SeqCst));
-            if let Some(action) = self.on_sample.lock().take() {
+            let action = self.on_sample.lock().take();
+            if let Some(action) = action {
                 action();
             }
             time
@@ -367,6 +427,40 @@ mod ttl_tests {
         fn sleep(&self, _: Duration) -> SleepFuture {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn overlapping_puts_cannot_shorten_the_refreshed_ttl() {
+        let clock = Arc::new(InterleavingClock::default());
+        let cache = Arc::new(VersionedLruCache::new(
+            CacheConfig {
+                max_bytes: 4096,
+                ttl: Duration::from_millis(10),
+                zeroize_on_evict: true,
+            },
+            clock.clone(),
+        ));
+        let refreshed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finish_refresh = refreshed.clone();
+        let refreshing = cache.clone();
+        let advancing = clock.clone();
+        *clock.on_sample.lock() = Some(Box::new(move || {
+            advancing.millis.store(5, Ordering::SeqCst);
+            // Complete the second put before publication if the first put
+            // sampled time without holding the entries lock.
+            if refreshing.inner.try_lock().is_some() {
+                refreshing.put(0, 4, SecretBuffer::from_slice(&[42]));
+                finish_refresh.store(true, Ordering::SeqCst);
+            }
+        }));
+        cache.put(0, 4, SecretBuffer::from_slice(&[42]));
+        if !refreshed.load(Ordering::SeqCst) {
+            cache.put(0, 4, SecretBuffer::from_slice(&[42]));
+        }
+        clock.millis.store(11, Ordering::SeqCst);
+        assert!(cache.get(0, 4).is_some(), "the 5ms refresh expires at 15ms");
+        clock.millis.store(15, Ordering::SeqCst);
+        assert!(cache.get(0, 4).is_none());
     }
 
     #[test]
