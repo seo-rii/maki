@@ -202,6 +202,44 @@ async fn a_recovered_small_peer_does_not_change_the_serving_contract() {
 }
 
 #[tokio::test]
+async fn nested_dispatchers_honor_the_inner_no_resend_policy() {
+    for inner_retry_safe in [false, true] {
+        let peer = Arc::new(Peer::new(4, 4 * UNIT as u64).await);
+        let mut inner_config = config();
+        inner_config.retry_safe = inner_retry_safe;
+        let inner = Arc::new(EndpointSet::new(
+            vec![("inner".into(), peer.clone())],
+            inner_config,
+            Arc::new(SystemClock::new()),
+        ));
+        let advertised = inner.capabilities().await.unwrap();
+        let fallback = Arc::new(Peer::new(4, 4 * UNIT as u64).await);
+        let outer = EndpointSet::new(
+            vec![
+                ("first".into(), inner),
+                ("fallback".into(), fallback.clone()),
+            ],
+            config(),
+            Arc::new(SystemClock::new()),
+        );
+        peer.inner
+            .fail_next([CryptoError::Retryable("uncertain completion".into())]);
+        let result = outer.encrypt_batch(&context(), &items()[..1]).await;
+        assert_eq!(peer.inner.encrypt_calls(), 1);
+        assert_eq!(
+            fallback.inner.encrypt_calls(),
+            usize::from(inner_retry_safe)
+        );
+        assert_eq!(result.is_ok(), inner_retry_safe);
+        assert_eq!(advertised.retry_safe, inner_retry_safe);
+        assert_eq!(
+            outer.capabilities().await.unwrap().retry_safe,
+            inner_retry_safe
+        );
+    }
+}
+
+#[tokio::test]
 async fn peer_retry_contract_overrides_a_more_permissive_dispatch_config() {
     let mut a = Peer::new(16, 4096).await;
     a.caps.retry_safe = false;
