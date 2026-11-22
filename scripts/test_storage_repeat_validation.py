@@ -562,8 +562,8 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual({number: signal.getsignal(number) for number in handlers}, handlers)
 
     def terminal_child(self, directory, elapsed=0, cancelled=False, whole_worker=False,
-                       max_bytes=64 << 20):
-        """Finish a real child during the polling gap, without wall-clock races."""
+                       max_bytes=64 << 20, cleanup_elapsed=None):
+        """Finish a real child during supervision, without wall-clock races."""
         gate_read, gate_write = os.pipe()
         self.addCleanup(os.close, gate_read)
         self.addCleanup(os.close, gate_write)
@@ -577,7 +577,13 @@ class BackgroundStorageTests(unittest.TestCase):
         children = []
         clock = [100.0]
         original_popen = subprocess.Popen
-        original_sleep, original_monotonic = time.sleep, time.monotonic
+        original_wait = self.runner.wait
+        original_killpg = os.killpg
+
+        def kill_group(pid, sig):
+            if cleanup_elapsed is not None:
+                clock[0] = 100 + cleanup_elapsed
+            return original_killpg(pid, sig)
 
         def launch(*args, **kwargs):
             child = original_popen(*args, **kwargs, pass_fds=(gate_read,))
@@ -585,19 +591,16 @@ class BackgroundStorageTests(unittest.TestCase):
             self.addCleanup(self.stop_controller, child)
             return child
 
-        def poll_interval(_duration):
-            # The child cannot exit until the runner has entered its polling
-            # sleep. Observe its exit without consuming its process identity.
+        def poll_interval(futures, timeout):
+            # Release the child when supervision starts waiting for its exit.
             clock[0] = 100 + elapsed
             os.write(gate_write, b"x")
-            deadline = original_monotonic() + 5
-            while os.waitid(os.P_PID, children[0].pid,
-                            os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-                self.assertLess(original_monotonic(), deadline, "fixture did not exit")
-                original_sleep(.01)
+            done, _ = original_wait(futures, timeout=5)
+            self.assertEqual(len(done), 1, "fixture did not exit")
 
         with mock.patch.object(self.runner.subprocess, "Popen", side_effect=launch), \
-                mock.patch.object(self.runner.time, "sleep", side_effect=poll_interval), \
+                mock.patch.object(self.runner.os, "killpg", side_effect=kill_group), \
+                mock.patch.object(self.runner, "wait", side_effect=poll_interval), \
                 mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]):
             if whole_worker:
                 self.runner.save_json(directory / "config.json", {
@@ -616,6 +619,13 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(len(children), 1)
         self.assertEqual(children[0].returncode, 0, "the real child must exit and be reaped")
         return result
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
+    def test_exit_before_deadline_stays_successful_through_late_group_cleanup(self):
+        result = self.terminal_child(self.root, elapsed=9.95, cleanup_elapsed=10.05)
+        self.assertEqual(result["reason"], "exited")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertGreater(result["seconds"], 10)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_bug160_child_exit_rechecks_cancellation_deadline_and_output(self):

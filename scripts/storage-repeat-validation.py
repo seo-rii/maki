@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Repeat existing Linux storage regressions using frozen source and binaries."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack
 import datetime
 import hashlib
@@ -116,6 +117,12 @@ def passed_count(stream):
     return count
 
 
+def observe_exit(pid):
+    # Leave the leader waitable: its PID anchors the process group until cleanup.
+    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+    return time.monotonic()
+
+
 def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
     began = time.monotonic()
     if stop.exists():
@@ -134,29 +141,31 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
         for number in previous:
             signal.signal(number, request_stop)
         with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
-            child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-            reason = "exited"
-            try:
-                # Keep the leader unreaped until group cleanup, so its PID
-                # cannot be reused for an unrelated process group.
-                while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-                    if received_signal is not None or stop.exists():
-                        reason = "cancelled"
-                    elif time.monotonic() - began >= timeout:
-                        reason = "timeout"
-                    elif log.stat().st_size > max_bytes:
-                        reason = "output_limit"
-                    if reason != "exited":
-                        break
-                    time.sleep(.1)
-            finally:
-                # Kill descendants also after an early leader exit.
+            with subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=output, stderr=subprocess.STDOUT,
+                                  start_new_session=True) as child, ThreadPoolExecutor(max_workers=1) as observer:
+                reason = "exited"
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait()
+                    exit_time = observer.submit(observe_exit, child.pid)
+                    while not exit_time.done():
+                        remaining = timeout - (time.monotonic() - began)
+                        if received_signal is not None or stop.exists():
+                            reason = "cancelled"
+                            break
+                        if remaining <= 0:
+                            reason = "timeout"
+                            break
+                        if log.stat().st_size > max_bytes:
+                            reason = "output_limit"
+                            break
+                        # Wake on exit immediately, even between stop/size checks.
+                        wait((exit_time,), timeout=min(.1, remaining))
+                finally:
+                    # Kill descendants before joining the observer and reaping the leader.
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
@@ -164,16 +173,17 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
         # Reuse the cancellation marker so build-time interruption also
         # reaches worker() as cancellation rather than a build failure.
         stop.touch(mode=0o600)
-    # The leader can exit during the polling interval, skipping the loop's
-    # limit checks. Cancellation also takes precedence during group cleanup;
-    # otherwise retain any limit reason already observed while it was alive.
+    # Cleanup can outlast the deadline. Use the observed leader exit for the
+    # verdict, but report the total elapsed time and honour late cancellation.
     if received_signal is not None or stop.exists():
         reason = "cancelled"
-    elif reason == "exited":
-        if time.monotonic() - began >= timeout:
+    elif reason in ("exited", "timeout"):
+        if exit_time.result() - began >= timeout:
             reason = "timeout"
         elif log.stat().st_size > max_bytes:
             reason = "output_limit"
+        else:
+            reason = "exited"
     result = {"exit_code": child.returncode, "reason": reason,
               "seconds": round(time.monotonic() - began, 3)}
     if received_signal is not None:
