@@ -92,6 +92,9 @@ fn unloadable() -> Vec<(&'static str, String)> {
         ("file", format!("/etc/maki/keys/.{SECRET}")),
         ("file", format!("/etc/maki/keys/{SECRET} key")),
         ("file", format!("/etc/maki/{SECRET}/..")),
+        ("file", format!("/etc/maki/{SECRET}/")),
+        ("file", format!("/etc/maki/{SECRET}/.")),
+        ("file", format!("/etc/maki/{SECRET}//./")),
         ("file", "/".to_string()),
     ]
 }
@@ -140,6 +143,8 @@ fn names_the_loaders_accept_still_validate() {
         ("credential", "vol.key"),
         ("credential", "Vol_Key-2.hex"),
         ("file", "/etc/maki/keys/vol-key"),
+        ("file", "/etc/maki/./keys/vol-key"),
+        ("file", "/etc/maki/keys/vol-key."),
         // Only the file name is a credential name; directories are free.
         ("file", "/etc/maki/.keys/vol key dir/vol-key"),
         // Development-only environment names are not file names.

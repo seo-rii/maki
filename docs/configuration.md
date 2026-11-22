@@ -340,6 +340,11 @@ A `credential` name, and the file name that ends a `file` path, may contain
 only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
 the loaders refuse any other name, so validation refuses it before a volume is
 created (a key's name is stored as the volume's immutable key identity).
+A file credential path must end in the file name. If an older volume was
+created with a key path such as `/etc/maki/key/` or `/etc/maki/key/.`, remove
+the trailing directory suffix from the configuration before reattaching.
+The old loader opened `/etc/maki/key` in both cases. Maki recognizes that
+stored spelling for the corrected file path and verifies the key as usual.
 An `env` name is upper-cased, with `-` and `.` replaced by `_`, to form the
 variable name. It must not contain `=` or a NUL character, which no
 environment variable name can hold (a lookup of `A=B` would even return part

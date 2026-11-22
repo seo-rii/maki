@@ -1125,7 +1125,7 @@ async fn attach_hardened(
         tracing::warn!("cannot raise the open-file soft limit: {e}");
     }
     let backing = build_backing(config)?;
-    let options = engine_options(config);
+    let mut options = engine_options(config);
     let recovery_options = options.volume.clone();
     let volume = Arc::new(
         tokio::task::spawn_blocking(move || match progress {
@@ -1139,6 +1139,23 @@ async fn attach_hardened(
         .map_err(AttachError::from)?,
     );
     validate_recovered_geometry(config, &volume)?;
+    // Older builds opened `key/.` and `key/` as `key` but persisted the
+    // original string. Recognize only that trailing directory syntax on a
+    // stored file identity. The caller still supplies the validated file
+    // path and the engine still verifies the key canary.
+    if let (Some(key), Some(identity)) = (&config.crypto.key, &mut options.identity) {
+        let stored = &volume.superblock().key_identity;
+        if key.source == "file"
+            && stored.strip_prefix(&key.name).is_some_and(|suffix| {
+                suffix.starts_with(std::path::is_separator)
+                    && suffix
+                        .split(std::path::is_separator)
+                        .all(|part| part.is_empty() || part == ".")
+            })
+        {
+            identity.key_identity.clone_from(stored);
+        }
+    }
     let prepared = match prepared {
         Some(provider) => provider,
         None => prepare_provider(config).await?,

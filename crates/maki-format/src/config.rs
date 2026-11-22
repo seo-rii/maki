@@ -1380,7 +1380,11 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
             if !std::path::Path::new(&c.name)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(is_loadable_credential_name) =>
+                // Path::file_name strips trailing separators and `/.`. The
+                // original spelling must actually end with this file name.
+                .is_some_and(|name| {
+                    is_loadable_credential_name(name) && c.name.ends_with(name)
+                }) =>
         {
             return Err(invalid(
                 "file credential name must end in a file name of ASCII letters, digits, \
