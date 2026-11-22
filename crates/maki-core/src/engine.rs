@@ -1652,8 +1652,7 @@ impl Engine {
     }
 
     async fn flush_inner(&self, fua: bool) -> Result<(), CoreError> {
-        let admission = Arc::new(self.inner.admission.acquire(0).await?);
-        self.check_freshness(admission.clone()).await?;
+        let admission = self.inner.admission.acquire(0).await?;
         let mut volume = self.inner.write_volume().await?;
         let inner = self.inner.clone();
         storage_task(move || {

@@ -219,10 +219,14 @@ async fn slow_write_keeps_runtime_responsive() {
 async fn slow_flush_keeps_runtime_responsive() {
     let (backing, engine) = fixture().await;
     engine.write(0, &[0x32; 1024], false).await.unwrap();
+    let before = backing.freshness_calls.load(Ordering::SeqCst);
     responsive(&backing.gate, SYNC, async {
         engine.flush().await.unwrap();
     })
     .await;
+    assert_eq!(backing.freshness_calls.load(Ordering::SeqCst) - before, 1);
+    engine.flush().await.unwrap();
+    assert_eq!(backing.freshness_calls.load(Ordering::SeqCst) - before, 2);
 }
 
 #[tokio::test(flavor = "current_thread")]
