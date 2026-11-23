@@ -132,8 +132,8 @@ fn service_without_a_stdout_reader(dir: &Path) -> (Service, PathBuf) {
 }
 
 #[test]
-fn help_succeeds_when_the_stdout_reader_has_gone() {
-    for flag in ["--help", "-h"] {
+fn help_and_version_succeed_when_the_stdout_reader_has_gone() {
+    for flag in ["--help", "-h", "--version", "-V"] {
         let output = witness(&[flag], closed_pipe());
         let stderr = stderr(&output);
         assert_eq!(output.status.code(), Some(0), "{flag}: {stderr}");

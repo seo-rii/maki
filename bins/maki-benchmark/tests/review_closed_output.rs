@@ -10,8 +10,8 @@
 use std::process::{Command, Stdio};
 
 #[test]
-fn help_succeeds_when_the_stdout_reader_has_gone() {
-    for flag in ["--help", "-h"] {
+fn help_and_version_succeed_when_the_stdout_reader_has_gone() {
+    for flag in ["--help", "-h", "--version", "-V"] {
         let (reader, writer) = std::io::pipe().unwrap();
         drop(reader);
         let output = Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))

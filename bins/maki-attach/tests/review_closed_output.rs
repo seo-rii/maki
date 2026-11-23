@@ -72,6 +72,16 @@ fn plans_succeed_when_the_stdout_reader_has_gone() {
 }
 
 #[test]
+fn help_and_version_succeed_when_the_stdout_reader_has_gone() {
+    for flag in ["--help", "-h", "help", "--version", "-V"] {
+        let output = helper(&[flag], closed_pipe());
+        let stderr = stderr(&output);
+        assert_eq!(output.status.code(), Some(0), "{flag}: {stderr}");
+        assert!(stderr.is_empty(), "{flag}: {stderr}");
+    }
+}
+
+#[test]
 fn the_failed_start_preview_succeeds_when_the_stdout_reader_has_gone() {
     let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
         .args(["recover-failed-start", "--volume", VOLUME, "--plan"])
