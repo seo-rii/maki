@@ -65,7 +65,10 @@ fn records_round_trip_atomically_with_private_regular_files() {
     let fixture = Fixture::new();
     let state = fixture.state().unwrap();
     let lock = state.lock().unwrap();
-    assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        lock.0.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert!(state.read("pg").unwrap().is_none());
     let mut entry = record();
     state.write(&entry).unwrap();
