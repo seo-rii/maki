@@ -1,7 +1,9 @@
 //! Read-only automatic NBD admission. A missing connection does not imply
-//! an unused device: stale mappings and direct mounts may remain. Selection
-//! runs under the attach lock; the executor rechecks its chosen device before
-//! publishing an attachment or connecting it.
+//! an unused device: stale mappings and direct mounts may remain, and so may
+//! another volume's trusted record, published before its connection or not
+//! yet retired after it. Selection runs under the attach lock; the executor
+//! rechecks its chosen device before publishing an attachment or connecting
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
@@ -16,16 +18,30 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// The mount table is bytes (paths need not be UTF-8); see `probe`.
+/// The kernel's view alone: no trusted record reserves a device.
 pub(super) fn allocate(sysfs: &Path, mountinfo: &Path) -> Result<String, ExecError> {
+    allocate_excluding(sysfs, mountinfo, &BTreeSet::new())
+}
+
+/// The mount table is bytes (paths need not be UTF-8); see `probe`.
+/// `reserved` holds the devices other volumes' trusted records name.
+pub(super) fn allocate_excluding(
+    sysfs: &Path,
+    mountinfo: &Path,
+    reserved: &BTreeSet<String>,
+) -> Result<String, ExecError> {
     let mut mounts = Vec::new();
     std::fs::File::open(mountinfo)?
         .take(MAX_MOUNTINFO_BYTES as u64 + 1)
         .read_to_end(&mut mounts)?;
-    choose(sysfs, &mounts)
+    choose(sysfs, &mounts, reserved)
 }
 
-fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
+fn choose(
+    sysfs: &Path,
+    mountinfo: &[u8],
+    reserved: &BTreeSet<String>,
+) -> Result<String, ExecError> {
     if mountinfo.len() > MAX_MOUNTINFO_BYTES {
         return Err(invalid("mount inventory exceeds the allocation observation limit").into());
     }
@@ -60,6 +76,10 @@ fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
     'candidate: for (index, names) in devices {
         let root = format!("nbd{index}");
         let device = format!("/dev/{root}");
+        // A recorded device is its volume's even with nothing connected.
+        if reserved.contains(&device) {
+            continue;
+        }
         // A PID alone is sufficient to establish occupancy, including NBDs
         // connected by clients that do not publish a backend identifier.
         if sysfs.join(&root).join("pid").try_exists()?
@@ -95,3 +115,7 @@ fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
 #[cfg(test)]
 #[path = "allocation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_stale_attach_record.rs"]
+mod review_stale_attach_record;

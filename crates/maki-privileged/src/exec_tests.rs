@@ -129,35 +129,180 @@ fn lvm_report_fixture() -> serde_json::Value {
     }]})
 }
 
-fn assert_inventory_attaches(count: usize, hidden: bool) {
-    let fixture = Fixture::new();
-    let state = fixture.state();
+/// Activation of the fixture report creates one kernel mapping per reported
+/// LV, so the production mapping verification, proof capture and recovery
+/// observers see the whole inventory that preflight admitted.
+struct InventorySystem {
+    inner: ObservedSystem,
+    /// Device-mapper name and UUID of every reported LV after the configured one.
+    extra: Vec<(String, String)>,
+}
+
+impl InventorySystem {
+    /// Follow the fixture's activation state with the additional mappings.
+    fn settle<T>(&self, result: T) -> T {
+        for (index, (name, uuid)) in self.extra.iter().enumerate() {
+            let kernel = format!("dm-{}", index + 1);
+            let mapping = self.inner.sysfs.join(&kernel);
+            let holder = self.inner.sysfs.join("nbd3/holders").join(&kernel);
+            if self.inner.fake.vg_active {
+                for directory in ["dm", "slaves", "holders"] {
+                    std::fs::create_dir_all(mapping.join(directory)).unwrap();
+                }
+                std::fs::write(mapping.join("dm/name"), format!("{name}\n")).unwrap();
+                std::fs::write(mapping.join("dm/uuid"), format!("{uuid}\n")).unwrap();
+                std::fs::write(mapping.join("dev"), format!("253:{}\n", index + 1)).unwrap();
+                std::fs::write(mapping.join("slaves/nbd3"), "").unwrap();
+                std::fs::write(holder, "").unwrap();
+            } else {
+                let _ = std::fs::remove_dir_all(mapping);
+                let _ = std::fs::remove_file(holder);
+            }
+        }
+        result
+    }
+}
+
+impl System for InventorySystem {
+    fn lvm_preflight(
+        &mut self,
+        record: &BoundDeviceRecord,
+    ) -> Result<lvm_preflight::VerifiedLvm, ExecError> {
+        self.inner.lvm_preflight(record)
+    }
+    fn activate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+        attempted: &mut bool,
+    ) -> Result<(), ExecError> {
+        let result = self.inner.activate_lvm(record, verified, attempted);
+        self.settle(result)
+    }
+    fn verify_activated_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        self.inner.verify_activated_lvm(record, verified)
+    }
+    fn verify_rollback_lvm(
+        &self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> io::Result<()> {
+        self.inner.verify_rollback_lvm(record, verified)
+    }
+    fn deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        let result = self.inner.deactivate_lvm(record, verified);
+        self.settle(result)
+    }
+    fn recover_deactivate_lvm(
+        &mut self,
+        record: &BoundDeviceRecord,
+        verified: &lvm_preflight::VerifiedLvm,
+    ) -> Result<(), ExecError> {
+        let result = self.inner.recover_deactivate_lvm(record, verified);
+        self.settle(result)
+    }
+    fn recovery_proof(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<Option<recover::RecoveryProof>> {
+        self.inner.recovery_proof(record)
+    }
+    fn recovery_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        self.inner.recovery_observation(record)
+    }
+    fn disconnected_recovery_observation(
+        &self,
+        record: &BoundDeviceRecord,
+    ) -> io::Result<DetachObservation> {
+        self.inner.disconnected_recovery_observation(record)
+    }
+    fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
+        let result = self.inner.run_step(step, identifier);
+        self.settle(result)
+    }
+    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+        self.inner.wait_ready(step, device)
+    }
+    fn allocate(&mut self) -> Result<String, ExecError> {
+        self.inner.allocate()
+    }
+    fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        self.inner.backend(device)
+    }
+    fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
+        self.inner.detach_observation(record)
+    }
+}
+
+/// A VG of `count` linear LVs on `/dev/nbd3`: the configured `data` LV and
+/// `count - 1` more, visible or hidden.
+fn inventory_system(fixture: &Fixture, count: usize, hidden: bool) -> InventorySystem {
     let mut report = lvm_report_fixture();
     let lvs = report["report"][0]["lv"].as_array_mut().unwrap();
+    let mut extra = Vec::new();
     for index in 1..count {
         let name = if hidden {
-            format!("[internal_{index}]")
+            format!("internal_{index}")
         } else {
             format!("extra_{index}")
         };
+        let uuid = format!("{index:06}-iiii-jjjj-kkkk-llll-mmmm-nnnnnn");
+        extra.push((
+            format!("vg_maki_pg-{name}"),
+            format!(
+                "LVM-aaaaaabbbbccccddddeeeeffffgggggg{}",
+                uuid.replace('-', "")
+            ),
+        ));
         lvs.push(serde_json::json!({
-            "lv_name": name,
-            "lv_uuid": format!("{index:06}-iiii-jjjj-kkkk-llll-mmmm-nnnnnn"),
+            "lv_name": if hidden { format!("[{name}]") } else { name },
+            "lv_uuid": uuid,
             "vg_uuid": "aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg",
             "lv_layout": "linear"
         }));
     }
-    let mut system = FakeSystem {
-        lvm_report: Some(report),
-        ..Default::default()
-    };
+    let sysfs = fixture.0.join("sys");
+    std::fs::create_dir_all(sysfs.join("nbd3/holders")).unwrap();
+    std::fs::write(sysfs.join("nbd3/dev"), "43:3\n").unwrap();
+    std::fs::write(sysfs.join("nbd3/size"), "1024\n").unwrap();
+    InventorySystem {
+        inner: ObservedSystem {
+            fake: FakeSystem {
+                lvm_report: Some(report),
+                ..Default::default()
+            },
+            sysfs,
+        },
+        extra,
+    }
+}
+
+fn assert_inventory_attaches(count: usize, hidden: bool) {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = inventory_system(&fixture, count, hidden);
     // The executor durably publishes and validates the full inventory
     // before activation; the previous 4 KiB record bound rejected this.
+    // After activation it verifies every mapping and records the proof of
+    // the topology: the NBD device and one mapping per LV.
     execute_with(&plan_attach(&request()), Some(&state), &mut system)
         .unwrap_or_else(|error| panic!("count={count}, hidden={hidden}: {error}"));
-    assert!(system.steps.contains(&"lvm-activate"));
-    assert!(system.mounted);
-    assert!(state.read("pg").unwrap().is_some());
+    assert!(system.inner.fake.steps.contains(&"lvm-activate"));
+    assert!(system.inner.fake.mounted);
+    let record = serde_json::to_value(state.read("pg").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        record["recovery"]["nodes"].as_array().map(Vec::len),
+        Some(count + 1),
+        "count={count}, hidden={hidden}"
+    );
     cleanup_with(&plan_detach(&request()), &state, &mut system).unwrap();
     assert!(state.read("pg").unwrap().is_none());
 }
@@ -212,6 +357,10 @@ fn oversized_lvm_inventory_is_rejected_before_activation() {
     };
     let error = execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap_err();
     assert!(error.to_string().contains("LVM LV inventory exceeds"));
+    assert!(
+        error.to_string().contains("64 logical volumes"),
+        "the refusal does not name the limit: {error}"
+    );
     assert!(!system.steps.contains(&"lvm-activate"));
     assert!(!system.steps.contains(&"mount-xfs"));
     assert!(system.backends.is_empty());
@@ -447,6 +596,14 @@ impl System for FakeSystem {
         Ok("/dev/nbd3".into())
     }
 
+    /// Silent, like every fake, except in the child that gives the executor
+    /// an unread stdout: there the line goes through the real writer.
+    fn announce_bound_device(&mut self, device: &str) {
+        if std::env::var_os(UNREAD_STDOUT_CHILD).is_some() {
+            LinuxSystem.announce_bound_device(device);
+        }
+    }
+
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
         let probe = self.backend_probes.get() + 1;
         self.backend_probes.set(probe);
@@ -552,6 +709,60 @@ fn new_auto_and_fixed_attachments_record_and_verify_the_kernel_identifier() {
         assert!(state.read("pg").unwrap().is_none());
         assert!(system.backends.is_empty());
     }
+}
+
+const UNREAD_STDOUT_CHILD: &str = "MAKI_PRIVILEGED_EXEC_TEST_UNREAD_STDOUT";
+
+/// Runs in a copy of this test binary (see the test below): an attach that
+/// allocates its device, with a stdout nobody reads.
+#[test]
+fn child_attaches_with_an_allocated_device_and_an_unread_stdout() {
+    use std::os::fd::AsRawFd;
+    if std::env::var_os(UNREAD_STDOUT_CHILD).is_none() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = FakeSystem::default();
+    let mut request = request();
+    request.nbd_device = AUTO_NBD_DEVICE.into();
+    let plan = plan_attach(&request);
+    // The harness reports on stdout as well, so descriptor 1 becomes the
+    // closed pipe only now, and the child exits before the harness writes
+    // this test's result.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    // SAFETY: both descriptors are open; `dup2` only replaces descriptor 1.
+    assert_eq!(unsafe { libc::dup2(writer.as_raw_fd(), 1) }, 1);
+    let attached = execute_with(&plan, Some(&state), &mut system).is_ok()
+        && system.mounted
+        && state.read("pg").is_ok_and(|record| record.is_some());
+    drop(fixture);
+    std::process::exit(if attached { 0 } else { 1 });
+}
+
+/// The executor announces the device it allocated on stdout, after loading
+/// the NBD module and before connecting. `println!` panics when that write
+/// fails, so a reader that had gone ended the attach there with status 101.
+#[test]
+fn an_attach_that_allocates_its_device_survives_an_unread_stdout() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exec::tests::child_attaches_with_an_allocated_device_and_an_unread_stdout",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UNREAD_STDOUT_CHILD, "1")
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

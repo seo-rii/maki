@@ -9,6 +9,8 @@ volume_uuid = "00000000-0000-0000-0000-000000000000"
 
 # Omit to allocate the lowest free /dev/nbdN at attach time (the helper
 # serializes allocation through /run/maki-attach/attach.lock). Set to pin one.
+# A device that another volume's attachment record names is skipped, and
+# refused when pinned.
 # nbd_device = "/dev/nbd0"
 
 # Defaults: /run/maki/<volume>/nbd.sock, vg_maki_<volume>, data, /srv/<volume>.

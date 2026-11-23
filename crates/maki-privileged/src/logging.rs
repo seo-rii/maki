@@ -38,6 +38,11 @@ pub fn install_default_logging() -> bool {
         .with_writer(io::stderr)
         .with_ansi(false)
         .with_target(false)
+        // This builder's default reports an event it could not write with
+        // `eprintln!`, which panics when stderr is the writer that failed (a
+        // pipe whose reader has gone): the helper would die at the first
+        // step it logs. An event that cannot be delivered is dropped.
+        .log_internal_errors(false)
         .try_init()
         .is_ok();
     if let (true, Some(reason)) = (installed, refused) {
@@ -153,6 +158,30 @@ mod tests {
             !stderr.contains("\u{1b}["),
             "no ANSI escapes in a journal:\n{stderr}"
         );
+    }
+
+    /// With a stderr nobody reads the sink cannot write its events. It must
+    /// drop them: the executor logs every step, and a panic there would end
+    /// the helper in the middle of an attach or a detach.
+    #[test]
+    fn events_nobody_reads_are_dropped_without_a_panic() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::child_emits_events",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .env_remove(super::LOG_ENV)
+            .env("RUST_BACKTRACE", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(writer)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child failed on its first event");
     }
 
     #[test]
