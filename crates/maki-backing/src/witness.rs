@@ -1062,8 +1062,18 @@ mod tests {
     /// temporary record, and a file someone who can write the directory
     /// puts back under that name before it is opened again is published
     /// only if it is root's or the directory owner's, whose record it is.
+    /// Only a root run checks the refusal; `scripts/run_root_tests.py` runs
+    /// this crate's unit tests as root.
+    #[cfg(unix)]
     #[test]
     fn root_creates_the_first_record_only_in_a_file_of_root_or_the_directory_owner() {
+        const TEST: &str =
+            "root_creates_the_first_record_only_in_a_file_of_root_or_the_directory_owner";
+        // SAFETY: geteuid has no preconditions.
+        let as_root = unsafe { libc::geteuid() } == 0;
+        if !as_root {
+            eprintln!("{TEST}: the refusal of another user's file is skipped without root");
+        }
         let daemon = FileOwner {
             uid: 4242,
             gid: 4343,
@@ -1081,7 +1091,7 @@ mod tests {
             let backing: Arc<dyn Backing> = fault.clone();
             let created = FileWitness::create_backing(backing, IDENTITY, ROOT_A);
 
-            if !super::running_as_root() {
+            if !as_root {
                 drop(created.unwrap());
                 assert_eq!(
                     fault.trace(),
