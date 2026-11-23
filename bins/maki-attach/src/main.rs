@@ -109,6 +109,14 @@ fn validate_arguments(args: &[OsString]) -> Result<(), String> {
             "--plan" => false,
             "--init-sentinel" if verb == "attach" => false,
             "--size-bytes" if verb == "grow" => true,
+            // The former relative option is refused with its reason: a retry
+            // after a partial failure could not tell whether its increase
+            // had already been applied.
+            "--add-bytes" if verb == "grow" => {
+                return Err("relative growth is unsupported; use --size-bytes with the \
+                            absolute desired LV size and reuse it on retry"
+                    .into());
+            }
             "--nbd-device" | "--vg" | "--lv" | "--mountpoint" | "--socket" | "--uuid"
             | "--fs-uuid"
                 if !matches!(verb, "verify" | "recover-failed-start") =>
@@ -281,10 +289,6 @@ fn main() -> ExitCode {
         "attach" => plan_attach(&request),
         "detach" | "recover" | "cleanup" => plan_detach(&request),
         "grow" => {
-            if args.iter().any(|arg| arg == "--add-bytes") {
-                diagnostic!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
-                return ExitCode::from(2);
-            }
             // Plain decimal digits only: `u64::from_str` accepts a leading
             // `+`, which turned an intended relative "+N" into an absolute
             // target that an existing larger LV already met (BUG-116).
