@@ -23,6 +23,11 @@ python3 -B scripts/run_cargo_tests.py --workspace --locked
 cargo test --workspace --release --locked -- --ignored
 ```
 
+CI checks formatting on Linux only: on Windows `cargo fmt --all` hands every
+target's root file to a single rustfmt command line, which the workspace has
+outgrown ("The filename or extension is too long", os error 206). There,
+check one package at a time with `cargo fmt -p <package> --check`.
+
 On Linux, `run_cargo_tests.py` first compiles the same selection with
 `--no-run --message-format=json` and passes the exact reported nbdkit cdylib
 path into the test run. Windows cross-target tests use Cargo's configured
