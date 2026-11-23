@@ -237,6 +237,29 @@ impl FileBacking {
         }
         Ok(p)
     }
+
+    /// A directory's sorted entry names for `Backing::list`, each exactly
+    /// as stored. A name that is not UTF-8 fails the listing, unless
+    /// `skip_non_utf8` leaves it out; it is never converted lossily, which
+    /// could return a name that opens a different entry.
+    #[cfg(not(target_os = "linux"))]
+    fn utf8_names(&self, dir: &str, skip_non_utf8: bool) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.resolve(dir, true)?)? {
+            match entry?.file_name().into_string() {
+                Ok(name) => names.push(name),
+                Err(_) if skip_non_utf8 => {}
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry name is not UTF-8",
+                    ))
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 // The shared GC dispatcher uses this result type, but only Linux constructs
@@ -529,19 +552,11 @@ impl Backing for FileBacking {
     }
 
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        let p = self.resolve(dir, true)?;
-        let mut names = Vec::new();
-        for entry in fs::read_dir(p)? {
-            let name = entry?.file_name().into_string().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory entry name is not UTF-8",
-                )
-            })?;
-            names.push(name);
-        }
-        names.sort();
-        Ok(names)
+        self.utf8_names(dir, false)
+    }
+
+    fn list_skipping_non_utf8(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.utf8_names(dir, true)
     }
 
     fn sync_dir(&self, dir: &str) -> io::Result<()> {

@@ -44,6 +44,11 @@ fn cases() -> Vec<Case> {
         ("list a directory", Ok(r#"["inner"]"#.into()), |b| {
             value(b.list("dir"))
         }),
+        (
+            "list a directory's UTF-8 names",
+            Ok(r#"["inner"]"#.into()),
+            |b| value(b.list_skipping_non_utf8("dir")),
+        ),
         ("exists for a directory", Ok("true".into()), |b| {
             value(b.exists("dir"))
         }),
@@ -70,6 +75,11 @@ fn cases() -> Vec<Case> {
         ("list a missing directory", Err(NotFound), |b| {
             done(b.list("missing"))
         }),
+        (
+            "list a missing directory's UTF-8 names",
+            Err(NotFound),
+            |b| done(b.list_skipping_non_utf8("missing")),
+        ),
         ("sync a missing directory", Err(NotFound), |b| {
             done(b.sync_dir("missing"))
         }),
@@ -87,6 +97,9 @@ fn cases() -> Vec<Case> {
             done(b.create_dir_all("file/sub"))
         }),
         ("list a file", Err(NotADirectory), |b| done(b.list("file"))),
+        ("list a file's UTF-8 names", Err(NotADirectory), |b| {
+            done(b.list_skipping_non_utf8("file"))
+        }),
         ("sync a file as a directory", Err(NotADirectory), |b| {
             done(b.sync_dir("file"))
         }),
