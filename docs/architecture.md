@@ -375,7 +375,8 @@ as the outer operation's deadline.
 The dispatcher validates quarantined endpoints in background tasks, never on
 the request path. Only proof that an endpoint serves another contract rejects
 it for the life of the set; an inconclusive validation (a failed exchange,
-such as a timeout or a truncated reply) is retried with the circuit breaker's
+such as a timeout, a truncated reply or a request refused without an
+integrity failure) is retried with the circuit breaker's
 doubling open interval, and the endpoint serves only after a validation
 succeeds in full. Each admitted call owns a circuit-breaker permit for its
 generation. Completion, operation deadline, cancellation, request/provider

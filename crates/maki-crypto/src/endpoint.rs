@@ -206,10 +206,13 @@ impl Revalidation {
 /// Everything else shows only that an exchange failed: transport errors,
 /// timeouts, admission limits, and replies that do not parse, are
 /// truncated or have the wrong shape (`Contract`: a proxy error page, a
-/// restart mid-response). [`ValidationProvider`] already relabels the
-/// reference's own failures as retryable, since they say nothing about the
-/// candidate (BUG-068). Such an attempt is retried with backoff, and the
-/// endpoint serves only once a later validation succeeds in full.
+/// restart mid-response). A request refused without an integrity verdict
+/// (a generic HTTP 4xx, a `bad-request` reply) is such a failure too, but
+/// at attach the two checks read it as a verdict, so [`ValidationProvider`]
+/// relabels it as retryable before they see it, together with the
+/// reference's own failures, which say nothing about the candidate
+/// (BUG-068). Such an attempt is retried with backoff, and the endpoint
+/// serves only once a later validation succeeds in full.
 fn proves_another_contract(error: &CryptoError) -> bool {
     matches!(
         error,
@@ -350,30 +353,52 @@ struct ValidationProvider {
 }
 
 impl ValidationProvider {
+    /// What a failed validation RPC is evidence of. The self-test and the
+    /// cross-endpoint check serve attach, where an endpoint that answers a
+    /// negative probe, or the decrypt of its peer's ciphertext, with
+    /// anything but a transport failure is refused: they fold such a reply
+    /// into a `ProviderFatal` verdict. In background validation a verdict
+    /// excludes the candidate for the life of the set, so a failure that
+    /// proves nothing about it is relabelled retryable here, before those
+    /// checks see it; they return it unchanged and the validation is tried
+    /// again later:
+    ///
+    /// - from either peer, a request refused without an integrity verdict
+    ///   (`NonRetryableRequest`: a generic HTTP 4xx, a WebSocket
+    ///   `bad-request`, a gRPC `InvalidArgument`, a local admission limit).
+    ///   It says that this request was not served, not that the peer holds
+    ///   another key or lacks a capability it claims;
+    /// - from the validated reference, every other failure the checks
+    ///   would read as a verdict on the candidate. Each endpoint already
+    ///   wraps its peer in `CheckedProvider`, so a malformed reply of the
+    ///   reference arrives as `Contract`; a broken reference is
+    ///   inconclusive for the candidate and must not reject it (BUG-068).
+    ///
+    /// `Integrity` is kept from both peers: it is the definitive refusal a
+    /// negative probe must get, and, for a decrypt of the other peer's
+    /// ciphertext, the evidence of another key. The candidate's own
+    /// `Contract` is already inconclusive, and its `ProviderFatal` and
+    /// `UnsupportedContext` are verdicts.
     fn failure(&self, operation: &str, error: CryptoError) -> CryptoError {
-        // Each Endpoint already wraps its peer in CheckedProvider. That
-        // check attributes malformed successful replies to the peer before
-        // cross-endpoint validation can turn a decrypt failure into a generic
-        // incompatibility verdict. A broken reference is inconclusive for
-        // the candidate; it must not permanently reject that candidate.
-        if self.reference
-            && matches!(
-                error,
-                CryptoError::Contract(_)
-                    | CryptoError::ProviderFatal(_)
-                    | CryptoError::UnsupportedContext(_)
-            )
-        {
-            CryptoError::Retryable(format!(
-                "validation reference {:?} {operation} failed: {error}",
-                self.endpoint.name
-            ))
-        } else {
-            // In particular, retain Integrity / NonRetryableRequest while
-            // the reference decrypts candidate ciphertext: this is evidence
-            // of incompatibility, rather than a malformed reference reply.
-            error
+        let inconclusive = match &error {
+            CryptoError::NonRetryableRequest(_) => true,
+            CryptoError::Contract(_)
+            | CryptoError::ProviderFatal(_)
+            | CryptoError::UnsupportedContext(_) => self.reference,
+            _ => false,
+        };
+        if !inconclusive {
+            return error;
         }
+        let role = if self.reference {
+            "reference"
+        } else {
+            "candidate"
+        };
+        CryptoError::Retryable(format!(
+            "validation {role} {:?} {operation} failed: {error}",
+            self.endpoint.name
+        ))
     }
 
     async fn admit(&self, bytes: u64) -> Result<EndpointAdmission, CryptoError> {
@@ -382,8 +407,12 @@ impl ValidationProvider {
             || bytes > self.global.max_bytes
             || bytes > self.endpoint.semaphore.max_bytes()
         {
-            return Err(CryptoError::NonRetryableRequest(
-                "validation RPC exceeds global or endpoint admission capacity".into(),
+            // The set's own limit refused the RPC before it was sent.
+            return Err(self.failure(
+                "admission",
+                CryptoError::NonRetryableRequest(
+                    "validation RPC exceeds global or endpoint admission capacity".into(),
+                ),
             ));
         }
         loop {
