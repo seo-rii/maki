@@ -338,7 +338,11 @@ The dispatcher and the random-prefix wrapper check every unit of a call before
 the first RPC and refuse the whole call for one they cannot carry. The
 scheduler applies the same per-unit checks at admission, request by request,
 so a request with such a unit (an empty ciphertext from a damaged slot, say)
-fails alone instead of failing every request coalesced with it. Only a
+fails alone instead of failing every request coalesced with it. It checks
+plaintext against the sizes the layer below reports, so that report lists only
+what the layer serves: the wrapper its logical unit, and a dispatcher bound to
+the volume's provider unit that unit alone, whatever other sizes its endpoints
+have in common. Only a
 retry-safe provider has a rejected coalesced call re-sent request by request;
 a provider that is not retry-safe is never sent a request twice, so its
 rejection reaches every request in the call.

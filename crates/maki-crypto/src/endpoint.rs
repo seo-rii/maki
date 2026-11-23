@@ -252,8 +252,9 @@ pub struct EndpointSet {
     validation_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     caps: OnceCell<CryptoCapabilities>,
     /// The provider plaintext unit selected by this volume, including any
-    /// prefix added before dispatch. Unbound sets conservatively use the
-    /// largest common size when splitting decrypt calls.
+    /// prefix added before dispatch. A bound set serves, and reports, that
+    /// size only. Unbound sets conservatively use the largest common size
+    /// when splitting decrypt calls.
     plaintext_size: Option<u32>,
 }
 
@@ -698,6 +699,10 @@ impl EndpointSet {
     /// Ciphertext lengths cannot establish this logical size (BUG-058).
     /// Configure this before serving; capabilities and batch calls reject a
     /// size that no common peer can accept within its batch byte limit.
+    /// A bound set refuses a unit of any other size, so its capabilities
+    /// list this size alone, whatever else the endpoints have in common:
+    /// a layer that admits by the reported sizes (the batch scheduler)
+    /// then never hands it a unit that fails the whole call it is in.
     pub fn with_plaintext_size(mut self, plaintext_size: u32) -> Self {
         self.plaintext_size = Some(plaintext_size);
         self.caps = OnceCell::new();
@@ -1417,6 +1422,13 @@ impl CryptoProvider for EndpointSet {
         }
         caps.supported_plaintext_sizes
             .retain(|&size| u64::from(size) <= budget);
+        // The reported contract is what this set serves: the common
+        // contract of its endpoints (R3-004), less what its own limits and
+        // binding refuse. `common_caps` has checked that the bound size is
+        // a common one.
+        if let Some(bound) = self.plaintext_size {
+            caps.supported_plaintext_sizes.retain(|&size| size == bound);
+        }
         Ok(caps)
     }
 
