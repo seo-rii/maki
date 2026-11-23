@@ -262,12 +262,14 @@ to remove by hand. The format marker and the anchor are each written under
 a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
 into place, so neither name ever holds an empty or torn file. `create` then
 accepts a backing directory that holds only what a creation writes (the
-lock, the marker, the arena and the two manifest slots) as long as no
-manifest slot holds a committed manifest, and a witness directory that holds
-only `witness.lock` and `anchor.next`. It never creates over a backing that
-committed anything, whatever the witness directory holds, so a witness mount
-that is missing (an empty directory in its place) cannot get a used volume
-recreated, and it never writes over an `anchor`. Earlier releases created
+lock, the marker, the arena and the two manifest slots) as long as the
+second slot holds only zeros and the first only zeros or the initial empty
+manifest, and a witness directory that holds only `witness.lock` and
+`anchor.next`. Every volume that committed anything wrote its second slot,
+so `create` never creates over one, whatever the witness directory holds
+and whatever state damage left its slots in: a witness mount that is
+missing (an empty directory in its place) cannot get a used volume
+recreated. It never writes over an `anchor` either. Earlier releases created
 the anchor empty before writing it: an empty `anchor` that such a release
 left is refused by `create` and by the daemon, which say that the creation
 did not complete or the witness lost its state. If the volume was never

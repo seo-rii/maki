@@ -341,7 +341,16 @@ impl RollbackBacking {
             files: BTreeMap::new(),
         };
         let bytes = manifest.encode()?;
-        write_manifest(disk.as_ref(), 0, &bytes)?;
+        // The initial manifest goes into slot 0 with its length in one
+        // write, far smaller than a sector, so a cut leaves the slot as it
+        // was (zeros, or an earlier attempt's initial manifest) or holding
+        // this one whole: never a part `require_unpublished_local` would
+        // have to tell apart from damage.
+        let slot = disk.open(MANIFESTS[0], false)?;
+        let mut record = (bytes.len() as u64).to_le_bytes().to_vec();
+        record.extend_from_slice(&bytes);
+        slot.write_at(0, &record)?;
+        slot.sync_data()?;
         disk.sync_dir("")?;
         let witness = FileWitness::create_backing(
             witness,
@@ -635,16 +644,16 @@ fn unwritten_marker(disk: &dyn Backing, magic: &[u8]) -> io::Result<bool> {
 /// writing the record, and which is also what a truncated anchor looks
 /// like) is never created over. The backing may hold its lock, the marker
 /// (staged, published, or created and never written by an earlier
-/// release), the arena and the two manifest slots, but no slot may hold a
-/// committed manifest: one that decodes with a generation above zero or
-/// that names any file or entry. A creation writes only the empty
-/// generation-0 manifest, and a slot it reserved and has not written, or
-/// was cut writing, holds zeros or does not decode. A backing whose slots
-/// hold nothing that decodes as a committed manifest names no data that
-/// any witness could select, so a creation over it loses nothing, while a
-/// volume that committed anything is refused whatever the witness
-/// directory holds, an empty one included (a witness that is not mounted).
-/// The marker refuses anything but this format.
+/// release), the arena and the two manifest slots, each holding only what
+/// a creation writes there (`unpublished_slot`): slot 1 nothing at all,
+/// slot 0 nothing or the empty generation-0 manifest. Such a backing names
+/// no data that any witness could select, so a creation over it loses
+/// nothing. Every volume that committed anything wrote generation 1 to
+/// slot 1 before its witness moved past the initial manifest, and a slot
+/// holding anything else, bytes that do not decode included, is a
+/// volume's slot in whatever state damage left it: it is refused whatever
+/// the witness directory holds, an empty one included (a witness that is
+/// not mounted). The marker refuses anything but this format.
 fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::Result<()> {
     let refused = || {
         io::Error::new(
@@ -664,7 +673,8 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
                 };
                 complete || unwritten_marker(disk, MAGIC)?
             }
-            slot if MANIFESTS.contains(&slot) => !holds_committed_manifest(disk, slot)?,
+            slot if slot == MANIFESTS[0] => unpublished_slot(disk, 0)?,
+            slot if slot == MANIFESTS[1] => unpublished_slot(disk, 1)?,
             _ => false,
         };
         if !unpublished {
@@ -681,14 +691,29 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
     Ok(())
 }
 
-/// Whether the manifest slot `name` holds a manifest that names volume
-/// data: one that decodes with a generation above zero, or with any file or
-/// entry. A slot shorter than its header, with a zero length, or whose
-/// bytes do not decode names nothing.
-fn holds_committed_manifest(disk: &dyn Backing, name: &str) -> io::Result<bool> {
-    let file = disk.open(name, false)?;
+/// Whether manifest slot `index` holds only what a creation writes there.
+/// A creation reserves both slots (zeros) and writes the empty
+/// generation-0 manifest to slot 0 with its length in one write, so a slot
+/// it left is all zeros, or, for slot 0, exactly that manifest. Anything
+/// else, a slot whose length or bytes do not decode included, is refused:
+/// only an all-zero slot is unwritten (S-01).
+fn unpublished_slot(disk: &dyn Backing, index: usize) -> io::Result<bool> {
+    let file = disk.open(MANIFESTS[index], false)?;
     let size = file.len()?;
-    if size < 8 {
+    let mut chunk = vec![0; 64 << 10];
+    let mut offset = 0;
+    while offset < size {
+        let part = &mut chunk[..(size - offset).min(64 << 10) as usize];
+        file.read_at(offset, part)?;
+        if part.iter().any(|byte| *byte != 0) {
+            break;
+        }
+        offset += part.len() as u64;
+    }
+    if offset >= size {
+        return Ok(true);
+    }
+    if index != 0 || size < 8 {
         return Ok(false);
     }
     let mut header = [0; 8];
@@ -701,7 +726,7 @@ fn holds_committed_manifest(disk: &dyn Backing, name: &str) -> io::Result<bool> 
     file.read_at(8, &mut bytes)?;
     Ok(
         serde_json::from_slice::<Manifest>(&bytes).is_ok_and(|manifest| {
-            manifest.generation != 0 || !manifest.entries.is_empty() || !manifest.files.is_empty()
+            manifest.generation == 0 && manifest.entries.is_empty() && manifest.files.is_empty()
         }),
     )
 }
