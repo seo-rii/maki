@@ -580,6 +580,14 @@ fn witness_init_killed_before_its_state_is_written_can_be_run_again() {
     assert_eq!(killed.status.signal(), Some(libc::SIGSYS), "{killed:?}");
     let left = entries(&state);
     assert!(left.iter().any(|name| name == "remote.lock"), "{left:?}");
+    // Nothing was published under the state's name, and `serve` says so.
+    assert!(!left.iter().any(|name| name == "remote.state"), "{left:?}");
+    let unserved = StateStore::open(&state).err().unwrap();
+    assert_eq!(unserved.kind(), io::ErrorKind::NotFound);
+    assert!(
+        unserved.to_string().contains("is not initialized"),
+        "{unserved}"
+    );
     init_again_and_serve(&state, &left);
 }
 
@@ -722,4 +730,36 @@ fn control_init_writes_over_a_staged_state_left_behind() {
             IDENTITY
         );
     }
+}
+
+/// Why the way out of an empty state file cannot make a rollback
+/// acceptable even when it is taken by mistake: an authority initialized
+/// again starts without a current root, and nothing accepts a backing that
+/// holds a volume's data for it.
+#[test]
+fn control_an_authority_initialized_again_accepts_none_of_the_existing_backing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let (writer, _) = authority();
+    let backing = RollbackBacking::create_remote(&root, writer, CAPACITY).unwrap();
+    let file = backing.open("payload", true).unwrap();
+    file.write_at(0, b"kept").unwrap();
+    file.sync_data().unwrap();
+    backing.sync_dir("").unwrap();
+    drop((file, backing));
+    let before = entries(&root);
+
+    // The same identity, initialized again.
+    let (writer, admin) = authority();
+    let record = inspect(admin.as_ref());
+    assert!(record.current.is_none() && record.fence == 0);
+    assert!(RollbackBacking::open_remote(&root, writer.clone()).is_err());
+    assert!(RollbackBacking::takeover_remote(&root, admin.clone(), &record).is_err());
+    assert!(
+        RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+            .is_err()
+    );
+    assert!(RollbackBacking::create_remote(&root, writer, CAPACITY).is_err());
+    assert_eq!(inspect(admin.as_ref()), record);
+    assert_eq!(entries(&root), before);
 }
