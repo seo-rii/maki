@@ -95,3 +95,7 @@ fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
 #[cfg(test)]
 #[path = "allocation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_stale_attach_record.rs"]
+mod review_stale_attach_record;
