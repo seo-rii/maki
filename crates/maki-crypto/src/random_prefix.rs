@@ -7,8 +7,8 @@ use rand::{rngs::OsRng, TryRngCore};
 use zeroize::Zeroize;
 
 use crate::{
-    checked::CheckedProvider, BatchCapability, CiphertextUnit, ContextField, CryptoCapabilities,
-    CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer,
+    checked::CheckedProvider, provider::private::SelfTestCaller, BatchCapability, CiphertextUnit,
+    CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer,
 };
 
 /// Prepends fresh random bytes to every plaintext unit before encryption and
@@ -118,10 +118,16 @@ impl RandomPrefixProvider {
     }
 
     fn inner_context(&self, context: &CryptoContext) -> Result<CryptoContext, CryptoError> {
+        // The wrapper translates the compatibility id; it does not bind it.
+        // Its refusal of another id is therefore not the field evidence a
+        // provider's `UnsupportedContext` is. The self-test's probe of the id
+        // is forwarded to the inner provider (`decrypt_compatibility_probe`);
+        // one that reaches this check as an ordinary decrypt fails closed.
         if context.crypto_compatibility_id != self.caps.crypto_compatibility_id {
-            return Err(CryptoError::UnsupportedContext(
-                ContextField::CompatibilityId,
-            ));
+            return Err(CryptoError::ProviderFatal(format!(
+                "random-prefix provider serves compatibility id {:?}, not {:?}",
+                self.caps.crypto_compatibility_id, context.crypto_compatibility_id
+            )));
         }
         let mut translated = context.clone();
         translated.crypto_compatibility_id = self.inner_compatibility_id.clone();
@@ -135,6 +141,53 @@ impl RandomPrefixProvider {
             )));
         }
         Ok(())
+    }
+
+    /// Decrypt under `context`, or, for the self-test's compatibility-id
+    /// probe (`probe`), under the inner provider's foreign id: the probe
+    /// passes the same checks, is sent with the translated inner context,
+    /// and its result is validated before the prefix is removed.
+    async fn decrypt_units(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+        probe: Option<SelfTestCaller>,
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        let inner_context = self.inner_context(context)?;
+        let bytes = u64::try_from(items.len())
+            .ok()
+            .and_then(|count| count.checked_mul(u64::from(self.logical_unit_size)))
+            .ok_or_else(|| {
+                CryptoError::NonRetryableRequest("ciphertext batch size overflows".into())
+            })?;
+        self.validate_batch(items.len(), bytes)?;
+        if let Some(item) = items.iter().find(|item| {
+            item.data.is_empty() || item.data.len() > self.caps.max_ciphertext_size as usize
+        }) {
+            return Err(CryptoError::NonRetryableRequest(format!(
+                "unit {} has invalid ciphertext size {} (maximum {})",
+                item.unit_index,
+                item.data.len(),
+                self.caps.max_ciphertext_size
+            )));
+        }
+        let mut units = match probe {
+            None => self.inner.decrypt_batch(&inner_context, items).await?,
+            Some(caller) => {
+                self.inner
+                    .decrypt_compatibility_probe(caller, &inner_context, items)
+                    .await?
+            }
+        };
+        for item in &mut units {
+            // The checked provider has pinned each expanded unit to the wire
+            // size. Keep its guarded allocation and erase the vacated tail.
+            item.data
+                .expose_mut()
+                .copy_within(self.prefix_bytes as usize.., 0);
+            item.data.truncate(self.logical_unit_size as usize);
+        }
+        Ok(units)
     }
 }
 
@@ -246,34 +299,19 @@ impl CryptoProvider for RandomPrefixProvider {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        let inner_context = self.inner_context(context)?;
-        let bytes = u64::try_from(items.len())
-            .ok()
-            .and_then(|count| count.checked_mul(u64::from(self.logical_unit_size)))
-            .ok_or_else(|| {
-                CryptoError::NonRetryableRequest("ciphertext batch size overflows".into())
-            })?;
-        self.validate_batch(items.len(), bytes)?;
-        if let Some(item) = items.iter().find(|item| {
-            item.data.is_empty() || item.data.len() > self.caps.max_ciphertext_size as usize
-        }) {
-            return Err(CryptoError::NonRetryableRequest(format!(
-                "unit {} has invalid ciphertext size {} (maximum {})",
-                item.unit_index,
-                item.data.len(),
-                self.caps.max_ciphertext_size
-            )));
-        }
-        let mut units = self.inner.decrypt_batch(&inner_context, items).await?;
-        for item in &mut units {
-            // The checked provider has pinned each expanded unit to the wire
-            // size. Keep its guarded allocation and erase the vacated tail.
-            item.data
-                .expose_mut()
-                .copy_within(self.prefix_bytes as usize.., 0);
-            item.data.truncate(self.logical_unit_size as usize);
-        }
-        Ok(units)
+        self.decrypt_units(context, items, None).await
+    }
+
+    async fn decrypt_compatibility_probe(
+        &self,
+        caller: SelfTestCaller,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        // `context` is the volume's own (derived) context: the probe asks the
+        // inner provider about the base id it actually receives, exactly as
+        // the same provider is probed on a volume without a prefix.
+        self.decrypt_units(context, items, Some(caller)).await
     }
 }
 

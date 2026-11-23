@@ -6,6 +6,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use maki_format::config::{parse_config, ByteSize};
 use maki_nbdkit::adapter::{NbdAdapter, EINVAL};
 
@@ -54,7 +57,7 @@ impl Fixture {
             &socket.to_string_lossy().replace('\\', "/"),
         );
         let path = directory.path().join("volume.toml");
-        std::fs::write(&path, &raw).unwrap();
+        volume_config::write(&path, &raw).unwrap();
         maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         Self { directory, path }
     }

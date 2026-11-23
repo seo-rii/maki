@@ -332,9 +332,11 @@ async fn rejects_bad_inputs_before_invoking_inner() {
         wrapper.encrypt_batch(&context("outer-v1"), &bad).await,
         Err(CryptoError::NonRetryableRequest(_))
     ));
+    // The wrapper translates the compatibility id without binding it: its
+    // refusal of another id must not read as a provider's field refusal.
     assert!(matches!(
         wrapper.encrypt_batch(&context("wrong"), &units()).await,
-        Err(CryptoError::UnsupportedContext(_))
+        Err(CryptoError::ProviderFatal(_))
     ));
     assert!(inner.calls.lock().unwrap().is_empty());
     let four: Vec<_> = (0..4)

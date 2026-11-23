@@ -1,6 +1,9 @@
 //! R3-008: acknowledged drain and retryable failure without admitting more I/O.
 #![cfg(unix)]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use maki_backing::Backing;
 use maki_control::protocol::{read_response, send_command, Request};
 use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
@@ -131,7 +134,7 @@ socket = "{}"
             root.display(),
             socket.display()
         );
-        std::fs::write(&path, &raw).unwrap();
+        volume_config::write(&path, &raw).unwrap();
         maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         Self {
             _dir: dir,

@@ -273,7 +273,7 @@ packaged configuration without installing services or creating users.
 | Administrative socket access (BUG-009) | `maki-nbdkit/tests/regression_control_packaging.rs`: default/example/custom paths, admin traversal, daemon access, and isolation from NBD and helper state under the packaged directory modes |
 | Interrupted detach (BUG-010) | `maki-privileged/src/detach_tests.rs`, `exec_tests.rs`, and `probe.rs`: retry after each completed step, safe record-only cleanup, wrong mount/backend refusal, escaped VG names, partition holders, and direct mounts; all device operations use fixtures |
 | NBD request limits (BUG-011, supersedes O-03) | `maki-nbdkit/tests/review_nbd_limits.rs`: oversized reads leave caller buffers untouched, oversized writes leave volume data unchanged, minimum alignment applies to offsets and lengths, valid maximum writes survive reopen, invalid wire sizes fail configuration validation, and real nbdkit/libnbd negotiation reports the configured tuple |
-| Scheduler cancellation (BUG-012) | `maki-crypto/tests/review_scheduler_cancellation.rs`: queued payload and admission release, cancellation behind a live blocked group, active-RPC cancellation, cancellation of one group in a coalesced batch, and continued service for live callers; `review_r5_scheduler_resend.rs`: no per-request re-send to a provider that is not retry-safe, and an abandoned re-send releases its lane slot (R5-004) |
+| Scheduler cancellation (BUG-012) | `maki-crypto/tests/review_scheduler_cancellation.rs`: queued payload and admission release, cancellation behind a live blocked group, active-RPC cancellation, cancellation of one group in a coalesced batch, and continued service for live callers; `review_r5_scheduler_resend.rs`: no per-request re-send to a provider that is not retry-safe, and an abandoned re-send releases its lane slot (R5-004); `review_scheduler_local_refusal.rs`: with such a provider, a request with a unit the endpoint set or random-prefix wrapper refuses before sending (empty or oversized ciphertext, unsupported plaintext size) fails alone at admission, while a rejection after sending still reaches the whole batch; `maki-core/tests/review_coalesced_empty_slot.rs`: a read of a slot recording an empty ciphertext does not fail a healthy read coalesced with it |
 | Queue deadlines (BUG-013) | `maki-crypto/tests/review_queued_deadline.rs`: ManualClock deadlines cover admission, coalescing, slot wait, and RPC under one caller budget; a live peer retains its own budget and stall mode remains unbounded |
 | Deadline exits | `maki-crypto/tests/review_deadline_exits.rs`: with ManualClock, an operation with no time left, the top of a pass, right after a failed RPC, admission with no time left, a cut-off RPC, scheduler callers on their own timer (both lanes, with and without the random prefix, coalesced, or re-sent alone after a request-specific rejection) and a dispatcher deadline reaching a scheduler caller all return the last endpoint error of the RPC batch in progress with its class (else the deadline error) and count once; a call split into several RPC batches, directly or through the scheduler, reports only the current one; a failure the dispatcher receives, or a batch it starts, at or after a scheduler caller's deadline but before the caller's task runs does not change the caller's answer; a nested set's expiry counts only in that set and never as a scheduler caller's deadline. `maki-nbdkit/tests/review_deadline_metrics.rs` checks the exported counter for an endpoint error at the deadline |
 | Concurrent socket permissions (BUG-014) | `maki-control/tests/review_uds_umask.rs`: bind concurrently with private directory creation and verify mode 0700 is preserved; `review_uds.rs` also checks prepared socket mode/group, preservation on failed group lookup, cleanup on failed publication, and actual Linux connection at the maximum public path length |
@@ -634,17 +634,18 @@ The [prefix wrapper](random-plaintext-prefix.md) has focused provider, config
 and daemon suites:
 
 ```sh
-cargo test -p maki-crypto --test random_prefix
+cargo test -p maki-crypto --test random_prefix --test review_prefix_context_probe
 cargo test -p maki-format --test random_prefix_config
 cargo test -p maki-nbdkit --test random_prefix --test random_prefix_remote --test random_prefix_admission
 ```
 
 The tests inspect the actual expanded plaintext, fresh per-unit prefixes,
 provider response validation, capabilities and batch sizes, compatibility
-gates, authenticated-prefix corruption, partial writes, discard, reopen and
-two-endpoint remote operation. They do not establish a randomness benefit for
-every possible provider algorithm; existing nonce and integrity requirements
-still apply.
+gates, authenticated-prefix corruption, partial writes, discard, reopen,
+two-endpoint remote operation, and that the attach self-test's context probes
+reach the provider and give the same verdict with and without the prefix. They
+do not establish a randomness benefit for every possible provider algorithm;
+existing nonce and integrity requirements still apply.
 
 ## Experimental rollback backing
 

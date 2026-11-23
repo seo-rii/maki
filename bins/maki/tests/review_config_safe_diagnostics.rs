@@ -1,4 +1,7 @@
 //! Actual CLI stderr must not reproduce rejected configuration input.
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 #[test]
 fn rejected_config_values_and_keys_are_not_printed() {
     let dir = tempfile::tempdir().unwrap();
@@ -9,7 +12,7 @@ fn rejected_config_values_and_keys_are_not_printed() {
         "S3NT1NEL0123456789abcdef = true",
         r#"key = "bad\\\"S3NT1NEL0123456789abcdef""#,
     ] {
-        std::fs::write(&path, format!("config_schema_version = 1\n[volume]\nname = \"safe-errors\"\nmax_virtual_size = \"1MiB\"\n[backing]\nroot = \"unused\"\n[crypto]\nprovider = \"local-aes-gcm-siv\"\ncrypto_compatibility_id = \"x\"\n{field}\n")).unwrap();
+        volume_config::write(&path, format!("config_schema_version = 1\n[volume]\nname = \"safe-errors\"\nmax_virtual_size = \"1MiB\"\n[backing]\nroot = \"unused\"\n[crypto]\nprovider = \"local-aes-gcm-siv\"\ncrypto_compatibility_id = \"x\"\n{field}\n")).unwrap();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_maki"))
             .args(["volume", "inspect"])
             .arg(&path)

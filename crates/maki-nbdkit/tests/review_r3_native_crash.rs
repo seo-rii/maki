@@ -9,6 +9,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
@@ -158,7 +161,7 @@ root = {root:?}
 socket = {control:?}
 "#
         );
-        std::fs::write(&config, &raw).unwrap();
+        volume_config::write(&config, &raw).unwrap();
         {
             let _creation = PROCESS_SPAWN
                 .read()

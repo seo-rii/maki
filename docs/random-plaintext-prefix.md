@@ -97,10 +97,20 @@ removal can expose logical plaintext. An encryption response identical to the
 expanded input is also refused: the added prefix must not hide an endpoint
 that simply returns the supplied plaintext.
 
+The self-test's context-binding probes reach the provider through the wrapper.
+The wrapper translates the volume's derived compatibility ID into the base ID
+without binding either, so the compatibility-ID probe is forwarded with the
+base context: the provider is asked to decrypt under the same foreign base ID
+as on a volume without a prefix, and a provider that declares context binding
+but ignores the compatibility ID is refused at attach with or without the
+prefix. For volume I/O the wrapper still refuses, before any request, a context
+that does not carry the volume's derived ID; that refusal is a provider-fatal
+error, never the provider's own field refusal that a context probe accepts.
+
 ## Focused validation
 
 ```sh
-cargo test -p maki-crypto --test random_prefix
+cargo test -p maki-crypto --test random_prefix --test review_prefix_context_probe
 cargo test -p maki-format --test random_prefix_config
 cargo test -p maki-nbdkit --test random_prefix --test random_prefix_remote --test random_prefix_admission
 ```
@@ -108,7 +118,8 @@ cargo test -p maki-nbdkit --test random_prefix --test random_prefix_remote --tes
 The suites inspect expanded provider inputs, independent prefix generation,
 round trips, response shape and length errors, compatibility changes, logical
 geometry, batch bounds, authenticated-prefix corruption, partial writes,
-discard, reopen and rejection of unchanged provider plaintext. A two-endpoint
-local reference service exercises the remote
-daemon path. These tests validate the wrapper's behavior; they do not prove
-additional cryptographic strength for an arbitrary vendor algorithm.
+discard, reopen, rejection of unchanged provider plaintext, and the same
+context-binding verdict and probes with and without the prefix. A one- and
+two-endpoint local reference service exercises the remote daemon path. These
+tests validate the wrapper's behavior; they do not prove additional
+cryptographic strength for an arbitrary vendor algorithm.

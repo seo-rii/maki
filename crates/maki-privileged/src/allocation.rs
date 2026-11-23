@@ -33,17 +33,9 @@ fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
     for line in
         crate::probe::mountinfo_lines(mountinfo).filter(|line| !line.trim_ascii().is_empty())
     {
-        let (left, right) = crate::probe::split_record(line)
+        let record = crate::probe::mount_record(line)
             .ok_or_else(|| invalid("incomplete mount inventory during NBD allocation"))?;
-        let mut fields = crate::probe::mountinfo_fields(left);
-        let number = fields
-            .nth(2)
-            .ok_or_else(|| invalid("incomplete mount inventory during NBD allocation"))?;
-        if fields.take(3).count() != 3 || crate::probe::mountinfo_fields(right).take(3).count() != 3
-        {
-            return Err(invalid("incomplete mount inventory during NBD allocation").into());
-        }
-        mounted.insert(crate::detach::mount_device_number(number)?);
+        mounted.insert(crate::detach::mount_device_number(record.device)?);
     }
 
     // Group root devices and their partitions in one bounded sysfs pass.
