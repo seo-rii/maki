@@ -98,6 +98,7 @@ class ReleasePreparationTests(unittest.TestCase):
             "LANG": "C",
             "LC_ALL": "C",
             "TMPDIR": str(self.work),
+            "CARGO_HOME": str(self.work / "cargo-home"),
         }
 
     def git(self, *args, env=None):
@@ -509,6 +510,109 @@ class ReleasePreparationTests(unittest.TestCase):
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertEqual(manifest["build"]["compiler_environment"],
                          {"RUSTC": str(self.tools / "rustc"), **wrappers})
+
+    def test_release_profile_and_unstable_toolchain_overrides_are_refused_before_building(self):
+        # The committed Cargo.toml owns the release profile. An inherited
+        # panic = "abort", for example, removes the nbdkit plugin's panic
+        # boundary while the bundle looks like a default build.
+        base = dict(self.environment)
+        refused = {
+            "CARGO_PROFILE_RELEASE_PANIC": "abort",
+            "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS": "true",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
+            "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS": "",
+            "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL": "3",
+            "RUSTC_BOOTSTRAP": "1",
+            "CARGO_UNSTABLE_BUILD_STD": "std,panic_abort",
+            "__CARGO_DEFAULT_LIB_METADATA": "fixture",
+        }
+        for index, (key, value) in enumerate(refused.items()):
+            with self.subTest(key=key):
+                self.environment = base | {key: value}
+                output, result = self.prepare(f"refused-{index}", succeeds=False)
+                self.assertIn(key, result.stderr)
+                self.assertNotIn("Building candidate", result.stdout)
+                self.assertFalse(output.exists())
+                self.assertEqual(list(self.work.glob(".maki-candidate-*")), [])
+                self.assertFalse(self.cargo_trace.exists())
+        # Profiles that a release build never reads remain the caller's business.
+        self.environment = base | {"CARGO_PROFILE_DEV_PANIC": "abort", "CARGO_PROFILE_TEST_DEBUG": "0"}
+        self.prepare("allowed")
+
+    def test_manifest_records_native_toolchain_inputs_of_the_selected_target(self):
+        # aws-lc-sys and ring compile C through the cc, cmake and pkg-config
+        # helpers. They read these inputs in plain, HOST_/TARGET_ and
+        # per-target spellings, and aws-lc-sys also reads its own settings.
+        recorded = {
+            "CC": "clang",
+            "CFLAGS": "-O0",
+            "CXX": "clang++",
+            "CXXFLAGS": "-O1",
+            "AR": "llvm-ar",
+            "CC_fixture-native-linux-gnu": "target-spelled-cc",
+            "CFLAGS_fixture_native_linux_gnu": "-g0",
+            "HOST_CC": "host-cc",
+            "TARGET_CFLAGS": "-fno-plt",
+            "CRATE_CC_NO_DEFAULTS": "1",
+            "CC_SHELL_ESCAPED_FLAGS": "1",
+            "CMAKE_GENERATOR": "Ninja",
+            "PKG_CONFIG_PATH": "/opt/fixture/lib/pkgconfig",
+            "OPENSSL_DIR": "/opt/fixture",
+            "AWS_LC_SYS_NO_ASM": "1",
+            "AWS_LC_SYS_CFLAGS_fixture_native_linux_gnu": "-O2",
+            "RING_PREGENERATE_ASM": "0",
+            "CARGO_INCREMENTAL": "1",
+            "CARGO_BUILD_INCREMENTAL": "true",
+        }
+        ignored = {
+            "CC_other-linux-gnu": "other-cc",
+            "CFLAGS_other_linux_gnu": "-O3",
+            "CCACHE_DIR": str(self.work / "ccache"),
+            "OPENSSL_CONF": "/etc/ssl/fixture.cnf",
+        }
+        self.environment.update(recorded | ignored)
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["compiler_environment"],
+                         {"RUSTC": str(self.tools / "rustc"), **recorded})
+        self.assertEqual(manifest["build"]["cargo_configuration"], [])
+
+    def test_cargo_configuration_outside_the_committed_source_is_recorded_or_refused(self):
+        # Committed configuration is part of the archived source and stays allowed.
+        (self.repo / ".cargo").mkdir()
+        (self.repo / ".cargo/config.toml").write_text("[profile.release]\ncodegen-units = 1\n")
+        self.git("add", ".cargo/config.toml")
+        self.git("commit", "-qm", "test: committed Cargo configuration")
+        # Cargo reads every .cargo/config{,.toml} above the build directory,
+        # then the one in CARGO_HOME.
+        cargo_home = pathlib.Path(self.environment["CARGO_HOME"])
+        cargo_home.mkdir()
+        home_config = cargo_home / "config.toml"
+        home_config.write_text("[net]\nretry = 3\n")
+        (self.work / ".cargo").mkdir()
+        ancestor_config = self.work / ".cargo/config"
+        ancestor_config.write_text('[build]\nrustflags = ["--cfg", "ancestor_marker"]\n')
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["cargo_configuration"], [
+            {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in (ancestor_config, home_config)
+        ])
+        self.cargo_trace.unlink()
+        for index, (config, text) in enumerate((
+            (home_config, '[profile.release]\npanic = "abort"\n'),
+            (ancestor_config, "profile.release.debug = 0\n"),
+            (home_config, '[unstable]\nbuild-std = ["std"]\n'),
+            (ancestor_config, "[profile.release\n"),
+        )):
+            with self.subTest(config=config.name, text=text):
+                original = config.read_text()
+                config.write_text(text)
+                output, result = self.prepare(f"refused-{index}", succeeds=False)
+                config.write_text(original)
+                self.assertIn(str(config.resolve()), result.stderr)
+                self.assertFalse(output.exists())
+                self.assertFalse(self.cargo_trace.exists())
 
     def test_compiler_overrides_match_the_recorded_toolchain_and_target(self):
         alternate = self.tools / "alternate-rustc"
