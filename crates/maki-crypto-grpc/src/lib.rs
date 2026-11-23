@@ -7,6 +7,13 @@
 //! sizes are bounded in both directions. Dynamic descriptor loading
 //! (arbitrary message shapes) is not supported; see docs/configuration.md.
 //!
+//! An error is classified by its status code ([`map_status`]). An integrity
+//! failure or a context refusal additionally needs exactly one
+//! `maki-crypto-error` metadata value on `FailedPrecondition`:
+//! `auth-tag-mismatch` or `context-mismatch`, or
+//! `unsupported-format-version` or `unsupported-compatibility-id`. Remote
+//! status text and details are never read.
+//!
 //! The provider's private wire items erase their owned data on drop and field
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 

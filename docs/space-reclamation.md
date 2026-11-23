@@ -1,9 +1,22 @@
 # Discard and space reclamation
 
-Status: implemented with local regression qualification and a scoped external
-GCE whole-instance-reset campaign on 2026-09-20. The default v2 format is
-unchanged. V3 has not run the database campaigns previously run for v2, and the
-GCE reset did not power-cycle the physical Persistent Disk service.
+Status: implemented, with local regression qualification and scoped external
+campaigns; [current status](status.md#volume-formats) is the page that states
+current support. GCE whole-instance-reset campaigns passed on
+[2026-09-20](qualification/gce-discard-reset-validation-2026-09-20.md) and,
+after the R5 fixes, on
+[2026-10-03](qualification/r5-hardware-validation-2026-10-03.md), when kernel
+`fstrim` also reclaimed backing space through XFS, LVM and NBD. Scoped
+PostgreSQL crash and lifecycle campaigns then passed on v3 volumes:
+PostgreSQL 15 with `fstrim` under load
+([2026-10-03](qualification/database-discard-pressure-validation-2026-10-03.md)),
+PostgreSQL 15 over remote gRPC
+([2026-10-04](qualification/remote-database-zero-mdwe-validation-2026-10-04.md))
+and PostgreSQL 17 over per-item HTTP on Debian 13
+([2026-10-05](qualification/debian13-postgresql-http-validation-2026-10-05.md)).
+The default v2 format is unchanged. No run power-cycled physical storage: the
+2026-09-20 reset did not power-cycle the physical Persistent Disk service, and
+the later reports list physical power loss as not covered.
 
 ## Selecting the volume format
 

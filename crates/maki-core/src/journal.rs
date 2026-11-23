@@ -264,12 +264,12 @@ impl JournalWriter {
     }
 
     /// Exact bytes appending records of the given on-disk lengths would add
-    /// to [`total_bytes`], **including any new 48-byte segment headers an
+    /// to [`Self::total_bytes`], **including any new 48-byte segment headers an
     /// automatic roll creates**. Journal admission bounds against this, not
     /// the record payloads alone: at the hard limit a roll's header would
     /// otherwise push the on-disk total past a limit that record-only
     /// accounting reported as exact equality (review R08, 2026-09-07). The
-    /// projection mirrors [`append`]/[`roll`] step by step; `record_len` is
+    /// projection mirrors [`Self::append`]/`roll` step by step; `record_len` is
     /// the encoded record size (`RECORD_HEADER_SIZE + payload`), the same
     /// quantity those methods advance `write_offset` by.
     pub fn append_footprint(&self, record_lens: impl IntoIterator<Item = u64>) -> u64 {

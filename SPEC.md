@@ -268,11 +268,22 @@ maki detach
 maki status
 maki metrics
 
+maki checkpoint
+maki drain
+
 maki reload
 maki check
 
 maki grow
 ```
+
+`maki checkpoint` and `maki drain` are control-socket commands: `checkpoint`
+requests a graceful checkpoint, and `drain` closes I/O admission, waits for
+the requests in progress, then flushes and checkpoints. `maki attach`,
+`maki detach` and `maki grow` do not perform the operation: `maki` prints the
+`maki-attach` command to run (the same verb and arguments) on standard error
+and exits with status 3. The operation runs only when the operator runs that
+privileged helper (§6).
 
 Normal status and runtime configuration operations are performed over the daemon control socket:
 
@@ -720,6 +731,29 @@ Alignment             512
 Slot size            4608
 ```
 
+A slot holds a 64-byte header followed by the unit's ciphertext; the rest of
+the slot is not read. Slot `i` of a shard holds unit
+`shard_index * units_per_shard + i` of the volume and starts at byte
+`i * slot_size` of `data/shard-<index>.dat`, where `<index>` is the shard
+index as eight lowercase hexadecimal digits. The header (record notation in
+§21):
+
+```text
+magic[8] = MAKISLT1
+unit_index u64          the unit's index in the volume, not in the shard
+write_sequence u64      journal sequence of the write the slot holds; never 0
+ciphertext_len u32      at most max_ciphertext_size
+flags u32 = 0
+ciphertext_crc u32      CRC-32 of the ciphertext
+reserved[24] = 0
+crc32
+```
+
+The header has no version field: its magic, which ends in the format version
+`1`, is its only format identifier, and a header with another magic does not
+decode. Writers set `flags` and the reserved bytes to zero, and readers do not
+interpret them.
+
 Maximum fully allocated layout sizes are calculated from the immutable
 geometry with checked arithmetic:
 
@@ -975,6 +1009,92 @@ context evidence. These tokens denote a field refusal, not an authentication
 failure; they cannot satisfy unit-index, volume-UUID, or tamper probes. Remote
 error text is ignored.
 
+Integrity failures use the same carriers with their own tokens: HTTP status
+`422` or gRPC status `FailedPrecondition` with exactly one `maki-crypto-error`
+header/metadata value, `auth-tag-mismatch` (the ciphertext failed
+authentication) or `context-mismatch` (the ciphertext is not bound to the
+context it was presented under). WebSocket uses `error.class = "integrity"`
+and one of the same two `error.reason` values. Either token yields
+`CryptoError::Integrity`. A token is compared exactly: a missing, unknown,
+repeated or comma-joined value is not an integrity failure, and neither is a
+token under any other HTTP or gRPC status.
+
+A provider that declares integrity MUST answer a ciphertext it cannot
+authenticate with an integrity failure; the attach self-test accepts nothing
+else from its tamper probe. A negative probe (the tamper probe and the
+context probes above) is judged by its classified result alone:
+
+- `CryptoError::Integrity` satisfies the tamper probe and every context probe.
+- A successful reply never satisfies the tamper probe, whatever plaintext it
+  carries. It satisfies a context probe only when it is well formed and its
+  plaintext differs from the original.
+- `CryptoError::UnsupportedContext` satisfies only the probe that changed the
+  field it names.
+- A `Retryable`, `Throttled` or `EndpointFatal` error is inconclusive and is
+  returned unchanged: the endpoint is not validated (§34).
+- A contract violation (a malformed or mislabelled reply) is not an answer:
+  the self-test fails without a verdict on the capability.
+- Every other result leaves the capability unproven and refuses attach: a
+  generic bad request (an HTTP `400`, a `422` without one recognised token,
+  a gRPC `InvalidArgument`, a WebSocket `bad-request`), a refusal of another
+  field, or a provider failure.
+
+The cross-endpoint check (§34) reads a refusal the other way: an endpoint
+that answers its peer's ciphertext with anything but a transport failure or a
+contract violation, an integrity failure included, fails the check as not
+interchangeable, and attach is refused. These are the verdicts at attach; §34
+states what each means for a quarantined endpoint that is validated later.
+
+Each transport classifies a provider's answer as follows (classes in §31).
+`Integrity` has the class `NonRetryableRequest`; `UnsupportedContext` and a
+contract violation (`CryptoError::Contract`) have the class `ProviderFatal`.
+In each table a row applies only when no row above it does.
+
+| HTTP response status | Result |
+| --- | --- |
+| 2xx | Success; a body that does not satisfy the response mapping is a contract violation |
+| `422` with exactly one `maki-crypto-error` header, holding a token | `Integrity` or `UnsupportedContext`, by the token |
+| `429` | `Throttled` |
+| `408` | `Retryable` |
+| 3xx, `401`, `403`, `404`, `405`, `407`, `410` | `EndpointFatal`; a redirect is never followed |
+| Any other 4xx | `NonRetryableRequest` |
+| Any other status | `Retryable` |
+
+| gRPC status | Result |
+| --- | --- |
+| `OK` | Success; a reply that is not one message answering the request's items is a contract violation |
+| `FailedPrecondition` with exactly one `maki-crypto-error` metadata value, holding a token | `Integrity` or `UnsupportedContext`, by the token |
+| `ResourceExhausted` | `Throttled` |
+| `Unauthenticated`, `PermissionDenied`, `Unimplemented` | `EndpointFatal` |
+| `InvalidArgument`, `NotFound`, `OutOfRange`, any other `FailedPrecondition` | `NonRetryableRequest` |
+| Any other status (`Unavailable`, `DeadlineExceeded`, `Aborted`, `Internal`, `Cancelled`, `Unknown`, `AlreadyExists`, `DataLoss`) | `Retryable` |
+
+A gRPC response with an HTTP status other than 200 and no `grpc-status` is
+taken as an intermediary's answer, not the provider's, and is classified by
+that HTTP status: `401`, `403` and `404` are `EndpointFatal`, every other
+status is `Retryable`.
+
+| WebSocket `error.class` | Result |
+| --- | --- |
+| `integrity` with `error.reason` `auth-tag-mismatch` or `context-mismatch` | `Integrity` |
+| `unsupported-context` with `error.reason` `unsupported-format-version` or `unsupported-compatibility-id` | `UnsupportedContext` |
+| `throttled` | `Throttled` |
+| `retryable` | `Retryable` |
+| `bad-request` | `NonRetryableRequest` |
+| Anything else, a missing class included | Contract violation |
+
+A WebSocket `integrity` or `unsupported-context` error with another reason,
+with none, or in a frame that repeats its `id`, `error`, `class` or `reason`
+member is a contract violation as well. A WebSocket error frame has no class
+for an endpoint failure; the refused upgrade of a connection reports one:
+status `429` is `Throttled`, `408` and 5xx are `Retryable`, and any other
+status is `EndpointFatal`.
+
+Without a classified answer, every transport reports a timeout or a lost
+connection as `Retryable`, a TLS authentication or protocol failure as
+`EndpointFatal`, and a reply that breaks the transport's framing or size limit
+as a contract violation.
+
 ---
 
 # 19. HTTP Configuration Example
@@ -1119,6 +1239,46 @@ It MUST NOT replace or weaken the required proof. Local CRC records do not
 authenticate metadata, prevent coordinated valid rollback, or provide separate
 physical failure domains.
 
+Record notation: a layout in this document lists a record's fields in file
+order, with no padding between them unless it names some. Integers are
+unsigned and little-endian. `magic[n]` is `n` ASCII bytes. A UUID is its 16
+bytes in the order of its text form, not a little-endian integer. `crc32` is
+the CRC-32 of IEEE 802.3 and zlib over every byte of the record before it,
+stored little-endian like any other integer. Every A/B record of this layout
+(`*.a`, `*.b`) begins with `magic[8]`, `version u32` and `generation u64`.
+
+A superblock copy is exactly 4096 bytes:
+
+```text
+magic[8] = MAKISB01
+version u32             envelope version: 1 (legacy), 2 or 3
+generation u64
+volume_uuid[16]
+device_block_size u32
+crypto_unit_size u32
+slot_alignment u32
+max_ciphertext_size u32
+slot_header_size u32 = 64
+slot_size u64
+max_virtual_size u64
+shard_logical_size u64
+format_version u32 = 1  the crypto context's format version
+created_unix u64        creation time in seconds since the Unix epoch
+flags u64 = 0
+provider_type           string
+crypto_compatibility_id string
+key_identity            string
+zero padding up to byte 4092
+crc32
+```
+
+A string is a `u16` byte length followed by that many bytes of UTF-8, at most
+128. The envelope version is the only field in which the v1, v2 and v3 images
+of one superblock differ. A decoder MUST refuse an envelope version, a
+`format_version` or a `flags` bit it does not know, and a stored
+`slot_header_size` or `slot_size` that differs from the value §14 derives
+from the other fields.
+
 An optional, experimental outer backing format can anchor the authenticated
 namespace and retained COW pages in an independent trusted local or remote
 witness.
@@ -1260,6 +1420,45 @@ slots the last checkpoint filled. Therefore:
 - a cataloged shard with *no* valid allocation copy refuses attach
   (offline repair territory), as does a missing data file.
 
+Record layouts (notation in §21). A shard's allocation map is stored A/B as
+`data/shard-<index>.alloc.a` and `data/shard-<index>.alloc.b`, with `<index>`
+written as for the data file (§14):
+
+```text
+magic[8] = MAKIALC1
+version u32 = 1
+generation u64
+units u64               units_per_shard
+bitmap[ceil(units / 8)]
+crc32
+```
+
+Unit `u` of the shard (`0 <= u < units`) is bit `u % 8` of bitmap byte
+`u / 8`, counting from the least significant bit: unit 0 is `0x01` of byte 0
+and unit 9 is `0x02` of byte 1. A set bit means allocated. The bits of the
+last byte beyond `units` name no unit; writers leave them clear and readers
+ignore them. `units` is the volume's `units_per_shard` in every shard, so a
+copy is `32 + ceil(units_per_shard / 8)` bytes; attach accepts no map of
+another size.
+
+An envelope-v3 volume keeps a second map per shard, the discard map, stored
+A/B as `data/shard-<index>.discard.a` and `data/shard-<index>.discard.b`. It
+is the same record, with the same magic, version and bit order; a set bit
+means the unit was discarded and reads as zero.
+
+The shard catalog (`shard-catalog.a`, `shard-catalog.b`):
+
+```text
+magic[8] = MAKICAT1
+version u32 = 1
+generation u64
+count u32               at most 2^24
+shard_index u64         count times, in strictly ascending order
+crc32
+```
+
+A copy is `28 + 8 * count` bytes. Both decoders refuse trailing bytes.
+
 ---
 
 # 23. Ciphertext Journal
@@ -1301,6 +1500,49 @@ next_sequence
 appended_sequence
 durable_sequence
 active_segment
+```
+
+On-disk layout (record notation in §21). A segment is the file
+`journal/seg-<index>`, with its index written as 16 lowercase hexadecimal
+digits. It begins with a 48-byte header:
+
+```text
+magic[8] = MAKIJSG1
+version u32 = 1
+segment_index u64       the index in the file name
+volume_uuid[16]
+base_sequence u64       sequence of the segment's first record
+crc32
+```
+
+Records follow the header back to back, their sequences increasing by one
+from `base_sequence`; the first record of a volume has sequence 1. A record is
+a 32-byte header followed by its payload, the ciphertext of one unit:
+
+```text
+magic[4] = MJR1
+sequence u64
+unit_index u64
+payload_len u32         at most max_ciphertext_size (itself at most 16 MiB)
+payload_crc u32         CRC-32 of the payload
+header_crc u32          CRC-32 of the 28 header bytes before it
+payload[payload_len]
+```
+
+The record header has no version field: its magic, which ends in the format
+version `1`, is its only format identifier. On an envelope-v3 volume a record
+with an empty payload discards its unit.
+
+The advisory durable mark (`journal/durable-mark`, §21) is 32 bytes. It names
+the prefix of one segment file, bytes `[0, durable_size)`, that a data sync
+covered:
+
+```text
+magic[8] = MAKIJDM1
+version u32 = 1
+segment_index u64
+durable_size u64
+crc32
 ```
 
 ---
@@ -1424,6 +1666,20 @@ wait behind that write instead of appending into it, so concurrent writers
 cannot turn a reclaimable bound into ENOSPC. A failed checkpoint
 MUST be visible as a degraded volume state until a later checkpoint succeeds.
 
+Checkpoint state is the A/B record `checkpoint/state.a` and
+`checkpoint/state.b`, exactly 32 bytes (record notation in §21):
+
+```text
+magic[8] = MAKICKP1
+version u32 = 1
+generation u64
+checkpoint_sequence u64
+crc32
+```
+
+Every journal record with a sequence at or below `checkpoint_sequence` has
+been applied by a checkpoint.
+
 ---
 
 # 27. Recovery
@@ -1536,6 +1792,19 @@ the same compatibility ID therefore refuses attach; for unauthenticated
 ciphers this comparison is the only wrong-key detection. A volume that holds
 data but no canary is probed by decrypting one existing unit with an
 integrity-capable provider; without integrity it MUST refuse attach.
+
+The canary record (record notation in §21):
+
+```text
+magic[8] = MAKICNY1
+version u32 = 1
+generation u64
+volume_uuid[16]
+unit_index u64          the reserved index, 0x0010_0000_4D41_4B49
+ciphertext_len u32      at most 16 MiB
+ciphertext[ciphertext_len]
+crc32
+```
 
 ---
 
@@ -2136,8 +2405,13 @@ retry sleeps do not retain scarce permits
 
 Configuration and binary metadata decoders MUST reject malformed input without
 panicking. Geometry uses checked arithmetic. Superblocks, allocation maps,
-shard catalogs, slots, journal records, and checkpoint state use versioned,
-CRC-protected encodings with frozen golden vectors.
+shard catalogs, slots, journal records, and checkpoint state use
+CRC-protected encodings with frozen golden vectors. Superblocks, allocation
+and discard maps, shard catalogs, checkpoint state, durable proofs, key
+canaries, journal segment headers and the durable mark carry a `version`
+field after their magic. Slot headers and journal record headers have none:
+their magic (`MAKISLT1`, `MJR1`) is their only format identifier. The layouts
+are given in §14, §21–§23, §26 and §27.
 
 A/B metadata MUST fall back to the highest valid generation. Each store advances
 a generation by one; recovery and the deep check MUST refuse, before any
