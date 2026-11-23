@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::command::{capture, Policy};
+use super::command::{capture, finish_by, Policy};
 
 /// Fixture directories are named by pid + wall clock; the clock can repeat
 /// within one process (coarse ticks), so a per-process sequence keeps them
@@ -95,6 +95,38 @@ fn hung_command_has_a_deadline_and_is_reaped() {
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(2));
     fixture.assert_reaped("parent");
+}
+
+/// A caller with its own time limit bounds every command it starts: one
+/// that would otherwise be allowed to run longer is ended at that limit, and
+/// none is started once it has passed.
+#[test]
+fn a_callers_deadline_ends_a_command_before_its_own_timeout() {
+    let patient = Policy {
+        timeout: Duration::from_secs(3),
+        ..policy()
+    };
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    {
+        let _bounded = finish_by(Instant::now() + Duration::from_millis(150));
+        let error = capture(&mut fixture.command("hang"), patient).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fixture.assert_reaped("parent");
+
+        // Past the deadline nothing is spawned: a program that does not
+        // exist is not even looked up.
+        std::thread::sleep(Duration::from_millis(150));
+        let error = capture(&mut Command::new("/nonexistent/maki-command"), patient).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+    // The limit ends with its guard.
+    let error = capture(&mut Command::new("/nonexistent/maki-command"), patient).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let fixture = Fixture::new();
+    let output = capture(&mut fixture.command("failure"), patient).unwrap();
+    assert_eq!(output.status.code(), Some(7));
 }
 
 #[test]

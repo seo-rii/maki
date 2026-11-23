@@ -19,19 +19,24 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(8);
 
+/// Whether nbdkit can run here, probed once. Every test that cannot run
+/// says so in its own output: a notice from the first caller alone left the
+/// others reporting a bare `ok`.
 fn native_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| match Command::new("nbdkit").arg("--version").output() {
-        Ok(output) => {
-            assert!(output.status.success(), "installed nbdkit cannot run");
-            true
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            eprintln!("nbdkit unavailable; skipping optional native startup qualification");
-            false
-        }
-        Err(error) => panic!("nbdkit probe failed: {error}"),
-    })
+    let available =
+        *AVAILABLE.get_or_init(|| match Command::new("nbdkit").arg("--version").output() {
+            Ok(output) => {
+                assert!(output.status.success(), "installed nbdkit cannot run");
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => panic!("nbdkit probe failed: {error}"),
+        });
+    if !available {
+        eprintln!("nbdkit unavailable; skipping optional native startup qualification");
+    }
+    available
 }
 
 struct Fixture {

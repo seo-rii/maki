@@ -543,6 +543,7 @@ fn phase3_gate_crash_recovery_smoke() {
 #[test]
 #[ignore = "phase gate: 10,000+ crash/recovery cycles"]
 fn phase3_gate_full() {
+    let _guard = failpoints::test_lock();
     for seed in 0..10_000u64 {
         crash_cycle(seed, 60);
     }

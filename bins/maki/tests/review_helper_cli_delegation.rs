@@ -80,3 +80,23 @@ fn leading_timeout_keeps_the_existing_helper_route() {
         );
     }
 }
+
+/// The usage described these verbs as "delegated to maki-attach
+/// (privileged)". Nothing is delegated: `maki` starts no helper, prints the
+/// `maki-attach` command to run and exits 3. The usage says what happens.
+#[test]
+fn usage_says_the_helper_verbs_only_print_the_command_to_run() {
+    let help = Command::new(env!("CARGO_BIN_EXE_maki"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let usage = String::from_utf8_lossy(&help.stdout);
+    let line = usage
+        .lines()
+        .find(|line| line.contains("maki attach|detach|grow"))
+        .expect("the usage lists the helper verbs");
+    assert!(!line.contains("delegated"), "{line}");
+    for stated in ["not run here", "maki-attach command", "exit 3"] {
+        assert!(line.contains(stated), "{stated:?} is missing from {line:?}");
+    }
+}

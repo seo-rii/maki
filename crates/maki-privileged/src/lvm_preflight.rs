@@ -19,7 +19,15 @@ use crate::detach::device_number;
 use crate::plan::LvmIdentityPins;
 use crate::state::BoundDeviceRecord;
 
-const MAX_DEVICES: usize = 64;
+/// Candidate block devices of one attachment: the NBD device and its
+/// partitions.
+pub(super) const MAX_DEVICES: usize = 64;
+/// Logical volumes of the volume group, hidden ones included. Activation
+/// leaves at most one verified mapping per LV: `verify_mappings` accepts a
+/// mapping only under the exact device-mapper name of a reported LV, and
+/// the kernel keeps those names unique. The recovery proof is sized for
+/// both limits together.
+pub(super) const MAX_LVS: usize = 64;
 const MAX_REPORT: usize = 64 * 1024;
 const INTERNAL_MAPPING_UUID_SUFFIXES: &[&str] = &[
     "-real", "-tpool", "-tdata", "-tmeta", "-cdata", "-cmeta", "-cvol", "-pool",
@@ -104,7 +112,7 @@ pub(super) fn validate_recovery_identity(
         || uuid(&verified.vg_uuid).is_err()
         || uuid(&verified.lv_uuid).is_err()
         || verified.lvs.is_empty()
-        || verified.lvs.len() > MAX_DEVICES
+        || verified.lvs.len() > MAX_LVS
     {
         return Err(invalid("invalid persisted LVM metadata identity"));
     }
@@ -505,8 +513,13 @@ pub(super) fn validate(
         let mut lvs = BTreeMap::new();
         let mut layouts = BTreeMap::new();
         let mut lv_ids = BTreeSet::new();
-        if group.lv.len() > MAX_DEVICES {
-            return Err(invalid("LVM LV inventory exceeds the supported bound"));
+        if group.lv.len() > MAX_LVS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LVM LV inventory exceeds the supported bound of {MAX_LVS} logical volumes"
+                ),
+            ));
         }
         for lv in group.lv {
             let name = reported_lv_name(&lv.lv_name)?;

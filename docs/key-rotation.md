@@ -1,8 +1,8 @@
 # Credential rotation and key migration
 
 Check [format compatibility](durable-recovery.md) before restarting a volume
-with the current binary. Writable recovery requires v2 metadata; a legacy v1
-volume needs the separate preservation and migration procedure. Credential
+with the current binary. Writable recovery requires v2 or v3 metadata; a legacy
+v1 volume needs the separate preservation and migration procedure. Credential
 rotation alone does not upgrade its format or prove ambiguous legacy history.
 
 An authentication credential can be replaced on an existing volume only when
@@ -229,7 +229,9 @@ changing it does not reload a running connection pool.
    the packaged production unit and its automatic recovery handler.
 
 Removing this private root from `ca_file` is not certificate revocation and
-does not remove built-in public roots. Qualify the deployment's actual chain,
+does not remove the roots the transport trusts without it: the compiled-in
+public roots, the host's trust store, or both, depending on the
+[transport](configuration.md#providers). Qualify the deployment's actual chain,
 DNS/IP names, proxy, trust policy, and rollback procedure separately. Retain
 old trust or certificates for rollback only when the security policy permits.
 
@@ -301,7 +303,12 @@ offline `maki check <config.toml> --deep` checks stored structure and checksums;
 decrypt or authenticate the database and cannot replace those checks.
 
 The [2026-09-19 three-host qualification](qualification/credential-rotation-key-migration-validation-2026-09-19.md)
-exercised this stopped sequence with bearer and mTLS client credentials, two
+exercised a stopped rotation in the order its report records: writers held
+stopped, the trusted attachment cleaned up, an explicit drain acknowledgement
+received, then the daemon stopped. The attachment was therefore cleaned up
+before the acknowledgement, not by the lifecycle-target stop after it as in
+step 4 of the [credential rotation](#rotate-a-credential-while-retaining-the-encryption-key)
+above. The run used bearer and mTLS client credentials, two
 reference-provider hosts, actual kernel NBD/LVM/XFS, trusted attach/verify,
 SQLite external acknowledgements, and a DB-native restore into a distinct K2
 volume. It also proved old-credential refusal, unchanged superblock/canary

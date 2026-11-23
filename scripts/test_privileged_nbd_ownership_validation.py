@@ -186,6 +186,8 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
         body += after + "\n"
         result = subprocess.run(["/bin/bash", "-c", body],
                                 env=dict(os.environ, FIXTURE=str(self.root),
+                                         # The driver imports the wrapper from scripts/.
+                                         PYTHONDONTWRITEBYTECODE="1",
                                          CONNECT_MODE=mode, PYTHON=sys.executable,
                                          WRAPPER=str(WRAPPER), DRIVER=str(self.driver),
                                          REPO_ROOT=str(SCRIPT.parent.parent)),
@@ -193,6 +195,15 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
                                 capture_output=True, timeout=5)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         return result, calls
+
+    def test_fixture_interpreters_write_no_bytecode_next_to_the_wrapper(self):
+        bytecode = (WRAPPER.with_name("__pycache__"), WRAPPER.stem + ".*")
+        for stale in bytecode[0].glob(bytecode[1]):
+            stale.unlink()
+        result, calls = self.run_case()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(call[0] == "connect" for call in calls), calls)
+        self.assertEqual(list(bytecode[0].glob(bytecode[1])), [], "the driver compiled into the checkout")
 
     def device_state(self, backend):
         (self.sysfs / "pid").write_text("12345\n")

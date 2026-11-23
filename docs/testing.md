@@ -50,10 +50,11 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 
 | Tier | Trigger | Platform | Enforcement |
 |---|---|---|---|
-| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block |
+| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block; on Ubuntu the root-only test targets also run as root |
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
+| etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
 
 Both platform matrices set `fail-fast: false`, so a Linux failure cannot
 cancel the Windows evidence. The pinned baseline is reproducible; latest stable
@@ -76,7 +77,40 @@ without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
 The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
 fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
-campaigns remain opt-in host qualification steps.
+campaigns remain opt-in host qualification steps. The job runs every
+`scripts/test_*.py` (`scripts/test_ci_gate_validation.py` fails for a module
+the workflow would not run) and fails when those suites leave
+`scripts/__pycache__` in the checkout.
+
+The workspace tests run as the unprivileged runner user. Tests that give a
+fixture to another user, run a binary as the daemon user, enter a private
+mount namespace or set the immutable flag print why they are skipped there
+and pass. The Linux baseline therefore runs
+`python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked`
+next. The script reuses the compilation of the workspace run as the runner
+user and starts only the test executables in its `ROOT_TARGETS` list as root
+through `sudo -n`, each with a scratch `TMPDIR` under `/tmp` that other users
+can search and that it removes afterwards. It fails when root is not
+available (nothing is compiled or skipped), when a test that ran as root
+still reports that it needs root, and when the run leaves an entry owned by
+root in the checkout or the build tree. `--open-build-tree` lets the fixture
+user (uid 65534) reach the built `maki` and `maki-check` binaries below a
+`0750` home directory for the duration of the run.
+`scripts/test_root_tests_validation.py` fails for a test source that probes
+its privilege (`geteuid`, a "needs root" notice, `chown`, `unshare`) and is
+neither in `ROOT_TARGETS` nor classified in that test as not needing root, so
+a new root-only test cannot be left out. Run the same command without
+`--open-build-tree` locally as root or as a user with passwordless `sudo`.
+
+Root does not make every host capable. The memory-budget mount-table tests
+reach the final admission check only where root can create a group in a
+single cgroup-v2 hierarchy with the memory controller; elsewhere they compare
+earlier verdicts, which they print, or skip with a notice. The
+immutable-snapshot restore test needs a filesystem under `/tmp` that accepts
+the immutable flag, and the mount-namespace tests need a kernel that lets
+root unshare one; otherwise they print why they skip. The script repeats
+every skip notice at the end of its output, and a run with notices is not
+evidence for the cases they name.
 
 The independent `systemd-lifecycle` job builds the actual `maki-attach` hook
 and runs `scripts/systemd-lifecycle-validation.py` on its disposable runner.
@@ -84,7 +118,9 @@ Random instance units preserve the packaged lifecycle dependency graph; marker
 processes replace storage and workload commands. Cases cover failed start,
 timeout, SIGKILL, refusal of recovery cleanup, a simulated foreign resource,
 start-rate limiting, duplicate start, planned stop, failed stop and cancelled
-startup. The fixture removes only its own unit links and retains case results
+startup. A marker command after the hook checks that no daemon stop precedes
+the end of the attach unit's stop phase, during which the hook rolls back an
+interrupted activation. The fixture removes only its own unit links and retains case results
 and bounded diagnostics as a CI artifact. It does not attach devices or qualify
 the Debian 12 NBD/LVM/XFS stack. The
 [first production campaign](deployment/first-production-candidate.md) requires
@@ -115,7 +151,7 @@ The current vendored pin is 0.23.46, which includes the subsequent
 `RUSTSEC-2026-0346` through `RUSTSEC-2026-0349` fixes while retaining the local
 plaintext-erasure patch and its allocator-observed regressions.
 
-The scheduled job runs:
+The scheduled `nightly-gates` job runs:
 
 | Test identifier | Workload |
 |---|---|
@@ -129,6 +165,7 @@ The scheduled job runs:
 | `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
 | `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
+| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures |
 | `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on `/dev/shm`) |
 
 The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
@@ -137,7 +174,11 @@ without a name filter, so every ignored test runs, including any new gate; the
 one failing gate binary from hiding the result of every binary after it.
 
 Gates that need operator-provided infrastructure refuse to skip, so they are
-compiled only with an opt-in feature and are not part of the scheduled run:
+compiled only with an opt-in feature and are not part of that `-- --ignored`
+run. The etcd gate has its own scheduled job, `etcd-qualification`, which
+installs a digest-pinned etcd v3.6.5 and builds `maki-witness`; no CI job
+provides the delegated cgroup, so the cgroup gate runs only on an operator's
+host:
 
 | Feature | Gate | Requires |
 |---|---|---|
@@ -151,11 +192,19 @@ MAKI_ETCD_BIN=/opt/etcd-v3.6/etcd MAKI_WITNESS_BIN=$PWD/target/release/maki-witn
   --test etcd_ha -- --ignored --nocapture
 ```
 
-It also builds the Linux cdylib, verifies the global `plugin_init` symbol,
+The `nightly-gates` job also builds the Linux cdylib, verifies the global
+`plugin_init` symbol,
 installs `nbdkit-plugin-dev` and runs `review_abi.rs`, which compiles a C probe
 against the distribution's `nbdkit-plugin.h` and compares every field offset
 and `NBDKIT_*` constant the shim depends on. The same test runs under WSL
 when the header is installed there, and skips with a message otherwise.
+
+The last step of the `nightly-gates` job builds `maki` alone in release mode
+and requires `maki volume create` to refuse a configuration with
+`provider = "fake"`: the command must fail with `provider "fake" is not
+compiled into this build` and leave no `superblock.a`. The workspace test run
+cannot show this, because feature unification compiles the fake provider into
+`maki-nbdkit` for that crate's own tests.
 
 ## Test model
 
@@ -281,6 +330,7 @@ packaged configuration without installing services or creating users.
 | Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO (failed inside `CrashableBacking`, so no later sync of other bytes persists it), retry, and full-replay process recovery followed by power loss, changes after the scan (refused before any proof covers them), valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer; `review_recovery_prefix_rewrite.rs`: power loss after every backing operation of a recovery that adopted such bytes after a restart, including the window in which the synced mark and proof already cover records that only the journal segment holds |
 | gRPC authentication evidence (TEST-002) | `maki-nbdkit/tests/phase9_daemon.rs`: attach without metadata must fail after the server actually rejects it with Unauthenticated; valid metadata roundtrips with no authentication rejection, independently of which deadline's error text wins |
 | Convergent privileged cleanup (R3-007) | `maki-privileged/src/exec_tests.rs`, `recover.rs`, and `maki-attach/tests/e2e.rs`: no record succeeds without probing, an owned connected backend selects detach, an absent backend selects recovery, and a foreign or unreadable backend preserves the record. The proof-scoped fallback runs only after an exited `vgchange` returns nonzero, accepts one exact closed target mapping, rechecks the backend, and rejects changed identity, multi-mapping topology, open count, or force/deferred/retry removal |
+| Privileged step faults | `maki-privileged/src/review_step_faults.rs`: the production executor, observers and trusted state over a simulated kernel (fake sysfs tree and mount table; LVM needs the device served, `dmsetup` does not). Every command of attach, detach, cleanup and the failed-start hook's rollback exits nonzero, is killed by a signal, times out or loses its helper, before and after its effect, and every observation fails or loses its helper; the packaged order (hook, daemon stop, cleanup, new attach) must converge, with the interrupted activation nothing serves as the one documented refusal. No real LVM, device-mapper, NBD or systemd is involved |
 | Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
 | Current privileged runner contract | `regression_nbd_client_version_probe.rs` and `phase7_priv.rs`: a 3.27.1 help banner with nonzero exit is accepted, netlink receives `nbdN`, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice |
 | Runtime logging (R4-001) | `maki-core/src/logging.rs` child-process tests, `maki-privileged/src/logging.rs` (the `maki-attach` sink: steps and halted rollbacks reach stderr) and `maki-nbdkit/tests/review_r4_native_logging.rs`: a real nbdkit run must show the store's `WARN` for an adopted orphan shard on its captured stderr, and `MAKI_LOG=error` must suppress it. `MAKI_LOG` values without a level (`warning`, `err`, a bare target, `target=`) fall back to `info` with one `WARN` naming the value, and an empty value means `info`, in both sinks and through `maki check` (`bins/maki/tests/review_log_filter.rs`) |

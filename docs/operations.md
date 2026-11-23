@@ -93,6 +93,9 @@ retried `volume create` reports `volume superblock already present`: the root
 is a complete volume, except that a failed or killed creation may have left
 that copy only in the page cache. The first attach makes both superblock copies
 durable before it accepts writes; empty the root instead to start over.
+A backing with a remote rollback witness is continued differently, without
+emptying its root: see
+[interrupted initial enrollment](rollback-protection.md#resume-interrupted-initial-enrollment).
 
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing
@@ -578,8 +581,9 @@ Execution (Linux, root) then:
 1. opens `/run/maki-attach` through verified root-owned directory descriptors,
    takes its private `attach.lock`, and, unless a device is pinned, allocates
    the lowest unused `/dev/nbdN` from sysfs. Automatic selection skips connected
-   devices and devices whose root or partitions have holders or direct mounts
-   in the helper's mount namespace. Unreadable or inconsistent observations
+   devices, devices whose root or partitions have holders or direct mounts
+   in the helper's mount namespace, and devices that another volume's
+   attachment record names. Unreadable or inconsistent observations
    refuse allocation; the helper checks the selected device again before
    connecting it;
 2. records the requested attachment and a random connection identifier before
@@ -612,6 +616,28 @@ An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV,
 optional administrator LVM pins, device, random connection identifier, and
 either the pre-activation recovery intent or the complete post-activation
 mapping proof.
+
+A record can outlive its kernel connection: a helper killed between publishing
+the record and connecting, or between disconnecting and retiring it, leaves a
+record whose device has no backend, holder or mount. The device stays that
+volume's until its next attach replaces the record, or its next cleanup,
+detach or recover retires it. Every attach therefore reads all records under
+the lock before choosing a device: automatic selection skips a device that
+another volume's record names, a pinned `nbd_device` that another volume's
+record names is refused, and a `<volume>.nbd` entry that cannot be read refuses
+the attach and names the file, because it could name any device.
+
+If a recorded device is found connected under another identity all the same
+(an NBD client started outside the helper, or two volumes left sharing a
+device by a helper from before this rule), every verb of the recorded volume
+refuses without changing anything and keeps the record: sysfs shows what holds
+the device, not under which connection it was set up. Detach the volume or
+disconnect the client that uses the device now, then run
+`maki-attach cleanup --volume <volume>`, which finds the device without a
+backend and retires the record. If the device's present user has to stay up,
+confirm independently that nothing is mounted at the recorded mountpoint and
+that no device-mapper mapping of the recorded VG exists, and only then remove
+`/run/maki-attach/<volume>.nbd` by hand.
 
 `maki-attach detach` takes the same lock and compares the requested attachment
 with that record and the live `/sys/block/nbdN/backend` before unmounting or
@@ -672,7 +698,10 @@ backend nonce remains connected. It refuses any mount and any changed device,
 partition, mapper name, UUID, dependency or holder. A verified partial mapping
 subset can be deactivated with the recorded device list and VG UUID; an unknown
 internal LVM UUID suffix is not treated as owned. The intent never authorizes an
-unmount or workload access.
+unmount or workload access. LVM reads the volume group from the NBD device for
+this deactivation, so it works only while the daemon serves that device; the
+packaged failed-start hook runs it before the recovery coordinator stops the
+daemon, and [one state is left to the operator](#interrupted-activation-after-the-daemon-stopped).
 
 If disconnect succeeded but the process stopped before retiring its record,
 a retry may remove that record without running device commands only after
@@ -879,7 +908,31 @@ service result and a failed main (`ExecStart`) process, and the exact attach
 unit still has a running start job. A stop, restart, missing or unrecognized
 job does not authorize recovery. The coordinator stops
 registered workloads before identity-checked cleanup and starts the lifecycle
-again only after cleanup succeeds. The hook does not clean up devices itself.
+again only after cleanup succeeds.
+
+The hook itself performs one cleanup, on the same evidence and after it has
+queued the coordinator. If the trusted record holds only a pre-activation
+intent and its device still carries the recorded backend identifier (the
+helper died between LVM activation and the mapping proof), the hook runs that
+attach's rollback: the scoped VG deactivation of the
+[privileged helper](#privileged-helper), then the NBD disconnect, and it
+retires the record. The coordinator cannot do this later,
+because it stops the daemon before its cleanup and LVM can then no longer read
+the volume group. The coordinator's stop of the daemon is ordered after the
+attach unit's stop job, which does not finish before the hook does, so the
+daemon is still serving while the hook runs. The hook never unmounts and
+leaves every other record to the coordinator. It reads the same
+`/etc/maki/attach/<volume>.toml` as `cleanup`.
+
+Two bounds keep the hook inside the unit's `TimeoutStopSec=120`. It first
+waits up to 15 seconds until it is the only process in the attach unit's
+control group: a command of the failed start, such as a `vgchange` that
+defers signals until it has finished, can outlive the helper there. This
+check needs the unified cgroup hierarchy. The rollback then has 30 seconds
+for the attach lock and all of its commands. If the group does not settle or
+cannot be read, a bound expires, or the rollback is refused, the hook logs
+the reason and the coordinator proceeds as it would have without it.
+
 Attach starts are limited to three in 300 seconds; inspect the failure before
 resetting a start-limit failure.
 
@@ -905,6 +958,53 @@ any partial attachment for explicit cleanup. A failed cleanup also keeps the
 daemon running. Keep the runtime mask until recovery is deliberately re-enabled
 with `systemctl unmask --runtime maki-recover@pg.service`; a reboot removes a
 runtime mask. This procedure must be qualified on the installed stack.
+
+### Interrupted activation after the daemon stopped
+
+One state has no helper path. The attach helper died between LVM activation
+and its mapping proof, so the record holds only the pre-activation intent and
+the VG's mappings are active but unmounted; and the daemon behind the
+recorded kernel connection stopped serving reads before that activation was
+rolled back. That takes a second fault: the daemon failed or was stopped
+within the same window, or the hook's rollback above did not complete before
+the coordinator stopped the daemon. LVM cannot read the volume group through
+that connection again (a restarted daemon serves new connections only), and
+the `dmsetup` fallback requires the completed mapping proof. `maki-attach
+cleanup`, and with it `maki-recover@pg.service`, then fails with an error
+that ends in one of
+
+```text
+scoped LVM deactivation of the interrupted activation on /dev/nbd3 failed (...). LVM reads the volume group from that device and can deactivate the mapping only while the volume's daemon serves it; keeping the attach record
+scoped LVM deactivation of the interrupted activation on /dev/nbd3 left its mapping active. LVM reads the volume group from that device and can deactivate the mapping only while the volume's daemon serves it; keeping the attach record
+```
+
+and the next attach reports `recorded device is still connected`. The record,
+the kernel NBD connection and the mappings stay as they are. Nothing was
+mounted from this activation, and the intent never allowed a workload to use
+it.
+
+Mask the recovery coordinator as above and keep the workloads stopped. For
+each device-mapper name of the volume group (`vg_maki_pg-data` for the default
+names; LVM doubles a hyphen that is part of a VG or LV name, and `dmsetup ls`
+lists them), confirm that it is an unused LVM mapping on the NBD device the
+message names, remove it without force, and let cleanup finish:
+
+```bash
+dmsetup info -c -o name,uuid,open vg_maki_pg-data  # UUID starts with LVM-, Open is 0
+dmsetup deps -o devname vg_maki_pg-data            # only that nbdN or its partitions
+dmsetup remove vg_maki_pg-data                     # never --force or --deferred
+maki-attach cleanup --volume pg
+```
+
+A plain `dmsetup remove` refuses a mapping that is open, including one that
+another mapping is stacked on; remove the upper one first, by the same checks. Cleanup then
+verifies the recorded device identity again, disconnects NBD and retires the
+record. Stop the daemon if it is running and reset the failed units before
+re-enabling recovery, as after [a failed planned stop](#retry-a-failed-planned-stop).
+If a mapping is open, does not carry an LVM UUID, or depends on any other
+device, stop and preserve the host state for diagnosis. A reboot also ends
+this state: the mappings, the kernel connection and the record under `/run`
+do not survive it.
 
 ### Retry a failed planned stop
 
@@ -1148,6 +1248,11 @@ calls.
   runs, that the mounted filesystem is stored only on the NBD device it
   connected (device-mapper stacks are walked through sysfs); a filesystem on
   any other device, or a volume group spanning other devices, is refused.
+- An attach helper that dies between LVM activation and its mapping record is
+  rolled back by the packaged failed-start hook while the daemon still serves
+  the device. If the daemon stopped serving first, `cleanup` refuses and
+  keeps the record and the mapping; see
+  [the manual step](#interrupted-activation-after-the-daemon-stopped).
 - An allocated slot that cannot be validated returns EIO, never fabricated zeros.
 - A second process cannot attach while the volume lock is held.
 - Clean detach requires FLUSH, checkpoint, engine drop, and lock release.

@@ -8,6 +8,13 @@
 //! never logged. Provider failure never falls back to another algorithm
 //! (SPEC §12) — errors are classified (SPEC §31) and handled by the
 //! dispatcher.
+//!
+//! A response is classified by its status (`classify_status`). An integrity
+//! failure or a context refusal additionally needs exactly one
+//! `maki-crypto-error` header on status 422: `auth-tag-mismatch` or
+//! `context-mismatch`, or `unsupported-format-version` or
+//! `unsupported-compatibility-id`. No other status reports either, and the
+//! body of an error response is not read.
 
 use std::time::Duration;
 

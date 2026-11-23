@@ -198,10 +198,14 @@ spec=importlib.util.spec_from_file_location("host", {source!r})
 host=importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
 host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0)
 '''
-        result = subprocess.run([sys.executable, "-O", "-c", code], capture_output=True, timeout=5)
+        bytecode = (pathlib.Path(source).with_name("__pycache__"), pathlib.Path(source).stem + ".*")
+        for stale in bytecode[0].glob(bytecode[1]):
+            stale.unlink()
+        result = subprocess.run([sys.executable, "-B", "-O", "-c", code], capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"ValueError", result.stderr)
         self.assertFalse(self.ledger.exists())
+        self.assertEqual(list(bytecode[0].glob(bytecode[1])), [], "the child compiled into the checkout")
 
 
 class GuestContracts(unittest.TestCase):

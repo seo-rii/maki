@@ -290,7 +290,11 @@ The controlled real-file tests compare 1 MiB and 64 MiB journal histories:
 These are allocations made by the measured recovery thread, not process RSS or
 filesystem cache. Fixed stack scratch is separate. The earlier 488-byte
 covered-scan result in `133d36d` predates v2 envelope/proof loading and is a
-historical intermediate result.
+historical intermediate result. So are the three volume-recovery rows: attach
+no longer retains the latest record per unit, and the bounded replay of
+revision `733833c` below replaced that. The regressions in
+`review_r3_recovery_memory.rs` assert bounds on these peaks, not the measured
+values.
 
 An unchanged latest/durable overlay version now shares its immutable
 ciphertext, including the internal checkpoint snapshot. A newer volatile

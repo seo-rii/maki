@@ -556,7 +556,17 @@ fn stalled_tls_provider(address: std::net::SocketAddr) -> GrpcCryptoProvider {
     let mut spec = test_provider("http://127.0.0.1:1", 1 << 20).spec.clone();
     spec.url = format!("https://{address}");
     spec.timeout = std::time::Duration::from_secs(60);
-    GrpcCryptoProvider::new_with_tls(spec, super::GrpcTlsConfig::default()).unwrap()
+    // The peer never answers, so any root will do, but the host's own may
+    // be missing: a provider with no root at all cannot be built.
+    let ca = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    GrpcCryptoProvider::new_with_tls(
+        spec,
+        super::GrpcTlsConfig {
+            ca_certificate_pem: Some(ca.cert.pem().into_bytes()),
+            client_identity: None,
+        },
+    )
+    .unwrap()
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! Newline-delimited JSON over the per-volume control socket
 //! (`/run/maki-control/<volume>/control.sock`, owner `maki`, group `maki-admin`,
 //! mode 0660). Allowed operations: status, metrics snapshot, hot reloads,
-//! graceful checkpoint. Attach/detach/mount/grow are **not** part of this
+//! graceful checkpoint, drain. Attach/detach/mount/grow are **not** part of this
 //! protocol — they require the privileged helper (SPEC §7, PRIV-009).
 
 pub mod protocol;

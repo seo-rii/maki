@@ -1,9 +1,22 @@
 # Discard and space reclamation
 
-Status: implemented with local regression qualification and a scoped external
-GCE whole-instance-reset campaign on 2026-09-20. The default v2 format is
-unchanged. V3 has not run the database campaigns previously run for v2, and the
-GCE reset did not power-cycle the physical Persistent Disk service.
+Status: implemented, with local regression qualification and scoped external
+campaigns; [current status](status.md#volume-formats) is the page that states
+current support. GCE whole-instance-reset campaigns passed on
+[2026-09-20](qualification/gce-discard-reset-validation-2026-09-20.md) and,
+after the R5 fixes, on
+[2026-10-03](qualification/r5-hardware-validation-2026-10-03.md), when kernel
+`fstrim` also reclaimed backing space through XFS, LVM and NBD. Scoped
+PostgreSQL crash and lifecycle campaigns then passed on v3 volumes:
+PostgreSQL 15 with `fstrim` under load
+([2026-10-03](qualification/database-discard-pressure-validation-2026-10-03.md)),
+PostgreSQL 15 over remote gRPC
+([2026-10-04](qualification/remote-database-zero-mdwe-validation-2026-10-04.md))
+and PostgreSQL 17 over per-item HTTP on Debian 13
+([2026-10-05](qualification/debian13-postgresql-http-validation-2026-10-05.md)).
+The default v2 format is unchanged. No run power-cycled physical storage: the
+2026-09-20 reset did not power-cycle the physical Persistent Disk service, and
+the later reports list physical power loss as not covered.
 
 ## Selecting the volume format
 
@@ -112,12 +125,16 @@ post-recovery reclamation.
 
 The scan skips every unit with a remaining overlay version, including a newer
 tombstone hiding an intermediate write reservation. Normal checkpointing handles
-that newer version later. A failed punch or data sync leaves the cursor unchanged
-for retry and is logged; it never fails the checkpoint, so `maki drain` and a
-clean shutdown still succeed while punching keeps failing (for example ENOSPC
-splitting an extent on a full filesystem). The stalled scan is then no longer
-pending work: the worker does not rerun it on its own, and the next checkpoint
-that runs for other reasons, or the next attach, retries it. Unsupported
+that newer version later. A failed punch or data sync is logged and never fails
+the checkpoint, so `maki drain` and a clean shutdown still succeed while
+punching keeps failing (for example ENOSPC splitting an extent on a full
+filesystem). The scan remembers the earliest failed batch and moves on, so
+later batches and shards are still reclaimed. When it reaches the end it starts
+again from that batch as a deferred scan, which is no longer pending work: the
+worker does not rerun it back to back, but waits one checkpoint interval
+(30 seconds) and then retries it by itself, with no new write needed. A
+checkpoint that runs meanwhile for other reasons, or the next attach, retries
+it too. Unsupported
 punching completes the hint without releasing physical blocks. Each attach starts
 a new scan, so previously punched holes can be visited again. Recovery itself
 still performs no physical release while replaying journal records.
@@ -146,7 +163,9 @@ requires over 75% allocated-block reduction, and verifies retained neighbors,
 reopening, and rewriting.
 `review_discard_reclaim_retry.rs` covers idle checkpoint and worker progress after
 replay, failed-release retry without failing the checkpoint or spinning the worker, preservation of newer write reservations, and the
-per-checkpoint scan bound. The real-file suite also checks that an idle checkpoint
+per-checkpoint scan bound. `review_reclamation_progress.rs` covers progress past a
+failed batch or shard and the idle worker's interval-spaced retry without new
+writes. The real-file suite also checks that an idle checkpoint
 after recovery releases over 75% of blocks for the 126-of-128-slot discard case.
 
 The complete workspace tests, formatting check, and strict all-target Clippy

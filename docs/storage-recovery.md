@@ -79,6 +79,14 @@ access, or workload start. A record with neither the proof nor the new intent
 retains the legacy fail-closed behavior. Topologies over the bounded record or
 inventory limits are rejected.
 
+LVM reads the volume group from the NBD device to run that command, so a
+connected intent can be consumed only while the daemon still serves the
+device. The packaged attach unit's failed-start hook therefore consumes it
+before the recovery coordinator stops the daemon. When the daemon stopped
+serving first, cleanup refuses, keeps the record and the mapping, and the
+operations guide gives the
+[manual step](operations.md#interrupted-activation-after-the-daemon-stopped).
+
 ## Checking LVM before activation
 
 After connecting the recorded NBD backend, attach checks its kernel device
@@ -107,8 +115,12 @@ conditional checks; it does not discover or certify live identities.
 
 This path requires LVM2 support for `fullreport`, `--devices`, UUID selection,
 and complete activation mode. Unsupported options or report fields fail
-closed. The candidate inventory is limited to 64 devices and subprocess
-reports to 64 KiB. Every candidate needs a recognized, unambiguous label:
+closed. The candidate inventory is limited to 64 devices (the NBD device and
+its partitions), the volume group to 64 logical volumes, hidden ones included,
+and subprocess reports to 64 KiB. A larger inventory is refused before
+anything is activated; the recorded mapping proof holds every device and
+mapping within these limits.
+Every candidate needs a recognized, unambiguous label:
 blank spare partitions and unreadable or unclassified candidates are refused.
 In particular, `blkid` exit 2 cannot establish that a device is safely empty.
 The [blkid CLI implementation](https://github.com/util-linux/util-linux/blob/v2.38.1/misc-utils/blkid.c#L479)

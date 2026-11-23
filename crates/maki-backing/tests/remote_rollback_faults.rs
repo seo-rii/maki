@@ -1,6 +1,9 @@
 //! Format and enrollment-failure boundaries of the remote namespace format.
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::io;
 use std::os::unix::fs::symlink;
 use std::sync::{Arc, Mutex};
@@ -48,7 +51,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let authority = tempfile::tempdir().unwrap();
+        let authority = private_dir::tempdir().unwrap();
         let store = Arc::new(Mutex::new(
             StateStore::create(authority.path(), [1; 16]).unwrap(),
         ));

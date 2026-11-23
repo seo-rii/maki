@@ -1,4 +1,7 @@
 //! BUG-033: observing a predecessor never grants ownership of its writer session.
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use maki_backing::remote_witness::{
     Action, CanonicalState, Descriptor, Request, Role, SessionAuthorization, StateStore,
 };
@@ -197,7 +200,7 @@ fn same_writer_old_key_cannot_release_an_admin_enrollment_recovery() {
 
 #[test]
 fn exact_replay_is_key_bound_and_private_authority_hash_survives_restart() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_dir::tempdir().unwrap();
     let mut store = StateStore::create(directory.path(), [1; 16]).unwrap();
     let state = CanonicalState::initial([1; 16]).unwrap();
     let request = mutation(&state, 1, Action::Claim);
@@ -268,8 +271,16 @@ fn legacy_authority_v1_is_rejected_without_rewriting_its_evidence() {
         "ea09320612df918579eb6cb2c2527bc1b4884348dd9f4f00b3b89551ece992c8"
     );
     assert!(CanonicalState::decode(&bytes).is_err());
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("remote.state"), &bytes).unwrap();
+    let directory = private_dir::tempdir().unwrap();
+    let state = directory.path().join("remote.state");
+    std::fs::write(&state, &bytes).unwrap();
+    // The record must be refused for what it holds, not for a mode the
+    // umask gave its file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     assert!(StateStore::open(directory.path()).is_err());
     assert_eq!(
         std::fs::read(directory.path().join("remote.state")).unwrap(),
