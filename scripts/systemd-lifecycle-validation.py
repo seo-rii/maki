@@ -108,6 +108,10 @@ def fixture_units(volume, directory, helper):
     if hooks != ["ExecStopPost=/usr/bin/maki-attach recover-failed-start --volume %i"]:
         raise ValueError("unexpected failed-start hook contract")
     attach += hooks[0].replace("%i", volume).replace("/usr/bin/maki-attach", unit_argument(helper, executable=True)) + "\n"
+    # After queueing the coordinator the hook still rolls back an interrupted
+    # activation, which needs the daemon. Mark the end of the unit's stop
+    # phase: no daemon stop may precede it.
+    attach += f"ExecStopPost={actor_command} stop-post-end\n"
     recovery = packaged_unit_section("maki-recover@.service", volume)
     recovery += ("JobTimeoutSec=12\n\n[Service]\nType=oneshot\nTimeoutStartSec=3\n"
                  f"ExecStart={actor_command} cleanup-recover\n")
@@ -146,7 +150,7 @@ def actor(directory, action):
     mode = (directory / "mode").read_text().strip()
     resource = directory / "resource"
     workload = directory / "workload-running"
-    if action == "daemon-ready":
+    if action in ("daemon-ready", "stop-post-end"):
         event(directory, action)
         return 0
     if action == "attach":
@@ -451,6 +455,7 @@ class Fixture:
             require(self.count("workload-stop") == expected_cycles, "planned stop did not quiesce workload")
         daemon = "stopped"
         attachment = "absent"
+        daemon_stopped_since_attach = False
         for record in self.events():
             name = record["event"]
             require(not name.startswith("unsafe-"), "unsafe ordering in simulated lifecycle")
@@ -463,6 +468,7 @@ class Fixture:
                 require(daemon == "ready", "attachment began before its daemon was ready")
                 require(attachment == "absent", "reattach began before previous cleanup completed")
                 attachment = "starting"
+                daemon_stopped_since_attach = False
             elif name == "attach-ready":
                 require(attachment == "starting", "attachment became ready outside a start attempt")
                 attachment = "ready"
@@ -471,8 +477,14 @@ class Fixture:
                 require(attachment == "ready", "workload started before its attachment was ready")
             elif name == "cleanup-complete":
                 attachment = "absent"
+            elif name == "stop-post-end":
+                # The coordinator's daemon stop is ordered after the attach
+                # unit's stop job, which ends after its last ExecStopPost.
+                require(not daemon_stopped_since_attach,
+                        "daemon stopped before the attach unit's stop phase ended")
             elif name == "daemon-stop":
                 daemon = "stopped"
+                daemon_stopped_since_attach = True
                 if mode in ("normal-stop", "failed-stop", "timeout-stop", "kill-stop",
                             "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
                     require(attachment == "absent", "daemon stopped before successful cleanup")

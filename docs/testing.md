@@ -84,7 +84,9 @@ Random instance units preserve the packaged lifecycle dependency graph; marker
 processes replace storage and workload commands. Cases cover failed start,
 timeout, SIGKILL, refusal of recovery cleanup, a simulated foreign resource,
 start-rate limiting, duplicate start, planned stop, failed stop and cancelled
-startup. The fixture removes only its own unit links and retains case results
+startup. A marker command after the hook checks that no daemon stop precedes
+the end of the attach unit's stop phase, during which the hook rolls back an
+interrupted activation. The fixture removes only its own unit links and retains case results
 and bounded diagnostics as a CI artifact. It does not attach devices or qualify
 the Debian 12 NBD/LVM/XFS stack. The
 [first production campaign](deployment/first-production-candidate.md) requires
