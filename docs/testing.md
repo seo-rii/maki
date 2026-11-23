@@ -35,14 +35,6 @@ build outputs. On other platforms it invokes Cargo directly, and so does a
 and they never load the plugin. Use `CARGO` to select a Cargo executable, or
 `RUSTUP_TOOLCHAIN=1.94.0` for the baseline.
 
-On Unix, run the suites under a umask that clears group and other write
-(`022`, the usual default, or `077`). Their fixtures write volume
-configurations with the default file mode, and every loader refuses a
-configuration its group or others can write
-([configuration file](configuration.md#configuration-file)): under
-`umask 002` the daemon, `maki` and `maki-benchmark` tests that load one fail
-with `writable by the group or by others`.
-
 The ignored release-mode suite is substantially more expensive than the default
 workspace suite. It uses simulated backing stores and does not perform real
 power cuts or privileged device operations.
