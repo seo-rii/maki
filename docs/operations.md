@@ -681,19 +681,25 @@ including rollback. Missing records or mismatched identities refuse execution;
 an explicit `--nbd-device` cannot bypass this check.
 
 Detach, cleanup, recover and grow address the VG only where attach found it.
-`vgchange --activate n` and `lvextend` run with the record's candidate PVs as
-`--devices` (the NBD device and its partitions, as attach recorded them), and
-the deactivation also selects the record's VG UUID; `lvextend` has no
-selection, and with `--devices` it looks for the VG name only on those
-devices. The record holds them in its mapping proof or pre-activation intent,
-and the VG UUID in its administrator pins; a record from before both is held
-to its NBD device. A VG of the same name on another disk (a second disk, a
+Their `vgchange --activate n` and `lvextend` run with the record's candidate
+PVs as `--devices`: the NBD device and its partitions as the mapping proof or
+the pre-activation intent recorded them, or the NBD device alone for a record
+from before both. The deactivation also selects the recorded VG UUID, which
+the proof's mapping uuids or the intent name; for a record with neither it
+comes from the administrator pins, and pins must always agree with the record.
+`lvextend` has no selection: with `--devices` it looks for the VG name only on
+those devices, and grow runs it only after checking that the live mapping is
+the recorded one. A VG of the same name on another disk (a second disk, a
 cloned image) is therefore never extended or deactivated, and because
 `--devices` replaces the host's own LVM device scan, a devices file or filter
-that leaves `/dev/nbd*` out does not stop detach or grow either. The
-deactivation still names the VG: when LVM cannot read it, as after the daemon
+that leaves `/dev/nbd*` out does not stop detach or grow either.
+
+For a record with a mapping proof, or one from before proofs and intents, the
+deactivation also names the VG: when LVM cannot read it, as after the daemon
 stopped serving, the command fails instead of succeeding without effect, and
-cleanup can continue with the fallback below.
+cleanup can continue with the fallback below. The deactivation of a
+pre-activation intent selects the VG by UUID without naming it, as before; the
+helper observes the mappings again afterwards instead of trusting its status.
 
 `maki-attach cleanup --volume <volume>` is the idempotent selector used by the
 packaged service lifecycle. Under the same single attach lock, no trusted

@@ -208,7 +208,8 @@ impl fmt::Display for PlannedStep {
                 "preflight all PVs of {vg_name}; activate by verified VG UUID with verified devices and complete mode"),
             PlannedStep::LvmDeactivate { vg_name } => write!(
                 f,
-                "vgchange -an {vg_name}, on the recorded PVs and VG UUID only"
+                "vgchange -an {vg_name}, on the recorded PVs only and by the recorded VG UUID \
+                 where the record names one"
             ),
             PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => write!(
                 f,
