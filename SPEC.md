@@ -431,6 +431,12 @@ match the live NBD backend before detach and immediately before disconnect,
 including rollback. A missing or invalid record MUST fail closed, even when
 the caller supplies an explicit NBD device.
 
+A trusted record reserves the NBD device it names for its volume, connected
+or not, until one of that volume's own operations replaces or retires the
+record. Under the attach lock, attach MUST read every record before it
+chooses or connects a device, MUST NOT allocate or connect a device that
+another volume's record names, and MUST refuse while a record cannot be read.
+
 A detach retry MAY skip a step whose completion is verified from current mount
 and block-device observations. Destructive steps still require matching live
 identity. If every detach step has already completed, the helper MAY retire

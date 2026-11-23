@@ -551,9 +551,7 @@ fn absent_backend(record: &BoundDeviceRecord, system: &impl System) -> Result<()
         Some(identifier) if identifier == record.connection_id => Err(identity_error(
             "backend is still connected; use detach for a live attachment",
         )),
-        Some(_) => Err(identity_error(
-            "recorded NBD device now has a foreign backend; refusing recovery",
-        )),
+        Some(_) => Err(super::other_identity(record, "recovery")),
     }
 }
 
