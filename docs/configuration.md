@@ -515,8 +515,15 @@ when available, and establish throughput and tail latency with the
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
 stale response IDs are discarded; a binary frame, a text frame that is not JSON,
 or a response without a numeric ID breaks the contract and fails every request
-on that connection at once as a contract error. Ping and pong frames are
-ignored, and a close frame ends the connection. Pending requests are scoped to a connection
+on that connection at once as a contract error. An `integrity` or
+`unsupported-context` error frame whose envelope is not exact (see
+[provider error signals](#provider-error-signals)) fails only the request it
+answers, as a contract error, and that request is not sent again; the
+connection then takes no new request and is released once the requests already
+on it finish, as after a cancelled request (below). Any other malformed answer
+to one request, such as an unknown error class or reason or a missing item, is
+a contract error for that request and leaves the connection in use. Ping and
+pong frames are ignored, and a close frame ends the connection. Pending requests are scoped to a connection
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
@@ -665,10 +672,12 @@ Two failures carry an explicit token:
 
 A token is compared exactly. A missing, unknown, repeated or comma-joined
 value, or a token on any other HTTP or gRPC status, is not one of these
-signals: the response is classified by its status alone. A WebSocket
-`integrity` or `unsupported-context` error whose `reason` is absent or is not
-one of that class's two tokens, or whose frame repeats `id`, `error`, `class`
-or `reason`, is a contract error.
+signals: the response is classified by its status alone. A WebSocket frame
+that repeats a member is read from its last occurrence, so its class is the
+last `class` of its last `error`. An `integrity` or `unsupported-context`
+class selected this way is a contract error when its `reason` is absent, is
+not a string or is not one of that class's two tokens, or when the frame
+repeats `id`, `error`, `class` or `reason`.
 
 In each table below a row applies only when no row above it does.
 
@@ -708,10 +717,27 @@ A WebSocket error frame cannot report an endpoint failure. The upgrade that
 opens a connection can, as described [above](#websocket-and-grpc-contracts).
 
 A failure without such an answer is classified the same way on all three
-transports: a timeout or a lost connection is retryable, a TLS authentication
-or protocol failure is an endpoint failure, and a reply that breaks the
-transport's framing or its size limit (`max_response_bytes`,
-`max_message_bytes`, `max_frame_bytes`) is a contract error.
+transports: a timeout or a lost connection, also one that cuts a reply short,
+is retryable, and a TLS authentication or protocol failure is an endpoint
+failure. On an established connection, a reply that breaks the framing of the
+transport's messages or its size limit (`max_response_bytes`,
+`max_message_bytes`, `max_frame_bytes`) is a contract error: an HTTP/1.1
+response head or chunked body that does not parse, or a body that only the
+connection's close ends; a gRPC message whose length prefix, count or final
+status breaks the gRPC protocol, or a stream that ends inside a message; a
+WebSocket frame that breaks the WebSocket protocol or is not a JSON text frame
+with a numeric ID. Two protocol failures are classified otherwise:
+
+- A WebSocket upgrade reply that is not a valid upgrade (a 101 without the
+  upgrade headers or with the wrong accept key, a status below 300 or above
+  599, a head that is not HTTP) is an endpoint failure, like a refused upgrade.
+  An upgrade reply cut short by a lost connection is retryable.
+- An HTTP/2 error under a gRPC call, a reset stream or a GOAWAY, becomes the
+  gRPC status that the gRPC library derives from it and is classified by the
+  gRPC table above: a reset with `ENHANCE_YOUR_CALM` is throttled
+  (`ResourceExhausted`), one with `INADEQUATE_SECURITY` is an endpoint failure
+  (`PermissionDenied`), and every other reset, and a GOAWAY whatever its code,
+  is retryable.
 
 Each error's message carries a fixed prefix, and the dispatcher handles each
 kind differently:
