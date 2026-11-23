@@ -186,11 +186,12 @@ impl Revalidation {
 /// Whether a failed validation proves that the candidate serves another
 /// contract, so it is excluded for the life of the set (review M-011).
 /// The self-test, the cross-endpoint check and the daemon's canary check
-/// reach such a verdict only from replies that passed validation (another
-/// key or compatibility id, a decrypt to the wrong plaintext, a claimed
-/// capability it does not honour) and report it as `ProviderFatal`; a
-/// candidate's explicit refusal of the volume's real context
-/// (`UnsupportedContext`) is such a reply too.
+/// reach such a verdict only from definitive replies: replies that passed
+/// validation (another compatibility id, a decrypt to the wrong plaintext,
+/// a claimed capability it does not honour) or a refusal of ciphertext the
+/// other endpoint produced or attach authenticated (another key), and
+/// report it as `ProviderFatal`; a candidate's explicit refusal of the
+/// volume's real context (`UnsupportedContext`) is such a reply too.
 ///
 /// Everything else shows only that an exchange failed: transport errors,
 /// timeouts, admission limits, and replies that do not parse, are

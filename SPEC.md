@@ -1683,9 +1683,9 @@ Validation evidence is either conclusive or inconclusive:
 conclusive (excluded for the life of the set):
   replies that passed validation show another key (either peer
   refuses or misdecrypts the other's ciphertext, or the volume canary
-  decrypts to the wrong plaintext), another compatibility id, or a
-  claimed capability that is not honoured; an explicit refusal of the
-  volume's real context
+  is refused or decrypts to the wrong plaintext), another
+  compatibility id, or a claimed capability that is not honoured; an
+  explicit refusal of the volume's real context
 
 inconclusive (validated again later):
   a transport error, timeout or admission limit; a reply that does
