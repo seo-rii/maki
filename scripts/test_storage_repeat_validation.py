@@ -18,6 +18,11 @@ from unittest import mock
 
 class BackgroundStorageTests(unittest.TestCase):
     def setUp(self):
+        # The entry points under test set the process umask to 0077 for the
+        # files they write; give later tests the caller's umask back.
+        umask = os.umask(0o077)
+        os.umask(umask)
+        self.addCleanup(os.umask, umask)
         spec = importlib.util.spec_from_file_location(
             "storage_runner", Path(__file__).with_name("storage-repeat-validation.py"))
         self.runner = importlib.util.module_from_spec(spec)

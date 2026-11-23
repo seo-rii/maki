@@ -228,8 +228,8 @@ def with_output(text):
 @unittest.skipUnless(sys.platform.startswith("linux"), "the root-only targets are Linux-only")
 class RootRunner(unittest.TestCase):
     def setUp(self):
-        # Campaign entry points other suites call leave a 0077 umask behind;
-        # the fixture build tree is one other users can reach.
+        # The fixture build tree is one other users can reach, whatever the
+        # caller's umask.
         self.addCleanup(os.umask, os.umask(0o022))
         temporary = tempfile.TemporaryDirectory(prefix="maki-root-runner-", dir=runner.SCRATCH_PARENT)
         self.addCleanup(temporary.cleanup)
