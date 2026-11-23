@@ -737,6 +737,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_mount_sources_are_empty_fields() {
+        // Linux prints a mount whose source string is empty (`mount -t tmpfs
+        // '' /dir`, a FUSE mount with an empty `fsname`) as an empty field,
+        // the only place where it writes two consecutive spaces.
+        let cgroup = mountinfo("/", "/sys/fs/cgroup");
+        let empty = "52 31 0:61 / /run/empty rw,relatime - tmpfs  rw,mode=755\n";
+        let expected = Layout {
+            mount: "/sys/fs/cgroup".into(),
+            leaf: "/sys/fs/cgroup/slice/daemon".into(),
+        };
+        for table in [
+            format!("{cgroup}{empty}"),
+            format!("{empty}{cgroup}{empty}"),
+            "31 22 0:26 / /sys/fs/cgroup rw,nosuid shared:9 - cgroup2  rw\n".into(),
+        ] {
+            assert_eq!(
+                layout("0::/slice/daemon\n", &table).as_ref(),
+                Ok(&expected),
+                "{table}"
+            );
+        }
+        // Such a mount below the cgroup mount still shadows its policy.
+        let nested = format!("{cgroup}44 31 0:55 / /sys/fs/cgroup/slice rw - tmpfs  rw\n");
+        assert_eq!(
+            layout("0::/slice/daemon\n", &nested).unwrap_err(),
+            "nested mount can shadow cgroup memory policy"
+        );
+    }
+
+    #[test]
     fn admission_uses_leaf_limit_and_all_visible_ancestor_headroom() {
         let f = Fixture::new();
         let result = assess(&budget(), &f.layout, 2048).unwrap();

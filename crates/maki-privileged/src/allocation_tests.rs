@@ -193,3 +193,16 @@ fn review_auto_allocation_refuses_oversized_mount_inventory() {
     file.set_len(MAX_MOUNTINFO_BYTES as u64 + 1).unwrap();
     assert!(allocate(&fixture.0, &mounts).is_err());
 }
+
+/// Linux prints a mount whose source string is empty (`mount -t tmpfs ''
+/// /dir`) as an empty field: `- tmpfs  rw,...`, the only place where it
+/// writes two consecutive spaces. Such a record is an ordinary mount.
+#[test]
+fn review_auto_allocation_reads_empty_mount_sources_as_empty_fields() {
+    let fixture = Fixture::new();
+    let unrelated = b"92 20 0:41 / /run/empty rw,relatime - tmpfs  rw,mode=755\n";
+    assert_eq!(choose(&fixture.0, unrelated).unwrap(), "/dev/nbd2");
+    // A mount of the device itself still occupies it, whatever its source.
+    let direct = b"91 20 43:32 / /srv/old rw - xfs  rw\n";
+    assert_eq!(choose(&fixture.0, direct).unwrap(), "/dev/nbd3");
+}

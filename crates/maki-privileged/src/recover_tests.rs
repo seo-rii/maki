@@ -747,3 +747,54 @@ fn non_utf8_mount_records_keep_recovery_and_gate_checks_exact() {
     };
     assert_ne!(snapshot(b"/dev/\xfe"), snapshot(b"/dev/\xff"));
 }
+
+/// Linux prints a mount whose source string is empty (`mount -t tmpfs ''
+/// /dir`) as an empty field: `- tmpfs  rw,...`. One such mount anywhere in
+/// the namespace must not block recovery or the workload gate, and the
+/// gate's checks keep reading the fields after it.
+#[test]
+fn empty_mount_sources_keep_recovery_and_gate_checks_exact() {
+    let (_fixture, state, _req, system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    let mounts = system.mounts(&record);
+    let mountpoint = record.attachment.mountpoint.clone();
+    let error = |table: &str| {
+        recover::observe_complete(&record, table.as_bytes(), &system.sysfs)
+            .unwrap_err()
+            .to_string()
+    };
+
+    let table = format!("{mounts}42 25 0:41 / /run/empty rw,relatime - tmpfs  rw,mode=755\n");
+    assert!(
+        recover::observe(&record, table.as_bytes(), &system.sysfs)
+            .unwrap()
+            .mounted
+    );
+    assert_eq!(
+        recover::observe_complete(&record, table.as_bytes(), &system.sysfs)
+            .unwrap()
+            .device,
+        (253, 0)
+    );
+
+    // The volume's own record with an empty source is still the volume.
+    let volume = format!("40 25 253:0 / {mountpoint} rw,nosuid,nodev - xfs  rw\n");
+    assert_eq!(
+        recover::observe_complete(&record, volume.as_bytes(), &system.sysfs)
+            .unwrap()
+            .device,
+        (253, 0)
+    );
+    let read_only = format!("40 25 253:0 / {mountpoint} rw,nosuid,nodev - xfs  ro\n");
+    assert_eq!(error(&read_only), "workload mount is read-only");
+
+    // Nested and second mounts are still refused whatever their source.
+    let nested = format!("{mounts}44 40 0:62 / {mountpoint}/wal rw - tmpfs  rw\n");
+    assert_eq!(error(&nested), "workload volume contains a nested mount");
+    let extra = format!("{mounts}43 25 253:0 / /container/data rw - xfs  rw\n");
+    let refused = recover::observe(&record, extra.as_bytes(), &system.sysfs).unwrap_err();
+    assert!(
+        refused.to_string().contains("has another mount"),
+        "{refused}"
+    );
+}
