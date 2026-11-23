@@ -54,6 +54,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
+| etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
 
 Both platform matrices set `fail-fast: false`, so a Linux failure cannot
 cancel the Windows evidence. The pinned baseline is reproducible; latest stable
@@ -115,7 +116,7 @@ The current vendored pin is 0.23.46, which includes the subsequent
 `RUSTSEC-2026-0346` through `RUSTSEC-2026-0349` fixes while retaining the local
 plaintext-erasure patch and its allocator-observed regressions.
 
-The scheduled job runs:
+The scheduled `nightly-gates` job runs:
 
 | Test identifier | Workload |
 |---|---|
@@ -129,6 +130,7 @@ The scheduled job runs:
 | `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
 | `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
+| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures |
 | `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on `/dev/shm`) |
 
 The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
@@ -137,7 +139,11 @@ without a name filter, so every ignored test runs, including any new gate; the
 one failing gate binary from hiding the result of every binary after it.
 
 Gates that need operator-provided infrastructure refuse to skip, so they are
-compiled only with an opt-in feature and are not part of the scheduled run:
+compiled only with an opt-in feature and are not part of that `-- --ignored`
+run. The etcd gate has its own scheduled job, `etcd-qualification`, which
+installs a digest-pinned etcd v3.6.5 and builds `maki-witness`; no CI job
+provides the delegated cgroup, so the cgroup gate runs only on an operator's
+host:
 
 | Feature | Gate | Requires |
 |---|---|---|
@@ -151,7 +157,8 @@ MAKI_ETCD_BIN=/opt/etcd-v3.6/etcd MAKI_WITNESS_BIN=$PWD/target/release/maki-witn
   --test etcd_ha -- --ignored --nocapture
 ```
 
-It also builds the Linux cdylib, verifies the global `plugin_init` symbol,
+The `nightly-gates` job also builds the Linux cdylib, verifies the global
+`plugin_init` symbol,
 installs `nbdkit-plugin-dev` and runs `review_abi.rs`, which compiles a C probe
 against the distribution's `nbdkit-plugin.h` and compares every field offset
 and `NBDKIT_*` constant the shim depends on. The same test runs under WSL

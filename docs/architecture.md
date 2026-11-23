@@ -111,7 +111,7 @@ writes.
 
 | Structure | Protection | Role |
 |---|---|---|
-| Superblock | Two generations plus CRC; new volumes use envelope v2 | Volume identity, geometry, provider type, key name, compatibility ID, and required recovery policy |
+| Superblock | Two generations plus CRC; new volumes use envelope v2, or v3 when created with discard support | Volume identity, geometry, provider type, key name, compatibility ID, and required recovery policy |
 | Key canary | Two generations plus CRC, written at first attach | Provider/key-bound ciphertext of a fixed plaintext; must decrypt on every attach |
 | Shard catalog | Two generations plus CRC | Durable set of allocated shard files |
 | Allocation map | Per-shard A/B copies | Distinguishes unwritten units from allocated slots |
@@ -165,8 +165,10 @@ bitmap publication, physical hole punching and replay ordering.
 
 Recovery acquires the volume lock, checks the superblock envelope and required
 proof, validates allocation state, loads checkpoint state, scans journal segments,
-and rebuilds the in-memory overlay from records newer than the checkpoint. It
-fails closed: the oldest surviving segment must bridge from the checkpoint
+and, once the checks and repairs below succeed, replays the records newer than
+the checkpoint into their slots in bounded batches, advances the checkpoint and
+removes the segments it then covers. The volume starts with an empty overlay.
+Recovery fails closed: the oldest surviving segment must bridge from the checkpoint
 boundary, segments must be contiguous and carry the volume's UUID, a segment
 larger than the writer can produce is rejected before it is read, and a
 complete-but-invalid segment header is treated as damage rather than as a
@@ -224,13 +226,17 @@ has no new append. Data sync alone does not advance the public durable boundary
 or make those records checkpoint-eligible. Recovery publishes every accepted
 horizon to both proof copies before READY.
 
-Segment scanning uses fixed 64 KiB scratch and discards checkpoint-covered
-payloads as they are validated. Volume attach retains only the latest record
-per unit, and the deep checker discards each validated payload after counting
-it. With shared overlay storage, the four-unit overwrite regression measures
-21,280 bytes of extra heap
-for recovery and 9,176 bytes for deep checking at both 1 MiB and 64 MiB history.
-Distinct units, different latest/durable versions and segment/allocation metadata
+Segment scanning uses fixed 64 KiB scratch, and neither volume attach nor the
+deep checker retains a payload while validating. Attach scans the accepted
+segments a second time and replays their records through a ciphertext batch
+with a 1 MiB grouping target (plus at most one record of up to
+`max_ciphertext_size`); the deep checker keeps the index of each unit that has
+a record above the checkpoint. The four-unit overwrite regression
+(`review_r3_recovery_memory.rs`) asserts that 64 MiB of history raises the heap
+peak over 1 MiB of history by at most 256 KiB for attach (at most 2 MiB in
+all) and by at most 64 KiB for the deep check (at most 512 KiB in all).
+Those unit indexes, the record headers both keep as checkpoint evidence (for at
+most 65,536 units at a time) and segment/allocation metadata
 still consume memory; public all-record APIs retain their return contract. See the
 [measurements and limits](durable-recovery.md#cost-and-verification-limits).
 
