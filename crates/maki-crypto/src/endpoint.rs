@@ -457,10 +457,11 @@ pub(crate) fn deadline_error() -> CryptoError {
 /// [`EndpointSet::expire`] turns it into the operation's result.
 struct Expired;
 
-/// What the dispatcher serving one batch scheduler call has seen so far.
+/// What the dispatcher serving one batch scheduler call had seen before the
+/// caller's deadline.
 #[derive(Default)]
 pub(crate) struct DispatchReport {
-    /// The last endpoint error of the dispatch in progress, without the
+    /// The last endpoint error of the request in progress, without the
     /// not-sent mark (the scheduler cannot tell whether a later attempt
     /// was sent, and dropping the mark is always safe).
     pub(crate) last_error: Option<CryptoError>,
@@ -470,12 +471,35 @@ pub(crate) struct DispatchReport {
 
 /// One scheduler caller's view of the dispatcher serving its request. The
 /// caller's own budget usually runs out while the shared RPC still runs; it
-/// then leaves with the error this dispatcher would return at that moment
-/// (SPEC §35).
+/// then leaves with the error this dispatcher would have returned at the
+/// caller's deadline (SPEC §35).
 #[derive(Clone, Default)]
-pub(crate) struct DispatchObserver(Arc<parking_lot::Mutex<DispatchReport>>);
+pub(crate) struct DispatchObserver(Arc<ObservedDispatch>);
+
+#[derive(Default)]
+struct ObservedDispatch {
+    report: parking_lot::Mutex<DispatchReport>,
+    /// The caller's deadline, on the caller's clock: the dispatcher's clock
+    /// may count from another epoch (the daemon gives each its own). The
+    /// dispatcher can run past it before the caller's timer task runs; what
+    /// it reports from then on (a failure, the start of the next RPC batch)
+    /// came too late to be the caller's answer and is not recorded, so that
+    /// answer does not depend on which task runs first. Its own deadline
+    /// exit then changes nothing either: the caller's budget has run out
+    /// and counts.
+    deadline: Option<(Arc<dyn Clock>, Duration)>,
+}
 
 impl DispatchObserver {
+    /// The observer of a caller whose budget ends at `deadline` on `clock`
+    /// (`None`: no deadline).
+    pub(crate) fn until(clock: Arc<dyn Clock>, deadline: Option<Duration>) -> Self {
+        Self(Arc::new(ObservedDispatch {
+            report: parking_lot::Mutex::default(),
+            deadline: deadline.map(|deadline| (clock, deadline)),
+        }))
+    }
+
     /// The observer of the scheduler caller this task runs, or a fresh one
     /// that nobody reads.
     pub(crate) fn current() -> Self {
@@ -487,7 +511,16 @@ impl DispatchObserver {
     }
 
     pub(crate) fn take(&self) -> DispatchReport {
-        std::mem::take(&mut *self.0.lock())
+        std::mem::take(&mut *self.0.report.lock())
+    }
+
+    fn update(&self, update: impl Fn(&mut DispatchReport)) {
+        if let Some((clock, deadline)) = &self.0.deadline {
+            if clock.now() >= *deadline {
+                return;
+            }
+        }
+        update(&mut self.0.report.lock());
     }
 }
 
@@ -513,12 +546,12 @@ fn report_dispatch(update: impl Fn(&mut DispatchReport)) {
     // Outside any scope (no scheduler) there is nobody to tell.
     let _ = DISPATCH_OBSERVERS.try_with(|observers| {
         for observer in observers.iter().flatten() {
-            update(&mut observer.0.lock());
+            observer.update(&update);
         }
     });
 }
 
-/// The latest endpoint failure of this dispatch: what a deadline exit
+/// The latest endpoint failure of this request: what a deadline exit
 /// returns.
 fn record_failure(last_error: &mut Option<CryptoError>, err: CryptoError) {
     report_dispatch(|report| report.last_error = Some(err.duplicate().maybe_sent()));
@@ -1073,7 +1106,7 @@ impl EndpointSet {
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
         // A scheduler caller leaving at its own deadline reports what this
-        // dispatch has seen (another chunk's failures are not its cause).
+        // request has seen (another request's failures are not its cause).
         report_dispatch(|report| report.last_error = None);
         // The previous actual RPC survives retry-pass boundaries. A newly
         // recovered endpoint is still a failover from the last peer called.

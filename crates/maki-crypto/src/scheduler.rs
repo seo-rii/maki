@@ -846,12 +846,16 @@ impl BatchScheduler {
         &self,
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
-        let observer = DispatchObserver::default();
+        let deadline = self
+            .max_operation_time()
+            .map(|limit| self.clock.now().saturating_add(limit));
+        // The observer records nothing at or after the deadline: a failure
+        // the dispatcher sees then arrived too late for this caller.
+        let observer = DispatchObserver::until(self.clock.clone(), deadline);
         let operation = observe_dispatch(vec![observer.clone()], operation);
         // `None`: the caller's own budget ran out first.
-        let result = match self.max_operation_time() {
-            Some(limit) => {
-                let deadline = self.clock.now().saturating_add(limit);
+        let result = match deadline {
+            Some(deadline) => {
                 let remaining = deadline.saturating_sub(self.clock.now());
                 if remaining.is_zero() {
                     None
@@ -875,8 +879,9 @@ impl BatchScheduler {
         if result.is_none() || report.deadline_expired {
             self.stats.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
         }
-        // Leave as the dispatcher serving this request would now: with its
-        // last endpoint error, or the deadline error if none failed it.
+        // Leave as the dispatcher serving this request would have at the
+        // deadline: with the last endpoint error of the request then in
+        // progress, or the deadline error if none failed it.
         result.unwrap_or_else(|| Err(report.last_error.unwrap_or_else(deadline_error)))
     }
 }
