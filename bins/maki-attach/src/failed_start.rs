@@ -29,8 +29,10 @@ use std::time::Instant;
 /// lock. They must fit inside the unit's `TimeoutStopSec`, which bounds this
 /// hook, and inside the coordinator's `JobTimeoutSec`, which counts the wait
 /// for this hook, the daemon's stop and the coordinator's own cleanup; see
-/// `the_rollback_budget_fits_the_packaged_timeouts`. The lock wait is the
-/// longest that fits. Helpers queued before the hook (other volumes'
+/// `the_rollback_budget_fits_the_packaged_timeouts`. The lock wait leaves
+/// about three seconds of the job timeout for unit transitions and the work
+/// after the deadline (removing the record, the report); five seconds more
+/// would not fit. Helpers queued before the hook (other volumes'
 /// attach, detach or cleanup) are served first, and one attach can hold the
 /// lock for up to its 180-second start timeout: contention beyond this wait
 /// leaves the rollback undone, the documented second fault.
@@ -718,8 +720,9 @@ mountpoint = "/srv/custom"
         let daemon_stop = seconds(daemon, "TimeoutStopSec=").unwrap_or(90);
         let cleanup = seconds(recovery, "TimeoutStartSec=").unwrap();
         let job = seconds(recovery, "JobTimeoutSec=").unwrap();
-        assert!(hook + daemon_stop + cleanup <= job);
-        // The lock wait is the longest that fits: five seconds more do not.
+        // About three seconds stay for unit transitions and the work after
+        // the deadline; five seconds more of lock wait would not fit.
+        assert!(hook + daemon_stop + cleanup + 3 <= job);
         assert!(hook + 5 + daemon_stop + cleanup > job);
     }
 

@@ -290,16 +290,21 @@ impl TrustedState {
         }
     }
 
-    /// How many lock requests wait for `attach.lock`, from `/proc/locks`.
+    /// How many lock requests of this process wait for `attach.lock`, from
+    /// `/proc/locks`. Only the inode number is compared, not the device, so
+    /// the process id keeps a blocked request on another filesystem's file
+    /// with the same inode number out of the count.
     #[cfg(test)]
     pub(crate) fn lock_waiters(&self) -> usize {
         let inode = format!(":{}", self.lock_file().unwrap().metadata().unwrap().ino());
+        let pid = std::process::id().to_string();
         std::fs::read_to_string("/proc/locks")
             .unwrap()
             .lines()
             .filter(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
                 fields.get(1) == Some(&"->")
+                    && fields.contains(&pid.as_str())
                     && fields
                         .iter()
                         .any(|field| field.matches(':').count() == 2 && field.ends_with(&inode))
