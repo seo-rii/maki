@@ -137,10 +137,17 @@ fn validate_arguments(args: &[OsString]) -> Result<(), String> {
                 // receives the original OS pathname, including non-Unicode bytes.
                 config::check_argument(argument, &value.to_string_lossy())
             } else {
-                config::check_argument(
-                    argument,
-                    value.to_str().ok_or("option value must be valid UTF-8")?,
-                )
+                let value = value.to_str().ok_or("option value must be valid UTF-8")?;
+                config::check_argument(argument, value).and_then(|()| match argument {
+                    // The name selects the configuration, the attachment
+                    // state and the units: a malformed one is misuse, refused
+                    // before any of them is read.
+                    "--volume" if matches!(verb, "attach" | "verify") => {
+                        config::check_volume_name(value)
+                    }
+                    "--volume" => config::check_instance_name(value),
+                    _ => Ok(()),
+                })
             }
             .map_err(|error| error.to_string())?;
         }
@@ -195,6 +202,12 @@ fn main() -> ExitCode {
     let plan_only = args.iter().any(|a| a == "--plan");
 
     if verb == "recover-failed-start" {
+        // Without Linux there is no systemd to run the hook and nothing it
+        // could schedule: like every other action, it executes only on Linux.
+        if !plan_only && !cfg!(target_os = "linux") {
+            diagnostic!("failed-start recovery requires Linux");
+            return ExitCode::from(3);
+        }
         return match failed_start::run(&volume, plan_only) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

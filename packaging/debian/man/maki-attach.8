@@ -139,9 +139,12 @@ The Maki volume UUID
 The expected XFS filesystem UUID
 .RB ( fs_uuid ).
 .SH EXIT STATUS
-Zero indicates success. A failed action returns 1. Invalid command usage,
-including a malformed option value, returns 2 and prints no plan. Without
-Linux, an action run without
+Zero indicates success. A failed action returns 1, as does an attachment
+file that cannot be read, is not trusted or does not parse. Invalid command
+usage returns 2 and prints no plan: an unknown, repeated or misplaced
+option, a malformed volume name, which is checked first, or an option or
+setting value that fails validation, which is checked once the file has been
+read. Without Linux, an action run without
 .B \-\-plan
 returns 3.
 .SH SEE ALSO
