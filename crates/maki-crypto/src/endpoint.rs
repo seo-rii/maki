@@ -33,7 +33,7 @@
 //!   M-011). Only proof that an endpoint serves another contract excludes
 //!   it for the life of the set; a validation that merely failed to
 //!   complete is retried with exponential backoff (see
-//!   [`proves_another_contract`]).
+//!   `proves_another_contract`).
 
 use std::future::Future;
 use std::pin::Pin;

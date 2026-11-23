@@ -125,7 +125,7 @@ const MAX_GROUP_BUFFER: usize = 16 << 20;
 /// [`resolve_gid`] starting from an `initial` record buffer. `getgrnam_r`
 /// reports `ERANGE` when the record (a directory group's member list can
 /// be large) does not fit; the buffer is doubled and the lookup retried, up
-/// to [`MAX_GROUP_BUFFER`].
+/// to `MAX_GROUP_BUFFER` (16 MiB).
 pub fn resolve_gid_with_capacity(name: &str, initial: usize) -> io::Result<u32> {
     let cname = std::ffi::CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group name contains NUL"))?;
