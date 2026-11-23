@@ -49,6 +49,16 @@ impl RecoveryProof {
         Ok(())
     }
 
+    /// The NBD device and the partitions of it that attach recorded: the
+    /// candidate PVs of the volume group.
+    pub(super) fn candidate_devices(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|node| node.dm_name.is_none())
+            .map(|node| format!("/dev/{}", node.name))
+            .collect()
+    }
+
     /// The VG UUID that every recorded mapping's device-mapper uuid
     /// (`LVM-<VG UUID><LV UUID>[-suffix]`) carries, without dashes. `None`
     /// unless the proof has a mapping and all of them agree.
@@ -644,14 +654,14 @@ pub(super) fn execute(
         };
         // A failed command may already have applied its effect. Keep the
         // original record; a retry observes which upper layers remain.
-        if matches!(step, PlannedStep::LvmDeactivate { .. }) && record.recovery.is_none() {
-            if let Some(intent) = &record.recovery_intent {
-                system.recover_deactivate_lvm(&record, intent.verified())?;
-            } else {
-                system.run_step(&step, None)?;
+        match (&step, &record.recovery_intent) {
+            (PlannedStep::LvmDeactivate { .. }, Some(intent)) => {
+                system.recover_deactivate_lvm(&record, intent.verified())?
             }
-        } else {
-            system.run_step(&step, None)?;
+            (PlannedStep::LvmDeactivate { .. }, None) => {
+                super::run_recorded_lvm(system, &step, &record)?
+            }
+            _ => system.run_step(&step, None)?,
         }
     }
     Err(identity_error(
@@ -747,5 +757,91 @@ mod force_deactivation_tests {
                 .collect::<Vec<_>>(),
             ["remove", "vg-data"]
         );
+    }
+}
+
+#[cfg(test)]
+mod recorded_scope_tests {
+    use super::*;
+    use crate::plan::AttachmentIdentity;
+
+    const VG: &str = "aaaaaabbbbccccddddeeeeffffgggggg";
+    const LV: &str = "hhhhhhiiiijjjjkkkkllllmmmmnnnnnn";
+
+    fn node(name: &str, mapping: Option<&str>, slaves: &[&str]) -> BlockIdentity {
+        BlockIdentity {
+            name: name.into(),
+            device: (43, 0),
+            dm_name: mapping.map(str::to_owned),
+            dm_uuid: mapping.map(|_| format!("LVM-{VG}{LV}")),
+            slaves: slaves.iter().map(|name| (*name).into()).collect(),
+        }
+    }
+
+    fn record(nodes: Vec<BlockIdentity>) -> BoundDeviceRecord {
+        BoundDeviceRecord {
+            version: 1,
+            volume: "pg".into(),
+            attachment: AttachmentIdentity {
+                volume_uuid: "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c".into(),
+                nbd_socket: "/run/maki/pg/nbd.sock".into(),
+                mountpoint: "/srv/pg".into(),
+                vg_name: "vg_maki_pg".into(),
+                lv_name: "data".into(),
+                lvm_identity: None,
+            },
+            device: "/dev/nbd3".into(),
+            connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),
+            recovery: Some(RecoveryProof {
+                nodes,
+                mount_permitted: true,
+            }),
+            recovery_intent: None,
+        }
+    }
+
+    /// A proof keeps every candidate device attach recorded, partitions
+    /// included, so detach and recovery find a partition PV's VG; its
+    /// mappings name the VG UUID, spelled for `--select` as LVM spells it.
+    #[test]
+    fn a_proof_scopes_lvm_to_its_recorded_devices_and_vg_uuid() {
+        let proven = record(vec![
+            node("dm-0", Some("vg_maki_pg-data"), &["nbd3p1"]),
+            node("nbd3", None, &[]),
+            node("nbd3p1", None, &[]),
+        ]);
+        let scope = lvm_preflight::recorded_scope(&proven).unwrap();
+        let args: Vec<String> = lvm_preflight::recorded_deactivation_command(&scope, "vg_maki_pg")
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--devices",
+                "/dev/nbd3,/dev/nbd3p1",
+                "--activate",
+                "n",
+                "--select",
+                "vg_uuid=aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg",
+                "--config",
+                "devices { allow_changes_with_duplicate_pvs=0 }",
+                "vg_maki_pg"
+            ]
+        );
+
+        // Mappings that disagree on their VG, or none at all, name no VG UUID.
+        let mut other = node("dm-1", Some("vg_maki_pg-meta"), &["nbd3"]);
+        other.dm_uuid = Some(format!("LVM-{}{LV}", "z".repeat(32)));
+        for nodes in [
+            vec![
+                node("dm-0", Some("vg_maki_pg-data"), &["nbd3"]),
+                other,
+                node("nbd3", None, &[]),
+            ],
+            vec![node("nbd3", None, &[])],
+        ] {
+            assert!(lvm_preflight::recorded_scope(&record(nodes)).is_err());
+        }
     }
 }

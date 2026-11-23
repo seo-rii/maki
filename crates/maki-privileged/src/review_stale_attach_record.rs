@@ -9,7 +9,8 @@
 //! state are the production ones reading that tree.
 
 use super::super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,6 +87,54 @@ struct Host {
     /// before the given read.
     backend_reads: Cell<usize>,
     before_backend_read: Option<(usize, Change)>,
+    /// What LVM finds on the host; see [`Lvm`].
+    lvm: RefCell<Lvm>,
+}
+
+/// A disk that is no NBD device and carries a volume group of its own.
+struct Disk {
+    device: &'static str,
+    vg_name: &'static str,
+    vg_uuid: &'static str,
+    lv_name: &'static str,
+    lv_bytes: u64,
+}
+
+/// LVM as its commands see the host: the PV of each volume's NBD export
+/// while the export is connected, and other disks. A command without
+/// `--devices` scans what the host's LVM configuration admits, all of it or
+/// everything but the NBD devices (a devices file or filter that leaves
+/// them out); `--devices` replaces that scan. A VG name that two visible
+/// VGs carry is refused, as LVM refuses it.
+#[derive(Default)]
+struct Lvm {
+    disks: Vec<Disk>,
+    scan_leaves_out_nbd: bool,
+    /// The daemon behind every NBD connection serves no reads.
+    nbd_unreadable: bool,
+    /// The volume each connection identifier exports.
+    exports: BTreeMap<String, &'static str>,
+    /// LV sizes of the NBD exports, by VG UUID; 1 GiB until extended.
+    export_bytes: BTreeMap<&'static str, u64>,
+    /// Each command that acted on a VG, and that VG's UUID.
+    acted_on: Vec<(&'static str, &'static str)>,
+}
+
+/// One volume group a command can find.
+struct Found {
+    device: String,
+    vg_name: String,
+    vg_uuid: &'static str,
+    lv_name: &'static str,
+}
+
+/// LVM's refusal: a command that ran to its end with status 5.
+fn lvm_failed(step: &PlannedStep) -> ExecError {
+    ExecError::StepFailed {
+        step: step.to_string(),
+        status: Some(5),
+        stderr: "external command output omitted".into(),
+    }
 }
 
 /// A change another actor makes to the simulated kernel.
@@ -113,6 +162,7 @@ impl Host {
             commands: Vec::new(),
             backend_reads: Cell::new(0),
             before_backend_read: None,
+            lvm: RefCell::default(),
         };
         for index in [3, 4] {
             let device = host.sysfs.join(format!("nbd{index}"));
@@ -193,6 +243,159 @@ impl Host {
             "",
         )
         .unwrap();
+    }
+
+    /// The volume groups LVM finds with `devices` as its `--devices`, or
+    /// through its own scan.
+    fn lvm_finds(&self, devices: Option<&[&str]>) -> Vec<Found> {
+        let lvm = self.lvm.borrow();
+        let admitted = |device: &str, nbd: bool| match devices {
+            Some(listed) => listed.contains(&device),
+            None => !(nbd && lvm.scan_leaves_out_nbd),
+        };
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&self.sysfs).unwrap() {
+            let device = format!("/dev/{}", entry.unwrap().file_name().to_str().unwrap());
+            let Ok(Some(identifier)) = nbd_backend_at(&self.sysfs, &device) else {
+                continue;
+            };
+            let Some(volume) = lvm.exports.get(&identifier) else {
+                continue;
+            };
+            let export = [PG, DB, CLONE]
+                .into_iter()
+                .find(|export| export.volume == *volume)
+                .unwrap();
+            if admitted(&device, true) && !lvm.nbd_unreadable {
+                found.push(Found {
+                    device,
+                    vg_name: format!("vg_maki_{}", export.volume),
+                    vg_uuid: export.vg_uuid,
+                    lv_name: "data",
+                });
+            }
+        }
+        for disk in &lvm.disks {
+            if admitted(disk.device, false) {
+                found.push(Found {
+                    device: disk.device.into(),
+                    vg_name: disk.vg_name.into(),
+                    vg_uuid: disk.vg_uuid,
+                    lv_name: disk.lv_name,
+                });
+            }
+        }
+        found
+    }
+
+    /// Run `vgchange` or `lvextend` with `args` against [`Lvm`].
+    fn simulate_lvm(
+        &self,
+        step: &PlannedStep,
+        program: &str,
+        args: &[String],
+    ) -> Result<(), ExecError> {
+        let mut devices = None;
+        let mut selected = None;
+        let mut deactivate = false;
+        let mut bytes = None;
+        let mut positional = Vec::new();
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--devices" => devices = Some(args.next().unwrap().clone()),
+                "--select" => {
+                    selected = Some(args.next().unwrap().strip_prefix("vg_uuid=").unwrap())
+                }
+                "--config" => {
+                    args.next().unwrap();
+                }
+                "-an" => deactivate = true,
+                "--activate" => deactivate = args.next().unwrap() == "n",
+                "-L" => {
+                    bytes = Some(
+                        args.next()
+                            .unwrap()
+                            .strip_suffix('b')
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap(),
+                    )
+                }
+                option if option.starts_with('-') => panic!("fixture LVM option {option}"),
+                _ => positional.push(arg.clone()),
+            }
+        }
+        let listed: Option<Vec<&str>> = devices.as_deref().map(|list| list.split(',').collect());
+        let found = self.lvm_finds(listed.as_deref());
+        let named = |name: &str| -> Result<Vec<&Found>, ExecError> {
+            let matching: Vec<_> = found.iter().filter(|vg| vg.vg_name == name).collect();
+            // Not found, or the same name on two visible VGs.
+            if matching.len() != 1 {
+                return Err(lvm_failed(step));
+            }
+            Ok(matching)
+        };
+        let targets: Vec<&Found> = match (program, positional.as_slice()) {
+            ("vgchange", [name]) if deactivate => named(name)?,
+            ("vgchange", []) if deactivate => found.iter().collect(),
+            ("lvextend", [path]) => {
+                let (vg, lv) = path.split_once('/').unwrap();
+                named(vg)?
+                    .into_iter()
+                    .filter(|vg| vg.lv_name == lv)
+                    .collect()
+            }
+            _ => panic!("fixture LVM command {program} {positional:?}"),
+        };
+        // `--select` filters what was found; selecting nothing succeeds.
+        for target in targets
+            .into_iter()
+            .filter(|vg| selected.is_none_or(|uuid| vg.vg_uuid == uuid))
+        {
+            let mut lvm = self.lvm.borrow_mut();
+            lvm.acted_on.push((
+                if program == "lvextend" {
+                    "lvextend"
+                } else {
+                    "vgchange"
+                },
+                target.vg_uuid,
+            ));
+            let on_nbd = target.device.starts_with("/dev/nbd");
+            match bytes {
+                Some(bytes) => {
+                    let current = if on_nbd {
+                        *lvm.export_bytes.get(target.vg_uuid).unwrap_or(&(1 << 30))
+                    } else {
+                        lvm.disks
+                            .iter()
+                            .find(|disk| disk.vg_uuid == target.vg_uuid)
+                            .unwrap()
+                            .lv_bytes
+                    };
+                    if bytes <= current {
+                        return Err(lvm_failed(step));
+                    }
+                    if on_nbd {
+                        lvm.export_bytes.insert(target.vg_uuid, bytes);
+                    } else {
+                        lvm.disks
+                            .iter_mut()
+                            .find(|disk| disk.vg_uuid == target.vg_uuid)
+                            .unwrap()
+                            .lv_bytes = bytes;
+                    }
+                }
+                None if on_nbd => {
+                    drop(lvm);
+                    self.deactivate(&target.vg_name);
+                }
+                // The other disk's VG is not active.
+                None => {}
+            }
+        }
+        Ok(())
     }
 
     fn deactivate(&self, vg: &str) {
@@ -346,10 +549,36 @@ impl System for Host {
     ) -> io::Result<DetachObservation> {
         recover::observe_disconnected(record, &self.mounts(), &self.sysfs)
     }
+    /// The size `blockdev` reports for the active LV `vg/lv`.
+    fn lv_size(&self, vg: &str, lv: &str) -> Result<u64, ExecError> {
+        let mapping = self
+            .mapping(vg)
+            .filter(|_| lv == "data")
+            .ok_or_else(|| identity_error("fixture LV is not active"))?;
+        let uuid = std::fs::read_to_string(mapping.join("dm/uuid")).unwrap();
+        let export = [PG, DB, CLONE]
+            .into_iter()
+            .find(|export| uuid.starts_with(&format!("LVM-{}", export.vg_uuid.replace('-', ""))))
+            .unwrap();
+        Ok(*self
+            .lvm
+            .borrow()
+            .export_bytes
+            .get(export.vg_uuid)
+            .unwrap_or(&(1 << 30)))
+    }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.command(step.kind(), |host| {
             match step {
-                PlannedStep::NbdConnect { device, .. } => {
+                PlannedStep::NbdConnect { device, socket, .. } => {
+                    let volume = [PG.volume, DB.volume, CLONE.volume]
+                        .into_iter()
+                        .find(|volume| socket == &format!("/run/maki/{volume}/nbd.sock"))
+                        .unwrap();
+                    host.lvm
+                        .borrow_mut()
+                        .exports
+                        .insert(identifier.unwrap().into(), volume);
                     let nbd = host.nbd(device);
                     std::fs::write(nbd.join("pid"), "4242\n").unwrap();
                     std::fs::write(nbd.join("backend"), format!("{}\n", identifier.unwrap()))
@@ -386,10 +615,27 @@ impl System for Host {
                         .collect();
                     std::fs::write(&host.mountinfo, kept).unwrap();
                 }
-                PlannedStep::LvmDeactivate { vg_name } => host.deactivate(vg_name),
-                PlannedStep::LvmActivate { .. }
-                | PlannedStep::LvExtend { .. }
-                | PlannedStep::XfsGrowfs { .. } => {
+                // The commands an unscoped step runs.
+                PlannedStep::LvmDeactivate { vg_name } => {
+                    host.simulate_lvm(step, "vgchange", &["-an".into(), vg_name.clone()])?
+                }
+                PlannedStep::LvExtend {
+                    vg_name,
+                    lv_name,
+                    target_bytes,
+                    ..
+                } => host.simulate_lvm(
+                    step,
+                    "lvextend",
+                    &[
+                        "-L".into(),
+                        format!("{target_bytes}b"),
+                        format!("{vg_name}/{lv_name}"),
+                    ],
+                )?,
+                // The filesystem follows the LV it is on.
+                PlannedStep::XfsGrowfs { .. } => {}
+                PlannedStep::LvmActivate { .. } => {
                     return Err(identity_error("unexpected fixture step"))
                 }
                 // Module load, block size and the probes change no kernel state.
@@ -419,6 +665,18 @@ impl System for Host {
     }
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         crate::detach::observe(record, &self.mounts(), &self.sysfs)
+    }
+    fn run_scoped_lvm(
+        &mut self,
+        step: &PlannedStep,
+        command: std::process::Command,
+    ) -> Result<(), ExecError> {
+        let program = command.get_program().to_str().unwrap().to_owned();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        self.command(step.kind(), |host| host.simulate_lvm(step, &program, &args))
     }
     fn displaced_remains(
         &self,
@@ -795,3 +1053,6 @@ fn a_recorded_device_under_another_identity_is_refused_with_the_way_out() {
 
 #[path = "review_displaced_attach_record.rs"]
 mod displaced_record;
+
+#[path = "review_lvm_device_scope.rs"]
+mod lvm_device_scope;
