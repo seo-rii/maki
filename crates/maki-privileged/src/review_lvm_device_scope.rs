@@ -275,3 +275,26 @@ fn every_kind_of_record_scopes_its_commands_to_what_attach_verified() {
     conflicting.attachment.vg_name = proven.attachment.vg_name.clone();
     assert!(lvm_preflight::recorded_scope(&conflicting).is_err());
 }
+
+/// The plan is rendered before any record is read, and the same text names
+/// a failed step. It states the scope every record gets: the recorded PVs,
+/// and a selection by VG UUID only where the record names one; `lvextend`
+/// is never selected by UUID.
+#[test]
+fn the_plan_states_the_scope_each_kind_of_record_gets() {
+    let pg = request(&PG);
+    let detach = plan_detach(&pg).to_string();
+    assert!(
+        detach.contains(
+            "vgchange -an vg_maki_pg, on the recorded PVs only and by the recorded VG UUID \
+             where the record names one"
+        ),
+        "{detach}"
+    );
+    let grow = grow(&pg, 2 << 30).to_string();
+    assert!(
+        grow.contains("lvextend -L 2147483648b vg_maki_pg/data, on the recorded PVs only"),
+        "{grow}"
+    );
+    assert!(!grow.contains("UUID"), "{grow}");
+}
