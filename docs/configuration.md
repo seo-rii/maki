@@ -734,10 +734,17 @@ with a numeric ID. Two protocol failures are classified otherwise:
   An upgrade reply cut short by a lost connection is retryable.
 - An HTTP/2 error under a gRPC call, a reset stream or a GOAWAY, becomes the
   gRPC status that the gRPC library derives from it and is classified by the
-  gRPC table above: a reset with `ENHANCE_YOUR_CALM` is throttled
-  (`ResourceExhausted`), one with `INADEQUATE_SECURITY` is an endpoint failure
-  (`PermissionDenied`), and every other reset, and a GOAWAY whatever its code,
-  is retryable.
+  gRPC table above. A reset, and a GOAWAY that refuses the call (its last
+  stream ID is below the call's stream, so the server did not process it), is
+  classified by its error code: `ENHANCE_YOUR_CALM` is throttled
+  (`ResourceExhausted`; a gRPC server's keepalive policy sends it to a client
+  that pings too often), `INADEQUATE_SECURITY` is an endpoint failure
+  (`PermissionDenied`), and every other code is retryable. A GOAWAY that
+  accepted the call and then closes the connection under it is retryable
+  whatever its code. Either way the request was handed to the connection and
+  counts as sent, so a call that a GOAWAY refused is sent to another endpoint
+  only when the provider is `retry_safe`. The next call opens a new
+  connection.
 
 Each error's message carries a fixed prefix, and the dispatcher handles each
 kind differently:

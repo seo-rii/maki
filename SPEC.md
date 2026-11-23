@@ -1109,10 +1109,14 @@ protocol failures are classified otherwise. A WebSocket upgrade reply that is
 not a valid upgrade is `EndpointFatal`, as above. An HTTP/2 error below the
 gRPC messages, a reset stream or a GOAWAY, is no framing violation: it reaches
 Maki as the gRPC status that the gRPC library derives from it and is classified
-by the gRPC table. A reset with `ENHANCE_YOUR_CALM` is `Throttled`
-(`ResourceExhausted`), one with `INADEQUATE_SECURITY` `EndpointFatal`
-(`PermissionDenied`), and every other reset, and a GOAWAY whatever its code,
-`Retryable`.
+by the gRPC table. A reset, and a GOAWAY that refuses the call (its last stream
+ID is below the call's stream, so the server did not process it), is classified
+by its error code: `ENHANCE_YOUR_CALM` is `Throttled` (`ResourceExhausted`),
+`INADEQUATE_SECURITY` is `EndpointFatal` (`PermissionDenied`), and every other
+code is `Retryable`. A GOAWAY that accepted the call and then closes the
+connection under it is `Retryable` whatever its code. Either way the request
+was handed to the connection and counts as sent: a call that a GOAWAY refused
+is not resent or failed over unless the provider is `retry_safe`.
 
 ---
 
