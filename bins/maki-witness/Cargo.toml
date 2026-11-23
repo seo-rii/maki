@@ -7,6 +7,9 @@ license.workspace = true
 [[bin]]
 name = "maki-witness"
 path = "src/main.rs"
+# rustdoc would write the binary to doc/maki_witness, where the maki-witness
+# library's documentation goes.
+doc = false
 
 [dependencies]
 maki-witness.workspace = true
