@@ -312,7 +312,11 @@ leaves. For bounded-error calls, one caller budget covers admission, coalescing,
 the slot wait, and the provider response; dispatch does not restart it.
 
 The dispatcher validates quarantined endpoints in background tasks, never on
-the request path. Each admitted call owns a circuit-breaker permit for its
+the request path. Only proof that an endpoint serves another contract rejects
+it for the life of the set; an inconclusive validation (a failed exchange,
+such as a timeout or a truncated reply) is retried with the circuit breaker's
+doubling open interval, and the endpoint serves only after a validation
+succeeds in full. Each admitted call owns a circuit-breaker permit for its
 generation. Completion, operation deadline, cancellation, request/provider
 errors, and retry-budget refusal all release a HalfOpen probe slot; outcomes
 that are not endpoint failures do not advance the failure count. A stale

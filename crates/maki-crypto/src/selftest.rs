@@ -118,6 +118,9 @@ fn patterns(unit_size: usize) -> Vec<PlaintextUnit> {
 /// - a transport/availability error is *inconclusive* and returned unchanged,
 ///   so the dispatcher retries and quarantines this one endpoint rather than
 ///   failing the whole attach as if the provider were proven wrong (FUP-008);
+/// - a malformed reply (`Contract`) is not an answer at all and is returned
+///   unchanged: it fails the self-test without proving that the provider
+///   lacks the capability;
 /// - any other error is not integrity evidence and refuses attach.
 fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
     if matches!(e, CryptoError::Integrity(_)) {
@@ -125,6 +128,7 @@ fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
     }
     match e.class() {
         ErrorClass::Retryable | ErrorClass::Throttled | ErrorClass::EndpointFatal => Err(e),
+        _ if matches!(e, CryptoError::Contract(_)) => Err(e),
         _ => Err(CryptoError::ProviderFatal(format!(
             "{what} self-test: the negative probe was rejected with a {:?}-class error, not a \
              definitive integrity failure — the capability is not proven; attach refused",
@@ -418,7 +422,13 @@ pub async fn cross_endpoint_self_test_attributed(
         for range in batch_ranges(&cts, caps_dec, |_| unit_size as u64) {
             let chunk = &cts[range.clone()];
             let got = dec.decrypt_batch(context, chunk).await.map_err(|error| {
-                let error = if error.is_retryable() || matches!(error.class(), ErrorClass::EndpointFatal) {
+                // A refusal of the peer's ciphertext proves the endpoints
+                // differ; a transport failure or a malformed reply
+                // (`Contract`) only shows that this exchange failed.
+                let error = if error.is_retryable()
+                    || matches!(error.class(), ErrorClass::EndpointFatal)
+                    || matches!(error, CryptoError::Contract(_))
+                {
                     error
                 } else {
                     CryptoError::ProviderFatal(format!(

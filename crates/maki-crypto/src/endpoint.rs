@@ -24,7 +24,10 @@
 //! - endpoints whose cross-endpoint validation could not run at attach are
 //!   quarantined: they never serve until the validator (run against a
 //!   validated endpoint, with the real volume context) succeeds (review
-//!   M-011).
+//!   M-011). Only proof that an endpoint serves another contract excludes
+//!   it for the life of the set; a validation that merely failed to
+//!   complete is retried with exponential backoff (see
+//!   [`proves_another_contract`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -65,8 +68,9 @@ pub struct DispatchConfig {
     /// may have sent it. Attempts that failed with a
     /// [`CryptoError::not_sent`] error did not send it.
     pub retry_safe: bool,
-    /// Minimum spacing between validation attempts of a quarantined
-    /// endpoint.
+    /// Spacing before a quarantined endpoint is validated again after an
+    /// inconclusive attempt. It doubles after each further inconclusive
+    /// attempt, up to `breaker.open_max` (never below this interval).
     pub validation_interval: Duration,
 }
 
@@ -141,11 +145,65 @@ struct Endpoint {
     inflight: AtomicU32,
     /// Cross-endpoint validation passed (at attach or later).
     validated: AtomicBool,
-    /// Validation proved the endpoint *not* interchangeable: never retried.
+    /// Validation proved the endpoint serves another contract: never
+    /// retried.
     rejected: AtomicBool,
     /// A background validation of this endpoint is running.
     validating: AtomicBool,
-    last_validation_attempt: parking_lot::Mutex<Option<Duration>>,
+    revalidation: parking_lot::Mutex<Revalidation>,
+}
+
+/// When a quarantined endpoint may be validated again. Only inconclusive
+/// attempts advance it: the spacing starts at `validation_interval` and
+/// doubles per inconclusive attempt up to the cap, like a circuit
+/// breaker's open interval, measured on the set's clock from the moment
+/// the attempt failed.
+struct Revalidation {
+    /// No attempt starts before this time.
+    not_before: Duration,
+    /// Spacing after the next inconclusive attempt.
+    delay: Duration,
+}
+
+impl Revalidation {
+    fn new(config: &DispatchConfig) -> Self {
+        Self {
+            not_before: Duration::ZERO,
+            delay: config.validation_interval,
+        }
+    }
+
+    /// Schedule the next attempt after an inconclusive one at `now`; returns
+    /// the spacing applied.
+    fn defer(&mut self, now: Duration, cap: Duration) -> Duration {
+        let delay = self.delay.min(cap);
+        self.not_before = now.saturating_add(delay);
+        self.delay = delay.saturating_mul(2).min(cap);
+        delay
+    }
+}
+
+/// Whether a failed validation proves that the candidate serves another
+/// contract, so it is excluded for the life of the set (review M-011).
+/// The self-test, the cross-endpoint check and the daemon's canary check
+/// reach such a verdict only from replies that passed validation (another
+/// key or compatibility id, a decrypt to the wrong plaintext, a claimed
+/// capability it does not honour) and report it as `ProviderFatal`; a
+/// candidate's explicit refusal of the volume's real context
+/// (`UnsupportedContext`) is such a reply too.
+///
+/// Everything else shows only that an exchange failed: transport errors,
+/// timeouts, admission limits, and replies that do not parse, are
+/// truncated or have the wrong shape (`Contract`: a proxy error page, a
+/// restart mid-response). [`ValidationProvider`] already relabels the
+/// reference's own failures as retryable, since they say nothing about the
+/// candidate (BUG-068). Such an attempt is retried with backoff, and the
+/// endpoint serves only once a later validation succeeds in full.
+fn proves_another_contract(error: &CryptoError) -> bool {
+    matches!(
+        error,
+        CryptoError::ProviderFatal(_) | CryptoError::UnsupportedContext(_)
+    )
 }
 
 /// Decrements the endpoint's inflight count when dropped, so an RPC future
@@ -502,7 +560,7 @@ impl EndpointSet {
                     validated: AtomicBool::new(validated),
                     rejected: AtomicBool::new(false),
                     validating: AtomicBool::new(false),
-                    last_validation_attempt: parking_lot::Mutex::new(None),
+                    revalidation: parking_lot::Mutex::new(Revalidation::new(&config)),
                 })
             })
             .collect();
@@ -698,8 +756,8 @@ impl EndpointSet {
             .collect()
     }
 
-    /// Start validating quarantined endpoints (bounded by
-    /// `validation_interval`, one run per endpoint at a time) against a
+    /// Start validating quarantined endpoints (one run per endpoint at a
+    /// time, spaced by the backoff of [`Revalidation`]) against a
     /// validated, admitting reference. The validator makes real RPCs to an
     /// endpoint that was unreachable at attach and may be so still, so it
     /// runs in a background task: awaiting it on the request path stalled
@@ -732,14 +790,8 @@ impl EndpointSet {
         };
         let now = self.clock.now();
         for endpoint in pending {
-            {
-                let mut last = endpoint.last_validation_attempt.lock();
-                if let Some(at) = *last {
-                    if now.saturating_sub(at) < self.config.validation_interval {
-                        continue;
-                    }
-                }
-                *last = Some(now);
+            if now < endpoint.revalidation.lock().not_before {
+                continue;
             }
             if endpoint.validating.swap(true, Ordering::SeqCst) {
                 continue;
@@ -761,6 +813,12 @@ impl EndpointSet {
                 context.clone(),
             );
             let changed = self.capacity_changed.clone();
+            let clock = self.clock.clone();
+            let cap = self
+                .config
+                .breaker
+                .open_max
+                .max(self.config.validation_interval);
             // Retaining the handle bounds task ownership to this set. The
             // guard also restores the endpoint's state on task cancellation.
             let guard = ValidationGuard {
@@ -776,7 +834,7 @@ impl EndpointSet {
                         changed.notify_waiters();
                         tracing::info!("endpoint {:?} validated and admitted", endpoint.name);
                     }
-                    Err(e) if matches!(e.class(), ErrorClass::ProviderFatal) => {
+                    Err(e) if proves_another_contract(&e) => {
                         endpoint.rejected.store(true, Ordering::SeqCst);
                         tracing::error!(
                             "endpoint {:?} is not interchangeable and stays excluded: {e}",
@@ -784,10 +842,12 @@ impl EndpointSet {
                         );
                     }
                     Err(e) => {
-                        // Which side was unreachable is unknown here; leave
-                        // the breakers to real traffic and try again later.
+                        // Inconclusive: an exchange failed, on either side.
+                        // Leave the breakers to real traffic and try again
+                        // after the backoff.
+                        let delay = endpoint.revalidation.lock().defer(clock.now(), cap);
                         tracing::warn!(
-                            "endpoint {:?} validation deferred (endpoint unavailable): {e}",
+                            "endpoint {:?} validation deferred for {delay:?} (inconclusive): {e}",
                             endpoint.name
                         );
                     }

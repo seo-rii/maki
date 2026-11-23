@@ -1671,6 +1671,32 @@ ciphertext encrypted by B must decrypt on A
 
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
+An endpoint that is unreachable when these self-tests run at attach is
+quarantined. A quarantined endpoint MUST NOT receive a request until
+the same validation, run against a validated endpoint under the real volume
+context, succeeds in full. The set's common contract covers every configured
+endpoint, quarantined ones included, so admitting one never changes it.
+
+Validation evidence is either conclusive or inconclusive:
+
+```text
+conclusive (excluded for the life of the set):
+  replies that passed validation show another key (either peer
+  refuses or misdecrypts the other's ciphertext, or the volume canary
+  decrypts to the wrong plaintext), another compatibility id, or a
+  claimed capability that is not honoured; an explicit refusal of the
+  volume's real context
+
+inconclusive (validated again later):
+  a transport error, timeout or admission limit; a reply that does
+  not parse, is truncated or has the wrong shape; any other failure
+  of the validated peer
+```
+
+After an inconclusive attempt the endpoint stays quarantined and is
+validated again after `open_initial`; the spacing doubles after each further
+inconclusive attempt, up to `open_max` (§33).
+
 Initial endpoint selection policy:
 
 ```text
