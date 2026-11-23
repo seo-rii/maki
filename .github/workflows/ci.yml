@@ -104,6 +104,14 @@ jobs:
           python-version: "3.11"
       - name: workspace tests
         run: python scripts/run_cargo_tests.py --workspace --locked
+      # Tests that give a fixture to another user, run a binary as the
+      # daemon user or enter a private mount namespace skip without root,
+      # and the run above is unprivileged. The script reuses that
+      # compilation as the runner user and starts only the listed test
+      # executables through sudo; without root it fails instead of skipping.
+      - name: root-only tests (Linux)
+        if: runner.os == 'Linux'
+        run: python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked
       # A separate package invocation avoids workspace dev dependencies
       # supplying tonic's TLS backend and hiding missing production features.
       - name: standalone gRPC TLS provider selection (Linux)
