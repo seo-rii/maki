@@ -193,13 +193,8 @@ mod linux {
         digest: TableDigest,
     }
 
-    fn open_mountinfo() -> Result<BufReader<std::fs::File>, String> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(MOUNTINFO)
-            .map(BufReader::new)
-            .map_err(|e| format!("cannot read {MOUNTINFO}: {e}"))
+    fn open_mountinfo<K: Kernel>(kernel: &K) -> Result<BufReader<K::Proc>, String> {
+        kernel.open_proc(Path::new(MOUNTINFO)).map(BufReader::new)
     }
 
     /// Read the mount table as a stream of records, split as `str::lines`
@@ -303,12 +298,20 @@ mod linux {
         Ok((Layout { mount, leaf }, first.digest))
     }
 
-    fn read_bounded_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
-        let file = std::fs::OpenOptions::new()
+    fn open_nofollow(path: &Path) -> Result<std::fs::File, String> {
+        std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+    }
+
+    fn read_bounded_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+        read_bounded_from(open_nofollow(path)?, path, max)
+    }
+
+    /// Read `path`, already opened as `file`, refusing more than `max` bytes.
+    fn read_bounded_from(file: impl Read, path: &Path, max: u64) -> Result<Vec<u8>, String> {
         let mut result = Vec::new();
         file.take(max + 1)
             .read_to_end(&mut result)
@@ -320,7 +323,11 @@ mod linux {
     }
 
     fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
-        String::from_utf8(read_bounded_bytes(path, max)?).map_err(|_| {
+        utf8(read_bounded_bytes(path, max)?, path)
+    }
+
+    fn utf8(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
+        String::from_utf8(bytes).map_err(|_| {
             format!(
                 "cannot read {}: stream did not contain valid UTF-8",
                 path.display()
@@ -442,29 +449,77 @@ mod linux {
         })
     }
 
+    const PROC_CGROUP: &str = "/proc/self/cgroup";
+
+    /// The kernel state admission reads besides the controller files, which
+    /// `assess` reads under the resolved mount. The daemon reads the live
+    /// kernel; tests substitute state that changes while admission runs.
+    pub(super) trait Kernel {
+        type Proc: Read;
+        /// Open this process's `PROC_CGROUP` or `MOUNTINFO`.
+        fn open_proc(&self, path: &Path) -> Result<Self::Proc, String>;
+        /// The soft `RLIMIT_MEMLOCK`.
+        fn memlock_limit(&self) -> Result<u64, String>;
+        /// Refuse a resolved mount that is not a cgroup-v2 filesystem.
+        fn check_cgroup2(&self, mount: &Path) -> Result<(), String>;
+    }
+
+    /// This process's procfs files and resource limit, and the real mount.
+    struct LiveKernel;
+
+    impl Kernel for LiveKernel {
+        type Proc = std::fs::File;
+
+        fn open_proc(&self, path: &Path) -> Result<std::fs::File, String> {
+            open_nofollow(path)
+        }
+
+        fn memlock_limit(&self) -> Result<u64, String> {
+            memlock_limit()
+        }
+
+        fn check_cgroup2(&self, mount: &Path) -> Result<(), String> {
+            let file =
+                std::fs::File::open(mount).map_err(|e| format!("cannot open cgroup mount: {e}"))?;
+            let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: a live descriptor and correctly-sized writable statfs output.
+            if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err("cannot identify cgroup filesystem".into());
+            }
+            // SAFETY: successful fstatfs initialized every field.
+            if unsafe { stat.assume_init() }.f_type != libc::CGROUP2_SUPER_MAGIC {
+                return Err("resolved mount is not a cgroup-v2 filesystem".into());
+            }
+            Ok(())
+        }
+    }
+
+    /// Read one of this process's procfs files through `kernel`.
+    fn read_proc(kernel: &impl Kernel, path: &str) -> Result<Vec<u8>, String> {
+        let path = Path::new(path);
+        read_bounded_from(kernel.open_proc(path)?, path, 1 << 20)
+    }
+
     pub(super) fn verify(budget: &MemoryBudgetSection) -> Result<MemoryBudgetPosture, String> {
-        let memlock = memlock_limit()?;
+        verify_with(budget, &LiveKernel)
+    }
+
+    pub(super) fn verify_with(
+        budget: &MemoryBudgetSection,
+        kernel: &impl Kernel,
+    ) -> Result<MemoryBudgetPosture, String> {
+        let memlock = kernel.memlock_limit()?;
         if memlock < budget.required_memlock_bytes.0 {
             return Err("RLIMIT_MEMLOCK is below required_memlock_bytes".into());
         }
-        let membership = read_bounded(Path::new("/proc/self/cgroup"), 1 << 20)?;
+        let membership = utf8(read_proc(kernel, PROC_CGROUP)?, Path::new(PROC_CGROUP))?;
         // Linux emits mount path bytes as is: the table is never decoded.
-        let (layout, mounts) = layout(&membership, open_mountinfo)?;
-        let file = std::fs::File::open(&layout.mount)
-            .map_err(|e| format!("cannot open cgroup mount: {e}"))?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: a live descriptor and correctly-sized writable statfs output.
-        if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err("cannot identify cgroup filesystem".into());
-        }
-        // SAFETY: successful fstatfs initialized every field.
-        if unsafe { stat.assume_init() }.f_type != libc::CGROUP2_SUPER_MAGIC {
-            return Err("resolved mount is not a cgroup-v2 filesystem".into());
-        }
+        let (layout, mounts) = layout(&membership, || open_mountinfo(kernel))?;
+        kernel.check_cgroup2(&layout.mount)?;
         let posture = assess(budget, &layout, memlock)?;
-        if read_bounded(Path::new("/proc/self/cgroup"), 1 << 20)? != membership
-            || scan_mountinfo(&mut open_mountinfo()?, None)?.digest != mounts
-            || memlock_limit()? != memlock
+        if utf8(read_proc(kernel, PROC_CGROUP)?, Path::new(PROC_CGROUP))? != membership
+            || scan_mountinfo(&mut open_mountinfo(kernel)?, None)?.digest != mounts
+            || kernel.memlock_limit()? != memlock
         {
             return Err("kernel memory policy changed during admission".into());
         }
@@ -1054,6 +1109,82 @@ mod tests {
         assert!(assess(&budget(), &f.layout, 2048).is_ok());
         f.write(0, "memory.current", "3073\n");
         assert!(assess(&budget(), &f.layout, 2048).is_err());
+    }
+
+    /// Kernel state that changes when admission checks the resolved mount's
+    /// filesystem: after the membership, mount table and resource limit
+    /// were first read, before the controller files and the recheck.
+    struct ChangingKernel {
+        membership: [String; 2],
+        mountinfo: [String; 2],
+        memlock: [u64; 2],
+        changed: std::cell::Cell<bool>,
+    }
+
+    impl ChangingKernel {
+        fn new(membership: &str, mountinfo: &str, memlock: u64) -> Self {
+            Self {
+                membership: [membership.into(), membership.into()],
+                mountinfo: [mountinfo.into(), mountinfo.into()],
+                memlock: [memlock, memlock],
+                changed: Default::default(),
+            }
+        }
+
+        fn now(&self) -> usize {
+            usize::from(self.changed.get())
+        }
+    }
+
+    impl Kernel for ChangingKernel {
+        type Proc = std::io::Cursor<Vec<u8>>;
+
+        fn open_proc(&self, path: &Path) -> Result<Self::Proc, String> {
+            let text = match path.to_str() {
+                Some("/proc/self/cgroup") => &self.membership[self.now()],
+                Some("/proc/self/mountinfo") => &self.mountinfo[self.now()],
+                _ => panic!("unexpected kernel file {}", path.display()),
+            };
+            Ok(std::io::Cursor::new(text.clone().into_bytes()))
+        }
+
+        fn memlock_limit(&self) -> Result<u64, String> {
+            Ok(self.memlock[self.now()])
+        }
+
+        fn check_cgroup2(&self, _mount: &Path) -> Result<(), String> {
+            self.changed.set(true);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recheck_refuses_membership_mount_table_and_memlock_changed_during_admission() {
+        let f = Fixture::new();
+        let membership = "0::/slice/service\n";
+        let table = mountinfo("/", f.layout.mount.to_str().unwrap());
+        let posture = verify_with(&budget(), &ChangingKernel::new(membership, &table, 2048))
+            .expect("unchanged kernel state is admitted");
+        assert_eq!(posture.cgroup, f.layout.leaf);
+        assert_eq!(posture.available_bytes, 3072);
+
+        let mut moved = ChangingKernel::new(membership, &table, 2048);
+        moved.membership[1] = "0::/slice/other\n".into();
+        let mut remounted = ChangingKernel::new(membership, &table, 2048);
+        remounted.mountinfo[1] = format!("{table}44 31 0:55 / /srv rw - tmpfs tmpfs rw\n");
+        let mut relimited = ChangingKernel::new(membership, &table, 2048);
+        relimited.memlock[1] = 4096;
+        for (what, kernel) in [
+            ("cgroup membership", moved),
+            ("mount table", remounted),
+            ("RLIMIT_MEMLOCK", relimited),
+        ] {
+            assert_eq!(
+                verify_with(&budget(), &kernel).expect_err(what),
+                "kernel memory policy changed during admission",
+                "{what}"
+            );
+        }
     }
 
     #[cfg(unix)]
