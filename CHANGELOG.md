@@ -25,9 +25,12 @@ documents.
   malformed `--volume` before it reads any file (it exited 1 for
   `recover-failed-start`, and for the other verbs with an unreadable
   `--config`), and off Linux `recover-failed-start` without `--plan` exits 3
-  like every other action, where it exited 0 or 1. The messages are
-  unchanged, and a command that fails still exits 1: a script that detects
-  misuse by status 1 must test for 2. `maki(8)` and `maki-attach(8)` have an
+  like every other action, where it exited 0 or 1. The messages are those
+  printed before, but `maki-attach` now follows a malformed `--volume` with
+  the usage for every verb, `recover-failed-start` included, and `maki`
+  reports a malformed approval before a missing or unreadable configuration.
+  A command that fails still exits 1: a script that detects misuse by
+  status 1 must test for 2. `maki(8)` and `maki-attach(8)` have an
   EXIT STATUS section.
 - **The three remote crypto transports trust one set of TLS roots: the
   host's trust store, the public roots compiled into the binary and
@@ -39,7 +42,9 @@ documents.
   public roots (webpki-roots) and no longer fails to build its provider on a
   host whose trust store is empty: a public endpoint is reachable from such
   an image, and a private endpoint that none of the roots vouches for is
-  refused at the TLS handshake instead of at attach. A gRPC deployment with
+  refused at the TLS handshake instead of when the provider is built (with
+  a single endpoint attach still fails, now at the self-test's handshake). A
+  gRPC deployment with
   `ca_file` on a host whose trust store is empty (a distroless image,
   `SSL_CERT_FILE` naming an empty bundle) trusted that CA alone; it now also
   accepts a server whose certificate chains to a public root and matches the
@@ -65,13 +70,16 @@ documents.
   first volume then refused it as a foreign backend
   ([privileged helper](docs/operations.md#privileged-helper)).
 - **Detach, cleanup, recovery and grow run LVM only on the recorded devices**
-  (AUD-135, [#368](https://github.com/seo-rii/maki/pull/368)). Their
-  deactivation runs `vgchange --devices <recorded PVs> --activate n --select
-  vg_uuid=<recorded> --config "devices { allow_changes_with_duplicate_pvs=0
-  }" <vg>` (the selection where the record names a VG UUID) and growth
-  `lvextend --devices <recorded PVs> --config "…" -L <n>b <vg>/<lv>`, instead
-  of `vgchange -an <vg>` and `lvextend -L <n>b <vg>/<lv>` resolved over
-  LVM's own device scan. A VG of the same name on another disk is never
+  (AUD-135, [#368](https://github.com/seo-rii/maki/pull/368)). The
+  deactivation of a record with a mapping proof, or of one from before
+  proofs and intents, runs `vgchange --devices <recorded PVs> --activate n
+  --select vg_uuid=<recorded> --config "devices {
+  allow_changes_with_duplicate_pvs=0 }" <vg>` (the selection where the
+  record names a VG UUID), and growth runs `lvextend --devices <recorded
+  PVs> --config "…" -L <n>b <vg>/<lv>`, instead of `vgchange -an <vg>` and
+  `lvextend -L <n>b <vg>/<lv>` resolved over LVM's own device scan. The
+  deactivation of an activation intent, like activation and its rollback,
+  was already scoped. A VG of the same name on another disk is never
   extended or deactivated: grow used to report success after extending the
   other disk's LV when the volume's PV was outside LVM's scan, and cleanup
   after a daemon death deactivated the other VG instead of reaching its
@@ -556,11 +564,13 @@ documents.
   again; an empty `remote.state` is still refused, now with its causes and
   the way out. A local-witness `maki volume create` completes a backing and
   witness directory that hold only what an interrupted creation leaves (the
-  marker, the arena, manifest slots that are unwritten or hold the initial
-  manifest, `anchor.next`), where it refused every pair that was not empty,
-  for example after the arena reservation ran out of space. It still never
-  creates over committed data or an existing `anchor`, and a creation that
-  stopped after publishing the anchor is still refused. The local witness
+  marker, the arena, a first manifest slot that holds only zeros or the
+  initial empty manifest and a second that holds only zeros, `anchor.next`),
+  where it refused every pair that was not empty, for example after the arena
+  reservation ran out of space. It still never creates over an existing
+  `anchor` or over a backing that committed data, short of both manifest
+  slots lost or zeroed entirely, and a creation that stopped after
+  publishing the anchor is still refused. The local witness
   no longer installs an empty anchor first; an empty `anchor` that an
   earlier release left is refused with an explanation
   ([local creation](docs/rollback-protection.md#local-configuration-and-creation),
