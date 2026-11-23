@@ -816,6 +816,48 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
     }
 }
 
+/// A `volume create` that fails while it writes the format marker (a full
+/// disk; here a zero file-size limit refuses the write) has claimed nothing
+/// from the authority, and running the same command again completes it.
+#[test]
+fn volume_create_whose_marker_write_failed_can_be_run_again() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new();
+    let mut create = Command::new(env!("CARGO_BIN_EXE_maki"));
+    create.args(["volume", "create", f.path(false)]);
+    // SAFETY: the closure makes two async-signal-safe calls between fork
+    // and exec. An ignored SIGXFSZ and the limit are kept across exec.
+    unsafe {
+        create.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR
+                || libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let failed = create.output().unwrap();
+    assert!(!failed.status.success());
+    let error = String::from_utf8_lossy(&failed.stderr);
+    assert!(error.contains("File too large"), "{error}");
+    let untouched = inspect(f.writer.as_ref());
+    assert_eq!((untouched.fence, untouched.phase), (0, Phase::Released));
+
+    let output = success(&["volume", "create", f.path(false)]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("created volume admin-test"),
+        "{output:?}"
+    );
+    let created = inspect(f.writer.as_ref());
+    assert_eq!((created.fence, created.phase), (1, Phase::Released));
+    assert!(created.current.is_some());
+}
+
 /// Whether this `maki` binary has the test-only `fake` provider compiled in.
 /// `cargo test --workspace` unifies the nbdkit crate's own dev-dependency
 /// features into every binary; `cargo test -p maki` builds the feature set a

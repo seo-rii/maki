@@ -25,6 +25,15 @@ const STATE_DOMAIN: &[u8] = b"maki-remote-witness-state-v2\0";
 const REQUEST_DOMAIN: &[u8] = b"maki-remote-witness-request-v2\0";
 const AUTHORIZATION_DOMAIN: &[u8] = b"maki-remote-witness-session-authorization-v2\0";
 
+/// An empty `remote.state` has two possible causes that cannot be told
+/// apart, and only the operator knows which holds. Neither `init` nor
+/// `serve` replaces the file.
+const EMPTY_STATE: &str = "remote witness state file remote.state is empty: an earlier \
+    initialization did not complete, or this authority lost its state. It is never replaced \
+    automatically. If this authority has never been served and no volume was enrolled with it, \
+    remove remote.state and remote.next from the state directory and initialize it again; an \
+    authority that a volume was enrolled with must not be initialized again";
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -487,7 +496,9 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    /// Explicitly enroll an authority; existing state, even corrupt, refuses.
+    /// Explicitly enroll an authority; existing state, even corrupt or
+    /// empty, refuses. An enrollment that failed or was cut before its
+    /// first record was published left no state and can be run again.
     /// The directory must be private to this process's user (see `open`).
     pub fn create(path: &Path, identity: [u8; 16]) -> io::Result<Self> {
         if identity == [0; 16] {
@@ -515,18 +526,31 @@ impl StateStore {
         }
         let lock = backing.try_lock(LOCK_FILE)?;
         if backing.exists(STATE_FILE)? {
+            // Whatever it holds, it is never replaced: an empty file may be
+            // all that is left of an enrolled authority's state.
+            let empty = backing
+                .open(STATE_FILE, false)
+                .and_then(|state| state.len())
+                .is_ok_and(|len| len == 0);
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "remote witness already enrolled",
+                if empty {
+                    EMPTY_STATE
+                } else {
+                    "remote witness already enrolled"
+                },
             ));
         }
         let stored = CanonicalState::initial(identity)?.stored;
-        // Confined rename requires an existing destination. The synced empty
-        // sentinel makes interrupted enrollment invalid, never silently usable.
-        let placeholder = backing.open(STATE_FILE, true)?;
-        placeholder.set_len(0)?;
-        placeholder.sync_data()?;
-        backing.sync_dir("")?;
+        // The first record is published like every later one: staged as
+        // `remote.next`, synced, renamed to `remote.state`, and the
+        // directory synced. `remote.state` therefore exists only once it
+        // holds a complete record, and an enrollment that fails or is cut
+        // before the rename leaves the directory as one this function
+        // accepts again. Nothing reads `remote.next` as state. No
+        // placeholder is created under the state's name first: an empty
+        // `remote.state` could not be told from an enrolled authority's
+        // truncated state, so nothing could ever complete it.
         publish(backing.as_ref(), &stored)?;
         Ok(Self {
             backing,
@@ -539,7 +563,17 @@ impl StateStore {
     /// Re-publish selected page-cache bytes before acknowledging any request.
     pub fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
         let lock = backing.try_lock(LOCK_FILE)?;
-        let stored = read(backing.as_ref())?;
+        let stored = read(backing.as_ref()).map_err(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return error;
+            }
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "remote witness is not initialized: its state directory holds no remote.state \
+                 (it was never initialized, or an initialization did not complete); initialize \
+                 it first",
+            )
+        })?;
         publish(backing.as_ref(), &stored)?;
         Ok(Self {
             backing,
@@ -833,6 +867,9 @@ fn trusted_state(what: &str, metadata: &std::fs::Metadata) -> io::Result<()> {
 fn read(backing: &dyn Backing) -> io::Result<Stored> {
     let file = backing.open(STATE_FILE, false)?;
     let len = file.len()?;
+    if len == 0 {
+        return Err(invalid(EMPTY_STATE));
+    }
     if !(44..=MAX_BYTES as u64).contains(&len) {
         return Err(invalid("invalid remote witness length"));
     }
@@ -867,6 +904,10 @@ fn commit(backing: &dyn Backing) -> io::Result<()> {
     backing.rename(TEMP_FILE, STATE_FILE)?;
     backing.sync_dir("")
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "remote_witness_init_tests.rs"]
+mod init_tests;
 
 #[cfg(test)]
 mod tests {
