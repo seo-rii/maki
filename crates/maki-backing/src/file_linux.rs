@@ -817,7 +817,8 @@ impl Directory {
             }
             if entry == "rollback.lock" {
                 match file.try_lock() {
-                    Ok(()) => lock = Some(file),
+                    // `FileLock` unlocks on every return below.
+                    Ok(()) => lock = Some(FileLock { file }),
                     Err(std::fs::TryLockError::WouldBlock) => return Ok(GcRemoval::Live),
                     Err(std::fs::TryLockError::Error(error)) => return Err(error),
                 }
@@ -876,7 +877,7 @@ impl Directory {
             }
         }
         directory.sync_all()?;
-        if let Some(file) = &lock {
+        if let Some(FileLock { file }) = &lock {
             if file.metadata()?.nlink() != 1 || !same_entry(&directory, c"rollback.lock", file)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -985,7 +986,7 @@ impl Backing for FileBacking {
         self.writable()?;
         let file = self.directory.open_file(path, true, false)?;
         match file.try_lock() {
-            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Ok(()) => Ok(Box::new(FileLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",

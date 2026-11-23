@@ -60,19 +60,33 @@ impl Drop for ControlListener {
     }
 }
 
+/// A held socket directory lock. A `flock` lock belongs to the open file
+/// description, which a child forked by any thread shares until its `exec`
+/// closes its copy, so closing the descriptor alone would leave the directory
+/// locked for that child. Dropping unlocks first.
+struct DirectoryLock(std::fs::File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // Releasing a held lock does not fail on a valid descriptor; the
+        // close that follows still releases it where no child shares it.
+        let _ = self.0.unlock();
+    }
+}
+
 /// A directory lock serializes socket publication and ownership checks
 /// across processes without leaving another persistent filesystem entry.
-fn lock_socket_directory(path: &Path) -> io::Result<std::fs::File> {
+fn lock_socket_directory(path: &Path) -> io::Result<DirectoryLock> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let directory = std::fs::File::open(parent)?;
     loop {
-        // SAFETY: the descriptor stays open in the returned File. Closing
-        // it releases this advisory lock after the synchronous operation.
+        // SAFETY: the descriptor stays open in the returned guard, which
+        // unlocks it after the synchronous operation.
         if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(directory);
+            return Ok(DirectoryLock(directory));
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -350,3 +364,7 @@ pub async fn serve_uds(
     let listener = bind_control_socket(path, group)?;
     serve(listener, backend).await
 }
+
+#[cfg(test)]
+#[path = "uds_lock_tests.rs"]
+mod uds_lock_tests;

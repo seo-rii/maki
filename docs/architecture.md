@@ -87,6 +87,13 @@ user may hold open: a leftover `anchor.next` is removed first, and a file
 that a user other than root or the record's owner puts back under that name
 meanwhile is refused.
 
+Volume, rollback, witness, attach and control-socket directory locks are
+`flock` locks on descriptors opened close-on-exec. Such a lock belongs to the
+open file description, which every child process forked by any thread shares
+until its `exec` closes its copy. Each lock guard therefore unlocks before
+closing its descriptor: a close alone would keep a released lock held for such
+a child, and a reattach in that window would fail as `VOLUME_ALREADY_ATTACHED`.
+
 ## Read and write semantics
 
 The engine divides the device into fixed crypto units. Reads take a consistent

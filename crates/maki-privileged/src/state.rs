@@ -142,6 +142,20 @@ fn openat(directory: &File, name: &CString, flags: i32, mode: u32) -> io::Result
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// The held exclusive `attach.lock`. A `flock` lock belongs to the open file
+/// description, which every command the helper forks shares until its `exec`
+/// closes its copy, so closing the descriptor alone would leave the lock held
+/// for such a child. Dropping unlocks first.
+pub struct StateLock(File);
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // Releasing a held lock does not fail on a valid descriptor; the
+        // close that follows still releases it where no child shares it.
+        let _ = self.0.unlock();
+    }
+}
+
 impl TrustedState {
     pub fn open() -> io::Result<Self> {
         Self::open_beneath(
@@ -215,21 +229,21 @@ impl TrustedState {
         Ok(Self { directory, owner })
     }
 
-    pub fn lock(&self) -> io::Result<File> {
+    pub fn lock(&self) -> io::Result<StateLock> {
         let name = CString::new("attach.lock").unwrap();
         let file = openat(&self.directory, &name, libc::O_RDWR | libc::O_CREAT, 0o600)?;
         private_regular_file(&file, self.owner)?;
         file.lock()?;
-        Ok(file)
+        Ok(StateLock(file))
     }
 
     /// Verification joins the same exclusive lock without creating a file.
-    pub fn lock_existing(&self) -> io::Result<File> {
+    pub fn lock_existing(&self) -> io::Result<StateLock> {
         let name = CString::new("attach.lock").unwrap();
         let file = openat(&self.directory, &name, libc::O_RDONLY | libc::O_NOATIME, 0)?;
         private_regular_file(&file, self.owner)?;
         file.lock()?;
-        Ok(file)
+        Ok(StateLock(file))
     }
 
     fn record_name(volume: &str) -> io::Result<CString> {

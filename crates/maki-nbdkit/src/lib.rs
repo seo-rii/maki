@@ -14,6 +14,8 @@ pub mod config_file;
 pub mod control;
 pub mod daemon;
 mod drain;
+// Refuses to compile unless panics unwind; the panic boundaries rely on it.
+mod panic_strategy;
 pub mod security;
 
 #[cfg(target_os = "linux")]
