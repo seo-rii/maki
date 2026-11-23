@@ -454,13 +454,15 @@ one MUST be kept, and every verb of its volume MUST refuse without a command,
 unless observation under the attach lock proves that nothing of the recorded
 attachment remains: the record names its VG UUID (mapping proof, activation
 intent or administrator pins); no device-mapper device on the host belongs to
-that VG; every holder of the device and of its partitions is a device-mapper
-device of another VG; nothing is mounted at the recorded mountpoint and no
-mount is of a mapping of that VG; no other volume's record names the device
-with the same VG UUID or with none; and the device's backend stays the same
-across the observation. Every such observation MUST be readable. Attach,
-cleanup, recover and detach MAY then retire the record without any command
-and without touching the device or its connection; grow MUST refuse.
+that VG; every holder of the device and of its partitions is an LVM mapping
+of another VG (a device-mapper uuid of `LVM-` and another VG UUID), not any
+other device-mapper or block device; nothing is mounted at the recorded
+mountpoint and no mount is of a mapping of that VG; no other volume's record
+names the device with the same VG UUID or with none; and the device's backend
+stays the same across the observation. Every such observation MUST be
+readable. Attach, cleanup, recover and detach MAY then retire the record
+without any command and without touching the device or its connection; grow
+MUST refuse.
 
 A detach retry MAY skip a step whose completion is verified from current mount
 and block-device observations. Destructive steps still require matching live
