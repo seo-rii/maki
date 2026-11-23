@@ -190,6 +190,9 @@ fn real_nbdkit_negotiates_configured_block_sizes() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        // The child reports a missing tool on its standard error; without
+        // it this test would show a bare `ok` for a run that checked nothing.
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
     }
 
