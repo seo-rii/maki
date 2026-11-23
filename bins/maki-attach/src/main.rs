@@ -8,6 +8,7 @@
 //! reverse rollback on failure.
 
 use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -33,6 +34,26 @@ Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
 requires the volume UUID (config or --uuid); --plan prints the plan without it."
     );
     ExitCode::from(2)
+}
+
+/// Write `text` to stdout and flush it.
+///
+/// `print!` panics when the write fails, and the panic replaces the
+/// helper's exit status with 101. A reader that has gone (`| head -3`) has
+/// what it wanted, so a closed pipe is not an error; any other failure is
+/// returned for the caller to report.
+fn print_stdout(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Print a `--plan` preview, which is all that such a run produces: a plan
+/// that could not be written is its failure.
+fn print_plan(text: &str) -> Result<(), String> {
+    print_stdout(text).map_err(|error| format!("writing the plan failed: {error}"))
 }
 
 fn flag_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a OsStr> {
@@ -151,17 +172,34 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         if plan_only {
-            println!("# verify volume {volume}: PLAN ONLY; no live evidence has been checked");
-            println!("Require trusted config {} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.", config_path.display());
-            println!("Check the connected backend identifier, complete persisted mapping proof and complete read/write XFS mount in this namespace.");
-            println!("Read the pinned XFS UUID and volume sentinel; recheck kernel identity around reads. No write probe or repair.");
-            return ExitCode::SUCCESS;
+            let preview = format!(
+                "# verify volume {volume}: PLAN ONLY; no live evidence has been checked\n\
+                 Require trusted config {} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.\n\
+                 Check the connected backend identifier, complete persisted mapping proof and complete read/write XFS mount in this namespace.\n\
+                 Read the pinned XFS UUID and volume sentinel; recheck kernel identity around reads. No write probe or repair.\n",
+                config_path.display()
+            );
+            return match print_plan(&preview) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            };
         }
         #[cfg(target_os = "linux")]
         {
             return match maki_privileged::exec::verify(&volume, &config_path) {
                 Ok(()) => {
-                    println!("verified current storage attachment for volume {volume}");
+                    // The gate's answer is the exit status: a confirmation
+                    // that cannot be written does not withdraw it.
+                    if let Err(error) = print_stdout(&format!(
+                        "verified current storage attachment for volume {volume}\n"
+                    )) {
+                        eprintln!(
+                            "warning: volume {volume} was verified, but writing the confirmation failed: {error}"
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
@@ -266,28 +304,41 @@ fn main() -> ExitCode {
         _ => return usage(),
     };
 
+    let mut printed = String::new();
     if verb == "recover" {
-        println!("# recover disconnected volume {}; require an absent backend and unchanged persisted kernel identities before each conditional cleanup step", request.volume);
+        printed += &format!("# recover disconnected volume {}; require an absent backend and unchanged persisted kernel identities before each conditional cleanup step\n", request.volume);
         // Recovery consumes the detach identity but never disconnects NBD.
         // Print only the conditional upper-layer cleanup it can execute.
         for (index, step) in plan.steps.iter().take(2).enumerate() {
-            println!("{}. {step} (only if still present)", index + 1);
+            printed += &format!("{}. {step} (only if still present)\n", index + 1);
         }
     } else if verb == "cleanup" {
-        println!("# cleanup volume {}; no trusted record is success; owned connected backend follows detach; known absent backend follows recovery; foreign or unreadable backend is preserved", request.volume);
+        printed += &format!("# cleanup volume {}; no trusted record is success; owned connected backend follows detach; known absent backend follows recovery; foreign or unreadable backend is preserved\n", request.volume);
         for (index, step) in plan.steps.iter().enumerate() {
             let condition = if index < 2 {
                 "only if still present in the selected detach or recovery path"
             } else {
                 "only for the owned connected backend detach path"
             };
-            println!("{}. {step} ({condition})", index + 1);
+            printed += &format!("{}. {step} ({condition})\n", index + 1);
         }
     } else {
-        print!("{plan}");
+        printed = plan.to_string();
     }
     if plan_only {
-        return ExitCode::SUCCESS;
+        return match print_plan(&printed) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // Before execution the plan is an audit copy of what follows. Whether it
+    // could be written must not decide whether storage is attached, detached
+    // or cleaned up: the exit status is the execution's.
+    if let Err(error) = print_stdout(&printed) {
+        eprintln!("warning: writing the plan failed: {error}; continuing with {verb}");
     }
 
     #[cfg(target_os = "linux")]

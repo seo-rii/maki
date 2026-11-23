@@ -92,6 +92,21 @@ fn inspect_request() -> Request {
     }
 }
 
+/// Print what a command reports. A reader that has gone (`| head -1`) has
+/// what it wanted, so a closed pipe is not an error; `println!` would panic
+/// on it and replace the exit status with 101. Any other failure to write
+/// is the command's failure.
+fn print_result(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(io::Error::new(
+            error.kind(),
+            format!("writing the output failed: {error}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn report_initialization(record: &Record) -> io::Result<()> {
     let json = serde_json::to_string(record)?;
     let mut stdout = io::stdout().lock();
@@ -108,7 +123,7 @@ fn report_initialization(record: &Record) -> io::Result<()> {
 
 fn run(args: &[String]) -> io::Result<()> {
     match args {
-        [help] if help == "--help" || help == "-h" => print!("{HELP}"),
+        [help] if help == "--help" || help == "-h" => print_result(HELP)?,
         [command, directory, identity] if command == "init" => {
             let identity = Uuid::parse_str(identity).map_err(|_| {
                 io::Error::new(
@@ -144,8 +159,11 @@ fn run(args: &[String]) -> io::Result<()> {
                 )?)
             };
             let listener = TcpListener::bind(config.listen)?;
-            println!("maki-witness listening {}", listener.local_addr()?);
-            io::stdout().flush()?;
+            // Nobody reading the address is no reason not to serve.
+            print_result(&format!(
+                "maki-witness listening {}\n",
+                listener.local_addr()?
+            ))?;
             server.serve(listener, handler)?;
         }
         [command, path, identity] if command == "init-etcd" => {
@@ -165,11 +183,13 @@ fn run(args: &[String]) -> io::Result<()> {
         [command, path] if command == "inspect" => {
             let client = Client::new(read_config::<ClientOptions>(Path::new(path))?)?;
             let record = Rpc::call(&client, &inspect_request())?;
-            serde_json::to_writer(io::stdout().lock(), &record)?;
-            println!();
+            print_result(&format!("{}\n", serde_json::to_string(&record)?))?;
         }
         [command, path] if command == "fingerprint" => {
-            println!("{}", certificate_file_fingerprint(Path::new(path))?);
+            print_result(&format!(
+                "{}\n",
+                certificate_file_fingerprint(Path::new(path))?
+            ))?;
         }
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP)),
     }

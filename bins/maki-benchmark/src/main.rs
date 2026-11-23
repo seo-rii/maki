@@ -210,8 +210,22 @@ fn main() -> ExitCode {
             Some("--help" | "-h")
         )
     {
-        println!("{USAGE}\nOverwrites a disposable volume; reports verified I/O and latency.");
-        return ExitCode::SUCCESS;
+        // `println!` panics when the write fails. As for the report below,
+        // a reader that has gone is not a failure; help that could not be
+        // written is.
+        let mut out = io::stdout().lock();
+        let written = writeln!(
+            out,
+            "{USAGE}\nOverwrites a disposable volume; reports verified I/O and latency."
+        )
+        .and_then(|()| out.flush());
+        return match written {
+            Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+                eprintln!("error: writing the output failed: {error}");
+                ExitCode::FAILURE
+            }
+            _ => ExitCode::SUCCESS,
+        };
     }
     let options = match parse_args() {
         Ok(options) => options,

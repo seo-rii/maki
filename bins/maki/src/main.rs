@@ -37,6 +37,35 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Write `text` to stdout and flush it.
+///
+/// `println!` panics when the write fails, and the panic replaces the
+/// command's exit status with 101. A reader that has gone (`| head -1`,
+/// `| grep -q`) has what it wanted, so a closed pipe is not an error and the
+/// command keeps its own verdict; any other failure is returned for the
+/// caller to report.
+fn print_stdout(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Print the result of a command that produces nothing else: output that
+/// could not be written is its failure.
+fn print_result(text: &str) -> Result<(), String> {
+    print_stdout(text).map_err(|error| format!("writing the output failed: {error}"))
+}
+
+/// The exit status of a command that completes or reports one error.
+fn finish(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(error),
+    }
+}
+
 /// Read a volume configuration through the checked reader: the file decides
 /// where plaintext and credentials go, so one another user could write or
 /// substitute is refused before it is parsed (SPEC §8).
@@ -222,14 +251,11 @@ fn main() -> ExitCode {
     }
     match argv.as_slice() {
         // BUG-112: asking for help is not misuse.
-        ["--help" | "-h" | "help"] => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
-        }
-        ["--version" | "-V"] => {
-            println!("maki {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
+        ["--help" | "-h" | "help"] => finish(print_result(&format!("{USAGE}\n"))),
+        ["--version" | "-V"] => finish(print_result(&format!(
+            "maki {}\n",
+            env!("CARGO_PKG_VERSION")
+        ))),
         ["volume", "create", config] | ["volume", "create", config, "--discard"] => {
             let raw = match read_config_text(std::path::Path::new(config)) {
                 Ok(raw) => raw,
@@ -290,8 +316,22 @@ fn main() -> ExitCode {
                 },
                 _ => return usage(),
             };
+            let inspects = matches!(command, RemoteVolume::Witness);
             match remote_volume(config, command) {
-                Ok(()) => ExitCode::SUCCESS,
+                // `witness` only reports.
+                Ok(record) if inspects => finish(print_result(&record)),
+                // The others have changed the authority or the backing by
+                // now, and most refuse a retry with the same approval. Like
+                // `volume create`, they report an output error and succeed.
+                Ok(record) => {
+                    if let Err(error) = print_stdout(&record) {
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "warning: volume {verb} completed, but writing its result failed: {error}"
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
                 Err(error) => fail(error),
             }
         }
@@ -675,7 +715,9 @@ enum RemoteVolume<'a> {
     },
 }
 
-fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> {
+/// Run a remote-volume command and return the line it reports: the
+/// authority's record, the snapshot descriptor or the collection report.
+fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<String, String> {
     use maki_backing::remote_witness::Phase;
     use maki_backing::{Backing, FileBacking, RollbackBacking};
     use std::path::Path;
@@ -691,28 +733,23 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> 
         .and_then(|rollback| rollback.remote.as_ref())
         .ok_or("command requires remote rollback protection")?;
     let rpc = maki_nbdkit::daemon::remote_witness_client(remote).map_err(|e| e.to_string())?;
-    match command {
+    let mut line = match command {
         RemoteVolume::Witness => {
-            println!(
-                "{}",
-                serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
-            );
+            serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
         }
         RemoteVolume::Gc => {
             let report =
                 RollbackBacking::collect_remote(Path::new(&cfg.backing.root), rpc.as_ref())
                     .map_err(|e| e.to_string())?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "removed": report.removed,
-                    "skipped_live": report.skipped_live,
-                    "skipped_unrecognized": report.skipped_unrecognized,
-                    "retained": report.retained,
-                    "counts": report.counts,
-                    "details_truncated": report.details_truncated,
-                })
-            );
+            serde_json::json!({
+                "removed": report.removed,
+                "skipped_live": report.skipped_live,
+                "skipped_unrecognized": report.skipped_unrecognized,
+                "retained": report.retained,
+                "counts": report.counts,
+                "details_truncated": report.details_truncated,
+            })
+            .to_string()
         }
         RemoteVolume::ResumeEnrollment {
             fence,
@@ -750,10 +787,7 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> 
             {
                 return Err("enrollment initialized but writer release could not be confirmed; inspect authority before proceeding".into());
             }
-            println!(
-                "{}",
-                serde_json::to_string(&after).map_err(|e| e.to_string())?
-            );
+            serde_json::to_string(&after).map_err(|e| e.to_string())?
         }
         RemoteVolume::Snapshot { directory } => {
             let target = Path::new(directory);
@@ -783,10 +817,7 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> 
             if released.phase != Phase::Released || released.current.as_ref() != Some(&descriptor) {
                 return Err("snapshot was copied but writer release could not be confirmed".into());
             }
-            println!(
-                "{}",
-                serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
-            );
+            serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
         }
         RemoteVolume::Takeover { fence, root } => {
             let before = approved_record(rpc.as_ref(), fence, root)?;
@@ -798,10 +829,7 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> 
             .map_err(|e| e.to_string())?;
             drop(backing);
             let record = confirm_released(rpc.as_ref(), &before, false)?;
-            println!(
-                "{}",
-                serde_json::to_string(&record).map_err(|e| e.to_string())?
-            );
+            serde_json::to_string(&record).map_err(|e| e.to_string())?
         }
         RemoteVolume::Restore {
             directory,
@@ -825,13 +853,11 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> 
             .map_err(|e| e.to_string())?;
             drop(backing);
             let record = confirm_released(rpc.as_ref(), &before, true)?;
-            println!(
-                "{}",
-                serde_json::to_string(&record).map_err(|e| e.to_string())?
-            );
+            serde_json::to_string(&record).map_err(|e| e.to_string())?
         }
-    }
-    Ok(())
+    };
+    line.push('\n');
+    Ok(line)
 }
 
 fn existing_backing(
@@ -863,30 +889,53 @@ fn inspect(config: &std::path::Path) -> Result<(), String> {
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
         .map_err(|e| e.to_string())?;
     let sb = envelope.superblock;
-    println!("volume:        {}", cfg.volume.name);
-    println!("uuid:          {}", sb.volume_uuid);
-    println!("provider:      {}", sb.provider_type);
-    println!("compatibility: {}", sb.crypto_compatibility_id);
-    println!("virtual size:  {}", sb.geometry.max_virtual_size);
-    println!("unit size:     {}", sb.geometry.crypto_unit_size);
-    println!("slot size:     {}", sb.geometry.slot_size);
-    println!("generation:    {}", sb.generation);
-    println!("metadata envelope: {}", envelope.metadata_version);
-    let plan = sb.geometry.capacity_plan().map_err(|e| e.to_string())?;
-    println!("maximum units:             {}", plan.num_units);
-    println!("maximum shards:            {}", plan.num_shards);
-    println!("full slot span bytes:      {}", plan.full_slot_span_bytes);
-    println!("allocation map A/B bytes: {}", plan.allocation_map_ab_bytes);
-    println!(
-        "discard map A/B bytes:    {}",
+    let mut text = format!(
+        "volume:        {}\n\
+         uuid:          {}\n\
+         provider:      {}\n\
+         compatibility: {}\n\
+         virtual size:  {}\n\
+         unit size:     {}\n\
+         slot size:     {}\n\
+         generation:    {}\n\
+         metadata envelope: {}\n",
+        cfg.volume.name,
+        sb.volume_uuid,
+        sb.provider_type,
+        sb.crypto_compatibility_id,
+        sb.geometry.max_virtual_size,
+        sb.geometry.crypto_unit_size,
+        sb.geometry.slot_size,
+        sb.generation,
+        envelope.metadata_version,
+    );
+    let plan = match sb.geometry.capacity_plan() {
+        Ok(plan) => plan,
+        Err(error) => {
+            // What the superblock says is still shown before the error.
+            print_result(&text)?;
+            return Err(error.to_string());
+        }
+    };
+    text += &format!(
+        "maximum units:             {}\n\
+         maximum shards:            {}\n\
+         full slot span bytes:      {}\n\
+         allocation map A/B bytes: {}\n\
+         discard map A/B bytes:    {}\n\
+         catalog A/B bytes:        {}\n",
+        plan.num_units,
+        plan.num_shards,
+        plan.full_slot_span_bytes,
+        plan.allocation_map_ab_bytes,
         if envelope.metadata_version == maki_format::superblock::SUPERBLOCK_VERSION_V3 {
             plan.allocation_map_ab_bytes
         } else {
             0
-        }
+        },
+        plan.catalog_ab_bytes,
     );
-    println!("catalog A/B bytes:        {}", plan.catalog_ab_bytes);
-    Ok(())
+    print_result(&text)
 }
 
 fn check(config: &str, deep: bool) -> Result<bool, String> {
@@ -898,16 +947,22 @@ fn check(config: &str, deep: bool) -> Result<bool, String> {
     } else {
         maki_format::checker::check_volume(backing.as_ref()).map_err(|e| e.to_string())?
     };
+    let mut text = String::new();
     for info in &report.info {
-        println!("info: {info}");
+        text += &format!("info: {info}\n");
     }
     for warning in &report.warnings {
-        println!("warning: {warning}");
+        text += &format!("warning: {warning}\n");
     }
     for error in &report.errors {
-        println!("ERROR: {error}");
+        text += &format!("ERROR: {error}\n");
     }
-    println!("check {}", if report.ok() { "passed" } else { "FAILED" });
+    let verdict = if report.ok() { "passed" } else { "FAILED" };
+    text += &format!("check {verdict}\n");
+    // A reader that has gone leaves the verdict to the exit status. A report
+    // that could not be written is an error, which still names the verdict.
+    print_stdout(&text)
+        .map_err(|error| format!("check {verdict}, but writing the report failed: {error}"))?;
     Ok(report.ok())
 }
 

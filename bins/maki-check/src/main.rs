@@ -5,6 +5,7 @@
 //! journal (with the recovery scanner) and every allocated slot (review
 //! M-018). The deep check takes the volume lock: run it after detach.
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -16,6 +17,32 @@ const USAGE: &str =
 fn usage() -> ExitCode {
     eprintln!("{USAGE}");
     ExitCode::from(2)
+}
+
+/// Write `text` to stdout and flush it.
+///
+/// `println!` panics when the write fails, and the panic replaces the
+/// command's exit status with 101. A reader that has gone (`| head -1`,
+/// `| grep -q`) has what it wanted, so a closed pipe is not an error and the
+/// command keeps its own verdict; any other failure is returned for the
+/// caller to report.
+fn print_stdout(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Print help or the version, which is all such a command produces.
+fn print_result(text: &str) -> ExitCode {
+    match print_stdout(text) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: writing the output failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -33,13 +60,9 @@ fn main() -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
-            Some("--help" | "-h") => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
+            Some("--help" | "-h") => return print_result(&format!("{USAGE}\n")),
             Some("--version" | "-V") => {
-                println!("maki-check {}", env!("CARGO_PKG_VERSION"));
-                return ExitCode::SUCCESS;
+                return print_result(&format!("maki-check {}\n", env!("CARGO_PKG_VERSION")));
             }
             Some("--deep") => deep = true,
             Some("--journal-segment-size") => {
@@ -97,20 +120,28 @@ fn main() -> ExitCode {
     };
     match report {
         Ok(report) => {
+            let mut text = String::new();
             for info in &report.info {
-                println!("info: {info}");
+                text += &format!("info: {info}\n");
             }
             for warning in &report.warnings {
-                println!("warning: {warning}");
+                text += &format!("warning: {warning}\n");
             }
             for error in &report.errors {
-                println!("ERROR: {error}");
+                text += &format!("ERROR: {error}\n");
+            }
+            let verdict = if report.ok() { "passed" } else { "FAILED" };
+            text += &format!("check {verdict}\n");
+            // A reader that has gone leaves the verdict to the exit status.
+            // A report that could not be written is an error, which still
+            // names the verdict.
+            if let Err(error) = print_stdout(&text) {
+                eprintln!("error: check {verdict}, but writing the report failed: {error}");
+                return ExitCode::FAILURE;
             }
             if report.ok() {
-                println!("check passed");
                 ExitCode::SUCCESS
             } else {
-                println!("check FAILED");
                 ExitCode::FAILURE
             }
         }
