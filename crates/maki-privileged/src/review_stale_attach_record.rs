@@ -420,6 +420,18 @@ impl System for Host {
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         crate::detach::observe(record, &self.mounts(), &self.sysfs)
     }
+    fn displaced_remains(
+        &self,
+        record: &BoundDeviceRecord,
+        vg_uuid: &str,
+    ) -> io::Result<Option<String>> {
+        displaced::remains(
+            record,
+            vg_uuid,
+            &std::fs::read(&self.mountinfo)?,
+            &self.sysfs,
+        )
+    }
 }
 
 fn killed(run: impl FnOnce()) -> bool {
@@ -718,9 +730,11 @@ fn a_plan_that_does_not_connect_cannot_allocate_a_device() {
 
 /// A recorded device that carries a connection under another identity: a
 /// second volume attached on it by a helper that did not read the records,
-/// or an NBD client outside the helper. Nothing observable shows whose the
-/// device's present users are, so every verb of the recorded volume keeps
-/// refusing and keeps the record; the refusal says how to resolve it.
+/// or an NBD client outside the helper. This record names no VG UUID, so no
+/// mapping on the host can be shown not to be its volume group's: every verb
+/// of the recorded volume keeps refusing and keeps the record, and the
+/// refusal says how to resolve it. Records that name their VG UUID are
+/// retired once nothing of them remains (`displaced_record`).
 #[test]
 fn a_recorded_device_under_another_identity_is_refused_with_the_way_out() {
     let mut host = Host::new();

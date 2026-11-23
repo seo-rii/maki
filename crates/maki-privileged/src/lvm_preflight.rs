@@ -58,6 +58,13 @@ pub(super) struct VerifiedLvm {
     layouts: BTreeMap<String, BTreeSet<String>>,
 }
 
+impl VerifiedLvm {
+    /// The verified VG UUID, as LVM reports it.
+    pub(super) fn vg_uuid(&self) -> &str {
+        &self.vg_uuid
+    }
+}
+
 pub(super) fn validate_recovery_identity(
     record: &BoundDeviceRecord,
     verified: &VerifiedLvm,
