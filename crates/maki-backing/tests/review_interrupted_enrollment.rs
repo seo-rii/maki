@@ -21,6 +21,8 @@
 
 #[path = "support/private_dir.rs"]
 mod private_dir;
+#[path = "support/seccomp.rs"]
+mod seccomp;
 
 use std::io;
 use std::path::Path;
@@ -184,6 +186,14 @@ fn step(step: &str, path: &Path) -> ! {
     let arranged = match interruption {
         "killed" => die_at_the_first_file_write(),
         "refused" => refuse_file_writes(),
+        // The binding is the first 64-byte write of a creation (the marker
+        // is 27 bytes).
+        "killed-at-the-binding" => seccomp::on(libc::SYS_pwrite64, Some(64), seccomp::KILLS),
+        "refused-at-the-binding" => seccomp::on(
+            libc::SYS_pwrite64,
+            Some(64),
+            seccomp::fails_with(libc::ENOSPC),
+        ),
         other => panic!("unknown interruption {other}"),
     };
     if !arranged {
@@ -284,6 +294,73 @@ fn create_whose_marker_write_failed_can_be_retried() {
         "after one failed marker write the root is stranded with {left:?}: {refusals:?}"
     );
     assert_eq!(std::fs::read(root.join("rollback.format")).unwrap(), MARKER);
+}
+
+/// After the marker the creation writes the binding, and only once that is
+/// durable does it claim the authority. Cut while it writes the binding,
+/// the creation has published the marker and claimed nothing: enrollment
+/// recovery, which the administrator approves, must continue it without
+/// anything to remove by hand.
+#[test]
+fn create_killed_while_writing_its_binding_is_resumed() {
+    use std::os::unix::process::ExitStatusExt;
+    child();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let Some(killed) = interrupted(
+        "create_killed_while_writing_its_binding_is_resumed",
+        "create killed-at-the-binding",
+        &root,
+    ) else {
+        return;
+    };
+    assert_eq!(killed.status.signal(), Some(libc::SIGSYS), "{killed:?}");
+    assert_eq!(std::fs::read(root.join("rollback.format")).unwrap(), MARKER);
+    let left = entries(&root);
+    let refusals = documented_commands(&root);
+    assert!(
+        refusals.is_empty(),
+        "a creation killed while writing its binding is stranded with {left:?}: {refusals:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("remote.enrollment"))
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[test]
+fn create_whose_binding_write_failed_is_resumed() {
+    child();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let Some(failed) = interrupted(
+        "create_whose_binding_write_failed_is_resumed",
+        "create refused-at-the-binding",
+        &root,
+    ) else {
+        return;
+    };
+    assert_eq!(failed.status.code(), Some(FAILED), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("No space left on device"),
+        "the binding write must have failed: {failed:?}"
+    );
+    let left = entries(&root);
+    let refusals = documented_commands(&root);
+    assert!(
+        refusals.is_empty(),
+        "after one failed binding write the root is stranded with {left:?}: {refusals:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("remote.enrollment"))
+            .unwrap()
+            .len(),
+        64
+    );
 }
 
 /// A marker that is empty, or a torn copy (each byte the marker's or zero),
