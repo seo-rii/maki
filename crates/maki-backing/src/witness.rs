@@ -1050,6 +1050,69 @@ mod tests {
         }
     }
 
+    /// The first record follows the same rule: `create` removes a stale
+    /// temporary record, and a file someone who can write the directory
+    /// puts back under that name before it is opened again is published
+    /// only if it is root's or the directory owner's, whose record it is.
+    #[test]
+    fn root_creates_the_first_record_only_in_a_file_of_root_or_the_directory_owner() {
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let other = FileOwner {
+            uid: 4444,
+            gid: 4545,
+        };
+        let root = FileOwner { uid: 0, gid: 0 };
+        for planter in [other, root, daemon] {
+            let dir = tempdir().unwrap();
+            let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+            fault.report_directory_owner(daemon);
+            fault.replant_temporary(b"put back", planter);
+            let backing: Arc<dyn Backing> = fault.clone();
+            let created = FileWitness::create_backing(backing, IDENTITY, ROOT_A);
+
+            if !super::running_as_root() {
+                drop(created.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    ["temp_write", "temp_sync", "rename", "directory_sync"],
+                    "{planter:?}"
+                );
+                assert!(fault.given().is_empty());
+            } else if planter == other {
+                let error = created.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("uid 4444"), "{error}");
+                assert!(error.to_string().contains("uid 4242"), "{error}");
+                assert!(fault.trace().is_empty());
+                assert!(fault.given().is_empty());
+                assert!(!dir.path().join(super::ANCHOR_FILE).exists());
+            } else if planter == daemon {
+                drop(created.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    ["temp_write", "temp_sync", "rename", "directory_sync"]
+                );
+                assert!(fault.given().is_empty());
+            } else {
+                drop(created.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    [
+                        "temp_owner",
+                        "temp_write",
+                        "temp_sync_all",
+                        "rename",
+                        "directory_sync"
+                    ]
+                );
+                assert_eq!(fault.given(), [daemon]);
+            }
+        }
+    }
+
     #[test]
     fn encoding_has_a_fixed_vector() {
         let anchor = Anchor {
