@@ -15,7 +15,10 @@ use tokio::sync::OnceCell;
 use zeroize::Zeroize;
 
 use crate::error::CryptoError;
-use crate::provider::{private::ValidationCaller, CryptoProvider};
+use crate::provider::{
+    private::{SelfTestCaller, ValidationCaller},
+    CryptoProvider,
+};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
 pub struct CheckedProvider {
@@ -51,6 +54,26 @@ impl CheckedProvider {
         self.caps
             .get_or_try_init(|| self.inner.capabilities())
             .await
+    }
+
+    /// The checks every decrypt result passes, the self-test's probe included.
+    fn checked_decrypt(
+        &self,
+        items: &[CiphertextUnit],
+        out: Vec<PlaintextUnit>,
+        caps: &CryptoCapabilities,
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        validate_decrypt_result(items, &out, caps)?;
+        if let Some(unit_size) = self.unit_size {
+            if let Some(pt) = out.iter().find(|pt| pt.data.len() != unit_size as usize) {
+                return Err(CryptoError::Contract(format!(
+                    "decrypt of unit {} returned {} bytes, volume unit size is {unit_size}",
+                    pt.unit_index,
+                    pt.data.len()
+                )));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -209,17 +232,21 @@ impl CryptoProvider for CheckedProvider {
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
         let caps = self.caps().await?;
         let out = self.inner.decrypt_batch(context, items).await?;
-        validate_decrypt_result(items, &out, caps)?;
-        if let Some(unit_size) = self.unit_size {
-            if let Some(pt) = out.iter().find(|pt| pt.data.len() != unit_size as usize) {
-                return Err(CryptoError::Contract(format!(
-                    "decrypt of unit {} returned {} bytes, volume unit size is {unit_size}",
-                    pt.unit_index,
-                    pt.data.len()
-                )));
-            }
-        }
-        Ok(out)
+        self.checked_decrypt(items, out, caps)
+    }
+
+    async fn decrypt_compatibility_probe(
+        &self,
+        caller: SelfTestCaller,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        let caps = self.caps().await?;
+        let out = self
+            .inner
+            .decrypt_compatibility_probe(caller, context, items)
+            .await?;
+        self.checked_decrypt(items, out, caps)
     }
 }
 

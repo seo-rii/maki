@@ -41,7 +41,10 @@ use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 use crate::clock::Clock;
 use crate::error::CryptoError;
 use crate::flow::{DualPermit, DualSemaphore};
-use crate::provider::{private::ValidationCaller, CryptoProvider};
+use crate::provider::{
+    private::{SelfTestCaller, ValidationCaller},
+    CryptoProvider,
+};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
 #[derive(Debug, Clone)]
@@ -992,6 +995,23 @@ impl CryptoProvider for BatchScheduler {
                 )
                 .await
         })
+        .await
+    }
+
+    /// The self-test's compatibility-id probe bypasses the decrypt lane,
+    /// which calls the inner provider's ordinary decrypt: a translating
+    /// layer below (the random-prefix wrapper) must receive it as the probe.
+    /// It keeps the caller's deadline; it is one unit, sent once at attach.
+    async fn decrypt_compatibility_probe(
+        &self,
+        caller: SelfTestCaller,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.with_deadline(
+            self.inner
+                .decrypt_compatibility_probe(caller, context, items),
+        )
         .await
     }
 }

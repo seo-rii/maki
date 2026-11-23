@@ -2,7 +2,7 @@
 
 use crate::checked::{validate_decrypt_result, validate_owned_encrypt_result};
 use crate::error::{ContextField, CryptoError, ErrorClass};
-use crate::provider::CryptoProvider;
+use crate::provider::{private::SelfTestCaller, CryptoProvider};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 use crate::SecretBuffer;
 
@@ -133,14 +133,17 @@ fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
     }
 }
 
+/// The context of the compatibility-id probe at the layer that sends the
+/// id: the same volume, format version and unit, under an id the volume does
+/// not use.
+pub(crate) fn foreign_compatibility_context(context: &CryptoContext) -> CryptoContext {
+    let mut foreign = context.clone();
+    foreign.crypto_compatibility_id = format!("{}.selftest-probe", context.crypto_compatibility_id);
+    foreign
+}
+
 /// One context-binding probe: decrypt `probe` under `probe_context` and require
-/// that it does not reproduce `original`. An `Ok` response is shape-validated
-/// first (an empty or malformed success is a contract violation, never proof —
-/// FUP-009); a matching plaintext means the claimed binding is not enforced.
-///
-/// `refused_field` permits an explicit schema refusal only for the field this
-/// probe changed. Generic request/provider failures and refusals of a different
-/// field do not prove context binding. Schema refusal never proves integrity.
+/// that it does not reproduce `original` (see [`judge_context_probe`]).
 async fn check_context_probe(
     provider: &dyn CryptoProvider,
     probe_context: &CryptoContext,
@@ -150,10 +153,29 @@ async fn check_context_probe(
     what: &str,
     refused_field: Option<ContextField>,
 ) -> Result<(), CryptoError> {
-    match provider
+    let result = provider
         .decrypt_batch(probe_context, std::slice::from_ref(probe))
-        .await
-    {
+        .await;
+    judge_context_probe(result, probe, original, caps, what, refused_field)
+}
+
+/// The verdict on one context-binding probe's decrypt `result`: it must not
+/// reproduce `original`. An `Ok` response is shape-validated first (an empty
+/// or malformed success is a contract violation, never proof — FUP-009); a
+/// matching plaintext means the claimed binding is not enforced.
+///
+/// `refused_field` permits an explicit schema refusal only for the field this
+/// probe changed. Generic request/provider failures and refusals of a different
+/// field do not prove context binding. Schema refusal never proves integrity.
+fn judge_context_probe(
+    result: Result<Vec<PlaintextUnit>, CryptoError>,
+    probe: &CiphertextUnit,
+    original: &SecretBuffer,
+    caps: &CryptoCapabilities,
+    what: &str,
+    refused_field: Option<ContextField>,
+) -> Result<(), CryptoError> {
+    match result {
         Ok(pts) => {
             validate_decrypt_result(std::slice::from_ref(probe), &pts, caps)?;
             if pts.first().map(|p| p.data == *original).unwrap_or(false) {
@@ -228,6 +250,12 @@ pub async fn provider_self_test(
     // distinguishes a definitive rejection / correct rebinding (pass) from an
     // inconclusive transport error (quarantine) and an empty or malformed
     // success (refuse). The schema-level fields may also be refused outright.
+    // The compatibility id is the one field a layer of the stack translates
+    // (the random-prefix wrapper sends the base id below the volume's derived
+    // one), so its probe asks the stack to pick the foreign id where the id
+    // goes on the wire: the provider then receives the probe it receives
+    // without the wrapper, rather than the wrapper refusing a foreign outer
+    // id it does not bind.
     if caps.context_binding.present() {
         let mut moved_index = cts[0].clone();
         moved_index.unit_index = cts[0].unit_index.wrapping_add(1);
@@ -269,19 +297,17 @@ pub async fn provider_self_test(
         )
         .await?;
 
-        let mut other_profile = context.clone();
-        other_profile.crypto_compatibility_id =
-            format!("{}.selftest-probe", context.crypto_compatibility_id);
-        check_context_probe(
-            provider,
-            &other_profile,
+        let probe = std::slice::from_ref(&cts[0]);
+        judge_context_probe(
+            provider
+                .decrypt_compatibility_probe(SelfTestCaller, context, probe)
+                .await,
             &cts[0],
             &items[0].data,
             &caps,
             "context-binding (compatibility id)",
             Some(ContextField::CompatibilityId),
-        )
-        .await?;
+        )?;
     }
 
     // Tamper detection: a flipped ciphertext byte must be rejected with a
