@@ -2,13 +2,46 @@
 .SH NAME
 maki-attach \- manage the NBD, LVM and XFS attachment for a Maki volume
 .SH SYNOPSIS
-.B maki-attach
-.I action
+.B maki-attach attach
+.B \-\-volume
+.I name
+.RB [ \-\-config
+.IR file ]
+.RI [ overrides ]
+.RB [ \-\-init-sentinel ]
+.RB [ \-\-plan ]
+.br
+.BR "maki-attach detach" | recover | cleanup
+.B \-\-volume
+.I name
+.RB [ \-\-config
+.IR file ]
+.RI [ overrides ]
+.RB [ \-\-plan ]
+.br
+.B maki-attach grow
+.B \-\-volume
+.I name
+.B \-\-size-bytes
+.I bytes
+.RB [ \-\-config
+.IR file ]
+.RI [ overrides ]
+.RB [ \-\-plan ]
+.br
+.B maki-attach verify
 .B \-\-volume
 .I name
 .RB [ \-\-config
 .IR file ]
 .RB [ \-\-plan ]
+.br
+.B maki-attach recover-failed-start
+.B \-\-volume
+.I name
+.RB [ \-\-plan ]
+.br
+.BR "maki-attach \-\-help" " | " \-\-version
 .SH DESCRIPTION
 .B attach
 connects the NBD device and mounts the configured filesystem.
@@ -27,15 +60,84 @@ for a disconnected backend.
 .B cleanup
 uses the attachment record to select detach or recovery.
 .B recover-failed-start
-is the systemd failed-start cleanup hook.
+is the systemd failed-start cleanup hook. It queues the recovery coordinator
+and, when the start died between LVM activation and the mapping proof, rolls
+back that activation itself while the daemon still serves the device: the
+scoped VG deactivation, the NBD disconnect, and the removal of the record. It
+never unmounts.
 .SH OPTIONS
+.TP
+.BI \-\-volume " name"
+The volume to act on. Every action requires it.
 .TP
 .BI \-\-config " file"
 Read attachment settings from this file. The default path, when present, is
 .IR /etc/maki/attach/name.toml .
+.B recover-failed-start
+refuses this option; to roll back an interrupted activation it reads the
+default path, under the same ownership rule as the other actions.
+.TP
+.BR \-h ", " \-\-help
+Print the usage and exit. Accepted only as the sole argument.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit. Accepted only as the sole argument.
 .TP
 .B \-\-plan
 Print the planned steps. Execution requires Linux and the volume identity.
+.TP
+.BI \-\-size-bytes " bytes"
+Required by
+.B grow
+and refused by the other actions: the absolute minimum size of the logical
+volume, in plain decimal digits and a multiple of 512.
+.TP
+.B \-\-init-sentinel
+Accepted by
+.B attach
+only: create the volume sentinel on the mounted filesystem, as the setting
+.B init_sentinel = true
+does. The option cannot turn that setting off.
+.SS Overrides
+Each of these options replaces one attachment setting.
+.BR attach ", " detach ", " recover ", " cleanup " and " grow
+accept them;
+.B verify
+and
+.B recover-failed-start
+refuse them. The device block size and the LVM identity pins have no option
+and come from the file only.
+.TP
+.BI \-\-nbd-device " device"
+The NBD device
+.RI ( /dev/nbdN ),
+instead of the setting
+.B nbd_device
+or automatic allocation.
+.TP
+.BI \-\-socket " path"
+The NBD socket of the daemon
+.RB ( nbd_socket ).
+.TP
+.BI \-\-vg " name"
+The volume group
+.RB ( vg_name ).
+.TP
+.BI \-\-lv " name"
+The logical volume
+.RB ( lv_name ).
+.TP
+.BI \-\-mountpoint " directory"
+The mountpoint
+.RB ( mountpoint ).
+.TP
+.BI \-\-uuid " uuid"
+The Maki volume UUID
+.RB ( volume_uuid ).
+.TP
+.BI \-\-fs-uuid " uuid"
+The expected XFS filesystem UUID
+.RB ( fs_uuid ).
 .SH SEE ALSO
 .BR maki (8),
 .BR maki-check (8)

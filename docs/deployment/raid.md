@@ -63,14 +63,17 @@ Status: **refused or fail closed**. This is what
 "multi-LV/internal thin/cache/RAID mappings … fail closed" in
 [operations](../operations.md#privileged-helper) refers to. `cachevol`
 layouts are refused at activation. Thin pools, LVM RAID and other internal
-device-mapper layers may activate, but every recovery path (dead-`nbdkit`
-cleanup, pre-activation intent, partial mapping cleanup) accepts only the
+device-mapper layers may activate, but every recovery path (cleanup after
+`nbdkit` died or `maki drain` closed admission, pre-activation intent, partial
+mapping cleanup) accepts only the
 single-target mapping of the qualified topology and otherwise keeps the
 trusted record for operator diagnosis. LVM RAID on a single underlying device
 also adds no redundancy.
 
 Use one plain linear data LV. Additional LVs in the same VG attach and detach
-normally but exclude the VG from the automatic cleanup fallback
+normally while the daemon serves reads, but exclude the VG from the automatic
+cleanup fallback, which a stop after `maki drain` depends on as much as one
+after a dead `nbdkit`
 ([support matrix](support-matrix.md#exported-stack-above-maki)).
 
 ## Summary
