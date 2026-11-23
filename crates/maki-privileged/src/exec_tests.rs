@@ -92,6 +92,9 @@ struct FakeSystem {
     steps: Vec<&'static str>,
     fail_at: Option<&'static str>,
     nonzero_at: Option<&'static str>,
+    /// The step's command is terminated by a signal: the runner reports a
+    /// failed step that carries no exit status.
+    signalled_at: Option<&'static str>,
     readiness_failure: bool,
     replace_on_failure: bool,
     replace_after_deactivate: bool,
@@ -375,10 +378,10 @@ impl System for FakeSystem {
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.steps.push(step.kind());
-        if self.nonzero_at == Some(step.kind()) {
+        if self.nonzero_at == Some(step.kind()) || self.signalled_at == Some(step.kind()) {
             return Err(ExecError::StepFailed {
                 step: step.to_string(),
-                status: Some(5),
+                status: (self.signalled_at != Some(step.kind())).then_some(5),
                 stderr: "external command output omitted".into(),
             });
         }
@@ -1944,6 +1947,23 @@ fn step_commands_do_not_inherit_the_callers_environment() {
         ],
     )
     .expect("the step saw the caller's environment");
+}
+
+/// The step runner reports a command that a signal terminated (the OOM
+/// killer, a crash) as a failed step without an exit status, and one that
+/// exited nonzero with that status. Cleanup's device-mapper fallback tells
+/// the two apart: only the second is LVM's own refusal.
+#[test]
+fn a_step_killed_by_a_signal_reports_no_exit_status() {
+    let step = PlannedStep::LvmDeactivate {
+        vg_name: "vg_maki_pg".into(),
+    };
+    for (script, expected) in [("kill -KILL $$", None), ("exit 5", Some(5))] {
+        match run(&step, "sh", &["-c", script]) {
+            Err(ExecError::StepFailed { status, .. }) => assert_eq!(status, expected, "{script}"),
+            other => panic!("{script}: expected a failed step, got {other:?}"),
+        }
+    }
 }
 
 /// BUG-096: the mount source comes from mountinfo, and whoever mounts on

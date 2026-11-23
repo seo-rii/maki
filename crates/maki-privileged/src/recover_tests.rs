@@ -509,6 +509,39 @@ fn cleanup_does_not_fallback_when_lvm_did_not_return_a_nonzero_status() {
     assert_eq!(state.read("pg").unwrap(), Some(record));
 }
 
+/// A `vgchange` that a signal terminated never reported whether it could
+/// deactivate the volume group, and may have stopped halfway. Only LVM's own
+/// nonzero exit lets cleanup remove the mapping directly; the next cleanup
+/// runs LVM again.
+#[test]
+fn cleanup_does_not_fallback_when_lvm_was_killed_by_a_signal() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.signalled_at = Some("lvm-deactivate");
+
+    let error = cleanup_with(&plan_detach(&req), &state, &mut system).unwrap_err();
+
+    assert!(error.to_string().contains("status None"), "{error}");
+    assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
+    assert!(system.fake.vg_active, "the mapping was removed directly");
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    // LVM exits this time: nonzero enters the fallback as before.
+    system.fake.signalled_at = None;
+    system.fake.nonzero_at = Some("lvm-deactivate");
+    system.fake.steps.clear();
+    cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+    assert_eq!(
+        system.fake.steps,
+        ["lvm-deactivate", "dm-proof-deactivate", "nbd-disconnect"]
+    );
+    assert!(state.read("pg").unwrap().is_none());
+}
+
 #[test]
 fn cleanup_rechecks_the_backend_before_proof_scoped_deactivation() {
     let (_fixture, state, req, mut system) = attached();
