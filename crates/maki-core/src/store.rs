@@ -411,13 +411,17 @@ impl SlotStore {
 
         let mut catalog_dirty = false;
         let mut orphans: Vec<u64> = Vec::new();
-        let data_entries = backing.list(layout::DATA_DIR).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => CoreError::Corrupt(format!(
-                "required {} directory is missing",
-                layout::DATA_DIR
-            )),
-            _ => CoreError::Io(e),
-        })?;
+        // Only shard data file names matter here, and they are ASCII: any
+        // other entry, one whose name is not UTF-8 included, is ignored.
+        let data_entries = backing
+            .list_skipping_non_utf8(layout::DATA_DIR)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => CoreError::Corrupt(format!(
+                    "required {} directory is missing",
+                    layout::DATA_DIR
+                )),
+                _ => CoreError::Io(e),
+            })?;
         for name in data_entries {
             if let Some(idx) = layout::parse_shard_data(&name) {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {

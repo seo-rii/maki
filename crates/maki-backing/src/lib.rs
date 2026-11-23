@@ -199,8 +199,23 @@ pub trait Backing: Send + Sync + 'static {
 
     fn create_dir_all(&self, path: &str) -> io::Result<()>;
 
-    /// Sorted file/dir names directly inside `dir` ("" = root).
+    /// Sorted file/dir names directly inside `dir` ("" = root). A name that
+    /// is not UTF-8 fails the listing with `InvalidData`, so a caller that
+    /// must account for every entry (one proving a directory empty) never
+    /// misses one, and no name is converted lossily into one that opens a
+    /// different entry.
     fn list(&self, dir: &str) -> io::Result<Vec<String>>;
+
+    /// [`list`](Backing::list) without the names that are not UTF-8, for
+    /// scans that look only for names the volume writes (all ASCII) and
+    /// ignore every other entry: such a name is none of those, so it is
+    /// skipped like any other unknown name instead of failing the scan.
+    /// Each name returned is exact. A backing whose names are all UTF-8
+    /// keeps this default; one that forwards `list` to a backing that can
+    /// hold other names forwards this too, or it refuses them.
+    fn list_skipping_non_utf8(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.list(dir)
+    }
 
     /// Make namespace operations under `dir` durable (fsync of directory).
     fn sync_dir(&self, dir: &str) -> io::Result<()>;
