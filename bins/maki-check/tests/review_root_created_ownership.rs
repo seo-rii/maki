@@ -5,6 +5,9 @@
 //! without it this test prints why it is skipped.
 #![cfg(target_os = "linux")]
 
+#[path = "support/shared_dir.rs"]
+mod shared_dir;
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -59,7 +62,17 @@ fn can_give_files_away(directory: &Path) -> bool {
 
 #[test]
 fn root_deep_check_recreates_a_missing_volume_lock_for_the_daemon() {
-    let dir = tempfile::tempdir().unwrap();
+    // The daemon user runs the checker on this volume, so it must be able
+    // to reach the directory: `TMPDIR` may be private to this user.
+    let dir = match shared_dir::tempdir() {
+        Ok(dir) => dir,
+        Err(reason) => {
+            eprintln!(
+                "root_deep_check_recreates_a_missing_volume_lock_for_the_daemon: skipped: {reason}"
+            );
+            return;
+        }
+    };
     if !can_give_files_away(dir.path()) {
         eprintln!(
             "root_deep_check_recreates_a_missing_volume_lock_for_the_daemon: skipped: running \
