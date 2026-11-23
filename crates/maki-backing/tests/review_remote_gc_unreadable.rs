@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
+use maki_backing::remote_gc::GcUnreadable;
 use maki_backing::remote_witness::{
     namespace, Action, CanonicalState, Record, Request, Role, Rpc, StateStore,
 };
@@ -196,6 +197,18 @@ fn gc_reclaims_past_a_namespace_it_may_not_open() {
     assert_eq!(report.counts.removed, 0);
     assert_eq!(namespaces(root.path()).len(), 2);
     assert!(root.path().join(&closed).is_dir());
+    // Reported with the step and the OS error, apart from the entries GC
+    // does not recognize.
+    assert_eq!(
+        report.skipped_unreadable,
+        [GcUnreadable {
+            name: closed.clone(),
+            error: "opening the namespace directory: Permission denied (os error 13)".into(),
+        }]
+    );
+    assert_eq!(report.counts.skipped_unreadable, 1);
+    assert!(report.skipped_unrecognized.is_empty());
+    assert!(!report.details_truncated);
 
     drop(modes);
     set_mode(&root.path().join(&closed), 0o700);
@@ -228,6 +241,14 @@ fn gc_reclaims_past_a_namespace_holding_a_directory_named_like_its_arena() {
         .expect("a namespace GC cannot examine must not end the pass");
     assert!(report.removed.is_empty());
     assert_eq!(namespaces(root.path()).len(), 2);
+    assert_eq!(
+        report.skipped_unreadable,
+        [GcUnreadable {
+            name: odd.clone(),
+            error: "opening rollback.arena: Is a directory (os error 21)".into(),
+        }]
+    );
+    assert_eq!(report.counts.skipped_unreadable, 1);
     // Kept exactly as it was, under its own name.
     assert!(root.path().join(&odd).join("rollback.arena").is_dir());
     assert!(root.path().join(&odd).join("rollback.lock").is_file());
@@ -271,6 +292,13 @@ fn a_retired_namespace_whose_lock_cannot_be_opened_keeps_its_files() {
         .expect("a tombstone GC cannot examine must not end the pass");
     assert!(report.removed.is_empty());
     assert_eq!(
+        report.skipped_unreadable,
+        [GcUnreadable {
+            name: format!(".remote-gc-{}", first_stale_name()),
+            error: "opening rollback.lock: Permission denied (os error 13)".into(),
+        }]
+    );
+    assert_eq!(
         std::fs::read(retired.join("rollback.arena")).unwrap(),
         b"ciphertext"
     );
@@ -313,6 +341,144 @@ fn control_gc_refuses_a_root_whose_current_namespace_it_cannot_open() {
     set_mode(&root.path().join(&current), 0o700);
     let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
     assert_eq!(report.removed, [stale]);
+}
+
+/// Every event logged in this test process, with the thread that logged it.
+static EVENTS: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+
+/// The events the calling thread logs while `run` runs, each as its level,
+/// target and fields in one line. The subscriber is installed once for the
+/// whole process: one scoped to a thread can miss an event whose callsite
+/// another test's thread reached first, without a subscriber.
+fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::fmt::Write;
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+
+    struct Line(String);
+    impl Visit for Line {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            write!(self.0, " {}={value:?}", field.name()).unwrap();
+        }
+    }
+    struct Capture;
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let metadata = event.metadata();
+            let mut line = Line(format!("{} {}", metadata.level(), metadata.target()));
+            event.record(&mut line);
+            EVENTS
+                .lock()
+                .unwrap()
+                .push((std::thread::current().id(), line.0));
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| tracing::subscriber::set_global_default(Capture).unwrap());
+    let mine = || -> Vec<String> {
+        let me = std::thread::current().id();
+        let events = EVENTS.lock().unwrap();
+        let mine = events.iter().filter(|(thread, _)| *thread == me);
+        mine.map(|(_, line)| line.clone()).collect()
+    };
+    let before = mine().len();
+    let result = run();
+    (result, mine().split_off(before))
+}
+
+/// Nothing but the log reports the automatic pass after an activation, and
+/// the activation succeeds whatever that pass could do.
+#[test]
+fn the_automatic_pass_logs_the_namespaces_it_could_not_examine() {
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    // Without anything it cannot examine, the pass logs nothing.
+    let (backing, events) =
+        logged(|| RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+    assert_eq!(events, Vec::<String>::new());
+    drop(backing);
+
+    let odd = first_stale_name();
+    std::fs::create_dir(root.path().join(&odd)).unwrap();
+    std::fs::write(root.path().join(&odd).join("rollback.lock"), b"").unwrap();
+    std::fs::create_dir(root.path().join(&odd).join("rollback.arena")).unwrap();
+    let (backing, events) =
+        logged(|| RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+    commit(&backing, b"attached");
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert!(
+        events[0].starts_with("WARN maki_backing::rollback::remote ")
+            && events[0].contains("automatic remote GC kept retired writer namespaces")
+            && events[0].contains("count=1")
+            && events[0].contains(&format!("namespace={odd}"))
+            && events[0].contains("error=opening rollback.arena: Is a directory (os error 21)"),
+        "{events:#?}"
+    );
+}
+
+/// The authority of a writer whose activation was accepted, and which then
+/// stops answering.
+struct AnswersUntilActive {
+    inner: Arc<dyn Rpc>,
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl Rpc for AnswersUntilActive {
+    fn call(&self, request: &Request) -> io::Result<Record> {
+        use std::sync::atomic::Ordering;
+        if self.active.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the authority did not answer",
+            ));
+        }
+        let record = self.inner.call(request)?;
+        if matches!(request.action, Action::Activate { .. }) {
+            self.active.store(true, Ordering::SeqCst);
+        }
+        Ok(record)
+    }
+}
+
+#[test]
+fn the_automatic_pass_logs_why_it_did_not_complete() {
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let predecessor = namespaces(root.path());
+    let unanswered: Arc<dyn Rpc> = Arc::new(AnswersUntilActive {
+        inner: writer.clone(),
+        active: false.into(),
+    });
+    let (backing, events) = logged(|| RollbackBacking::open_remote(root.path(), unanswered));
+    // The activation was accepted; only reclamation is postponed.
+    let backing = backing.unwrap();
+    assert_eq!(namespaces(root.path()).len(), 2);
+    assert!(namespaces(root.path()).contains(&predecessor[0]));
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert!(
+        events[0].starts_with("WARN maki_backing::rollback::remote ")
+            && events[0].contains("automatic remote GC did not complete")
+            && events[0].contains("error=the authority did not answer"),
+        "{events:#?}"
+    );
+    // Its writer session cannot be released through this authority either.
+    drop(backing);
 }
 
 const STEP: &str = "MAKI_GC_UNREADABLE_STEP";
@@ -421,7 +587,12 @@ fn step(top: &Path, step: &str) {
         }
         // `maki volume gc`.
         "gc" => match RollbackBacking::collect_remote(&root, rpc(Role::Writer).as_ref()) {
-            Ok(report) => println!("gc: removed {}", report.counts.removed),
+            Ok(report) => {
+                println!("gc: removed {}", report.counts.removed);
+                for skipped in &report.skipped_unreadable {
+                    println!("gc: unreadable {}: {}", skipped.name, skipped.error);
+                }
+            }
             Err(error) => println!("gc: failed: {error}"),
         },
         other => panic!("unknown step {other}"),
@@ -534,4 +705,12 @@ fn gc_as_the_daemon_reclaims_past_the_namespace_a_killed_root_takeover_left() {
         "only the current namespace and the leftover may remain: {left:#?}\n{gc}"
     );
     assert!(left.contains(&leftover[0]));
+    // The daemon user is told which entry it could not examine and why.
+    assert!(
+        gc.contains(&format!(
+            "gc: unreadable {}: opening the namespace directory: Permission denied",
+            leftover[0]
+        )),
+        "{gc}"
+    );
 }

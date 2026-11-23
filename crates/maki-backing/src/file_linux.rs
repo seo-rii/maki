@@ -714,6 +714,26 @@ fn unexpected(error: &io::Error) -> bool {
         || error.kind() == io::ErrorKind::InvalidData
 }
 
+/// Name the step of a candidate's examination that `error` stopped.
+fn examining(step: impl std::fmt::Display, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{step}: {error}"))
+}
+
+/// A stale namespace that passed examination: it holds only known,
+/// single-link regular files on the root's mount, and this pass holds its
+/// lifetime lock if the lock file is still there.
+struct GcCandidate {
+    directory: File,
+    files: Vec<(CString, File)>,
+    lock: Option<FileLock>,
+}
+
+enum GcExamined {
+    Quiescent(GcCandidate),
+    /// Live or unrecognized: kept, and nothing failed.
+    Kept(GcRemoval),
+}
+
 impl Directory {
     pub(super) fn gc_entries(&self, after: Option<&OsStr>) -> io::Result<Vec<OsString>> {
         names_after(&self.0, after, 4096)
@@ -738,55 +758,45 @@ impl Directory {
         Ok(Self(directory))
     }
 
-    /// Called only while the root operation lock excludes all physical forks.
-    /// Retirement is made durable before any ciphertext is unlinked.
-    pub(super) fn gc_retire(&self, original: &str, retired: bool) -> io::Result<GcRemoval> {
-        use std::os::unix::fs::MetadataExt;
-        validate(original, false)?;
-        if original.contains('/') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "GC namespace is not a root child",
-            ));
-        }
-        let original_name = name(OsStr::new(original))?;
-        let retired_name = name(OsStr::new(&format!(".remote-gc-{original}")))?;
-        let current_name = if retired {
-            &retired_name
-        } else {
-            &original_name
-        };
+    /// Open and check one retirement candidate, changing nothing. Every
+    /// error returned here is a failure to open or examine that candidate
+    /// (its directory, its listing, one of its files or its lifetime lock),
+    /// named with the step it stopped. It says nothing about the root or
+    /// about any other candidate.
+    fn gc_examine(
+        &self,
+        current_name: &CStr,
+        counterpart: &CStr,
+        retired: bool,
+        root_mount: u64,
+    ) -> io::Result<GcExamined> {
+        let unrecognized = || Ok(GcExamined::Kept(GcRemoval::Unrecognized));
         // Collision refusal ensures no retired path can stand in for an
         // existing original session or overwrite another directory.
-        match entry_exists(
-            &self.0,
-            if retired {
-                &original_name
-            } else {
-                &retired_name
-            },
-        ) {
+        match entry_exists(&self.0, counterpart) {
             Ok(false) => {}
-            Ok(true) => return Ok(GcRemoval::Unrecognized),
+            Ok(true) => return unrecognized(),
             Err(error) if unexpected(&error) || error.kind() == io::ErrorKind::InvalidInput => {
-                return Ok(GcRemoval::Unrecognized)
+                return unrecognized()
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(examining("checking for a retirement collision", error)),
         }
         let directory = match open_at(&self.0, current_name, libc::O_RDONLY | libc::O_DIRECTORY) {
             Ok(directory) => directory,
-            Err(error) if unexpected(&error) => return Ok(GcRemoval::Unrecognized),
-            Err(error) => return Err(error),
+            Err(error) if unexpected(&error) => return unrecognized(),
+            Err(error) => return Err(examining("opening the namespace directory", error)),
         };
-        if mount_id(&directory)? != mount_id(&self.0)?
-            || !same_entry(&self.0, current_name, &directory)?
+        let inspecting = |error| examining("examining the namespace directory", error);
+        let mount = mount_id(&directory).map_err(inspecting)?;
+        if mount != root_mount
+            || !same_entry(&self.0, current_name, &directory).map_err(inspecting)?
         {
-            return Ok(GcRemoval::Unrecognized);
+            return unrecognized();
         }
         let entries = match names(&directory, 4) {
             Ok(entries) => entries,
-            Err(error) if unexpected(&error) => return Ok(GcRemoval::Unrecognized),
-            Err(error) => return Err(error),
+            Err(error) if unexpected(&error) => return unrecognized(),
+            Err(error) => return Err(examining("listing the namespace", error)),
         };
         let mut files = Vec::new();
         let mut lock = None;
@@ -799,28 +809,35 @@ impl Directory {
             ]
             .contains(&entry.as_str())
             {
-                return Ok(GcRemoval::Unrecognized);
+                return unrecognized();
             }
             let entry_name = name(OsStr::new(entry))?;
             let file = match open_at(&directory, &entry_name, libc::O_RDWR | libc::O_NONBLOCK) {
                 Ok(file) => file,
-                Err(error) if unexpected(&error) => return Ok(GcRemoval::Unrecognized),
-                Err(error) => return Err(error),
+                Err(error) if unexpected(&error) => return unrecognized(),
+                Err(error) => return Err(examining(format_args!("opening {entry}"), error)),
             };
-            let metadata = file.metadata()?;
+            let inspecting = |error| examining(format_args!("examining {entry}"), error);
+            let metadata = file.metadata().map_err(inspecting)?;
             if !metadata.is_file()
                 || metadata.nlink() != 1
-                || mount_id(&file)? != mount_id(&directory)?
-                || !same_entry(&directory, &entry_name, &file)?
+                || mount_id(&file).map_err(inspecting)? != mount
+                || !same_entry(&directory, &entry_name, &file).map_err(inspecting)?
             {
-                return Ok(GcRemoval::Unrecognized);
+                return unrecognized();
             }
             if entry == "rollback.lock" {
                 match file.try_lock() {
-                    // `FileLock` unlocks on every return below.
+                    // `FileLock` unlocks on every return, here and in the
+                    // caller.
                     Ok(()) => lock = Some(FileLock { file }),
-                    Err(std::fs::TryLockError::WouldBlock) => return Ok(GcRemoval::Live),
-                    Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        return Ok(GcExamined::Kept(GcRemoval::Live))
+                    }
+                    // A lock that could not be tried is not a free lock.
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        return Err(examining("locking rollback.lock", error))
+                    }
                 }
             } else {
                 files.push((entry_name, file));
@@ -829,11 +846,52 @@ impl Directory {
         // An original namespace without its durable lifetime lock has no
         // proof that an old State handle is gone. A durable tombstone does.
         if lock.is_none() && !retired {
-            return Ok(GcRemoval::Unrecognized);
+            return unrecognized();
         }
-        if !same_entry(&self.0, current_name, &directory)? {
-            return Ok(GcRemoval::Unrecognized);
+        if !same_entry(&self.0, current_name, &directory).map_err(inspecting)? {
+            return unrecognized();
         }
+        Ok(GcExamined::Quiescent(GcCandidate {
+            directory,
+            files,
+            lock,
+        }))
+    }
+
+    /// Called only while the root operation lock excludes all physical forks.
+    /// Retirement is made durable before any ciphertext is unlinked.
+    ///
+    /// A candidate that cannot be opened or examined is returned as
+    /// [`GcRemoval::Unreadable`]: nothing about it has been changed, and
+    /// the failure says nothing about any other candidate, so the caller
+    /// keeps it and goes on. An error is returned only for the root itself
+    /// (its mount identity here) and once the retirement of a candidate
+    /// that passed examination has begun.
+    pub(super) fn gc_retire(&self, original: &str, retired: bool) -> io::Result<GcRemoval> {
+        validate(original, false)?;
+        if original.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GC namespace is not a root child",
+            ));
+        }
+        let original_name = name(OsStr::new(original))?;
+        let retired_name = name(OsStr::new(&format!(".remote-gc-{original}")))?;
+        let (current_name, counterpart) = if retired {
+            (&retired_name, &original_name)
+        } else {
+            (&original_name, &retired_name)
+        };
+        let root_mount = mount_id(&self.0)?;
+        let GcCandidate {
+            directory,
+            files,
+            lock,
+        } = match self.gc_examine(current_name, counterpart, retired, root_mount) {
+            Ok(GcExamined::Quiescent(candidate)) => candidate,
+            Ok(GcExamined::Kept(kept)) => return Ok(kept),
+            Err(error) => return Ok(GcRemoval::Unreadable(error)),
+        };
         if !retired {
             // SAFETY: names are pinned-root children; NOREPLACE prevents an
             // existing retirement namespace from ever being overwritten.

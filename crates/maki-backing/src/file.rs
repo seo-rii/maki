@@ -281,6 +281,9 @@ pub(crate) enum GcRemoval {
     Removed,
     Live,
     Unrecognized,
+    /// The candidate could not be opened or examined, for the reason held.
+    /// Nothing about it was changed.
+    Unreadable(io::Error),
 }
 
 /// `OpenOptions` that never follow a symlink at the final component and

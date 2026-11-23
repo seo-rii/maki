@@ -277,7 +277,27 @@ fn collect_after_activation(
 ) {
     // An accepted root is already durable. GC failure postpones reclamation;
     // it must not turn a successful activation into an ambiguous writer loss.
-    let _ = guard.collect_within(rpc, only);
+    // Nothing else reports this pass, and every namespace it leaves behind
+    // keeps a whole arena, so say what it could not do. The events carry
+    // namespace names and error text only.
+    match guard.collect_within(rpc, only) {
+        Ok(report) => {
+            if let Some(first) = report.skipped_unreadable.first() {
+                tracing::warn!(
+                    count = report.counts.skipped_unreadable,
+                    namespace = %first.name,
+                    error = %first.error,
+                    "automatic remote GC kept retired writer namespaces it could not examine; \
+                     `maki volume gc` lists each with its error"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "automatic remote GC did not complete; retired writer namespaces stay on the \
+             backing until a pass completes (`maki volume gc`)"
+        ),
+    }
 }
 
 /// The only manifest a never-activated authority's session can have written:
