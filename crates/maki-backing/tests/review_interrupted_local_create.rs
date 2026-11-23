@@ -376,6 +376,25 @@ fn create_refuses_a_second_manifest_slot_that_holds_anything() {
     }
 }
 
+/// Not even the initial manifest is accepted in the second slot: only slot
+/// 0 ever holds it, and a copy of it in slot 1 is no state a creation or a
+/// commit leaves.
+#[test]
+fn create_refuses_the_initial_manifest_in_the_second_slot() {
+    let (root, witness) = directories();
+    drop(RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap());
+    let initial = std::fs::read(root.path().join("rollback.manifest.0")).unwrap();
+    std::fs::write(root.path().join("rollback.manifest.1"), &initial).unwrap();
+    std::fs::remove_file(witness.path().join("anchor")).unwrap();
+    let before = (entries(root.path()), entries(witness.path()));
+    assert!(RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_err());
+    assert_eq!((entries(root.path()), entries(witness.path())), before);
+    assert_eq!(
+        std::fs::read(root.path().join("rollback.manifest.1")).unwrap(),
+        initial
+    );
+}
+
 /// An anchor that is empty is what an earlier release's creation left when
 /// it was cut after installing it, and also what a witness whose anchor
 /// was truncated looks like. `create` never writes over an anchor, and

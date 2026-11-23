@@ -271,9 +271,10 @@ second slot holds only zeros and the first only zeros or the initial empty
 manifest, and a witness directory that holds only `witness.lock` and
 `anchor.next`. Every volume that committed anything wrote its second slot,
 so `create` never creates over one, whatever the witness directory holds
-and whatever state damage left its slots in: a witness mount that is
-missing (an empty directory in its place) cannot get a used volume
-recreated. It never writes over an `anchor` either. Earlier releases created
+and short of both slots lost or zeroed entirely (an all-zero slot is an
+unwritten one): a witness mount that is missing (an empty directory in its
+place) cannot get a used volume recreated, and neither can slots that
+damage left holding anything else. It never writes over an `anchor` either. Earlier releases created
 the anchor empty before writing it: an empty `anchor` that such a release
 left is refused by `create` and by the daemon, which say that the creation
 did not complete or the witness lost its state. If the volume was never
