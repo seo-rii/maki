@@ -575,7 +575,7 @@ fn a_rename_the_root_refuses_ends_the_pass() {
 
 /// An append-only root refuses every rename out of it with the same EPERM
 /// an immutable namespace gets. It is the root's flag, not the namespace's:
-/// the pass ends.
+/// the pass ends, also when the namespace carries a flag of its own.
 #[test]
 fn an_append_only_root_ends_the_pass() {
     const TEST: &str = "an_append_only_root_ends_the_pass";
@@ -584,35 +584,48 @@ fn an_append_only_root_ends_the_pass() {
         eprintln!("{TEST}: skipped: setting the append-only flag needs root");
         return;
     }
-    let writer = authority();
-    let root = tempfile::tempdir().unwrap();
-    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
-    commit(&created, b"created");
-    drop(created);
-    drop(RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
-    let stale = first_stale_name();
-    std::fs::create_dir(root.path().join(&stale)).unwrap();
-    std::fs::write(root.path().join(&stale).join("rollback.lock"), b"").unwrap();
-    if let Err(error) = set_flag(root.path(), FS_APPEND_FL, true) {
-        eprintln!("{TEST}: skipped: the filesystem refuses the append-only flag ({error})");
-        return;
+    for namespace_immutable in [false, true] {
+        let writer = authority();
+        let root = tempfile::tempdir().unwrap();
+        let created =
+            RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+        commit(&created, b"created");
+        drop(created);
+        drop(RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+        let stale = first_stale_name();
+        std::fs::create_dir(root.path().join(&stale)).unwrap();
+        std::fs::write(root.path().join(&stale).join("rollback.lock"), b"").unwrap();
+        let immutable = if namespace_immutable {
+            if let Err(error) = set_immutable(&root.path().join(&stale), true) {
+                eprintln!("{TEST}: skipped: the filesystem refuses the immutable flag ({error})");
+                return;
+            }
+            Some(Immutable(root.path().join(&stale)))
+        } else {
+            None
+        };
+        if let Err(error) = set_flag(root.path(), FS_APPEND_FL, true) {
+            eprintln!("{TEST}: skipped: the filesystem refuses the append-only flag ({error})");
+            return;
+        }
+        let append_only = AppendOnly(root.path().to_owned());
+
+        let error = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+            .expect_err("a rename an append-only root refuses must end the pass");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("GC stopped while retiring {stale}: ")),
+            "namespace immutable: {namespace_immutable}: {error}"
+        );
+        assert!(root.path().join(&stale).join("rollback.lock").is_file());
+
+        drop(append_only);
+        drop(immutable);
+        let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+        assert_eq!(report.removed, [stale]);
     }
-    let append_only = AppendOnly(root.path().to_owned());
-
-    let error = RollbackBacking::collect_remote(root.path(), writer.as_ref())
-        .expect_err("a rename an append-only root refuses must end the pass");
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
-    assert!(
-        error
-            .to_string()
-            .starts_with(&format!("GC stopped while retiring {stale}: ")),
-        "{error}"
-    );
-    assert!(root.path().join(&stale).join("rollback.lock").is_file());
-
-    drop(append_only);
-    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
-    assert_eq!(report.removed, [stale]);
 }
 
 /// What GC may delete is decided against the authority's current
