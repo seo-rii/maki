@@ -714,9 +714,29 @@ fn unexpected(error: &io::Error) -> bool {
         || error.kind() == io::ErrorKind::InvalidData
 }
 
-/// Name the step of a candidate's examination that `error` stopped.
+/// Name the step of a candidate's examination or retirement that `error`
+/// stopped.
 fn examining(step: impl std::fmt::Display, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{step}: {error}"))
+}
+
+/// Whether `directory` carries the immutable or the append-only flag. A
+/// filesystem without the flags has neither.
+fn immutable_or_append_only(directory: &File) -> bool {
+    const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+    const FS_APPEND_FL: libc::c_int = 0x20;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: valid descriptor; FS_IOC_GETFLAGS writes one int.
+    let read = unsafe { libc::ioctl(directory.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+    read == 0 && (flags & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
+}
+
+/// A retirement that stopped at a step changing the candidate alone.
+fn unfinished(tombstone: bool, step: impl std::fmt::Display, error: io::Error) -> GcRemoval {
+    GcRemoval::Unfinished {
+        tombstone,
+        error: examining(step, error),
+    }
 }
 
 /// A stale namespace that passed examination: it holds only known,
@@ -864,9 +884,18 @@ impl Directory {
     /// A candidate that cannot be opened or examined is returned as
     /// [`GcRemoval::Unreadable`]: nothing about it has been changed, and
     /// the failure says nothing about any other candidate, so the caller
-    /// keeps it and goes on. An error is returned only for the root itself
-    /// (its mount identity here) and once the retirement of a candidate
-    /// that passed examination has begun.
+    /// keeps it and goes on. A step of its retirement that changes the
+    /// candidate alone (its rename when its own directory is immutable or
+    /// append-only, which changes nothing, an unlink in it, the sync of its
+    /// directory, its removal) that fails is
+    /// returned as [`GcRemoval::Unfinished`]: the tombstone, once renamed,
+    /// is already durable, and every other candidate's deletion rests on its
+    /// own examination, lock and durable tombstone, so the caller keeps it
+    /// as the step left it and goes on; a later pass resumes it. An error is
+    /// returned only for the root itself (its mount identity, its syncs, a
+    /// rename it or its filesystem refuses) and for an entry that changed
+    /// identity while it was being retired, which only something other than
+    /// this pass can have done.
     pub(super) fn gc_retire(&self, original: &str, retired: bool) -> io::Result<GcRemoval> {
         validate(original, false)?;
         if original.contains('/') {
@@ -906,8 +935,26 @@ impl Directory {
             } != 0
             {
                 let error = io::Error::last_os_error();
+                // Renaming a directory inside its parent needs no
+                // permission on the directory itself, so a failure is the
+                // root's or its filesystem's (no write permission on the
+                // root, a read-only or full filesystem, an append-only root,
+                // an I/O error) and ends the pass, except the namespace's own
+                // immutable or append-only flag, which concerns it alone when
+                // the root carries neither.
+                // Nothing has been renamed either way.
                 return if error.kind() == io::ErrorKind::AlreadyExists {
                     Ok(GcRemoval::Unrecognized)
+                } else if error.raw_os_error() == Some(libc::EPERM)
+                    && immutable_or_append_only(&directory)
+                    && !immutable_or_append_only(&self.0)
+                {
+                    Ok(unfinished(
+                        false,
+                        "renaming the immutable or append-only namespace directory to its \
+                         tombstone",
+                        error,
+                    ))
                 } else {
                     Err(error)
                 };
@@ -931,10 +978,18 @@ impl Directory {
             }
             // SAFETY: pinned namespace and exact regular-file inode checked.
             if unsafe { libc::unlinkat(directory.as_raw_fd(), entry_name.as_ptr(), 0) } != 0 {
-                return Err(io::Error::last_os_error());
+                return Ok(unfinished(
+                    true,
+                    format_args!("unlinking {}", entry_name.to_string_lossy()),
+                    io::Error::last_os_error(),
+                ));
             }
         }
-        directory.sync_all()?;
+        // A failed sync is not retried here: the next pass lists what this
+        // directory holds again and repeats every step from there.
+        if let Err(error) = directory.sync_all() {
+            return Ok(unfinished(true, "syncing the tombstone directory", error));
+        }
         if let Some(FileLock { file }) = &lock {
             if file.metadata()?.nlink() != 1 || !same_entry(&directory, c"rollback.lock", file)? {
                 return Err(io::Error::new(
@@ -944,7 +999,11 @@ impl Directory {
             }
             // Keep the acquired lock descriptor alive through rmdir + fsync.
             if unsafe { libc::unlinkat(directory.as_raw_fd(), c"rollback.lock".as_ptr(), 0) } != 0 {
-                return Err(io::Error::last_os_error());
+                return Ok(unfinished(
+                    true,
+                    "unlinking rollback.lock",
+                    io::Error::last_os_error(),
+                ));
             }
         }
         if !same_entry(&self.0, &retired_name, &directory)? {
@@ -962,7 +1021,11 @@ impl Directory {
             )
         } != 0
         {
-            return Err(io::Error::last_os_error());
+            return Ok(unfinished(
+                true,
+                "removing the tombstone directory",
+                io::Error::last_os_error(),
+            ));
         }
         self.0.sync_all()?;
         Ok(GcRemoval::Removed)

@@ -515,8 +515,10 @@ A namespace's existing `rollback.lock` must be available. Open file handles keep
 the session and this lock alive even after their volume object drops. Cleanup
 skips unknown files, symlinks, hardlinks, mount boundaries and original
 namespaces missing their lock file. A namespace it cannot open or examine
-(one the daemon user does not own, for example) is kept and reported with the
-error, and cleanup goes on to the next one. A Linux kernel supporting statx mount IDs
+(one the daemon user does not own, for example), or one whose retirement
+stops at a step that changes it alone (a directory the daemon user may not
+write, so that its tombstone cannot be emptied), is kept and reported with
+the error, and cleanup goes on to the next one. A Linux kernel supporting statx mount IDs
 (5.8+) and consistent advisory locks for every writer are required; unsupported
 or failed automatic cleanup postpones reclamation without revoking the accepted
 new root, and says so in a `WARN` log event. There is no fallback that deletes
@@ -537,8 +539,10 @@ sudo -u maki maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and
-`retained` namespace arrays as JSON, and `skipped_unreadable`, which gives
-each namespace it could not open or examine with the error. Each array holds
+`retained` namespace arrays as JSON, `skipped_unreadable`, which gives
+each namespace it could not open or examine with the error, and
+`unfinished`, which gives each namespace or tombstone whose retirement it
+could not finish with the step and the error. Each array holds
 at most 4,096 entries;
 use the corresponding `counts` fields for totals and `details_truncated` to
 detect omitted details. See [GC reports](remote-witness-service.md#retire-old-writer-namespaces).

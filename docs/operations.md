@@ -316,7 +316,7 @@ Events that matter operationally:
 | Level | Event |
 |---|---|
 | `ERROR` | control socket server stopped; shutdown during unload failed; panic caught at the NBD boundary; `maki-attach` rollback halted (attach record kept) |
-| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings; automatic remote namespace GC did not complete, or kept namespaces it could not examine |
+| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings; automatic remote namespace GC did not complete, or kept namespaces it could not examine or could not finish retiring |
 | `INFO` | default threshold; lifecycle milestones |
 | `DEBUG` | free-space query failures, control session lifecycle |
 

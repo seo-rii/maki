@@ -361,6 +361,15 @@ fn collect_after_activation(
                      `maki volume gc` lists each with its error"
                 );
             }
+            if let Some(first) = report.unfinished.first() {
+                tracing::warn!(
+                    count = report.counts.unfinished,
+                    namespace = %first.name,
+                    error = %first.error,
+                    "automatic remote GC could not finish retiring writer namespaces; \
+                     `maki volume gc` lists each with its error"
+                );
+            }
         }
         Err(error) => tracing::warn!(
             %error,
