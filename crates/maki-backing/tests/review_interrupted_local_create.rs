@@ -281,6 +281,73 @@ fn control_create_refuses_a_used_backing_beside_an_empty_witness_directory() {
     assert_eq!(read(&reopened), b"committed");
 }
 
+/// Damage that reads back as bytes, a length field or one byte of a
+/// manifest, does not make a committed volume's manifest slots look unused.
+/// Beside a witness directory without an anchor (one that lost it, or is
+/// not mounted), `create` refuses the backing and changes nothing: a slot
+/// that holds anything but zeros, or, in slot 0, the initial generation-0
+/// manifest, belongs to a volume, whatever state it is in.
+#[test]
+fn create_refuses_a_committed_backing_whose_manifest_slots_are_damaged() {
+    use std::os::unix::fs::FileExt;
+    type Damage = fn(&Path);
+    let header: Damage = |slot| {
+        let file = std::fs::OpenOptions::new().write(true).open(slot).unwrap();
+        file.write_all_at(&[0xff; 8], 0).unwrap();
+    };
+    let body: Damage = |slot| {
+        let file = std::fs::OpenOptions::new().write(true).open(slot).unwrap();
+        file.write_all_at(b"#", 8).unwrap();
+    };
+    // Slot 1 as `open` recreates a missing inactive slot: zeros.
+    let zeroed: Damage = |slot| {
+        let file = std::fs::OpenOptions::new().write(true).open(slot).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(0).unwrap();
+        file.set_len(len).unwrap();
+    };
+    let mut created_over = Vec::new();
+    for (what, slot0, slot1) in [
+        ("both lengths", header, header),
+        ("a byte of both", body, body),
+        ("the length of slot 0, slot 1 zeroed", header, zeroed),
+        ("a byte of slot 0, slot 1 zeroed", body, zeroed),
+    ] {
+        let (root, witness) = directories();
+        let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap();
+        commit(&backing, b"committed");
+        let file = backing.open("second", true).unwrap();
+        file.write_at(0, b"committed too").unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("").unwrap();
+        drop((file, backing));
+        slot0(&root.path().join("rollback.manifest.0"));
+        slot1(&root.path().join("rollback.manifest.1"));
+        std::fs::remove_file(witness.path().join("anchor")).unwrap();
+        let slots = |root: &Path| {
+            ["rollback.manifest.0", "rollback.manifest.1"]
+                .map(|slot| std::fs::read(root.join(slot)).unwrap())
+        };
+        let state = || {
+            (
+                entries(root.path()),
+                entries(witness.path()),
+                slots(root.path()),
+            )
+        };
+        let before = state();
+        if RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_ok()
+            || state() != before
+        {
+            created_over.push(what);
+        }
+    }
+    assert!(
+        created_over.is_empty(),
+        "create completed over, or changed, a backing that committed data: {created_over:?}"
+    );
+}
+
 /// An anchor that is empty is what an earlier release's creation left when
 /// it was cut after installing it, and also what a witness whose anchor
 /// was truncated looks like. `create` never writes over an anchor, and
