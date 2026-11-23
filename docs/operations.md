@@ -503,7 +503,11 @@ Every executing verb (attach, detach, cleanup, recover, grow, verify) reads
 this file only when it is a root-owned regular file with one link, not
 writable by group or others, below root-owned directories with the same
 restriction: the helper runs as root on what it says. `--plan` reads any file.
-Command-line flags override individual values other than those LVM pins.
+For attach, detach, recover, cleanup and grow, command-line flags override the
+NBD device, NBD socket, VG, LV, mountpoint, volume UUID and XFS UUID, and
+`--init-sentinel` (attach only) turns the sentinel option on, never off.
+`device_block_size` and the LVM pins come from the file only, and `verify`
+accepts no override.
 Every value is checked before it reaches a system utility: option-like values,
 relative or non-canonical paths, non-canonical pinned devices (`/dev/nbd01`)
 and malformed UUIDs are rejected with exit code 2 and no plan is printed.
