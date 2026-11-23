@@ -662,4 +662,73 @@ mod tests {
         let version = unsafe { CStr::from_ptr(PLUGIN.version) };
         assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
     }
+
+    const UNREAD_STDERR_CHILD: &str = "MAKI_NBDKIT_PLUGIN_TEST_UNREAD_STDERR";
+
+    /// Runs in a copy of this test binary whose stderr is a pipe nobody
+    /// reads (see the test below): each callback refuses and reports why,
+    /// and nothing panics.
+    #[test]
+    fn child_reports_refusals_to_an_unread_stderr() {
+        if std::env::var_os(UNREAD_STDERR_CHILD).is_none() {
+            return;
+        }
+        static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        std::panic::set_hook(Box::new(|info| PANICS.lock().push(info.to_string())));
+        let statuses = [
+            ("unknown parameter", unsafe {
+                config(c"volume".as_ptr(), c"example".as_ptr())
+            }),
+            ("non-UTF-8 config path", unsafe {
+                config(c"config".as_ptr(), c"/tmp/\xff.toml".as_ptr())
+            }),
+            ("missing config path", unsafe { config_complete() }),
+            (
+                "failed startup",
+                startup::Startup::new().run(|| Err("fixture startup error".into())),
+            ),
+        ];
+        let panics = PANICS.lock().clone();
+        let accepted: Vec<_> = statuses
+            .iter()
+            .filter(|(_, status)| *status != -1)
+            .collect();
+        println!("panics: {panics:?}; not refused: {accepted:?}");
+        std::process::exit(if panics.is_empty() && accepted.is_empty() {
+            0
+        } else {
+            1
+        });
+    }
+
+    /// nbdkit forwards the plugin's stderr to its log. The configuration
+    /// and startup callbacks reported a refusal with `eprintln!`, which
+    /// panics when that write fails (a log pipe whose reader has gone, a
+    /// full log file): the callback still failed, but through its panic
+    /// boundary, which set EIO and logged a caught panic in place of the
+    /// reason.
+    #[test]
+    fn refusals_reach_an_unread_stderr_without_a_panic() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "plugin::tests::child_reports_refusals_to_an_unread_stderr",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UNREAD_STDERR_CHILD, "1")
+            .env("RUST_BACKTRACE", "0")
+            .env_remove(maki_core::logging::LOG_ENV)
+            .stderr(writer)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
