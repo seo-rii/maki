@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -187,8 +190,8 @@ client_key_file={key:?}
             .unwrap()
             .validate()
             .unwrap();
-        std::fs::write(&writer_config, writer_text).unwrap();
-        std::fs::write(&admin_config, config(&admin_files)).unwrap();
+        volume_config::write(&writer_config, writer_text).unwrap();
+        volume_config::write(&admin_config, config(&admin_files)).unwrap();
         let client = |tls| {
             Arc::new(
                 Client::new(ClientOptions {
@@ -607,7 +610,7 @@ fn admin_approval_syntax_and_nonremote_configs_fail_before_mutation() {
     }
     let raw = std::fs::read_to_string(&fixture.writer_config).unwrap();
     let plain = fixture.dir.path().join("plain.toml");
-    std::fs::write(
+    volume_config::write(
         &plain,
         raw.split("[backing.rollback_protection]").next().unwrap(),
     )
@@ -725,7 +728,7 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
 /// release has, where a plain `volume create` refuses the provider (M-008).
 fn fake_provider_compiled(dir: &std::path::Path) -> bool {
     let config = dir.join("fake-probe.toml");
-    std::fs::write(
+    volume_config::write(
         &config,
         format!(
             "config_schema_version=1\n[volume]\nname=\"fake-probe\"\nmax_virtual_size=\"1MiB\"\n\
@@ -787,7 +790,7 @@ fn resume_enrollment_refuses_a_provider_this_build_cannot_construct() {
         )
         .replace("max_ciphertext_size=4384", "max_ciphertext_size=4104");
     assert!(fake.contains("provider=\"fake\""));
-    std::fs::write(&f.admin_config, fake).unwrap();
+    volume_config::write(&f.admin_config, fake).unwrap();
     // Initialization would record provider "fake" in a superblock that no
     // build without the provider can attach, and consume the enrollment.
     failure(
@@ -803,7 +806,7 @@ fn resume_enrollment_refuses_a_provider_this_build_cannot_construct() {
     assert_eq!(inspect(f.writer.as_ref()), before, "authority changed");
     assert_eq!(entries(), root_before, "backing root changed");
     // The same approval still completes with a provider this build has.
-    std::fs::write(&f.admin_config, real).unwrap();
+    volume_config::write(&f.admin_config, real).unwrap();
     success(&[
         "volume",
         "resume-enrollment",
@@ -828,7 +831,7 @@ fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness() {
         ),
     );
     let config = f.dir.path().join("ha.toml");
-    std::fs::write(&config, &raw).unwrap();
+    volume_config::write(&config, &raw).unwrap();
     let path = config.to_str().unwrap();
     success(&["volume", "create", path]);
     let output = success(&["volume", "witness", path]);
@@ -841,7 +844,7 @@ fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness() {
         "read-only remote backing inspection is not supported",
     );
     assert_eq!(inspect(f.writer.as_ref()), before);
-    std::fs::write(
+    volume_config::write(
         &config,
         raw.replace(&identity, &uuid::Uuid::from_bytes([2; 16]).to_string()),
     )

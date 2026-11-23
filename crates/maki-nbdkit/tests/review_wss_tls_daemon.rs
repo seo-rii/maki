@@ -1,5 +1,8 @@
 //! Daemon-path coverage for verified WebSocket TLS and mutual TLS.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -198,7 +201,7 @@ socket = "{socket}"
         addr = server.addr,
     );
     let path = directory.path().join("volume.toml");
-    std::fs::write(&path, &raw).unwrap();
+    volume_config::write(&path, &raw).unwrap();
     (directory, raw, path.to_string_lossy().into_owned())
 }
 

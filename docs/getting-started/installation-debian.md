@@ -160,7 +160,7 @@ This installs `maki`, `maki-attach`, `maki-check`, the nbdkit plugin at
 
 | Path | Owner and mode | Purpose |
 |---|---|---|
-| `/etc/maki/volumes/` | `root:maki 0750` | Data-plane volume configurations (`<volume>.toml`) |
+| `/etc/maki/volumes/` | `root:maki 0750` | Data-plane volume configurations (`<volume>.toml`, each `root:maki 0640`) |
 | `/etc/maki/attach/` | `root:root 0700` | Privileged attach configurations, never readable by the daemon |
 | `/etc/maki/secrets/` | `root:root 0700` | Credentials loaded by systemd `LoadCredential=` |
 | `/var/lib/maki/` | `root:maki 0750` | Backing directories, one `0700` subdirectory per volume owned by `maki` |
@@ -195,6 +195,10 @@ Grant an administrator account access to control sockets by adding it to the
 `maki-admin` group. Root does not need it. The volume configuration is
 readable only by root and group `maki`, so a `maki-admin` member names the
 socket directly: `maki status --socket /run/maki-control/<volume>/control.sock`.
+Keep it that way: Maki refuses a volume configuration its group or others can
+write, one owned by a user other than root or the loading process's user, a
+symlink and a file with a second hard link
+([configuration file](../configuration.md#configuration-file)).
 Do not add administrators to group `maki` instead: it also opens the NBD
 sockets under `/run/maki`.
 

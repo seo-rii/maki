@@ -312,6 +312,15 @@ growing memory. Each lane keeps several batches in flight (bounded by
 `limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
 requests behind it. Local providers are called directly.
 
+The dispatcher and the random-prefix wrapper check every unit of a call before
+the first RPC and refuse the whole call for one they cannot carry. The
+scheduler applies the same per-unit checks at admission, request by request,
+so a request with such a unit (an empty ciphertext from a damaged slot, say)
+fails alone instead of failing every request coalesced with it. Only a
+retry-safe provider has a rejected coalesced call re-sent request by request;
+a provider that is not retry-safe is never sent a request twice, so its
+rejection reaches every request in the call.
+
 Queued groups own their payload and admission charge together. Cancellation
 removes the complete group even if it is behind another group waiting for an
 RPC slot. An active coalesced RPC remains necessary until its last caller
@@ -319,7 +328,11 @@ leaves. For bounded-error calls, one caller budget covers admission, coalescing,
 the slot wait, and the provider response; dispatch does not restart it.
 
 The dispatcher validates quarantined endpoints in background tasks, never on
-the request path. Each admitted call owns a circuit-breaker permit for its
+the request path. Only proof that an endpoint serves another contract rejects
+it for the life of the set; an inconclusive validation (a failed exchange,
+such as a timeout or a truncated reply) is retried with the circuit breaker's
+doubling open interval, and the endpoint serves only after a validation
+succeeds in full. Each admitted call owns a circuit-breaker permit for its
 generation. Completion, operation deadline, cancellation, request/provider
 errors, and retry-budget refusal all release a HalfOpen probe slot; outcomes
 that are not endpoint failures do not advance the failure count. A stale
@@ -417,6 +430,11 @@ separate privileged `lvextend` and `xfs_growfs` operation.
   releasing ownership; `into_vec` transfers zeroization to the caller and
   releases only that buffer's lock ownership.
 - Configuration rejects literal values for sensitive headers.
+- Every loader reads a volume configuration through one checked reader
+  (`maki_nbdkit::config_file`): on Unix a final symlink, a second hard link, an
+  owner other than root or the loading process's user, or group or other write
+  access refuses the file before it is parsed
+  ([configuration file](configuration.md#configuration-file)).
 - Repeated credential names must declare the same source throughout a volume
   configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.

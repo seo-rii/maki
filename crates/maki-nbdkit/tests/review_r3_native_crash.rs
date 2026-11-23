@@ -9,6 +9,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
@@ -153,7 +156,7 @@ root = {root:?}
 socket = {control:?}
 "#
         );
-        std::fs::write(&config, &raw).unwrap();
+        volume_config::write(&config, &raw).unwrap();
         maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         let mut client = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
         client.write_all(CLIENT.as_bytes()).unwrap();

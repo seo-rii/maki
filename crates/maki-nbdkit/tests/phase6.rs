@@ -4,6 +4,9 @@
 //! surface the nbdkit C ABI shim calls. Kernel-level verification (libnbd,
 //! /dev/nbd fio) runs on Linux; see docs/testing.md.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -325,7 +328,7 @@ socket = "{control_sock}"
 "#
     );
     let config_path = dir.path().join("vol.toml");
-    std::fs::write(&config_path, &config).unwrap();
+    volume_config::write(&config_path, &config).unwrap();
 
     // maki volume create, then adapter open.
     maki_nbdkit::daemon::create_volume_from_config_str(&config).unwrap();

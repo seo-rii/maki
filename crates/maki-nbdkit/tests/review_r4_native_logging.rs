@@ -12,6 +12,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
@@ -66,7 +69,7 @@ root = {root:?}
 socket = {control:?}
 "#
         );
-        std::fs::write(&config, &raw).unwrap();
+        volume_config::write(&config, &raw).unwrap();
         maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         Self { dir, config, root }
     }

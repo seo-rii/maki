@@ -6,6 +6,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use maki_control::protocol::{read_response, send_command, Request};
 use std::path::Path;
 use std::process::Command;
@@ -106,7 +109,7 @@ root = {root:?}
 socket = {socket:?}
 "#
     );
-    std::fs::write(&config_path, &config).unwrap();
+    volume_config::write(&config_path, &config).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&config).unwrap();
     let exe = std::env::current_exe().unwrap();
     let plugin = native_plugin::path();

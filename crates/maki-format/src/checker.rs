@@ -149,8 +149,9 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     // crash between file creation and the catalog update, or from a fallback
     // to an older catalog copy. Recovery adopts it and serves its slots
     // (S-01); one beyond the geometry is never read. Only the canonical
-    // spelling is a shard file, exactly as recovery parses it.
-    let entries = match backing.list(layout::DATA_DIR) {
+    // (ASCII) spelling is a shard file, exactly as recovery parses it, so a
+    // name that is not UTF-8 is skipped like any other.
+    let entries = match backing.list_skipping_non_utf8(layout::DATA_DIR) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             report

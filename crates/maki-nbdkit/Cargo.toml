@@ -49,3 +49,7 @@ tokio-rustls.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Digest of the mount table compared across memory-budget admission passes.
+[target.'cfg(target_os = "linux")'.dependencies]
+sha2 = "0.10"

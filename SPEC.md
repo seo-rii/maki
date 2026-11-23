@@ -343,7 +343,8 @@ Recommended layout:
 └── minio.nbd
 ```
 
-Recommended permissions:
+Recommended ownership and permissions (the volume configuration rule below
+is enforced):
 
 ```text
 /etc/maki
@@ -376,6 +377,22 @@ root:root                 0700
 /run/maki-attach/*
 root:root                 0600
 ```
+
+A volume configuration decides where plaintext goes: the provider and its
+endpoints, TLS trust, credential references, the backing root and the rollback
+witness. Every loader (the data-plane daemon, `maki` and `maki-benchmark`)
+MUST open it without following a final symlink and MUST refuse, before parsing
+it, anything but a regular file with exactly one link, owned by root or by the
+user the loading process runs as, with no group or other write permission. The
+checks MUST describe the opened descriptor that is then read. Group and other
+read MAY be granted: a configuration holds credential references, never
+secrets (§9). The recommended `root:maki 0640` is accepted by root and by the
+daemon user, which reads it through its group; a file owned by the daemon user
+is refused by commands run as root. The directory holding it SHOULD be
+root-owned and not writable by others. This is the witness configuration's
+owner and mode rule plus the single link; secret files (§9) have the same
+owner rule and a stricter mode rule. Non-Unix hosts check only that the file
+is regular.
 
 The NBD Unix Domain Socket:
 
@@ -786,7 +803,10 @@ the provider wire; the derived ID binds the volume's plaintext layout. Changing
 the prefix length or enabling/disabling it on an existing volume MUST refuse
 attach. Batch limits and remote admission MUST account for expanded plaintext,
 and endpoint/canary verification MUST cover the same prefix wrapper used for
-volume I/O. See [random plaintext prefixes](docs/random-plaintext-prefix.md).
+volume I/O. The wrapper translates the derived ID to the base ID without
+binding either: the attach self-test's compatibility-ID probe MUST reach the
+provider through it (§18), and its own refusal of another ID is not context
+evidence. See [random plaintext prefixes](docs/random-plaintext-prefix.md).
 
 ---
 
@@ -885,17 +905,22 @@ for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
 `CryptoBatchRequest`. A provider that declares context binding MUST tie
 ciphertext to all of them. Maki's attach self-test probes each field
 separately (plus the unit index) and refuses attach when a foreign value
-decrypts to the original plaintext. WebSocket and gRPC always send each
-item's unit index; an HTTP mapping that declares context binding MUST also
+decrypts to the original plaintext. The probes run on the provider stack the
+volume is served through and MUST reach the provider: with random prefixes
+(§17) the compatibility-ID probe is forwarded through the wrapper, so the
+provider is asked to decrypt under the same foreign base ID as on a volume
+without a prefix and the verdict is the same. WebSocket and gRPC always send
+each item's unit index; an HTTP mapping that declares context binding MUST also
 map a per-item `unit_index` field (in `fields` of a per-item body, in
 `item_fields` of a batch, whose top-level fields belong to no item), and
 configuration validation rejects one that omits any of these fields. A
-schema-level refusal is accepted only as `CryptoError::UnsupportedContext` for
-the exact field that probe changed: `FormatVersion` or `CompatibilityId`. A
-generic bad request, provider failure, or a refusal of another field does not
-prove context binding. Definitive `CryptoError::Integrity` or a valid changed
-plaintext also satisfies a context probe; an unavailable endpoint remains
-inconclusive.
+schema-level refusal is accepted only as the provider's
+`CryptoError::UnsupportedContext` for the exact field that probe changed:
+`FormatVersion` or `CompatibilityId`; a layer that does not bind a field never
+answers with one. A generic bad request, provider failure, or a refusal of
+another field does not prove context binding. Definitive
+`CryptoError::Integrity` or a valid changed plaintext also satisfies a context
+probe; an unavailable endpoint remains inconclusive.
 
 Explicit schema refusals use HTTP status `422` or gRPC status
 `FailedPrecondition` with exactly one `maki-crypto-error` header/metadata value:
@@ -1670,6 +1695,32 @@ ciphertext encrypted by B must decrypt on A
 ```
 
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
+
+An endpoint that is unreachable when these self-tests run at attach is
+quarantined. A quarantined endpoint MUST NOT receive a request until
+the same validation, run against a validated endpoint under the real volume
+context, succeeds in full. The set's common contract covers every configured
+endpoint, quarantined ones included, so admitting one never changes it.
+
+Validation evidence is either conclusive or inconclusive:
+
+```text
+conclusive (excluded for the life of the set):
+  replies that passed validation show another key (either peer
+  refuses or misdecrypts the other's ciphertext, or the volume canary
+  is refused or decrypts to the wrong plaintext), another
+  compatibility id, or a claimed capability that is not honoured; an
+  explicit refusal of the volume's real context
+
+inconclusive (validated again later):
+  a transport error, timeout or admission limit; a reply that does
+  not parse, is truncated or has the wrong shape; any other failure
+  of the validated peer
+```
+
+After an inconclusive attempt the endpoint stays quarantined and is
+validated again after `open_initial`; the spacing doubles after each further
+inconclusive attempt, up to `open_max` (§33).
 
 Initial endpoint selection policy:
 

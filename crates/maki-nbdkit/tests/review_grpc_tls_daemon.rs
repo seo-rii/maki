@@ -1,6 +1,9 @@
 //! Daemon-path coverage for verified gRPC TLS and mutual TLS. All peers and
 //! certificate material are generated locally for the test process.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -229,7 +232,7 @@ socket = "{socket}"
             socket = socket.to_string_lossy().replace('\\', "/"),
         );
         let path = self.directory.path().join("volume.toml");
-        std::fs::write(&path, &raw).unwrap();
+        volume_config::write(&path, &raw).unwrap();
         (raw, path)
     }
 }

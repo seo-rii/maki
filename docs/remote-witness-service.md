@@ -236,7 +236,10 @@ its owner can rewrite the administrator allow-list, the key path or the
 authority it names. A root-owned `0644` file suits both the service account
 and root; a command run as root refuses a configuration owned by the service
 account. Configurations hold no secrets, so group and other read access is
-allowed. Credential files are
+allowed. The writer and administrator configurations that the `maki volume`
+commands read are volume configurations and follow the same owner and mode
+rule, with exactly one hard link and at most 1 MiB
+([configuration file](configuration.md#configuration-file)). Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
 accessible to group/others (`0600` is appropriate), and must be owned by root
 or by the user the loading process runs as. A key owned by any other user is

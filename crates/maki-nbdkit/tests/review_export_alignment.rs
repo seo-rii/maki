@@ -1,5 +1,8 @@
 //! BUG-136: every exported byte must be reachable by a minimum-I/O request.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use maki_format::config::parse_config;
 use maki_nbdkit::adapter::NbdAdapter;
 use maki_nbdkit::daemon::{attach_from_config, create_volume_from_config_str};
@@ -115,7 +118,7 @@ fn aligned_export_sizes_are_fully_accessible() {
         parse_config(&raw).unwrap().validate().unwrap();
         create_volume_from_config_str(&raw).unwrap();
         let config = directory.path().join("volume.toml");
-        std::fs::write(&config, raw).unwrap();
+        volume_config::write(&config, raw).unwrap();
         let adapter = NbdAdapter::open_config(config.to_str().unwrap()).unwrap();
         assert_eq!(adapter.get_size(), size);
         assert_eq!(adapter.block_sizes(), (minimum, 4096, 8192));
