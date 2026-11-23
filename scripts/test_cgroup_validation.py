@@ -429,7 +429,7 @@ module.require_oom({{"Running": False, "ExitCode": 137, "OOMKilled": False}})
         bytecode = (script.with_name("__pycache__"), script.stem + ".*")
         for stale in bytecode[0].glob(bytecode[1]):
             stale.unlink()
-        result = campaign.subprocess.run([campaign.sys.executable, "-O", "-c", code], capture_output=True)
+        result = campaign.subprocess.run([campaign.sys.executable, "-B", "-O", "-c", code], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(list(bytecode[0].glob(bytecode[1])), [], "the child compiled into the checkout")
 

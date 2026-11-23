@@ -186,6 +186,8 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
         body += after + "\n"
         result = subprocess.run(["/bin/bash", "-c", body],
                                 env=dict(os.environ, FIXTURE=str(self.root),
+                                         # The driver imports the wrapper from scripts/.
+                                         PYTHONDONTWRITEBYTECODE="1",
                                          CONNECT_MODE=mode, PYTHON=sys.executable,
                                          WRAPPER=str(WRAPPER), DRIVER=str(self.driver),
                                          REPO_ROOT=str(SCRIPT.parent.parent)),
