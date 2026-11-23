@@ -60,11 +60,12 @@ for a disconnected backend.
 .B cleanup
 uses the attachment record to select detach or recovery.
 .B recover-failed-start
-is the systemd failed-start cleanup hook. It queues the recovery coordinator
-and, when the start died between LVM activation and the mapping proof, rolls
-back that activation itself while the daemon still serves the device: the
-scoped VG deactivation, the NBD disconnect, and the removal of the record. It
-never unmounts.
+is the systemd failed-start cleanup hook. It asks systemd to queue the
+recovery coordinator and, when the start died between LVM activation and the
+mapping proof, rolls back that activation itself while the daemon still
+serves the device, also when systemd refused the request: the scoped VG
+deactivation, the NBD disconnect, and the removal of the record. It never
+unmounts.
 .SH OPTIONS
 .TP
 .BI \-\-volume " name"

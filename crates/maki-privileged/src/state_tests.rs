@@ -6,6 +6,7 @@ use super::*;
 static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
+use std::time::Duration;
 
 struct Fixture(PathBuf);
 
@@ -300,11 +301,16 @@ impl Drop for PausedChild {
 
 /// The failed-start hook must not queue behind another volume's helper for
 /// as long as that one runs: its lock attempt ends at its deadline, and
-/// succeeds once the lock is free.
+/// succeeds once the lock is free. A wait that gave up holds nothing.
 #[test]
 fn a_bounded_lock_attempt_gives_up_at_its_deadline() {
     let fixture = Fixture::new();
     let state = fixture.state().unwrap();
+    drop(
+        state
+            .lock_until(Instant::now())
+            .expect("a free lock is taken at once"),
+    );
     let held = state.lock().unwrap();
     let started = Instant::now();
     let error = state
@@ -314,13 +320,58 @@ fn a_bounded_lock_attempt_gives_up_at_its_deadline() {
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(started.elapsed() >= Duration::from_millis(150));
     assert!(started.elapsed() < Duration::from_secs(2));
+    let started = Instant::now();
+    assert!(state.lock_until(started).is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // The abandoned request is granted the lock now, and must let it go.
     drop(held);
-    let lock = state.lock_until(Instant::now()).unwrap();
+    until(|| state.lock_waiters() == 0);
+    let lock = state
+        .lock_until(Instant::now() + Duration::from_secs(5))
+        .expect("an abandoned lock request kept the lock it was granted");
     assert!(
         state.lock_until(Instant::now()).is_err(),
         "a bounded attempt took a lock that is held"
     );
     drop(lock);
+}
+
+/// Wait until `condition` holds, or give up after a few seconds.
+fn until(condition: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !condition() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Helpers wait for the attach lock in a queue that the kernel serves in
+/// order. The failed-start hook's bounded wait must keep its place in it: a
+/// wait that only retried a non-blocking attempt got the lock only once
+/// nobody was queued, so every helper that queued meanwhile overtook it,
+/// and on a host attaching several volumes the hook ran out of time.
+#[test]
+fn a_bounded_lock_wait_is_served_before_helpers_that_queue_after_it() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    let held = state.lock().unwrap();
+    let order = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let lock = state.lock_until(Instant::now() + Duration::from_secs(15));
+            order.lock().unwrap().push(("bounded", lock.is_ok()));
+        });
+        until(|| state.lock_waiters() >= 1);
+        scope.spawn(|| {
+            let _lock = state.lock().unwrap();
+            order.lock().unwrap().push(("later", true));
+        });
+        until(|| state.lock_waiters() >= 2);
+        drop(held);
+    });
+    assert_eq!(
+        order.into_inner().unwrap(),
+        [("bounded", true), ("later", true)]
+    );
 }
 
 /// The attach lock is a `flock` on `attach.lock`, which belongs to the open
