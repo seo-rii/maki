@@ -238,6 +238,11 @@ def cargo_configuration(source, environment):
                     if present:
                         fail(f"Cargo configuration {path} sets [{table}] outside the committed source; "
                              "remove it before preparing a candidate")
+                # Cargo reads included files like the including one, so they
+                # could carry either table without being listed here.
+                if "include" in settings:
+                    fail(f"Cargo configuration {path} includes other configuration files outside the "
+                         "committed source; remove the include before preparing a candidate")
                 records.append({"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()})
             break
     return records
