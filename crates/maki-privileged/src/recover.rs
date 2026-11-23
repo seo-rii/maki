@@ -48,6 +48,25 @@ impl RecoveryProof {
         }
         Ok(())
     }
+
+    /// The VG UUID that every recorded mapping's device-mapper uuid
+    /// (`LVM-<VG UUID><LV UUID>[-suffix]`) carries, without dashes. `None`
+    /// unless the proof has a mapping and all of them agree.
+    pub(super) fn vg_uuid(&self) -> Option<String> {
+        let mut uuids = self
+            .nodes
+            .iter()
+            .filter_map(|node| node.dm_uuid.as_deref())
+            .map(|uuid| {
+                uuid.strip_prefix("LVM-")
+                    .and_then(|identity| identity.get(..32))
+                    .filter(|vg| vg.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            });
+        let first = uuids.next()??;
+        uuids
+            .all(|uuid| uuid == Some(first))
+            .then(|| first.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,12 +564,24 @@ pub(super) fn observe_complete(
     verified_mount.ok_or_else(|| invalid("workload mount is missing"))
 }
 
-fn absent_backend(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
+/// Recovery needs the recorded device without a backend. One under the
+/// recorded identity is a live attachment; another identity is returned.
+fn backend_other_than_recorded(
+    record: &BoundDeviceRecord,
+    system: &impl System,
+) -> Result<Option<String>, ExecError> {
     match system.backend(&record.device)? {
-        None => Ok(()),
+        None => Ok(None),
         Some(identifier) if identifier == record.connection_id => Err(identity_error(
             "backend is still connected; use detach for a live attachment",
         )),
+        Some(identifier) => Ok(Some(identifier)),
+    }
+}
+
+fn absent_backend(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
+    match backend_other_than_recorded(record, system)? {
+        None => Ok(()),
         Some(_) => Err(super::other_identity(record, "recovery")),
     }
 }
@@ -573,8 +604,16 @@ pub(super) fn execute(
             "recovery configuration does not match the trusted attachment",
         ));
     }
-    for _ in 0..4 {
-        absent_backend(&record, system)?;
+    for attempt in 0..4 {
+        if let Some(identifier) = backend_other_than_recorded(&record, system)? {
+            // Found on entry, the device is another connection's: the record
+            // goes if nothing of its attachment remains. Later, a changed
+            // backend means the storage changed under this recovery.
+            if attempt == 0 {
+                return super::retire_displaced(&record, &identifier, "recovery", state, system);
+            }
+            return Err(super::other_identity(&record, "recovery"));
+        }
         let observed = system.disconnected_recovery_observation(&record)?;
         absent_backend(&record, system)?;
         let step = if observed.mounted {

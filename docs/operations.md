@@ -632,17 +632,47 @@ another volume's record names, a pinned `nbd_device` that another volume's
 record names is refused, and a `<volume>.nbd` entry that cannot be read refuses
 the attach and names the file, because it could name any device.
 
-If a recorded device is found connected under another identity all the same
-(an NBD client started outside the helper, or two volumes left sharing a
-device by a helper from before this rule), every verb of the recorded volume
-refuses without changing anything and keeps the record: sysfs shows what holds
-the device, not under which connection it was set up. Detach the volume or
-disconnect the client that uses the device now, then run
+A recorded device can still be found connected under another identity: an
+NBD client started outside the helper, or two volumes left sharing a device by
+a helper from before this rule. The device is no longer the record's, but the
+record is still the only authority over what its attachment may have left: a
+mount at its mountpoint, or a mapping of its VG, which on the device's number
+would now read the other connection's data. Attach, cleanup, recover and
+detach of the recorded volume therefore retire such a record, under the lock,
+only when every observation shows that nothing of the attachment remains:
+
+- the record names its VG UUID, in its mapping proof, its pre-activation
+  intent or the administrator LVM pins;
+- no device-mapper device on the host belongs to that VG (its uuid starts with
+  `LVM-` and the VG UUID without dashes), and every holder of the device and of
+  its partitions is an LVM mapping of another VG, whose uuid is `LVM-` and
+  that VG's UUID. A crypt, multipath or partition mapping, a mapping without a
+  uuid, or any other kind of holder keeps the record;
+- nothing is mounted at the recorded mountpoint, and no mount is of a mapping
+  of that VG;
+- no other volume's record names the device with the same VG UUID (a cloned
+  image) or with none;
+- the device keeps the same backend across two such observations of the host.
+
+Retiring runs no command and touches neither the device nor its connection.
+Cleanup, recover and detach then succeed; detach logs that nothing was
+attached. Attach goes on to choose a device without the recorded one, which is
+connected and may also be reserved by the other volume's record. Grow refuses
+and points to cleanup.
+
+Otherwise every verb refuses without changing anything, keeps the record and
+names what keeps it, including an observation that cannot be read. A mapping
+of the recorded VG that still sits on the device's number reads the other
+connection's data: stop whatever uses it first. Then detach the volume or
+disconnect the client that uses the device and run
 `maki-attach cleanup --volume <volume>`, which finds the device without a
-backend and retires the record. If the device's present user has to stay up,
-confirm independently that nothing is mounted at the recorded mountpoint and
-that no device-mapper mapping of the recorded VG exists, and only then remove
-`/run/maki-attach/<volume>.nbd` by hand.
+backend and continues as for any disconnected attachment. A record that names
+no VG UUID (an attach without `[lvm_identity]` pins that stopped before LVM
+activation, or a record from before activation intents) is never retired this
+way. If the device's present user has to stay up, confirm independently that
+nothing is mounted at the recorded mountpoint and that no device-mapper mapping
+of the recorded VG exists, and only then remove `/run/maki-attach/<volume>.nbd`
+by hand.
 
 `maki-attach detach` takes the same lock and compares the requested attachment
 with that record and the live `/sys/block/nbdN/backend` before unmounting or
@@ -654,8 +684,9 @@ an explicit `--nbd-device` cannot bypass this check.
 packaged service lifecycle. Under the same single attach lock, no trusted
 record is already clean and succeeds without probing the backend. A matching
 connected backend follows the detach path; a known absent backend follows the
-recovery path. A foreign or unreadable backend fails before mutation and keeps
-the record. Re-run cleanup after a partial successful effect; each selected
+recovery path. An unreadable backend fails before mutation and keeps the
+record; a backend under another identity is never touched, and its record is
+retired only as described above. Re-run cleanup after a partial successful effect; each selected
 path re-observes storage identity before its next change.
 
 If the daemon stops serving reads while its recorded kernel connection is
@@ -1263,7 +1294,8 @@ calls.
 - `maki-attach detach` compares the request with the trusted attach record
   under the attach lock and refuses one the record does not back (a different
   device, mountpoint, VG or LV, a re-attached volume, a live backend with
-  another identity); see the helper section above.
+  another identity while anything of the recorded attachment remains); see the
+  helper section above.
 - `maki-attach attach` verifies, before the sentinel is written or the probe
   runs, that the mounted filesystem is stored only on the NBD device it
   connected (device-mapper stacks are walked through sysfs); a filesystem on
