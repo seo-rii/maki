@@ -7,8 +7,10 @@
 //!             "items": [{"unit": u, "data": base64}, …]}`
 //! (`profile`, `volume` and `format` are the crypto context a context-binding
 //! provider must tie ciphertext to.)
-//! Response: `{"id": n, "items": [{"data": base64}, …]}`
+//! Response: `{"id": n, "items": [{"unit": u, "data": base64}, …]}`
 //!        or `{"id": n, "error": {"class": …, "message": …}}`
+//! (each response item echoes the `unit` of the request item it answers, in
+//! request order; a missing or different `unit` is a contract violation.)
 //! Integrity errors require `class: "integrity"` and a `reason` of exactly
 //! `"auth-tag-mismatch"` or `"context-mismatch"`; remote messages are ignored.
 //!

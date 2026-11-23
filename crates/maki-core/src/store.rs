@@ -2,7 +2,8 @@
 //!
 //! Read classification (SPEC §22):
 //! - shard absent from catalog → unwritten zero
-//! - allocation bit 0 → unwritten zero
+//! - allocation bit 0 → the slot header decides: all zero is unwritten zero,
+//!   a valid header for the unit is served, anything else is EIO (see below)
 //! - bit 1, slot invalid/missing → EIO (never fabricated data)
 //! - bit 1, slot valid → ciphertext
 //!
