@@ -176,6 +176,8 @@ fn a_refused_owner_change_leaves_no_entry_behind() {
 fn a_new_directory_is_given_away_only_while_it_is_empty() {
     let temp = tempfile::tempdir().unwrap();
     let parent = directory(temp.path());
+    // Whatever empty directory of this process's user the name holds after
+    // `mkdirat` is given away, whoever made it: here the test did.
     fs::create_dir(temp.path().join("journal")).unwrap();
     give_new_directory(&parent, c"journal", me()).unwrap();
     assert_eq!(owner_of(&temp.path().join("journal")), (me().uid, me().gid));

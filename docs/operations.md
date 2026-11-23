@@ -134,7 +134,10 @@ daemon-owned tree. A volume directory the command has to create itself is
 root's, and so is everything in it: a root-owned `0700` tree is unreadable to
 the daemon, which then fails to attach. `volume create` then warns with the
 `chown -R maki:maki` to run before the first start. The offline commands below
-follow the same rule.
+follow the same rule. A root run that a crash interrupts can leave an empty
+root-owned directory behind (or, on a filesystem without `O_TMPFILE`, an empty
+root-owned file), which later runs open as it is; hand the tree back with
+`chown -R maki:maki` after such a crash.
 
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
@@ -176,7 +179,8 @@ recovery/backup verification before accepting recovered data.
 `--deep` takes the volume lock and refuses to run while a daemon is attached.
 It recreates a missing `volume.lock` (a restore or copy can drop the empty
 file); run as root, it creates the file for the owner of the backing root, so
-the daemon can still take the lock and nothing has to be handed back.
+the daemon can still take the lock and nothing has to be handed back unless a
+crash interrupted the run (above).
 When checking a backing root directly, `maki-check` needs no segment size:
 like recovery, it bounds each journal segment file by the largest file a
 writer can produce under any valid `journal_segment_size` (at most 1 GiB), so

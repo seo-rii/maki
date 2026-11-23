@@ -72,14 +72,20 @@ root, so a lock file or manifest slot it recreates in the daemon user's tree
 stays openable by the daemon. A new file is created unnamed (`O_TMPFILE`),
 given away and synced with fsync before it is linked under its name; on a
 filesystem without unnamed files it is created under its name and given away
-before anything is written to it. A new directory is given away only while it
-is still empty. An entry that already exists is opened as it is and never
-changes owner, and a refused owner change removes what was created. The
-backing root itself, when `FileBacking::new` creates it, belongs to the user
-that runs the process. The local witness directory follows the same rule,
-and its record is never published from a file another user may hold open: a
-leftover `anchor.next` is removed first, and a file that a user other than
-root or the record's owner puts back under that name meanwhile is refused.
+before anything is written to it. A directory cannot be created unnamed: after
+`mkdirat`, the directory its name holds is given away only while it is empty
+and root's, whichever root process made it, so nothing that holds an entry or
+belongs to another user changes owner. An entry that already exists is opened
+as it is and never changes owner, and a refused owner change removes what was
+created. A crash between creating an entry and giving it away (a directory, or
+a file created under its name) leaves an empty root-owned entry that later
+runs open as it is, and the entries they create in such a directory are
+root's too. The backing root itself, when `FileBacking::new` creates it,
+belongs to the user that runs the process. The local witness directory
+follows the same rule, and its record is never published from a file another
+user may hold open: a leftover `anchor.next` is removed first, and a file
+that a user other than root or the record's owner puts back under that name
+meanwhile is refused.
 
 ## Read and write semantics
 

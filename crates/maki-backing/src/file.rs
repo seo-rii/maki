@@ -33,7 +33,8 @@ mod linux;
 /// another user owns, for that user (the directory's uid and gid): an
 /// offline check or inspect run as root may recreate a lock file or
 /// manifest slot in the daemon user's volume, and must not lock that user
-/// out. A file is given away before it is linked under its name, an
+/// out. A file is given away before it holds a byte (and, where the
+/// filesystem has unnamed files, before it is linked under its name), an
 /// existing entry is never given away, and a refused change creates
 /// nothing. The root and missing ancestors of it, which [`FileBacking::new`]
 /// creates, belong to the user that runs the process.

@@ -391,14 +391,20 @@ offline check or inspect, a creation into existing directories, a remote
 takeover, restore or enrollment recovery) MUST create each file and
 directory it adds below the backing root or in a local witness directory for
 the owner of the directory it is created in, when that owner is not root, so
-that it never leaves an entry the daemon cannot open. It MUST NOT give away
-an entry another user owns, MUST give a new file its owner before writing to
-it, and MUST refuse rather than keep an entry it cannot give away. A local
-witness publication MUST remove a temporary record left from before, and
-MUST NOT publish a file under that name that a user other than root or the
-record's owner owns, as that user may still hold it open for writing. The
-backing root itself, when such a command creates it, belongs to the user
-that runs the command.
+that it never leaves an entry the daemon cannot open. It MUST open an entry
+that already exists as it is, MUST NOT give away an entry another user owns,
+MUST give a new file its owner before writing to it, and MUST refuse rather
+than keep an entry it cannot give away. A directory cannot be created
+unnamed, so once the command has created one it MUST give away only an empty
+root-owned directory under that name; whichever root process made that
+directory, it holds nothing. A local witness publication MUST instead remove
+a temporary record left from before, and MUST NOT publish a file under that
+name that a user other than root or the record's owner owns, as that user
+may still hold it open for writing. The backing root itself, when such a
+command creates it, belongs to the user that runs the command. A crash
+between creating an entry and giving it away (a directory, or a file on a
+filesystem without unnamed files) leaves it root's, and later runs open it
+as it is; like a backing root the command created, it needs a hand-back.
 
 Privileged attachment state MUST be opened through root-controlled directory
 descriptors without following symlinks. Detach MUST verify its requested

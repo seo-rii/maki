@@ -455,11 +455,11 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
 
 /// The backing tree is created owner-only, and a root-owned entry in it is
 /// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). Root
-/// creates each file for the owner of its directory, but every directory it
-/// creates is its own, and so is everything below one: a backing root or
-/// local rollback witness directory that did not exist, or a plain volume's
-/// journal, data and checkpoint directories. Name each path that holds such
-/// an entry.
+/// creates each file and directory for the owner of the directory it creates
+/// it in, so what it leaves root-owned is a backing root or local rollback
+/// witness directory that root owns, such as one that did not exist and the
+/// command had to create, and everything below one. Name each path that
+/// holds such an entry.
 fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Option<String> {
     if !as_root {
         return None;

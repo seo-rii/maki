@@ -420,8 +420,10 @@ owner-only (`0700` directories, `0600` files). They run as root, which an
 administrator key readable only by root requires, and a process run as root
 creates every file and directory below the backing root for the owner of the
 directory it creates it in: in a backing root that belongs to the daemon user,
-the new `remote-*` tree is the daemon's, so nothing has to be handed back.
-Keep the administrator key unreadable to the daemon user.
+the new `remote-*` tree is the daemon's, so nothing has to be handed back
+unless a crash interrupted the command
+([volume lifecycle](operations.md#volume-lifecycle)). Keep the administrator
+key unreadable to the daemon user.
 
 For a stale or failed writer, review the current fence/root and replace the
 placeholders:

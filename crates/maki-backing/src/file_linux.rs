@@ -110,11 +110,12 @@ fn create_or_open_dir(parent: &File, child: &CStr) -> io::Result<File> {
 
 /// Give the directory this process has just created as `child` to `owner`,
 /// durably. A directory cannot be created unnamed, so the parent's owner
-/// could swap another one in under that name: it is given away only while
-/// it is still an empty directory of this process's user (root), so
-/// nothing that holds an entry changes owner. A refused change removes it
-/// again. A crash before the change leaves an empty root-owned directory,
-/// which a later run opens as it is.
+/// could swap another one in under that name: whatever directory the name
+/// holds is given away only while it is empty and this process's user's
+/// (root's), which only a root process can have made, so nothing that holds
+/// an entry or belongs to anyone else changes owner. A refused change
+/// removes it again. A crash before the change leaves an empty root-owned
+/// directory, which a later run opens as it is.
 fn give_new_directory(parent: &File, child: &CStr, owner: crate::FileOwner) -> io::Result<()> {
     let directory = open_at(parent, child, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let mut empty = true;

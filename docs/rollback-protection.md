@@ -146,7 +146,9 @@ daemon user. `resume-enrollment` creates the new writer namespace owner-only
 (`0700` directories, `0600` files) for the owner of the backing root, as
 takeover and restore do
 ([remote witness operations](remote-witness-service.md#snapshot-takeover-and-restore)),
-so a backing root that belongs to the daemon user needs no hand-back.
+so a backing root that belongs to the daemon user needs no hand-back unless a
+crash interrupted the command
+([volume lifecycle](operations.md#volume-lifecycle)).
 
 The authority must have `current = null`; successful first activation makes
 that condition permanently unavailable. Recovery compares the full inspected
@@ -259,7 +261,10 @@ record's owner, except that a root-owned record in a directory the daemon user
 owns goes back to that user, and a record of a third user is refused with an
 error naming both owners. Root never changes the owner of a file that was
 there before it ran: a restored copy whose files lost their owners must still
-be returned with `chown -R maki:maki` (see the recovery procedure below). A
+be returned with `chown -R maki:maki` (see the recovery procedure below), and
+so must both paths after a root run that a crash interrupted while it was
+creating an entry, which can leave it root's
+([volume lifecycle](operations.md#volume-lifecycle)). A
 leftover `anchor.next` is removed rather than reused, so the published record
 is never a file someone else may still hold open for writing; one that a third
 user puts under that name meanwhile is refused. `maki-check`,
