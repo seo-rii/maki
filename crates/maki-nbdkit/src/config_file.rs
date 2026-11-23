@@ -128,12 +128,17 @@ fn check_trusted(metadata: &std::fs::Metadata) -> Result<(), ConfigFileError> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn an_oversized_configuration_is_refused_before_it_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("volume.toml");
         let file = std::fs::File::create(&path).unwrap();
+        // Not the umask's mode: under `umask 002` the file would be refused
+        // as group-writable before its size is looked at.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
         file.set_len(MAX_VOLUME_CONFIG_BYTES + 1).unwrap();
         let error = read_volume_config(&path).unwrap_err();
         assert!(error.to_string().contains("larger than 1 MiB"), "{error}");

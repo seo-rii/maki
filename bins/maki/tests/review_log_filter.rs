@@ -4,6 +4,9 @@
 //! word as a target enabled at trace and turned every other target off. An
 //! empty value enabled nothing at all.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::process::{Command, Output};
 
 const VOLUME: &str = r#"
@@ -46,7 +49,7 @@ fn a_maki_log_value_that_is_not_a_level_keeps_warnings_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("vol");
     let config_path = dir.path().join("volume.toml");
-    std::fs::write(
+    volume_config::write(
         &config_path,
         format!("{VOLUME}[backing]\nroot = {:?}\n", root.to_string_lossy()),
     )

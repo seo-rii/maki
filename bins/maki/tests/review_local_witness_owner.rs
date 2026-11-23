@@ -6,6 +6,9 @@
 //! user needs root: without it these tests print why they are skipped.
 #![cfg(target_os = "linux")]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -93,7 +96,7 @@ impl Fixture {
             directory: tempfile::tempdir_in("/tmp").unwrap(),
             witness_parent: tempfile::tempdir_in("/dev/shm").unwrap(),
         };
-        fs::write(
+        volume_config::write(
             fixture.config(),
             config(&fixture.root(), &fixture.witness()),
         )
