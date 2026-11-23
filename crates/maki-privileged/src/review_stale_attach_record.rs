@@ -9,6 +9,7 @@
 //! state are the production ones reading that tree.
 
 use super::super::*;
+use std::cell::Cell;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,11 +44,32 @@ const DB: Export = Export {
     lv_uuid: "iiiiii-iiii-jjjj-kkkk-llll-mmmm-nnnnnn",
 };
 
+/// A volume whose image was cloned from pg's: the same LVM identity under
+/// another Maki volume and VG name.
+const CLONE: Export = Export {
+    volume: "clone",
+    volume_uuid: "2f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2e",
+    pv_uuid: PG.pv_uuid,
+    vg_uuid: PG.vg_uuid,
+    lv_uuid: PG.lv_uuid,
+};
+
 fn request(export: &Export) -> AttachRequest {
     parse(&format!("volume_uuid = '{}'\n", export.volume_uuid))
         .unwrap()
         .into_request(export.volume, AttachOverrides::default(), true)
         .unwrap()
+}
+
+/// The same attachment with administrator LVM pins.
+fn pinned(export: &Export) -> AttachRequest {
+    parse(&format!(
+        "volume_uuid = '{}'\n[lvm_identity]\npv_uuids = ['{}']\nvg_uuid = '{}'\nlv_uuid = '{}'\n",
+        export.volume_uuid, export.pv_uuid, export.vg_uuid, export.lv_uuid
+    ))
+    .unwrap()
+    .into_request(export.volume, AttachOverrides::default(), true)
+    .unwrap()
 }
 
 /// A host with `/dev/nbd3` and `/dev/nbd4`, nothing connected or mounted.
@@ -60,7 +82,14 @@ struct Host {
     /// The helper dies right after this command took effect.
     killed_after: Option<&'static str>,
     commands: Vec<&'static str>,
+    /// Backend reads so far, and a change to the simulated kernel made just
+    /// before the given read.
+    backend_reads: Cell<usize>,
+    before_backend_read: Option<(usize, Change)>,
 }
+
+/// A change another actor makes to the simulated kernel.
+type Change = fn(&Host);
 
 impl Host {
     fn new() -> Self {
@@ -82,6 +111,8 @@ impl Host {
             killed_before: None,
             killed_after: None,
             commands: Vec::new(),
+            backend_reads: Cell::new(0),
+            before_backend_read: None,
         };
         for index in [3, 4] {
             let device = host.sysfs.join(format!("nbd{index}"));
@@ -205,7 +236,7 @@ impl Drop for Host {
 }
 
 fn export_of(record: &BoundDeviceRecord) -> Export {
-    [PG, DB]
+    [PG, DB, CLONE]
         .into_iter()
         .find(|export| record.attachment.vg_name == format!("vg_maki_{}", export.volume))
         .expect("fixture volume")
@@ -294,6 +325,12 @@ impl System for Host {
     ) -> Result<(), ExecError> {
         self.deactivate_lvm(record, verified)
     }
+    fn deactivate_lvm_from_proof(&mut self, record: &BoundDeviceRecord) -> Result<(), ExecError> {
+        self.command("dmsetup-remove", |host| {
+            host.deactivate(&record.attachment.vg_name);
+            Ok(())
+        })
+    }
     fn recovery_proof(
         &self,
         record: &BoundDeviceRecord,
@@ -371,6 +408,13 @@ impl System for Host {
         super::allocate_excluding(&self.sysfs, &self.mountinfo, reserved)
     }
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        let read = self.backend_reads.get() + 1;
+        self.backend_reads.set(read);
+        if let Some((at, change)) = self.before_backend_read {
+            if at == read {
+                change(self);
+            }
+        }
         nbd_backend_at(&self.sysfs, device)
     }
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
@@ -734,3 +778,6 @@ fn a_recorded_device_under_another_identity_is_refused_with_the_way_out() {
     assert_attached(&host, &first);
     assert_attached(&host, &second);
 }
+
+#[path = "review_displaced_attach_record.rs"]
+mod displaced_record;
