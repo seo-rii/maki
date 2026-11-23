@@ -4,10 +4,11 @@
 //! A cancelled oneshot start can also have a failed main-process status, so the
 //! hook additionally requires the manager's original start job to be running.
 //!
-//! On that evidence the hook queues the recovery coordinator and then, while
-//! the daemon is still running, finishes the one rollback the coordinator
-//! cannot do after it stopped the daemon: that of an LVM activation whose
-//! helper died before it recorded the mapping.
+//! On that evidence the hook asks the manager to queue the recovery
+//! coordinator. Then, while the daemon is still running, and also when the
+//! manager refused that request, it finishes the one rollback the
+//! coordinator cannot do after it stopped the daemon: that of an LVM
+//! activation whose helper died before it recorded the mapping.
 
 #[cfg(any(target_os = "linux", test))]
 use maki_privileged::config::AttachConfig;
@@ -22,14 +23,23 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
-/// How long the hook waits for processes the failed start left in the unit's
-/// control group, and how long the rollback may then take. Together they
-/// must stay well inside the unit's `TimeoutStopSec`, which bounds this hook,
-/// and inside the coordinator's `JobTimeoutSec`, which includes waiting for it.
+/// The rollback's time limits: how long the hook waits for processes the
+/// failed start left in the unit's control group, then for its turn on the
+/// global attach lock, and how long its commands may take once it holds the
+/// lock. They must fit inside the unit's `TimeoutStopSec`, which bounds this
+/// hook, and inside the coordinator's `JobTimeoutSec`, which counts the wait
+/// for this hook, the daemon's stop and the coordinator's own cleanup; see
+/// `the_rollback_budget_fits_the_packaged_timeouts`. The lock wait is the
+/// longest that fits. Helpers queued before the hook (other volumes'
+/// attach, detach or cleanup) are served first, and one attach can hold the
+/// lock for up to its 180-second start timeout: contention beyond this wait
+/// leaves the rollback undone, the documented second fault.
 #[cfg(any(target_os = "linux", test))]
 const SETTLE_WAIT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", test))]
-const ROLLBACK_BUDGET: Duration = Duration::from_secs(30);
+const LOCK_WAIT: Duration = Duration::from_secs(40);
+#[cfg(any(target_os = "linux", test))]
+const COMMAND_BUDGET: Duration = Duration::from_secs(30);
 
 fn failed_main_process(result: Option<&str>, code: Option<&str>, status: Option<&str>) -> bool {
     if !matches!(
@@ -173,6 +183,9 @@ trait Host {
     fn start_job_running(&mut self, attach: &str) -> Result<bool, String>;
     /// Ask the manager to queue `unit`, without waiting for its job.
     fn schedule(&mut self, unit: &str) -> Result<(), String>;
+    /// Whether the volume's trusted record holds an activation intent. It
+    /// only reads: no attach lock, no attach configuration.
+    fn interrupted_activation(&mut self, volume: &str) -> Result<bool, String>;
     /// Whether this hook is, or within `SETTLE_WAIT` becomes, the only
     /// process in `attach`'s control group.
     fn settled(&mut self, attach: &str) -> bool;
@@ -231,6 +244,10 @@ impl Host for LinuxHost {
         }
     }
 
+    fn interrupted_activation(&mut self, volume: &str) -> Result<bool, String> {
+        maki_privileged::exec::interrupted_activation(volume).map_err(|error| error.to_string())
+    }
+
     fn settled(&mut self, attach: &str) -> bool {
         unit_settled(attach, SETTLE_WAIT)
     }
@@ -242,8 +259,12 @@ impl Host for LinuxHost {
     }
 
     fn roll_back(&mut self, plan: &Plan) -> Result<bool, String> {
-        maki_privileged::exec::finish_interrupted_activation(plan, Instant::now() + ROLLBACK_BUDGET)
-            .map_err(|error| error.to_string())
+        maki_privileged::exec::finish_interrupted_activation(
+            plan,
+            Instant::now() + LOCK_WAIT,
+            COMMAND_BUDGET,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// `eprintln!` panics when the write fails, and nothing here may end
@@ -255,15 +276,32 @@ impl Host for LinuxHost {
 }
 
 /// Roll back an LVM activation the failed helper did not live to record,
-/// while the daemon still serves the device. The coordinator is already
-/// queued and runs its cleanup whatever happens here, so every failure is
-/// only reported.
+/// while the daemon still serves the device. Whatever happens here is only
+/// reported: the coordinator, if the manager accepted it, runs its cleanup
+/// in any case.
 #[cfg(any(target_os = "linux", test))]
 fn finish_interrupted_activation(volume: &str, attach: &str, host: &mut impl Host) {
+    // Most failed starts leave no intent, and then nothing here concerns
+    // them: not the settle wait, and not the attach configuration, whose
+    // errors would read as a failed rollback of an activation that never
+    // happened. The helper that writes the record is gone, so reading it
+    // without the lock is enough to decide whether to go on.
+    match host.interrupted_activation(volume) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            host.report(&format!(
+                "cannot tell whether volume {volume} has an interrupted LVM activation to roll \
+                 back: {error}; leaving all cleanup to the recovery coordinator"
+            ));
+            return;
+        }
+    }
     if !host.settled(attach) {
         host.report(&format!(
-            "processes of the failed start are still running, or the control group of {attach} \
-             cannot be read; leaving all cleanup to the recovery coordinator"
+            "volume {volume} has an interrupted LVM activation, but processes of the failed \
+             start are still running, or the control group of {attach} cannot be read; leaving \
+             all cleanup to the recovery coordinator"
         ));
         return;
     }
@@ -275,9 +313,13 @@ fn finish_interrupted_activation(volume: &str, attach: &str, host: &mut impl Hos
         Ok(true) => host.report(&format!(
             "rolled back the interrupted LVM activation of volume {volume}"
         )),
-        Ok(false) => {}
+        Ok(false) => host.report(&format!(
+            "did not roll back the interrupted LVM activation of volume {volume}: under the \
+             attach lock its record no longer holds the activation intent, or its device no \
+             longer carries the recorded connection; leaving cleanup to the recovery coordinator"
+        )),
         Err(error) => host.report(&format!(
-            "could not roll back an interrupted LVM activation of volume {volume}: {error}; \
+            "could not roll back the interrupted LVM activation of volume {volume}: {error}; \
              the recovery coordinator retries cleanup after it stopped the daemon"
         )),
     }
@@ -309,6 +351,10 @@ fn recover(volume: &str, host: &mut impl Host) -> Result<(), String> {
     // into the stop timeout below, the coordinator is already on its way.
     // Its stop of the daemon is ordered after this unit's stop job, which
     // cannot finish before this hook does, so the daemon is still serving.
+    // The rollback also runs when the manager refused the request (a masked
+    // coordinator, as during maintenance): it is the rollback the dead
+    // helper would have run, identity-checked and without any unmount, and
+    // anything it cannot finish keeps its record for an explicit cleanup.
     finish_interrupted_activation(volume, &attach, host);
     scheduled
 }
@@ -348,7 +394,7 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
 mod tests {
     use super::{
         failed_main_process, other_processes, recover, running_start_job, unit_cgroup, Host,
-        ROLLBACK_BUDGET, SETTLE_WAIT,
+        COMMAND_BUDGET, LOCK_WAIT, SETTLE_WAIT,
     };
     use maki_privileged::config::{parse, AttachConfig};
     use maki_privileged::plan::Plan;
@@ -414,6 +460,10 @@ mountpoint = "/srv/custom"
         fn schedule(&mut self, unit: &str) -> Result<(), String> {
             self.actions.push(format!("start {unit}"));
             self.scheduled.clone()
+        }
+        fn interrupted_activation(&mut self, volume: &str) -> Result<bool, String> {
+            self.actions.push(format!("read record {volume}"));
+            self.intent.clone()
         }
         fn settled(&mut self, attach: &str) -> bool {
             self.actions.push(format!("settle {attach}"));
@@ -645,24 +695,32 @@ mountpoint = "/srv/custom"
         }
     }
 
-    /// The unit's stop timeout bounds this hook, and the coordinator's job
-    /// timeout includes the wait for it. The rollback gives up long before
-    /// either: a command the deadline ends is killed within about two
-    /// seconds more.
+    /// The unit's stop timeout bounds this hook. The coordinator's job
+    /// timeout runs from when the hook queued it and counts the rest of the
+    /// hook, the daemon's stop and the coordinator's own cleanup; when it
+    /// expires the lifecycle stays down. The hook's longest run: the settle
+    /// wait, the lock wait, the commands, and about two seconds to kill a
+    /// command the deadline ends. A quarter of the stop timeout stays for
+    /// the hook's two manager calls.
     #[test]
     fn the_rollback_budget_fits_the_packaged_timeouts() {
-        let seconds = |unit: &str, key: &str| -> u64 {
+        let seconds = |unit: &str, key: &str| -> Option<u64> {
             unit.lines()
                 .find_map(|line| line.strip_prefix(key))
-                .unwrap_or_else(|| panic!("no {key}"))
-                .parse()
-                .unwrap()
+                .map(|value| value.parse().unwrap())
         };
         let attach = include_str!("../../../packaging/systemd/maki-attach@.service");
         let recovery = include_str!("../../../packaging/systemd/maki-recover@.service");
-        let budget = (SETTLE_WAIT + ROLLBACK_BUDGET).as_secs();
-        assert!(2 * budget <= seconds(attach, "TimeoutStopSec="));
-        assert!(4 * budget <= seconds(recovery, "JobTimeoutSec="));
+        let daemon = include_str!("../../../packaging/systemd/maki@.service");
+        let hook = (SETTLE_WAIT + LOCK_WAIT + COMMAND_BUDGET).as_secs() + 2;
+        assert!(4 * hook <= 3 * seconds(attach, "TimeoutStopSec=").unwrap());
+        // The daemon sets no stop timeout: systemd's default of 90 seconds.
+        let daemon_stop = seconds(daemon, "TimeoutStopSec=").unwrap_or(90);
+        let cleanup = seconds(recovery, "TimeoutStartSec=").unwrap();
+        let job = seconds(recovery, "JobTimeoutSec=").unwrap();
+        assert!(hook + daemon_stop + cleanup <= job);
+        // The lock wait is the longest that fits: five seconds more do not.
+        assert!(hook + 5 + daemon_stop + cleanup > job);
     }
 
     #[test]

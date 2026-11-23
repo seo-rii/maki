@@ -6,6 +6,7 @@ use super::*;
 static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
+use std::time::Duration;
 
 struct Fixture(PathBuf);
 
@@ -322,10 +323,12 @@ fn a_bounded_lock_attempt_gives_up_at_its_deadline() {
     let started = Instant::now();
     assert!(state.lock_until(started).is_err());
     assert!(started.elapsed() < Duration::from_secs(1));
+    // The abandoned request is granted the lock now, and must let it go.
     drop(held);
+    until(|| state.lock_waiters() == 0);
     let lock = state
         .lock_until(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+        .expect("an abandoned lock request kept the lock it was granted");
     assert!(
         state.lock_until(Instant::now()).is_err(),
         "a bounded attempt took a lock that is held"
@@ -333,11 +336,10 @@ fn a_bounded_lock_attempt_gives_up_at_its_deadline() {
     drop(lock);
 }
 
-/// Wait until `count` lock requests wait for `state`'s attach lock, or
-/// give up after a few seconds.
-fn until_lock_waiters(state: &TrustedState, count: usize) {
+/// Wait until `condition` holds, or give up after a few seconds.
+fn until(condition: impl Fn() -> bool) {
     let started = Instant::now();
-    while state.lock_waiters() < count && started.elapsed() < Duration::from_secs(5) {
+    while !condition() && started.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -358,12 +360,12 @@ fn a_bounded_lock_wait_is_served_before_helpers_that_queue_after_it() {
             let lock = state.lock_until(Instant::now() + Duration::from_secs(15));
             order.lock().unwrap().push(("bounded", lock.is_ok()));
         });
-        until_lock_waiters(&state, 1);
+        until(|| state.lock_waiters() >= 1);
         scope.spawn(|| {
             let _lock = state.lock().unwrap();
             order.lock().unwrap().push(("later", true));
         });
-        until_lock_waiters(&state, 2);
+        until(|| state.lock_waiters() >= 2);
         drop(held);
     });
     assert_eq!(

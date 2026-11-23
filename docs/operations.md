@@ -915,28 +915,42 @@ job does not authorize recovery. The coordinator stops
 registered workloads before identity-checked cleanup and starts the lifecycle
 again only after cleanup succeeds.
 
-The hook itself performs one cleanup, on the same evidence and after it has
-queued the coordinator. If the trusted record holds only a pre-activation
-intent and its device still carries the recorded backend identifier (the
-helper died between LVM activation and the mapping proof), the hook runs that
-attach's rollback: the scoped VG deactivation of the
+The hook itself performs one cleanup, on the same evidence, after it has asked
+systemd to queue the coordinator. It also runs when systemd refuses that
+request, for example while the coordinator is masked as in the maintenance
+procedure below: it is the rollback the dead helper would have run, checked
+against the recorded identity. If the trusted record holds only a
+pre-activation intent and its device still carries the recorded backend
+identifier (the helper died between LVM activation and the mapping proof), the
+hook runs that attach's rollback: the scoped VG deactivation of the
 [privileged helper](#privileged-helper), then the NBD disconnect, and it
-retires the record. The coordinator cannot do this later,
-because it stops the daemon before its cleanup and LVM can then no longer read
-the volume group. The coordinator's stop of the daemon is ordered after the
-attach unit's stop job, which does not finish before the hook does, so the
-daemon is still serving while the hook runs. The hook never unmounts and
-leaves every other record to the coordinator. It reads the same
-`/etc/maki/attach/<volume>.toml` as `cleanup`.
+retires the record. The coordinator cannot do this later, because it stops the
+daemon before its cleanup and LVM can then no longer read the volume group.
+The coordinator's stop of the daemon is ordered after the attach unit's stop
+job, which does not finish before the hook does, so the daemon is still
+serving while the hook runs. The hook never unmounts and leaves every other
+record to the coordinator. It first reads the record, without the attach lock.
+Only when the record holds an intent does it read the same
+`/etc/maki/attach/<volume>.toml` as `cleanup`, so an invalid or untrusted
+attach configuration is reported by the hook only when there is an activation
+to roll back.
 
-Two bounds keep the hook inside the unit's `TimeoutStopSec=120`. It first
-waits up to 15 seconds until it is the only process in the attach unit's
-control group: a command of the failed start, such as a `vgchange` that
-defers signals until it has finished, can outlive the helper there. This
-check needs the unified cgroup hierarchy. The rollback then has 30 seconds
-for the attach lock and all of its commands. If the group does not settle or
-cannot be read, a bound expires, or the rollback is refused, the hook logs
-the reason and the coordinator proceeds as it would have without it.
+Three bounds keep the hook inside the unit's `TimeoutStopSec=120` and inside
+what the coordinator's `JobTimeoutSec=360` leaves after the daemon's stop
+(systemd's default of 90 seconds) and its own cleanup (`TimeoutStartSec=180`).
+The hook first waits up to 15 seconds until it is the only process in the
+attach unit's control group: a command of the failed start, such as a
+`vgchange` that defers signals until it has finished, can outlive the helper
+there. This check needs the unified cgroup hierarchy. It then waits up to 40
+seconds for the global attach lock, in turn behind the helpers already waiting
+for it (other volumes' attach, detach and cleanup), and its commands have 30
+seconds once it holds the lock. If the record or the control group cannot be
+read, the group does not settle, a bound expires, or the rollback is refused,
+the hook logs the reason and the coordinator proceeds as it would have without
+it. An attach of another volume can hold the attach lock for up to its
+180-second start timeout, longer than any lock wait these timeouts leave room
+for: contention of that length is one way into
+[the state below](#interrupted-activation-after-the-daemon-stopped).
 
 Attach starts are limited to three in 300 seconds; inspect the failure before
 resetting a start-limit failure.
@@ -972,11 +986,12 @@ the VG's mappings are active but unmounted; and the daemon behind the
 recorded kernel connection stopped serving reads before that activation was
 rolled back. That takes a second fault: the daemon failed or was stopped
 within the same window, or the hook's rollback above did not complete before
-the coordinator stopped the daemon. LVM cannot read the volume group through
-that connection again (a restarted daemon serves new connections only), and
-the `dmsetup` fallback requires the completed mapping proof. `maki-attach
-cleanup`, and with it `maki-recover@pg.service`, then fails with an error
-that ends in one of
+the coordinator stopped the daemon, for example because other helpers held
+the attach lock for longer than the hook waits for it. LVM cannot read the
+volume group through that connection again (a restarted daemon serves new
+connections only), and the `dmsetup` fallback requires the completed mapping
+proof. `maki-attach cleanup`, and with it `maki-recover@pg.service`, then
+fails with an error that ends in one of
 
 ```text
 scoped LVM deactivation of the interrupted activation on /dev/nbd3 failed (...). LVM reads the volume group from that device and can deactivate the mapping only while the volume's daemon serves it; keeping the attach record

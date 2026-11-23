@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -247,24 +247,46 @@ impl TrustedState {
         Ok(StateLock(file))
     }
 
-    /// Take the lock, but give up at `deadline` rather than queue behind
-    /// another helper for as long as that one runs.
+    /// Take the lock in turn, but give up at `deadline` rather than wait for
+    /// as long as the helpers ahead of this one run.
+    ///
+    /// Requests that block in `flock` form a queue that the kernel serves in
+    /// order, and every other helper blocks. A caller that only retried a
+    /// non-blocking attempt would get the lock only when nobody is queued,
+    /// so every helper that queued meanwhile would overtake it. The blocking
+    /// request therefore runs on a thread of its own. At the deadline it is
+    /// abandoned: a lock granted to it later is dropped with the channel it
+    /// is sent into, which releases it, and the helper's exit ends a request
+    /// that is still queued.
     pub fn lock_until(&self, deadline: Instant) -> io::Result<StateLock> {
         let file = self.lock_file()?;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(StateLock(file)),
-                Err(std::fs::TryLockError::Error(error)) => return Err(error),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the attach lock is held by another helper",
-                    ));
-                }
-            }
+        match file.try_lock() {
+            Ok(()) => return Ok(StateLock(file)),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+        let held = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the attach lock is held by another helper",
+            )
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Err(held());
+        }
+        let (granted, answer) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("attach-lock".into())
+            .spawn(move || {
+                let _ = granted.send(file.lock().map(|()| StateLock(file)));
+            })?;
+        match answer.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(held()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "the attach lock request ended without an answer",
+            )),
         }
     }
 
