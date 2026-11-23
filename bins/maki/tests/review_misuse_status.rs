@@ -11,6 +11,9 @@
 //! The configuration and socket named here do not exist: a command that got
 //! as far as reading or connecting would fail with status 1.
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::process::{Command, Output};
 
 const ROOT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -30,7 +33,7 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn malformed_options_and_approvals_exit_2_before_anything_is_read() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let config = dir.path().join("missing.toml");
     let config = config.to_str().unwrap();
     let socket = dir.path().join("missing.sock");
@@ -104,7 +107,7 @@ fn malformed_options_and_approvals_exit_2_before_anything_is_read() {
 /// configuration or the socket, and fail there with status 1.
 #[test]
 fn well_formed_commands_that_fail_still_exit_1() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let config = dir.path().join("missing.toml");
     let config = config.to_str().unwrap();
     let socket = dir.path().join("missing.sock");
