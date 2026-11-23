@@ -298,6 +298,7 @@ credential reload
 cache resize
 retry/backpressure configuration reload
 graceful checkpoint
+drain (close I/O admission, then flush and checkpoint)
 ```
 
 The following operations MUST require the privileged helper:
@@ -561,27 +562,38 @@ provide continuous health monitoring or container reattachment.
 maki/
 ├── crates/
 │   ├── maki-core/
-│   │   ├── io/
-│   │   ├── scheduler/
-│   │   ├── barrier/
-│   │   ├── admission/
-│   │   ├── recovery/
-│   │   ├── state/
-│   │   └── volume/
+│   │   ├── engine
+│   │   ├── volume
+│   │   ├── journal
+│   │   ├── overlay
+│   │   ├── store
+│   │   ├── recovery
+│   │   └── check
 │   │
 │   ├── maki-format/
-│   │   ├── superblock/
-│   │   ├── slot/
-│   │   ├── journal/
-│   │   ├── allocation/
-│   │   └── checksum/
+│   │   ├── superblock
+│   │   ├── slot
+│   │   ├── journal
+│   │   ├── allocation
+│   │   ├── catalog
+│   │   ├── checkpoint
+│   │   ├── durable_proof
+│   │   ├── canary
+│   │   ├── ab
+│   │   ├── codec
+│   │   ├── geometry
+│   │   └── config
 │   │
 │   ├── maki-crypto/
-│   │   ├── provider/
-│   │   ├── batching/
-│   │   ├── retry/
-│   │   ├── circuit_breaker/
-│   │   └── endpoint/
+│   │   ├── provider
+│   │   ├── checked
+│   │   ├── selftest
+│   │   ├── scheduler
+│   │   ├── endpoint
+│   │   ├── retry
+│   │   ├── breaker
+│   │   ├── flow
+│   │   └── secret
 │   │
 │   ├── maki-crypto-local/
 │   ├── maki-crypto-http/
@@ -592,20 +604,26 @@ maki/
 │   ├── maki-nbdkit/
 │   ├── maki-control/
 │   ├── maki-privileged/
+│   ├── maki-witness/
 │   └── maki-test-support/
 │
 ├── bins/
 │   ├── maki
 │   ├── maki-attach
 │   ├── maki-check
-│   └── maki-benchmark
+│   ├── maki-benchmark
+│   └── maki-witness
 │
 └── packaging/
     ├── systemd/
     ├── tmpfiles.d/
     ├── sysusers.d/
+    ├── debian/
     └── examples/
 ```
+
+The entries under `maki-core`, `maki-format` and `maki-crypto` are those
+crates' principal source modules (`src/<name>.rs`), not directories.
 
 ---
 
@@ -1041,6 +1059,11 @@ the change was not applied; use the restart and self-test procedure above.
 ├── canary.a
 ├── canary.b
 ├── data/
+│   ├── shard-<index>.dat
+│   ├── shard-<index>.alloc.a
+│   ├── shard-<index>.alloc.b
+│   ├── shard-<index>.discard.a   (envelope v3 only)
+│   └── shard-<index>.discard.b   (envelope v3 only)
 ├── journal/
 │   ├── seg-<index>
 │   ├── durable-proof.a
@@ -1051,12 +1074,16 @@ the change was not applied; use the restart and self-test procedure above.
     └── state.b
 ```
 
-New volumes MUST use superblock envelope v2 and require
-`journal/durable-proof.{a,b}`. The envelope version is separate from the crypto
-context's `format_version`; changing the envelope MUST NOT silently change AAD.
-Both initial proof copies and their directory entries MUST be durable before
-publishing the v2 superblock. `checkpoint/state.{a,b}` are also written at
-creation (sequence 0), and recovery requires a valid checkpoint copy.
+New volumes MUST use superblock envelope v2, or envelope v3 when created with
+discard support; both require `journal/durable-proof.{a,b}`. Envelope v3 adds
+a replicated per-shard discard map, `data/shard-<index>.discard.{a,b}`, and
+journal records with an empty payload as discards
+([space reclamation](docs/space-reclamation.md)). The envelope version is
+separate from the crypto context's `format_version`; changing the envelope
+MUST NOT silently change AAD. Both initial proof copies and their directory
+entries MUST be durable before publishing the superblock.
+`checkpoint/state.{a,b}` are also written at creation (sequence 0), and
+recovery requires a valid checkpoint copy.
 
 A durable proof is exactly 64 bytes:
 
@@ -1085,10 +1112,10 @@ FUA/FLUSH acknowledgement advances. Both copies then attest that horizon even
 though their generations differ. The highest valid proof MUST be preserved
 before replacing the lower or invalid side. One missing/stale/corrupt copy may
 be tolerated when another retains the current horizon; both invalid/absent
-copies MUST refuse v2 recovery, including on an empty-looking volume.
+copies MUST refuse v2 and v3 recovery, including on an empty-looking volume.
 
 The single `journal/durable-mark` remains advisory and MAY be absent or stale.
-It MUST NOT replace or weaken required v2 evidence. Local CRC records do not
+It MUST NOT replace or weaken the required proof. Local CRC records do not
 authenticate metadata, prevent coordinated valid rollback, or provide separate
 physical failure domains.
 
@@ -1177,7 +1204,8 @@ slot header bytes are all zero
 allocation bit = 0
 slot holds a valid header for this unit
 → allocation copy is behind the slot: treat as bit = 1
-  (served; bit repaired in memory, persisted by the next checkpoint)
+  (served; the open-time audit below repairs the bit in memory and the
+  next checkpoint persists it, a read alone repairs nothing)
 
 allocation bit = 0
 slot header bytes are neither zero nor a valid header for this unit
@@ -1199,9 +1227,9 @@ grown back), so it reads as allocated-but-invalid, EIO, until it is
 rewritten. The only legitimately short data file belongs to a shard that was
 never checkpointed into: not named by the loaded catalog copy and with an
 empty allocation map (a stale empty copy from an earlier creation attempt
-proves nothing). Its creation (§27) never finished, so no slot of it holds
+proves nothing). Its creation (§14) never finished, so no slot of it holds
 data and its holes stay holes. Nothing proves such a file's size durable —
-not even a full-size page-cache view after a restart (§12 K-01) — so the
+not even a full-size page-cache view after a restart (§27) — so the
 size is set and synced again before the shard is written to or cataloged.
 
 ```text
@@ -1213,6 +1241,10 @@ allocation bit = 1
 slot valid
 → decrypt
 ```
+
+On an envelope-v3 volume the shard's discard map (§21) is consulted before
+the allocation map and the slot: a unit whose discard bit is set reads as
+zero, whatever they hold.
 
 Slot headers are authoritative; the shard catalog and the allocation maps
 are accelerators. An A/B record legitimately falls back to its older
@@ -1403,7 +1435,7 @@ acquire volume lock
  ↓
 select valid superblock
  ↓
-require envelope v2 and load valid durable proof (both missing/invalid = error)
+require envelope v2 or v3 and load valid durable proof (both missing/invalid = error)
  ↓
 read shard catalog and allocation metadata
  ↓
@@ -1867,9 +1899,12 @@ zram configured to write back to an unencrypted device
 any swap device that cannot be classified (the check fails closed)
 ```
 
-The daemon decides by what a swap device *is* (`/dev/zramN` and its
-`backing_dev`, the device-mapper UUID), never by its name, and refuses to
-attach when `/proc/swaps` cannot be read or parsed.
+The daemon enforces this at attach only with
+`security.require_secure_swap_policy = true` (default `false`; the §57 example
+enables it); without it no swap check runs. When enforcing, it decides by what
+a swap device *is* (`/dev/zramN` and its `backing_dev`, the device-mapper
+UUID), never by its name, and refuses to attach when `/proc/swaps` cannot be
+read or parsed.
 
 ---
 
@@ -2107,8 +2142,11 @@ A/B metadata MUST fall back to the highest valid generation. Each store advances
 a generation by one; recovery and the deep check MUST refuse, before any
 recovery write, A/B metadata (superblock, shard catalog, allocation and discard
 maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
-is above `u64::MAX - 2^62`. Torn final journal tails may be truncated;
-corruption before a valid successor record MUST refuse recovery.
+is above `u64::MAX - 2^62`. Torn final journal tails may be truncated. Damage
+inside a non-final segment, or inside the part of the final segment that the
+durable proof or the durable mark covers, MUST refuse recovery. Beyond that
+part, a record that fails its checksum is a torn tail whether or not an intact
+record follows it (§27).
 
 ---
 

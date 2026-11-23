@@ -171,7 +171,9 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the
-  backing filesystem. Raw discards are still admitted there.
+  backing filesystem. Raw discards need no checkpoint headroom and are still
+  admitted while free space covers the emergency reserve and their journal
+  records.
 - Automatic dead-daemon cleanup supports the pinned single-PV/single-data-LV
   XFS topology. A sidecar LV passed attach/detach, but multi-mapping and other
   device-mapper recovery layouts fail closed and need operator diagnosis

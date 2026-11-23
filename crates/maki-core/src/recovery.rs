@@ -272,8 +272,11 @@ impl ReplayRecords {
     }
 }
 
-/// Recover a volume. `segment_size` is the writer's effective segment size;
-/// it bounds how large any segment file may legitimately be.
+/// Recover a volume. `segment_size` is the writer's effective segment size.
+/// A segment file may be as large as any configuration's writer can produce
+/// (`max_journal_segment_file_size`), so a segment written before the size
+/// was lowered stays readable (R5-033); a larger `segment_size` raises that
+/// bound.
 pub fn recover(backing: &Arc<dyn Backing>, segment_size: u64) -> Result<Recovered, RecoveryError> {
     recover_with_replay(
         backing,
