@@ -719,8 +719,12 @@ fn retired_namespace_with_a_live_lifetime_lock_is_never_unlinked() {
     );
 }
 
+/// A lifetime lock ends when its holder drops it. A child forked meanwhile
+/// shares the lock's open file description until its `exec`; when only the
+/// holder's descriptor was closed, the lock stayed held for that child and GC
+/// skipped a namespace no handle used any more.
 #[test]
-fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
+fn a_dropped_lifetime_lock_is_free_while_a_forked_child_holds_its_descriptor() {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -792,9 +796,12 @@ fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
         .unwrap()
         .collect(&rpc)
         .unwrap();
-    assert_eq!(report.skipped_live, std::slice::from_ref(&retired));
-    assert!(report.removed.is_empty());
-    assert!(disk.exists(&format!("{retired}/rollback.arena")).unwrap());
+    assert_eq!(
+        report.removed,
+        [original],
+        "GC report while the child still holds the dropped lock's descriptor: {report:?}"
+    );
+    assert!(!disk.exists(&retired).unwrap());
 
     release_write.write_all(&[1]).unwrap();
     let mut status = 0;
@@ -803,12 +810,6 @@ fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
     child.0 = 0;
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
-    let report = OperationGuard::acquire(&disk)
-        .unwrap()
-        .collect(&rpc)
-        .unwrap();
-    assert_eq!(report.removed, [original]);
-    assert!(!disk.exists(&retired).unwrap());
 }
 
 #[test]

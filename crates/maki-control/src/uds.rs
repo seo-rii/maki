@@ -350,3 +350,7 @@ pub async fn serve_uds(
     let listener = bind_control_socket(path, group)?;
     serve(listener, backend).await
 }
+
+#[cfg(test)]
+#[path = "uds_lock_tests.rs"]
+mod uds_lock_tests;
