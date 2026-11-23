@@ -277,6 +277,60 @@ fn contains_plaintext(
 mod substring_tests {
     use super::contains_plaintext;
 
+    fn search(haystack: &[u8], needle: &[u8]) -> bool {
+        contains_plaintext(haystack, needle, |a, b| a == b)
+    }
+
+    /// The search's answer and the number of byte comparisons it made.
+    fn comparisons(haystack: &[u8], needle: &[u8]) -> (bool, usize) {
+        let mut count = 0;
+        let found = contains_plaintext(haystack, needle, |a, b| {
+            count += 1;
+            a == b
+        });
+        (found, count)
+    }
+
+    /// Linear work: two comparisons per haystack byte and five per needle
+    /// byte cover preprocessing and every near match.
+    fn bound(haystack: &[u8], needle: &[u8]) -> usize {
+        2 * haystack.len() + 5 * needle.len()
+    }
+
+    fn expected(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty()
+            || haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    /// Every string of `length` letters drawn from `0..letters`.
+    fn strings(letters: usize, length: usize) -> Vec<Vec<u8>> {
+        (0..letters.pow(length as u32))
+            .map(|mut n| {
+                (0..length)
+                    .map(|_| {
+                        let letter = (n % letters) as u8;
+                        n /= letters;
+                        letter
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// xorshift64: deterministic and dependency-free.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
     #[test]
     fn f03_search_matches_slice_windows_exhaustively() {
         for haystack_length in 0..=8 {
@@ -289,18 +343,91 @@ mod substring_tests {
                         let needle: Vec<_> = (0..needle_length)
                             .map(|i| ((bits >> i) & 1) as u8)
                             .collect();
-                        let expected = needle.is_empty()
-                            || haystack
-                                .windows(needle.len())
-                                .any(|window| window == needle);
-                        assert_eq!(
-                            contains_plaintext(&haystack, &needle, |a, b| a == b),
-                            expected
-                        );
+                        assert_eq!(search(&haystack, &needle), expected(&haystack, &needle));
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn search_matches_slice_windows_over_three_letters_exhaustively() {
+        let needles: Vec<_> = (0..=5).flat_map(|length| strings(3, length)).collect();
+        for haystack in (0..=7).flat_map(|length| strings(3, length)) {
+            for needle in &needles {
+                assert_eq!(
+                    search(&haystack, needle),
+                    expected(&haystack, needle),
+                    "{needle:?} in {haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_matches_slice_windows_for_periodic_and_planted_needles() {
+        // Periodic needles, exact or with one changed byte, planted whole or
+        // nearly whole in periodic or random text: the cases where a search
+        // that shifts too far or remembers too much would miss an echo.
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            let letters = 2 + rng.below(3);
+            let root: Vec<u8> = (0..1 + rng.below(6))
+                .map(|_| rng.below(letters) as u8)
+                .collect();
+            let needle_length = 1 + rng.below(48);
+            let mut needle: Vec<u8> = root.iter().copied().cycle().take(needle_length).collect();
+            if rng.below(2) == 0 {
+                needle[rng.below(needle_length)] = rng.below(letters) as u8;
+            }
+            let haystack_length = rng.below(2 * needle_length + 32);
+            let mut haystack: Vec<u8> = if rng.below(2) == 0 {
+                let skip = rng.below(root.len());
+                root.iter()
+                    .copied()
+                    .cycle()
+                    .skip(skip)
+                    .take(haystack_length)
+                    .collect()
+            } else {
+                (0..haystack_length)
+                    .map(|_| rng.below(letters) as u8)
+                    .collect()
+            };
+            if haystack_length >= needle_length && rng.below(3) != 0 {
+                let at = rng.below(haystack_length - needle_length + 1);
+                haystack[at..at + needle_length].copy_from_slice(&needle);
+                if rng.below(2) == 0 {
+                    haystack[at + rng.below(needle_length)] = rng.below(letters) as u8;
+                }
+            }
+            let (found, count) = comparisons(&haystack, &needle);
+            assert_eq!(
+                found,
+                expected(&haystack, &needle),
+                "{needle:?} in {haystack:?}"
+            );
+            assert!(
+                count <= bound(&haystack, &needle),
+                "{count} comparisons for {needle:?} in {haystack:?}"
+            );
+        }
+    }
+
+    fn assert_linear(haystack: &[u8], needle: &[u8], case: &str) {
+        let (found, count) = comparisons(haystack, needle);
+        assert_eq!(
+            found,
+            expected(haystack, needle),
+            "{case}, needle length {}",
+            needle.len()
+        );
+        assert!(
+            count <= bound(haystack, needle),
+            "{case}: {count} comparisons for a {}-byte needle in {} bytes",
+            needle.len(),
+            haystack.len()
+        );
     }
 
     #[test]
@@ -309,15 +436,7 @@ mod substring_tests {
             let haystack = vec![b'a'; length * 8];
             let mut needle = vec![b'a'; length];
             needle[length - 1] = b'b';
-            let mut comparisons = 0;
-            assert!(!contains_plaintext(&haystack, &needle, |a, b| {
-                comparisons += 1;
-                a == b
-            }));
-            assert!(
-                comparisons <= 4 * (haystack.len() + needle.len()),
-                "{comparisons} comparisons for needle length {length}"
-            );
+            assert_linear(&haystack, &needle, "a^(m-1) b in a^n");
         }
     }
 
@@ -326,14 +445,75 @@ mod substring_tests {
         let haystack: Vec<_> = b"abab".iter().copied().cycle().take(8192).collect();
         let mut needle: Vec<_> = b"abab".iter().copied().cycle().take(1024).collect();
         needle[1023] = b'c';
-        let mut comparisons = 0;
-        assert!(!contains_plaintext(&haystack, &needle, |a, b| {
-            comparisons += 1;
-            a == b
-        }));
-        assert!(
-            comparisons <= 4 * (haystack.len() + needle.len()),
-            "{comparisons} comparisons"
-        );
+        assert_linear(&haystack, &needle, "(ab)^k c in (ab)^n");
+    }
+
+    /// The Fibonacci word: aperiodic, yet every prefix has long borders.
+    fn fibonacci(length: usize) -> Vec<u8> {
+        let (mut previous, mut word) = (vec![b'b'], vec![b'a']);
+        while word.len() < length {
+            let next = [&word[..], &previous[..]].concat();
+            previous = std::mem::replace(&mut word, next);
+        }
+        word.truncate(length);
+        word
+    }
+
+    #[test]
+    fn adversarial_near_matches_have_linear_comparison_cost() {
+        let flip = |mut bytes: Vec<u8>, at: usize| {
+            bytes[at] = if bytes[at] == b'a' { b'b' } else { b'a' };
+            bytes
+        };
+        for length in [64, 256, 1024, 4096] {
+            let n = length * 8;
+            let a = |count: usize| vec![b'a'; count];
+            let run = |count: usize, period: usize| -> Vec<u8> {
+                (0..count)
+                    .map(|i| if i % period == period - 1 { b'b' } else { b'a' })
+                    .collect()
+            };
+            let cases: [(&str, Vec<u8>, Vec<u8>); 8] = [
+                ("b a^(m-1) in a^n", flip(a(length), 0), a(n)),
+                (
+                    "a^(m/2) b a^(m/2-1) in a^n",
+                    flip(a(length), length / 2),
+                    a(n),
+                ),
+                ("a^m in (a^(m-1) b)^*", a(length), run(n, length)),
+                (
+                    "(aaab)^k, last flipped, in (aaab)^*",
+                    flip(run(length, 4), length - 1),
+                    run(n, 4),
+                ),
+                (
+                    "Fibonacci prefix, last flipped, in the Fibonacci word",
+                    flip(fibonacci(length), length - 1),
+                    fibonacci(n),
+                ),
+                (
+                    "Fibonacci prefix, first flipped, in the Fibonacci word",
+                    flip(fibonacci(length), 0),
+                    fibonacci(n),
+                ),
+                (
+                    "a^(m-1) b at the end of a^n",
+                    flip(a(length), length - 1),
+                    flip(a(n), n - 1),
+                ),
+                (
+                    "Fibonacci prefix at the end of a near copy",
+                    fibonacci(length),
+                    [
+                        flip(fibonacci(n - length), n - length - 1),
+                        fibonacci(length),
+                    ]
+                    .concat(),
+                ),
+            ];
+            for (case, needle, haystack) in &cases {
+                assert_linear(haystack, needle, case);
+            }
+        }
     }
 }
