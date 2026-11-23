@@ -41,8 +41,9 @@ pub fn verify(config: &VolumeConfig) -> Result<Option<MemoryBudgetPosture>, Daem
 mod linux {
     use super::*;
     use maki_format::config::MemoryBudgetSection;
+    use sha2::{Digest, Sha256};
     use std::ffi::OsString;
-    use std::io::Read;
+    use std::io::{BufRead, BufReader, Read};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -126,16 +127,6 @@ mod linux {
         Ok(PathBuf::from(OsString::from_vec(path)))
     }
 
-    /// Records of the mount table, split as `str::lines` splits text.
-    fn mountinfo_records(table: &[u8]) -> impl Iterator<Item = &[u8]> {
-        table
-            .split_inclusive(|&byte| byte == b'\n')
-            .map(|line| match line.strip_suffix(b"\n") {
-                Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
-                None => line,
-            })
-    }
-
     /// The fields of one record admission reads, still escaped.
     struct MountRecord<'a> {
         root: &'a [u8],
@@ -180,12 +171,100 @@ mod linux {
         })
     }
 
-    /// The mount table is bytes, not text: only the cgroup-v2 records are
-    /// decoded and validated as paths admission uses.
-    pub(super) fn layout(
+    const MOUNTINFO: &str = "/proc/self/mountinfo";
+
+    /// The longest mount table record admission reads, newline included.
+    /// A record holds two escaped paths, a type, a source and option lists.
+    /// The table as a whole is not bounded: its size is host state, one
+    /// record per mount. 1 MiB was the bound on the whole table before it
+    /// was read as a stream, so no table accepted then is refused now.
+    const MAX_MOUNTINFO_RECORD: u64 = 1 << 20;
+
+    /// SHA-256 of every byte of one read of the mount table: two reads with
+    /// the same digest read the same table.
+    type TableDigest = [u8; 32];
+
+    /// What one pass over the mount table found.
+    struct MountScan {
+        /// The first cgroup-v2 mountpoint, validated as a path admission
+        /// resolves, and how many cgroup-v2 records there are.
+        cgroup_mount: Option<PathBuf>,
+        cgroup_mounts: usize,
+        digest: TableDigest,
+    }
+
+    fn open_mountinfo() -> Result<BufReader<std::fs::File>, String> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(MOUNTINFO)
+            .map(BufReader::new)
+            .map_err(|e| format!("cannot read {MOUNTINFO}: {e}"))
+    }
+
+    /// Read the mount table as a stream of records, split as `str::lines`
+    /// splits text, and check every record. The table is bytes, not text:
+    /// only the cgroup-v2 records are decoded and validated as paths
+    /// admission uses. With `cgroup_mount`, a mount at or below it refuses.
+    fn scan_mountinfo(
+        table: &mut impl BufRead,
+        cgroup_mount: Option<&Path>,
+    ) -> Result<MountScan, String> {
+        let mut digest = Sha256::new();
+        let mut scan = MountScan {
+            cgroup_mount: None,
+            cgroup_mounts: 0,
+            digest: TableDigest::default(),
+        };
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            table
+                .by_ref()
+                .take(MAX_MOUNTINFO_RECORD + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|e| format!("cannot read {MOUNTINFO}: {e}"))?;
+            if line.is_empty() {
+                break;
+            }
+            if line.len() as u64 > MAX_MOUNTINFO_RECORD {
+                return Err(format!("oversized record in {MOUNTINFO}"));
+            }
+            digest.update(&line);
+            let record = match line.strip_suffix(b"\n") {
+                Some(record) => record.strip_suffix(b"\r").unwrap_or(record),
+                None => &line,
+            };
+            let record = mount_record(record)?;
+            if record.fstype != b"cgroup2" {
+                let path = other_mount_path(record.mountpoint)?;
+                if cgroup_mount.is_some_and(|mount| path.starts_with(mount)) {
+                    return Err("nested mount can shadow cgroup memory policy".into());
+                }
+                continue;
+            }
+            let root = cgroup_mount_path(record.root)?;
+            if root != Path::new("/") {
+                return Err("subtree cgroup mount hides ancestor limits".into());
+            }
+            let mount = cgroup_mount_path(record.mountpoint)?;
+            scan.cgroup_mount.get_or_insert(mount);
+            scan.cgroup_mounts += 1;
+        }
+        scan.digest = digest.finalize().into();
+        Ok(scan)
+    }
+
+    /// Resolve the leaf cgroup from the membership and the mount table,
+    /// which `open` reads from its start on each call. The cgroup-v2
+    /// record can follow a mount that shadows it, so a second pass checks
+    /// every other mountpoint against it; the digests prove that both
+    /// passes read the same table. Returns the table's digest for the
+    /// recheck after the controller files are read.
+    pub(super) fn layout<R: BufRead>(
         membership: &str,
-        mountinfo: &(impl AsRef<[u8]> + ?Sized),
-    ) -> Result<Layout, String> {
+        mut open: impl FnMut() -> Result<R, String>,
+    ) -> Result<(Layout, TableDigest), String> {
         let mut group = None;
         // procfs terminates records with LF; a preceding CR belongs to the path.
         for line in membership.split_terminator('\n') {
@@ -213,29 +292,15 @@ mod linux {
             return Err("ambiguous, deleted or namespace-root cgroup membership".into());
         }
         let group = absolute_path(group)?;
-        let mut mounts = Vec::new();
-        let mut other_mounts = Vec::new();
-        for line in mountinfo_records(mountinfo.as_ref()) {
-            let record = mount_record(line)?;
-            if record.fstype != b"cgroup2" {
-                other_mounts.push(other_mount_path(record.mountpoint)?);
-                continue;
-            }
-            let root = cgroup_mount_path(record.root)?;
-            if root != Path::new("/") {
-                return Err("subtree cgroup mount hides ancestor limits".into());
-            }
-            mounts.push(cgroup_mount_path(record.mountpoint)?);
-        }
-        if mounts.len() != 1 {
+        let first = scan_mountinfo(&mut open()?, None)?;
+        let (Some(mount), 1) = (first.cgroup_mount, first.cgroup_mounts) else {
             return Err("missing or ambiguous cgroup-v2 mount".into());
-        }
-        let mount = mounts.remove(0);
-        if other_mounts.iter().any(|other| other.starts_with(&mount)) {
-            return Err("nested mount can shadow cgroup memory policy".into());
+        };
+        if scan_mountinfo(&mut open()?, Some(&mount))?.digest != first.digest {
+            return Err("kernel memory policy changed during admission".into());
         }
         let leaf = mount.join(group.strip_prefix("/").map_err(|_| "invalid cgroup path")?);
-        Ok(Layout { mount, leaf })
+        Ok((Layout { mount, leaf }, first.digest))
     }
 
     fn read_bounded_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
@@ -384,8 +449,7 @@ mod linux {
         }
         let membership = read_bounded(Path::new("/proc/self/cgroup"), 1 << 20)?;
         // Linux emits mount path bytes as is: the table is never decoded.
-        let mounts = read_bounded_bytes(Path::new("/proc/self/mountinfo"), 1 << 20)?;
-        let layout = layout(&membership, &mounts)?;
+        let (layout, mounts) = layout(&membership, open_mountinfo)?;
         let file = std::fs::File::open(&layout.mount)
             .map_err(|e| format!("cannot open cgroup mount: {e}"))?;
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -399,7 +463,7 @@ mod linux {
         }
         let posture = assess(budget, &layout, memlock)?;
         if read_bounded(Path::new("/proc/self/cgroup"), 1 << 20)? != membership
-            || read_bounded_bytes(Path::new("/proc/self/mountinfo"), 1 << 20)? != mounts
+            || scan_mountinfo(&mut open_mountinfo()?, None)?.digest != mounts
             || memlock_limit()? != memlock
         {
             return Err("kernel memory policy changed during admission".into());
@@ -414,6 +478,12 @@ mod tests {
     use super::*;
     use maki_format::config::{ByteSize, MemoryBudgetSection};
     use std::path::Path;
+
+    /// `layout` over a table in memory, which every pass reads from its
+    /// start.
+    fn layout(membership: &str, table: &(impl AsRef<[u8]> + ?Sized)) -> Result<Layout, String> {
+        linux::layout(membership, || Ok(table.as_ref())).map(|(layout, _)| layout)
+    }
 
     fn budget() -> MemoryBudgetSection {
         MemoryBudgetSection {
@@ -815,6 +885,104 @@ mod tests {
                 "{record:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_mount_table_is_read_as_a_stream_of_bounded_records() {
+        let membership = "0::/slice/daemon\n";
+        let cgroup = mountinfo("/", "/sys/fs/cgroup");
+        let expected = Layout {
+            mount: "/sys/fs/cgroup".into(),
+            leaf: "/sys/fs/cgroup/slice/daemon".into(),
+        };
+        // The table's size is host state: 4 MiB of other mounts, with the
+        // cgroup-v2 record in the middle, read from a file as admission
+        // reads the kernel's.
+        let name = "m".repeat(200);
+        let records: Vec<String> = (100..20_000)
+            .map(|id| {
+                format!("{id} 31 0:55 /source /srv/{name}{id} rw,relatime - tmpfs tmpfs rw\n")
+            })
+            .collect();
+        let (before, after) = records.split_at(records.len() / 2);
+        let table = [before.concat(), cgroup.clone(), after.concat()].concat();
+        assert!(table.len() > 4 << 20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mountinfo");
+        std::fs::write(&path, &table).unwrap();
+        let open = || {
+            std::fs::File::open(&path)
+                .map(std::io::BufReader::new)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            linux::layout(membership, open).map(|(layout, _)| layout),
+            Ok(expected)
+        );
+
+        // Only a record is bounded, its newline included.
+        let record = |len: usize| {
+            let (head, tail) = ("44 31 0:55 / /", " rw - tmpfs tmpfs rw\n");
+            format!("{head}{}{tail}", "d".repeat(len - head.len() - tail.len()))
+        };
+        assert!(layout(membership, &format!("{cgroup}{}", record(1 << 20))).is_ok());
+        for table in [
+            format!("{cgroup}{}", record((1 << 20) + 1)),
+            format!("{}{cgroup}", record((1 << 20) + 1)),
+            format!("{cgroup}{}", record((1 << 20) + 2).trim_end()),
+        ] {
+            assert_eq!(
+                layout(membership, &table).unwrap_err(),
+                "oversized record in /proc/self/mountinfo"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pass_reads_and_checks_the_same_whole_table() {
+        let membership = "0::/slice/daemon\n";
+        let cgroup = mountinfo("/", "/sys/fs/cgroup");
+        // A mount listed before the cgroup-v2 record still shadows it: the
+        // second pass checks every mountpoint against the cgroup mount.
+        let shadow = "44 31 0:55 / /sys/fs/cgroup/slice rw - tmpfs tmpfs rw\n";
+        assert_eq!(
+            layout(membership, &format!("{shadow}{cgroup}")).unwrap_err(),
+            "nested mount can shadow cgroup memory policy"
+        );
+
+        // Both passes must read the same table.
+        let other = "45 31 0:56 / /srv rw - tmpfs tmpfs rw\n";
+        let table = format!("{cgroup}{other}");
+        for (second, error) in [
+            (
+                format!("{cgroup}{}", other.replace("45 ", "46 ")),
+                "kernel memory policy changed during admission",
+            ),
+            (
+                format!("{shadow}{cgroup}"),
+                "nested mount can shadow cgroup memory policy",
+            ),
+            (
+                cgroup.clone(),
+                "kernel memory policy changed during admission",
+            ),
+        ] {
+            let mut reads = [table.as_bytes(), second.as_bytes()].into_iter();
+            let result = linux::layout(membership, || Ok(reads.next().unwrap()));
+            assert_eq!(result.unwrap_err(), error, "{second}");
+        }
+
+        // The digest the recheck compares is the table's exact bytes: equal
+        // tables agree, and a difference the parser ignores still counts.
+        let digest = |table: &str| {
+            linux::layout(membership, || Ok(table.as_bytes()))
+                .unwrap()
+                .1
+        };
+        assert_eq!(digest(&table), digest(&table.clone()));
+        assert_ne!(digest(&table), digest(&table.replace("45 ", "46 ")));
+        assert_ne!(digest(&table), digest(&table.replace('\n', "\r\n")));
+        assert_ne!(digest(&table), digest(table.trim_end()));
     }
 
     #[test]

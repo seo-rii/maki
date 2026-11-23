@@ -876,7 +876,10 @@ including mountinfo escaping. Other mounts are compared with the cgroup-v2 mount
 by their exact path bytes, so one elsewhere whose path is not UTF-8, contains a
 newline or is deeply nested does not affect admission. Records are split by the
 kernel's field layout, so a mount whose source is empty (printed as an empty
-field) is read like any other. Ambiguous mounts, subtree
+field) is read like any other. The table is read as a stream, so the number of
+mounts does not limit admission; one record longer than 1 MiB is refused.
+Admission reads the table again after the controller files and refuses when its
+SHA-256 digest changed. Ambiguous mounts, subtree
 mounts hiding ancestors, root membership, nested mounts shadowing controller
 files and escaping paths are refused. Run under the host cgroup
 namespace with the complete hierarchy visible; a container can hide further
