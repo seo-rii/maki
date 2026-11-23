@@ -331,3 +331,23 @@ fn empty_mount_sources_keep_detach_observation_exact() {
     let observed = fixture.observe(&read_only).unwrap();
     assert!(observed.mounted && !observed.writable);
 }
+
+/// Only the source field of a record can be empty. A record with any other
+/// empty field could shift the mountpoint and hide a mount, so it fails the
+/// observation, like a record without all three filesystem fields.
+#[test]
+fn records_with_other_empty_fields_fail_the_observation() {
+    let fixture = Fixture::new();
+    let mountpoint = &fixture.record.attachment.mountpoint;
+    for mounts in [
+        format!("41 25 253:9 /  {mountpoint} rw - xfs /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}  rw - xfs /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}2 rw  - xfs /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}2 rw -  /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}2 rw - xfs /dev/x \n"),
+        format!("41 25 253:9 / {mountpoint}2 rw - xfs  \n"),
+        format!("41 25 253:9 / {mountpoint}2 rw - xfs /dev/x\n"),
+    ] {
+        assert!(fixture.observe(&mounts).is_err(), "{mounts:?}");
+    }
+}

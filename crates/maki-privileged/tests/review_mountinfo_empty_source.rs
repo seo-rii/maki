@@ -35,6 +35,30 @@ fn an_empty_mount_source_is_an_empty_field() {
     assert_eq!(observed.source, "/dev/dm-0");
 }
 
+/// Kernel records keep one space between fields, and only the source can
+/// be empty. A record with any other empty field, or without all three
+/// filesystem fields, was not written by the kernel and identifies nothing.
+#[test]
+fn records_with_another_empty_field_are_not_mounts() {
+    let path = "/srv/audit";
+    for table in [
+        format!("35 27 253:0 /  {path} rw - xfs /dev/dm-0 rw\n"),
+        format!("35 27 253:0 / {path}  rw - xfs /dev/dm-0 rw\n"),
+        format!("35 27 253:0 / {path} rw  - xfs /dev/dm-0 rw\n"),
+        format!(" 35 27 253:0 / {path} rw - xfs /dev/dm-0 rw\n"),
+        format!("35 27 253:0 / {path} rw -  /dev/dm-0 rw\n"),
+        format!("35 27 253:0 / {path} rw - xfs /dev/dm-0 \n"),
+        format!("35 27 253:0 / {path} rw - xfs /dev/dm-0\n"),
+        format!("35 27 253:0 / {path} rw - xfs  \n"),
+        format!("35 27 253:0 / {path} rw - xfs\n"),
+    ] {
+        assert!(parse_mountinfo(&table, path).is_none(), "{table:?}");
+    }
+    // The super options are the rest of the record.
+    let table = format!("35 27 253:0 / {path} rw - xfs  rw,opt=a b\n");
+    assert_eq!(parse_mountinfo(&table, path).unwrap().source, "");
+}
+
 #[cfg(target_os = "linux")]
 mod namespace {
     use std::ffi::{CString, OsString};

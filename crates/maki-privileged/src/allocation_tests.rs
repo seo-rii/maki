@@ -206,3 +206,20 @@ fn review_auto_allocation_reads_empty_mount_sources_as_empty_fields() {
     let direct = b"91 20 43:32 / /srv/old rw - xfs  rw\n";
     assert_eq!(choose(&fixture.0, direct).unwrap(), "/dev/nbd3");
 }
+
+/// Only the source field of a record can be empty; any other empty field
+/// or a missing filesystem field is not a kernel record and refuses.
+#[test]
+fn review_auto_allocation_refuses_records_with_other_empty_fields() {
+    let fixture = Fixture::new();
+    for mounts in [
+        "92 20 0:41 /  /run/x rw - tmpfs tmpfs rw\n",
+        "92 20 0:41 / /run/x rw  - tmpfs tmpfs rw\n",
+        "92 20 0:41 / /run/x rw -  tmpfs rw\n",
+        "92 20 0:41 / /run/x rw - tmpfs tmpfs \n",
+        "92 20 0:41 / /run/x rw - tmpfs \n",
+        "92 20 0:41 / /run/x rw - tmpfs tmpfs\n",
+    ] {
+        assert!(choose(&fixture.0, mounts.as_bytes()).is_err(), "{mounts:?}");
+    }
+}

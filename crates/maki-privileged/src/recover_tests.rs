@@ -798,3 +798,26 @@ fn empty_mount_sources_keep_recovery_and_gate_checks_exact() {
         "{refused}"
     );
 }
+
+/// The workload gate reads every record itself: only the source field can
+/// be empty, and any other malformed record refuses.
+#[test]
+fn the_workload_gate_refuses_records_with_other_empty_fields() {
+    let (_fixture, state, _req, system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    let mounts = system.mounts(&record);
+    let gate = |extra: &str| {
+        let table = format!("{mounts}{extra}");
+        recover::observe_complete(&record, table.as_bytes(), &system.sysfs)
+    };
+    assert!(gate("42 25 0:41 / /run/x rw - tmpfs  rw\n").is_ok());
+    for extra in [
+        "42 25 0:41 /  /run/x rw - tmpfs tmpfs rw\n",
+        "42 25 0:41 / /run/x rw  - tmpfs tmpfs rw\n",
+        "42 25 0:41 / /run/x rw -  tmpfs rw\n",
+        "42 25 0:41 / /run/x rw - tmpfs tmpfs \n",
+        "42 25 0:41 / /run/x rw - tmpfs tmpfs\n",
+    ] {
+        assert!(gate(extra).is_err(), "{extra:?}");
+    }
+}

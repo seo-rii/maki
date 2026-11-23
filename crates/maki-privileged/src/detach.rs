@@ -195,26 +195,21 @@ pub(crate) fn observe_kernel(
     for line in
         crate::probe::mountinfo_lines(mountinfo).filter(|line| !line.trim_ascii().is_empty())
     {
-        let (left, right) = crate::probe::split_record(line)
+        let mount = crate::probe::mount_record(line)
             .ok_or_else(|| invalid("incomplete mountinfo observation"))?;
-        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
-        let filesystem: Vec<_> = crate::probe::mountinfo_fields(right).collect();
-        if fields.len() < 6 || filesystem.len() < 3 {
-            return Err(invalid("incomplete mountinfo observation"));
-        }
-        let device = mount_device_number(fields[2])?;
+        let device = mount_device_number(mount.device)?;
         // Partitions have their own holders directories, and direct
         // filesystem mounts are represented in mountinfo rather than in
         // holders. Neither may be mistaken for an entirely unused NBD.
         nbd_in_use |= nbd_devices.contains(&device);
-        let mounted_path = crate::probe::unescape(fields[4]);
+        let mounted_path = crate::probe::unescape(mount.mountpoint);
         nested |= mounted_below(&mounted_path, &record.attachment.mountpoint);
         if mounted_path == record.attachment.mountpoint.as_bytes() {
             // Every entry at the target must belong to the same complete
             // filesystem. A stacked or bind-subtree mount is not safe to
             // unmount as part of this recorded attachment.
-            if crate::probe::unescape(fields[3]) != b"/"
-                || filesystem[0] != b"xfs"
+            if crate::probe::unescape(mount.root) != b"/"
+                || mount.fstype != b"xfs"
                 || expected_lv_device != Some(device)
                 || mounted_device.is_some()
             {
@@ -223,7 +218,7 @@ pub(crate) fn observe_kernel(
                 ));
             }
             mounted_device = Some(device);
-            writable = [fields[5], filesystem[2]]
+            writable = [mount.options, mount.super_options]
                 .iter()
                 .all(|options| crate::probe::mount_options(options).any(|option| option == b"rw"));
         }

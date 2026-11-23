@@ -136,10 +136,48 @@ mod linux {
             })
     }
 
-    fn mountinfo_fields(part: &[u8]) -> Vec<&[u8]> {
-        part.split(|&byte| byte == b' ')
-            .filter(|field| !field.is_empty())
-            .collect()
+    /// The fields of one record admission reads, still escaped.
+    struct MountRecord<'a> {
+        root: &'a [u8],
+        mountpoint: &'a [u8],
+        fstype: &'a [u8],
+    }
+
+    /// Split a record into its fields by the positions Linux's
+    /// `show_mountinfo` writes them: `id parent major:minor root mountpoint
+    /// options [optional...] - fstype source superopts`. One ASCII space
+    /// separates fields: Linux escapes the spaces inside paths, the type
+    /// and the source (`\040`; tabs, newlines and backslashes too in paths),
+    /// and other bytes, including Unicode whitespace, carriage return,
+    /// form-feed and sequences that are not UTF-8, are field data. No field
+    /// before the separator is ever empty. After it come exactly the type,
+    /// the source and the superblock options, and only the source can be
+    /// empty (when the string given to mount(2) was): that is the one way
+    /// the kernel writes two consecutive spaces.
+    fn mount_record(line: &[u8]) -> Result<MountRecord<'_>, String> {
+        let Some(at) = line.windows(3).position(|window| window == b" - ") else {
+            return Err("malformed mountinfo".into());
+        };
+        record_fields(&line[..at], &line[at + 3..])
+            .ok_or_else(|| "malformed mountinfo fields".into())
+    }
+
+    fn record_fields<'a>(mount: &'a [u8], filesystem: &'a [u8]) -> Option<MountRecord<'a>> {
+        let mut mount = mount.split(|&byte| byte == b' ');
+        if mount.clone().any(<[u8]>::is_empty) {
+            return None;
+        }
+        // id parent major:minor root mountpoint options [optional...]
+        let (root, mountpoint) = (mount.nth(3)?, mount.next()?);
+        let _options = mount.next()?;
+        let mut filesystem = filesystem.splitn(3, |&byte| byte == b' ');
+        let (fstype, _source) = (filesystem.next()?, filesystem.next()?);
+        let super_options = filesystem.next()?;
+        (!fstype.is_empty() && !super_options.is_empty()).then_some(MountRecord {
+            root,
+            mountpoint,
+            fstype,
+        })
     }
 
     /// The mount table is bytes, not text: only the cgroup-v2 records are
@@ -178,27 +216,16 @@ mod linux {
         let mut mounts = Vec::new();
         let mut other_mounts = Vec::new();
         for line in mountinfo_records(mountinfo.as_ref()) {
-            let Some(at) = line.windows(3).position(|window| window == b" - ") else {
-                return Err("malformed mountinfo".into());
-            };
-            // Linux separates fields with ASCII spaces and escapes spaces,
-            // tabs, newlines and backslashes within paths. Other bytes,
-            // including Unicode whitespace, carriage return, form-feed and
-            // sequences that are not UTF-8, are path data.
-            let fields = mountinfo_fields(&line[..at]);
-            let fs = mountinfo_fields(&line[at + 3..]);
-            if fields.len() < 6 || fs.len() < 3 {
-                return Err("malformed mountinfo fields".into());
-            }
-            if fs[0] != b"cgroup2" {
-                other_mounts.push(other_mount_path(fields[4])?);
+            let record = mount_record(line)?;
+            if record.fstype != b"cgroup2" {
+                other_mounts.push(other_mount_path(record.mountpoint)?);
                 continue;
             }
-            let root = cgroup_mount_path(fields[3])?;
+            let root = cgroup_mount_path(record.root)?;
             if root != Path::new("/") {
                 return Err("subtree cgroup mount hides ancestor limits".into());
             }
-            mounts.push(cgroup_mount_path(fields[4])?);
+            mounts.push(cgroup_mount_path(record.mountpoint)?);
         }
         if mounts.len() != 1 {
             return Err("missing or ambiguous cgroup-v2 mount".into());
@@ -764,6 +791,30 @@ mod tests {
             layout("0::/slice/daemon\n", &nested).unwrap_err(),
             "nested mount can shadow cgroup memory policy"
         );
+    }
+
+    #[test]
+    fn records_with_other_empty_fields_still_refuse() {
+        // Only the source field can be empty. Any other empty field, or a
+        // missing filesystem field, is not a record the kernel wrote: it
+        // could shift a mountpoint and hide a nested mount.
+        let cgroup = mountinfo("/", "/sys/fs/cgroup");
+        for record in [
+            "44 31 0:55 /  /srv rw - tmpfs tmpfs rw\n",
+            "44 31 0:55 / /srv  rw - tmpfs tmpfs rw\n",
+            "44 31 0:55 / /srv rw  - tmpfs tmpfs rw\n",
+            " 44 31 0:55 / /srv rw - tmpfs tmpfs rw\n",
+            "44 31 0:55 / /srv rw -  tmpfs rw\n",
+            "44 31 0:55 / /srv rw - tmpfs tmpfs \n",
+            "44 31 0:55 / /srv rw - tmpfs  \n",
+            "44 31 0:55 / /srv rw - tmpfs tmpfs\n",
+        ] {
+            assert_eq!(
+                layout("0::/slice/daemon\n", &format!("{cgroup}{record}")).unwrap_err(),
+                "malformed mountinfo fields",
+                "{record:?}"
+            );
+        }
     }
 
     #[test]
