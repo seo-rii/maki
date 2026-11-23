@@ -216,7 +216,7 @@ impl Volume {
     }
 
     /// Exact bytes appending records of the given on-disk lengths would add
-    /// to [`journal_total_bytes`], including any new segment headers a roll
+    /// to [`Self::journal_total_bytes`], including any new segment headers a roll
     /// creates (review R08). Journal admission uses this so the hard limit
     /// accounts for rolls, not only record payloads.
     pub fn journal_append_footprint(&self, record_lens: impl IntoIterator<Item = u64>) -> u64 {

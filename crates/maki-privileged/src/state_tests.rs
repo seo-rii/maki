@@ -219,6 +219,8 @@ fn verify_config_loading_pins_trusted_descriptors_and_bounds_content() {
     let owner = fixture.0.metadata().unwrap().uid();
     let config = fixture.0.join("volume.toml");
     std::fs::write(&config, "volume_uuid = 'test'\n").unwrap();
+    // The umask must not decide whether the file is group-writable.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
     let load = || {
         read_config_beneath(
             File::open(&fixture.0).unwrap(),

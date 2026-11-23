@@ -249,25 +249,95 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
     Ok(disk)
 }
 
-fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
-    if disk
-        .list("")?
-        .iter()
-        .any(|name| !matches!(name.as_str(), super::ENROLL_LOCK | OPERATION_LOCK))
-    {
-        return Err(input("remote enrollment requires an empty backing"));
+/// Refuse a root in which a creation has published anything. What may be
+/// there is what a creation leaves before its format marker is published:
+/// the root locks, the marker under its staging name, and, from a release
+/// that wrote the marker in place, a marker that was created and never
+/// completely written. Such a root holds no namespace, tombstone or binding,
+/// so no volume data and nothing that names a volume, and no authority has
+/// accepted anything in it: a creation claims its authority only once the
+/// marker and the binding are durable. For rollback protection it is an
+/// empty directory. A complete marker is a creation that got further, which
+/// enrollment recovery continues.
+fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
+    for name in disk.list("")? {
+        let unpublished = match name.as_str() {
+            super::ENROLL_LOCK | OPERATION_LOCK | super::MARKER_NEXT => true,
+            MARKER => unwritten_marker(disk)?,
+            _ => false,
+        };
+        if !unpublished {
+            return Err(input("remote enrollment requires an empty backing"));
+        }
     }
     Ok(())
 }
 
-/// Called with both root operation and enrollment locks held.
-fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+/// Whether `rollback.format` was created and never completely written: it
+/// is empty or a torn copy of the marker, each byte the marker's or still
+/// zero. The marker itself is not.
+fn unwritten_marker(disk: &dyn Backing) -> io::Result<bool> {
+    let marker = disk.open(MARKER, false)?;
+    let len = marker.len()?;
+    if len > REMOTE_MAGIC.len() as u64 {
+        return Ok(false);
+    }
+    let mut bytes = vec![0; len as usize];
+    marker.read_at(0, &mut bytes)?;
+    Ok(bytes != REMOTE_MAGIC
+        && bytes
+            .iter()
+            .zip(REMOTE_MAGIC)
+            .all(|(byte, expected)| *byte == 0 || byte == expected))
+}
+
+/// Publish the format marker. Called with both root operation and
+/// enrollment locks held.
+///
+/// The marker is written and synced under its staging name, renamed into
+/// place, and the directory is synced, so `rollback.format` never names an
+/// empty or torn marker, whatever kills this process, cuts the power or
+/// fails in between. Until the rename nothing is published and the creation
+/// can simply be run again. A staged marker that a failed write or sync
+/// left is never synced as it is: it is truncated and written again through
+/// a new descriptor first.
+fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
     require_empty_remote_root(disk)?;
-    let marker = disk.open(MARKER, true)?;
-    marker.write_at(0, REMOTE_MAGIC)?;
-    marker.set_len(REMOTE_MAGIC.len() as u64)?;
-    marker.sync_data()?;
+    let staged = (|| {
+        let marker = disk.open(super::MARKER_NEXT, true)?;
+        marker.set_len(0)?;
+        marker.write_at(0, REMOTE_MAGIC)?;
+        marker.set_len(REMOTE_MAGIC.len() as u64)?;
+        marker.sync_data()
+    })();
+    if let Err(error) = staged {
+        // Leave the root as this run found it where that still works. A
+        // staged marker that stays does no harm: the next creation accepts
+        // and rewrites it.
+        let _ = disk.remove(super::MARKER_NEXT);
+        return Err(error);
+    }
+    disk.rename(super::MARKER_NEXT, MARKER)?;
     disk.sync_dir("")
+}
+
+/// Say what to do with a root that enrollment recovery cannot open because
+/// its creation stopped before the marker was published, while the approved
+/// authority is still one a creation accepts (released, never activated).
+/// Recovery continues a published root with the administrator's approval;
+/// this one needs none. Under a claimed authority a root without a marker
+/// is not an interrupted creation, and keeps its own refusal.
+fn unpublished(root: &Path, expected: &Record, error: io::Error) -> io::Error {
+    let nothing_published = expected.phase == Phase::Released
+        && FileBacking::read_only(root).is_ok_and(|disk| require_empty_remote_root(&disk).is_ok());
+    if !nothing_published {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        "this backing root's creation stopped before it published the format marker: create \
+         the volume again instead of resuming",
+    )
 }
 
 fn collect_after_activation(
@@ -539,7 +609,7 @@ impl RollbackBacking {
                 "cannot recover enrollment after its first activation",
             ));
         }
-        let disk = remote_root(root, false)?;
+        let disk = remote_root(root, false).map_err(|error| unpublished(root, expected, error))?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         if inspect(rpc.as_ref())? != *expected {
@@ -836,3 +906,7 @@ impl RollbackBacking {
 #[cfg(test)]
 #[path = "remote_load_tests.rs"]
 mod load_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "remote_creation_tests.rs"]
+mod creation_tests;

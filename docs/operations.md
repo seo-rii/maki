@@ -93,6 +93,9 @@ retried `volume create` reports `volume superblock already present`: the root
 is a complete volume, except that a failed or killed creation may have left
 that copy only in the page cache. The first attach makes both superblock copies
 durable before it accepts writes; empty the root instead to start over.
+A backing with a remote rollback witness is continued differently, without
+emptying its root: see
+[interrupted initial enrollment](rollback-protection.md#resume-interrupted-initial-enrollment).
 
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing

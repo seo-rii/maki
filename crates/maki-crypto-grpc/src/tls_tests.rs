@@ -167,10 +167,17 @@ async fn custom_ca_and_verified_server_name_succeed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_trust_and_wrong_server_name_are_rejected() {
+    // The client trusts a CA that did not issue the server's certificate.
+    // It is a test CA rather than the host's roots, which may be missing:
+    // a provider with no root at all cannot be built.
     let (untrusted_address, _) = tls_server("localhost", None).await;
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let untrusted = GrpcCryptoProvider::new_with_tls(
         spec(format!("https://localhost:{}", untrusted_address.port())),
-        GrpcTlsConfig::default(),
+        GrpcTlsConfig {
+            ca_certificate_pem: Some(other.cert.pem().into_bytes()),
+            client_identity: None,
+        },
     )
     .unwrap();
     assert!(untrusted

@@ -2,7 +2,8 @@
 //!
 //! Read classification (SPEC §22):
 //! - shard absent from catalog → unwritten zero
-//! - allocation bit 0 → unwritten zero
+//! - allocation bit 0 → the slot header decides: all zero is unwritten zero,
+//!   a valid header for the unit is served, anything else is EIO (see below)
 //! - bit 1, slot invalid/missing → EIO (never fabricated data)
 //! - bit 1, slot valid → ciphertext
 //!
@@ -1346,7 +1347,7 @@ impl SlotStore {
 
     /// The write sequence of the version a slot currently holds, without
     /// reading or verifying its payload: `None` for an unwritten (or v3
-    /// discarded) unit. Every header-level refusal of [`read_slot`] applies
+    /// discarded) unit. Every header-level refusal of [`Self::read_slot`] applies
     /// here too, so a caller that finds a plaintext cache entry for
     /// `(unit, sequence)` may serve it without the payload read (R4-006).
     pub fn slot_sequence(&self, unit: u64) -> Result<Option<u64>, CoreError> {

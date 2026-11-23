@@ -1,5 +1,7 @@
-"""The scheduled job must run every ignored release gate to completion."""
+"""The scheduled job must run every ignored release gate to completion, and
+the pull-request job every script test module."""
 
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ ETCD_GATE = ROOT / "crates" / "maki-witness" / "tests" / "etcd_ha.rs"
 ETCD_CFG = '#[cfg(all(unix, feature = "etcd-qualification"))]'
 DAEMON = ROOT / "crates" / "maki-nbdkit" / "src" / "daemon.rs"
 PLUGIN_STEP = "nbdkit plugin build (cdylib + plugin_init symbol)"
+BYTECODE_STEP = "Python suites leave no bytecode in the checkout (Linux)"
 FAKE_STEP = 'release build refuses provider = "fake"'
 # What `maki volume create` prints for provider = "fake" without the feature.
 FAKE_REFUSAL = ('error: config invalid: provider "fake" is not compiled into this build '
@@ -132,6 +135,49 @@ class ReleaseGateContract(unittest.TestCase):
         gate = ETCD_GATE.read_text()
         self.assertIn(f"{ETCD_CFG}\nmod quorum {{", gate)
         self.assertNotIn("#[cfg(unix)]\nmod quorum", gate)
+
+
+class PythonSuites(unittest.TestCase):
+    def pull_request_job(self):
+        """The always-on `pr` job without its comments."""
+        workflow = WORKFLOW.read_text()
+        job = workflow[workflow.index("\n  pr:\n"):workflow.index("\n  latest-stable:\n")]
+        return "".join(line for line in job.splitlines(keepends=True)
+                       if not line.lstrip().startswith("#"))
+
+    def test_the_pull_request_job_runs_every_script_test_module(self):
+        # Most modules run because their name matches a discovery pattern
+        # and the rest are named: a module that does neither would never run.
+        job = self.pull_request_job()
+        self.assertNotIn("continue-on-error", job)
+        patterns = re.findall(r"python3 -B -m unittest discover -s scripts -p '([^']+)'", job)
+        named = set(re.findall(r"python3 -B -m unittest scripts\.(test_\w+)", job))
+        modules = sorted(path.stem for path in (ROOT / "scripts").glob("test_*.py"))
+        self.assertGreater(len(modules), 20)
+        self.assertEqual(
+            [module for module in modules if module not in named and not any(
+                fnmatch.fnmatchcase(module + ".py", pattern) for pattern in patterns)],
+            [], "name these modules in a Linux step of the pr job, or rename them to match "
+                f"one of {patterns}")
+        self.assertEqual(sorted(named - set(modules)), [],
+                         "the workflow names script test modules that do not exist")
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_bytecode_gate_follows_the_suites_and_rejects_a_cache_directory(self):
+        job = self.pull_request_job()
+        gate = job.index(f"      - name: {BYTECODE_STEP}\n        if: runner.os == 'Linux'\n")
+        self.assertLess(job.rindex("python3 -B -m unittest"), gate)
+        with tempfile.TemporaryDirectory(prefix="maki-ci-gate-") as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            result = run_step(BYTECODE_STEP, root, {})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            cache = root / "scripts" / "__pycache__"
+            cache.mkdir()
+            (cache / "campaign_io.cpython-311.opt-1.pyc").write_bytes(b"fixture")
+            result = run_step(BYTECODE_STEP, root, {})
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("campaign_io.cpython-311.opt-1.pyc", result.stderr)
 
 
 @unittest.skipUnless(os.name == "posix", "the nightly steps run in bash on Linux runners")

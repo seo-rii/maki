@@ -32,6 +32,32 @@ Initialization refuses existing state. Local `serve` holds the authority's
 exclusive process lock until exit. Copied local directories are separate
 histories; they cannot be used as failover replicas.
 
+`init` publishes the first record the way `serve` publishes every later one:
+it writes and syncs `remote.next`, renames it to `remote.state` and syncs the
+directory. An `init` that fails (on a full disk, for example), is killed or
+loses power before the rename leaves no `remote.state`. Nothing was enrolled:
+run the same `init` command again. Whatever it left in `remote.next` is
+written over and is never read as state, and `serve` on such a directory
+answers `remote witness is not initialized`. If `init` did not report success
+and `remote.state` exists, the record was published: a second `init` answers
+`remote witness already enrolled`, and `serve` makes the record durable
+before it answers a request.
+
+An empty `remote.state` is the one state neither command continues. `init`
+and `serve` both refuse it, change nothing and say so:
+`remote witness state file remote.state is empty`. The files cannot show
+which of two things happened. Either an `init` of an older binary, which
+created the file before writing it, stopped in between, or an enrolled
+authority's state file was truncated. Only you can tell them apart. If this
+authority has never been served (no `serve` ever reported readiness for this
+directory), no volume can have been enrolled with it: remove `remote.state`
+and `remote.next` from the state directory and run `init` again. If it has
+served a volume, or you cannot rule that out, remove nothing and do not
+initialize it again. A new authority starts at fence 0 without a current
+root, so it accepts none of the volume's existing backing: attach, takeover,
+restore and enrollment recovery all refuse, and the record of which state
+was current is gone with the old file.
+
 Whoever can write the state directory or its `remote.*` files can put an older
 record back and roll the authority back. On Unix, `init` and `serve` therefore
 require the directory (checked on the opened directory, without following a
@@ -519,9 +545,11 @@ investigation.
 
 If activation actually succeeded, use exact-current takeover and inspect the
 selected state. This command does not reset it or automatically finish inner
-volume initialization that stopped after outer activation. See
+volume initialization that stopped after outer activation. A creation that
+stopped before it published `rollback.format` claimed nothing and is not
+resumed this way: run `maki volume create` again. See
 [enrollment recovery](rollback-protection.md#resume-interrupted-initial-enrollment)
-for the compatibility and initialization limits.
+for both cases and the compatibility and initialization limits.
 
 ## Retire old writer namespaces
 

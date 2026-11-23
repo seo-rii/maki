@@ -1,3 +1,6 @@
+#[path = "support/witness_config.rs"]
+mod witness_config;
+
 use std::process::Command;
 
 fn command(args: &[&str]) -> std::process::Output {
@@ -130,7 +133,7 @@ fn config_size_type_and_secret_redaction_are_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     for bytes in [vec![b'x'; 65537], b"unknown = 'DO_NOT_ECHO_ME'".to_vec()] {
-        std::fs::write(&config, bytes).unwrap();
+        witness_config::write(&config, bytes).unwrap();
         let output = command(&["serve", config.to_str().unwrap()]);
         assert!(!output.status.success());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("DO_NOT_ECHO_ME"));
@@ -212,7 +215,7 @@ fn real_service_inspect_and_fingerprint_work_and_serve_never_initializes() {
         &serde_json::json!({"state_dir":state,"listen":"127.0.0.1:0","server":options}),
     )
     .unwrap();
-    std::fs::write(&config, &text).unwrap();
+    witness_config::write(&config, &text).unwrap();
     assert!(!command(&["serve", config.to_str().unwrap()])
         .status
         .success());
@@ -259,7 +262,7 @@ fn real_service_inspect_and_fingerprint_work_and_serve_never_initializes() {
         tls: writer,
     };
     let client_path = dir.path().join("client.toml");
-    std::fs::write(&client_path, toml::to_string(&client).unwrap()).unwrap();
+    witness_config::write(&client_path, toml::to_string(&client).unwrap()).unwrap();
     let inspect = command(&["inspect", client_path.to_str().unwrap()]);
     assert!(
         inspect.status.success(),

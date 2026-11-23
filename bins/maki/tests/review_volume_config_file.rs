@@ -18,6 +18,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/shared_dir.rs"]
+mod shared_dir;
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -59,18 +62,37 @@ fn is_root() -> bool {
 struct Fixture {
     dir: tempfile::TempDir,
     binary: PathBuf,
+    /// Why other users cannot reach `dir`; the cases that run the CLI as
+    /// another user skip then.
+    private: Option<String>,
 }
 
 impl Fixture {
-    /// A directory every user can search, holding a copy of the binary that
-    /// every user can run (the build tree may sit below a private home).
+    /// A directory every user can reach, holding a copy of the binary that
+    /// every user can run (the build tree may sit below a private home, and
+    /// so may `TMPDIR`). Where no such directory can be made, the fixture
+    /// is private to this user.
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (dir, private) = match shared_dir::tempdir() {
+            Ok(dir) => (dir, None),
+            Err(reason) => (tempfile::tempdir().unwrap(), Some(reason)),
+        };
         let binary = dir.path().join("maki");
         std::fs::copy(env!("CARGO_BIN_EXE_maki"), &binary).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { dir, binary }
+        Self {
+            dir,
+            binary,
+            private,
+        }
+    }
+
+    /// Whether `test` must skip its cases that run as another user; says so.
+    fn skips_other_users(&self, test: &str) -> bool {
+        if let Some(reason) = &self.private {
+            eprintln!("{test}: skipped the cases that run as another user: {reason}");
+        }
+        self.private.is_some()
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -215,6 +237,10 @@ fn a_configuration_owned_by_another_user_is_refused_by_every_loader() {
             &format!("root loading owner {NOBODY}, mode {mode:o}"),
         );
     }
+    if fixture.skips_other_users("a_configuration_owned_by_another_user_is_refused_by_every_loader")
+    {
+        return;
+    }
     // An unprivileged user can open another user's file only when it grants
     // read access to others; the owner check then refuses it.
     let config = fixture.write_owned("stranger.toml", OTHER, OTHER, 0o644);
@@ -236,6 +262,9 @@ fn root_owned_and_own_configurations_still_load_in_every_loader() {
     }
     if !is_root() {
         eprintln!("needs root to chown the fixture and switch users; skipping the rest");
+        return;
+    }
+    if fixture.skips_other_users("root_owned_and_own_configurations_still_load_in_every_loader") {
         return;
     }
     // SPEC 8: root:maki 0640, read by the daemon user through its group.

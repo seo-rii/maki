@@ -8,9 +8,13 @@
 //! by request (R5-004). A slot holding a CRC-valid empty ciphertext thus
 //! turned every read coalesced with it into EIO, although nothing was sent.
 //! The scheduler refuses such a request at admission, so it never joins a
-//! batch. A rejection the provider returns after the batch may have been
-//! sent still reaches every request in it.
+//! batch. It admits by the contract the stack reports, so that contract
+//! must not list a size the stack refuses: an endpoint set bound to one
+//! plaintext size reports that size only, whatever else its endpoints have
+//! in common. A rejection the provider returns after the batch may have
+//! been sent still reaches every request in it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +42,9 @@ enum Stack {
     /// The endpoint also declares a plaintext size above its batch byte
     /// limit, which the dispatcher refuses before sending.
     EndpointsWithUnbatchableSize,
+    /// The endpoint also declares half the unit as a plaintext size. The
+    /// set is bound to the unit and refuses every other size.
+    EndpointsWithSmallerSize,
     RandomPrefix,
 }
 
@@ -46,20 +53,28 @@ enum Stack {
 enum Refused {
     EmptyCiphertext,
     OversizedCiphertext,
-    UnsupportedPlaintextSize,
+    /// Half the unit: a size the stack does not serve, whether or not its
+    /// endpoint declares it.
+    OtherPlaintextSize,
     PlaintextAboveBatchLimit,
 }
 
-/// Declares one more plaintext size than it serves and a batch byte limit
-/// of a single unit.
-struct UnbatchableSize(Arc<FakeCryptoProvider>);
+/// Declares one more plaintext size than it serves and, with `max_bytes`,
+/// that batch byte limit.
+struct Declares {
+    inner: Arc<FakeCryptoProvider>,
+    size: u32,
+    max_bytes: Option<u64>,
+}
 
 #[async_trait]
-impl CryptoProvider for UnbatchableSize {
+impl CryptoProvider for Declares {
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        let mut caps = self.0.capabilities().await?;
-        caps.supported_plaintext_sizes.push(2 * UNIT);
-        caps.batch.max_bytes = u64::from(UNIT);
+        let mut caps = self.inner.capabilities().await?;
+        caps.supported_plaintext_sizes.push(self.size);
+        if let Some(max_bytes) = self.max_bytes {
+            caps.batch.max_bytes = max_bytes;
+        }
         Ok(caps)
     }
 
@@ -68,7 +83,7 @@ impl CryptoProvider for UnbatchableSize {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        self.0.encrypt_batch(context, items).await
+        self.inner.encrypt_batch(context, items).await
     }
 
     async fn decrypt_batch(
@@ -76,7 +91,68 @@ impl CryptoProvider for UnbatchableSize {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError> {
-        self.0.decrypt_batch(context, items).await
+        self.inner.decrypt_batch(context, items).await
+    }
+}
+
+/// Serves the unit and half the unit, each with its own cipher.
+struct TwoSizes {
+    unit: FakeCryptoProvider,
+    half: FakeCryptoProvider,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CryptoProvider for TwoSizes {
+    async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        let mut caps = self.unit.capabilities().await?;
+        caps.supported_plaintext_sizes.push(UNIT / 2);
+        Ok(caps)
+    }
+
+    async fn encrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[PlaintextUnit],
+    ) -> Result<Vec<CiphertextUnit>, CryptoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut out = Vec::new();
+        for item in items {
+            let cipher = if item.data.len() == (UNIT / 2) as usize {
+                &self.half
+            } else {
+                &self.unit
+            };
+            out.extend(
+                cipher
+                    .encrypt_batch(context, std::slice::from_ref(item))
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
+
+    async fn decrypt_batch(
+        &self,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let half = self.half.capabilities().await?.max_ciphertext_size as usize;
+        let mut out = Vec::new();
+        for item in items {
+            let cipher = if item.data.len() == half {
+                &self.half
+            } else {
+                &self.unit
+            };
+            out.extend(
+                cipher
+                    .decrypt_batch(context, std::slice::from_ref(item))
+                    .await?,
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -136,7 +212,16 @@ impl Fixture {
         };
         let endpoint = Arc::new(FakeCryptoProvider::new(wire));
         let served: Arc<dyn CryptoProvider> = match stack {
-            Stack::EndpointsWithUnbatchableSize => Arc::new(UnbatchableSize(endpoint.clone())),
+            Stack::EndpointsWithUnbatchableSize => Arc::new(Declares {
+                inner: endpoint.clone(),
+                size: 2 * UNIT,
+                max_bytes: Some(u64::from(UNIT)),
+            }),
+            Stack::EndpointsWithSmallerSize => Arc::new(Declares {
+                inner: endpoint.clone(),
+                size: UNIT / 2,
+                max_bytes: None,
+            }),
             _ => endpoint.clone(),
         };
         let set: Arc<dyn CryptoProvider> = Arc::new(
@@ -233,12 +318,13 @@ async fn a_unit_the_stack_refuses_before_sending_fails_alone() {
     for stack in [
         Stack::Endpoints,
         Stack::EndpointsWithUnbatchableSize,
+        Stack::EndpointsWithSmallerSize,
         Stack::RandomPrefix,
     ] {
         for case in [
             Refused::EmptyCiphertext,
             Refused::OversizedCiphertext,
-            Refused::UnsupportedPlaintextSize,
+            Refused::OtherPlaintextSize,
             Refused::PlaintextAboveBatchLimit,
         ] {
             let f = Fixture::new(stack).await;
@@ -257,9 +343,9 @@ async fn a_unit_the_stack_refuses_before_sending_fails_alone() {
                         }]),
                     )
                 }
-                Refused::UnsupportedPlaintextSize | Refused::PlaintextAboveBatchLimit => {
+                Refused::OtherPlaintextSize | Refused::PlaintextAboveBatchLimit => {
                     let len = match case {
-                        Refused::UnsupportedPlaintextSize => UNIT / 2,
+                        Refused::OtherPlaintextSize => UNIT / 2,
                         _ => 2 * UNIT,
                     };
                     (
@@ -306,6 +392,59 @@ async fn a_unit_the_stack_refuses_before_sending_fails_alone() {
          provider stack refuses before sending anything:\n{}",
         failures.join("\n")
     );
+}
+
+/// A set that is not bound to one plaintext size serves every size its
+/// endpoints have in common and reports them all: the scheduler admits a
+/// unit of each, and may send them in one call.
+#[tokio::test]
+async fn a_set_not_bound_to_one_size_serves_every_common_size() {
+    let clock = Arc::new(ManualClock::new());
+    let endpoint = Arc::new(TwoSizes {
+        unit: FakeCryptoProvider::new(UNIT),
+        half: FakeCryptoProvider::new(UNIT / 2),
+        calls: AtomicUsize::new(0),
+    });
+    let set: Arc<dyn CryptoProvider> = Arc::new(EndpointSet::new(
+        vec![("only".into(), endpoint.clone())],
+        dispatch(),
+        clock.clone(),
+    ));
+    assert_eq!(
+        set.capabilities().await.unwrap().supported_plaintext_sizes,
+        [UNIT / 2, UNIT]
+    );
+    let scheduler = Arc::new(BatchScheduler::new(set, config(), clock.clone()));
+    let context = CryptoContext {
+        volume_uuid: uuid::Uuid::from_u128(0x10ca1),
+        format_version: 3,
+        crypto_compatibility_id: "test-profile-v1".into(),
+    };
+    let requests: Vec<_> = [(1, UNIT), (2, UNIT / 2)]
+        .into_iter()
+        .map(|(unit_index, len)| {
+            let scheduler = scheduler.clone();
+            let context = context.clone();
+            tokio::spawn(async move {
+                let item = plaintext(unit_index, len);
+                let sealed = scheduler
+                    .encrypt_batch(&context, std::slice::from_ref(&item))
+                    .await?;
+                let opened = scheduler.decrypt_batch(&context, &sealed).await?;
+                Ok::<_, CryptoError>(opened[0].data == item.data)
+            })
+        })
+        .collect();
+    settle(&clock).await;
+    for request in requests {
+        assert!(request.await.unwrap().unwrap(), "round trip mismatch");
+    }
+    assert_eq!(
+        endpoint.calls.load(Ordering::SeqCst),
+        2,
+        "one encrypt and one decrypt call carry both sizes"
+    );
+    assert_eq!(scheduler.stats().coalesced_batches_total(), 2);
 }
 
 /// The admission check does not widen per-request isolation: a provider

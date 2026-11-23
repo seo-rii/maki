@@ -24,11 +24,16 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/scratch_cgroup.rs"]
+mod scratch_cgroup;
+
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use scratch_cgroup::Group;
 
 const MODE: &str = "MAKI_REVIEW_MOUNT_TABLE_MODE";
 const GROUP: &str = "MAKI_REVIEW_MOUNT_TABLE_GROUP";
@@ -59,18 +64,6 @@ max_bytes = "1GiB"
 startup_headroom_bytes = "1MiB"
 required_memlock_bytes = 0
 "#;
-
-/// Phrases of verdicts that come from the membership file or the mount
-/// table rather than from the cgroup: with one of them the comparison would
-/// not reach the code under test.
-const BEFORE_THE_CGROUP: [&str; 6] = [
-    "membership",
-    "mountinfo",
-    "cgroup-v2 mount",
-    "nested mount",
-    "subtree cgroup mount",
-    "cgroup path",
-];
 
 /// The admission verdict, without the host's fluctuating usage figures.
 fn outcome() -> String {
@@ -120,7 +113,7 @@ impl Drop for Detach {
 /// mounts lies on a tmpfs at a scratch directory, detached at the end.
 fn child(mode: &str) {
     let group = std::env::var_os(GROUP).expect("the parent names the cgroup");
-    std::fs::write(Path::new(&group).join("cgroup.procs"), "0").unwrap();
+    scratch_cgroup::enter(Path::new(&group)).unwrap();
     let scratch = tempfile::tempdir().unwrap();
     if let Err(error) = mount(c"maki-review", scratch.path(), c"tmpfs", 0) {
         println!("SKIP: cannot mount tmpfs in a private mount namespace: {error}");
@@ -161,45 +154,6 @@ fn child(mode: &str) {
     println!("OUTCOME: {}", outcome());
 }
 
-/// A private, empty cgroup-v2 group under the hierarchy's mount, removed
-/// when dropped (the children that joined it have exited by then).
-struct Group(PathBuf);
-
-impl Group {
-    fn create(label: &str) -> Result<Self, String> {
-        let table = std::fs::read("/proc/self/mountinfo").map_err(|e| e.to_string())?;
-        let mut mounts = table.split(|&byte| byte == b'\n').filter_map(|line| {
-            let line = std::str::from_utf8(line).ok()?;
-            let (mount, filesystem) = line.split_once(" - ")?;
-            (filesystem.split(' ').next() == Some("cgroup2"))
-                .then(|| mount.split(' ').nth(4).map(PathBuf::from))
-                .flatten()
-        });
-        let (Some(mount), None) = (mounts.next(), mounts.next()) else {
-            return Err("no single cgroup-v2 mount in this namespace".into());
-        };
-        let name = format!("maki-review-mount-table-{}-{label}", std::process::id());
-        let group = mount.join(name);
-        std::fs::create_dir(&group)
-            .map_err(|e| format!("cannot create a cgroup-v2 group under {mount:?}: {e}"))?;
-        let group = Self(group);
-        let limit = group.0.join("memory.max");
-        if limit.exists() {
-            std::fs::write(&limit, BUDGET_BYTES.to_string())
-                .map_err(|e| format!("cannot set {limit:?}: {e}"))?;
-        }
-        Ok(group)
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_dir(&self.0) {
-            eprintln!("cannot remove the test cgroup {:?}: {error}", self.0);
-        }
-    }
-}
-
 /// Run `test`'s child half in `mode`, in a fresh mount namespace whose
 /// mounts do not propagate to the host. `Err` is the reason the host does
 /// not permit it.
@@ -208,7 +162,7 @@ fn run(test: &str, mode: &str, group: &Group) -> Result<String, String> {
     command
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(MODE, mode)
-        .env(GROUP, &group.0);
+        .env(GROUP, group.path());
     // SAFETY: runs in the forked child before exec and only makes raw
     // system calls on static strings.
     unsafe {
@@ -261,7 +215,7 @@ fn compare(test: &str, mode: &str) {
         eprintln!("skipped: a private mount namespace and cgroup need root");
         return;
     }
-    let group = match Group::create(mode) {
+    let group = match Group::create(mode, BUDGET_BYTES) {
         Ok(group) => group,
         Err(reason) => {
             eprintln!("skipped: {reason}");
@@ -279,7 +233,7 @@ fn compare(test: &str, mode: &str) {
     };
     println!("without the extra mounts: {plain}");
     println!("with the extra mounts ({mode}): {changed}");
-    if BEFORE_THE_CGROUP.iter().any(|stage| plain.contains(stage)) {
+    if scratch_cgroup::stops_before_the_cgroup(&plain) {
         eprintln!("skipped: admission does not get past the mount table here: {plain}");
         return;
     }

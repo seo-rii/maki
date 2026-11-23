@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // regressions. A dev dependency on maki-test-support would form a cycle.
 #[allow(dead_code)]
 #[path = "../../../maki-test-support/src/crash_backing.rs"]
-mod crash_backing;
+pub(crate) mod crash_backing;
 use crash_backing::{CrashableBacking, FaultOp};
 
 struct Restore {

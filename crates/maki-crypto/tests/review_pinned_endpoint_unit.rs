@@ -1,4 +1,5 @@
 //! BUG-058: select a known provider plaintext size without guessing from CT.
+//! A set bound to that size serves no other, and reports no other.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -122,7 +123,12 @@ async fn selected_unit_splits_decrypt_logically_even_with_expanded_ciphertext() 
     let set = set(peer.clone());
     let before = set.capabilities().await.unwrap();
     let set = set.with_plaintext_size(UNIT as u32);
-    assert_eq!(set.capabilities().await.unwrap(), before);
+    // Binding narrows the reported plaintext sizes to the bound one and
+    // leaves the rest of the common contract as it was.
+    let mut bound = set.capabilities().await.unwrap();
+    assert_eq!(bound.supported_plaintext_sizes, [UNIT as u32]);
+    bound.supported_plaintext_sizes = before.supported_plaintext_sizes.clone();
+    assert_eq!(bound, before);
     let input: Vec<_> = (0..4)
         .map(|unit_index| PlaintextUnit {
             unit_index,
@@ -201,6 +207,39 @@ async fn selected_unit_rejects_an_entire_mixed_input_before_any_rpc() {
     ));
     assert_eq!(peer.inner.encrypt_calls(), 0);
     assert_eq!(set.global_inflight(), (0, 0));
+}
+
+/// What a bound set reports is what it serves: a layer that admits units by
+/// the reported sizes (the batch scheduler) never hands it one that it
+/// refuses, which would fail the whole call that unit is batched into.
+#[tokio::test]
+async fn a_bound_set_reports_only_the_plaintext_size_it_serves() {
+    let peer = Arc::new(Peer::new(false));
+    let common = set(peer.clone())
+        .capabilities()
+        .await
+        .unwrap()
+        .supported_plaintext_sizes;
+    assert_eq!(common, [UNIT as u32, 4096]);
+    let set = set(peer.clone()).with_plaintext_size(UNIT as u32);
+    let reported = set.capabilities().await.unwrap();
+    assert_eq!(reported.supported_plaintext_sizes, [UNIT as u32]);
+    for size in common {
+        let calls = peer.inner.encrypt_calls();
+        let result = set
+            .encrypt_batch(&context(), &[plaintext(size as usize)])
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            reported.accepts_plaintext_size(size as usize),
+            "{size}-byte unit: {result:?}"
+        );
+        assert_eq!(
+            peer.inner.encrypt_calls() - calls,
+            usize::from(result.is_ok()),
+            "{size}-byte unit"
+        );
+    }
 }
 
 #[tokio::test]

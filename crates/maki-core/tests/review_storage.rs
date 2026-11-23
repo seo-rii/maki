@@ -380,6 +380,9 @@ fn recovery_truncates_torn_final_record_header() {
 #[cfg(unix)]
 #[test]
 fn recovery_rejects_oversized_segment_before_allocation() {
+    // No failpoint is armed here, but the write below passes the journal
+    // failpoints other tests of this binary arm for exactly one hit.
+    let _guard = failpoints::test_lock();
     let dir = tempfile::tempdir().unwrap();
     let backing: Arc<dyn Backing> =
         Arc::new(maki_backing::FileBacking::new(dir.path().join("volume")).unwrap());

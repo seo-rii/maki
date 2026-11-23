@@ -11,6 +11,109 @@ documents.
 
 ### Breaking changes
 
+- **A volume configuration must be a regular file that no other user can
+  change** (AUD-106, 2026-11-23;
+  [#339](https://github.com/seo-rii/maki/pull/339)). The daemon, every `maki`
+  command that takes a configuration and `maki-benchmark` refuse, before
+  parsing it, a file that is a symlink, has a second hard link, is owned by a
+  user other than root and the user the process runs as, or is writable by
+  its group or others (a file written under `umask 002`, or one with a POSIX
+  ACL that grants write access); the daemon fails attach on such a file.
+  Group and other read stay allowed. Before upgrading, list the affected
+  files and reinstall each with `install -m 0640 -o root -g maki`. A file
+  owned by the daemon user is still accepted by the daemon, but refused by
+  commands run as root
+  ([configuration file](docs/configuration.md#configuration-file),
+  [upgrade](docs/operations.md#upgrading-the-runtime-layout)).
+- **A root process creates backing and witness entries for the owner of
+  their directory, and fails when it cannot** (AUD-111,
+  [#344](https://github.com/seo-rii/maki/pull/344)). On Linux, a command run
+  as root (`maki check --deep`, `maki-check --deep`, `maki volume inspect`,
+  `create`, `takeover`, `restore` or `resume-enrollment`) creates each file
+  and directory below a backing root or a local witness directory for the
+  owner of the directory it is created in. A root run on a volume the daemon
+  user owns therefore no longer leaves root-owned files that stop the next
+  attach, and the procedures drop their `chown -R maki:maki` step. A root
+  process that cannot change the owner (CAP_CHOWN dropped) now fails instead
+  of creating a root-owned entry.
+  Opening a local rollback witness as root gives a root-owned anchor in the
+  daemon's directory back to the daemon user, refuses an anchor a third user
+  owns, and removes a leftover `anchor.next` instead of publishing it; a
+  file a third user puts back under that name is refused. A hand-back is
+  still needed for a restored copy whose files lost their owners, for a
+  volume or witness directory root had to create itself (the `volume create`
+  warning, now printed only then, names it) and after a root run that a
+  crash interrupted ([volume lifecycle](docs/operations.md#volume-lifecycle),
+  [rollback
+  protection](docs/rollback-protection.md#local-configuration-and-creation)).
+- **Candidate builds refuse release-profile and unstable-toolchain overrides,
+  and `maki-nbdkit` requires unwinding panics** (AUD-103,
+  [#336](https://github.com/seo-rii/maki/pull/336)).
+  `scripts/prepare_release.py` stops before building when its environment
+  holds a `CARGO_PROFILE_RELEASE_*`, `RUSTC_BOOTSTRAP`, `CARGO_UNSTABLE_*` or
+  `__CARGO_*` variable, or when Cargo configuration outside the committed
+  source (above the build directory or in `CARGO_HOME`) has a
+  `[profile.release]` or `[unstable]` table or an `include`: unset the
+  variable, or commit the profile change. The manifest also records
+  `CARGO_INCREMENTAL`, the C toolchain inputs of the native dependencies and
+  each external Cargo configuration file with its digest. `maki-nbdkit` no
+  longer compiles with `panic = "abort"`, however that strategy is selected,
+  because the plugin would lose its panic boundary
+  ([releasing](docs/releasing.md#prepare-and-inspect)).
+- **A crypto call that ends at its `bounded-error` deadline returns the last
+  endpoint error, and `maki_crypto_deadline_exceeded_total` counts every
+  expired call once** (AUD-109,
+  [#342](https://github.com/seo-rii/maki/pull/342)). Wherever the deadline
+  expires, the call returns the last error an endpoint returned before it for
+  the RPC batch in progress, with that error's class (`throttled: HTTP 429`,
+  for example), or `operation deadline exceeded` when no endpoint failed that
+  batch. Before, an RPC cut off by the deadline got the bare deadline error
+  whatever the endpoints had answered, and so did a caller whose budget ran
+  out in the batch scheduler before the dispatcher's, the usual case on a
+  remote volume. The counter no longer follows the error text: it counts each
+  call whose own deadline expired exactly once, including one that returns an
+  endpoint error and the exit right after a failed RPC. Alert on the counter
+  rather than on the error text
+  ([metrics](docs/operations.md#metrics-and-health)).
+- **A quarantined endpoint is validated again after an inconclusive failure
+  instead of staying excluded until the daemon restarts** (AUD-110,
+  [#343](https://github.com/seo-rii/maki/pull/343)). A malformed or truncated
+  reply during background validation (a proxy error page, an endpoint
+  restarting mid-response) used to mark the endpoint `rejected` for the life
+  of the process. Only proof that it serves another contract does so now:
+  another key, compatibility id or canary, a claimed capability it does not
+  honour, or an explicit refusal of the volume's context. An endpoint that
+  refuses the volume's key canary with an integrity failure is rejected; it
+  used to be deferred and validated again forever. Inconclusive attempts are
+  repeated after `circuit_breaker.open_initial`, the spacing doubling up to
+  `circuit_breaker.open_max`, instead of at a fixed interval, so an endpoint
+  that was unreachable for long can take up to `open_max` to return after it
+  recovers ([endpoint
+  validation](docs/configuration.md#websocket-and-grpc-contracts)).
+- **With `crypto.random_prefix_bytes`, the attach self-test's
+  compatibility-id probe reaches the provider** (AUD-107,
+  [#340](https://github.com/seo-rii/maki/pull/340)). The random-prefix
+  wrapper used to answer that probe itself, so a remote provider that
+  declares context binding but ignores the compatibility id, or a transport
+  mapping that drops the field, attached with a prefix and was refused
+  without one. It is now refused at attach in both cases ("compatibility id
+  decrypts to the original plaintext"); fix the provider or the mapping. A
+  prefixed volume's self-test sends one more decrypt request ([random
+  plaintext
+  prefixes](docs/random-plaintext-prefix.md#existing-volumes-and-endpoint-compatibility)).
+- **A lock ends when its holder releases it, even while a forked child still
+  holds its descriptor** (AUD-108,
+  [#341](https://github.com/seo-rii/maki/pull/341)). The volume, rollback,
+  witness, attach and control-socket directory locks were released only by
+  closing their descriptor, so a child forked by another thread kept them
+  held until its `exec`: an attach right after a detach or a create could
+  fail with `VOLUME_ALREADY_ATTACHED`, and a closed rollback backing or
+  witness store could refuse to reopen. Every lock is now unlocked before its
+  descriptor closes. As a consequence, remote GC no longer treats a namespace
+  as live because a forked child inherited the descriptor of a lifetime lock
+  its holder has dropped; a held lifetime lock still keeps its namespace
+  ([backing namespace](docs/architecture.md#backing-namespace)).
+
 - **The `maki-witness` configuration, state directory and state files must be
   owned by root or by the user that runs the command** (AUD-075, AUD-076,
   2026-11-17; [#170](https://github.com/seo-rii/maki/pull/170)). `serve`,
@@ -301,6 +404,43 @@ documents.
   checker in CI (2026-09-23).
 
 ### Fixed
+
+- **2026-11-23 audit: privileged helper and daemon admission** (AUD-101,
+  AUD-102). A mount with an empty source (`mount -t tmpfs '' /dir`) anywhere
+  in the namespace no longer fails NBD allocation, attach, detach, cleanup,
+  recovery, grow and the workload verify gate for every volume, or the start
+  of a memory-budgeted daemon: both mount-table parsers split a record by
+  field position. Memory-budget admission reads the table as a stream, so a
+  host with thousands of mounts is no longer refused with "oversized kernel
+  field /proc/self/mountinfo"; one record longer than 1 MiB still is
+  ([#337](https://github.com/seo-rii/maki/pull/337); [memory
+  budget](docs/configuration.md#measured-memory-budget)). See the
+  [remediation
+  log](docs/review-remediation.md#internal-audit-fourth-round-2026-11-23-aud-098aud-112).
+- **2026-11-23 audit: storage, remote providers and secrets** (AUD-098 to
+  AUD-100). A file whose name is not UTF-8 in a volume's `data/` or
+  `journal/` directory no longer fails every attach or leaves `maki check`
+  inconclusive: the scans skip it like any other unknown name, while volume
+  creation and rollback enrollment still refuse it
+  ([#338](https://github.com/seo-rii/maki/pull/338)). A request with a unit
+  that is refused before anything is sent (an empty ciphertext recorded by a
+  damaged slot, a ciphertext above the provider's maximum, plaintext of a
+  size the provider does not accept) now fails alone at scheduler admission;
+  with a provider that is not retry-safe it used to fail every request
+  coalesced with it, so one such slot gave healthy reads EIO
+  ([#334](https://github.com/seo-rii/maki/pull/334);
+  [batching](docs/configuration.md#batching-and-pending-bounds)). The search
+  of each encrypt result for its own plaintext no longer builds a table
+  derived from that plaintext in ordinary heap memory, where it was not
+  page-locked and was freed without erasure
+  ([#335](https://github.com/seo-rii/maki/pull/335); [transport
+  memory](docs/transport-memory.md#local-providers-and-key-material)).
+- **2026-11-23 audit: tests** (AUD-112). The preserve-first rule of the A/B
+  metadata stores is pinned for every record type by the copy a torn retry
+  keeps, and for the checkpoint state at the volume level
+  ([#345](https://github.com/seo-rii/maki/pull/345)). The memory-budget
+  admission recheck, which no test covered, has one
+  ([#337](https://github.com/seo-rii/maki/pull/337)).
 
 - **2026-11-17 audit: durability and recovery** (AUD-052 to AUD-062, AUD-091).
   A worker pass started by the interval, the overlay bound or a write refused
@@ -701,6 +841,23 @@ observable behaviour:
   per-RPC deadlines cover gRPC readiness plus the call (BUG-017).
 
 ### Documentation
+
+- **2026-11-23 audit** (AUD-104, AUD-105): the nbd-client 3.27 backport
+  recipe in the Debian guide stops at the first failed step, builds in a new
+  directory, refuses a tarball that does not match the digest the operator
+  verified against the upstream signature (`NBD_TARBALL_SHA256`) and installs
+  exactly the package it built for the host's architecture; the quoted
+  `Depends` line includes `systemd (>= 249)`
+  ([installation](docs/getting-started/installation-debian.md#nbd-client-327-or-later),
+  [#336](https://github.com/seo-rii/maki/pull/336)). The link checker counts
+  a tab after a block quote or list margin to the line's next tab stop, so
+  links on such lines are no longer skipped as indented code
+  ([#333](https://github.com/seo-rii/maki/pull/333)). The remediation log
+  records the fourth audit and marks the statements it supersedes; SPEC §8
+  says that non-Unix hosts also hold a volume configuration to 1 MiB, SPEC
+  §34 that a quarantined endpoint serves no volume request before its
+  validation succeeds, and the architecture page that the echo check finds
+  the plaintext anywhere in an encrypt result.
 
 - **2026-11-17 audit** (AUD-081, AUD-084 to AUD-090, AUD-096, AUD-097): the
   link checker verifies reference-style link definitions and references

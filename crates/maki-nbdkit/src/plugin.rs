@@ -276,7 +276,7 @@ unsafe extern "C" fn can_fua(_h: *mut c_void) -> c_int {
     NBDKIT_FUA_NATIVE
 }
 
-/// What [`can_fua`] answers (exposed for the ABI test).
+/// What `can_fua` answers (exposed for the ABI test).
 pub fn can_fua_value() -> c_int {
     // SAFETY: the handle is unused.
     unsafe { can_fua(std::ptr::null_mut()) }

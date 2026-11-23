@@ -1,3 +1,6 @@
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -7,7 +10,7 @@ use maki_backing::remote_witness::{
 };
 use maki_backing::witness::Anchor;
 use maki_backing::{Backing, BackingFile, FileBacking, VolumeLock};
-use tempfile::tempdir;
+use private_dir::tempdir;
 
 const ID: [u8; 16] = [1; 16];
 fn op(n: u8, current: &Record, action: Action) -> Request {

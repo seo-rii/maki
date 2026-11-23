@@ -33,7 +33,7 @@
 //!   M-011). Only proof that an endpoint serves another contract excludes
 //!   it for the life of the set; a validation that merely failed to
 //!   complete is retried with exponential backoff (see
-//!   [`proves_another_contract`]).
+//!   `proves_another_contract`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -206,10 +206,13 @@ impl Revalidation {
 /// Everything else shows only that an exchange failed: transport errors,
 /// timeouts, admission limits, and replies that do not parse, are
 /// truncated or have the wrong shape (`Contract`: a proxy error page, a
-/// restart mid-response). [`ValidationProvider`] already relabels the
-/// reference's own failures as retryable, since they say nothing about the
-/// candidate (BUG-068). Such an attempt is retried with backoff, and the
-/// endpoint serves only once a later validation succeeds in full.
+/// restart mid-response). A request refused without an integrity verdict
+/// (a generic HTTP 4xx, a `bad-request` reply) is such a failure too, but
+/// at attach the two checks read it as a verdict, so [`ValidationProvider`]
+/// relabels it as retryable before they see it, together with the
+/// reference's own failures, which say nothing about the candidate
+/// (BUG-068). Such an attempt is retried with backoff, and the endpoint
+/// serves only once a later validation succeeds in full.
 fn proves_another_contract(error: &CryptoError) -> bool {
     matches!(
         error,
@@ -252,8 +255,9 @@ pub struct EndpointSet {
     validation_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     caps: OnceCell<CryptoCapabilities>,
     /// The provider plaintext unit selected by this volume, including any
-    /// prefix added before dispatch. Unbound sets conservatively use the
-    /// largest common size when splitting decrypt calls.
+    /// prefix added before dispatch. A bound set serves, and reports, that
+    /// size only. Unbound sets conservatively use the largest common size
+    /// when splitting decrypt calls.
     plaintext_size: Option<u32>,
 }
 
@@ -350,30 +354,52 @@ struct ValidationProvider {
 }
 
 impl ValidationProvider {
+    /// What a failed validation RPC is evidence of. The self-test and the
+    /// cross-endpoint check serve attach, where an endpoint that answers a
+    /// negative probe, or the decrypt of its peer's ciphertext, with
+    /// anything but a transport failure is refused: they fold such a reply
+    /// into a `ProviderFatal` verdict. In background validation a verdict
+    /// excludes the candidate for the life of the set, so a failure that
+    /// proves nothing about it is relabelled retryable here, before those
+    /// checks see it; they return it unchanged and the validation is tried
+    /// again later:
+    ///
+    /// - from either peer, a request refused without an integrity verdict
+    ///   (`NonRetryableRequest`: a generic HTTP 4xx, a WebSocket
+    ///   `bad-request`, a gRPC `InvalidArgument`, a local admission limit).
+    ///   It says that this request was not served, not that the peer holds
+    ///   another key or lacks a capability it claims;
+    /// - from the validated reference, every other failure the checks
+    ///   would read as a verdict on the candidate. Each endpoint already
+    ///   wraps its peer in `CheckedProvider`, so a malformed reply of the
+    ///   reference arrives as `Contract`; a broken reference is
+    ///   inconclusive for the candidate and must not reject it (BUG-068).
+    ///
+    /// `Integrity` is kept from both peers: it is the definitive refusal a
+    /// negative probe must get, and, for a decrypt of the other peer's
+    /// ciphertext, the evidence of another key. The candidate's own
+    /// `Contract` is already inconclusive, and its `ProviderFatal` and
+    /// `UnsupportedContext` are verdicts.
     fn failure(&self, operation: &str, error: CryptoError) -> CryptoError {
-        // Each Endpoint already wraps its peer in CheckedProvider. That
-        // check attributes malformed successful replies to the peer before
-        // cross-endpoint validation can turn a decrypt failure into a generic
-        // incompatibility verdict. A broken reference is inconclusive for
-        // the candidate; it must not permanently reject that candidate.
-        if self.reference
-            && matches!(
-                error,
-                CryptoError::Contract(_)
-                    | CryptoError::ProviderFatal(_)
-                    | CryptoError::UnsupportedContext(_)
-            )
-        {
-            CryptoError::Retryable(format!(
-                "validation reference {:?} {operation} failed: {error}",
-                self.endpoint.name
-            ))
-        } else {
-            // In particular, retain Integrity / NonRetryableRequest while
-            // the reference decrypts candidate ciphertext: this is evidence
-            // of incompatibility, rather than a malformed reference reply.
-            error
+        let inconclusive = match &error {
+            CryptoError::NonRetryableRequest(_) => true,
+            CryptoError::Contract(_)
+            | CryptoError::ProviderFatal(_)
+            | CryptoError::UnsupportedContext(_) => self.reference,
+            _ => false,
+        };
+        if !inconclusive {
+            return error;
         }
+        let role = if self.reference {
+            "reference"
+        } else {
+            "candidate"
+        };
+        CryptoError::Retryable(format!(
+            "validation {role} {:?} {operation} failed: {error}",
+            self.endpoint.name
+        ))
     }
 
     async fn admit(&self, bytes: u64) -> Result<EndpointAdmission, CryptoError> {
@@ -382,8 +408,12 @@ impl ValidationProvider {
             || bytes > self.global.max_bytes
             || bytes > self.endpoint.semaphore.max_bytes()
         {
-            return Err(CryptoError::NonRetryableRequest(
-                "validation RPC exceeds global or endpoint admission capacity".into(),
+            // The set's own limit refused the RPC before it was sent.
+            return Err(self.failure(
+                "admission",
+                CryptoError::NonRetryableRequest(
+                    "validation RPC exceeds global or endpoint admission capacity".into(),
+                ),
             ));
         }
         loop {
@@ -698,6 +728,10 @@ impl EndpointSet {
     /// Ciphertext lengths cannot establish this logical size (BUG-058).
     /// Configure this before serving; capabilities and batch calls reject a
     /// size that no common peer can accept within its batch byte limit.
+    /// A bound set refuses a unit of any other size, so its capabilities
+    /// list this size alone, whatever else the endpoints have in common:
+    /// a layer that admits by the reported sizes (the batch scheduler)
+    /// then never hands it a unit that fails the whole call it is in.
     pub fn with_plaintext_size(mut self, plaintext_size: u32) -> Self {
         self.plaintext_size = Some(plaintext_size);
         self.caps = OnceCell::new();
@@ -1417,6 +1451,13 @@ impl CryptoProvider for EndpointSet {
         }
         caps.supported_plaintext_sizes
             .retain(|&size| u64::from(size) <= budget);
+        // The reported contract is what this set serves: the common
+        // contract of its endpoints (R3-004), less what its own limits and
+        // binding refuse. `common_caps` has checked that the bound size is
+        // a common one.
+        if let Some(bound) = self.plaintext_size {
+            caps.supported_plaintext_sizes.retain(|&size| size == bound);
+        }
         Ok(caps)
     }
 
