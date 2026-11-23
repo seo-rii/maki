@@ -795,7 +795,14 @@ dispatch beyond that deadline; available capacity does not start a new window.
 A request's items are never split and keep
 their order. Requests that touch the same unit are never coalesced: one
 provider call never carries a unit twice. A single request with a repeated unit
-number is rejected before queue admission. Each lane keeps up to `limits.max_crypto_inflight_batches`
+number is rejected before queue admission. So is a request with a unit that the
+dispatcher or the random-prefix wrapper refuses before sending anything: an
+empty ciphertext (a damaged slot can record one), a ciphertext above the
+provider's maximum, or plaintext of a size the provider does not accept. Such a
+request fails alone. A rejection the provider itself returns for a coalesced
+call reaches each request separately only when the provider is `retry_safe`
+(each request is then re-sent alone); otherwise it reaches every request in
+the call. Each lane keeps up to `limits.max_crypto_inflight_batches`
 batches in flight at once (the dispatcher's own limits bound what reaches the
 endpoints), so one slow batch does not serialize the requests behind it.
 `limits.max_pending_crypto_items` bounds queued items per lane (one permit per

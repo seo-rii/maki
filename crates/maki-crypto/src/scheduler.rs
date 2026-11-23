@@ -19,11 +19,19 @@
 //! and decrypt run on separate lanes, each bounded (count + bytes) so pending
 //! crypto work can never grow without limit (SPEC §12).
 //!
+//! A request with a unit the provider stack refuses before sending anything
+//! (an empty or oversized ciphertext, or plaintext of a size the inner
+//! provider does not accept) is rejected at admission and fails alone: the
+//! dispatcher and the random-prefix wrapper refuse a whole call for one such
+//! unit, which would otherwise fail every request coalesced with it.
 //! A transport-class provider error reaches every request of the batch.
 //! An integrity or other request-specific rejection of a coalesced batch
-//! may concern one request only, so each request is then re-sent independently
-//! within the lane's inflight limit and gets its own verdict: a tampered unit read by one
-//! client never turns another client's healthy read into EIO.
+//! may concern one request only. For a retry-safe provider each request is
+//! then re-sent independently within the lane's inflight limit and gets its
+//! own verdict: a tampered unit read by one client never turns another
+//! client's healthy read into EIO. A provider that is not retry-safe is never
+//! sent a request twice, so its rejection reaches every request of the batch
+//! (R5-004).
 //!
 //! Costs: a request pays at most `max_wait` of extra latency when it is
 //! alone, and plaintext is copied once into the lane (the provider trait
@@ -725,6 +733,53 @@ fn deliver<O>(
     }
 }
 
+/// Refuse, per request, every unit the provider stack below refuses before
+/// sending anything. `EndpointSet` and `RandomPrefixProvider` check each unit
+/// of a call before the first RPC and refuse the whole call for one they
+/// cannot carry. Once coalesced, that refusal reaches every request of the
+/// batch, and a provider that is not retry-safe never has a rejected batch
+/// re-sent request by request (R5-004), so one bad unit (say, a slot holding
+/// a CRC-valid empty ciphertext) would fail the healthy requests beside it
+/// although nothing was sent. Requests in one batch share their context, so
+/// a context the stack refuses fails them all alike and is not checked here.
+fn check_plaintext_units(
+    items: &[PlaintextUnit],
+    caps: &CryptoCapabilities,
+) -> Result<(), CryptoError> {
+    match items.iter().find(|item| {
+        !caps.accepts_plaintext_size(item.data.len())
+            || item.data.len() as u64 > caps.batch.max_bytes
+    }) {
+        Some(item) => Err(CryptoError::NonRetryableRequest(format!(
+            "unit {} has plaintext size {}, which the provider does not accept",
+            item.unit_index,
+            item.data.len()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The decrypt counterpart of [`check_plaintext_units`]. An empty unit is
+/// never ciphertext a provider made: `CheckedProvider` and the engine refuse
+/// an empty encrypt result.
+fn check_ciphertext_units(
+    items: &[CiphertextUnit],
+    caps: &CryptoCapabilities,
+) -> Result<(), CryptoError> {
+    match items
+        .iter()
+        .find(|item| item.data.is_empty() || item.data.len() > caps.max_ciphertext_size as usize)
+    {
+        Some(item) => Err(CryptoError::NonRetryableRequest(format!(
+            "unit {} has ciphertext size {}, outside the declared 1 to {} bytes",
+            item.unit_index,
+            item.data.len(),
+            caps.max_ciphertext_size
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// A provider that coalesces concurrent requests into batched calls to an
 /// inner provider.
 pub struct BatchScheduler {
@@ -814,6 +869,13 @@ impl BatchScheduler {
 
     pub fn stats(&self) -> Arc<SchedulerStats> {
         self.stats.clone()
+    }
+
+    /// The inner provider's contract, learned on first use.
+    async fn inner_caps(&self) -> Result<&CryptoCapabilities, CryptoError> {
+        self.caps
+            .get_or_try_init(|| self.inner.capabilities())
+            .await
     }
 
     fn decrypt_unit_size(&self, caps: &CryptoCapabilities) -> Result<u32, CryptoError> {
@@ -924,6 +986,7 @@ impl CryptoProvider for BatchScheduler {
             if items.is_empty() {
                 return Ok(Vec::new());
             }
+            check_plaintext_units(items, self.inner_caps().await?)?;
             // Reserve before copying: waiting callers retain only their own
             // input, never an uncharged duplicate owned by this scheduler.
             let permit = self
@@ -955,24 +1018,14 @@ impl CryptoProvider for BatchScheduler {
             if items.is_empty() {
                 return Ok(Vec::new());
             }
-            let caps = self
-                .caps
-                .get_or_try_init(|| self.inner.capabilities())
-                .await?;
+            let caps = self.inner_caps().await?;
             let unit_size = self.decrypt_unit_size(caps)?;
             let logical_bytes = (items.len() as u64)
                 .checked_mul(u64::from(unit_size))
                 .ok_or_else(|| {
                     CryptoError::NonRetryableRequest("logical batch size overflow".into())
                 })?;
-            if items
-                .iter()
-                .any(|item| item.data.len() > caps.max_ciphertext_size as usize)
-            {
-                return Err(CryptoError::NonRetryableRequest(
-                    "ciphertext exceeds the declared maximum unit size".into(),
-                ));
-            }
+            check_ciphertext_units(items, caps)?;
             // Check logical batching independently of resident ciphertext,
             // then reserve its full resident cost before cloning (R3-003).
             self.decrypt.check_admissible(items, logical_bytes, bytes)?;

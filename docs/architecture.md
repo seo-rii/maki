@@ -305,6 +305,15 @@ growing memory. Each lane keeps several batches in flight (bounded by
 `limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
 requests behind it. Local providers are called directly.
 
+The dispatcher and the random-prefix wrapper check every unit of a call before
+the first RPC and refuse the whole call for one they cannot carry. The
+scheduler applies the same per-unit checks at admission, request by request,
+so a request with such a unit (an empty ciphertext from a damaged slot, say)
+fails alone instead of failing every request coalesced with it. Only a
+retry-safe provider has a rejected coalesced call re-sent request by request;
+a provider that is not retry-safe is never sent a request twice, so its
+rejection reaches every request in the call.
+
 Queued groups own their payload and admission charge together. Cancellation
 removes the complete group even if it is behind another group waiting for an
 RPC slot. An active coalesced RPC remains necessary until its last caller
