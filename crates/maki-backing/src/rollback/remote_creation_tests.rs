@@ -35,6 +35,10 @@ fn attempt(machine: &CrashableBacking) -> io::Result<()> {
 
 /// How many backing operations an undisturbed attempt performs.
 fn operations() -> usize {
+    operations_of(attempt)
+}
+
+fn operations_of(attempt: fn(&CrashableBacking) -> io::Result<()>) -> usize {
     let machine = machine();
     let count = Arc::new(AtomicUsize::new(0));
     let seen = count.clone();
@@ -169,4 +173,96 @@ fn a_marker_whose_sync_failed_is_written_again_before_it_is_published() {
     machine.set_fault_hook(None);
     complete(&machine, "the marker's first sync failed");
     assert!(published(&machine));
+}
+
+const IDENTITY: [u8; 16] = [0x5a; 16];
+const CAPACITY: u64 = 16 * PAGE;
+
+/// One creation attempt as far as the binding, the file after the marker.
+/// The authority is claimed only once both are durable, so a creation cut
+/// anywhere in here has claimed nothing.
+fn attempt_binding(machine: &CrashableBacking) -> io::Result<()> {
+    let process = machine.process();
+    let _operation = process.try_lock(OPERATION_LOCK)?;
+    let _enrollment = process.try_lock(super::super::ENROLL_LOCK)?;
+    initialize_remote_root(process.as_ref())?;
+    Enrollment::load_or_create(process.as_ref(), IDENTITY, CAPACITY).map(drop)
+}
+
+/// Continue the root to a durable binding with the documented command:
+/// `volume create` again while the marker is not published, enrollment
+/// recovery once it is. Recovery first checks the binding, and refuses one
+/// that is there and is not this identity's: that must never be what a
+/// creation that was cut leaves.
+fn complete_binding(machine: &CrashableBacking, context: &str) {
+    one_command_continues(machine, context);
+    if published(machine) {
+        let process = machine.process();
+        let _enrollment = process.try_lock(super::super::ENROLL_LOCK).unwrap();
+        Enrollment::verify_if_present(process.as_ref(), IDENTITY, CAPACITY).unwrap_or_else(
+            |error| {
+                panic!(
+                    "{context}: enrollment recovery refuses the binding ({error}); root: {:?}",
+                    process.list("").unwrap()
+                )
+            },
+        );
+        Enrollment::load_or_create(process.as_ref(), IDENTITY, CAPACITY)
+            .unwrap_or_else(|error| panic!("{context}: resume: {error}"));
+    } else {
+        attempt_binding(machine).unwrap_or_else(|error| panic!("{context}: create again: {error}"));
+    }
+    // What the completing command published survives any power loss.
+    machine.crash_all_lost();
+    assert_eq!(
+        Enrollment::load(machine.process().as_ref()).ok(),
+        Some(Enrollment {
+            identity: IDENTITY,
+            capacity: CAPACITY
+        }),
+        "{context}: the binding was not durable"
+    );
+}
+
+#[test]
+fn a_creation_killed_at_any_operation_of_its_binding_can_be_continued() {
+    for cut in 0..=operations_of(attempt_binding) {
+        let machine = machine();
+        inject(&machine, move |index| index >= cut);
+        let _ = attempt_binding(&machine);
+        machine.set_fault_hook(None);
+        complete_binding(&machine, &format!("killed before operation {cut}"));
+    }
+}
+
+#[test]
+fn a_creation_cut_by_a_power_loss_at_any_operation_of_its_binding_can_be_continued() {
+    for cut in 0..=operations_of(attempt_binding) {
+        for seed in 0..=16 {
+            let machine = machine();
+            inject(&machine, move |index| index >= cut);
+            let _ = attempt_binding(&machine);
+            machine.set_fault_hook(None);
+            if seed == 0 {
+                machine.crash_all_lost();
+            } else {
+                machine.crash(&mut StdRng::seed_from_u64(seed));
+            }
+            complete_binding(
+                &machine,
+                &format!("power loss before operation {cut}, seed {seed}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn a_creation_whose_binding_operation_failed_can_be_continued() {
+    for failed in 0..operations_of(attempt_binding) {
+        let machine = machine();
+        inject(&machine, move |index| index == failed);
+        assert!(attempt_binding(&machine).is_err(), "operation {failed}");
+        machine.set_fault_hook(None);
+        complete_binding(&machine, &format!("operation {failed} failed"));
+    }
 }

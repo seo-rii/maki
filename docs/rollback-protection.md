@@ -139,11 +139,15 @@ empty or partly written beside nothing but those lock files is completed by
 `resume-enrollment` refuses such a root with a message that says to create
 the volume again. Once `rollback.format` holds the marker, `volume create`
 refuses the root (`remote enrollment requires an empty backing`) and the
-procedure below continues it. A creation that stopped while it wrote the
-binding, the next file, leaves a `remote.enrollment` that is empty or
-incomplete, which `resume-enrollment` refuses as invalid enrollment metadata:
-move that file out of the backing root, keep it, and resume, which then
-writes the binding for the approved identity and capacity. An interrupted
+procedure below continues it. The binding, the next file, is written the
+same way, as `remote.enrollment.next` renamed to `remote.enrollment` once it
+is synced: a creation that stopped while it wrote the binding leaves at most
+the staged file, which nothing reads, and `resume-enrollment` continues it
+and writes the binding for the approved identity and capacity. An older
+binary wrote the binding in place; a `remote.enrollment` it left empty or
+incomplete is refused as invalid enrollment metadata, because it cannot be
+told apart from a damaged binding: move that file out of the backing root,
+keep it, and resume. An interrupted
 `maki-witness init` is a separate case, described with
 [the authority's initialization](remote-witness-service.md#initialize-a-local-authority).
 
@@ -229,7 +233,7 @@ witness_root = "/mnt/maki-witness/protected"
 capacity = "128MiB"
 ```
 
-Both directories must be empty for creation. Provision the independent witness
+Start from two empty directories. Provision the independent witness
 mount first, create both per-volume directories for the daemon user, and run
 the creation as that user, as for any volume
 ([volume lifecycle](operations.md#volume-lifecycle)). Add `--discard` for a v3
@@ -249,6 +253,33 @@ it; the command then warns with the `chown -R maki:maki` of each such path to
 run before the first start. An existing raw or protected backing is refused;
 there is no implicit enrollment, in-place conversion or automatic witness
 recreation.
+
+The outer creation publishes the witness anchor last, and until then
+nothing can open the volume, so nothing was acknowledged. A `maki volume
+create` that is killed, loses power or fails before it publishes the anchor
+(a full disk while it reserves the arena, for example) is completed by
+running it again, with nothing to remove by hand. Once the anchor is
+published, the command initializes the volume inside the backing; one that
+stops there is refused by a later `create`, which never writes over an
+anchor: if the volume was never attached, empty both directories and create
+it again. The format marker and the anchor are each written under
+a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
+into place, so neither name ever holds an empty or torn file. `create` then
+accepts a backing directory that holds only what a creation writes (the
+lock, the marker, the arena and the two manifest slots) as long as the
+second slot holds only zeros and the first only zeros or the initial empty
+manifest, and a witness directory that holds only `witness.lock` and
+`anchor.next`. Every volume that committed anything wrote its second slot,
+so `create` never creates over one, whatever the witness directory holds
+and short of both slots lost or zeroed entirely (an all-zero slot is an
+unwritten one): a witness mount that is missing (an empty directory in its
+place) cannot get a used volume recreated, and neither can slots that
+damage left holding anything else. It never writes over an `anchor` either. Earlier releases created
+the anchor empty before writing it: an empty `anchor` that such a release
+left is refused by `create` and by the daemon, which say that the creation
+did not complete or the witness lost its state. If the volume was never
+attached, remove that empty file and run `maki volume create` again;
+otherwise restore the witness directory.
 
 The packaged daemon uses `ProtectSystem=strict`. For this example, add a
 per-instance systemd drop-in to `maki@protected.service`:

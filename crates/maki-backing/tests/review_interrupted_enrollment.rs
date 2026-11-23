@@ -19,6 +19,11 @@
 //! refused by a zero file-size limit.
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+#[path = "support/seccomp.rs"]
+mod seccomp;
+
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -181,6 +186,14 @@ fn step(step: &str, path: &Path) -> ! {
     let arranged = match interruption {
         "killed" => die_at_the_first_file_write(),
         "refused" => refuse_file_writes(),
+        // The binding is the first 64-byte write of a creation (the marker
+        // is 27 bytes).
+        "killed-at-the-binding" => seccomp::on(libc::SYS_pwrite64, Some(64), seccomp::KILLS),
+        "refused-at-the-binding" => seccomp::on(
+            libc::SYS_pwrite64,
+            Some(64),
+            seccomp::fails_with(libc::ENOSPC),
+        ),
         other => panic!("unknown interruption {other}"),
     };
     if !arranged {
@@ -281,6 +294,112 @@ fn create_whose_marker_write_failed_can_be_retried() {
         "after one failed marker write the root is stranded with {left:?}: {refusals:?}"
     );
     assert_eq!(std::fs::read(root.join("rollback.format")).unwrap(), MARKER);
+}
+
+/// After the marker the creation writes the binding, and only once that is
+/// durable does it claim the authority. Cut while it writes the binding,
+/// the creation has published the marker and claimed nothing: enrollment
+/// recovery, which the administrator approves, must continue it without
+/// anything to remove by hand.
+#[test]
+fn create_killed_while_writing_its_binding_is_resumed() {
+    use std::os::unix::process::ExitStatusExt;
+    child();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let Some(killed) = interrupted(
+        "create_killed_while_writing_its_binding_is_resumed",
+        "create killed-at-the-binding",
+        &root,
+    ) else {
+        return;
+    };
+    assert_eq!(killed.status.signal(), Some(libc::SIGSYS), "{killed:?}");
+    assert_eq!(std::fs::read(root.join("rollback.format")).unwrap(), MARKER);
+    let left = entries(&root);
+    let refusals = documented_commands(&root);
+    assert!(
+        refusals.is_empty(),
+        "a creation killed while writing its binding is stranded with {left:?}: {refusals:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("remote.enrollment"))
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[test]
+fn create_whose_binding_write_failed_is_resumed() {
+    child();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let Some(failed) = interrupted(
+        "create_whose_binding_write_failed_is_resumed",
+        "create refused-at-the-binding",
+        &root,
+    ) else {
+        return;
+    };
+    assert_eq!(failed.status.code(), Some(FAILED), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("No space left on device"),
+        "the binding write must have failed: {failed:?}"
+    );
+    let left = entries(&root);
+    let refusals = documented_commands(&root);
+    assert!(
+        refusals.is_empty(),
+        "after one failed binding write the root is stranded with {left:?}: {refusals:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("remote.enrollment"))
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+/// A creation stages the binding as `remote.enrollment.next` and renames it
+/// into place once it is synced. Whatever an interrupted creation left
+/// under that name, another identity's binding included, is never read:
+/// enrollment recovery writes the approved binding over it.
+#[test]
+fn enrollment_recovery_writes_over_a_staged_binding_left_behind() {
+    assert!(RollbackBacking::owns_host_entry(
+        "remote.enrollment.next",
+        true
+    ));
+    // Another identity's complete binding.
+    let other = tempfile::tempdir().unwrap();
+    let other_writer: Arc<dyn Rpc> = Arc::new(RoleRpc(
+        Arc::new(Authority(Mutex::new(
+            CanonicalState::initial([0x33; 16]).unwrap(),
+        ))),
+        Role::Writer,
+    ));
+    drop(
+        RollbackBacking::create_remote(&other.path().join("root"), other_writer, CAPACITY).unwrap(),
+    );
+    let foreign = std::fs::read(other.path().join("root/remote.enrollment")).unwrap();
+    for staged in [&[][..], &foreign[..20], &foreign[..]] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = locked_root(dir.path());
+        std::fs::write(root.join("rollback.format"), MARKER).unwrap();
+        std::fs::write(root.join("remote.enrollment.next"), staged).unwrap();
+        let (_, admin) = authority();
+        let record = inspect(admin.as_ref());
+        RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+            .unwrap_or_else(|error| panic!("staged {} bytes: {error}", staged.len()));
+        assert_eq!(inspect(admin.as_ref()).fence, 1);
+        assert!(!root.join("remote.enrollment.next").exists());
+        let binding = std::fs::read(root.join("remote.enrollment")).unwrap();
+        assert_eq!(binding.len(), 64);
+        assert_eq!(&binding[8..24], &IDENTITY);
+    }
 }
 
 /// A marker that is empty, or a torn copy (each byte the marker's or zero),
@@ -427,10 +546,10 @@ fn control_a_published_marker_is_continued_by_enrollment_recovery_only() {
     assert_eq!(inspect(admin.as_ref()).fence, 1);
 }
 
-/// One file later the creation writes the binding. Cut there, it leaves a
-/// published marker and an unwritten binding: enrollment recovery refuses
-/// the binding rather than write over it, and continues once the operator
-/// has moved it out of the root.
+/// A release that wrote the binding in place and was cut there left a
+/// published marker and an unwritten binding, which is also what a damaged
+/// binding looks like: enrollment recovery refuses it rather than write
+/// over it, and continues once the operator has moved it out of the root.
 #[test]
 fn control_an_unwritten_binding_is_quarantined_before_enrollment_recovery_continues() {
     let dir = tempfile::tempdir().unwrap();
@@ -652,7 +771,7 @@ fn witness_init_whose_state_write_failed_can_be_run_again() {
 /// only safe way out, and the directory stays as it was.
 #[test]
 fn an_empty_witness_state_is_refused_with_its_causes_and_the_way_out() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir::tempdir().unwrap();
     drop(StateStore::create(dir.path(), IDENTITY).unwrap());
     std::fs::OpenOptions::new()
         .write(true)
@@ -701,7 +820,7 @@ fn an_empty_witness_state_is_refused_with_its_causes_and_the_way_out() {
 /// by rerunning `init`, which would reset its fence to zero.
 #[test]
 fn control_an_enrolled_authority_whose_state_was_truncated_is_never_initialized_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir::tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), IDENTITY).unwrap();
     let expected = inspect_store(&mut store);
     let claimed = store
@@ -749,7 +868,7 @@ fn control_an_enrolled_authority_whose_state_was_truncated_is_never_initialized_
 fn control_init_writes_over_a_staged_state_left_behind() {
     use std::os::unix::fs::PermissionsExt;
     for staged in [&[][..], b"MAKIRW02 and then not a record at all"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir::tempdir().unwrap();
         let next = dir.path().join("remote.next");
         std::fs::write(&next, staged).unwrap();
         std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
