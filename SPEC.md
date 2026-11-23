@@ -1722,6 +1722,16 @@ The crypto operation budget MUST include scheduler admission, coalescing,
 waiting for an RPC slot, and the RPC itself. Dispatch MUST NOT reset the
 caller's budget.
 
+Wherever the budget runs out (before the first attempt, during backoff, while
+waiting for endpoint admission or an RPC slot, or with an RPC in flight), the
+operation MUST end with the last error an endpoint returned for it before the
+deadline, keeping that error's class, or with a retryable deadline error when
+no endpoint failed it. A result that arrives after the deadline MUST NOT be
+returned. Every operation that ends this way (with batching, every caller)
+MUST count exactly once in `maki_crypto_deadline_exceeded_total`, whatever
+error it returned. An endpoint's own timeout, including a nested dispatcher's
+deadline, is that endpoint's failure, not the operation's deadline.
+
 ---
 
 # 36. Memory Security
