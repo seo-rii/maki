@@ -1530,6 +1530,10 @@ mod tests;
 mod review_growth_topology;
 
 #[cfg(test)]
+#[path = "review_step_faults.rs"]
+mod review_step_faults;
+
+#[cfg(test)]
 #[path = "command_tests.rs"]
 mod command_tests;
 
@@ -1582,6 +1586,17 @@ fn cleanup_with(
             "recorded NBD device has a foreign backend; refusing cleanup",
         )),
     }
+}
+
+/// The storage work of the attach unit's failed-start hook. The hook only
+/// queues the recovery coordinator, so there is none.
+#[cfg(test)]
+fn finish_interrupted_activation_with(
+    _plan: &Plan,
+    _state: &TrustedState,
+    _system: &mut impl System,
+) -> Result<bool, ExecError> {
+    Ok(false)
 }
 
 #[cfg(test)]
