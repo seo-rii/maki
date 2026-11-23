@@ -410,6 +410,11 @@ separate privileged `lvextend` and `xfs_growfs` operation.
   releasing ownership; `into_vec` transfers zeroization to the caller and
   releases only that buffer's lock ownership.
 - Configuration rejects literal values for sensitive headers.
+- Every loader reads a volume configuration through one checked reader
+  (`maki_nbdkit::config_file`): on Unix a final symlink, a second hard link, an
+  owner other than root or the loading process's user, or group or other write
+  access refuses the file before it is parsed
+  ([configuration file](configuration.md#configuration-file)).
 - Repeated credential names must declare the same source throughout a volume
   configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.

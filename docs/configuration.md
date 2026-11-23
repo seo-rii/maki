@@ -39,6 +39,41 @@ See [Rollback-protected backing](rollback-protection.md) for the witness trust
 boundary, capacity/reserve sizing, creation and systemd access requirements.
 This option is off by default and does not upgrade existing volumes.
 
+## Configuration file
+
+The configuration decides where a volume's plaintext goes: the provider and
+its endpoints, TLS trust, credential references, the backing root and the
+rollback witness. Every loader (the daemon, each `maki` command that takes a
+`<config.toml>`, and `maki-benchmark`) therefore refuses, before parsing it, a
+file that another user could change or substitute (SPEC §8). On Unix the file
+must be:
+
+- named by its own path: a final symlink is refused (directories above it may
+  be symlinks; they are not checked);
+- a regular file with exactly one hard link, of at most 1 MiB;
+- owned by root or by the user the loading process runs as;
+- not writable by its group or by others (no `0020` or `0002` bit; a POSIX ACL
+  that grants write access sets the group bits too).
+
+Group and other read are allowed, because the file holds credential
+references, never secrets. Install it as `root:maki 0640`:
+
+```bash
+install -m 0640 -o root -g maki volume.toml /etc/maki/volumes/<volume>.toml
+```
+
+The daemon user reads that file through its group, and commands run as root or
+as the daemon user accept it. A file owned by the daemon user is accepted by
+the daemon and by commands run as that user (`sudo -u maki`), but refused by
+commands run as root. A configuration a user writes for
+their own runs, such as a disposable one below `/tmp`, is accepted with the
+usual `0600` or `0644`. A configuration tool that installs the file as a
+symlink, or as a hard link into a store, must copy it instead. Keep the
+directory holding it root-owned and not writable by others, as the package's
+`/etc/maki/volumes` (`root:maki 0750`) is. The error names the file and the
+problem, for example `has mode 0664: it is writable by the group or by others`.
+Non-Unix builds check only that the file is a regular file of at most 1 MiB.
+
 
 ## Remote witness endpoint sets
 
@@ -952,7 +987,8 @@ cargo run --locked -p maki -- check path/to/config.toml
 ```
 
 Creating a volume writes metadata to the configured backing root. Do not point
-an unreviewed configuration at an existing volume.
+an unreviewed configuration at an existing volume. Each command reads the file
+under the [configuration file](#configuration-file) rules.
 
 ## Privileged attachment identity
 

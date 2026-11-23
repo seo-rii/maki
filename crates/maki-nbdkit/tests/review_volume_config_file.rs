@@ -151,3 +151,69 @@ fn root_owned_and_own_configurations_still_load() {
         assert_loaded(&path, "root-owned, group-readable");
     }
 }
+
+/// Every documented installation of a volume configuration, and the packaged
+/// directory that holds it, must satisfy the loader: `install` makes the file
+/// root-owned without group or other write access, and tmpfiles creates
+/// `/etc/maki/volumes` root-owned and not writable by its group or others.
+#[test]
+fn documented_installations_produce_an_accepted_configuration() {
+    fn walk(path: &Path, out: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            // Dated qualification reports record past runs, not instructions.
+            if path.ends_with("docs/qualification") {
+                return;
+            }
+            for entry in std::fs::read_dir(path).unwrap() {
+                walk(&entry.unwrap().path(), out);
+            }
+        } else {
+            out.push(path.to_path_buf());
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = vec![root.join("README.md")];
+    for directory in ["docs", "examples", "packaging"] {
+        walk(&root.join(directory), &mut files);
+    }
+    let mut installs = 0;
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for line in text.lines() {
+            let words: Vec<_> = line.split_whitespace().collect();
+            let Some(start) = words.iter().position(|word| *word == "install") else {
+                continue;
+            };
+            let words = &words[start..];
+            if words.contains(&"-d") || !words.iter().any(|w| w.starts_with("/etc/maki/volumes/")) {
+                continue;
+            }
+            let value = |flag: &str| {
+                let index = words.iter().position(|word| *word == flag)?;
+                words.get(index + 1).copied()
+            };
+            let what = format!("{}: {line}", file.display());
+            let mode = value("-m").unwrap_or_else(|| panic!("{what}: no -m"));
+            let mode = u32::from_str_radix(mode, 8).unwrap_or_else(|_| panic!("{what}: mode"));
+            assert_eq!(mode & 0o022, 0, "{what}: writable by group or others");
+            assert_eq!(value("-o"), Some("root"), "{what}: not root-owned");
+            installs += 1;
+        }
+    }
+    // README, quick start, configuration and operations guides, example.
+    assert!(
+        installs >= 5,
+        "only {installs} documented installations found"
+    );
+
+    let tmpfiles = std::fs::read_to_string(root.join("packaging/tmpfiles.d/maki.conf")).unwrap();
+    let directory: Vec<_> = tmpfiles
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|fields| fields.len() >= 5 && fields[0] == "d" && fields[1] == "/etc/maki/volumes")
+        .expect("tmpfiles creates /etc/maki/volumes");
+    assert_eq!(u32::from_str_radix(directory[2], 8).unwrap() & 0o022, 0);
+    assert_eq!(directory[3], "root");
+}

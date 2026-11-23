@@ -37,11 +37,19 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Read a volume configuration through the checked reader: the file decides
+/// where plaintext and credentials go, so one another user could write or
+/// substitute is refused before it is parsed (SPEC §8).
+fn read_config_text(path: &std::path::Path) -> Result<String, String> {
+    maki_nbdkit::config_file::read_volume_config(path)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn read_config(
     path: impl AsRef<std::path::Path>,
 ) -> Result<maki_format::config::VolumeConfig, String> {
     let path = path.as_ref();
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let raw = read_config_text(path)?;
     let cfg = maki_format::config::parse_config(&raw).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -127,13 +135,15 @@ enum ControlTarget<'a> {
 impl ControlTarget<'_> {
     /// Only the socket address is needed: the configuration is parsed, not
     /// validated, so one edited for the next start cannot block `drain` on
-    /// the running daemon.
+    /// the running daemon. It is still read through the checked reader: a
+    /// substituted file would send the command to another listener.
     fn socket(&self) -> Result<String, String> {
         match self {
             Self::Socket(path) => Ok(path.clone()),
             Self::Config(config) => {
-                let raw = std::fs::read_to_string(config).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                let path = std::path::Path::new(config);
+                let raw = maki_nbdkit::config_file::read_volume_config(path).map_err(|e| {
+                    if e.is_access_denied() {
                         format!(
                             "{config}: {e}; without access to the volume configuration pass \
                              --socket /run/maki-control/<volume>/control.sock"
@@ -221,9 +231,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["volume", "create", config] | ["volume", "create", config, "--discard"] => {
-            let raw = match std::fs::read_to_string(config) {
+            let raw = match read_config_text(std::path::Path::new(config)) {
                 Ok(raw) => raw,
-                Err(e) => return fail(format!("{config}: {e}")),
+                Err(e) => return fail(e),
             };
             let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
                 Ok(creation) => creation,
