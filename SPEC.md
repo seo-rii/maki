@@ -382,17 +382,17 @@ A volume configuration decides where plaintext goes: the provider and its
 endpoints, TLS trust, credential references, the backing root and the rollback
 witness. Every loader (the data-plane daemon, `maki` and `maki-benchmark`)
 MUST open it without following a final symlink and MUST refuse, before parsing
-it, anything but a regular file with exactly one link, owned by root or by the
-user the loading process runs as, with no group or other write permission. The
-checks MUST describe the opened descriptor that is then read. Group and other
-read MAY be granted: a configuration holds credential references, never
-secrets (§9). The recommended `root:maki 0640` is accepted by root and by the
-daemon user, which reads it through its group; a file owned by the daemon user
-is refused by commands run as root. The directory holding it SHOULD be
-root-owned and not writable by others. This is the witness configuration's
-owner and mode rule plus the single link; secret files (§9) have the same
-owner rule and a stricter mode rule. Non-Unix hosts check only that the file
-is regular.
+it, anything but a regular file of at most 1 MiB with exactly one link, owned
+by root or by the user the loading process runs as, with no group or other
+write permission. The checks MUST describe the opened descriptor that is then
+read. Group and other read MAY be granted: a configuration holds credential
+references, never secrets (§9). The recommended `root:maki 0640` is accepted
+by root and by the daemon user, which reads it through its group; a file owned
+by the daemon user is refused by commands run as root. The directory holding
+it SHOULD be root-owned and not writable by others. This is the witness
+configuration's owner and mode rule plus the single link; secret files (§9)
+have the same owner rule and a stricter mode rule. Non-Unix hosts check only
+that it is a regular file of at most 1 MiB.
 
 The NBD Unix Domain Socket:
 
@@ -1717,10 +1717,11 @@ ciphertext encrypted by B must decrypt on A
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
 An endpoint that is unreachable when these self-tests run at attach is
-quarantined. A quarantined endpoint MUST NOT receive a request until
+quarantined. A quarantined endpoint MUST NOT serve a volume request until
 the same validation, run against a validated endpoint under the real volume
-context, succeeds in full. The set's common contract covers every configured
-endpoint, quarantined ones included, so admitting one never changes it.
+context, succeeds in full; the validation itself sends it requests. The set's
+common contract covers every configured endpoint, quarantined ones included,
+so admitting one never changes it.
 
 Validation evidence is either conclusive or inconclusive:
 
