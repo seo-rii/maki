@@ -1,0 +1,284 @@
+//! A local rollback `volume create` writes the backing's format marker,
+//! reserves the arena and the manifest slots, writes the initial manifest,
+//! and publishes the witness anchor last. Until the anchor is published
+//! nothing can open the volume and nothing was ever acknowledged, so a
+//! creation that is killed, loses power or fails on its way (a full disk,
+//! a quota, an I/O error) has lost nothing. It must also leave a pair of
+//! directories that `volume create` completes when it is run again. A
+//! creation that created a file and was cut before filling it (the marker,
+//! the witness anchor) or that stopped after the marker was neither
+//! continued by `create`, which wants both directories empty, nor opened.
+//!
+//! What `create` may complete is only what a creation leaves: never a
+//! backing that holds a volume's committed manifest, whatever the witness
+//! directory holds (an unmounted witness is an empty directory), and never
+//! a witness that holds an anchor.
+//!
+//! The interrupted commands run in child processes with a seccomp filter
+//! that kills them at, or fails, one system call.
+#![cfg(target_os = "linux")]
+
+#[path = "support/seccomp.rs"]
+mod seccomp;
+
+use std::path::Path;
+use std::process::Command;
+
+use maki_backing::{Backing, RollbackBacking};
+
+const CAPACITY: u64 = 16 * 4096;
+
+/// The backing root and the witness directory, on two filesystems.
+fn directories() -> (tempfile::TempDir, tempfile::TempDir) {
+    (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir_in("/dev/shm").unwrap(),
+    )
+}
+
+fn entries(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn commit(backing: &RollbackBacking, data: &[u8]) {
+    let file = backing.open("payload", true).unwrap();
+    file.write_at(0, data).unwrap();
+    file.sync_data().unwrap();
+    backing.sync_dir("").unwrap();
+}
+
+fn read(backing: &RollbackBacking) -> Vec<u8> {
+    let file = backing.open("payload", false).unwrap();
+    let mut bytes = vec![0; file.len().unwrap() as usize];
+    file.read_at(0, &mut bytes).unwrap();
+    bytes
+}
+
+const STEP: &str = "MAKI_INTERRUPTED_LOCAL_CREATE_STEP";
+const ROOT: &str = "MAKI_INTERRUPTED_LOCAL_CREATE_ROOT";
+const WITNESS: &str = "MAKI_INTERRUPTED_LOCAL_CREATE_WITNESS";
+/// Exit status of a creation that returned an error.
+const FAILED: i32 = 3;
+/// Exit status of a step that could not arrange its interruption.
+const UNAVAILABLE: i32 = 77;
+/// The length of a witness anchor record.
+const ANCHOR_LENGTH: u32 = 104;
+
+/// The interrupted creation, in the child process. Never returns.
+fn step(step: &str, root: &Path, witness: &Path) -> ! {
+    let arranged = match step {
+        // The format marker is the first file a creation writes.
+        "killed at the first write" => seccomp::on(libc::SYS_pwrite64, None, seccomp::KILLS),
+        "out of space for the arena" => {
+            seccomp::on(libc::SYS_fallocate, None, seccomp::fails_with(libc::ENOSPC))
+        }
+        "killed writing the anchor" => {
+            seccomp::on(libc::SYS_pwrite64, Some(ANCHOR_LENGTH), seccomp::KILLS)
+        }
+        "out of space for the anchor" => seccomp::on(
+            libc::SYS_pwrite64,
+            Some(ANCHOR_LENGTH),
+            seccomp::fails_with(libc::ENOSPC),
+        ),
+        other => panic!("unknown step {other}"),
+    };
+    if !arranged {
+        std::process::exit(UNAVAILABLE);
+    }
+    let outcome = RollbackBacking::create(root, witness, CAPACITY).map(drop);
+    eprintln!("create: {outcome:?}");
+    std::process::exit(if outcome.is_ok() { 0 } else { FAILED });
+}
+
+/// The child half of a test that interrupts a creation.
+fn child() {
+    if let (Some(name), Some(root), Some(witness)) = (
+        std::env::var_os(STEP),
+        std::env::var_os(ROOT),
+        std::env::var_os(WITNESS),
+    ) {
+        step(
+            name.to_str().unwrap(),
+            Path::new(&root),
+            Path::new(&witness),
+        );
+    }
+}
+
+/// Run `step` in a child process that re-enters `test`. `None`, with the
+/// reason printed, where the interruption cannot be arranged.
+fn interrupted(
+    test: &str,
+    step: &str,
+    root: &Path,
+    witness: &Path,
+) -> Option<std::process::Output> {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(STEP, step)
+        .env(ROOT, root)
+        .env(WITNESS, witness)
+        .output()
+        .unwrap();
+    if output.status.code() == Some(UNAVAILABLE) {
+        eprintln!("{test}: skipped: cannot arrange `{step}` in a child process");
+        return None;
+    }
+    Some(output)
+}
+
+/// Run `volume create` again after the interrupted one and use the volume:
+/// it must complete, and what it creates is an ordinary volume.
+fn create_again(root: &Path, witness: &Path, interrupted: &std::process::Output) {
+    let left = (entries(root), entries(witness));
+    let created = RollbackBacking::create(root, witness, CAPACITY).unwrap_or_else(|error| {
+        let opened = RollbackBacking::open(root, witness).err();
+        panic!(
+            "an interrupted creation is stranded with {left:?}: create: {error}; open: {opened:?}; \
+             the interrupted run: {interrupted:?}"
+        )
+    });
+    commit(&created, b"kept");
+    drop(created);
+    let reopened = RollbackBacking::open(root, witness).unwrap();
+    assert_eq!(read(&reopened), b"kept");
+}
+
+#[test]
+fn create_killed_at_its_first_write_can_be_run_again() {
+    use std::os::unix::process::ExitStatusExt;
+    child();
+    let (root, witness) = directories();
+    let Some(killed) = interrupted(
+        "create_killed_at_its_first_write_can_be_run_again",
+        "killed at the first write",
+        root.path(),
+        witness.path(),
+    ) else {
+        return;
+    };
+    assert_eq!(killed.status.signal(), Some(libc::SIGSYS), "{killed:?}");
+    assert!(entries(witness.path()).is_empty());
+    create_again(root.path(), witness.path(), &killed);
+}
+
+#[test]
+fn create_that_ran_out_of_space_for_its_arena_can_be_run_again() {
+    child();
+    let (root, witness) = directories();
+    let Some(failed) = interrupted(
+        "create_that_ran_out_of_space_for_its_arena_can_be_run_again",
+        "out of space for the arena",
+        root.path(),
+        witness.path(),
+    ) else {
+        return;
+    };
+    assert_eq!(failed.status.code(), Some(FAILED), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("No space left on device"),
+        "{failed:?}"
+    );
+    assert!(root.path().join("rollback.arena").exists());
+    create_again(root.path(), witness.path(), &failed);
+}
+
+#[test]
+fn create_killed_while_writing_its_witness_anchor_can_be_run_again() {
+    use std::os::unix::process::ExitStatusExt;
+    child();
+    let (root, witness) = directories();
+    let Some(killed) = interrupted(
+        "create_killed_while_writing_its_witness_anchor_can_be_run_again",
+        "killed writing the anchor",
+        root.path(),
+        witness.path(),
+    ) else {
+        return;
+    };
+    assert_eq!(killed.status.signal(), Some(libc::SIGSYS), "{killed:?}");
+    assert!(root.path().join("rollback.manifest.0").exists());
+    create_again(root.path(), witness.path(), &killed);
+}
+
+#[test]
+fn create_that_ran_out_of_space_for_its_witness_anchor_can_be_run_again() {
+    child();
+    let (root, witness) = directories();
+    let Some(failed) = interrupted(
+        "create_that_ran_out_of_space_for_its_witness_anchor_can_be_run_again",
+        "out of space for the anchor",
+        root.path(),
+        witness.path(),
+    ) else {
+        return;
+    };
+    assert_eq!(failed.status.code(), Some(FAILED), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("No space left on device"),
+        "{failed:?}"
+    );
+    create_again(root.path(), witness.path(), &failed);
+}
+
+/// A witness directory that is not mounted is an empty directory. The
+/// backing of a volume that committed anything is never created over,
+/// whatever the witness directory holds.
+#[test]
+fn control_create_refuses_a_used_backing_beside_an_empty_witness_directory() {
+    let (root, witness) = directories();
+    let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap();
+    commit(&backing, b"committed");
+    drop(backing);
+    let before = std::fs::read(root.path().join("rollback.manifest.1")).unwrap();
+    let unmounted = tempfile::tempdir_in("/dev/shm").unwrap();
+    for witness in [unmounted.path(), witness.path()] {
+        assert!(RollbackBacking::create(root.path(), witness, CAPACITY).is_err());
+    }
+    assert!(entries(unmounted.path()).is_empty());
+    assert_eq!(
+        std::fs::read(root.path().join("rollback.manifest.1")).unwrap(),
+        before
+    );
+    let reopened = RollbackBacking::open(root.path(), witness.path()).unwrap();
+    assert_eq!(read(&reopened), b"committed");
+}
+
+/// An anchor that is empty is what an earlier release's interrupted
+/// creation left, and also what a witness whose anchor was truncated looks
+/// like. `create` never writes over an anchor, and `open` refuses it.
+#[test]
+fn control_create_and_open_refuse_a_witness_that_holds_an_empty_anchor() {
+    let (root, witness) = directories();
+    std::fs::write(witness.path().join("witness.lock"), b"").unwrap();
+    std::fs::write(witness.path().join("anchor"), b"").unwrap();
+    let before = entries(witness.path());
+    assert!(RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_err());
+    assert_eq!(entries(witness.path()), before);
+    assert_eq!(
+        std::fs::metadata(witness.path().join("anchor"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(RollbackBacking::open(root.path(), witness.path()).is_err());
+}
+
+/// Only a backing that holds what a creation leaves is completed: an entry
+/// no creation writes is refused and left as it is.
+#[test]
+fn control_create_refuses_a_backing_that_holds_anything_else() {
+    let (root, witness) = directories();
+    std::fs::write(root.path().join("rollback.lock"), b"").unwrap();
+    std::fs::write(root.path().join("rollback.format"), b"").unwrap();
+    std::fs::write(root.path().join("notes"), b"operator").unwrap();
+    let before = entries(root.path());
+    assert!(RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_err());
+    assert_eq!(entries(root.path()), before);
+    assert!(entries(witness.path()).is_empty());
+}
