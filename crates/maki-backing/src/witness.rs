@@ -835,6 +835,105 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_record_left_in_the_directory_is_never_published() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let dir = tempdir().unwrap();
+        drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+        // Whoever left this file may still hold a writable descriptor.
+        let left = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join(super::TEMP_FILE))
+            .unwrap();
+        left.write_all_at(b"left behind", 0).unwrap();
+
+        let mut witness = FileWitness::open(dir.path()).unwrap();
+        let anchor = dir.path().join(super::ANCHOR_FILE);
+        let published = fs::read(&anchor).unwrap();
+        assert_ne!(
+            fs::metadata(&anchor).unwrap().ino(),
+            left.metadata().unwrap().ino(),
+            "the file left behind was published"
+        );
+        // Writing through the kept descriptor changes nothing published.
+        left.write_all_at(&[0xa5; ENCODED_LEN], 0).unwrap();
+        assert_eq!(fs::read(&anchor).unwrap(), published);
+        witness.verify_current().unwrap();
+        witness.advance(ROOT_B).unwrap();
+        drop(witness);
+        assert_eq!(FileWitness::open(dir.path()).unwrap().anchor().root, ROOT_B);
+    }
+
+    #[test]
+    fn root_hands_over_a_temporary_record_put_back_only_by_root_or_the_record_owner() {
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let other = FileOwner {
+            uid: 4444,
+            gid: 4545,
+        };
+        let root = FileOwner { uid: 0, gid: 0 };
+        for planter in [root, daemon, other] {
+            let dir = tempdir().unwrap();
+            drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+            let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+            fault.report_directory_owner(daemon);
+            fault.report_anchor_owner(daemon);
+            // Someone who can write the directory puts a record back under
+            // the temporary name once the stale one is removed.
+            fault.replant_temporary(b"put back", planter);
+            let backing: Arc<dyn Backing> = fault.clone();
+            let opened = FileWitness::open_backing(backing);
+
+            if !super::running_as_root() {
+                // Nobody else can give a file away; they publish as
+                // themselves.
+                drop(opened.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    ["temp_write", "temp_sync", "rename", "directory_sync"],
+                    "{planter:?}"
+                );
+                assert!(fault.given().is_empty());
+            } else if planter == other {
+                // Root gives the record to nobody and publishes nothing.
+                let error = opened.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("uid 4444"), "{error}");
+                assert!(error.to_string().contains("uid 4242"), "{error}");
+                assert!(fault.trace().is_empty());
+                assert!(fault.given().is_empty());
+            } else if planter == daemon {
+                // The record owner's own file needs no change.
+                drop(opened.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    ["temp_write", "temp_sync", "rename", "directory_sync"]
+                );
+                assert!(fault.given().is_empty());
+            } else {
+                // Root's own file is emptied and then handed over.
+                drop(opened.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    [
+                        "temp_owner",
+                        "temp_write",
+                        "temp_sync_all",
+                        "rename",
+                        "directory_sync"
+                    ]
+                );
+                assert_eq!(fault.given(), [daemon]);
+            }
+        }
+    }
+
     #[test]
     fn encoding_has_a_fixed_vector() {
         let anchor = Anchor {
@@ -909,6 +1008,8 @@ mod tests {
         trace: Arc<Mutex<Vec<&'static str>>>,
         anchor_owner: Mutex<Option<FileOwner>>,
         directory_owner: Mutex<Option<FileOwner>>,
+        replant: Mutex<Option<(Vec<u8>, FileOwner)>>,
+        temporary_owner: Mutex<Option<FileOwner>>,
         given: Arc<Mutex<Vec<FileOwner>>>,
     }
 
@@ -920,6 +1021,8 @@ mod tests {
                 trace: Arc::new(Mutex::new(Vec::new())),
                 anchor_owner: Mutex::new(None),
                 directory_owner: Mutex::new(None),
+                replant: Mutex::new(None),
+                temporary_owner: Mutex::new(None),
                 given: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -941,6 +1044,14 @@ mod tests {
         /// owner.
         fn report_directory_owner(&self, owner: FileOwner) {
             *self.directory_owner.lock().unwrap() = Some(owner);
+        }
+
+        /// Once the temporary record is next removed, put a file holding
+        /// `bytes` back under its name and report it as `owner`'s: what
+        /// anyone who can write the directory may do between that removal
+        /// and the creation that follows.
+        fn replant_temporary(&self, bytes: &[u8], owner: FileOwner) {
+            *self.replant.lock().unwrap() = Some((bytes.to_vec(), owner));
         }
 
         /// Owners given to temporary files. They are recorded, not applied,
@@ -1086,6 +1197,8 @@ mod tests {
                 anchor: path == super::ANCHOR_FILE,
                 reported_owner: if path == super::ANCHOR_FILE {
                     *self.anchor_owner.lock().unwrap()
+                } else if path == super::TEMP_FILE {
+                    *self.temporary_owner.lock().unwrap()
                 } else {
                     None
                 },
@@ -1098,7 +1211,14 @@ mod tests {
         }
 
         fn remove(&self, path: &str) -> io::Result<()> {
-            self.inner.remove(path)
+            let removed = self.inner.remove(path);
+            if path == super::TEMP_FILE {
+                if let Some((bytes, owner)) = self.replant.lock().unwrap().take() {
+                    self.inner.open(path, true)?.write_at(0, &bytes)?;
+                    *self.temporary_owner.lock().unwrap() = Some(owner);
+                }
+            }
+            removed
         }
 
         fn rename(&self, from: &str, to: &str) -> io::Result<()> {

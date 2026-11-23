@@ -4,10 +4,10 @@
 //! manifest slots there, and recreate them when a restore or a copy dropped
 //! them. A file root creates in a directory another user owns must belong to
 //! that user: a root-owned `0600` lock file or manifest slot locks the daemon
-//! out of its own volume. Root never gives away an entry it did not create,
-//! and a root-owned directory keeps getting root-owned files. Changing an
-//! owner needs root: without it these tests print why they are skipped (as
-//! in CI).
+//! out of its own volume. Root never gives away an entry another user owns
+//! or publishes a witness record another user put there, and a root-owned
+//! directory keeps getting root-owned files. Changing an owner needs root:
+//! without it these tests print why they are skipped (as in CI).
 #![cfg(target_os = "linux")]
 
 use std::fs;
@@ -336,6 +336,43 @@ fn root_refuses_to_republish_an_anchor_its_directory_owner_does_not_own() {
     // Nothing was given to either user.
     assert_eq!(owner(&dir.path().join("anchor")).0, OTHER);
     assert!(!dir.path().join("anchor.next").exists());
+}
+
+#[test]
+fn root_never_publishes_a_temporary_record_another_user_put_in_the_witness() {
+    if skip_unless_root("root_never_publishes_a_temporary_record_another_user_put_in_the_witness") {
+        return;
+    }
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    drop(FileWitness::create(dir.path(), *b"volume-identity!", [0x11; 32]).unwrap());
+    give(dir.path(), DAEMON);
+    // A temporary record of another user, who keeps a writable descriptor.
+    let planted = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.path().join("anchor.next"))
+        .unwrap();
+    std::os::unix::fs::fchown(&planted, Some(OTHER.0), Some(OTHER.1)).unwrap();
+
+    drop(FileWitness::open(dir.path()).unwrap());
+    let anchor = dir.path().join("anchor");
+    assert_ne!(
+        fs::metadata(&anchor).unwrap().ino(),
+        planted.metadata().unwrap().ino(),
+        "the other user's file was published as the anchor"
+    );
+    assert_eq!(owner(&anchor), (DAEMON, 0o600));
+    // Their file was not given away.
+    let metadata = planted.metadata().unwrap();
+    assert_eq!((metadata.uid(), metadata.gid()), OTHER);
+    // Their descriptor cannot rewrite the published anchor.
+    let published = fs::read(&anchor).unwrap();
+    planted.write_all_at(&[0xa5; 104], 0).unwrap();
+    assert_eq!(fs::read(&anchor).unwrap(), published);
+    drop(FileWitness::open(dir.path()).unwrap());
 }
 
 /// The authority in process, answering for one role.
