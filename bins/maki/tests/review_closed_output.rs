@@ -204,8 +204,9 @@ fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
         (vec!["attach", "--volume", "example"], 3),
         (vec!["check", missing], 1),
         (vec!["volume", "inspect", missing], 1),
-        (vec!["status", missing, "--timeout", "0"], 1),
-        (vec!["status", "--socket"], 1),
+        (vec!["status", missing, "--timeout", "0"], 2),
+        (vec!["status", "--socket"], 2),
+        (vec!["status", missing], 1),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_maki"))
             .args(&args)

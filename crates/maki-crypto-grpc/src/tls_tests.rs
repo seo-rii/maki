@@ -167,9 +167,8 @@ async fn custom_ca_and_verified_server_name_succeed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_trust_and_wrong_server_name_are_rejected() {
-    // The client trusts a CA that did not issue the server's certificate.
-    // It is a test CA rather than the host's roots, which may be missing:
-    // a provider with no root at all cannot be built.
+    // The client trusts a test CA that did not issue the server's
+    // certificate, besides the default roots, which did not issue it either.
     let (untrusted_address, _) = tls_server("localhost", None).await;
     let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let untrusted = GrpcCryptoProvider::new_with_tls(
@@ -290,4 +289,40 @@ fn an_ip_literal_host_is_verified_as_an_ip_address_server_name() {
             assert!(matches!(name, ServerName::DnsName(_)), "{host}: {name:?}");
         }
     }
+}
+
+fn missing_compiled_in_roots(roots: &rustls::RootCertStore) -> usize {
+    maki_crypto::tls_trust::COMPILED_IN_ROOTS
+        .iter()
+        .filter(|root| !roots.roots.contains(root))
+        .count()
+}
+
+/// The roots handed to tonic hold the compiled-in public roots, with or
+/// without a configured CA, which they also hold. The host's trust store is
+/// covered by `tests/review_default_trust.rs`, which needs a process of its
+/// own.
+#[test]
+fn the_trust_anchors_hold_the_compiled_in_roots_and_the_configured_ca() {
+    use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+    assert!(!maki_crypto::tls_trust::COMPILED_IN_ROOTS.is_empty());
+    let roots = super::trusted_roots(&GrpcTlsConfig::default()).unwrap();
+    assert_eq!(missing_compiled_in_roots(&roots), 0);
+
+    let ca = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+        .unwrap()
+        .cert
+        .pem()
+        .into_bytes();
+    let mut expected = rustls::RootCertStore::empty();
+    expected
+        .add(CertificateDer::from_pem_slice(&ca).unwrap())
+        .unwrap();
+    let roots = super::trusted_roots(&GrpcTlsConfig {
+        ca_certificate_pem: Some(ca),
+        client_identity: None,
+    })
+    .unwrap();
+    assert!(roots.roots.contains(&expected.roots[0]));
+    assert_eq!(missing_compiled_in_roots(&roots), 0);
 }

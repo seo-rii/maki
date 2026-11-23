@@ -120,3 +120,78 @@ async fn f04_upgrade_status_controls_class_and_retry_count() {
         }
     }
 }
+
+/// An upgrade reply that is not a valid WebSocket handshake answer (a
+/// status other than 101 outside the refusal ranges, a 101 without the
+/// upgrade headers or with the wrong accept key, a head that is not HTTP)
+/// is the endpoint's fault like a refused upgrade: `EndpointFatal`, not a
+/// contract violation, although it breaks the protocol. Only a head cut
+/// off by the peer is a lost connection.
+#[tokio::test]
+async fn an_upgrade_reply_that_breaks_the_handshake_is_an_endpoint_failure() {
+    for (reply, expected) in [
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            ErrorClass::EndpointFatal,
+        ),
+        (
+            "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n",
+            ErrorClass::EndpointFatal,
+        ),
+        (
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n",
+            ErrorClass::EndpointFatal,
+        ),
+        ("SSH-2.0-OpenSSH_9.6\r\n\r\n", ErrorClass::EndpointFatal),
+        ("HTTP/1.1 101 Swit", ErrorClass::Retryable),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut header = [0; 4096];
+                let mut used = 0;
+                while !header[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let received = socket.read(&mut header[used..]).await.unwrap();
+                    if received == 0 {
+                        return;
+                    }
+                    used += received;
+                }
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = WsCryptoProvider::new(WsProviderSpec {
+            url: format!("ws://{address}/crypto"),
+            capabilities: CryptoCapabilities {
+                provider_id: "review-upgrade".into(),
+                crypto_compatibility_id: "review-upgrade".into(),
+                supported_plaintext_sizes: vec![512],
+                max_ciphertext_size: 512,
+                stateless: true,
+                retry_safe: false,
+                batch: BatchCapability::default(),
+                integrity: Capability::Absent,
+                context_binding: Capability::Absent,
+                replay_protection: Capability::Absent,
+            },
+            timeout: Duration::from_secs(2),
+            max_frame_bytes: 4096,
+            tls: None,
+        });
+        let context = CryptoContext {
+            volume_uuid: uuid::Uuid::nil(),
+            format_version: 1,
+            crypto_compatibility_id: "review-upgrade".into(),
+        };
+        let input = [PlaintextUnit {
+            unit_index: 0,
+            data: SecretBuffer::from_slice(&[0x42; 512]),
+        }];
+        let error = provider.encrypt_batch(&context, &input).await.unwrap_err();
+        server.abort();
+        assert_eq!(error.class(), expected, "{reply:?}: {error:?}");
+        assert!(error.is_not_sent(), "{reply:?}: {error:?}");
+    }
+}

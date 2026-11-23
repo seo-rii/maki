@@ -70,8 +70,8 @@ async fn a_peer_that_never_answers_tls_does_not_pin_the_channel() {
             timeout: TIMEOUT,
             max_message_bytes: 1 << 20,
         },
-        // The peer never answers, so any root will do, but the host's own
-        // may be missing: a provider with no root at all cannot be built.
+        // The peer never answers, so the roots do not matter; a test CA
+        // keeps the provider independent of the host's trust store.
         GrpcTlsConfig {
             ca_certificate_pem: Some(
                 rcgen::generate_simple_self_signed(vec!["localhost".into()])

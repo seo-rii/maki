@@ -3,8 +3,8 @@
 //! A quarantined endpoint whose validation failed only because one exchange
 //! went wrong (a truncated batch reply, an empty success where a refusal was
 //! due, a request refused without an integrity verdict by either peer or by
-//! the set's own admission limits) has not been shown to serve another
-//! contract. It stays out of the serving pool, is revalidated with
+//! the set's own admission limits, a fatal error its own provider reports)
+//! has not been shown to serve another contract. It stays out of the serving pool, is revalidated with
 //! exponential backoff (the validation interval, doubled per inconclusive
 //! attempt, capped by the circuit breaker's `open_max`) and is admitted
 //! after a complete successful validation. Proof that it serves another
@@ -555,9 +555,9 @@ async fn one_generic_request_refusal_defers_the_endpoint_until_it_revalidates() 
     assert!(excluded.is_empty(), "{excluded:#?}");
 }
 
-/// What would be a verdict from the candidate (a fatal provider error, a
-/// refusal of the volume's context) says nothing about the candidate when
-/// the validated reference sends it.
+/// What would be a verdict from the candidate (a refusal of the volume's
+/// context) says nothing about the candidate when the validated reference
+/// sends it, and neither does the reference's fatal provider error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_failure_of_the_validated_reference_never_excludes_the_candidate() {
     let mut excluded = Vec::new();
@@ -570,6 +570,26 @@ async fn a_failure_of_the_validated_reference_never_excludes_the_candidate() {
             let case = format!("{check:?} validation, reference {glitch:?}");
             excluded.extend(
                 deferred_once_then_admitted(&case, check, Some(glitch), None)
+                    .await
+                    .err(),
+            );
+        }
+    }
+    assert!(excluded.is_empty(), "{excluded:#?}");
+}
+
+/// A fatal error that the candidate's own provider reports, rather than a
+/// reply the checks can judge, says that this endpoint cannot serve the
+/// request now (a backend that reports itself misconfigured), not that it
+/// holds another key or serves another contract.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fatal_error_of_the_candidates_own_provider_defers_the_endpoint() {
+    let mut excluded = Vec::new();
+    for check in [Check::Cross, Check::Full] {
+        for glitch in [Glitch::FatalEncrypt, Glitch::FatalDecrypt] {
+            let case = format!("{check:?} validation, candidate {glitch:?}");
+            excluded.extend(
+                deferred_once_then_admitted(&case, check, None, Some(glitch))
                     .await
                     .err(),
             );

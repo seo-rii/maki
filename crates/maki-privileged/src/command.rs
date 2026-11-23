@@ -56,6 +56,12 @@ pub(super) fn finish_by(deadline: Instant) -> Deadline {
     Deadline(FINISH_BY.replace(Some(deadline)))
 }
 
+/// The limit [`finish_by`] set for this thread, if any.
+#[cfg(test)]
+pub(super) fn finish_by_limit() -> Option<Instant> {
+    FINISH_BY.get()
+}
+
 /// A command with a controlled environment: nothing inherited from the
 /// caller (no `LD_*`, no hostile `PATH`), a fixed system `PATH`, and
 /// `LC_ALL=C` so parsed output never depends on the caller's locale.

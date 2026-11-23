@@ -60,11 +60,12 @@ for a disconnected backend.
 .B cleanup
 uses the attachment record to select detach or recovery.
 .B recover-failed-start
-is the systemd failed-start cleanup hook. It queues the recovery coordinator
-and, when the start died between LVM activation and the mapping proof, rolls
-back that activation itself while the daemon still serves the device: the
-scoped VG deactivation, the NBD disconnect, and the removal of the record. It
-never unmounts.
+is the systemd failed-start cleanup hook. It asks systemd to queue the
+recovery coordinator and, when the start died between LVM activation and the
+mapping proof, rolls back that activation itself while the daemon still
+serves the device, also when systemd refused the request: the scoped VG
+deactivation, the NBD disconnect, and the removal of the record. It never
+unmounts.
 .SH OPTIONS
 .TP
 .BI \-\-volume " name"
@@ -138,6 +139,15 @@ The Maki volume UUID
 .BI \-\-fs-uuid " uuid"
 The expected XFS filesystem UUID
 .RB ( fs_uuid ).
+.SH EXIT STATUS
+Zero indicates success. A failed action returns 1, as does an attachment
+file that cannot be read, is not trusted or does not parse. Invalid command
+usage returns 2 and prints no plan: an unknown, repeated or misplaced
+option, a malformed volume name, which is checked first, or an option or
+setting value that fails validation, which is checked once the file has been
+read. Without Linux, an action run without
+.B \-\-plan
+returns 3.
 .SH SEE ALSO
 .BR maki (8),
 .BR maki-check (8)

@@ -11,6 +11,11 @@
 //! - `exec` (Linux): command execution, observation, allocation, rollback;
 //! - [`logging`]: the stderr `tracing` sink the executor reports through.
 
+// Diagnostics go through `tracing`, and the executor writes the device it
+// bound without `println!`: the `print!` family panics when the write fails
+// (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod config;
 pub mod logging;
 pub mod plan;

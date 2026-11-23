@@ -240,7 +240,13 @@ See [space reclamation](space-reclamation.md) for supported semantics and limits
 `maki-crypto-websocket/tests/wss_tls.rs` and
 `maki-crypto-grpc/src/tls_tests.rs` run local TLS/mTLS peers, verify trust and
 hostname rejection, and preserve the transport request contracts. The WSS suite
-also uses a TLS-1.2-only peer and checks the exact upgrade URI.
+also uses a TLS-1.2-only peer and checks the exact upgrade URI. Each transport
+crate's `tests/review_default_trust.rs` checks the shared default trust against
+servers of three test CAs: one in the host's trust store, one in `ca_file` and
+one in neither, then with the host's store emptied. It points `SSL_CERT_FILE`
+and `SSL_CERT_DIR` at a test bundle, which is process-global, so each is a test
+binary of its own with a single test. Unit tests in the same crates check that
+the roots each transport builds hold every compiled-in public root.
 `maki-nbdkit/tests/review_wss_tls_daemon.rs` and
 `review_grpc_tls_daemon.rs` connect the configured provider through real daemon
 construction, attach self-test/canary, adapter write/read and shutdown. The gRPC

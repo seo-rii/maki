@@ -8,6 +8,10 @@
 //! calls into `maki_test_support::failpoints` under a stable name (see
 //! `docs/architecture.md` for the persistence model).
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod check;
 pub mod engine;
 pub mod error;

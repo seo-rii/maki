@@ -4,6 +4,10 @@
 //! CRC-protected. Multi-copy metadata uses the A/B generation protocol
 //! ([`ab`]). Golden vectors freeze the v1 encodings.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod ab;
 pub mod allocation;
 pub mod canary;

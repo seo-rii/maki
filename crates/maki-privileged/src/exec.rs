@@ -1687,31 +1687,65 @@ fn cleanup_with(
 /// coordinator, which stops the registered workloads first. An intent never
 /// authorized a mount, and this never unmounts.
 ///
-/// The attach lock and every command must be done by `deadline`: the hook
-/// runs inside the unit's stop timeout, and the coordinator waits for it.
-/// Returns whether an interrupted activation was found and rolled back.
-pub fn finish_interrupted_activation(plan: &Plan, deadline: Instant) -> Result<bool, ExecError> {
-    finish_interrupted_activation_by(plan, &TrustedState::open()?, &mut LinuxSystem, deadline)
+/// The attach lock must be granted by `lock_deadline`, and every command
+/// then finishes within `commands`: the hook runs inside the unit's stop
+/// timeout, and the coordinator waits for it. Returns whether an
+/// interrupted activation was found and rolled back.
+pub fn finish_interrupted_activation(
+    plan: &Plan,
+    lock_deadline: Instant,
+    commands: Duration,
+) -> Result<bool, ExecError> {
+    let Some(state) = existing_state()? else {
+        return Ok(false);
+    };
+    finish_interrupted_activation_by(plan, &state, &mut LinuxSystem, lock_deadline, commands)
+}
+
+/// Whether `volume`'s trusted record holds an activation intent, the state
+/// [`finish_interrupted_activation`] rolls back. It only reads: no lock, no
+/// configuration, and a missing state directory is no record. The hook asks
+/// this first, so that a failed start that left no intent is not reported
+/// as a rollback that failed for an unrelated reason.
+pub fn interrupted_activation(volume: &str) -> io::Result<bool> {
+    match existing_state()? {
+        Some(state) => holds_activation_intent(&state, volume),
+        None => Ok(false),
+    }
+}
+
+fn existing_state() -> io::Result<Option<TrustedState>> {
+    match TrustedState::open_existing() {
+        Ok(state) => Ok(Some(state)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn holds_activation_intent(state: &TrustedState, volume: &str) -> io::Result<bool> {
+    Ok(state
+        .read(volume)?
+        .is_some_and(|record| record.recovery_intent.is_some()))
 }
 
 fn finish_interrupted_activation_by(
     plan: &Plan,
     state: &TrustedState,
     system: &mut impl System,
-    deadline: Instant,
+    lock_deadline: Instant,
+    commands: Duration,
 ) -> Result<bool, ExecError> {
     // Most failed starts leave no intent, and a start often fails because the
     // global lock was busy for too long. Only the volume's own helper writes
     // its record, atomically, and that helper is gone: look before queueing
     // for the lock. The decision itself is made again under the lock.
-    if state
-        .read(&plan.volume)?
-        .is_none_or(|record| record.recovery_intent.is_none())
-    {
+    if !holds_activation_intent(state, &plan.volume)? {
         return Ok(false);
     }
-    let _lock = state.lock_until(deadline)?;
-    let _bounded = command::finish_by(deadline);
+    let _lock = state.lock_until(lock_deadline)?;
+    // The commands' time starts once the lock is held: a lock granted late
+    // in its wait must not leave the scoped deactivation less than that.
+    let _bounded = command::finish_by(Instant::now() + commands);
     finish_interrupted_activation_with(plan, state, system)
 }
 

@@ -48,6 +48,14 @@ Draining closes I/O admission and checkpoints the volume.
 Run
 .B maki \-\-help
 for the full command list and remote-volume operations.
+.SH EXIT STATUS
+Zero indicates success. A failing check, an error and a request the daemon
+refuses return 1. Invalid command usage, including a malformed option value
+or approval, returns 2 before anything is read.
+.BR attach ", " detach " and " grow
+return 3: they print the
+.B maki-attach
+command to run.
 .SH SEE ALSO
 .BR maki-attach (8),
 .BR maki-check (8)
